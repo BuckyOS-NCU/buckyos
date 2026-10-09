@@ -34,6 +34,8 @@ uv run src/test/test_boot_gatweay/run_debug_tests.py --binary ~/cyfs-gateway/src
   - 远端 app 转发（ROUTES forward-plan 路径）
   - 远端 service 转发（ROUTES forward-plan 路径，单 primary peer）
   - root host / host prefix / `/kapi` / `/sso_callback` / `/ndm`
+  - 带数字端口的 root host / host prefix 路由，保留原始 Host，拒绝非法域名和端口
+  - `local_access_origins.json` 中启用的 IP 入口，拒绝未配置或禁用的入口
   - `/.well-known/*` 与 `/1.0/identifiers/*`
   - 非法 host reject
   - `/kapi/kevent/*` 早转发

@@ -146,6 +146,14 @@ def stage_runtime(config: Path, node_gateway_info: dict) -> tuple[tempfile.Tempo
         json.dumps(node_gateway_info, indent=2),
         encoding="utf-8",
     )
+    (etc_dir / "local_access_origins.json").write_text(
+        json.dumps({
+            "http://100.79.198.28:3180": True,
+            "http://100.79.198.28:8080": True,
+            "http://100.79.198.28:9999": False,
+        }),
+        encoding="utf-8",
+    )
     return temp_root, etc_dir / "boot_gateway.yaml"
 
 
@@ -360,7 +368,13 @@ def assertions_for_case(case_name: str):
         return [control_matches({"return", "exit"}, expected_substring="tcp://ood2-edge.test.buckyos.io:10160")]
     if case_name == "req_service_kmsg_via_routes_ok":
         return [control_matches({"return", "exit"}, expected_substring="tcp://ood2-edge.test.buckyos.io:10163")]
-    if case_name == "req_invalid_host_prefix_reject":
+    if case_name in {
+        "req_invalid_host_prefix_reject",
+        "req_invalid_host_with_port_reject",
+        "req_invalid_host_port_reject",
+        "req_unconfigured_ip_reject",
+        "req_disabled_ip_origin_reject",
+    }:
         return [control_matches({"exit"}, exact_value="reject")]
     if case_name == "req_invalid_host_dash_reject":
         return [control_matches({"exit"}, exact_value="reject")]
@@ -368,6 +382,22 @@ def assertions_for_case(case_name: str):
         return [control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:10262")]
     if case_name == "req_service_by_root_host_ok":
         return [control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:10262")]
+    if case_name == "req_service_by_root_host_with_port_ok":
+        return [
+            control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:10262"),
+            request_header_equals("host", "test.buckyos.io:3180"),
+        ]
+    if case_name == "req_service_by_host_prefix_with_port_ok":
+        return [
+            control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:10262"),
+            request_header_equals("host", "www.test.buckyos.io:8080"),
+        ]
+    if case_name in {"req_configured_ip_gateway_ok", "req_configured_ip_http_ok"}:
+        port = 3180 if case_name == "req_configured_ip_gateway_ok" else 8080
+        return [
+            control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:10262"),
+            request_header_equals("host", f"100.79.198.28:{port}"),
+        ]
     if case_name == "req_service_by_kapi_ok":
         return [control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:10262")]
     if case_name == "req_sso_callback_ok":

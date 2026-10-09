@@ -1,0 +1,11 @@
+.workflow
+memory
+**/node_modules
+**/target
+**/.venv
+**/__pycache__
+**/dist
+**/dapp_dist
+src/rootfs/logs
+notepads
+test/reports

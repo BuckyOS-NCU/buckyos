@@ -1,0 +1,11 @@
+{
+  "input": {
+    "REQ": {
+      "path": "/index.html",
+      "host": "www.test.buckyos.io.example.com:3180",
+      "url": "http://www.test.buckyos.io.example.com:3180/index.html"
+    }
+  },
+  "id": "server:node_gateway:main",
+  "output": ["REQ", "RESP"]
+}

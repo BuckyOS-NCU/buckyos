@@ -71,12 +71,14 @@ impl ControlPanelServer {
             .or(Some(req.seq));
 
         let runtime: &buckyos_api::BuckyOSRuntime = get_buckyos_api_runtime()?;
+        let local_access_origins = Self::load_local_access_origins()?;
         let resolved_target = match redirect_url.as_deref() {
             Some(redirect_url) => Some(Self::resolve_sso_auth_target(
                 redirect_url,
                 Self::sso_zone_host(runtime)?.as_str(),
                 !runtime.force_https,
                 runtime.node_gateway_port,
+                &local_access_origins,
             )?),
             None => None,
         };
@@ -214,20 +216,27 @@ impl ControlPanelServer {
         };
         let runtime = get_buckyos_api_runtime().map_err(Self::rpc_to_server_error)?;
         let validation = (|| -> Result<(), RPCErrors> {
+            let local_access_origins = Self::load_local_access_origins()?;
             let zone_host = Self::sso_zone_host(runtime)?;
             let callback_target = Self::resolve_sso_auth_target(
                 redirect_url.as_str(),
                 zone_host.as_str(),
                 !runtime.force_https,
                 runtime.node_gateway_port,
+                &local_access_origins,
             )?;
-            let request_origin =
-                Self::request_origin(&req, !runtime.force_https, runtime.node_gateway_port)?;
+            let request_origin = Self::request_origin(
+                &req,
+                !runtime.force_https,
+                runtime.node_gateway_port,
+                &local_access_origins,
+            )?;
             let request_target = Self::resolve_sso_auth_target(
                 format!("{request_origin}/").as_str(),
                 zone_host.as_str(),
                 !runtime.force_https,
                 runtime.node_gateway_port,
+                &local_access_origins,
             )?;
             Self::validate_sso_callback_binding(&callback_target, &request_target, &pending)?;
             let session = RPCSessionToken::from_string(&pending.session_token)?;
@@ -301,15 +310,21 @@ impl ControlPanelServer {
         info!("sso_refresh received refresh token cookie");
         let runtime = get_buckyos_api_runtime().map_err(Self::rpc_to_server_error)?;
         let expected_target = match (|| -> Result<AuthTarget, RPCErrors> {
+            let local_access_origins = Self::load_local_access_origins()?;
             let parsed = RPCSessionToken::from_string(&refresh_token)?;
             let claims = validate_verify_hub_token_claims(&parsed, TokenUse::Refresh)?;
-            let request_origin =
-                Self::request_origin(&req, !runtime.force_https, runtime.node_gateway_port)?;
+            let request_origin = Self::request_origin(
+                &req,
+                !runtime.force_https,
+                runtime.node_gateway_port,
+                &local_access_origins,
+            )?;
             let current_route = Self::resolve_sso_auth_target(
                 format!("{request_origin}/").as_str(),
                 Self::sso_zone_host(runtime)?.as_str(),
                 !runtime.force_https,
                 runtime.node_gateway_port,
+                &local_access_origins,
             )?;
             Self::validate_sso_refresh_route(&current_route, &claims.target)?;
             Ok(claims.target)
@@ -642,6 +657,7 @@ impl ControlPanelServer {
         req: &http::Request<BoxBody<Bytes, ServerError>>,
         allow_http: bool,
         gateway_port: u16,
+        local_access_origins: &HashMap<String, bool>,
     ) -> Result<String, RPCErrors> {
         let scheme = if Self::request_is_secure(req) {
             "https"
@@ -669,7 +685,9 @@ impl ControlPanelServer {
             ));
         }
         if let Some(port) = url.port() {
-            if !(allow_http && port == gateway_port) {
+            if !(allow_http && port == gateway_port)
+                && local_access_origins.get(&url.origin().ascii_serialization()) != Some(&true)
+            {
                 return Err(RPCErrors::ParseRequestError(format!(
                     "request origin port {port} is not exposed by the gateway"
                 )));
@@ -900,6 +918,7 @@ impl ControlPanelServer {
         zone_host: &str,
         allow_http: bool,
         gateway_port: u16,
+        local_access_origins: &HashMap<String, bool>,
     ) -> Result<ResolvedSsoAuthTarget, RPCErrors> {
         let redirect_url = redirect_url.trim();
         if redirect_url.is_empty() {
@@ -912,8 +931,13 @@ impl ControlPanelServer {
             return Err(RPCErrors::ReasonError("missing zone host".to_string()));
         }
 
-        let (url, app_key, is_zone_root) =
-            Self::parse_sso_redirect_url(redirect_url, &zone_host, allow_http, gateway_port)?;
+        let (url, app_key, is_zone_root) = Self::parse_sso_redirect_url(
+            redirect_url,
+            &zone_host,
+            allow_http,
+            gateway_port,
+            local_access_origins,
+        )?;
         let gateway_info_path = gateway_etc_dir().join("node_gateway_info.json");
         let content = std::fs::read_to_string(gateway_info_path.as_path()).map_err(|error| {
             RPCErrors::ReasonError(format!("read node_gateway_info.json failed: {}", error))
@@ -924,11 +948,36 @@ impl ControlPanelServer {
         Self::resolve_sso_auth_target_from_gateway_info(&url, &app_key, is_zone_root, &value)
     }
 
+    fn load_local_access_origins() -> Result<HashMap<String, bool>, RPCErrors> {
+        let path = gateway_etc_dir().join("local_access_origins.json");
+        let content = std::fs::read_to_string(&path).map_err(|error| {
+            RPCErrors::ReasonError(format!("read local_access_origins.json failed: {error}"))
+        })?;
+        let origins: HashMap<String, bool> = serde_json::from_str(&content).map_err(|error| {
+            RPCErrors::ReasonError(format!("parse local_access_origins.json failed: {error}"))
+        })?;
+        for origin in origins.keys() {
+            let url = url::Url::parse(origin).map_err(|error| {
+                RPCErrors::ReasonError(format!("invalid local access origin: {error}"))
+            })?;
+            if !matches!(url.scheme(), "http" | "https")
+                || !matches!(url.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)))
+                || origin != &url.origin().ascii_serialization()
+            {
+                return Err(RPCErrors::ReasonError(
+                    "local access origins must be canonical HTTP(S) IP origins".to_string(),
+                ));
+            }
+        }
+        Ok(origins)
+    }
+
     fn parse_sso_redirect_url(
         redirect_url: &str,
         zone_host: &str,
         allow_http: bool,
         gateway_port: u16,
+        local_access_origins: &HashMap<String, bool>,
     ) -> Result<(url::Url, String, bool), RPCErrors> {
         let url = url::Url::parse(redirect_url).map_err(|error| {
             RPCErrors::ParseRequestError(format!("Invalid redirect_url: {error}"))
@@ -951,6 +1000,9 @@ impl ControlPanelServer {
             return Err(RPCErrors::ParseRequestError(
                 "redirect_url cannot contain credentials".to_string(),
             ));
+        }
+        if local_access_origins.get(&url.origin().ascii_serialization()) == Some(&true) {
+            return Ok((url, "_".to_string(), true));
         }
         if let Some(port) = url.port() {
             if !(allow_http && port == gateway_port) {
@@ -1299,6 +1351,7 @@ mod tests {
             &zone_host,
             !runtime.force_https,
             runtime.node_gateway_port,
+            &HashMap::new(),
         )?;
         ControlPanelServer::resolve_sso_auth_target_from_gateway_info(
             &url,
@@ -1381,12 +1434,135 @@ mod tests {
     }
 
     #[test]
+    fn configured_ip_origins_resolve_to_control_panel() {
+        let origins = HashMap::from([
+            ("http://100.79.198.28:3180".to_string(), true),
+            ("http://100.79.198.28:8080".to_string(), true),
+        ]);
+        for origin in origins.keys() {
+            let redirect_url = format!("{origin}/desktop?tab=apps#installed");
+            let (url, app_key, is_root) = ControlPanelServer::parse_sso_redirect_url(
+                &redirect_url,
+                "example.test",
+                true,
+                3180,
+                &origins,
+            )
+            .unwrap();
+            let resolved = ControlPanelServer::resolve_sso_auth_target_from_gateway_info(
+                &url,
+                &app_key,
+                is_root,
+                &gateway_info(),
+            )
+            .unwrap();
+            let target = AuthTarget::system("control-panel".parse().unwrap());
+            assert_eq!(resolved.auth_target, target);
+            assert_eq!(&resolved.canonical_origin, origin);
+            assert_eq!(resolved.canonical_redirect_url, redirect_url);
+            let mut req = request(None, false);
+            req.headers_mut().insert(
+                HOST,
+                origin.strip_prefix("http://").unwrap().parse().unwrap(),
+            );
+            assert_eq!(
+                ControlPanelServer::request_origin(&req, true, 3180, &origins).unwrap(),
+                *origin,
+            );
+            ControlPanelServer::validate_sso_refresh_route(&resolved, &target).unwrap();
+            assert!(ControlPanelServer::validate_sso_refresh_route(
+                &resolved,
+                &AuthTarget::app("filebrowser@alice".parse().unwrap()),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn local_access_requires_an_enabled_origin_and_valid_url() {
+        let origins = HashMap::from([
+            ("http://100.79.198.28:3180".to_string(), true),
+            ("http://100.79.198.28:8080".to_string(), true),
+            ("http://100.79.198.28:9999".to_string(), false),
+        ]);
+        for redirect_url in [
+            "http://100.79.198.29:3180/",
+            "http://100.79.198.28:9999/",
+            "http://100.79.198.28:8081/",
+            "http://100.79.198.28.example.com:3180/",
+            "http://user:password@100.79.198.28:3180/",
+            "https://100.79.198.28:3180/",
+        ] {
+            assert!(ControlPanelServer::parse_sso_redirect_url(
+                redirect_url,
+                "example.test",
+                true,
+                3180,
+                &origins,
+            )
+            .is_err());
+        }
+        assert!(ControlPanelServer::parse_sso_redirect_url(
+            "http://100.79.198.28:3180/",
+            "example.test",
+            false,
+            3180,
+            &origins,
+        )
+        .is_err());
+        let mut req = request(None, false);
+        req.headers_mut()
+            .insert(HOST, "100.79.198.28:8081".parse().unwrap());
+        assert!(ControlPanelServer::request_origin(&req, true, 3180, &origins).is_err());
+    }
+
+    #[test]
+    fn local_access_callback_stays_on_its_original_origin() {
+        let origins = HashMap::from([
+            ("http://100.79.198.28:3180".to_string(), true),
+            ("http://100.79.198.28:8080".to_string(), true),
+        ]);
+        let resolve = |redirect_url: &str| {
+            let (url, app_key, is_root) = ControlPanelServer::parse_sso_redirect_url(
+                redirect_url,
+                "example.test",
+                true,
+                3180,
+                &origins,
+            )
+            .unwrap();
+            ControlPanelServer::resolve_sso_auth_target_from_gateway_info(
+                &url,
+                &app_key,
+                is_root,
+                &gateway_info(),
+            )
+            .unwrap()
+        };
+        let callback = resolve("http://100.79.198.28:3180/");
+        let other_origin = resolve("http://100.79.198.28:8080/");
+        let expected = pending(
+            callback.auth_target.clone(),
+            &callback.canonical_origin,
+            &callback.canonical_redirect_url,
+        );
+        ControlPanelServer::validate_sso_callback_binding(&callback, &callback, &expected).unwrap();
+        assert!(ControlPanelServer::validate_sso_callback_binding(
+            &callback,
+            &other_origin,
+            &expected,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn zone_root_resolves_to_control_panel_system_target() {
         let (url, app_key, is_root) = ControlPanelServer::parse_sso_redirect_url(
             "https://example.test/desktop?tab=apps#installed",
             "example.test",
             false,
             3180,
+            &HashMap::new(),
         )
         .unwrap();
         let resolved = ControlPanelServer::resolve_sso_auth_target_from_gateway_info(
@@ -1440,6 +1616,7 @@ mod tests {
                         &req,
                         !runtime.force_https,
                         runtime.node_gateway_port,
+                        &HashMap::new(),
                     )
                     .unwrap();
                     let route = resolve_sso_test_target(&runtime, &format!("{origin}/")).unwrap();
@@ -1509,6 +1686,7 @@ mod tests {
             "example.test",
             false,
             3180,
+            &HashMap::new(),
         )
         .unwrap();
         let resolved = ControlPanelServer::resolve_sso_auth_target_from_gateway_info(
@@ -1537,6 +1715,7 @@ mod tests {
                 "example.test",
                 false,
                 3180,
+                &HashMap::new(),
             )
             .is_err());
         }
@@ -1545,6 +1724,7 @@ mod tests {
             "example.test",
             true,
             3180,
+            &HashMap::new(),
         )
         .is_ok());
     }

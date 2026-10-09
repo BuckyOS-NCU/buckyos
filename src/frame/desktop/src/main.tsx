@@ -47,7 +47,10 @@ async function bootstrap() {
     // zone host: every /kapi, /sso_* and /ndm call is forwarded to the real
     // gateway. Passing the config skips the SDK's host discovery, which would
     // otherwise probe unreachable parent hosts of 127.0.0.1.
-    if (import.meta.env.VITE_ZONE_PROXY) {
+    const hostname = window.location.hostname
+    const isIpHost = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)
+      || (hostname.startsWith('[') && hostname.endsWith(']'))
+    if (import.meta.env.VITE_ZONE_PROXY || isIpHost) {
       await buckyos.initBuckyOS('control-panel', {
         appId: 'control-panel',
         zoneHost: window.location.host,

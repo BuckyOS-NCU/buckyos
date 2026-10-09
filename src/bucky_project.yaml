@@ -137,6 +137,7 @@ apps:
     - etc/post_gateway.yaml
     - etc/node_gateway_params.json
     - etc/node_gateway.json
+    - etc/local_access_origins.json
     - etc/cyfs_gateway.yaml
     - data/               # cyfs://$zone_id/ 映射根: home/, srv/, var/, cache/ 均在此下
     - data/home/

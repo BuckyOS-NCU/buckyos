@@ -26,6 +26,10 @@ collections:
     type: json_map
     file_path: ./node_gateway_info.json#node_info
     only_read_file: true
+  LOCAL_ACCESS_ORIGINS:
+    type: json_map
+    file_path: ./local_access_origins.json
+    only_read_file: true
 
 stacks:
   node_rtcp:
@@ -96,6 +100,21 @@ servers:
             block: |
               global THIS_NODE_ID=$NODE_INFO.this_node_id;
               global THIS_ZONE_HOST=$NODE_INFO.this_zone_host;
+              global ROUTE_HOST=$REQ.host;
+              map-create host_parts;
+              if match-reg --capture host_parts $ROUTE_HOST "^([^:]+):[0-9]+\$" then
+                global ROUTE_HOST=$host_parts[1];
+              end
+              local request_scheme="http";
+              if eq $REQ_target_port "443" then
+                request_scheme="https";
+              end
+              local request_origin="${request_scheme}://${REQ.host}";
+              if match-include $LOCAL_ACCESS_ORIGINS $request_origin then
+                if eq $LOCAL_ACCESS_ORIGINS[$request_origin] "true" then
+                  global ROUTE_HOST=$THIS_ZONE_HOST;
+                end
+              end
               global CONTROL_PANEL_URL="https://sys.${THIS_ZONE_HOST}/";
               global APP_ID="";
               global SERVICE_ID="";
@@ -113,7 +132,7 @@ servers:
                 map-add REQ X-Forwarded-Proto "http";
               end
 
-              if eq $REQ.host "public.${THIS_ZONE_HOST}" then
+              if eq $ROUTE_HOST "public.${THIS_ZONE_HOST}" then
                 return --from chain $(exec forward_to_public);
               end
 
@@ -142,21 +161,21 @@ servers:
             priority: 120
             block: |
               app_lookup_key="";
-              if eq $REQ.host $THIS_ZONE_HOST then
+              if eq $ROUTE_HOST $THIS_ZONE_HOST then
                 app_lookup_key="_";
-              elif ends-with $REQ.host ".${THIS_ZONE_HOST}" then
-                app_lookup_key=$REQ.host;
+              elif ends-with $ROUTE_HOST ".${THIS_ZONE_HOST}" then
+                app_lookup_key=$ROUTE_HOST;
                 replace $app_lookup_key ".${THIS_ZONE_HOST}" "";
                 local expected_host=$(append $app_lookup_key ".${THIS_ZONE_HOST}");
-                eq $REQ.host $expected_host || return false;
+                eq $ROUTE_HOST $expected_host || return false;
                 map-create hp;
                 match-reg --capture hp $app_lookup_key "^([a-zA-Z0-9_-]+)\$" || return false;
                 eq $hp[1] $app_lookup_key || return false;
-              elif ends-with $REQ.host "-${THIS_ZONE_HOST}" then
-                app_lookup_key=$REQ.host;
+              elif ends-with $ROUTE_HOST "-${THIS_ZONE_HOST}" then
+                app_lookup_key=$ROUTE_HOST;
                 replace $app_lookup_key "-${THIS_ZONE_HOST}" "";
                 local expected_host=$(append $app_lookup_key "-${THIS_ZONE_HOST}");
-                eq $REQ.host $expected_host || return false;
+                eq $ROUTE_HOST $expected_host || return false;
                 map-create hp;
                 match-reg --capture hp $app_lookup_key "^([a-zA-Z0-9_-]+)\$" || return false;
                 eq $hp[1] $app_lookup_key || return false;

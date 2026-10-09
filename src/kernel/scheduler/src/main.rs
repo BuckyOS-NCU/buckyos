@@ -230,6 +230,29 @@ async fn do_boot_scheduler() -> Result<()> {
     return Ok(());
 }
 
+fn updated_buckyos_info(
+    previous: &BuckyOSInfo,
+    runtime_version: &str,
+    release_channel: &str,
+    target: &str,
+    updated_at: u64,
+) -> Result<Option<BuckyOSInfo>> {
+    previous.validate().map_err(anyhow::Error::msg)?;
+    let mut current = BuckyOSInfo::from_runtime(
+        runtime_version,
+        release_channel,
+        target,
+        previous.installed_at,
+    );
+    current.updated_at = previous.updated_at;
+    if current == *previous {
+        return Ok(None);
+    }
+    current.updated_at = updated_at;
+    current.validate().map_err(anyhow::Error::msg)?;
+    Ok(Some(current))
+}
+
 async fn service_main(is_boot: bool) -> Result<i32> {
     init_logging("scheduler", true);
     info!("Starting scheduler service............................");
@@ -297,6 +320,19 @@ async fn service_main(is_boot: bool) -> Result<i32> {
         let system_config_client = get_buckyos_api_runtime()?
             .get_system_config_client()
             .await?;
+        let stored = system_config_client.get(BUCKYOS_INFO_KEY).await?;
+        let previous: BuckyOSInfo = serde_json::from_str(&stored.value)?;
+        if let Some(current) = updated_buckyos_info(
+            &previous,
+            get_version(),
+            get_channel().to_string().as_str(),
+            get_target(),
+            buckyos_get_unix_timestamp(),
+        )? {
+            system_config_client
+                .set(BUCKYOS_INFO_KEY, &serde_json::to_string(&current)?)
+                .await?;
+        }
         let scheduler_server = SchedulerServer::new(system_config_client);
         scheduler_server.recover_install_plan_executions().await?;
 
@@ -368,6 +404,66 @@ mod test {
     const TEST_HOSTNAME: &str = "devtest.buckyos.io";
     const TEST_DEVICE_NAME: &str = "ood1";
     const TEST_NET_ID: &str = "lan1";
+
+    #[test]
+    fn buckyos_info_upgrade_preserves_install_time() {
+        let previous = BuckyOSInfo::from_runtime(
+            "0.7.0+old-build (nightly)",
+            "nightly",
+            "x86_64-unknown-linux-gnu",
+            100,
+        );
+        let current = updated_buckyos_info(
+            &previous,
+            "0.7.0+new-build (nightly)",
+            "nightly",
+            "x86_64-unknown-linux-gnu",
+            200,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(current.build_version.as_deref(), Some("new-build"));
+        assert_eq!(current.installed_at, 100);
+        assert_eq!(current.updated_at, 200);
+    }
+
+    #[test]
+    fn buckyos_info_restart_does_not_change_update_time() {
+        let mut previous = BuckyOSInfo::from_runtime(
+            "0.7.0+same-build (nightly)",
+            "nightly",
+            "x86_64-unknown-linux-gnu",
+            100,
+        );
+        previous.updated_at = 150;
+        assert!(updated_buckyos_info(
+            &previous,
+            "0.7.0+same-build (nightly)",
+            "nightly",
+            "x86_64-unknown-linux-gnu",
+            200,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn buckyos_info_upgrade_rejects_invalid_update_time() {
+        let previous = BuckyOSInfo::from_runtime(
+            "0.7.0+old-build (nightly)",
+            "nightly",
+            "x86_64-unknown-linux-gnu",
+            100,
+        );
+        assert!(updated_buckyos_info(
+            &previous,
+            "0.7.0+new-build (nightly)",
+            "nightly",
+            "x86_64-unknown-linux-gnu",
+            99,
+        )
+        .is_err());
+    }
 
     #[tokio::test]
     async fn test_gen_service_doc() -> Result<()> {

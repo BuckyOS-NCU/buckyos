@@ -1,0 +1,31 @@
+name: buckyos
+services:
+  buckyos:
+    build:
+      context: .
+      network: host
+      args:
+        BUCKYOS_CONFIG_GROUP: ${BUCKYOS_CONFIG_GROUP:-dev}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+    image: buckyos-local:0.7.0-${BUCKYOS_CONFIG_GROUP:-dev}
+    container_name: buckyos
+    privileged: true
+    restart: unless-stopped
+    environment:
+      BUCKYOS_LOCAL_HTTP_ORIGINS: ${BUCKYOS_LOCAL_HTTP_ORIGINS:-http://100.79.198.28:3180,http://100.79.198.28:8080,http://192.168.0.64:3180,http://192.168.0.64:8080}
+    extra_hosts:
+      - "test.buckyos.io:127.0.0.1"
+      - "sys.test.buckyos.io:127.0.0.1"
+    ports:
+      - "0.0.0.0:8080:80"
+      - "0.0.0.0:443:443"
+      - "0.0.0.0:2980:2980"
+      - "0.0.0.0:3180:3180"
+      - "0.0.0.0:3182:3182"
+    volumes:
+      - runtime:/opt/buckyos
+      - docker-data:/var/lib/docker
+volumes:
+  runtime:
+    name: buckyos_${BUCKYOS_CONFIG_GROUP:-dev}_runtime
+  docker-data:

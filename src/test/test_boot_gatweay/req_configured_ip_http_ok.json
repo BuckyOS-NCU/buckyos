@@ -1,0 +1,11 @@
+{
+  "input": {
+    "REQ": {
+      "path": "/login",
+      "host": "100.79.198.28:8080",
+      "url": "http://100.79.198.28:8080/login"
+    }
+  },
+  "id": "server:node_gateway:main",
+  "output": ["REQ", "RESP"]
+}
