@@ -1,0 +1,21 @@
+name: nginx
+services:
+  nginx:
+    image: nginx:stable-alpine
+    container_name: nginx
+    restart: unless-stopped
+    volumes:
+      - ./conf.d:/etc/nginx/conf.d:ro
+    networks:
+      buckyos:
+        aliases:
+          - domain-http-redirect
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+networks:
+  buckyos:
+    external: true
+    name: buckyos_default

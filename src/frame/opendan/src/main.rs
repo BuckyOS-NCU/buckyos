@@ -13,7 +13,8 @@ use agent_tool::xllm::XllmDeps;
 use anyhow::{anyhow, bail, Context, Result};
 use buckyos_api::{
     agent_spec_key, get_buckyos_api_runtime, init_buckyos_api_runtime, load_app_identity_from_env,
-    set_buckyos_api_runtime, AgentId, AgentSpec, AppInstanceId, BuckyOSRuntimeType,
+    set_buckyos_api_runtime, zone_document_hostname, AgentId, AgentSpec, AppInstanceId,
+    BuckyOSRuntime, BuckyOSRuntimeType,
     OPENDAN_SERVICE_PORT,
 };
 use buckyos_kit::{get_buckyos_app_data_dir, init_logging};
@@ -172,6 +173,16 @@ async fn wait_for_bound_agent(instance: &AppInstanceId) -> Result<AgentSpec> {
     }
 }
 
+fn zone_gateway_host(runtime: &BuckyOSRuntime) -> Result<String> {
+    let config = runtime
+        .get_zone_config()
+        .ok_or_else(|| anyhow!("the runtime has no Zone config"))?;
+    let document = config
+        .zone_document()
+        .map_err(|e| anyhow!("load Zone document: {e}"))?;
+    Ok(zone_document_hostname(&document))
+}
+
 async fn zone_env(args: &Args) -> Result<LoaderEnv> {
     let identity = load_app_identity_from_env()
         .map_err(|e| anyhow!("app identity from the environment: {e}"))?;
@@ -239,7 +250,7 @@ async fn zone_env(args: &Args) -> Result<LoaderEnv> {
             owner,
             app_id: runtime.get_app_id(),
             trust_loopback: args.trust_loopback,
-            zone_host: Some(runtime.zone_id.to_host_name()).filter(|h| !h.is_empty()),
+            zone_host: Some(zone_gateway_host(runtime)?),
         },
         port: port_of(args),
         web_dir: args.web.clone().or_else(|| beside_exe("web")),
@@ -354,9 +365,36 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buckyos_api::ZoneConfig;
+    use name_lib::{ZoneDocument, DID};
+    use serde_json::json;
 
     fn parse(args: &[&str]) -> Result<Args> {
         parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn desktop_links_use_the_published_zone_hostname() {
+        let mut runtime = BuckyOSRuntime::new(
+            "jarvis.buckyos.bns.did",
+            Some("devtest".to_string()),
+            BuckyOSRuntimeType::AppService,
+        );
+        runtime.zone_id = DID::new("web", "test.buckyos.io");
+        let public_key = serde_json::from_value(json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }))
+        .unwrap();
+        let mut document = ZoneDocument::new(
+            runtime.zone_id.clone(),
+            DID::new("bns", "devtest"),
+            public_key,
+        );
+        document.hostname = "bucykos.ncu.bin-go.cc".to_string();
+        runtime.zone_config = Some(ZoneConfig::from_zone_document(&document, None).unwrap());
+        assert_eq!(zone_gateway_host(&runtime).unwrap(), "bucykos.ncu.bin-go.cc");
     }
 
     #[test]

@@ -1,0 +1,21 @@
+{
+  "observed_at_utc": "2026-10-12T07:15:25.900648+00:00",
+  "source_head_before_export": "809105dc1070a6af0b2245791886ed45c4f30744",
+  "outer_image": {
+    "tag": "buckyos-local:0.7.0-dev",
+    "id": "sha256:3bab434cab815ddd53dc70991ee2aca394cecba11bbffa1c9cc3134c02999bc9",
+    "created": "2026-10-09T14:06:49.411241121+08:00"
+  },
+  "worker_image": {
+    "tag": "buckyos-aios-local:latest-amd64",
+    "id": "sha256:cf50a718b35908cd5b6f3714274b0cdf0ef328798a3eb01b13f415cee2d3dfad",
+    "created": "2026-10-09T10:27:03.7171089Z"
+  },
+  "outer_file_sha256": {
+    "/opt/buckyos/bin/opendan/opendan": "3361bda67e93a00033ce29294c926c5564839abb837bf8cdfa12c2a5b51ee0e0",
+    "/opt/buckyos/bin/opendan/web/index.html": "813c902c26e2f4b4dc79868e0a5b45808651e22f18eea19791ffb5b4cbe12ac3",
+    "/opt/buckyos/libexec/buckyos-tool/dist/node.mjs": "b10437b7d21fd9f0e56f5ccd6180518989ec853f83645c04fca023958b456007"
+  },
+  "worker_opendan_sha256": "45145e23b952e22a0a12791e7003a8e795e2e47d312b6033759ed06a17304b1e",
+  "note": "Reference for the existing deployment, not downloadable artifacts. The outer image predates the Worker hostname repair. Source export also includes runtime configuration fixes."
+}

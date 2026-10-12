@@ -163,6 +163,7 @@ cd src && uv run start.py --skip-update
 | `ui.bindings` | – | `[{session_id, to, to_session, kind}]` |
 
 - 资料：默认值取 `agent.toml [identity]`（`display_name`、`avatar`、`bio`），owner 的修改保存在 `<agent_root>/.meta/profile.json`；`agent.profile_set` 只改传入的字段，传空字符串回到默认值。`display_name` ≤ 64 字符，`bio` ≤ 500 字符，`avatar` 是图片 data URL 或 http(s) URL，≤ 128 KiB。`owner_did` 与 `desktop_url`（zone 桌面的地址，MessageHub 在其 `/messagehub`）在 `--dev` 形态下为 `null`。
+- Zone Document 配置公开 `hostname` 时，`desktop_url` 使用该域名；绑定自定义访问域名可以保留原 Zone DID。
 - 用量：汇总登记表里各 Session 的 `usage.jsonl`（[Session Directory Protocol](../../../doc/opendan/protocol/Session%20Directory%20Protocol.md) §4），按 `all.total` 降序；`hour` / `day` 是最近 1 小时 / 24 小时。`model` 是 AICC 路由最终选中的模型，取不到时是请求里的模型别名。没有 `usage.jsonl` 的旧 Session 不计入，`since_ms` 是最早一条记录的时间。
 - `ui.bindings`：UI Session 的回复去向（`session_config.json` 的 `channels.outbound`）。WebUI 据此把 Session 链接到 MessageHub：对方是 owner 时打开 owner 自己与 Agent 的会话（`/messagehub?entityId=<agent>&sessionId=<to_session | dm:<agent>>`），否则以观察模式打开 Agent 的会话（`ownerDid=<agent>&mode=observe&entityId=<对方>&sessionId=<收件箱会话>`）。没有绑定会话的 Session（work、self_check 等）在 WebUI 里进入自己的详情页。
 

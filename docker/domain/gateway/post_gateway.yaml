@@ -1,0 +1,110 @@
+{
+  "identity_manager": {
+    "public_root_path": "/opt/buckyos/local/identity",
+    "security_root_path": "/opt/buckyos/security"
+  },
+  "acme": {
+    "hosts": [
+      {
+        "host": "bucykos.ncu.bin-go.cc",
+        "challenge_type": "http-01"
+      },
+      {
+        "host": "sys.bucykos.ncu.bin-go.cc",
+        "challenge_type": "http-01"
+      },
+      {
+        "host": "www.bucykos.ncu.bin-go.cc",
+        "challenge_type": "http-01"
+      },
+      {
+        "host": "public.bucykos.ncu.bin-go.cc",
+        "challenge_type": "http-01"
+      },
+      {
+        "host": "jarvis.bucykos.ncu.bin-go.cc",
+        "challenge_type": "http-01"
+      },
+      {
+        "host": "text-editor.bucykos.ncu.bin-go.cc",
+        "challenge_type": "http-01"
+      },
+      {
+        "host": "buckyos-systest.bucykos.ncu.bin-go.cc",
+        "challenge_type": "http-01"
+      }
+    ]
+  },
+  "stacks": {
+    "zone_gateway_http": {
+      "protocol": "tcp",
+      "bind": "[::]:80",
+      "hook_point": {
+        "main": {
+          "priority": 1,
+          "blocks": {
+            "default": {
+              "priority": 1,
+              "block": "return \"server domain_http\";\n"
+            }
+          }
+        }
+      }
+    },
+    "zone_tls": {
+      "protocol": "tls",
+      "bind": "[::]:443",
+      "hosts": [
+        "bucykos.ncu.bin-go.cc",
+        "sys.bucykos.ncu.bin-go.cc",
+        "www.bucykos.ncu.bin-go.cc",
+        "public.bucykos.ncu.bin-go.cc",
+        "jarvis.bucykos.ncu.bin-go.cc",
+        "text-editor.bucykos.ncu.bin-go.cc",
+        "buckyos-systest.bucykos.ncu.bin-go.cc"
+      ],
+      "alpn_protocols": [
+        "http/1.1"
+      ],
+      "hook_point": {
+        "main": {
+          "priority": 1,
+          "blocks": {
+            "default": {
+              "priority": 1,
+              "block": "return \"server domain_https\";\n"
+            }
+          }
+        }
+      }
+    }
+  },
+  "servers": {
+    "domain_http": {
+      "type": "http",
+      "hook_point": {
+        "main": {
+          "blocks": {
+            "default": {
+              "priority": 1,
+              "block": "if match $REQ.path \"/.well-known/acme-challenge/*\" then\n  call-server acme_response;\nend\nlocal request_host=$REQ.host;\nmap-create host_parts;\nif match-reg --capture host_parts $request_host \"^([^:]+):[0-9]+\\$\" then\n  request_host=$host_parts[1];\nend\nif eq $request_host \"bucykos.ncu.bin-go.cc\" then\n  forward \"tcp:///domain-http-redirect:80\";\nelif ends-with $request_host \".bucykos.ncu.bin-go.cc\" then\n  forward \"tcp:///domain-http-redirect:80\";\nelse\n  call-server node_gateway;\nend\n"
+            }
+          }
+        }
+      }
+    },
+    "domain_https": {
+      "type": "http",
+      "hook_point": {
+        "main": {
+          "blocks": {
+            "default": {
+              "priority": 1,
+              "block": "if eq $REQ.host \"sys.bucykos.ncu.bin-go.cc\" then\n  redirect \"https://bucykos.ncu.bin-go.cc${REQ.uri}\";\nend\ncall-server node_gateway;\n"
+            }
+          }
+        }
+      }
+    }
+  }
+}

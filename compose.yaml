@@ -11,12 +11,15 @@ services:
     container_name: buckyos
     privileged: true
     restart: unless-stopped
+    tmpfs:
+      - /run
     environment:
       BUCKYOS_LOCAL_HTTP_ORIGINS: ${BUCKYOS_LOCAL_HTTP_ORIGINS:-http://100.79.198.28:3180,http://100.79.198.28:8080,http://192.168.0.64:3180,http://192.168.0.64:8080}
     extra_hosts:
       - "test.buckyos.io:127.0.0.1"
       - "sys.test.buckyos.io:127.0.0.1"
     ports:
+      - "0.0.0.0:80:80"
       - "0.0.0.0:8080:80"
       - "0.0.0.0:443:443"
       - "0.0.0.0:2980:2980"

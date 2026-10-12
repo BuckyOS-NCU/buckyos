@@ -1,0 +1,11 @@
+table inet buckyos_ingress {
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "eth0" tcp dport { 80, 443 } ct state new ct mark set 0x100 counter
+    ct mark 0x100 meta mark set ct mark counter
+  }
+  chain output {
+    type route hook output priority mangle; policy accept;
+    ct mark 0x100 meta mark set ct mark counter
+  }
+}

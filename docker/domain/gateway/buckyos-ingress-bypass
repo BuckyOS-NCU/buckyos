@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euo pipefail
+
+cleanup() {
+  if nft list table inet buckyos_ingress >/dev/null 2>&1; then
+    nft delete table inet buckyos_ingress
+  fi
+  if ip -4 rule show | rg -q '^5001:.*fwmark 0x100 lookup main$'; then
+    ip -4 rule delete priority 5001 fwmark 0x100 table main
+  fi
+}
+
+case "${1:-apply}" in
+  apply)
+    if ip -4 rule show | rg '^5001:' | rg -qv 'fwmark 0x100 lookup main$'; then
+      printf '%s\n' 'Routing priority 5001 is occupied by another rule' >&2
+      exit 1
+    fi
+    cleanup
+    ip -4 rule add priority 5001 fwmark 0x100 table main
+    nft -f /etc/buckyos-ingress-bypass.nft
+    ;;
+  cleanup)
+    cleanup
+    ;;
+  *)
+    exit 2
+    ;;
+esac

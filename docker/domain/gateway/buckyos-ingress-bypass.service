@@ -1,0 +1,15 @@
+[Unit]
+Description=BuckyOS HTTP and HTTPS ingress return routing
+Wants=network-online.target
+After=network-online.target sing-box-client-bypass.service sing-box-client.service
+PartOf=sing-box-client.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/buckyos-ingress-bypass apply
+ExecReload=/usr/local/sbin/buckyos-ingress-bypass apply
+ExecStop=/usr/local/sbin/buckyos-ingress-bypass cleanup
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target sing-box-client.service
