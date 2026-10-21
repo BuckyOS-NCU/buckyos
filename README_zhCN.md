@@ -11,10 +11,10 @@ BuckyOS 是一个开源的个人 AI 操作系统，将你的设备、应用、�
 - **Web Desktop 与 Control Panel**：统一的桌面环境，支持应用窗口、设置、用户与 Agent 管理、AI Center、Task Center 和应用管理。
 - **FileBrowser 与 Preview**：内置文件浏览和预览界面。FileBrowser 通过 `nfs-server` 执行文件操作，后台复制任务由 Task Manager 管理。
 - **MessageHub 与 Message Center**：内置消息应用，以 `msg-center` 为后端，支持会话历史、附件、已读状态，以及会话归档、恢复和删除。服务层提供基于 DID 的收发箱、联系人、自托管群组、原生消息通信和 Telegram 通道。
-- **OpenDAN 与 Jarvis**：基于 Rust 的 Agent Runtime，支持可配置的会话类别与行为循环、记忆和工作区工具、消息与事件路由、任务委派，以及请求人工输入。Jarvis 以带版本号的 `.pikg` 应用包交付，提示词、行为配置和翻译资源位于 [`src/apps/jarvis_runtime/agent`](src/apps/jarvis_runtime/agent)。
+- **OpenDAN 与 Jarvis**：OpenDAN 是基于 Rust 的 Agent Runtime，支持可配置的会话类别与行为循环、记忆和工作区工具、消息与事件路由、任务委派，以及请求人工输入。Jarvis 是系统内置的 Agent 模板，以带版本号的 `.pikg` 应用包交付，提示词、行为配置和翻译资源位于 [`src/apps/jarvis_agent/agent`](src/apps/jarvis_agent/agent)。
 - **AI Compute Center（AICC）**：提供服务商与模型管理、逻辑模型路由、用量日志，以及文本和媒体能力的适配器。桌面中的 AI Center 提供相应的管理界面。
 - **Workflow 与 Task Manager**：支持工作流定义与运行、计划任务、任务进度与控制，以及人工审批或介入。Workflow 和 OpenDAN 与 Task Manager、`kevent` 集成，交换任务状态更新。
-- **应用交付与 SDK/CLI**：支持 `.pikg` 包、经过校验的安装计划、按用户区分的应用实例和网关路由。TypeScript SDK 与 `buckyos` CLI 一起构建并随系统分发；Rust 服务使用 `buckyos-api`。
+- **应用交付与 SDK/CLI**：支持 `.pikg` 包、经过校验的安装计划、按用户区分的应用实例和网关路由。打包、安装、Agent/skill 与设计资料见 [PIKG 文档总览](doc/pikg/README.md)。TypeScript SDK 与 `buckyos` CLI 一起构建并随系统分发；Rust 服务使用 `buckyos-api`。
 - **系统基础设施**：`system-config`、调度器和 `node-daemon` 管理系统目标状态与部署；`verify-hub` 和 RBAC 负责登录与授权。`kmsg` 和 `kevent` 提供消息与事件通知，`repo-service` 和命名对象存储支持内容交付。
 - **开发工作流**：包含各平台的构建与打包流水线、本地开发验证（DV）测试，以及 [`harness/`](harness/README.md) 中的贡献者指南。
 
@@ -44,7 +44,7 @@ cd buckyos
 
 需要开发 SDK/CLI 时，可在同一父目录执行 `git clone --branch main https://github.com/buckyos/buckyos-websdk.git`。该仓库是可选的；缺少时构建会使用 npm 已发布的 `buckyos@latest`。
 
-构建需要稳定版 Rust 工具链、当前平台的 C/C++ 构建工具、Python 3.12+、`uv`、Node.js 及 npm 和 pnpm，以及 Deno。容器应用需要 Docker，开发工具会用到 tmux。当前 CI 使用 Node.js 24、pnpm 10.13.1 和 Deno 2.9.2。
+构建需要稳定版 Rust 工具链、当前平台的 C/C++ 构建工具、Python 3.12+、`uv`、Node.js 及 npm 和 pnpm，以及 Deno。容器应用需要 Docker，Windows 可直接使用 [WSL containers](doc/windows_wslc.md)，无需安装 Docker Desktop；开发工具会用到 tmux。当前 CI 使用 Node.js 24、pnpm 10.13.1 和 Deno 2.9.2。
 
 可以先查看并运行 [`devenv.py`](devenv.py)，安装当前平台的基础依赖：
 

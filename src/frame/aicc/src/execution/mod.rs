@@ -25,6 +25,9 @@ const DEFAULT_IDEMPOTENCY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_SAME_MODEL_ATTEMPTS: usize = 2;
 const DEFAULT_SAME_MODEL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_SAME_MODEL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const TASK_RESULT_PAYLOAD_MARGIN_BYTES: usize = 64 * 1024;
+const MAX_TASK_RESULT_PAYLOAD_BYTES: usize =
+    buckyos_http_server::DEFAULT_MAX_RPC_BODY_SIZE - TASK_RESULT_PAYLOAD_MARGIN_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct IdempotencyScope {
@@ -140,6 +143,46 @@ pub(crate) struct ExecutionOutput {
     pub usage: AiUsage,
     pub cost: Option<AiCost>,
     pub artifacts: Vec<AiArtifact>,
+}
+
+pub(crate) fn task_result_payload(output: &ExecutionOutput) -> Result<Value, AiccError> {
+    Ok(serde_json::json!({
+        "result": {
+            "output": serde_json::to_value(output).map_err(|_| {
+                aicc_error(
+                    AiccErrorCode::InternalError,
+                    "execution result could not be serialized",
+                    false,
+                )
+            })?
+        }
+    }))
+}
+
+fn check_result_payload(output: &ExecutionOutput) -> Result<(), AiccError> {
+    let payload = task_result_payload(output)?;
+    let serialized_bytes = serde_json::to_vec(&payload)
+        .map_err(|_| {
+            aicc_error(
+                AiccErrorCode::InternalError,
+                "execution result could not be serialized",
+                false,
+            )
+        })?
+        .len();
+    if serialized_bytes <= MAX_TASK_RESULT_PAYLOAD_BYTES {
+        return Ok(());
+    }
+    let mut error = aicc_error(
+        AiccErrorCode::InternalError,
+        "AICC result exceeds the TaskMgr payload limit",
+        false,
+    );
+    error.details = Some(serde_json::json!({
+        "serialized_bytes": serialized_bytes,
+        "max_bytes": MAX_TASK_RESULT_PAYLOAD_BYTES,
+    }));
+    Err(error)
 }
 
 impl TryFrom<ProtocolOutput> for ExecutionOutput {
@@ -752,6 +795,36 @@ pub(crate) struct ExecutionRecord {
     pub expires_at_ms: u64,
 }
 
+fn llm_log_metadata(record: &ExecutionRecord) -> Value {
+    serde_json::json!({
+        "task_id": record.task_id,
+        "trace_id": record.trace_id,
+        "tenant_id": record.scope.tenant_id,
+        "caller_app_id": record.caller_app_id,
+        "method": record.scope.method,
+        "request_model": record.request_model,
+        "provider_instance_name": record.binding.as_ref().map(|binding| &binding.provider_instance_name),
+        "exact_model": record.binding.as_ref().map(|binding| &binding.exact_model),
+        "provider": record.binding.as_ref().map(|binding| &binding.origin_provider),
+        "status": record.state,
+    })
+}
+
+fn log_llm_input(record: &ExecutionRecord, call: &ResolvedProviderCall) {
+    if call.api_type != ApiType::Llm || !log::log_enabled!(log::Level::Info) {
+        return;
+    }
+    let Ok(request) = call.input.canonical_request.to_params() else {
+        return;
+    };
+    let mut event = llm_log_metadata(record);
+    event["provider_instance_name"] = serde_json::json!(call.provider_instance_name);
+    event["exact_model"] = serde_json::json!(call.exact_model);
+    event["provider"] = serde_json::json!(call.context.state_coordinate.origin_provider);
+    event["request"] = request;
+    log::info!("aicc.llm.input {}", event);
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum IdempotencyClaim {
     Created(ExecutionRecord),
@@ -1080,6 +1153,8 @@ impl ExecutionEngine {
             }
             IdempotencyClaim::Created(record) => record,
         };
+
+        log_llm_input(&record, &request.primary);
 
         self.tasks
             .report_state(
@@ -1493,6 +1568,7 @@ impl ExecutionEngine {
             if !self.store.try_cancel(task_id).await? {
                 return Ok(false);
             }
+            self.log_llm_terminal(task_id, false).await;
             active.cancel.cancel();
             if let Some(binding) = record
                 .binding
@@ -1535,6 +1611,7 @@ impl ExecutionEngine {
         if !accepted || !self.store.try_cancel(task_id).await? {
             return Ok(false);
         }
+        self.log_llm_terminal(task_id, false).await;
         self.tasks
             .cancel_task(
                 task_id,
@@ -1636,6 +1713,9 @@ impl ExecutionEngine {
         };
         output.usage.cost = finance_snapshot.clone();
         output.cost = finance_snapshot.clone();
+        if let Err(error) = check_result_payload(&output) {
+            return self.finish_failure(task_id, error).await;
+        }
         let record = self.store.get_task(task_id).await?.ok_or_else(|| {
             aicc_error(
                 AiccErrorCode::InternalError,
@@ -1678,11 +1758,16 @@ impl ExecutionEngine {
         task_id: &str,
         output: ExecutionOutput,
     ) -> Result<ExecutionReceipt, AiccError> {
+        if let Err(error) = check_result_payload(&output) {
+            return self.finish_failure(task_id, error).await;
+        }
         if let Err(error) = self.tasks.commit_result(task_id, &output).await {
             self.remove_active(task_id);
             return Err(error);
         }
-        self.store.try_complete(task_id, output.clone()).await?;
+        if self.store.try_complete(task_id, output.clone()).await? {
+            self.log_llm_terminal(task_id, true).await;
+        }
         self.remove_active(task_id);
         self.current_receipt(task_id).await
     }
@@ -1693,10 +1778,48 @@ impl ExecutionEngine {
         error: AiccError,
     ) -> Result<ExecutionReceipt, AiccError> {
         if self.store.try_fail(task_id, error.clone()).await? {
+            self.log_llm_terminal(task_id, false).await;
             self.tasks.fail_task(task_id, &error).await?;
         }
         self.remove_active(task_id);
         self.current_receipt(task_id).await
+    }
+
+    async fn log_llm_terminal(&self, task_id: &str, succeeded: bool) {
+        let level = if succeeded {
+            log::Level::Info
+        } else {
+            log::Level::Warn
+        };
+        if !log::log_enabled!(level) {
+            return;
+        }
+        let Ok(Some(record)) = self.store.get_task(task_id).await else {
+            return;
+        };
+        if record.scope.method != buckyos_api::ai_methods::CHAT_COMPLETIONS_CREATE {
+            return;
+        }
+        let mut event = llm_log_metadata(&record);
+        if succeeded {
+            let Some(output) = record.output.as_ref() else {
+                return;
+            };
+            let Some(mut response) = output.value.as_object().cloned() else {
+                return;
+            };
+            response.insert("task_id".into(), serde_json::json!(record.task_id));
+            response.insert("status".into(), serde_json::json!(record.state));
+            response.insert("usage".into(), serde_json::json!(output.usage));
+            if let Some(cost) = &output.cost {
+                response.insert("cost".into(), serde_json::json!(cost));
+            }
+            event["response"] = Value::Object(response);
+            log::info!("aicc.llm.output {}", event);
+        } else if let Some(error) = record.error.as_ref() {
+            event["error"] = serde_json::json!(error);
+            log::warn!("aicc.llm.error {}", event);
+        }
     }
 
     async fn current_receipt(&self, task_id: &str) -> Result<ExecutionReceipt, AiccError> {
@@ -1827,7 +1950,58 @@ mod tests {
     use futures_util::stream;
     use serde_json::json;
     use std::collections::{BTreeSet, VecDeque};
+    use std::sync::Once;
     use std::time::Duration;
+
+    struct LlmTestLogger(Mutex<Vec<(String, Value)>>);
+
+    static LLM_TEST_LOGGER: LlmTestLogger = LlmTestLogger(Mutex::new(Vec::new()));
+    static INIT_LLM_TEST_LOGGER: Once = Once::new();
+
+    impl log::Log for LlmTestLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            let message = record.args().to_string();
+            let Some((kind, body)) = message.split_once(' ') else {
+                return;
+            };
+            if !kind.starts_with("aicc.llm.") {
+                return;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(body) else {
+                return;
+            };
+            if event["trace_id"]
+                .as_str()
+                .is_some_and(|trace| trace.starts_with("llm-log-test-"))
+            {
+                self.0.lock().unwrap().push((kind.to_owned(), event));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn init_llm_test_logger() {
+        INIT_LLM_TEST_LOGGER.call_once(|| {
+            log::set_logger(&LLM_TEST_LOGGER).unwrap();
+            log::set_max_level(log::LevelFilter::Info);
+        });
+    }
+
+    fn llm_log_events(trace_id: &str) -> Vec<(String, Value)> {
+        LLM_TEST_LOGGER
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, event)| event["trace_id"] == trace_id)
+            .cloned()
+            .collect()
+    }
 
     #[derive(Default)]
     struct MemoryStore {
@@ -2691,6 +2865,139 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn llm_logs_include_canonical_input_and_final_output_without_replay_duplicates() {
+        init_llm_test_logger();
+        for mode in ["immediate", "stream"] {
+            let trace_id = format!("llm-log-test-{mode}");
+            let mut final_output = output("done");
+            final_output.value = json!({
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+                "tool_calls": [],
+                "finish_reason": "stop",
+            });
+            let execution = if mode == "stream" {
+                ProviderExecution::Stream(ProtocolStream {
+                    events: Box::pin(stream::iter(vec![
+                        Ok(ProtocolEvent::Delta(json!({"text": "partial"}))),
+                        Ok(ProtocolEvent::Progress(json!({"tokens_generated": 1}))),
+                        Ok(ProtocolEvent::Final(final_output)),
+                    ])),
+                })
+            } else {
+                ProviderExecution::Immediate(final_output)
+            };
+            let providers = Arc::new(FakeProviders::default());
+            providers
+                .plans
+                .lock()
+                .unwrap()
+                .push_back(StartPlan::Success(execution));
+            *providers.completion_cost.lock().unwrap() = Some(AiCost {
+                amount: 0.25,
+                currency: "USD".into(),
+            });
+            let (engine, _, _, _) = make_engine(providers.clone());
+            let make_request = || {
+                let mut req = request(call("primary"));
+                req.trace_id = Some(trace_id.clone());
+                let AiccCall::ChatCompletionsCreate(chat) =
+                    &mut req.primary.input.canonical_request
+                else {
+                    unreachable!();
+                };
+                chat.messages = vec![buckyos_api::AiMessage::text(
+                    buckyos_api::AiRole::User,
+                    "hello",
+                )];
+                req.canonical_body = req.primary.input.canonical_request.to_params().unwrap();
+                req
+            };
+            let (first, replay) = tokio::join!(
+                engine.execute(make_request()),
+                engine.execute(make_request()),
+            );
+            assert_eq!(first.unwrap().task_id, replay.unwrap().task_id);
+            engine.execute(make_request()).await.unwrap();
+            let events = llm_log_events(&trace_id);
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|(kind, _)| kind.as_str())
+                    .collect::<Vec<_>>(),
+                ["aicc.llm.input", "aicc.llm.output"]
+            );
+            let input = &events[0].1;
+            let result = &events[1].1;
+            assert_eq!(input["task_id"], result["task_id"]);
+            assert_eq!(input["tenant_id"], "tenant-1");
+            assert_eq!(input["caller_app_id"], "app-1");
+            assert_eq!(input["request_model"], "smart-chat");
+            assert_eq!(
+                input["request"]["messages"][0]["content"][0]["text"],
+                "hello"
+            );
+            assert_eq!(result["provider_instance_name"], "primary");
+            assert_eq!(result["exact_model"], "model@primary");
+            assert_eq!(result["provider"], "fake");
+            assert_eq!(result["response"]["message"]["content"][0]["text"], "done");
+            assert_eq!(result["response"]["status"], "succeeded");
+            assert_eq!(result["response"]["usage"]["total_tokens"], 3);
+            assert_eq!(result["response"]["cost"]["amount"], 0.25);
+            let encoded = serde_json::to_string(&events).unwrap();
+            assert!(!encoded.contains("credential-1"));
+            assert!(!encoded.contains("secret"));
+            assert_eq!(providers.starts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_logs_capture_start_and_stream_failures_once() {
+        init_llm_test_logger();
+        for mode in ["start", "stream"] {
+            let trace_id = format!("llm-log-test-error-{mode}");
+            let error =
+                ProtocolError::new(ProtocolErrorKind::Authentication, "provider denied request");
+            let plan = if mode == "stream" {
+                StartPlan::Success(ProviderExecution::Stream(ProtocolStream {
+                    events: Box::pin(stream::iter(vec![Err(error)])),
+                }))
+            } else {
+                StartPlan::Failure(ProviderStartFailure::before_accept(error, false))
+            };
+            let providers = Arc::new(FakeProviders::default());
+            providers.plans.lock().unwrap().push_back(plan);
+            let (engine, _, _, _) = make_engine(providers);
+            let mut req = request(call("primary"));
+            req.trace_id = Some(trace_id.clone());
+            let receipt = engine.execute(req).await.unwrap();
+            assert_eq!(receipt.state, ExecutionState::Failed);
+            engine
+                .finish_failure(&receipt.task_id, receipt.error.unwrap())
+                .await
+                .unwrap();
+            let events = llm_log_events(&trace_id);
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|(kind, _)| kind.as_str())
+                    .collect::<Vec<_>>(),
+                ["aicc.llm.input", "aicc.llm.error"]
+            );
+            assert_eq!(events[1].1["task_id"], events[0].1["task_id"]);
+            assert_eq!(events[1].1["error"]["code"], "provider_error");
+            assert_eq!(events[1].1["error"]["message"], "provider denied request");
+            assert_eq!(
+                events[1].1["provider_instance_name"],
+                if mode == "stream" {
+                    json!("primary")
+                } else {
+                    Value::Null
+                }
+            );
+        }
+    }
+
     #[test]
     fn fingerprint_is_key_order_independent_and_excludes_idempotency_key() {
         let left = json!({"b": [2, {"z": true, "a": 1}], "a": 1, "idempotency_key": "x"});
@@ -2731,6 +3038,7 @@ mod tests {
 
     #[tokio::test]
     async fn decision_failover_preserves_api_and_writes_only_successful_usage() {
+        init_llm_test_logger();
         let providers = Arc::new(FakeProviders::default());
         providers.plans.lock().unwrap().extend([
             StartPlan::Failure(ProviderStartFailure::before_accept(
@@ -2765,6 +3073,7 @@ mod tests {
             resolved
         };
         let mut req = request(decision_call("primary"));
+        req.trace_id = Some("llm-log-test-decision".into());
         req.request_model = "decision".into();
         req.canonical_body = req.primary.input.canonical_request.to_params().unwrap();
         req.failover.push(decision_call("backup"));
@@ -2784,6 +3093,7 @@ mod tests {
         assert_eq!(completion.capability, "decision");
         assert_eq!(completion.provider_instance_name, "backup");
         assert_eq!(completion.usage.output_tokens, Some(5));
+        assert!(llm_log_events("llm-log-test-decision").is_empty());
     }
 
     #[tokio::test]
@@ -2924,6 +3234,83 @@ mod tests {
         assert_eq!(receipts[0].state, ExecutionState::Succeeded);
         assert_eq!(providers.starts.lock().unwrap().len(), 1);
         assert_eq!(tasks.completed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_result_fails_before_usage_or_staging() {
+        let providers = Arc::new(FakeProviders::default());
+        let text = "x".repeat(MAX_TASK_RESULT_PAYLOAD_BYTES);
+        providers
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(StartPlan::Success(ProviderExecution::Immediate(output(
+                &text,
+            ))));
+        let (engine, store, tasks, usage) = make_engine(providers);
+
+        let receipt = engine.execute(request(call("primary"))).await.unwrap();
+
+        assert_eq!(receipt.state, ExecutionState::Failed);
+        let error = receipt.error.unwrap();
+        assert_eq!(
+            error.message,
+            "AICC result exceeds the TaskMgr payload limit"
+        );
+        assert!(!error.retriable);
+        assert!(
+            error.details.unwrap()["serialized_bytes"].as_u64().unwrap()
+                > MAX_TASK_RESULT_PAYLOAD_BYTES as u64
+        );
+        assert!(usage.writes.lock().unwrap().is_empty());
+        assert!(store
+            .get_task("task-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .output
+            .is_none());
+        assert!(tasks.completed.lock().unwrap().is_empty());
+        assert_eq!(tasks.failed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_fails_legacy_oversized_staged_result_once() {
+        let providers = Arc::new(FakeProviders::default());
+        providers
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(StartPlan::Success(ProviderExecution::Immediate(output(
+                "ok",
+            ))));
+        let (engine, store, tasks, _) = make_engine(providers);
+        *tasks.commit_error.lock().unwrap() = Some(aicc_error(
+            AiccErrorCode::InternalError,
+            "taskmgr unavailable",
+            true,
+        ));
+        engine.execute(request(call("primary"))).await.unwrap_err();
+        store
+            .stage_output(
+                "task-1",
+                ExecutionOutput {
+                    value: json!({"text": "x".repeat(MAX_TASK_RESULT_PAYLOAD_BYTES)}),
+                    usage: AiUsage::default(),
+                    cost: None,
+                    artifacts: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        *tasks.commit_error.lock().unwrap() = None;
+
+        let receipts = engine.recover().await.unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].state, ExecutionState::Failed);
+        assert_eq!(tasks.failed.lock().unwrap().len(), 1);
+        assert!(engine.recover().await.unwrap().is_empty());
+        assert_eq!(tasks.failed.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3166,6 +3553,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_cancel_stops_local_consumption_and_keeps_cancelled_terminal() {
+        init_llm_test_logger();
         let providers = Arc::new(FakeProviders::default());
         providers
             .plans
@@ -3180,10 +3568,9 @@ mod tests {
         let engine = Arc::new(engine);
         let running_engine = engine.clone();
         let running = tokio::spawn(async move {
-            running_engine
-                .execute(request(call("primary")))
-                .await
-                .unwrap()
+            let mut req = request(call("primary"));
+            req.trace_id = Some("llm-log-test-cancel".into());
+            running_engine.execute(req).await.unwrap()
         });
         let task_id = loop {
             if let Some(task_id) = tasks.by_key.lock().unwrap().values().next() {
@@ -3198,10 +3585,18 @@ mod tests {
         let receipt = running.await.unwrap();
         assert_eq!(receipt.state, ExecutionState::Cancelled);
         assert!(usage.writes.lock().unwrap().is_empty());
+        assert!(!engine.cancel("tenant-1", &task_id).await.unwrap());
+        let events = llm_log_events("llm-log-test-cancel");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "aicc.llm.input");
+        assert_eq!(events[1].0, "aicc.llm.error");
+        assert_eq!(events[1].1["status"], "cancelled");
+        assert_eq!(events[1].1["error"]["code"], "cancelled");
     }
 
     #[tokio::test]
     async fn transient_failure_retries_same_model_then_fails_over() {
+        init_llm_test_logger();
         let providers = Arc::new(FakeProviders::default());
         providers.plans.lock().unwrap().extend([
             StartPlan::Failure(ProviderStartFailure::before_accept(
@@ -3216,6 +3611,7 @@ mod tests {
         ]);
         let (engine, _, _, _) = make_engine(providers.clone());
         let mut req = request(call("primary"));
+        req.trace_id = Some("llm-log-test-failover".into());
         req.failover.push(call("backup"));
         req.runtime_failover = true;
         let receipt = engine.execute(req).await.unwrap();
@@ -3224,6 +3620,12 @@ mod tests {
             providers.starts.lock().unwrap().as_slice(),
             ["model@primary", "model@primary", "model@backup"]
         );
+        let events = llm_log_events("llm-log-test-failover");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "aicc.llm.input");
+        assert_eq!(events[0].1["provider_instance_name"], "primary");
+        assert_eq!(events[1].0, "aicc.llm.output");
+        assert_eq!(events[1].1["provider_instance_name"], "backup");
 
         let providers = Arc::new(FakeProviders::default());
         providers.plans.lock().unwrap().extend([

@@ -10,6 +10,11 @@ on:
         required: false
         type: boolean
         default: false
+      paios_images:
+        description: Pin paios images with the paios-images-manifest artifact of this run
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,6 +29,10 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v6
+    - name: Setup Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
     - name: Setup pnpm
       uses: pnpm/action-setup@v4
       with:
@@ -84,12 +93,14 @@ jobs:
       if: ${{ inputs.enable_tests }}
       run: cargo test -- --test-threads=1
     - name: Install BuckyOS devkit
-      run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git@main"
+      run: |
+        python -m pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git@main"
+        python -c "import sys, yaml; print('Python:', sys.executable); print('PyYAML:', yaml.__version__)"
     - name: Prepare SDK/Tool distribution
       working-directory: ./src
       env:
         SDK_TOOL_WORK_DIR: ${{ runner.temp }}/sdk-tool-distribution
-      run: python3 tools/prepare_sdk_tool_distribution.py --work-dir "$SDK_TOOL_WORK_DIR"
+      run: python tools/prepare_sdk_tool_distribution.py --work-dir "$SDK_TOOL_WORK_DIR"
     - name: Build BuckyOS
       working-directory: ./src
       run: buckyos-build --app=buckyos --target=${{ inputs.arch }}-unknown-linux-${{ inputs.arch == 'aarch64' && 'gnu' || 'musl' }}
@@ -103,6 +114,20 @@ jobs:
         mkdir -p "$STAGE_ROOT/buckyos"
         buckyos-install --app=buckyos --all --target-rootfs="$STAGE_ROOT/buckyos"
         test -n "$(find "$STAGE_ROOT/buckyos" -mindepth 1 -print -quit)"
+    - name: Download paios_images.json
+      if: ${{ inputs.paios_images }}
+      uses: actions/download-artifact@v6
+      with:
+        name: paios-images-manifest
+        path: ${{ runner.temp }}/paios-images-manifest
+    - name: Pin paios images
+      if: ${{ inputs.paios_images }}
+      env:
+        STAGE_ROOT: ${{ runner.temp }}/staged
+      run: |
+        set -euo pipefail
+        cp "$RUNNER_TEMP/paios-images-manifest/paios_images.json" "$STAGE_ROOT/buckyos/bin/paios-images/paios_images.json"
+        python3 .github/scripts/paios_images.py validate "$STAGE_ROOT/buckyos/bin/paios-images/paios_images.json"
     - name: Get staged BuckyOS version
       id: version
       env:
@@ -116,6 +141,17 @@ jobs:
           exit 1
         fi
         echo "value=${BASH_REMATCH[0]}" >> "$GITHUB_OUTPUT"
+    - name: Add installation descriptor
+      working-directory: ./src
+      env:
+        STAGE_ROOT: ${{ runner.temp }}/staged
+        PAYLOAD_VERSION: ${{ steps.version.outputs.value }}
+        PAYLOAD_PLATFORM: ${{ inputs.arch == 'x86_64' && 'amd64-linux' || 'arm64-linux' }}
+      run: |
+        python ../.github/scripts/write-install-descriptor.py \
+          --project bucky_project.yaml --component buckyos \
+          --root "$STAGE_ROOT/buckyos" --version "$PAYLOAD_VERSION" \
+          --platform "$PAYLOAD_PLATFORM"
     - name: Archive staged payload
       env:
         STAGE_ROOT: ${{ runner.temp }}/staged

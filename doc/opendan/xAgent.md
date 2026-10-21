@@ -65,7 +65,7 @@ xagent : AgentSession ──InputBus──► 输入批次 ──commit──►
 
 | 已有能力 | 直接复用的入口 |
 |---|---|
-| `session_input/3`、`session_config/4`、`session_state/5`；binding `/3`、RunRecord v5、快照 v4 | `protocol/{input,config,state}.rs`、[协议索引](protocol/README.md)；类型与版本常量优先于旧 README 的摘要 |
+| `session_input/3`、`session_config/7`、`session_state/6`；binding `/4`、RunRecord v6、快照 v5 | `protocol/{input,config,state}.rs`、[协议索引](protocol/README.md)；类型与版本常量优先于旧 README 的摘要 |
 | 顺序路由、拒绝、去重、active 接受状态、Observe 合并、session 拉取订阅 | `runner/inputs.rs::route_inputs`；不再拆成整批 controls 与整批 events 两遍处理 |
 | InputView、命名格式、三类模板、媒体块、receipt 与回复来路 | `runner/{input_view,assembler,live,receipts,flush}.rs`；黄金结果在 `protocol/fixtures/14_input_bus/` |
 | 普通 task 串行等待、Unknown 回填、后台 task 跟踪、长工具 stop | `runner/shared.rs::{Opened,WaitingRun}`、`live.rs::try_fill`、`drive.rs::{poll_watched_tasks,StopMonitor}` |
@@ -115,10 +115,10 @@ xagent : AgentSession ──InputBus──► 输入批次 ──commit──►
 | ToolManager | `XllmToolManager`（本进程、本地 fs） | **Runtime 的 Sandbox**（按同一份有效 tools 配置解析与派发，内置文件/exec 使用执行体），外包 `SessionToolManager`：lease 检查、宿主门槛、inflight 记录、touching 推断。native 沙箱内部仍复用 xllm 的 `build_toolset` |
 | waist deps | `LLMContextDeps` + xllm `SnapshotHook`（InferenceHook） | `hosted_waist_deps`（behavior 时装 `XllmActionParser` + 无时间戳 `XmlStepRenderer`）+ `SessionCheckpointHook`（异步 CheckpointHook：已改为发布工具结果、顺序路由和刷新心跳；检查点只保存半订阅更新，注入在受控输入之前，见 §9.5）。**不用 InferenceHook** |
 | run 目录 | `RunStore` 在 `.llm_context` 的 runs_dir | 同一 `RunStore`，目录是 `<sid>/.opendan_agent_session/runs/`；RunRecord 多了 `host{assembled_by, session_id, runtime_kind, env_check}`、`host_commit_pending`、`inflight`、`executions`；`host.extra.finish` 存结束决定 |
-| 工作目录锁 | `<lock_dir>/<hash(workdir)>.lock` | `skip_workdir_lock = true`，多 session 共享 workspace 靠活动视图避让 |
+| 工作目录锁 | `<lock_dir>/<hash(workdir)>.lock` | `skip_workdir_lock = true`；绑定 Workspace 的 Session 由宿主持有 Workspace 写锁，活动视图只提供提示 |
 | run 结束 | 终态写 run.json，结果导出 | `handle_context_outcome` → `finish_run`：flush 历史进 worklog、关闭 Turn、提交 state.json、登记表回报、感知 digest |
 | 停止点之后 | xllm 结束；`next_behavior` 只留在快照与 run.json 里 | **Context 调度**（§3.2）：进入目标自己的 run、建子 run、回到调用方，或关闭 Turn |
-| 接手 | — | 保存的 runtime/target/cwd、helper 环境核验通过，且无 `host_commit_pending`、无进程内专有工具时，`xllm --resume --run <id> --runs-dir <sid>/.opendan_agent_session/runs --dir <workdir>` 可接手 |
+| 接手 | — | 未绑定 Workspace，且保存的 runtime/target/cwd、helper 环境核验通过，无 `host_commit_pending`、无进程内专有工具时，`xllm --resume --run <id> --runs-dir <sid>/.opendan_agent_session/runs --dir <workdir>` 可接手 |
 
 xagent 不改变这张表的分工，只在“配置来源”和“system 段”两格引入 behavior 冻结（§6），在“ToolManager”一格把执行权交给 Runtime 沙箱（§5）。这张表只讲一个 run 怎么构造；run 停下之后下一个 context 怎么来，是 §3.2–§3.7 的 Context 调度。
 
@@ -129,7 +129,7 @@ xagent 不改变这张表的分工，只在“配置来源”和“system 段”
 | G1 | `prepare_hosted` 只用 `llm_context` JSON 的 provider / model / limits / tools / `loop_model`，`prompt.sections`、`prompt.system`、groups 的 section、`runs_dir` 被解析但忽略 | behavior 叠加只能落在这几个键上，正好够用；但 `prompt.llm_context` 里写了 sections 会静默无效 | xagent 在冻结时校验并报错；§6.4 的 overlay 只产生这几个键 |
 | G2 | `hosted_waist_deps` 用无时间戳 `XmlStepRenderer`，而 `xllm --resume` 接手后重建 deps 时用带时间戳的渲染器 | 接手后历史渲染字节变化，只影响前缀缓存，不影响正确性 | run.json `host` 里记 `renderer_opts`，xllm resume 时沿用（E1 实验会观察到） |
 | G3 | `build_runtime_protocol` 的开场白是“你在 xllm 一次性任务里运行，没有后续对话，不要向用户提问”，hosted 也原样追加 | 与 Session 的 `WAIT_USER_MSG` 语义冲突 | `prepare_hosted` 增加 `HostProtocolFlavor::Session`，由宿主给出 runtime_protocol 的开场白 |
-| G4 | xllm action 解析把“无动作 + `<report>`”映射为 `next_behavior = "done"`，不是 `END`；依赖 `forbid_next_behavior = false` | libopendan 已按“done 即交付”处理（`classify_done`），子 context 的 run 不设 forbid | 保持；文档化到协议 Spec |
+| G4 | Behavior 完成使用显式 `report_end`；report-only 不再合成 done | 两套 parser、快照恢复、宿主及子返回统一报告身份 | 已实施 H4；END / done 拒绝，最终报告和动作 / 非空调度互斥 |
 | G5 | Runtime 已提供 exec 请求超时、执行记录与取消停止核验 | Session 的整体 behavior deadline 仍属于后续 xagent 预算接线 | 保留 Session stop/lease 中断；整体预算经宿主接入，policy 不作为首版前置 |
 | G6 | 已修：run 保存实际目标与 Session env_check | xllm 接管核验 PATH、环境、manifest 与 helper 内容 | 凭据重新读取环境引用；依赖缺失/变化则阻塞恢复 |
 | G7 | 已修：prepare/prepare_hosted 调用共享 runtime.open | 内置文件工具使用目标侧后端，与 exec 共用 cwd | native/tmux/SSH 已验证；远端 Session helper 缺失时报 Capability |
@@ -137,7 +137,7 @@ xagent 不改变这张表的分工，只在“配置来源”和“system 段”
 
 ### 3.2 Context 调度：Agent Session 与 LLMContext 的根本区别
 
-LLMContext 的契约只到一个停止点：`run()` 返回一个 Outcome。Behavior 模式下，LLM 用 `<next_behavior>` 声明下一步（`END`、`WAIT_USER_MSG`、xllm 的 `done`，或一个 behavior 名），`run()` 随即以 `Done` 返回。LLMContext 不知道目标 behavior 的配置，也不知道还有别的 context、Turn 和输入队列。function_call 模式没有 `next_behavior`，`Done` 就是最终回答。
+LLMContext 的契约只到一个停止点：`run()` 返回一个 Outcome。Behavior 模式下，`<report end="true">` 请求完成当前 context，`<next_behavior>` 只声明 WAIT_USER_MSG 或目标 behavior，两者不能同现；普通 report 更新状态后继续。两套 parser 拒绝 END / done 与空决策。function_call 的普通 Done 是无工具的回答，是否结束 Session 由完成策略决定；宿主 report 工具获准的 `is_end=true` 提交则无需额外推理即可完成当前 context。LLMContext 不解释调用关系、Session 队列或报告的业务内容。
 
 所以**下一个 context 由谁跑、从哪份快照起、用哪套配置、结果怎么交回，全部由 Agent Session 决定**。本文把这部分称为 Context 调度（Context Switch），它是 Session 比 LLMContext 多出来的核心能力。约束：
 
@@ -158,14 +158,14 @@ LLMContext 的契约只到一个停止点：`run()` 返回一个 Outcome。Behav
 | T0 | 续跑 | 受控输入批次（可带半订阅快照）、可恢复挂起之后 | 当前 context | 不换 | 保留 | 同一 run | — |
 | T1 | ~~普通切换~~（**废弃**） | — | 不再存在：不能在同一 run 里换成另一 behavior 的 system / 配置，也没有 normal 缺省回退；目标未声明进入模式是配置错误（§3.4） | — | — | — | — |
 | T2 | 子 context：**create-sub-context** 或 **fork**（behavior 触发） | `next_behavior = B`，B 的进入模式为 `create_sub_context` / `fork` | create-sub-context：新 run = B 的 system + 任务输入 + 显式选择的父历史（`inherit`：none / recent_dialogue / steps）；fork：新 run = 父的 system + 分叉点的完整有效历史 + 分支任务输入 | create-sub-context：B 自己的；fork：与父相同 | 子独立（budget、usage、错误计数从头）；Step / action 编号接续父 | 新 run；父 run 入栈 `caller`，`call.trigger = behavior` | 子 run 结束 → `process_result` 交接批次注入父 run |
-| T3 | **SWITCH_CONTEXT** | `next_behavior = B`，B 的进入模式为 `switch_context` | 栈里 B 自己 parked 的 run（恢复它自己的快照）；没有就新建：B 的 system + 交接输入，历史按 B 的 `inherit`（none / recent_dialogue） | B 自己的 | B 自己的 | 当前 run 入栈 `parked`；B 有 parked 的 run 就出栈成为 live | 不隐式返回：回 A 要显式切换；`END` 按 Session 结束条件收尾 |
+| T3 | **SWITCH_CONTEXT** | `next_behavior = B`，B 的进入模式为 `switch_context` | 栈里 B 自己 parked 的 run（恢复它自己的快照）；没有就新建：B 的 system + 交接输入，历史按 B 的 `inherit`（none / recent_dialogue） | B 自己的 | B 自己的 | 当前 run 入栈 `parked`；B 有 parked 的 run 就出栈成为 live | 不隐式返回：回 A 要显式切换；显式结束报告按 Session 完成策略收尾 |
 | T4 | **工具触发的子调用** | 调用 `call_behavior({behavior, task})` | 同 T2：由目标的进入模式决定是 create-sub-context 还是 fork；fork 的分叉点在触发批次之前 | 同 T2 | 同 T2 | 新 run；父 run 以 PendingTool 挂起（task id `subctx:<call_id>`），入栈 `caller`，`call.trigger = tool{call_id, task_id}` | 子 run 结束 → 父 run 以 `ToolResults{call_id}` 恢复 |
 | T5 | 改写 | `ContextLimitReached` | 同一 run，历史重写为 summary + `<session_history>` | 不换 | 保留 | 同一 run，epoch + 1 | — |
 | T6 | Turn 边界 | 上一个 run 已结束，又来了输入 | 新 run：当前 behavior 的 system + `<session_history>` | 当前 behavior 的 | 新 | 新 run | — |
 
 - T2 / T3 由 `next_behavior` 触发，只出现在 Behavior 模式；T4 两种模式都能用，也是 function_call 模式（如 opendan 现在的 ui session）唯一的调度手段。
 - **构造方式与触发方式独立**：子 context 是哪一种（create-sub-context / fork）只看目标 behavior 的进入模式；T2 与 T4 的区别只在触发和返回协议。旧 T2 的“用 B 的 system、继承父 steps”就是 `create_sub_context` + `inherit = steps`。
-- **子 context 的任何结束都返回调用方**，结果带 `status: ok | failed | needs_user_input`：`END` / `done` → ok；Error / BudgetExhausted → failed（对调用方是一次失败的结果，不是失败的 Turn）；`WAIT_USER_MSG` → needs_user_input（子 context 从不自己等用户，也不消费调用方的输入）；声明切换到一个 `switch_context` 目标也按 ok 返回（子 context 不离开自己的调用）。这由 Session 在 `classify_done` 里处理，不用 `forbid_next_behavior`（原因见 G4）。子 context 可以再调用子 context。
+- **子 context 的任何结束都返回调用方**，结果带 `status: ok | failed | needs_user_input`：获准的结束报告 → ok；Error / BudgetExhausted → failed（对调用方是一次失败的结果，不是失败的 Turn）；`WAIT_USER_MSG` → needs_user_input（子 context 从不自己等用户，也不消费调用方的输入）；声明切换到一个 `switch_context` 目标也按 ok 返回（子 context 不离开自己的调用）。这由 Session 在 `classify_done` 里处理，不用 `forbid_next_behavior`（原因见 G4）。子 context 可以再调用子 context。
 - **嵌套深度**：栈上的 `caller` frame 不超过 `session.policy.max_process_depth`（默认 4）；`parked` frame 不计入。超限时 T4 的工具直接返回 Error 观察；T2 超限只会发生在子 context 里，按 failed 交回它的调用方。
 - **没有回退**：进入模式缺失或非法在冻结时校验报错（§6.3）；运行中 LLM 跳到这样的目标时，顶层 run 的 Turn 以 `failed{behavior_config}` 结束，子 context 里则按 failed 交回调用方。不会落回“同一 run 换 system”。
 - 返回方向：子 run 结束 → `Return{status, result}`，`caller` frame 出栈，父 run 重新成为 live，不关闭 Turn；结果按 `call.trigger` 走 `process_result` 或 `ToolResults`。
@@ -191,12 +191,12 @@ LLMContext 的契约只到一个停止点：`run()` 返回一个 Outcome。Behav
 | system、工具、模型 | 目标自己的 | 目标（子任务）自己的 | 与父相同；目标不能声明自己的 `prompt.system` / `llm_context` 覆盖 |
 | 历史 | 目标自己的；首次进入按 `inherit`（none / recent_dialogue）装配，不带别的 context 的快照 | 任务输入 + 显式选择的父历史：none / recent_dialogue / steps | 分叉点的完整有效历史，再追加分支任务输入；不接受 `inherit` |
 | 再次进入 | 恢复目标自己的快照（同一个 run） | 每次新建子 run | 每次新建分支 |
-| 完成 | `END` 按 Session 结束条件收尾，不隐式返回上一个 behavior | 结果交回调用方 | 结果交回调用方 |
+| 完成 | 显式结束报告按 Session 完成策略收尾，不隐式返回上一个 behavior | 结果交回调用方 | 结果交回调用方 |
 | 栈 | 离开的 run 入栈 `parked` | 调用方入栈 `caller` | 调用方入栈 `caller` |
 
 三者都延续当前 Turn，都不自动隔离文件系统、Session 状态与 worklog。
 
-**SWITCH_CONTEXT（T3）**。目标有自己的 system、工具、历史和 run。首次进入时新建：目标的 system +（按 `inherit`）`<session_history>` + `on_context_switch` 交接批次（由 Session 从共享状态渲染：当前任务状态、交接原因）。再次进入时把它 parked 的 run 出栈并恢复原快照，只追加新的交接批次；它的 system、已有历史、编号、预算都不动，不把另一个 context 的原始历史并进来。各 run 各自编号。`END` 在这里就是 Session 的结束条件（`decide_end`）；要回到上一个 behavior 必须显式 `next_behavior`。入口 behavior 没有“被进入”的调用方，按 `switch_context` 处理。
+**SWITCH_CONTEXT（T3）**。目标有自己的 system、工具、历史和 run。首次进入时新建：目标的 system +（按 `inherit`）`<session_history>` + `on_context_switch` 交接批次（由 Session 从共享状态渲染：当前任务状态、交接原因）。再次进入时把它 parked 的 run 出栈并恢复原快照，只追加新的交接批次；它的 system、已有历史、编号、预算都不动，不把另一个 context 的原始历史并进来。各 run 各自编号。显式结束报告在这里交由 Session 完成策略裁决；要回到上一个 behavior 必须显式 `next_behavior`。入口 behavior 没有“被进入”的调用方，按 `switch_context` 处理。
 
 **create-sub-context（T2 / T4）**。子 run 用目标 behavior 冻结的 system、工具、模型，输入是任务（behavior 触发：交接批次；工具触发：`task` 参数）加上按 `inherit` 选的父历史，由 llm_context 的 `derive_child` 构造（§3.7）：
 
@@ -276,7 +276,25 @@ impl AgentSession {
 
 **与 T2 的关系**：T2 由 `next_behavior` 触发，结果经 `process_result` 交接批次返回；T4 由工具调用触发，结果经 `ToolResults` 返回。子 run 的构造（两种方式）、栈、持久化、worklog 完全共用。
 
-于是 `try_create_worksession` 的目标形态是：ui context 调用 `call_behavior({behavior: "route_worksession", task: …})`；`route_worksession` 声明 `mode = create_sub_context`、`inherit = recent_dialogue`，在自己的 system 里约定 JSON 输出，只开放 `read`、`exec` 和层 ② 的 `agent-session create-worksession`。**不需要层 ③**：子 context 不是一个进程内工具，而是 Session 的 Context 调度（回答 §12 第 7 项）。
+于是 `try_create_worksession` 的目标形态是：ui context 调用一个子 context 函数，结果作为工具结果返回。**不需要层 ③**：子 context 不是一个进程内工具，而是 Session 的 Context 调度（回答 §12 第 7 项）。已采用的形态（2026-10-11）是 `try_analyze_user_intent`：behavior `analyze_intent`（`fork`）用下面的 `[tool]` 声明暴露给 UI，取代 `task_route`。
+
+**`[tool]` 声明：LLM 可见的具名函数**（2026-10-11，[意图分析 TODO](../../notepads/opendan-analyze-user-intent-todo.md) §3.13）。目标 behavior 可以把自己声明为一个具名函数，调用方的模型看到的是这个函数，而不是通用的 `call_behavior`：
+
+```toml
+[tool]
+name = "try_analyze_user_intent"   # 函数名（字母、数字、_，≤ 64）；缺省 = behavior 名
+description = "…"                   # 什么时候该调：这就是路由指南
+task = "{{args.request}}"           # 子 context 的 task 模板，只能引用 args.<name>；缺省 = 参数 JSON（或缺省参数下的 args.task）
+[tool.parameters]                   # JSON Schema（type = object）；缺省 {task: string}
+…
+```
+
+- 只有进入模式为 `create_sub_context` / `fork` 的 behavior 能声明；它随 behavior 冻结（`extensions.opendan.behaviors.<name>.tool`），Session 存续期间定义不变（前缀缓存）。两个 behavior 声明同名函数，冻结时被拒。
+- 调用方在 `tool_whitelist` 里写 `behavior:<name>` 才能看到它（目标须是 `meta.next` 闭包内的已冻结 behavior 且带 `[tool]`，否则冻结时报错）；没有 `[tool]` 的目标仍只能经 `call_behavior` 调用，`call_behavior` 不再缺省进任何白名单。
+- 实现上 `CallBehaviorTool` 泛化为 `BehaviorTool`（通用 `call_behavior` 或某个 behavior 的具名函数）：`call()` 与上面完全一样——校验、深度、`allow_deferred`，返回 `Pending{subctx:<call_id>}`；`ChildCall.behavior` 是声明它的 behavior，`ChildCall.task` 是模板渲染结果。挂起识别（`pending_sub_call`）按函数名找回 behavior，结果回填、worklog、崩溃恢复不变。宿主不认识任何 behavior 名字。
+- behavior（XML）循环里作为 action 暴露（`action_whitelist` 写 `behavior:<name>`）协议上不排除，目前未实现。
+
+子 context 向用户提问不走 `needs_user_input`：允许提问的 Session（有输入队列、`wait_user_msg = allowed`、不是子 Session）里，子 context 运行 `agent-session ask-user`，以 PendingTool `userinput:<call_id>` 挂起，Session 把下一条用户消息作为该调用的结果回填，见[架构文档 §5.6](<OpenDAN Agent Session架构设计.md>)。`<sub_task>` 包装在这类 Session 里写“To ask the user, run `agent-session ask-user`”。没有队列的 Work（`[session.work] ask_user_timeout_secs > 0`）在宿主有通知服务（`RunnerDeps.notify`）时同样能问：问题作为 `input` 系统通知发出，Session 有界等待通知的结果（缺省 3 小时），`<sub_task>` 写“Ask the user only when one answer decides the rest …”；其它 Session 写“Do not ask the user.”。见[通知人 TODO](../../notepads/opendan-agent-notify-todo.md) §3.6。
 
 ### 3.7 llm_context / xllm 层提供的原语
 
@@ -413,14 +431,14 @@ bridge 必须保证：同一来源内有序、至少一次、key 唯一。Sessio
 
 ### 4.7 Session 模板
 
-模板是 `SessionSpec` 的预设，按 `session.class` 选择；内置四个，`agent.toml [session.<class>]` 可覆盖；创建时解析进 session_config 的现有字段（`end_condition`、`input_policy`、`channels`、`subscriptions`、`prompt.behavior`）加一个新段 `session.policy`，与 behavior 一起冻结。
+模板是 `SessionSpec` 的预设，按 `session.class` 选择；内置五个，`agent.toml [session.<class>]` 可覆盖；创建时解析进 session_config 的现有字段（`end_condition`、`input_policy`、`channels`、`subscriptions`、`prompt.behavior`）加一个新段 `session.policy`，与 behavior 一起冻结。
 
 ```rust
 pub struct SessionTemplate {
     pub class: String,
     pub kind: SessionKind,
     pub turns: Turns,                 // One | Unbounded | N(n)   → end_condition
-    pub wait_user_msg: WaitPolicy,    // Allowed（Turn 保持打开等输入）| FinishFailed（work：不许等人，记 failed 并结束）| FinishCompleted
+    pub wait_user_msg: WaitPolicy,    // Allowed（Turn 保持打开等输入）| FinishFailed（work：不许等人，记 failed 并结束）| FinishCompleted | EndTurn（goal：Turn 带着问题结束，Session 继续等）
     pub input: InputChannel,          // None（不建队列）| Queue
     pub observe: Observe,             // Off | Events | EventsAndActive     → 半订阅快照包含哪些状态
     pub load_hints: bool,
@@ -428,16 +446,19 @@ pub struct SessionTemplate {
     pub max_process_depth: u8,        // process_stack 深度上限（默认 4，§3.3）
     pub max_sub_sessions: u8,         // 同时未结束的子 session 数上限（默认 4，§4.11）
     pub max_session_depth: u8,        // 子 session 嵌套深度上限（默认 2，§4.11）
-    pub implicit_subscriptions: Vec<Subscription>, // 模板预先登记的订阅（如 self_check 的 timer、用户时区）；没有“未订阅也投递”的兜底策略（§4.3）
+    pub ask_user_timeout_secs: u64,   // 没人读的 Session（work）经通知提问时最多等多久（默认 10800；0 = 不问）
+    pub implicit_subscriptions: Vec<Subscription>, // 模板预先登记的订阅（如 self_check 的 timer、goal 的 system:goal、ui 的 _notify、用户时区）；没有“未订阅也投递”的兜底策略（§4.3）
+    pub goal: Option<GoalDefaults>,   // goal 类：[session.goal] 的 budget / min_interval_secs 缺省值
 }
 ```
 
 | class | turns | wait_user_msg | input | observe | hints | 说明 |
 |---|---|---|---|---|---|---|
-| `work` | One | FinishFailed | **None**（需要外部投递的订阅则升为 Queue） | Events | 否 | 一次性任务：一个 Turn 跑到结果；不等用户；默认没有队列 |
-| `ui` | Unbounded | Allowed | Queue | EventsAndActive | 是 | 长生命周期对话入口（后移） |
+| `work` | One | FinishFailed | **None**（需要外部投递的订阅则升为 Queue） | Events | 否 | 一次性任务：一个 Turn 跑到结果；不等用户消息；有通知服务时 `ask-user` 经通知有界等待；默认没有队列 |
+| `ui` | Unbounded | Allowed | Queue（隐式半订阅 `_notify`：`system:notify:<id>`） | EventsAndActive | 是 | 长生命周期对话入口；只在有输入时 bootstrap（观察到的通知不会让它开口） |
 | `self_improve` | One | FinishFailed | None | Off | 否 | 感知窗口整理 |
 | `self_check` | Unbounded | FinishFailed | Queue（timer 事件） | Off | 是 | 定时自检 |
+| `goal` | Unbounded | EndTurn | Queue（`_goal_activation`：`system:goal` 事件） | EventsAndActive | 是 | 一个 Goal 的一个 epoch：每个 Activation 是一个 Turn；只由宿主为 Goal 创建（`xagent new --class goal` 拒绝），见 [Agent State Protocol](<protocol/Agent State Protocol.md>) §9 与 [Goal Session TODO](../../notepads/opendan-goal-session-todo.md) |
 
 **无队列 work session 的后果**：stop 由 lease 持有者将 SIGINT 接到现有取消路径；decide 走 artifacts 门面；exec 子进程的 `activity --touch` / `perceive` 没有通道，touching 由工具调用推断、感知只有结束时的 run_digest。父接收子状态（C15）与 task resolver 查询不需要队列，但子 LLM 主动给父发消息需要父有队列。只有需要接收外部投递的订阅才自动升为 Queue；默认时区的初始快照、拉取 session 状态、已跟踪 task 不因此强制建队列。无队列时不承诺收到外部时区更新。等待 task / children 时仍须轮询，不能因 `bus = None` 提前结束。
 
@@ -510,7 +531,7 @@ agent-session create-worksession --objective <text>
     [--msg <text>]... [--attach <obj_id>[=<name>]]...   首批输入：MsgObject；附件只给已存在的 ObjId
     [--context recent:<n>|none]                     把父 run 最近 n 条对话摘录附进首批输入（默认 none；不继承 steps）
     [--class work|…] [--behavior <name>]            模板与入口 behavior（默认 work 模板）
-    [--workspace inherit|new|<id>]                  默认 inherit：与父共用，靠活动视图避让
+    [--workspace inherit|none|<id>]                 默认 inherit；none 使用子 SessionDir；id 为已登记 Workspace
     [--runtime inherit|<id>]                        默认 inherit：继承父的 runtime 配置；tmux 按子 session_id 创建并绑定（§5.2.1）
     [--report final|progress|none]                  父怎么收到汇报（§4.14），默认 final
     [--interactive]                                 子 session 建输入队列，父之后可以继续 post（默认不建，§4.7）
@@ -547,7 +568,7 @@ impl ChildDriver {
 - 父每次提交之后、以及登记表变化时 `tick`。子 session 各持自己的 lease，与父并行；宿主进程退出也会停止其中的子驱动协程，但不删除已提交状态；重启后 ChildDriver 从登记表与快照重新接管。
 - 子的状态变化后，ChildDriver 唤醒父的调度器；父没有 drive 在执行时再 drive(parent)，已有驱动者则让其轮询发现，不能并发驱动同一父。工具 create-worksession 在父执行中也可能登记子，因此 ChildDriver 需独立轮询登记表，不只等父提交。
 - `xagent run <parent>`：父 Turn 关闭后，默认继续推进本进程拉起的子 session，直到它们空闲或结束再退出；`--detach-children` 立即返回，留给 `xagent serve`。`xagent serve` 同样接管所服务 session 的子 session。
-- 子 session 首次推进时自己绑定 runtime（`binding.json`）。`--runtime inherit` 继承执行类型、连接与环境配置；tmux 的 `id`、`tmux.session` 和绑定要求按子 session_id 重新派生，cwd 由子的 workspace 解析，不复制父的绑定或 runtime 实例。同一 Session 内的子 context 则复用本 Session 的 runtime（§5.2.1）。共用 workspace 时按活动视图避让，与多个顶层 session 共用 workspace 相同。
+- 子 session 首次推进时自己绑定 runtime（`binding.json`）。`--runtime inherit` 继承执行类型、连接与环境配置；tmux 的 `id`、`tmux.session` 和绑定要求按子 session_id 重新派生，cwd 由子的 workspace 解析，不复制父的绑定或 runtime 实例。同一 Session 内的子 context 则复用本 Session 的 runtime（§5.2.1）。共用 Workspace 时按本地写锁串行执行；父只等待已登记的同 Workspace 子任务时提交等待状态并释放锁，宿主优先推进最内层任务，子完成后重新核验父绑定并接续。未核实的在途调用或后台任务阻止交接。绑定和恢复规则见 [Agent Workspace Protocol](<protocol/Agent Workspace Protocol.md>)。
 
 ### 4.13 父子之间的沟通渠道
 
@@ -591,15 +612,30 @@ impl ChildDriver {
 - **与 T4 的区别**：T4 的子 run 在父 session 内串行，父挂起时没有别的东西在跑；`--wait` 的子 session 在自己的 lease 下推进，可以与其它子并行；持久恢复相互独立，进程存活范围见 §4.12。
 - **接手**：这个 resolver 只依赖 Agent State，不依赖 Runner 内存；但 v1 只有 xagent 提供它，父 run 挂起期间 xllm 拒绝接手（同 T4）。
 
-**父结束规则（汇总）**：父的 `decide_end` 发现还有未结束、且 `report != none` 的子 session 时，不结束 session：run 结束，Turn 保持打开，`waiting_for = Children{sids}`；子的结束事件作为受控输入并入同一个 Turn，父 LLM 汇总后再 `END`。这样 work 父也能“先并行派出几个子 session，再汇总”。不想等的子，要么创建时选 `--report none`，要么先 `ctl <child> stop`。
+**父结束规则（汇总）**：父的 `decide_end` 发现还有未结束、且 `report != none` 的子 session 时，不结束 session：run 结束，Turn 保持打开，`waiting_for = Children{sids}`；子的结束事件作为受控输入并入同一个 Turn，父 LLM 汇总后再提交结束报告。这样 work 父也能“先并行派出几个子 session，再汇总”。不想等的子，要么创建时选 `--report none`，要么先 `ctl <child> stop`。
+
+**无决策即等待**（2026-10-16）：behavior loop 里只有阶段 `<report>`、没有 actions / next_behavior 的回复交给宿主判断（llm_context 的 `CheckpointHook::review_decision`，见 [llm_context 决策钩子 TODO](../../notepads/llm-context-plan-do-yield-todo.md)）：顶层 context 还有未收齐的子 Session 时，宿主接受它为等待——run 结束，Turn 以同样的 `waiting_for = Children{sids}` 保持打开，子的结束事件唤醒同一个 Turn；没有可等的就不表态，阶段报告照旧、context 继续（连续第三次被拒绝，防空转）。异步派出、无决策等待、逐个 Review，是 TodoList 并行探索的执行方式（§4.17）。
 
 ### 4.16 生命周期与限制
 
 - **stop 级联**：父 stop → 对未结束的子投 `stop`（子有队列时），或由 ChildDriver 直接中断（子无队列；驱动者是同一个 principal）。子被 stop 只在父那里产生 `finished{stopped}` 事件，不影响父。
-- **验收**：work 子 session 结束后 `acceptance = pending`，默认由父（创建者）决定：父 LLM 读报告后 `ctl decide <child> accept|discard`。
+- **验收**：work 子 session 结束后 `acceptance = pending`，默认由父（创建者）决定：父 LLM 读报告后 `ctl decide <child> accept|discard`。子没有输入队列时（默认），不经队列：父的工具进程以驱动者身份持子 Session 的锁直接写 acceptance（`api::decide_unqueued`；有 artifact 时先决定 artifact 版本）。探索 Todo 的 `todo review` 同时写它（§4.17）。
 - **数量与深度**：`session.policy.max_sub_sessions`（同时未结束的子，默认 4）与 `max_session_depth`（默认 2）。
 - **Turn 与预算不合并**：子有自己的 Turn（计划 §8.3），父的 Turn、Round、预算都不含子；子按自己的 budget。
 - **归档与清理**：子目录的归档与清理沿用顶层 session 的规则（后移）；登记表条目保留，供审计与 `sessions` 查询。
+
+### 4.17 TodoList：PLAN 的计划与两种执行形态
+
+Work Session 的 TodoList（`.opendan_agent_session/todos.json`，[Agent TodoList](<./Agent TodoList.md>)）把 §4.10 的两种交出方式组合成 PLAN 的决策循环。它不是新的调度器：
+
+| | 串行 Todo | 探索 Todo |
+|---|---|---|
+| 执行 | `next_behavior = <Todo 执行器>`（behavior 声明 `[entry] todo = true`，`create_sub_context`；Jarvis `do`）：T2 子 context，父 run 挂起 | `agent-session todo explore` / `todo dispatch`：Sub Session（`--workspace none`、`--report final`、入口 behavior `explore`），可并行 |
+| 准入 / 派发 | 宿主在交接时选第一个就绪的串行 Todo（`after` 中的结果已被接受），正文写入 `ChildCall.task`（`<sub_task>`），绑定 `ChildCall.todo = {todo_id, attempt}` 与 `(run_id, step:<n>)`；没有就绪 Todo 时可修正地拒绝，或在有探索时按等待处理 | 工具进程加锁：记 `dispatching` → `create_sub_session`（key `todo:<id>:<attempt>`）→ 记 `dispatched`；`max_sub_sessions` 与宿主 `--max-children`（`LIBOPENDAN_MAX_CHILDREN`）超限可观察地拒绝 |
+| 结果回流 | 子 context 返回的同一次提交前写回 attempt；`process_result` 只给一句话与 `todo show` 指引；报告副本存 `reports/<id>/` | 父宿主在批次边界按登记表状态回写；结束事件说 Todo、attempt、一句话与 `todo show` 指引 |
+| Review | `todo review` 写 Todo | `todo review` 写 Todo，同时写子 Session acceptance |
+
+PLAN 在每个顶层输入批次（列表修订变化时）得到紧凑视图 `<todo_list rev>`；报告全文只在 `todo show <id> --report` 时进入上下文。顶层结束报告在列表未收敛（有 Todo 在执行 / pending / 未 Review）时被拒绝。恢复：派发按登记表对账（有 sid 就绑定、没有就撤回），串行绑定按调用方 Step 幂等，回写幂等且只写自己的 attempt。
 
 ---
 
@@ -728,7 +764,7 @@ pub struct RuntimeGrant {
 
 1. behavior 是 **Agent 的**配置（`<agent_root>/behaviors/<name>.toml` + `*.inc`、`role.md`、`self.md`、`i18n/`），因此由 Agent State 提供，不由应用随手写进 session。
 2. llm_context 构造时要初始化 system 段，此刻需要 behavior；**Session 一旦构造，用的 behavior 就固定**：Agent 后来改了 behavior 文件，旧 session 不受影响，新 session 才看到。
-3. 冻结的是“文本与策略”，不是渲染结果：时间、活动 session、hints 等新鲜量仍然每个输入批次现算，放在 `<session_input>`（S-20）。
+3. 冻结的是“文本与策略”，不是渲染结果：时间、活动 session、hints 等新鲜量仍然每个输入批次现算，放在 `<session_input>`（S-20）；UI Session 放在 chat 格式的 `<<background_context>>` 里，只出现变化了的行（§11.6）。冻结材料还包括 Session 的 cmd_skills（`prompt.frozen.cmd_skills`，创建时选定、按顺序冻结，最多 8 份）。
 4. 冻结后 system 段只依赖冻结材料 + session_config，所以同一 behavior 的新 run 保持相同 system 前缀；不同 behavior 可以有各自的 system / 配置，fork 沿用父的前缀。
 
 ### 6.2 BehaviorCatalog：Agent State 的新门面
@@ -791,13 +827,13 @@ pub struct BehaviorConfig {
 
 `input.mode` 默认 Batch；Single 在按 source / index 排序的可处理 message / Input event 中总共选一条，Batch 最多取 `options.input_batch_max` 条，未选输入保留，后台 task 合成候选排在总线候选之后。首次进入目标 behavior 时先完成必要的冻结与校验，再读取策略和模板。模板缺省使用内建渲染；已有选中的外部输入却渲染为空必须报错并保留现场。没有外部输入时的 bootstrap / continuation 处理见 §9.3。
 
-`semi_subscription_snapshot`（半订阅快照）是三类入口共用的前置材料，装配函数为 `render_semi_subscription_snapshot`。不设置 `on_observation` 或第四类输入 hook；旧 `on_behavior_step_ob` 不作为半订阅入口沿用，工具结果渲染仍属于 LLM Context 的执行协议。旧输入入口 `on_wakeup / on_behavior_switch` 对应新名 `on_input / on_context_switch`；旧 behavior cfg 中用作 system 的 `prompt.on_init` 对应 `prompt.system`。libopendan 宿主已按新名实施（`session_config/4`），不提供旧名兼容；C7 的 behavior 素材按新结构编写，现有 OpenDAN 配置改造仍按 §1.2 后移。附件块由 `input.media` 决定，模板不决定是否内联。
+`semi_subscription_snapshot`（半订阅快照）是三类入口共用的前置材料，装配函数为 `render_semi_subscription_snapshot`。不设置 `on_observation` 或第四类输入 hook；旧 `on_behavior_step_ob` 不作为半订阅入口沿用，工具结果渲染仍属于 LLM Context 的执行协议。旧输入入口 `on_wakeup / on_behavior_switch` 对应新名 `on_input / on_context_switch`；旧 behavior cfg 中用作 system 的 `prompt.on_init` 对应 `prompt.system`。libopendan 宿主自 `session_config/4` 起按新名实施（当前为 `/7`），不提供旧名兼容；C7 的 behavior 素材按新结构编写，现有 OpenDAN 配置改造仍按 §1.2 后移。附件块由 `input.media` 决定，模板不决定是否内联。
 
-进入模式放在目标 behavior 上，正好回答 readme 里的 TODO（“切换模式由 target behavior 的配置决定，而不是由当前 session 决定？”）：是。校验规则：`fork` 目标不能声明自己的 system 与模型（要换就用 `create_sub_context`），也不接受 `inherit`；`switch_context` 目标不接受 `inherit = steps`；入口 behavior 未声明时按 `switch_context`；其它 behavior 没有进入模式是配置错误，不回退成任何默认模式。进入模式为 `create_sub_context` / `fork` 的 behavior 就是 `call_behavior` 可调用的目标（§3.6），不需要另外声明工具。`SessionAssembler::behavior_entry(cfg, behavior)` 读冻结的 `behaviors[target].entry`；Session 级的 `extensions.opendan.process_modes` 已废弃并被拒绝。libopendan 的 Session 宿主以 `extensions.opendan.behaviors.<name> = {mode, prompt{system?, on_init?, on_input?, on_context_switch?, semi_subscription_snapshot?}, input{mode, media}?, llm_context?, inherit?}` 承载同一份进入配置，冻结（C7）时由 BehaviorConfig 生成它。
+进入模式放在目标 behavior 上，正好回答 readme 里的 TODO（“切换模式由 target behavior 的配置决定，而不是由当前 session 决定？”）：是。校验规则：`fork` 目标不能声明自己的 system 与模型（要换就用 `create_sub_context`），也不接受 `inherit`；`switch_context` 目标不接受 `inherit = steps`；入口 behavior 未声明时按 `switch_context`；其它 behavior 没有进入模式是配置错误，不回退成任何默认模式。进入模式为 `create_sub_context` / `fork` 的 behavior 就是 `call_behavior` 可调用的目标（§3.6）；要让模型看到一个具名函数，再加 `[tool]` 声明（§3.6）。`fork` 目标的 `[budget]` 不进 `llm_context`，由宿主作用于分支的 run（工具迭代、token、时长、连续错误），不改变请求的渲染内容。`SessionAssembler::behavior_entry(cfg, behavior)` 读冻结的 `behaviors[target].entry`；Session 级的 `extensions.opendan.process_modes` 已废弃并被拒绝。libopendan 的 Session 宿主以 `extensions.opendan.behaviors.<name> = {mode, prompt{system?, on_init?, on_input?, on_context_switch?, semi_subscription_snapshot?}, input{mode, media}?, llm_context?, inherit?}` 承载同一份进入配置，冻结（C7）时由 BehaviorConfig 生成它。
 
 ### 6.3 冻结：时机、位置、范围
 
-**位置**：在当前 `session_config/4` 的 `prompt` 中新增 `frozen`，不新增文件。下例是冻结后的形状，已随 C4 / C5 / C7 / C15 实施为 `opendan.session_config/5`（fixtures 与 schema 已重新生成）：
+**位置**：`frozen` 位于当前 `opendan.session_config/7` 的 `prompt` 中，不新增文件。下例是冻结后的形状；冻结配置自 C4 / C5 / C7 / C15 的 `/5` 版本起实施，当前 fixtures 与 schema 已同步到 `/7`：
 
 ```jsonc
 "prompt": {
@@ -873,7 +909,7 @@ impl BehaviorConfig {
 |---|---|
 | `identity.*`、`behavior.{name,objective,mode}`、`session.{id,kind,objective,driver,scope,parent}`、`paths.{session_root,workspace_root}`（相对或 binding 提供）、`workspace.id`、`xml_behavior_result_protocol`（由 xllm `runtime_protocol` 段提供） | `runtime.{clock_text,status}`、`<active_sessions>`、`<hints>`、`semi_subscription_snapshot`（pending_events 的选定版本）、`<perceptions>`、`<inputs>`、`context_switch / process_result`、`session.current_todo*`（读 `todos.json`）、`notebook.last_items`、`workspace_list` |
 
-上表包含后续宿主变量。当前 libopendan 已提供 `input.*`、`session.{id,kind,objective,timezone,is_bootstrap,current_todo,background_hint_changed,default_changed_background_hint_text}`、`runtime.{status,clock_text}`、`handover` 与内建块文本；todo / 背景提示没有数据源，分别为 null / false，不能据此声称 xagent 已读取 todos.json。额外变量由对应宿主明确装配，不在 CLI 中猜测 OpenDAN 的状态路径。
+上表包含后续宿主变量。当前 libopendan 已提供 `input.*`、`session.{id,kind,objective,timezone,is_bootstrap,current_todo,background_hint_changed,default_changed_background_hint_text}`、`runtime.{status,clock_text}`、`handover` 与内建块文本；todo / 背景提示没有数据源，分别为 null / false，不能据此声称 xagent 已读取 todos.json（UI Session 的背景提示已由 chat 格式的背景行承担，模板变量为 `background` / `background_text`，§11.6）。额外变量由对应宿主明确装配，不在 CLI 中猜测 OpenDAN 的状态路径。
 
 渲染复用八个命名格式：`input.xml`、`message.xml`、`message.markdown`、`event.xml`、`event.summary_text`、`attachments.xml`、`attachments.list`、`todo.summary_xml`。`input.text` 与 `input.xml` 使用同一渲染器；XML 正文 / 属性分别转义，块标签独占行不输出空行，整体 trim，未知格式 / 错误形状报模板错误。内建时间为 UTC；用户时区来自绑定的 `session.timezone` 与默认 semi 订阅，不取执行机时区。逐字节结果以 `14_input_bus` fixtures 为准。
 
@@ -930,7 +966,7 @@ impl dyn AgentStateClient {
 xagent — drive an Agent Session for one Turn (or keep driving it)
 
   xagent new    --agent <did> --objective <text> [--class work|ui|self_improve|self_check] [--parent <dir>]
-                [--behavior <name>] [--llm-context <json|@file>] [--runtime <id>] [--workspace <path>]
+                [--behavior <name>] [--llm-context <json|@file>] [--runtime <id>] [--workspace <workspace_id>]
                 [--subscribe <spec>]... [--msg <text>] [--until turn|finished|idle|outcomes:<n>] [--no-run]
                  按模板创建 session（冻结 behavior 与模板），默认立刻推进一个 Turn
   xagent run    <session_dir|sid> [--msg <text> | --msg-file <path> | --event <json>]
@@ -947,6 +983,16 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
   xagent behaviors --agent <did> [--frozen <sid>]
   xagent xllm   <sid> [--run <id>]                                     打印让 xllm 接手 live run 的命令行
   xagent schema <dir>                                               导出现有 protocol::json_schemas()
+  xagent goal   create --objective <t> [--title] [--lifecycle achieve|maintain] [--achieved-when] [--healthy-state]
+                       [--distance] [--constraint]… [--skill <name>[=<ref>]]… [--workspace] [--path]… [--object]…
+                       [--every <secs>] [--min-interval <secs>] [--start] [--behavior] [--budget <json>] [--key] [--json <request>]
+  xagent goal   list | show [<id>] [--state] [--activations <n>] [--changes <n>] [--revisions] [--epochs] [--schedule]
+  xagent goal   revise <id> --expected-revision <n> [...] | pause|resume|archive [<id>] [--reason] | achieved [<id>] --evidence <t>
+  xagent goal   reopen <id> --reason <t> [--fresh-state] | restart <id> --reason <t> [--carry-state]
+  xagent goal   activate <id> [--reason] | post <id> --msg <t> | skills add <name>[=<ref>] | skills remove <name>
+  xagent goal   serve [--llm-context <json|@file>] [--idle-unload <secs>]
+                 Goal：create 只写 Goal；宿主（Loader 的 goals 模块，或 goal serve 的 Supervisor）补建 Goal Session、
+                 投递运行机会（epoch 开始、本地定时、手动）、处理 epoch 迁移；activate / post 直接投给当前 epoch 的 Session
 
   <spec> = active|semi:session:<sid>[:watch=f1,f2] | active|semi:object:<id>#<event>
 
@@ -955,6 +1001,9 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
   xagent recall <query> | note <text> | sessions [--active] [--children] | read-session <sid> | artifact ...
   xagent create-worksession --objective <t> [--report final|progress|none] [--wait] [...]   （§4.11）
   xagent wait <sid> | post <sid> --msg <t>                                                  （§4.13、§4.15）
+  xagent goal ...    调用方 = $OPENDAN_SESSION_ID 所在的 Session：UI Session 可 create / show / post / pause / resume /
+                     archive / reopen / restart / activate；Goal Session 可 show（省略 <id> 即自己的 Goal）/ skills add|remove /
+                     achieved --evidence / archive --reason；其余由 GoalStore 拒绝（退出码 6）
 
 身份与定位（都可用环境变量）：
   --agent <did>          [$OPENDAN_AGENT_DID]      --who <principal>       [$LIBOPENDAN_WHO，默认取 BuckyOS 运行时 app principal]
@@ -975,10 +1024,10 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
 | 0 | Turn 以 `completed` 关闭，或 Session 成功完成；只读 / 投递 / 创建不运行等命令成功 |
 | 1 | Turn 以 `failed` / `budget_exhausted` 关闭（含 work 模板下的 `WAIT_USER_MSG`），或 session 结束为 Failed |
 | 2 | 参数 / 配置 / 模板 / 冻结校验错误；失败的输入批次未消费，不表示此前没有应用控制或恢复提交 |
-| 3 | Idle / TurnOpen / OutcomesHandled：未正常完成所请求的推进，或调试停止条件已达到；等待用户、工具或子 Session 可再次 run；投递 input_full / queue_missing 也以可重试诊断返回 3 |
+| 3 | Idle / TurnOpen / OutcomesHandled：未正常完成所请求的推进，或调试停止条件已达到；等待用户、工具或子 Session 可再次 run；投递 input_full / queue_missing 也以可重试诊断返回 3；Goal 周期预算用尽（goal_budget_exhausted） |
 | 4 | 被 stop / 中断 |
-| 5 | Busy：session lease 或 run 锁被他人持有 |
-| 6 | 阻塞：NotDriver / Unregistered / BindFailed / RuntimeMismatch / RecoveryBlocked / session_readonly |
+| 5 | Busy：session lease 或 run 锁被他人持有；Goal 冲突（修订号不符、状态迁移不合法） |
+| 6 | 阻塞：NotDriver / Unregistered / BindFailed / RuntimeMismatch / RecoveryBlocked / session_readonly；Goal 操作越权（forbidden） |
 
 驱动命令 `--format json` 时 stdout 是带 kind 的 `DriveResult` JSON，各变体仅包含自己的字段；新增 TurnClosed / TurnOpen 带 §4.9 的字段。日志与诊断走 stderr，不能混入 JSON。现有 Idle 的详细等待信息可由 `status` 读取 state.waiting_for；不把本地推测补写回 state。
 
@@ -1029,7 +1078,7 @@ serve
 
 每个驱动命令按所驱动的 Session 构造 `RunnerDeps`，设置 assembler、任务 resolver 与 `session_cli = current_exe()`，runtime 通过 §5.2.1 的 Session 工厂装配；`serve` / ChildDriver 不能直接复用另一个 Session 的 tmux 依赖。由现有 bin overlay 包装成 `agent-session`。不要另建 Runtime 或工具派发协议；目标 behavior 的工具与模型按每个 run 的有效配置装配，context 的 runtime 则复用 Session 绑定。
 
-无队列 bootstrap 的持久输入（新增 C4）：创建前用同一消息 helper 构造 `PostedInput::msg`，写入目标字段 `prompt.initial_inputs: Vec<PostedInput>`，只接受合法 msg，最多 64 条；随 SessionConfig 一起发布，发布后不修改。已随 `session_config/5` 实施。Runner 将它适配为内部只读 source `_bootstrap`，index 从 1 开始，复用 SourceProgress / route_inputs / receipt；无需 kmsg，`channels.inputs` 仍为空，confirm 为空操作。Single 首批未选中的记录在后续 on_input 消费，不能因 bootstrap_done 就丢弃。初始消息与普通消息同样渲染为 user 输入，不挪进 system 的 prompt.context。
+无队列 bootstrap 的持久输入（新增 C4）：创建前用同一消息 helper 构造 `PostedInput::msg`，写入目标字段 `prompt.initial_inputs: Vec<PostedInput>`，只接受合法 msg，最多 64 条；随 SessionConfig 一起发布，发布后不修改。自 `session_config/5` 起实施，当前为 `/7`。Runner 将它适配为内部只读 source `_bootstrap`，index 从 1 开始，复用 SourceProgress / route_inputs / receipt；无需 kmsg，`channels.inputs` 仍为空，confirm 为空操作。Single 首批未选中的记录在后续 on_input 消费，不能因 bootstrap_done 就丢弃。初始消息与普通消息同样渲染为 user 输入，不挪进 system 的 prompt.context。
 
 `new --no-run --msg` 必须在退出前落盘；已有无队列 Session 的 `run --msg / --event / --msg-file` 与 post 拒绝投递，提示在创建时提供材料或使用 Queue 模板。E9 的三种外部投递等价在有队列 Session 验证；E13 另验内部初始 source 的逐条消费与恢复。
 
@@ -1212,7 +1261,7 @@ C4 默认无队列 work 用 `run`；如果由父的 ChildDriver 调度，无输�
 | E7 | 回归：输入崩溃 | 输入快照 / state / 清门槛 / ack 各窗口故障，恢复不重复注入、不倒退位置、延续同一 Turn；门槛期间 xllm 拒绝接手 |
 | E8 | 回归：推进权 | 两个 run 或 serve 与 run 争抢同一 Session，后者 Busy（5）；不同 Session 可并行 |
 | E9 | 回归：投递等价 | Queue Session 的 run --msg、post 后 run、serve 中 post 使用同内容合法 MsgObject，视图 / receipt 结构与提交语义相同 |
-| E10 | 回归：调度不断 Turn | plan → create_sub_context do → 返回 → switch_context review → plan → review → END，全程一个 Turn，重复进入 review 恢复其自己的 run |
+| E10 | 回归：调度不断 Turn | plan → create_sub_context do → 返回 → switch_context review → plan → review → 显式结束报告，全程一个 Turn，重复进入 review 恢复其自己的 run |
 | E11 | 回归：新鲜量 | 同一 behavior 的两次 Turn 间隔运行，system 前缀相同；时间在输入，UTC 不受 Runner 机器时区影响 |
 | E12 | 回归：缺失冻结 | 无 frozen 且目录不可读 → RecoveryBlocked（6），不猜配置、不推理 |
 | E13 | 验收：无队列 work | 默认 work 无外部订阅，new --no-run --msg 后退出并重新 run：不建队列，初始输入不丢；WAIT_USER_MSG → needs_user_input（1）；无队列仍能等待 resolver，decide 可走 artifacts 门面 |
@@ -1223,7 +1272,7 @@ C4 默认无队列 work 用 `run`；如果由父的 ChildDriver 调度，无输�
 | E18 | 后移：policy | guard 拒绝、审批 PendingTool / approve、grant 到期撤销；随 ActionGuard / RuntimeGrant 实施，本轮不提供这些 CLI 子命令 |
 | E19 | 验收：SWITCH_CONTEXT | do / check 使用不同模型与工具，往返后只有各自两个 run，配置、历史、编号、预算不串；xllm 到 handover 停为 paused，再次 resume 拒绝，xagent 提交转移一次；转移前后崩溃同样成立；未声明进入模式失败，无同 run 换 system 回退 |
 | E20 | 验收：工具子 context | function_call / behavior 父分别调用 create_sub_context（none/recent_dialogue/steps）与 fork；与 read 同批，进入 / 返回前后崩溃。父以 subctx:<call_id> 挂起，fork 前缀截止触发批次前；子结果恰好回填一次，父剩余调用继续、已执行不重放。继承记录不重复 flush，子 transcript 不进重建历史，子 WAIT_USER_MSG / Error 交回 needs_user_input / failed，不关闭父 Turn；嵌套超限及 fork 自带配置被拒，xllm 缺 Session resolver 时拒接 |
-| E21 | 验收：Sub Session | 无队列父派出 final / progress / --wait 三种子；各有 lease / Turn，progress 半订阅，wait 以 ToolResults 回填；父 END 时仍有需汇报子则 Turn 保持打开，结束事件 Input 后汇总。kill 宿主后登记与提交点可恢复、子不重复创建；同进程子协程也会停止，不宣称进程独立存活 |
+| E21 | 验收：Sub Session | 无队列父派出 final / progress / --wait 三种子；各有 lease / Turn，progress 半订阅，wait 以 ToolResults 回填；父普通 Done 时仍有需汇报子则 Turn 保持打开；显式结束报告在依赖未收齐时拒绝，结束事件 Input 后汇总。kill 宿主后登记与提交点可恢复、子不重复创建；同进程子协程也会停止，不宣称进程独立存活 |
 | E22 | 回归：父子对话 / stop | interactive 子提问，父收到 needs_input 后 post，子续同一 Turn；子主动 post 要求父有队列。父 stop 级联未结束子，各自驱动者提交 stopped |
 | E23 | 回归：模板 | 三入口分别渲染，Single / Batch 仅消费选中输入；启动 / 交接可合并外部输入；恢复、压缩、ToolResults 不重复触发入口；六个示例模板输出与 fixtures 一致 |
 | E24 | 验收：普通 PendingTool | 无通知 / 空 inbox 时查询终态并续同 run / Turn；无 resolver 阻塞、Unknown 回填；until_ms 到期回填当时状态。等待中 msg 暂存，回填后先续工具批次，再次 PendingTool 不丢关联；stop 配对且不重放 |
@@ -1315,6 +1364,16 @@ C4 默认无队列 work 用 `run`；如果由父的 ChildDriver 调度，无输�
 6. **timer / kevent 桥缺少配置约定**。`timer:<name>` 订阅没有间隔字段，`object_event` 没有到 kevent id 的映射规则；本轮分别取 `extensions.opendan.timers.<name>.every_secs` 与“object 即 kevent id”。这两处应由协议定下来。
 7. **ChildDriver 的轮询成本**。空闲但未结束的子（如等输入的交互式子）每个 tick 都被 `drive(Idle)` 一次（取 lease、核验绑定、重写 bin）。正确但偏重；需要一个“只在登记表 rev 或队列变化时再驱动”的条件。
 
+### 11.6 UI Session 提示词改造（2026-10-17）
+
+按 [Jarvis UI Session 提示词改造 TODO](../../notepads/jarvis-chat-prompt-todo.md)（先行项见 [llm_context 先行 TODO](../../notepads/llm-context-chat-prompt-prereq-todo.md)）实施，只改 `kind = ui` 的 Session（一对一与群聊）；Work / Goal 不变：
+
+- **system 段**：`## Identity`（role + 实例补充：名字、account、Agent DID 与 owner 的 account / DID）→ `## Current Session Constraints`（对端或群、身份来源、避让、session 目录、通知处理，按群聊 / 一对一分支）→ `## Objective`（UI Session 的设计意图，模板 `objective` / 内建 `UI_OBJECTIVE`，不再是 `msg.chat <route_key>`）→ 应用提示词原样（自带 `## Replying` / `## Memory`）→ `## Commands`（随 Session 冻结的 cmd_skills，`<agent_root>/cmd_skills/<name>.md`，`agent.toml [session.<class>] default_cmd_skills`；Work 的 cmd_skills 由 `create-worksession --cmd-skill` 在创建时选定，放在 `## objective` 之后，段首说明它们是可选捷径）。function call 循环的 UI run 关掉 xllm 追加的 `capabilities` / `cmd_manual` / `runtime_protocol` 三段（behavior 循环保留）。不写 session id。`SessionSection.owner` 记 owner DID。
+- **输入**：chat 格式（Session Input Protocol §6.5），背景行的显示记录 `state.background_shown` 随 receipt（`extra.background`）提交；半订阅版本作为背景行显示，不再单独成快照消息。子 Session 事件对 UI 父只有一行摘要。
+- **回复**：`[reply]` 回复契约（`BehaviorReply { schema, asks_field }` → `.llm_context` `json_schema` → `OutputSpec::Json { max_repairs: Some(1) }`）。UI 的最终回复 `{reply, topic, artifacts}`（schema 按 OpenAI strict 规则写：字段都必填，`topic` 可为 `null`，`artifacts` 可为 `[]`）由宿主解析：`reply` 出站，`artifacts` 经 `store_artifacts` 成附件，`topic` 写入 `state.topic`（与 Turn 关闭同一次提交）并经登记表 `status.topic` 给其它 Session 看；hints 由此开始按 topic 召回。两次不满足契约时原文出站，worklog 的 `outcome.report` 记原因。fork 子 context 可声明自己的 `[reply]`（`ForkOptions.output`），`asks_field` 要求列出本 context 里 `ask-user` 问过的每个问题（宿主 `ReplyValidator` 校验，一次纠正）。UI 不再有 `report` 工具。
+- **工具**：`group:bash_core`（`read` / `write_file` / `edit_file` / `shell`），长命令由 `agent-session task state|wait|cancel` 经 task CLI 桥跟进；run 结束时模型已看到结束态的 task（`RunningTaskResolver::result_seen`）不再跟踪。宿主的会话辅助命令（`SessionHelper`，与 `agent-session` 同在 `.runtime/bin`）提供 `llm_understand_media <file | object id | url>`。
+- 待做：UI 的 cmd_skill 运行时调整与延迟暴露（`notepads/opendan-cmd-skill-todo.md`）、function result 里的背景行（先行 TODO“以后”）。
+
 ---
 
 ## 12. 默认选择与后续待定项
@@ -1337,9 +1396,19 @@ C4 默认无队列 work 用 `run`；如果由父的 ChildDriver 调度，无输�
 14. **后移：显式完成策略的模板范围**（Context TODO H4）。本轮沿用 end_condition 与 §4.7 的 WAIT_USER_MSG 解释，不让普通 Done 自动获得另一种完成语义。
 15. **默认：子 context 嵌套范围**。沿用现行规则：可再调用子 context；跳到 switch_context 目标交回调用方，WAIT_USER_MSG 交回 needs_user_input；扩展内部切换或直接等用户后移。
 16. **默认：进入配置落点**。冻结保存 BehaviorConfig，生成现有 `extensions.opendan.behaviors.<name>` 的 `{mode,prompt{system,…},input{mode,media},llm_context,inherit}`；冻结 Session 拒绝冲突的应用覆盖。未采用冻结的库调用仍使用现有 extensions 入口，不增加旧字段兼容。
-17. **默认：子 workspace**。inherit，可明确选择 new / id；共用时依靠活动视图协调。
+17. **默认：子 workspace**。inherit，可明确选择 none / 已登记 ID；父已绑定时不能扩大权限或切换项目，无绑定的 UI Session 可显式选择项目派发工作。共用时由宿主持有本地写锁；绑定、失败与恢复语义见 [Agent Workspace Protocol](<protocol/Agent Workspace Protocol.md>)。
 18. **默认：父结束规则**。有 report != none 的未结束子时，父 Turn 保持打开等汇报。
 19. **默认：父对子隐式关注**。C15 取代创建时向父投 subscribe；父可无队列，但 Input 接受 / 消费必须可恢复。
 20. **默认：run 推进子 session**。按 §4.12 推进到空闲或结束；detach 只保证子已持久登记，后续由 serve / Supervisor 接管，不保证同进程任务在 CLI 退出后继续。
 21. **默认：子的用户是父**。子 headless；面向人的通道与例外随 UI 后移。
 22. **默认：数量与深度**。max_sub_sessions = 4、max_session_depth = 2；Context 调度深度是另一项限制。
+
+## H4：报告提交与显式完成
+
+工具启用的 Session 冻结宿主 `report` 工具；独立 xllm 不默认暴露。参数为非空 `report`、可选 `artifacts: string[]`、可选 `result: JSON`、`is_end`（缺省 false）。Behavior 使用 report/end 与并列 artifacts/result 节点。普通提交只更新最近报告；结束提交要求当前活动 task 与需等待的子 Work 已收敛，执行完成不代表人工验收通过。
+
+`session.policy.completion` 默认 `natural`，沿用 end_condition；可选 `explicit_report` 要求获准的结束报告才正常关闭 Session。普通 Done 在有输入队列的 Session 完成 Turn 并等待，在无输入队列的 WorkSession 按漏报失败。子 context 结束先交回调用方，父 Turn 保持打开；终态 Session 拒绝新增输入，后续修改创建新 Task / Work，H3 强制 reopen 不在本轮范围。
+
+工具结束报告按 run / call_id，XML 按 run / step_index 建立 `ReportSubmission`。先在 `run.json.host.extra.reports` 保存 accepted journal；文件产物为 `.opendan_agent_session/reports/{id}/{index}-{sha256}` 下的内容副本，宿主有对象库时再登记为 obj_id；对象 id 产物原样登记。state 分开保存 latest_report / final_report。工具接受结束后补齐同批未执行调用的回执并让出，宿主机械生成一次 `ReportDelivery` assistant message，与 report 文件共用正文和稳定引用，不增加推理 Round。恢复重复提交以同一身份重做，不重执行工具、不重复登记产物和交付。xllm 接手发现已接受的 final journal 会要求宿主继续完成。xllm 自行执行到宿主 XML 最终 Step 时只保存 paused + snapshot.state.report_end，不提前标记完成；宿主验证通过后交付，失败则将错误反馈给模型修正。
+
+当前持久版本：session_config / session_state 为 6，RunRecord 为 6，LLMContext snapshot 为 5，runtime protocol 为 xllm/2；不兼容旧 END / 隐式完成快照。

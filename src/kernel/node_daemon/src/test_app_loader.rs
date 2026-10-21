@@ -1,19 +1,20 @@
 use crate::app_loader::{
-    command_matches_agent_process, command_matches_exact_agent_process,
+    buckyos_tool_mounts, command_matches_agent_process, command_matches_exact_agent_process,
     container_list_contains_name, docker_deployment_health, docker_desc_requires_exact_match,
     docker_image_tar_candidates_for_arch, docker_missing_text, docker_runtime_matches_deployment,
-    docker_runtime_matches_target, exttool_prepare_lock, inspect_docker_image_layout,
-    normalize_digest, parse_docker_container_inspect, resolve_aios_image_repo_from_paths,
-    AppLoader, CommandSpec, ControlOperation, DockerCommandRunner, DockerExecOutcome,
-    DockerRuntimeIdentity, PlatformArch, PlatformOs, PlatformTarget, RuntimeType,
-    DOCKER_LABEL_APP_DOC_OBJECT_ID, DOCKER_LABEL_IMAGE_DIGEST, DOCKER_LABEL_PKG_ID,
+    docker_runtime_matches_target, inspect_docker_image_layout, normalize_digest,
+    parse_docker_container_inspect, AppLoader, CommandSpec, ControlOperation, DockerCommandRunner,
+    DockerExecOutcome, DockerRuntimeIdentity, PlatformArch, PlatformOs, PlatformTarget,
+    RuntimeType, DOCKER_LABEL_APP_DOC_OBJECT_ID, DOCKER_LABEL_IMAGE_DIGEST, DOCKER_LABEL_PKG_ID,
     DOCKER_LABEL_PKG_OBJID, DOCKER_LABEL_SPEC_GENERATION,
 };
+use crate::paios_images::exttool_prepare_lock;
 use crate::run_item::ControlRuntItemErrors;
 use buckyos_api::{
     AppDoc, AppId, AppInstanceId, AppServiceInstanceConfig, AppServiceSpec, AppType,
-    DeploymentIdentity, DeploymentPackage, LocalAppInstanceConfig, ServiceEndpointConfig,
-    ServiceInstanceState, ServiceSpecConfig, ServiceState, SubPkgDesc, OBJ_TYPE_APP_DOC,
+    DeploymentIdentity, DeploymentPackage, LocalAppInstanceConfig, MountPointConfig,
+    PermissionItem, ServiceEndpointConfig, ServiceInstanceState, ServiceSpecConfig,
+    ServiceState, SubPkgDesc, APP_PERMISSION_USER_HOME, OBJ_TYPE_APP_DOC,
 };
 use name_lib::DID;
 use ndn_lib::ObjId;
@@ -58,26 +59,196 @@ fn build_appservice_doc() -> AppDoc {
 
 fn build_agent_doc_without_category() -> AppDoc {
     let owner = DID::from_str("did:bns:test").unwrap();
-    let app_did = DID::from_str("did:web:jarvis-runtime.example").unwrap();
+    let app_did = DID::from_str("did:web:jarvis-agent.example").unwrap();
     AppDoc::builder(
         AppType::Agent,
-        "jarvis-runtime",
+        "jarvis-agent",
         "0.1.0",
         "did:bns:test",
         &owner,
     )
     .app_did(app_did)
     .agent_pkg(
-        SubPkgDesc::new("agent.jarvis-runtime.example#0.1.0")
+        SubPkgDesc::new("agent.jarvis-agent.example#0.1.0")
             .package_meta_object_id(test_package_object_id(3)),
     )
     .agent_skills_pkg(
-        SubPkgDesc::new("skills.jarvis-runtime.example#0.1.0")
+        SubPkgDesc::new("skills.jarvis-agent.example#0.1.0")
             .package_meta_object_id(test_package_object_id(4)),
     )
     .service_port("main", 4060)
     .build()
     .unwrap()
+}
+
+#[test]
+fn agent_permission_mount_boundaries() {
+    if std::env::var_os("BUCKYOS_AGENT_MOUNTS_TEST_CHILD").is_none() {
+        let root = tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "test_app_loader::agent_permission_mount_boundaries", "--nocapture"])
+            .env("BUCKYOS_ROOT", root.path())
+            .env("BUCKYOS_AGENT_MOUNTS_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let root = buckyos_kit::get_buckyos_root_dir();
+    let home = root.join("data/home/alice");
+    let data = home.join(".local/share/jarvis-agent.example");
+    let pkg = root.join("test-package");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::create_dir_all(home.join("Documents")).unwrap();
+    for (actions, expected_access) in [
+        (vec!["read".into()], "ro"),
+        (vec!["read".into(), "write".into()], "rw"),
+    ] {
+        let mut app_doc = build_agent_doc_without_category();
+        app_doc.permissions.push(PermissionItem {
+            scope_path: APP_PERMISSION_USER_HOME.into(),
+            required: true,
+            actions,
+            exp: None,
+        });
+        let mut config = build_spec_config(&app_doc);
+        config.data_mount_point.insert(
+            "/opt/buckyos/data/home/alice".into(),
+            MountPointConfig {
+                target_path: "data/home/alice".into(),
+                access: "read_write".into(),
+            },
+        );
+        config.data_mount_point.insert(
+            "/home-alias".into(),
+            MountPointConfig {
+                target_path: "data/home/alice/Documents".into(),
+                access: "read_write".into(),
+            },
+        );
+        config.external_mount_point.insert(
+            "/external-home-alias".into(),
+            MountPointConfig {
+                target_path: "data/home/alice/Documents".into(),
+                access: "read_write".into(),
+            },
+        );
+        config.external_mount_point.insert(
+            "/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example".into(),
+            MountPointConfig {
+                target_path: "data/home/alice/Documents".into(),
+                access: "read_only".into(),
+            },
+        );
+        config.external_mount_point.insert(
+            "/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example/agents/reader".into(),
+            MountPointConfig {
+                target_path: "data/home/alice/Documents".into(),
+                access: "read_only".into(),
+            },
+        );
+        let spec = build_test_app_spec(app_doc, config);
+        let instance = AppServiceInstanceConfig::new("ood1", &spec).unwrap();
+        let loader = AppLoader::new_for_service(&spec.app_instance_id.to_string(), instance);
+        let mounts = loader.test_agent_volume_mounts(&pkg).unwrap();
+        for target in [
+            "/opt/buckyos/data/home/alice",
+            "/home-alias",
+            "/external-home-alias",
+        ] {
+            let (_, _, access) = mounts.iter().find(|(path, _, _)| path == target).unwrap();
+            assert_eq!(*access, expected_access, "{target}");
+        }
+        let (_, actual, access) = mounts
+            .iter()
+            .find(|(path, _, _)| {
+                path == "/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example"
+            })
+            .unwrap();
+        assert_eq!(actual, &fs::canonicalize(&data).unwrap());
+        assert_eq!(*access, "rw");
+        assert!(!mounts.iter().any(|(path, _, _)| path.ends_with("/agents/reader")));
+        let (_, storage, access) = mounts
+            .iter()
+            .find(|(path, _, _)| path == "/opt/buckyos/storage")
+            .unwrap();
+        assert_eq!(*access, "rw");
+        assert!(storage.starts_with(root.join("storage/apps")));
+        assert_ne!(storage, &root.join("storage"));
+        if let Ok(image) = std::env::var("BUCKYOS_AGENT_MOUNTS_DOCKER_IMAGE") {
+            let mut command = std::process::Command::new("docker");
+            command.args([
+                "run", "--rm", "--network", "none", "--user", "0", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges", "--entrypoint", "sh",
+            ]);
+            for (target, source, access) in &mounts {
+                command.args(["-v", &format!("{}:{target}:{access}", source.display())]);
+            }
+            let writes = [
+                "/opt/buckyos/data/home/alice/Documents/agent-permissions-test",
+                "/home-alias/agent-permissions-test",
+                "/external-home-alias/agent-permissions-test",
+            ]
+            .map(|path| {
+                if expected_access == "ro" {
+                    format!("if printf denied > {path}; then exit 23; fi")
+                } else {
+                    format!("printf allowed > {path}")
+                }
+            })
+            .join("\n");
+            let script = format!(
+                "set -eu\nmkdir -p /opt/buckyos/data/home/alice/.local/share/jarvis-agent.example/agents/reader\nprintf writable > /opt/buckyos/data/home/alice/.local/share/jarvis-agent.example/agents/reader/state\n{writes}"
+            );
+            let output = command.args([&image, "-c", &script]).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{expected_access}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(data.join("agents/reader/state")).unwrap(),
+                "writable"
+            );
+        }
+    }
+    #[cfg(unix)]
+    {
+        let alias = root.join("home-link");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let mut app_doc = build_agent_doc_without_category();
+        app_doc.permissions.push(PermissionItem {
+            scope_path: APP_PERMISSION_USER_HOME.into(),
+            required: true,
+            actions: vec!["read".into()],
+            exp: None,
+        });
+        let mut config = build_spec_config(&app_doc);
+        config.external_mount_point.insert(
+            "/symlink-alias".into(),
+            MountPointConfig {
+                target_path: "home-link/new-directory".into(),
+                access: "read_write".into(),
+            },
+        );
+        let spec = build_test_app_spec(app_doc, config);
+        let instance = AppServiceInstanceConfig::new("ood1", &spec).unwrap();
+        let loader = AppLoader::new_for_service(&spec.app_instance_id.to_string(), instance);
+        let mounts = loader.test_agent_volume_mounts(&pkg).unwrap();
+        let (_, host, access) = mounts.iter().find(|(path, _, _)| path == "/symlink-alias").unwrap();
+        assert_eq!(host, &home.join("new-directory"));
+        assert_eq!(*access, "ro");
+        fs::remove_dir_all(&data).unwrap();
+        std::os::unix::fs::symlink(home.join("Documents"), &data).unwrap();
+        assert!(loader.test_agent_volume_mounts(&pkg).is_err());
+    }
 }
 
 fn build_web_doc() -> AppDoc {
@@ -172,6 +343,7 @@ fn build_service_loader(
     AppLoader::new_for_service(&app_instance_id, config)
         .with_platform(platform)
         .with_container_support_override(support_container)
+        .with_paios_images_root(local_paios_root())
 }
 
 fn package_matches_platform(key: &str, platform: PlatformTarget) -> bool {
@@ -262,6 +434,11 @@ fn build_spec_config(app_doc: &AppDoc) -> ServiceSpecConfig {
 }
 
 fn build_agent_loader(platform: PlatformTarget) -> AppLoader {
+    build_agent_loader_with_paios_root(platform, local_paios_root())
+        .with_worker_image_repo_override("paios/aios")
+}
+
+fn build_agent_loader_with_paios_root(platform: PlatformTarget, root: &Path) -> AppLoader {
     let app_doc = build_agent_doc_without_category();
     let install_config = build_spec_config(&app_doc);
     let app_spec = build_test_app_spec(app_doc, install_config);
@@ -272,7 +449,14 @@ fn build_agent_loader(platform: PlatformTarget) -> AppLoader {
     AppLoader::new_for_service(&app_instance_id, config)
         .with_platform(platform)
         .with_container_support_override(true)
-        .with_worker_image_repo_override("paios/aios")
+        .with_paios_images_root(root)
+}
+
+/// A BuckyOS root without bin/paios-images/ or etc/devenv.json: local image
+/// mode with the default repos, independent of the machine running the tests.
+fn local_paios_root() -> &'static Path {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| tempdir().unwrap()).path()
 }
 
 fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
@@ -338,36 +522,6 @@ fn default_tmp_mount_uses_platform_valid_host_path() {
             .join("alice")
             .join("demo.example")
     );
-}
-
-#[test]
-fn resolve_aios_image_repo_from_paths_reads_devenv_override() {
-    let temp_dir = unique_temp_path("node-daemon-devenv");
-    fs::create_dir_all(&temp_dir).unwrap();
-    let devenv_path = temp_dir.join("devenv.json");
-    fs::write(&devenv_path, r#"{"aios":"paios/aios_dev"}"#).unwrap();
-
-    let resolved =
-        resolve_aios_image_repo_from_paths([temp_dir.join("missing.json"), devenv_path.clone()]);
-
-    assert_eq!(resolved.as_deref(), Some("paios/aios_dev"));
-
-    let _ = fs::remove_dir_all(temp_dir);
-}
-
-#[test]
-fn resolve_aios_image_repo_from_paths_ignores_missing_or_empty_values() {
-    let temp_dir = unique_temp_path("node-daemon-devenv-empty");
-    fs::create_dir_all(&temp_dir).unwrap();
-    let devenv_path = temp_dir.join("devenv.json");
-    fs::write(&devenv_path, "{\"aios\":\"   \"}").unwrap();
-
-    let resolved =
-        resolve_aios_image_repo_from_paths([temp_dir.join("missing.json"), devenv_path.clone()]);
-
-    assert_eq!(resolved, None);
-
-    let _ = fs::remove_dir_all(temp_dir);
 }
 
 #[test]
@@ -627,13 +781,13 @@ fn docker_runtime_exact_match_rejects_another_deployment_generation() {
 
 #[test]
 fn agent_process_matching_distinguishes_wildcard_and_exact_checks() {
-    let agent_env = Path::new("/opt/buckyos/data/home/alice/.local/share/jarvis-runtime.example");
+    let agent_env = Path::new("/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example");
     let expected_root =
-        Path::new("/opt/buckyos/env/pkgs/agent.jarvis-runtime.example#pkg:1234567890");
+        Path::new("/opt/buckyos/env/pkgs/agent.jarvis-agent.example#pkg:1234567890");
     let exact_cmd = vec![
         "opendan".to_string(),
         "--app-id".to_string(),
-        "jarvis-runtime.example".to_string(),
+        "jarvis-agent.example".to_string(),
         "--agent-bin".to_string(),
         expected_root.to_string_lossy().to_string(),
         "--service-port".to_string(),
@@ -642,31 +796,31 @@ fn agent_process_matching_distinguishes_wildcard_and_exact_checks() {
     let old_cmd = vec![
         "opendan".to_string(),
         "--app-id".to_string(),
-        "jarvis-runtime.example".to_string(),
+        "jarvis-agent.example".to_string(),
         "--agent-bin".to_string(),
-        "/opt/buckyos/env/pkgs/agent.jarvis-runtime.example#pkg:oldversion".to_string(),
+        "/opt/buckyos/env/pkgs/agent.jarvis-agent.example#pkg:oldversion".to_string(),
         "--service-port".to_string(),
         "4060".to_string(),
     ];
 
     assert!(command_matches_agent_process(
         &exact_cmd,
-        "jarvis-runtime.example"
+        "jarvis-agent.example"
     ));
     assert!(command_matches_agent_process(
         &old_cmd,
-        "jarvis-runtime.example"
+        "jarvis-agent.example"
     ));
     assert!(command_matches_exact_agent_process(
         &exact_cmd,
-        "jarvis-runtime.example",
+        "jarvis-agent.example",
         agent_env,
         Some(expected_root),
         Some("pkg:1234567890"),
     ));
     assert!(!command_matches_exact_agent_process(
         &old_cmd,
-        "jarvis-runtime.example",
+        "jarvis-agent.example",
         agent_env,
         Some(expected_root),
         Some("pkg:1234567890"),
@@ -799,33 +953,59 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
     assert_eq!(deploy.runtime, RuntimeType::Agent);
     assert_programs(
         &deploy.commands,
-        &["pkg-install", "pkg-install", "docker", "docker", "docker"],
+        &[
+            "pkg-install",
+            "pkg-install",
+            "docker",
+            "docker",
+            "docker",
+            "docker",
+        ],
     );
     assert_eq!(
         deploy.commands[0].args,
-        vec![test_exact_package_id("agent.jarvis-runtime.example", 3)]
+        vec![test_exact_package_id("agent.jarvis-agent.example", 3)]
     );
     assert_eq!(
         deploy.commands[1].args,
-        vec![test_exact_package_id("skills.jarvis-runtime.example", 4)]
+        vec![test_exact_package_id("skills.jarvis-agent.example", 4)]
     );
+    // Local image mode never pulls: images must already be in the store.
     assert_eq!(
         deploy.commands[2].args,
-        vec!["pull", "paios/aios:latest-amd64"]
+        vec![
+            "image",
+            "inspect",
+            "--format={{json .}}",
+            "paios/aios:latest-amd64"
+        ]
     );
     assert_eq!(
         deploy.commands[3].args,
-        vec!["pull", "paios/exttool:latest-amd64"]
+        vec![
+            "image",
+            "inspect",
+            "--format={{json .}}",
+            "paios/exttool:latest-amd64"
+        ]
     );
     assert_eq!(
         deploy.commands[4].args,
-        vec!["volume", "create", "buckyos-exttool"]
+        vec!["volume", "create", "buckyos-exttool-<image id 12>"]
     );
+    assert!(deploy.commands[5]
+        .args
+        .iter()
+        .any(|arg| arg == "buckyos-exttool-<image id 12>:/opt/buckyos/tools"));
+    assert!(!deploy
+        .commands
+        .iter()
+        .any(|command| command.args.first().map(String::as_str) == Some("pull")));
 
     let start = loader.preview_operation(ControlOperation::Start).unwrap();
     assert_eq!(start.runtime, RuntimeType::Agent);
     assert_programs(&start.commands, &["docker", "docker"]);
-    let runtime_key = test_runtime_key("jarvis-runtime.example");
+    let runtime_key = test_runtime_key("jarvis-agent.example");
     let container_name = test_container_name("test-app");
     assert_eq!(
         start.commands[0].args,
@@ -842,17 +1022,17 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
         .contains(&"host.docker.internal:host-gateway".to_string()));
     assert!(start.commands[1]
         .args
-        .contains(&"BUCKYOS_APP_ID=jarvis-runtime.example".to_string()));
+        .contains(&"BUCKYOS_APP_ID=jarvis-agent.example".to_string()));
     assert!(start.commands[1]
         .args
         .contains(&"BUCKYOS_APP_TYPE=agent".to_string()));
     assert!(start.commands[1].args.contains(
-        &"BUCKYOS_DATA_DIR=/opt/buckyos/data/home/alice/.local/share/jarvis-runtime.example"
+        &"BUCKYOS_DATA_DIR=/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example"
             .to_string(),
     ));
     assert!(start.commands[1]
         .args
-        .contains(&"BUCKYOS_PKG_DIR=/opt/buckyos/bin/jarvis-runtime.example".to_string()));
+        .contains(&"BUCKYOS_PKG_DIR=/opt/buckyos/bin/jarvis-agent.example".to_string()));
     assert!(start.commands[1]
         .args
         .contains(&"BUCKYOS_PKG_SOURCE_DIR=/mnt/buckyos/pkg".to_string()));
@@ -881,17 +1061,19 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
         .args
         .iter()
         .any(|arg| arg == &format!("buckyos-instance-{runtime_key}:/opt/buckyos/instance:rw")));
-    // Default ExtTool Volume (§6.1) mounted ro — image seeds it with
-    // FreeCADCmd + pre-warmed uv/deno caches on first start.
+    // ExtTool Volume (§6.1) of the current ExtTool image, mounted ro.
     assert!(start.commands[1]
         .args
         .iter()
-        .any(|arg| arg == "buckyos-exttool:/opt/buckyos/tools:ro"));
+        .any(|arg| arg == "buckyos-exttool-<image id 12>:/opt/buckyos/tools:ro"));
     assert!(start.commands[1]
         .args
         .contains(&"BUCKYOS_EXTTOOL_DIR=/opt/buckyos/tools".to_string()));
-    assert!(start.commands[1].args.iter().any(|arg| arg
-        == "<app_data>:/opt/buckyos/data/home/alice/.local/share/jarvis-runtime.example:rw"));
+    assert!(start.commands[1]
+        .args
+        .iter()
+        .any(|arg| arg
+            == "<app_data>:/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example:rw"));
     assert!(start.commands[1]
         .args
         .iter()
@@ -905,6 +1087,25 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
     assert!(!start.commands[1]
         .args
         .contains(&"<agent-bootstrap-script>".to_string()));
+    // Host Tool scripts are mounted read-only for the image's `buckyos`
+    // launcher; the host Deno runtime is not.
+    for entry in ["cli", "dist", "package.json", "distribution.json"] {
+        let mount = format!("<buckyos_tool>/{entry}:/opt/buckyos/libexec/buckyos-tool/{entry}:ro");
+        assert!(start.commands[1].args.contains(&mount), "missing {mount}");
+    }
+    assert!(!start.commands[1]
+        .args
+        .iter()
+        .any(|arg| arg.contains("buckyos-tool/runtime")));
+    assert!(start.commands[1]
+        .args
+        .contains(&"BUCKYOS_TOOL_ENDPOINT=http://host.docker.internal:3180".to_string()));
+    assert!(start.commands[1]
+        .args
+        .contains(&"<agent_skills_pkg>:/mnt/buckyos/agent_skills:ro".to_string()));
+    assert!(start.commands[1]
+        .args
+        .contains(&"BUCKYOS_AGENT_SKILLS_PKG_DIR=/mnt/buckyos/agent_skills".to_string()));
 
     let stop = loader.preview_operation(ControlOperation::Stop).unwrap();
     assert_eq!(stop.runtime, RuntimeType::Agent);
@@ -940,7 +1141,12 @@ fn agent_control_commands_support_custom_runtime_image_repo() {
     let deploy = loader.preview_operation(ControlOperation::Deploy).unwrap();
     assert_eq!(
         deploy.commands[2].args,
-        vec!["pull", "paios/aios_dev:latest-amd64"]
+        vec![
+            "image",
+            "inspect",
+            "--format={{json .}}",
+            "paios/aios_dev:latest-amd64"
+        ]
     );
 
     let start = loader.preview_operation(ControlOperation::Start).unwrap();
@@ -990,7 +1196,8 @@ fn host_script_start_preview_uses_docker_with_script_service_image() {
     let loader = AppLoader::new_for_local("desktop-tool", config)
         .with_platform(PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64))
         .with_container_support_override(false)
-        .with_worker_image_repo_override("paios/aios");
+        .with_worker_image_repo_override("paios/aios")
+        .with_paios_images_root(local_paios_root());
 
     let preview = loader.preview_operation(ControlOperation::Start).unwrap();
     let runtime_key = test_runtime_key("desktop-tool");
@@ -1021,7 +1228,7 @@ fn host_script_start_preview_uses_docker_with_script_service_image() {
     assert!(preview.commands[1]
         .args
         .iter()
-        .any(|a| a == "buckyos-exttool:/opt/buckyos/tools:ro"));
+        .any(|a| a == "buckyos-exttool-<image id 12>:/opt/buckyos/tools:ro"));
     assert!(preview.commands[1]
         .args
         .iter()
@@ -1035,6 +1242,38 @@ fn host_script_start_preview_uses_docker_with_script_service_image() {
     assert!(preview.commands[1]
         .args
         .contains(&"BUCKYOS_PKG_SOURCE_DIR=/mnt/buckyos/pkg".to_string()));
+    assert!(!preview.commands[1]
+        .args
+        .iter()
+        .any(|a| a.contains("buckyos-tool") || a.contains("agent_skills")));
+    assert!(!preview.commands[1]
+        .args
+        .iter()
+        .any(|a| a.starts_with("BUCKYOS_TOOL_ENDPOINT=")));
+}
+
+#[test]
+fn buckyos_tool_mounts_skip_missing_entries_and_runtime() {
+    let root = tempdir().unwrap();
+    let tool_root = root.path().join("buckyos-tool");
+    fs::create_dir_all(tool_root.join("cli")).unwrap();
+    fs::create_dir_all(tool_root.join("dist")).unwrap();
+    fs::create_dir_all(tool_root.join("runtime")).unwrap();
+    fs::write(tool_root.join("package.json"), "{}").unwrap();
+
+    let mounts = buckyos_tool_mounts(&tool_root);
+    assert_eq!(
+        mounts,
+        ["cli", "dist", "package.json"]
+            .iter()
+            .map(|entry| (
+                format!("/opt/buckyos/libexec/buckyos-tool/{entry}"),
+                tool_root.join(entry)
+            ))
+            .collect::<Vec<_>>()
+    );
+    // The missing manifest is skipped, not created.
+    assert!(!tool_root.join("distribution.json").exists());
 }
 
 #[test]
@@ -1061,7 +1300,7 @@ fn host_script_stop_preview_uses_docker_rm() {
 }
 
 #[test]
-fn host_script_deploy_preview_includes_pkg_install_and_image_pull() {
+fn host_script_deploy_preview_checks_local_images_without_pulling() {
     let config = LocalAppInstanceConfig {
         target_state: ServiceInstanceState::Started,
         enable: true,
@@ -1072,23 +1311,63 @@ fn host_script_deploy_preview_includes_pkg_install_and_image_pull() {
     let loader = AppLoader::new_for_local("desktop-tool", config)
         .with_platform(PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64))
         .with_container_support_override(false)
-        .with_worker_image_repo_override("paios/aios");
+        .with_worker_image_repo_override("paios/aios")
+        .with_paios_images_root(local_paios_root());
 
     let preview = loader.preview_operation(ControlOperation::Deploy).unwrap();
     assert_eq!(preview.runtime, RuntimeType::HostScript);
-    assert_eq!(preview.commands.len(), 4);
-    assert_eq!(preview.commands[0].program, "pkg-install");
-    assert_eq!(preview.commands[1].program, "docker");
-    assert_eq!(preview.commands[1].args[0], "pull");
-    assert!(preview.commands[1].args[1].contains("paios/aios:"));
-    assert_eq!(preview.commands[2].program, "docker");
-    assert_eq!(preview.commands[2].args[0], "pull");
-    assert!(preview.commands[2].args[1].contains("paios/exttool:"));
-    assert_eq!(preview.commands[3].program, "docker");
+    assert_programs(
+        &preview.commands,
+        &["pkg-install", "docker", "docker", "docker", "docker"],
+    );
+    assert_eq!(preview.commands[1].args[..2], ["image", "inspect"]);
+    assert_eq!(preview.commands[1].args[3], "paios/aios:latest-amd64");
+    assert_eq!(preview.commands[2].args[3], "paios/exttool:latest-amd64");
     assert_eq!(
         preview.commands[3].args,
-        vec!["volume", "create", "buckyos-exttool"]
+        vec!["volume", "create", "buckyos-exttool-<image id 12>"]
     );
+}
+
+#[test]
+fn pinned_deploy_preview_loads_bundled_tarballs() {
+    let root = tempdir().unwrap();
+    let images = root.path().join("bin/paios-images");
+    fs::create_dir_all(&images).unwrap();
+    fs::write(
+        images.join("paios_images.json"),
+        include_str!("testdata/paios_images.v1.json"),
+    )
+    .unwrap();
+    let loader = build_agent_loader_with_paios_root(
+        PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64),
+        root.path(),
+    );
+
+    let deploy = loader.preview_operation(ControlOperation::Deploy).unwrap();
+    let docker = deploy
+        .commands
+        .iter()
+        .filter(|command| command.program == "docker")
+        .map(|command| command.args.clone())
+        .collect::<Vec<_>>();
+    let aios_tar = images.join("aios-amd64-7329ae7f4108.tar.gz");
+    let exttool_tar = images.join("exttool-amd64-444444444444.tar.gz");
+    assert_eq!(docker[0], vec!["load", "-i", aios_tar.to_str().unwrap()]);
+    assert_eq!(docker[1], vec!["load", "-i", exttool_tar.to_str().unwrap()]);
+    assert_eq!(
+        docker[2],
+        vec!["volume", "create", "buckyos-exttool-444444444444"]
+    );
+    assert!(docker[3].contains(&"paios/exttool:0.7.0-07787a750c1e-amd64".to_string()));
+
+    let start = loader.preview_operation(ControlOperation::Start).unwrap();
+    assert!(start.commands[1]
+        .args
+        .contains(&"paios/aios:0.7.0-835b5bd44125-amd64".to_string()));
+    assert!(start.commands[1]
+        .args
+        .contains(&"buckyos-exttool-444444444444:/opt/buckyos/tools:ro".to_string()));
 }
 
 #[test]
@@ -1106,10 +1385,12 @@ fn host_script_aarch64_uses_correct_image_tag() {
             PlatformArch::Aarch64,
         ))
         .with_container_support_override(false)
-        .with_worker_image_repo_override("paios/aios");
+        .with_worker_image_repo_override("paios/aios")
+        .with_paios_images_root(local_paios_root());
 
     let preview = loader.preview_operation(ControlOperation::Deploy).unwrap();
-    assert_eq!(preview.commands[1].args[1], "paios/aios:latest-aarch64");
+    assert_eq!(preview.commands[1].args[3], "paios/aios:latest-aarch64");
+    assert_eq!(preview.commands[2].args[3], "paios/exttool:latest-aarch64");
 }
 
 #[test]
@@ -1183,25 +1464,25 @@ fn exttool_prepare_lock_is_process_wide_and_exclusive() {
         "the ExtTool guard must be a single process-wide lock"
     );
 
-    let held = guard
-        .try_lock()
-        .expect("the ExtTool guard should be free here");
+    // Tests running in parallel take this lock while they prepare ExtTool, so
+    // wait for it instead of assuming it is free.
+    let held = guard.blocking_lock();
     assert!(
         guard.try_lock().is_err(),
         "a second caller must not enter while the ExtTool guard is held"
     );
     drop(held);
-    assert!(
-        guard.try_lock().is_ok(),
-        "the ExtTool guard must be released once the holder is done"
-    );
+    // Re-acquiring proves the guard is released once the holder is done.
+    drop(guard.blocking_lock());
 }
+
+const FAKE_EXTTOOL_ID: &str =
+    "sha256:4c1a2e5b6d7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
 
 #[derive(Clone)]
 struct FakeDockerState {
     log: Arc<Mutex<Vec<String>>>,
-    image_pulled: Arc<AtomicBool>,
-    volume_created: Arc<AtomicBool>,
+    volumes: Arc<Mutex<Vec<String>>>,
 }
 
 fn fake_docker_runner(state: FakeDockerState) -> DockerCommandRunner {
@@ -1218,60 +1499,30 @@ fn fake_docker_runner(state: FakeDockerState) -> DockerCommandRunner {
     })
 }
 
-fn missing_object(object: &str) -> DockerExecOutcome {
+fn ok_outcome(stdout: impl Into<String>) -> DockerExecOutcome {
     DockerExecOutcome {
-        ok: false,
-        stdout: String::new(),
-        stderr: format!("Error response from daemon: get {object}: no such volume"),
+        ok: true,
+        stdout: stdout.into(),
+        stderr: String::new(),
     }
 }
 
 async fn fake_docker_outcome(args: &[String], state: &FakeDockerState) -> DockerExecOutcome {
-    let sub = args.first().map(String::as_str).unwrap_or("");
-    let second = args.get(1).map(String::as_str).unwrap_or("");
-    if sub == "volume" && second == "inspect" {
-        if state.volume_created.load(Ordering::SeqCst) {
-            DockerExecOutcome {
-                ok: true,
-                stdout: "buckyos-exttool\n".to_string(),
-                stderr: String::new(),
-            }
-        } else {
-            missing_object(args.get(2).map(String::as_str).unwrap_or(""))
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    match args.as_slice() {
+        ["volume", "ls", ..] => ok_outcome(state.volumes.lock().unwrap().join("\n")),
+        ["volume", "create", name] => {
+            state.volumes.lock().unwrap().push(name.to_string());
+            ok_outcome(format!("{name}\n"))
         }
-    } else if sub == "volume" && second == "create" {
-        state.volume_created.store(true, Ordering::SeqCst);
-        DockerExecOutcome {
-            ok: true,
-            stdout: format!("{}\n", args.get(2).map(String::as_str).unwrap_or("")),
-            stderr: String::new(),
+        ["image", "inspect", "--format={{json .}}", "paios/exttool:latest-amd64"] => {
+            ok_outcome(serde_json::json!({ "Id": FAKE_EXTTOOL_ID }).to_string())
         }
-    } else if sub == "images" {
-        DockerExecOutcome {
-            ok: true,
-            stdout: if state.image_pulled.load(Ordering::SeqCst) {
-                "4c1a2e5b\n".to_string()
-            } else {
-                String::new()
-            },
-            stderr: String::new(),
+        ["run", ..] => {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            ok_outcome("")
         }
-    } else if sub == "pull" {
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        state.image_pulled.store(true, Ordering::SeqCst);
-        DockerExecOutcome {
-            ok: true,
-            stdout: String::new(),
-            stderr: String::new(),
-        }
-    } else if sub == "run" {
-        DockerExecOutcome {
-            ok: true,
-            stdout: String::new(),
-            stderr: String::new(),
-        }
-    } else {
-        panic!("fake docker received an unexpected command: {args:?}");
+        _ => panic!("fake docker received an unexpected command: {args:?}"),
     }
 }
 
@@ -1283,11 +1534,10 @@ fn count_entries(entries: &[String], needle: &str) -> usize {
 }
 
 #[tokio::test]
-async fn concurrent_prepare_exttool_volume_runs_pull_and_seed_exactly_once() {
+async fn concurrent_prepare_exttool_volume_seeds_exactly_once_without_pulling() {
     let state = FakeDockerState {
         log: Arc::new(Mutex::new(Vec::new())),
-        image_pulled: Arc::new(AtomicBool::new(false)),
-        volume_created: Arc::new(AtomicBool::new(false)),
+        volumes: Arc::new(Mutex::new(Vec::new())),
     };
     let runner = fake_docker_runner(state.clone());
 
@@ -1305,6 +1555,7 @@ async fn concurrent_prepare_exttool_volume_runs_pull_and_seed_exactly_once() {
     )
     .with_platform(platform)
     .with_container_support_override(false)
+    .with_paios_images_root(local_paios_root())
     .with_docker_command_runner(runner);
 
     let prepare_both = async {
@@ -1317,39 +1568,383 @@ async fn concurrent_prepare_exttool_volume_runs_pull_and_seed_exactly_once() {
         tokio::time::timeout(Duration::from_secs(5), prepare_both)
             .await
             .expect("both prepares should finish promptly");
-    assert!(
-        agent_result.is_ok(),
-        "agent prepare failed: {agent_result:?}"
-    );
-    assert!(
-        host_script_result.is_ok(),
-        "host script prepare failed: {host_script_result:?}"
-    );
+    let volume = "buckyos-exttool-4c1a2e5b6d7f";
+    assert_eq!(agent_result.unwrap().as_deref(), Some(volume));
+    assert_eq!(host_script_result.unwrap().as_deref(), Some(volume));
 
     let entries = state.log.lock().unwrap().clone();
+    assert_eq!(count_entries(&entries, "volume ls"), 2, "{entries:?}");
     assert_eq!(
-        count_entries(&entries, "volume inspect"),
+        count_entries(
+            &entries,
+            "image inspect --format={{json .}} paios/exttool:latest-amd64"
+        ),
         2,
-        "both callers must run their own volume check: {entries:?}"
+        "both callers must check the local ExtTool image: {entries:?}"
     );
+    assert_eq!(count_entries(&entries, "pull"), 0, "{entries:?}");
     assert_eq!(
-        count_entries(&entries, "images -q paios/exttool"),
-        2,
-        "both callers must run their own image check: {entries:?}"
-    );
-    assert_eq!(
-        count_entries(&entries, "pull paios/exttool"),
-        1,
-        "the slow image pull must happen exactly once: {entries:?}"
-    );
-    assert_eq!(
-        count_entries(&entries, "volume create buckyos-exttool"),
+        count_entries(&entries, &format!("volume create {volume}")),
         1,
         "the volume must be created exactly once: {entries:?}"
     );
     assert_eq!(
-        count_entries(&entries, "run --rm -v buckyos-exttool:"),
+        count_entries(
+            &entries,
+            "touch /opt/buckyos/tools/.buckyos-seeded-4c1a2e5b6d7f"
+        ),
         1,
         "the volume seeding run must happen exactly once: {entries:?}"
     );
+    assert_eq!(
+        count_entries(&entries, "test -f /seed/.buckyos-seeded-4c1a2e5b6d7f"),
+        1,
+        "the second caller only checks the seed marker: {entries:?}"
+    );
+}
+
+struct DockerObservationFixture {
+    commands: Vec<Vec<String>>,
+    container: Option<serde_json::Value>,
+    repo_digests: Vec<String>,
+    image_exists: bool,
+    image_inspect_fails: bool,
+}
+
+fn docker_observation_fixture(
+    image_id: &str,
+) -> (
+    AppServiceInstanceConfig,
+    Arc<Mutex<DockerObservationFixture>>,
+) {
+    let app_doc = build_appservice_doc();
+    let mut spec = build_test_app_spec(app_doc.clone(), build_spec_config(&app_doc));
+    let platform = PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64);
+    spec.packages
+        .retain(|package| package_matches_platform(&package.sub_pkg_name, platform));
+    let config = AppServiceInstanceConfig::new("ood1", &spec).unwrap();
+    let desc = config
+        .node_execution_spec
+        .packages
+        .get("amd64_docker_image")
+        .unwrap();
+    let labels = HashMap::from([
+        (DOCKER_LABEL_PKG_ID, desc.pkg_id.clone()),
+        (
+            DOCKER_LABEL_PKG_OBJID,
+            desc.pkg_objid.as_ref().unwrap().to_string(),
+        ),
+        (DOCKER_LABEL_IMAGE_DIGEST, "sha256:deadbeef".to_string()),
+        (
+            DOCKER_LABEL_APP_DOC_OBJECT_ID,
+            config.deployment.app_doc_object_id.to_string(),
+        ),
+        (
+            DOCKER_LABEL_SPEC_GENERATION,
+            config.deployment.spec_generation.to_string(),
+        ),
+    ]);
+    let container = serde_json::json!({
+        "Id": "container-one",
+        "Image": image_id,
+        "State": { "Running": true, "Health": { "Status": "healthy" } },
+        "Config": { "Labels": labels },
+    });
+    (
+        config,
+        Arc::new(Mutex::new(DockerObservationFixture {
+            commands: Vec::new(),
+            container: Some(container),
+            repo_digests: vec!["demo/service@sha256:deadbeef".to_string()],
+            image_exists: true,
+            image_inspect_fails: false,
+        })),
+    )
+}
+
+fn docker_observation_loader(
+    config: &AppServiceInstanceConfig,
+    fixture: &Arc<Mutex<DockerObservationFixture>>,
+) -> AppLoader {
+    let fixture = fixture.clone();
+    let runner: DockerCommandRunner = Arc::new(move |args| {
+        let fixture = fixture.clone();
+        Box::pin(async move {
+            let mut fixture = fixture.lock().unwrap();
+            fixture.commands.push(args.clone());
+            let stdout = match args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["container", "inspect", ..] => {
+                    let Some(container) = fixture.container.as_ref() else {
+                        return DockerExecOutcome {
+                            ok: false,
+                            stdout: String::new(),
+                            stderr: "No such container".to_string(),
+                        };
+                    };
+                    container.to_string()
+                }
+                ["container", "ls", ..] => String::new(),
+                ["image", "inspect", "--format={{json .RepoDigests}}", ..] => {
+                    if fixture.image_inspect_fails {
+                        return DockerExecOutcome {
+                            ok: false,
+                            stdout: String::new(),
+                            stderr: "docker daemon unavailable".to_string(),
+                        };
+                    }
+                    serde_json::to_string(&fixture.repo_digests).unwrap()
+                }
+                ["images", "-q", ..] => if fixture.image_exists {
+                    "image-present"
+                } else {
+                    ""
+                }
+                .to_string(),
+                _ => panic!("unexpected docker observation command: {args:?}"),
+            };
+            DockerExecOutcome {
+                ok: true,
+                stdout,
+                stderr: String::new(),
+            }
+        })
+    });
+    AppLoader::new_for_service(
+        &config.node_execution_spec.app_instance_id.to_string(),
+        config.clone(),
+    )
+    .with_platform(PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64))
+    .with_container_support_override(true)
+    .with_docker_command_runner(runner)
+}
+
+#[tokio::test]
+async fn deployment_observation_reads_state_health_and_identity_with_one_inspect() {
+    let (config, fixture) = docker_observation_fixture("sha256:observation-label-match");
+    let loader = docker_observation_loader(&config, &fixture);
+    for (running, health, state, expected_health) in [
+        (
+            true,
+            "healthy",
+            ServiceInstanceState::Started,
+            buckyos_api::DeploymentHealth::Healthy,
+        ),
+        (
+            true,
+            "unhealthy",
+            ServiceInstanceState::Started,
+            buckyos_api::DeploymentHealth::Unhealthy,
+        ),
+        (
+            true,
+            "starting",
+            ServiceInstanceState::Started,
+            buckyos_api::DeploymentHealth::Unknown,
+        ),
+        (
+            false,
+            "healthy",
+            ServiceInstanceState::Exited,
+            buckyos_api::DeploymentHealth::Unhealthy,
+        ),
+    ] {
+        {
+            let mut fixture = fixture.lock().unwrap();
+            fixture.commands.clear();
+            let container = fixture.container.as_mut().unwrap();
+            container["State"]["Running"] = serde_json::json!(running);
+            container["State"]["Health"]["Status"] = serde_json::json!(health);
+        }
+        let observation = loader.observe_deployment().await.unwrap();
+        assert_eq!(observation.state, state);
+        assert_eq!(observation.health, expected_health);
+        assert_eq!(observation.container_id.as_deref(), Some("container-one"));
+        assert_eq!(
+            observation.identity.unwrap().image_id.as_deref(),
+            Some("sha256:observation-label-match")
+        );
+        let fixture = fixture.lock().unwrap();
+        assert_eq!(fixture.commands.len(), 1, "{:?}", fixture.commands);
+        assert_eq!(&fixture.commands[0][..2], ["container", "inspect"]);
+    }
+}
+
+#[tokio::test]
+async fn deployment_observation_uses_container_image_id_without_image_inspect() {
+    let (config, fixture) = docker_observation_fixture("sha256:deadbeef");
+    fixture.lock().unwrap().container.as_mut().unwrap()["Config"]["Labels"]
+        .as_object_mut()
+        .unwrap()
+        .remove(DOCKER_LABEL_IMAGE_DIGEST);
+    let observation = docker_observation_loader(&config, &fixture)
+        .observe_deployment()
+        .await
+        .unwrap();
+    assert_eq!(observation.state, ServiceInstanceState::Started);
+    assert_eq!(fixture.lock().unwrap().commands.len(), 1);
+}
+
+#[tokio::test]
+async fn deployment_observation_caches_digest_across_loaders_and_refreshes_changed_image() {
+    let (config, fixture) = docker_observation_fixture("sha256:observation-cached-image-one");
+    fixture.lock().unwrap().container.as_mut().unwrap()["Config"]["Labels"]
+        .as_object_mut()
+        .unwrap()
+        .remove(DOCKER_LABEL_IMAGE_DIGEST);
+    for _ in 0..2 {
+        let observation = docker_observation_loader(&config, &fixture)
+            .observe_deployment()
+            .await
+            .unwrap();
+        assert_eq!(observation.state, ServiceInstanceState::Started);
+    }
+    {
+        let mut fixture = fixture.lock().unwrap();
+        assert_eq!(fixture.commands.len(), 3, "{:?}", fixture.commands);
+        let container = fixture.container.as_mut().unwrap();
+        container["Id"] = serde_json::json!("container-two");
+        container["Image"] = serde_json::json!("sha256:observation-cached-image-two");
+    }
+    let observation = docker_observation_loader(&config, &fixture)
+        .observe_deployment()
+        .await
+        .unwrap();
+    assert_eq!(observation.state, ServiceInstanceState::Started);
+    assert_eq!(observation.container_id.as_deref(), Some("container-two"));
+    let fixture = fixture.lock().unwrap();
+    assert_eq!(fixture.commands.len(), 5, "{:?}", fixture.commands);
+    assert_eq!(
+        fixture.commands[4].last().unwrap(),
+        "sha256:observation-cached-image-two"
+    );
+}
+
+#[tokio::test]
+async fn deployment_observation_rejects_stale_generation_without_inspecting_its_image() {
+    let (config, fixture) = docker_observation_fixture("sha256:observation-stale-generation");
+    {
+        let mut fixture = fixture.lock().unwrap();
+        fixture.image_exists = false;
+        let labels = &mut fixture.container.as_mut().unwrap()["Config"]["Labels"];
+        labels
+            .as_object_mut()
+            .unwrap()
+            .remove(DOCKER_LABEL_IMAGE_DIGEST);
+        labels[DOCKER_LABEL_SPEC_GENERATION] = serde_json::json!("0");
+    }
+    let observation = docker_observation_loader(&config, &fixture)
+        .observe_deployment()
+        .await
+        .unwrap();
+    assert_eq!(observation.state, ServiceInstanceState::NotExist);
+    assert_eq!(observation.health, buckyos_api::DeploymentHealth::Unknown);
+    let fixture = fixture.lock().unwrap();
+    assert_eq!(fixture.commands.len(), 2, "{:?}", fixture.commands);
+    assert_eq!(fixture.commands[1][0], "images");
+}
+
+#[tokio::test]
+async fn deployment_observation_missing_container_preserves_installed_image_state() {
+    let (config, fixture) = docker_observation_fixture("sha256:observation-missing");
+    fixture.lock().unwrap().container = None;
+    let observation = docker_observation_loader(&config, &fixture)
+        .observe_deployment()
+        .await
+        .unwrap();
+    assert_eq!(observation.state, ServiceInstanceState::Stopped);
+    assert_eq!(observation.health, buckyos_api::DeploymentHealth::Unknown);
+    assert!(observation.identity.is_none());
+    fixture.lock().unwrap().image_exists = false;
+    assert_eq!(
+        docker_observation_loader(&config, &fixture)
+            .observe_deployment()
+            .await
+            .unwrap()
+            .state,
+        ServiceInstanceState::NotExist
+    );
+}
+
+#[tokio::test]
+async fn deployment_observation_retries_digest_inspect_after_failure() {
+    let (config, fixture) = docker_observation_fixture("sha256:observation-inspect-retry");
+    {
+        let mut fixture = fixture.lock().unwrap();
+        fixture.image_inspect_fails = true;
+        fixture.container.as_mut().unwrap()["Config"]["Labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove(DOCKER_LABEL_IMAGE_DIGEST);
+    }
+    let loader = docker_observation_loader(&config, &fixture);
+    assert!(loader.observe_deployment().await.is_err());
+    fixture.lock().unwrap().image_inspect_fails = false;
+    assert_eq!(
+        loader.observe_deployment().await.unwrap().state,
+        ServiceInstanceState::Started
+    );
+    assert_eq!(fixture.lock().unwrap().commands.len(), 4);
+}
+
+#[tokio::test]
+async fn deployment_observation_refreshes_cached_metadata_for_new_digest() {
+    let (mut config, fixture) = docker_observation_fixture("sha256:observation-new-digest");
+    fixture.lock().unwrap().container.as_mut().unwrap()["Config"]["Labels"]
+        .as_object_mut()
+        .unwrap()
+        .remove(DOCKER_LABEL_IMAGE_DIGEST);
+    assert_eq!(
+        docker_observation_loader(&config, &fixture)
+            .observe_deployment()
+            .await
+            .unwrap()
+            .state,
+        ServiceInstanceState::Started
+    );
+    config
+        .node_execution_spec
+        .packages
+        .get_mut("amd64_docker_image")
+        .unwrap()
+        .docker_image_digest = Some("sha256:new-digest".to_string());
+    fixture.lock().unwrap().repo_digests = vec!["demo/service@sha256:new-digest".to_string()];
+    assert_eq!(
+        docker_observation_loader(&config, &fixture)
+            .observe_deployment()
+            .await
+            .unwrap()
+            .state,
+        ServiceInstanceState::Started
+    );
+    assert_eq!(fixture.lock().unwrap().commands.len(), 4);
+}
+
+#[tokio::test]
+async fn deployment_observation_does_not_cache_missing_digest_metadata() {
+    let (config, fixture) = docker_observation_fixture("sha256:observation-empty-digests");
+    {
+        let mut fixture = fixture.lock().unwrap();
+        fixture.container.as_mut().unwrap()["Config"]["Labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove(DOCKER_LABEL_IMAGE_DIGEST);
+        fixture.repo_digests.clear();
+        fixture.image_exists = false;
+    }
+    let loader = docker_observation_loader(&config, &fixture);
+    assert_eq!(
+        loader.observe_deployment().await.unwrap().state,
+        ServiceInstanceState::NotExist
+    );
+    fixture.lock().unwrap().repo_digests = vec!["demo/service@sha256:deadbeef".to_string()];
+    assert_eq!(
+        loader.observe_deployment().await.unwrap().state,
+        ServiceInstanceState::Started
+    );
+    assert_eq!(fixture.lock().unwrap().commands.len(), 5);
 }

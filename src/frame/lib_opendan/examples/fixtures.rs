@@ -24,11 +24,12 @@ use std::time::{Duration, Instant};
 use agent_tool::xllm::XllmDeps;
 use async_trait::async_trait;
 use buckyos_api::{AiContent, AiMessage, AiResponse, AiRole, AiUsage};
-use libopendan::api::{create_session, SessionSpec};
+use libopendan::api::{create_session, create_sub_session, SessionSpec, SubSessionSpec};
 use libopendan::channel::{kmsg::post_to_queue, KmsgChannels, PollWaker};
 use libopendan::protocol::*;
 use libopendan::runner::{drive, RunnerDeps, RunnerOptions, StopWhen};
 use libopendan::runtime::NativeRuntime;
+use libopendan::state::{AgentStateClient, GoalCaller, GoalCreate};
 use libopendan::{FsAgentStateClient, SessionDir};
 use llm_context::deps::{LlmClient, LlmInferenceRequest};
 use llm_context::error::{LLMComputeError, ProviderFailure};
@@ -88,6 +89,16 @@ impl LlmClient for Script {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let all = render(&req.messages);
         let mut r = match self.name.as_str() {
+            "final_report" => tool(
+                "report-final",
+                "report",
+                json!({
+                    "report": "Delivered the verified answer.",
+                    "artifacts": ["answer.txt"],
+                    "result": { "answer": 42 },
+                    "is_end": true
+                }),
+            ),
             "tool_then_answer" => {
                 if all.contains("<tool_result c1>") {
                     text("done: notes.txt written")
@@ -106,6 +117,28 @@ impl LlmClient for Script {
                     )
                 }
             }
+            "ask_notify" => {
+                if all.contains("<tool_result q1") {
+                    text("migrated to Postgres")
+                } else {
+                    let pending = json!({
+                        "agent_tool_protocol": "1", "tool": "ask-user", "status": "pending",
+                        "task_id": "userinput:q1", "summary": "waiting for the answer",
+                        "detail": { "question": "Postgres or SQLite?", "input": { "kind": "choice",
+                            "options": [ { "id": "pg", "label": "Postgres" }, { "id": "lite", "label": "SQLite" } ] } },
+                    });
+                    tool("q1", "shell", json!({ "command": format!("printf '%s' '{pending}'") }))
+                }
+            }
+            "goal_no_action" => tool(
+                "goal-report",
+                "report",
+                json!({
+                    "report": "Item 1 was ticked by its work; nothing else is open.",
+                    "is_end": true,
+                    "result": { "decision": "no_action", "distance": "TODO.md has no finished items left", "pending": [] }
+                }),
+            ),
             "transient" => {
                 if all.contains("second message") {
                     text("got both")
@@ -120,9 +153,9 @@ impl LlmClient for Script {
                 let n = all.matches("<response>").count();
                 let _ = n;
                 if all.contains("research result") {
-                    text("<response><report><![CDATA[final]]></report></response>")
+                    text("<response><report end=\"true\"><![CDATA[final]]></report></response>")
                 } else if all.contains("context_switch to=\"research\"") {
-                    text("<response><report><![CDATA[research result]]></report></response>")
+                    text("<response><report end=\"true\"><![CDATA[research result]]></report></response>")
                 } else if all.contains("p1-output") {
                     text("<response><next_behavior>research</next_behavior></response>")
                 } else {
@@ -329,23 +362,39 @@ fn relativize(dir: &Path) {
         .map(|p| p.display().to_string())
         .unwrap_or(root.clone());
     let host = libopendan::runtime::native_host_id();
-    let uid = fixture_paths::uid();
     let hostname = fixture_paths::hostname();
+    placeholder_uid(dir, &fixture_paths::uid());
     fixture_paths::rewrite(
         dir,
         &[
             (&canon, "${FIXTURE_ROOT}"),
             (&root, "${FIXTURE_ROOT}"),
             (&host, "${FIXTURE_HOST}"),
-            (
-                &format!("\"uid\": \"{uid}\""),
-                "\"uid\": \"${FIXTURE_UID}\"",
-            ),
             (&hostname, "${FIXTURE_HOSTNAME}"),
         ],
     );
     // kmsg lock file is runtime only.
     let _ = std::fs::remove_file(dir.join("kmsg").join(".lock"));
+    fixture_paths::compact(dir);
+}
+
+fn placeholder_uid(dir: &Path, uid: &str) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            placeholder_uid(&p, uid);
+        } else if let Ok(mut s) = std::fs::read_to_string(&p) {
+            for quote in ["\"", "\\\""] {
+                for sep in [": ", ":"] {
+                    s = s.replace(
+                        &format!("{quote}uid{quote}{sep}{quote}{uid}{quote}"),
+                        &format!("{quote}uid{quote}{sep}{quote}${{FIXTURE_UID}}{quote}"),
+                    );
+                }
+            }
+            std::fs::write(&p, s).unwrap();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +504,11 @@ async fn gen(out: &Path) -> R<()> {
         // The command belongs to nobody now (standard process semantics);
         // leave no process behind in the generator environment.
         let _ = std::process::Command::new("pkill")
-            .args(["-KILL", "-f", &sd.path().join("marker").display().to_string()])
+            .args([
+                "-KILL",
+                "-f",
+                &sd.path().join("marker").display().to_string(),
+            ])
             .status();
         write_expected(&d, "killed_during_exec",
             "The runner was killed while `shell` ran: run.json holds the in-flight call c1; the latest snapshot has no result for c1. No process identity is recorded.",
@@ -490,7 +543,10 @@ async fn gen(out: &Path) -> R<()> {
         drive(&sd, &env.deps("tool_then_answer"), StopWhen::Finished).await;
         env.post(
             &sd,
-            PostedInput::control(APP, "d-1", ControlCommand::Decide {
+            PostedInput::control(
+                APP,
+                "d-1",
+                ControlCommand::Decide {
                     decision: "accept".into(),
                     by: "did:user:alice".into(),
                     note: None,
@@ -534,10 +590,31 @@ async fn gen(out: &Path) -> R<()> {
         let env = Env::new(&d);
         let ws = d.join("ws");
         std::fs::create_dir_all(&ws)?;
+        let workspace = env
+            .agent()
+            .workspaces()
+            .import(
+                &WorkspaceImport {
+                    operation_id: "fixture-overlap".into(),
+                    location: WorkspaceLocation {
+                        runtime_id: CONTAINER_RUNTIME.into(),
+                        directory: ws,
+                    },
+                    name: Some("Overlap fixture".into()),
+                    description: String::new(),
+                    usage: WorkspaceUsage::Collaborative,
+                    expected_revision: None,
+                    source_session: None,
+                    policy_ref: None,
+                },
+                APP,
+            )
+            .await?;
         let mk = |p: &str| {
             let mut s = work("edit");
-            s.workspace = Some(WorkspaceRef::External {
-                path: ws.display().to_string(),
+            s.workspace = Some(WorkspaceRef {
+                workspace_id: workspace.workspace_id.clone(),
+                access: WorkspaceAccess::ReadWrite,
             });
             s.scope = Some(Scope {
                 paths: vec![p.into()],
@@ -555,7 +632,7 @@ async fn gen(out: &Path) -> R<()> {
         write_expected(&d, "active_overlap",
             "A is running (registry status running, touching ws:snake/src/); B is created on the same workspace.",
             vec![observe(&a), observe(&b)],
-            json!({ "action": "render_active_sessions", "session": b.sid(), "sees": [a.sid()], "relation": "same_target", "overlap": ["ws:snake/src/"] }));
+            json!({ "action": "workspace_busy", "session": b.sid(), "sees": [a.sid()], "relation": "same_target", "overlap": ["ws:snake/src/"] }));
         relativize(&d);
     }
     // 11. large worklog with a summary start point
@@ -579,6 +656,7 @@ async fn gen(out: &Path) -> R<()> {
                     run_id: "r-old".into(),
                     turn: i,
                     content: format!("old message {i}"),
+                    brief: None,
                 }],
             )?;
         }
@@ -684,12 +762,20 @@ async fn gen(out: &Path) -> R<()> {
             let out = render_template(tpl, vars.clone()).await?;
             write(&format!("rendering/templates/{name}.out"), out.as_bytes());
         }
-        for (name, media) in [("reference", InputMedia::Reference), ("inline", InputMedia::Inline)] {
+        for (name, media) in [
+            ("reference", InputMedia::Reference),
+            ("inline", InputMedia::Inline),
+        ] {
             let m = input_fixture::user_message(&builtin, &view, media);
             write(
                 &format!("rendering/ai_message_{name}.json"),
                 &pretty(&serde_json::to_value(&m)?),
             );
+        }
+        // The chat format of UI sessions (Session Input Protocol §6.5).
+        for (file, batch, group) in input_fixture::CHAT_BATCHES {
+            let text = input_fixture::chat_text(&records, batch, *group);
+            write(&format!("rendering/{file}"), text.as_bytes());
         }
         // The semi event as the snapshot message of the next controlled input.
         let semi = &records[3].1;
@@ -701,7 +787,10 @@ async fn gen(out: &Path) -> R<()> {
             "<semi_subscription_snapshot>\n{}\n</semi_subscription_snapshot>",
             render_snapshot_events(&views)
         );
-        write("rendering/semi_subscription_snapshot.txt", snapshot.as_bytes());
+        write(
+            "rendering/semi_subscription_snapshot.txt",
+            snapshot.as_bytes(),
+        );
         let v = json!({
             "scenario": "input_bus",
             "description": "Hand-written Session Input Bus records (opendan.session_input/3): what a consumer does with each, why the rejected ones are rejected, and the byte-exact text of the built-in formats and the example templates for one batch.",
@@ -727,6 +816,13 @@ async fn gen(out: &Path) -> R<()> {
                     "output": format!("rendering/templates/{n}.out"),
                 })).collect::<Vec<_>>(),
                 "ai_message": { "reference": "rendering/ai_message_reference.json", "inline": "rendering/ai_message_inline.json" },
+                "chat": {
+                    "timezone": input_fixture::CHAT_TIMEZONE,
+                    "background": "every line new; the semi event of 04_event_semi_object.json as a background line",
+                    "batches": input_fixture::CHAT_BATCHES.iter().map(|(f, b, g)| json!({
+                        "output": format!("rendering/{f}"), "batch": b, "group": g,
+                    })).collect::<Vec<_>>(),
+                },
                 "rules": [
                     "`{{ input | render_format: \"input.xml\" }}` equals input.text byte for byte",
                     "message.xml / event.xml equal the corresponding element inside input.text",
@@ -736,6 +832,226 @@ async fn gen(out: &Path) -> R<()> {
             }
         });
         write("expected.json", &pretty(&v));
+    }
+    {
+        let d = scen("15_report_pending_commit");
+        let env = Env::new(&d);
+        let mut spec = work("submit the verified answer");
+        spec.policy.completion = CompletionPolicy::ExplicitReport;
+        spec.prompt.llm_context = json!({
+            "tools": { "enabled": true, "tools": [{ "name": "report" }] }
+        });
+        let sd = env.create("work-fixture-report", spec).await;
+        std::fs::write(sd.path().join("answer.txt"), "verified answer: 42\n")?;
+        env.child_wait(&sd, "final_report", "report:after_paired_checkpoint");
+        assert!(!sd.state()?.is_finished());
+        let live = sd.state()?.live_run.unwrap();
+        let (record, snapshot) = sd.runs().load_checked(&live.run_id)?;
+        assert!(!record.status.is_terminal());
+        assert!(
+            agent_tool::exec_tracking::persisted_outcome_ids(&snapshot.unwrap())
+                .iter()
+                .any(|call_id| call_id == "report-final")
+        );
+        assert_eq!(
+            record.host.as_ref().unwrap().extra["reports"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        write_expected(&d, "report_pending_commit",
+            "The final report and stable artifact are persisted, and its tool result is paired in the published snapshot. The run and Session are not yet terminal.",
+            vec![observe(&sd)],
+            json!({
+                "action": "complete_accepted_report_without_inference",
+                "llm_calls": 0,
+                "rounds_after": 1,
+                "report_deliveries": 1,
+                "tool_results": { "report-final": 1 },
+                "final_report": "Delivered the verified answer.",
+                "result": { "answer": 42 },
+                "artifact": { "path": "answer.txt", "content": "verified answer: 42\n" },
+                "outcome": "succeeded",
+                "acceptance": "pending"
+            }));
+        relativize(&d);
+    }
+    {
+        // A Goal, its Goal Session between Activations, a Work of the Goal
+        // that finished, and an Activation whose close is committed but not
+        // written back to the Goal yet.
+        let d = scen("16_goal_session");
+        let env = Env::new(&d);
+        let agent = env.agent();
+        let goal = agent
+            .goals()
+            .create(
+                &GoalCreate {
+                    key: Some("fixture".into()),
+                    title: Some("todo keeper".into()),
+                    objective: "Keep TODO.md free of finished items.".into(),
+                    distance_evaluation: "Count the finished items still listed in TODO.md.".into(),
+                    schedule: GoalScheduleSpec {
+                        every_secs: Some(3600),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                &GoalCaller::owner(APP),
+            )
+            .await?;
+        agent.goals().prepare_epoch(&goal.goal_id, 1).await?;
+        let (gsd, _) = libopendan::goal::ensure_goal_session(
+            agent.as_ref(),
+            &goal,
+            1,
+            APP,
+            env.channels().as_ref(),
+            &d.join("app"),
+            &json!({ "tools": { "enabled": true } }),
+            libopendan::goal::GOAL_CLASS,
+        )
+        .await?;
+        let work = create_sub_session(
+            agent.as_ref(),
+            APP,
+            gsd.sid(),
+            SubSessionSpec {
+                objective: "Tick item 1 of TODO.md".into(),
+                msgs: vec!["tick item 1 of TODO.md".into()],
+                key: Some("fixture-work".into()),
+                ..Default::default()
+            },
+            env.channels().as_ref(),
+        )
+        .await?;
+        let r = drive(&work, &env.deps("answer"), StopWhen::Finished).await;
+        assert!(r.is_finished(), "{r:?}");
+        libopendan::goal::post_activation(
+            agent.as_ref(),
+            &goal,
+            APP,
+            ActivationReasonKind::Scheduled,
+            &libopendan::goal::scheduled_key(&goal.goal_id, 1, 1),
+            "scheduled run (every 3600s)",
+        )
+        .await?;
+        env.child_wait(&gsd, "goal_no_action", "finish_run:after_commit");
+        let st = gsd.state()?;
+        let shadow = st.goal.clone().unwrap();
+        assert!(shadow.needs_flush() && shadow.unwritten.len() == 1);
+        assert_eq!(st.waiting_for.as_ref().map(|w| w.kind), Some(WaitingKind::Event));
+        let mut observed = observe(&gsd);
+        observed["goal"] = json!({
+            "goal_id": goal.goal_id,
+            "epoch": shadow.epoch,
+            "state_rev": shadow.state.rev,
+            "published_rev": shadow.published_rev,
+            "unwritten": shadow.unwritten.iter().map(|a| json!([a.epoch, a.seq])).collect::<Vec<_>>(),
+            "activation_open": shadow.activation.is_some(),
+            "waiting_for": st.waiting_for.as_ref().map(|w| w.kind),
+        });
+        write_expected(&d, "goal_session",
+            "Goal g (agent_root/state/goals/<goal_id>/) with its epoch-1 Goal Session between Activations (waiting for an event). Activation 1 consumed a scheduled run opportunity and the end of the Goal's Work, its Turn close is committed in state.json (state.goal), but the Goal State and the Activation record are not written back to the Goal yet.",
+            vec![observed, observe(&work)],
+            json!({
+                "action": "publish_goal_state_and_append_activation_without_inference",
+                "llm_calls": 0,
+                "goal_state_rev": shadow.state.rev,
+                "activation": {
+                    "epoch": 1,
+                    "seq": 1,
+                    "outcome": "completed",
+                    "decision": "no_action",
+                    "reasons": ["scheduled", "child"],
+                    "works_absorbed": [work.sid()],
+                },
+                "goal_state": {
+                    "absorbed": [work.sid()],
+                    "distance": "TODO.md has no finished items left",
+                    "activations": 1
+                },
+                "session": { "run_state": "waiting", "waiting_for": "event", "finished": false }
+            }));
+        relativize(&d);
+    }
+    {
+        // A Work waiting for the answer to a question it asked through a
+        // notification (files of the AgentRoot: LocalNotify), and a UI
+        // session that observed a notification shown in its conversation.
+        let d = scen("17_notify");
+        let env = Env::new(&d);
+        let local = Arc::new(libopendan::notify::LocalNotify::enable(&d.join("agent_root"), AGENT)?);
+        let mut spec = libopendan::SessionTemplate::load("work", None)?.spec("Pick the database of the notes app");
+        spec.prompt.llm_context = json!({ "tools": { "enabled": true } });
+        let wsd = env.create("work-notify", spec).await;
+        let mut deps = env.deps("ask_notify");
+        deps.notify = Some(local.clone());
+        let r = drive(&wsd, &deps, StopWhen::Idle).await;
+        assert!(matches!(r, libopendan::runner::DriveResult::Idle { .. }), "{r:?}");
+        let st = wsd.state()?;
+        let w = st.waiting_for.clone().unwrap();
+        assert_eq!(w.kind, WaitingKind::Input);
+        let views = libopendan::notify::NotifyHost::list(local.as_ref(), Default::default()).await?;
+        assert_eq!(views.len(), 1);
+        let asked = &views[0];
+        let mut ui = libopendan::SessionTemplate::load("ui", None)?.spec("chat with alice");
+        ui.route_key = Some(format!("{AGENT}/dm%3Adid%3Abns%3Aalice"));
+        ui.outbound = Some(OutboundBinding {
+            to: "did:bns:alice".into(),
+            to_session: None,
+            kind: "chat".into(),
+        });
+        let usd = env.create("ui-notify", ui).await;
+        let data = buckyos_api::NotifyDeliveredData {
+            notify_id: asked.notify_id.clone(),
+            url: asked.url.clone(),
+            kind: asked.kind,
+            category: asked.category,
+            level: asked.level,
+            title: "Postgres or SQLite?".into(),
+            message: None,
+            options: libopendan::notify::prompt_options(&asked.prompt),
+            source: buckyos_api::NotifySource {
+                session_id: Some(wsd.sid().to_string()),
+                ..Default::default()
+            },
+            delivered_msg_id: None,
+            reply_route: buckyos_api::NotifyConversation {
+                to: "did:bns:alice".into(),
+                to_session: None,
+            },
+            at_ms: FIXTURE_MS,
+        };
+        let (key, ev) = libopendan::notify::notify_event(&data, "dm:did:bns:alice");
+        let mut posted = PostedInput::event(APP, key, ev);
+        posted.at_ms = FIXTURE_MS;
+        env.post(&usd, posted).await;
+        let _ = drive(&usd, &env.deps("answer"), StopWhen::Idle).await;
+        assert_eq!(usd.state()?.pending_events.len(), 1);
+        let mut work_obs = observe(&wsd);
+        work_obs["waiting_for"] = serde_json::to_value(&w)?;
+        let mut ui_obs = observe(&usd);
+        ui_obs["pending_events"] = serde_json::to_value(&usd.state()?.pending_events)?;
+        write_expected(&d, "notify",
+            "Work work-notify asked the user with `ask-user` (call q1) and, nobody reading it, the question went out as an `input` notification (agent_root/state/notifies/, run.json host.extra.asks.q1.notify): state waits for input with the deadline and the notification's task. UI session ui-notify holds a `_notify` observation of that notification in its conversation, not injected yet (it opened no Turn).",
+            vec![work_obs, ui_obs],
+            json!({
+                "work": {
+                    "action": "answer_the_notification_then_fill_q1_once",
+                    "answer": { "option": "pg" },
+                    "tool_result_q1": { "option": "pg", "text": "Postgres", "via": "notification", "notify_id": asked.notify_id },
+                    "llm_calls": 1,
+                    "report": "migrated to Postgres"
+                },
+                "ui": {
+                    "action": "show_the_observation_with_the_next_message",
+                    "snapshot_line_starts_with": format!("[notify {}] input/timely", asked.notify_id),
+                    "turns_opened_by_the_observation": 0
+                }
+            }));
+        relativize(&d);
     }
     // JSON Schemas next to the fixtures.
     let schema_dir = out.join("..").join("schema");

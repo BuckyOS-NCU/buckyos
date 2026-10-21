@@ -1,14 +1,15 @@
-import { useEffect } from 'react'
 import type { AppContentLoaderProps } from '../types'
 import { SettingsStoreContext } from './hooks/use-settings-store'
-import { globalSettingsStore } from './mock/store'
+import { globalSettingsStore } from './data/store'
 import { SettingsShell } from './components/layout/SettingsShell'
 import type { SettingsPage } from './components/layout/navigation'
 import { GeneralPage } from './pages/GeneralPage'
 import { AppearancePage } from './pages/AppearancePage'
 import { ClusterManagerPage } from './pages/ClusterManagerPage'
 import { PrivacyPage } from './pages/PrivacyPage'
+import { FilePermissionsPage } from './pages/FilePermissionsPage'
 import { DeveloperModePage } from './pages/DeveloperModePage'
+import { ZonePage } from './pages/ZonePage'
 
 function PageRouter({ page, appProps }: { page: SettingsPage; appProps: AppContentLoaderProps }) {
   switch (page) {
@@ -16,10 +17,14 @@ function PageRouter({ page, appProps }: { page: SettingsPage; appProps: AppConte
       return <GeneralPage />
     case 'appearance':
       return <AppearancePage appProps={appProps} />
+    case 'zone':
+      return <ZonePage />
     case 'cluster':
       return <ClusterManagerPage />
     case 'privacy':
       return <PrivacyPage />
+    case 'file-permissions':
+      return <FilePermissionsPage />
     case 'developer':
       return <DeveloperModePage />
     default:
@@ -28,11 +33,6 @@ function PageRouter({ page, appProps }: { page: SettingsPage; appProps: AppConte
 }
 
 export function SettingsAppPanel(props: AppContentLoaderProps) {
-  useEffect(() => {
-    void globalSettingsStore.reloadBuckyOSInfo()
-    void globalSettingsStore.reloadBuckyOSDevConfig()
-  }, [])
-
   return (
     <SettingsStoreContext.Provider value={globalSettingsStore}>
       <SettingsShell>

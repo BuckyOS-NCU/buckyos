@@ -33,6 +33,9 @@ modules:
   aiworkspace:
     type: rust
     name: aiworkspace
+  homestation:
+    type: rust
+    name: homestation
   repo_service:
     type: rust
     name: repo_service
@@ -80,10 +83,10 @@ modules:
     format: pikg
     name: text_editor
     src_dir: apps/text_editor
-  jarvis_runtime:
+  jarvis_agent:
     format: pikg
-    name: jarvis_runtime
-    src_dir: apps/jarvis_runtime
+    name: jarvis_agent
+    src_dir: apps/jarvis_agent
 
 apps:
   buckyos:
@@ -108,6 +111,7 @@ apps:
       smb_service: bin/smb-service/
       nfs_server: bin/nfs-server/
       aiworkspace: bin/aiworkspace/
+      homestation: bin/homestation/
       repo_service: bin/repo-service/
       node_active: bin/node-active/
       aicc: bin/aicc/
@@ -127,7 +131,8 @@ apps:
       desktop: bin/control-panel/web/
       buckyos_systest: data/cache/buckyos-systest.buckyos.bns.did-0.5.1.pikg
       text_editor: data/cache/text-editor.buckyos.bns.did-0.1.0.pikg
-      jarvis_runtime: data/cache/jarvis.buckyos.bns.did-0.7.0.pikg
+      jarvis_agent: data/cache/jarvis.buckyos.bns.did-0.7.0.pikg
+      paios_images: bin/paios-images/
 
     # 数据路径，install_data 的时候如果目标存在，则不会复制，否则从rootfs复制到目标(覆盖安装逻辑)
     data_paths: 

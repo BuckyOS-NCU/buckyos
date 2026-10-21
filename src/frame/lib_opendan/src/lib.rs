@@ -14,6 +14,9 @@
 //! - [`bridge`]: msg-center / task state → Session Input Bus records.
 //! - [`runtime`]: execution environments for `exec` (native, tmux).
 //! - [`runner`]: drives a session to its end condition.
+//! - [`goal`]: Goals and their Goal Sessions (derivation, run
+//!   opportunities, budgets); the Goal object is in [`state::GoalStore`].
+//! - [`xagent_cli`]: the `xagent` command line.
 
 pub mod api;
 pub mod bridge;
@@ -21,15 +24,21 @@ pub mod channel;
 pub mod error;
 pub mod fault;
 pub mod fsutil;
+pub mod goal;
 pub mod host;
 pub mod ids;
 pub mod lock;
+pub mod memory;
+pub mod notify;
 pub mod protocol;
 pub mod runner;
 pub mod runtime;
 pub mod session;
+pub mod skills;
 pub mod state;
 pub mod template;
+pub mod todos;
+pub mod xagent_cli;
 
 pub use api::{
     create_self_improve_session, create_session, post_input, read_session, InputChannel,

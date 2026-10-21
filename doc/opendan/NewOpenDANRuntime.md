@@ -1,5 +1,7 @@
 # new opendan agent runtime
 
+> 2026-10-10 H4 已替代本文历史 END / 隐式 report-only 完成描述：Behavior 用 `<report end="true">`，工具用 `report(..., is_end=true)`；同次结束决策不带动作或非空调度。当前完成策略、持久提交与恢复以 [Session Directory Protocol](<protocol/Session Directory Protocol.md>) 和 [Agent Actions](<../llm_context/Agent Actions.md>) 为准。
+
 > 重构目标：把 opendan 从「自己写 Agent Loop / Behavior 解析 / step 记录」改造成
 > 「**只负责构造正确的 LLMContextRequest + 正确的 LLMContextDeps，调度 LLMContext.run() / resume()，并消化 Outcome**」。
 >
@@ -394,7 +396,7 @@ render plan 由两类输入合成：
 
 | 层 | 路径 | 权限 | 承载 | 持久化 |
 |----|------|------|------|--------|
-| System Bin | `/opt/buckyos/tools/store/` | rx，所有 App 共享 | Worker Image 预置 CLI（ffmpeg/pandoc/...） | 随镜像 |
+| System Bin | `/opt/buckyos/tools/store/` | rx，所有 App 共享 | Worker Image 预置 CLI（ffmpeg/imagemagick/...） | 随镜像 |
 | Runtime Bin | `/opt/buckyos/tools/bin/` | rx，App-scoped symlink view | 从 `store/` + ExtTool Volume 渲染（Crafter 镜像产出工具包接入处） | 容器临时，按 manifest 重建 |
 | Agent Bin | Agent Root 下 `/tools/`（Instance Volume 内） | rwx 给 Agent | Agent 自演化脚本；升级走文件级合并（paios §7.4 R-15） | 持久化（Instance Volume） |
 | Session Bin（声明） | session 目录 `./tools/` | rwx | tool.toml / 脚本源 / 工具包元数据 / 交付物（平台无关） | 持久化（跨 OS 可迁移） |
@@ -403,7 +405,7 @@ render plan 由两类输入合成：
 **渲染规则**（2026-05-14 修订：改为 PATH 拼接 + Session 渲染的极简模型）：
 
 - **System / Runtime / Agent 三层**：每层就是一个普通的 bin 目录，**不做任何渲染**，
-  直接按顺序拼到 PATH 即可。系统工具（ffmpeg/pandoc/...）、卷工具（ExtTool Volume）、
+  直接按顺序拼到 PATH 即可。系统工具（ffmpeg/imagemagick/...）、卷工具（ExtTool Volume，如 pandoc）、
   Agent 自写脚本，都是"现成就摆在 bin 里"的文件。
 - **Session Exec Bin 是唯一需要"渲染"的层**，承担两件事：
   1. **Agent tools 落地**：session 启动时把 Agent Root FS 的 `/tools/` 内容自动拷过去（一份
@@ -478,7 +480,7 @@ opendan 的 `agent_config` 负责把这份 TOML 翻译成 `LLMContextRequest` + 
 
 ```xml
 <response>
-  <thinking>...自由形式推理...</thinking>
+  <intent>...下一步要做什么，一句话...</intent>
   <observation>...对上一步 action_result 的解读...</observation>
   <action tool="shell" call_id="optional">
     {"command": "ls -la"}
@@ -503,7 +505,7 @@ opendan 的 `agent_config` 负责把这份 TOML 翻译成 `LLMContextRequest` + 
 
 **Renderer 行为**：
 - `render(step) → (assistant, user)`：assistant = verbatim `assistant_text`；user = `<action_result tool="X" call_id="Y" status="ok|error|pending"[ truncated="true"]>BODY</action_result>`（或 `<step_ack/>` 当 step 无 action）
-- `render_history(steps)`：两档压缩——最近 `recent_full_steps` 个步骤全量；更老的步骤用 `<thinking>summary</thinking>` 形式收敛 assistant_text，action_result body 截断
+- `render_history(steps)`：两档压缩——最近 `recent_full_steps` 个步骤全量；更老的步骤用 `<intent>summary</intent>` 形式收敛 assistant_text，action_result body 截断
 - 严格保持 `(assistant, user)` 交替，对所有 provider 都兼容
 
 **自定义实现**：worksession 想用别的协议（JSON 行、ReAct markdown、自定义 DSL……）时，
@@ -836,6 +838,8 @@ WorkSession 的 `Done` 不需要特别处理——下游通过 worksession 的 `
 ---
 
 ## 8. WorkSession 工具：try_create_worksession / create_worksession / forward_msg
+
+> 2026-10-11：本节描述的 `try_create_worksession` 已被 behavior `analyze_intent` 的具名函数 `try_analyze_user_intent`（`[tool]` 声明，fork 子 context）取代，见 [架构文档 §5.6](<OpenDAN Agent Session架构设计.md>) 与 [意图分析 TODO](../../notepads/opendan-analyze-user-intent-todo.md)。
 
 UI session 不直接构造 worksession——它经过一个 **fork 出来的 sub-LLMContext** 来决定
 "复用已有 worksession 还是新建一个"，由 sub-context 调一个全参数的 `create_worksession`

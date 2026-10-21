@@ -306,6 +306,24 @@ impl OpenAiResponsesCodec {
 
 #[async_trait]
 impl OperationCodec for OpenAiResponsesCodec {
+    fn resource_input_form(&self) -> crate::resource::ResourceInputForm {
+        crate::resource::ResourceInputForm::UrlOrBytes
+    }
+
+    fn resource_input_form_for(
+        &self,
+        resource_pointers: &[&str],
+    ) -> crate::resource::ResourceInputForm {
+        if resource_pointers
+            .iter()
+            .any(|pointer| pointer.contains("/content/") && pointer.ends_with("/value/result"))
+        {
+            crate::resource::ResourceInputForm::BytesOnly
+        } else {
+            self.resource_input_form()
+        }
+    }
+
     fn descriptor(&self) -> &OperationDescriptor {
         &self.descriptor
     }
@@ -790,6 +808,7 @@ fn encode_response_input(
                 || (canonical_item_count > 0 && native_items.len() >= canonical_item_count)
             {
                 for item in native_items {
+                    let item = encode_provider_state_resources(item, call.context)?;
                     validate_provider_state(&item)?;
                     items.push(item);
                 }
@@ -848,14 +867,15 @@ fn encode_response_input(
                 AiContent::ProviderState { source, value, .. }
                     if super::provider_state_is_native(source, &call.context.state_coordinate) =>
                 {
-                    validate_provider_state(value)?;
+                    let value = encode_provider_state_resources(value.clone(), call.context)?;
+                    validate_provider_state(&value)?;
                     if replays_output_message
                         && value.get("type").and_then(Value::as_str) == Some("refusal")
                     {
-                        content.push(value.clone());
+                        content.push(value);
                     } else {
                         flush(&mut content, &mut items);
-                        items.push(value.clone());
+                        items.push(value);
                     }
                 }
                 AiContent::ProviderState {
@@ -917,6 +937,34 @@ fn validate_provider_state(value: &Value) -> ProtocolResultValue<()> {
     Ok(())
 }
 
+fn encode_provider_state_resources(
+    mut value: Value,
+    context: &CodecContext,
+) -> ProtocolResultValue<Value> {
+    if value.get("type").and_then(Value::as_str) != Some("image_generation_call") {
+        return Ok(value);
+    }
+    let Some(result) = value.get("result").cloned() else {
+        return Ok(value);
+    };
+    let Ok(resource) = serde_json::from_value::<PublicResourceRef>(result) else {
+        return Ok(value);
+    };
+    let bytes = match &resource {
+        PublicResourceRef::Base64 { data_base64, .. } => STANDARD
+            .decode(data_base64)
+            .map_err(|_| ProtocolError::invalid_request("resource contains invalid base64"))?,
+        PublicResourceRef::Url { .. } | PublicResourceRef::NamedObject { .. } => {
+            context.materialized_resource(&resource)?.bytes.to_vec()
+        }
+    };
+    value
+        .as_object_mut()
+        .expect("OpenAI provider state was validated as an object")
+        .insert("result".to_string(), Value::String(STANDARD.encode(bytes)));
+    Ok(value)
+}
+
 fn apply_responses_parameters(
     body: &mut Map<String, Value>,
     parameters: &BTreeMap<String, Value>,
@@ -938,12 +986,17 @@ fn apply_responses_parameters(
             }
             continue;
         }
+        if name == "translation_options" {
+            apply_translation_options(body, value)?;
+            continue;
+        }
         let valid = match name.as_str() {
             "background" | "parallel_tool_calls" | "store" | "stream" => value.is_boolean(),
             "include" => value
                 .as_array()
                 .is_some_and(|items| items.iter().all(Value::is_string)),
             "metadata" | "reasoning" | "thinking" => value.is_object(),
+            "max_output_tokens" => value.as_u64().is_some_and(|tokens| tokens > 0),
             "service_tier" | "truncation" => value.is_string(),
             "tool_choice" => value.is_string() || value.is_object(),
             _ => false,
@@ -955,6 +1008,87 @@ fn apply_responses_parameters(
         }
         body.insert(name.clone(), value.clone());
     }
+    Ok(())
+}
+
+fn apply_translation_options(
+    body: &mut Map<String, Value>,
+    value: &Value,
+) -> ProtocolResultValue<()> {
+    let options = value.as_object().ok_or_else(|| {
+        ProtocolError::invalid_request(
+            "resolved OpenAI Responses translation_options must be an object",
+        )
+    })?;
+    if options
+        .keys()
+        .any(|name| !matches!(name.as_str(), "source_language" | "target_language"))
+    {
+        return Err(ProtocolError::invalid_request(
+            "resolved OpenAI Responses translation_options contains an unsupported field",
+        ));
+    }
+    let target_language = options
+        .get("target_language")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ProtocolError::invalid_request(
+                "resolved OpenAI Responses translation_options requires target_language",
+            )
+        })?;
+    if options
+        .get("source_language")
+        .is_some_and(|value| value.as_str().is_none_or(|value| value.trim().is_empty()))
+    {
+        return Err(ProtocolError::invalid_request(
+            "resolved OpenAI Responses translation_options source_language must be a non-empty string",
+        ));
+    }
+    let input = body
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            ProtocolError::invalid_request(
+                "OpenAI Responses translation_options requires array input",
+            )
+        })?;
+    let mut input_text = None;
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        if item.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("input_text") {
+                if input_text.is_some() {
+                    return Err(ProtocolError::invalid_request(
+                        "OpenAI Responses translation_options requires exactly one user input_text block",
+                    ));
+                }
+                input_text = block.as_object_mut();
+            }
+        }
+    }
+    let input_text = input_text.ok_or_else(|| {
+        ProtocolError::invalid_request(
+            "OpenAI Responses translation_options requires exactly one user input_text block",
+        )
+    })?;
+    let mut normalized = Map::new();
+    if let Some(source_language) = options.get("source_language") {
+        normalized.insert("source_language".to_owned(), source_language.clone());
+    }
+    normalized.insert(
+        "target_language".to_owned(),
+        Value::String(target_language.to_owned()),
+    );
+    input_text.insert("translation_options".to_owned(), Value::Object(normalized));
     Ok(())
 }
 
@@ -1091,8 +1225,8 @@ fn decode_response_object(
     let mut artifacts = Vec::new();
     let mut images = Vec::new();
     for item in output {
-        decode_response_item(item, &mut blocks, &mut artifacts, &mut images)?;
-        blocks.push(provider_state(item.clone()));
+        let provider_value = decode_response_item(item, &mut blocks, &mut artifacts, &mut images)?;
+        blocks.push(provider_state(provider_value));
     }
     let message = AiMessage::new(AiRole::Assistant, blocks);
     message.validate().map_err(|error| {
@@ -1134,10 +1268,11 @@ fn decode_response_item(
     blocks: &mut Vec<AiContent>,
     artifacts: &mut Vec<AiArtifact>,
     images: &mut Vec<PublicResourceRef>,
-) -> ProtocolResultValue<()> {
+) -> ProtocolResultValue<Value> {
     let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
         ProtocolError::invalid_response("OpenAI response output item is missing type")
     })?;
+    let mut provider_value = item.clone();
     match item_type {
         "message" => {
             let content = item
@@ -1245,6 +1380,17 @@ fn decode_response_item(
                 .transpose()?
                 .unwrap_or("image/png");
             let resource = PublicResourceRef::base64(mime.to_string(), result);
+            provider_value
+                .as_object_mut()
+                .expect("OpenAI response item was validated as an object")
+                .insert(
+                    "result".to_string(),
+                    serde_json::to_value(&resource).map_err(|_| {
+                        ProtocolError::invalid_response(
+                            "OpenAI image generation resource could not be normalized",
+                        )
+                    })?,
+                );
             let index = images.len();
             images.push(resource.clone());
             artifacts.push(AiArtifact {
@@ -1256,7 +1402,7 @@ fn decode_response_item(
         }
         _ => {}
     }
-    Ok(())
+    Ok(provider_value)
 }
 
 fn provider_state(value: Value) -> AiContent {
@@ -1729,6 +1875,16 @@ fn encode_input_file(
     title: Option<&str>,
     call: &CodecCall<'_>,
 ) -> ProtocolResultValue<Value> {
+    // Materialization may have handed this resource over as a URL because the
+    // protocol takes one (`ResourceInputForm`), in which case there are no
+    // bytes to inline and the URL is the only usable form.
+    if let Some(url) = call.context.materialized_url(source) {
+        return Ok(json!({
+            "type": "input_file",
+            "file_url": url,
+            "filename": title
+        }));
+    }
     match source {
         PublicResourceRef::Url { url, .. } => Ok(json!({
             "type": "input_file",
@@ -1747,6 +1903,12 @@ fn resource_data_or_url(
     source: &PublicResourceRef,
     call: &CodecCall<'_>,
 ) -> ProtocolResultValue<String> {
+    // Materialization may have handed this resource over as a URL because the
+    // protocol takes one (`ResourceInputForm`), in which case there are no
+    // bytes to inline and the URL is the only usable form.
+    if let Some(url) = call.context.materialized_url(source) {
+        return Ok(url.to_string());
+    }
     match source {
         PublicResourceRef::Url { url, .. } => Ok(url.clone()),
         PublicResourceRef::Base64 { mime, data_base64 } => {
@@ -2994,14 +3156,56 @@ mod tests {
     }
 
     #[test]
-    fn responses_accepts_typed_provider_thinking_extension() {
+    fn responses_accepts_typed_provider_defaults() {
         let mut body = Map::new();
         apply_responses_parameters(
             &mut body,
-            &BTreeMap::from([("thinking".to_string(), json!({"type": "disabled"}))]),
+            &BTreeMap::from([
+                ("thinking".to_string(), json!({"type": "disabled"})),
+                ("max_output_tokens".to_string(), json!(2048)),
+            ]),
         )
         .unwrap();
         assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["max_output_tokens"], 2048);
+
+        assert!(apply_responses_parameters(
+            &mut Map::new(),
+            &BTreeMap::from([("max_output_tokens".to_string(), json!(0))]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn responses_nests_typed_translation_options_in_the_user_input_text() {
+        let mut body = Map::from_iter([(
+            "input".to_owned(),
+            json!([{"role":"user","content":[{"type":"input_text","text":"hello"}]}]),
+        )]);
+        apply_responses_parameters(
+            &mut body,
+            &BTreeMap::from([(
+                "translation_options".to_owned(),
+                json!({"source_language":"en","target_language":"zh"}),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            body["input"][0]["content"][0]["translation_options"],
+            json!({"source_language":"en","target_language":"zh"})
+        );
+
+        assert!(apply_responses_parameters(
+            &mut Map::from_iter([(
+                "input".to_owned(),
+                json!([{"role":"user","content":[{"type":"input_text","text":"hello"}]}]),
+            )]),
+            &BTreeMap::from([(
+                "translation_options".to_owned(),
+                json!({"source_language":"en"}),
+            )]),
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -3281,6 +3485,14 @@ mod tests {
             output.value["message"]["content"][1]["type"],
             "provider_state"
         );
+        let image_state = output.value["provider_states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|state| state["value"]["type"] == "image_generation_call")
+            .unwrap();
+        assert_eq!(image_state["value"]["result"]["kind"], "base64");
+        assert!(!image_state["value"]["result"].is_string());
 
         let assistant: AiMessage = serde_json::from_value(output.value["message"].clone()).unwrap();
         let request = LlmChatInvokeRequest::new(

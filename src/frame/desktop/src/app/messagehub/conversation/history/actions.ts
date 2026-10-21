@@ -52,6 +52,10 @@ export interface ConversationMessageActions {
   openDetails?: (message: MessageObject) => void
   /** Read receipt of an own group message, when the session shows receipts. */
   readReceipt?: (message: MessageObject) => ReadReceipt | null
+  /** The viewer may answer, acknowledge and dismiss notification cards (the owner, never an observer). */
+  handleNotify?: boolean
+  /** The viewer may answer friend request cards (the owner, never an observer). */
+  answerFriendRequests?: boolean
 }
 
 export const ConversationMessageActionsContext = createContext<ConversationMessageActions>({})

@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
-use buckyos_api::{AgentSpec, AppType, SelectorType};
+use buckyos_api::{
+    AgentPermissionMode, AgentSpec, AppType, MailboxAddress, MailboxKind, SelectorType,
+};
 use log::*;
 use package_lib::PackageId;
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,7 @@ use buckyos_api::{
     AppServiceSpec, AvailabilityEffect, KernelServiceSpec, NodeConfig,
     SchedulerRefreshRbacResponse, ServiceInstanceReportInfo, ServiceState, SystemConfigClient,
     UserSettings, UserState, UserType as ApiUserType, ZoneConfig, ZoneGatewaySettings,
-    APP_REGISTRY_KEY, CONTROL_PANEL_SERVICE_PORT,
+    APP_REGISTRY_KEY, CONTROL_PANEL_SERVICE_PORT, NFS_SERVER_SERVICE_NAME,
 };
 use buckyos_kit::*;
 use name_client::*;
@@ -1205,12 +1207,26 @@ pub(crate) async fn update_node_gateway_info(
                             service_id: spec_id.clone(),
                             selector: selector.clone(),
                         });
-                    for host in ["_", "www", "sys"] {
+                    // `homestation.<zone>` is HomeStation's own short host: like `www.<zone>`,
+                    // the Desktop serves it and opens the zone's default feed at `/`.
+                    for host in ["_", "www", "sys", "homestation"] {
                         node_gateway_info
                             .app_info
                             .entry(host.to_string())
                             .or_insert_with(|| service_entry.clone());
                     }
+                }
+            } else if spec_id == NFS_SERVER_SERVICE_NAME {
+                // `share.<zone>/s/{token}`: share links served by nfs-server (its own
+                // origin, apart from the Desktop), see notepads/share-content-mgr-tech-design-todo.md.
+                if let Some(selector) = selector.as_ref() {
+                    node_gateway_info.app_info.insert(
+                        "share".to_string(),
+                        NodeGatewayAppEntry::Service(NodeGatewayAppServiceInfoEntry {
+                            service_id: spec_id.clone(),
+                            selector: selector.clone(),
+                        }),
+                    );
                 }
             }
         }
@@ -1315,6 +1331,10 @@ pub(crate) async fn update_node_gateway_info(
         node_gateway_info
             .app_info
             .entry("www".to_string())
+            .or_insert_with(|| control_panel_entry.clone());
+        node_gateway_info
+            .app_info
+            .entry("homestation".to_string())
             .or_insert(control_panel_entry);
     }
 
@@ -1438,6 +1458,29 @@ async fn update_rbac(
         }
         policy.push_str(line.as_str());
     }
+    let mut agent_specs = Vec::new();
+    let mut read_only_apps = HashSet::new();
+    let mut paths = input_config.keys().collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let parts = path.split('/').collect::<Vec<_>>();
+        if !matches!(parts.as_slice(), ["users", _, "agents", _, "spec"]) {
+            continue;
+        }
+        let agent_spec: AgentSpec = serde_json::from_str(&input_config[path])?;
+        agent_spec
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid AgentSpec at {path}: {error}"))?;
+        if agent_spec.agent_id.as_str() != parts[3]
+            || agent_spec.binding.target_app_instance_id.owner_user_id() != parts[1]
+        {
+            return Err(anyhow::anyhow!("AgentSpec at {path} has inconsistent ownership"));
+        }
+        if agent_spec.permission_mode == AgentPermissionMode::ReadOnly {
+            read_only_apps.insert(agent_spec.binding.target_app_instance_id.app_id().clone());
+        }
+        agent_specs.push(agent_spec);
+    }
 
     for (user_id, user_item) in scheduler_ctx.users.iter() {
         if user_id == "root" {
@@ -1496,10 +1539,15 @@ async fn update_rbac(
     for (spec_id, service_spec) in scheduler_ctx.specs.iter() {
         match service_spec.spec_type {
             ServiceSpecType::App => {
-                push_policy_line(
-                    &mut rbac_policy,
-                    format!("g, app:{}, app", service_spec.app_id),
-                );
+                if !read_only_apps
+                    .iter()
+                    .any(|app_id| app_id.as_str() == service_spec.app_id)
+                {
+                    push_policy_line(
+                        &mut rbac_policy,
+                        format!("g, app:{}, app", service_spec.app_id),
+                    );
+                }
             }
             ServiceSpecType::Service => {
                 push_policy_line(
@@ -1516,24 +1564,74 @@ async fn update_rbac(
         }
     }
 
-    for (path, value) in input_config {
-        if !path.starts_with("users/") || !path.contains("/agents/") || !path.ends_with("/spec") {
-            continue;
+    for agent_spec in &agent_specs {
+        let runtime_app_id = agent_spec.binding.target_app_instance_id.app_id();
+        let runtime_subject = format!("app:{runtime_app_id}");
+        let agent_subject = agent_spec.agent_did.to_string();
+        let runtime_read_only = read_only_apps.contains(runtime_app_id);
+        if runtime_read_only {
+            push_policy_line(
+                &mut rbac_policy,
+                format!("g, {runtime_subject}, agent_read_only"),
+            );
+        } else {
+            for role in ["agent_read_write", "agent_runtime", "agent"] {
+                push_policy_line(
+                    &mut rbac_policy,
+                    format!("g, {runtime_subject}, {role}"),
+                );
+            }
         }
-        let agent_spec: AgentSpec = serde_json::from_str(value)?;
-        agent_spec
-            .validate()
-            .map_err(|error| anyhow::anyhow!("invalid AgentSpec at {path}: {error}"))?;
+        if agent_spec.permission_mode == AgentPermissionMode::ReadWrite {
+            push_policy_line(&mut rbac_policy, format!("g, {agent_subject}, agent"));
+        }
+        let owner = rbac_literal(agent_spec.binding.target_app_instance_id.owner_user_id());
+        let agent_id = rbac_literal(agent_spec.agent_id.as_str());
+        let app_instance_id =
+            rbac_literal(&agent_spec.binding.target_app_instance_id.to_string());
+        let mailbox = MailboxAddress::new(agent_spec.agent_did.clone(), None)
+            .map_err(anyhow::Error::msg)?;
+        for subject in [&runtime_subject, &agent_subject] {
+            for key in ["settings", "profile", "spec", "info"] {
+                push_policy_line(
+                    &mut rbac_policy,
+                    format!(
+                        "p, {subject}, obj://config/users/{owner}/agents/{agent_id}/{key},read,allow"
+                    ),
+                );
+            }
+            for resource in [
+                format!("obj://config/users/{owner}/agents/{agent_id}/info"),
+                format!(
+                    "obj://config/users/{owner}/apps/{}/info",
+                    rbac_literal(runtime_app_id.as_str())
+                ),
+                format!("obj://config/services/{app_instance_id}/instances/{{node}}"),
+            ] {
+                push_policy_line(
+                    &mut rbac_policy,
+                    format!("p, {subject}, {resource},write,allow"),
+                );
+            }
+            push_policy_line(
+                &mut rbac_policy,
+                format!("p, {subject}, {},read|write,allow", mailbox.owner_resource()),
+            );
+            for kind in [MailboxKind::Inbox, MailboxKind::Sent, MailboxKind::RequestBox] {
+                let resource = mailbox.resource(kind);
+                for resource in [resource.clone(), format!("{resource}/*")] {
+                    push_policy_line(
+                        &mut rbac_policy,
+                        format!("p, {subject}, {resource},read|write,allow"),
+                    );
+                }
+            }
+        }
+    }
+    for app_id in read_only_apps {
         push_policy_line(
             &mut rbac_policy,
-            format!("g, {}, agent", agent_spec.agent_did.to_string()),
-        );
-        push_policy_line(
-            &mut rbac_policy,
-            format!(
-                "g, app:{}, agent_runtime",
-                agent_spec.binding.target_app_instance_id.app_id()
-            ),
+            format!("p, app:{app_id}, obj://*,all,deny"),
         );
     }
 
@@ -1552,6 +1650,255 @@ async fn update_rbac(
     );
 
     Ok(result)
+}
+
+fn rbac_literal(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        if "\\.^$|?*+()[]{}".contains(ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod agent_rbac_tests {
+    use super::*;
+    use buckyos_api::{agent_spec_key, AgentId, AgentServiceBinding, AGENT_SPEC_SCHEMA_VERSION};
+    use name_lib::{generate_ed25519_key_pair, AgentDocument, DID};
+
+    fn agent_spec(owner: &str, name: &str) -> AgentSpec {
+        let agent_did = DID::new("web", &format!("{name}.example.com"));
+        let (_, public_key) = generate_ed25519_key_pair();
+        let agent_doc = AgentDocument::new(
+            agent_did.clone(),
+            DID::new("web", &format!("{owner}.example.com")),
+            serde_json::from_value(public_key).unwrap(),
+        );
+        let (agent_doc_object_id, _) = ndn_lib::build_named_object_by_json(
+            "agentdoc",
+            &serde_json::to_value(&agent_doc).unwrap(),
+        );
+        let agent_id = AgentId::from_agent_did(&agent_did).unwrap();
+        AgentSpec {
+            schema_version: AGENT_SPEC_SCHEMA_VERSION,
+            agent_id: agent_id.clone(),
+            agent_did: agent_did.clone(),
+            agent_doc_object_id: agent_doc_object_id.clone(),
+            agent_doc,
+            permission_mode: AgentPermissionMode::ReadWrite,
+            binding: AgentServiceBinding {
+                schema_version: AGENT_SPEC_SCHEMA_VERSION,
+                agent_did,
+                agent_doc_object_id,
+                target_app_instance_id: format!("{agent_id}@{owner}").parse().unwrap(),
+                service_name: "www".to_string(),
+                generation: 1,
+            },
+            generation: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn each_agent_spec_grants_agent_role_to_its_constructed_app() {
+        let input = ["xiaobai", "xiaohei"]
+            .into_iter()
+            .map(|name| {
+                let spec = agent_spec("bob", name);
+                (
+                    agent_spec_key("bob", &spec.agent_id),
+                    serde_json::to_string(&spec).unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let actions = update_rbac(&input, &NodeScheduler::new_empty(1))
+            .await
+            .unwrap();
+        let Some(KVAction::Update(policy)) = actions.get("system/rbac/policy") else {
+            panic!("RBAC policy should be generated");
+        };
+        let lines = policy.lines().collect::<HashSet<_>>();
+        for name in ["xiaobai", "xiaohei"] {
+            for expected in [
+                format!("g, did:web:{name}.example.com, agent"),
+                format!("g, app:{name}.example.com, agent_runtime"),
+                format!("g, app:{name}.example.com, agent"),
+                format!("g, app:{name}.example.com, agent_read_write"),
+            ] {
+                assert!(lines.contains(expected.as_str()), "missing `{expected}`");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_permissions_preserve_owner_limits_and_read_only_runtime_state() {
+        let writable = agent_spec("bob", "writer");
+        let mut readonly = agent_spec("bob", "reader");
+        readonly.permission_mode = AgentPermissionMode::ReadOnly;
+        let input = [&writable, &readonly]
+            .into_iter()
+            .map(|spec| {
+                (
+                    agent_spec_key("bob", &spec.agent_id),
+                    serde_json::to_string(spec).unwrap(),
+                )
+            })
+            .collect();
+        let mut scheduler = NodeScheduler::new_empty(1);
+        scheduler.users.insert(
+            "bob".into(),
+            UserItem {
+                userid: "bob".into(),
+                user_type: UserType::User,
+                res_pool_id: None,
+            },
+        );
+        let mut service = create_service_spec_by_app_config(
+            "reader.example.com@bob",
+            "bob",
+            &super::app_lifecycle_tests::app_spec(),
+        );
+        service.app_id = readonly.agent_id.to_string();
+        scheduler.specs.insert(service.id.clone(), service);
+        let actions = update_rbac(&input, &scheduler).await.unwrap();
+        let Some(KVAction::Update(policy)) = actions.get("system/rbac/policy") else {
+            panic!("RBAC policy should be generated");
+        };
+        assert!(!policy.contains("g, app:reader.example.com, app"));
+        assert!(!policy.contains("g, app:reader.example.com, agent_runtime"));
+        assert!(!policy.contains("g, did:web:reader.example.com, agent"));
+        let config = buckyos_api::build_current_rbac_config(Some(policy));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let writer = "app:writer.example.com";
+        let reader = "app:reader.example.com";
+        for resource in [
+            "obj://config/users/bob/profile",
+            "obj://config/users/bob/apps/notes/settings",
+        ] {
+            assert!(rbac::enforce("bob", writer, resource, "write", None).await);
+            assert!(rbac::enforce("bob", reader, resource, "read", None).await);
+            assert!(!rbac::enforce("bob", reader, resource, "write", None).await);
+        }
+        for resource in [
+            "obj://config/users/alice/profile",
+            "obj://config/security/alice/key",
+        ] {
+            for app in [writer, reader] {
+                assert!(!rbac::enforce("bob", app, resource, "read", None).await);
+                assert!(!rbac::enforce("bob", app, resource, "write", None).await);
+            }
+        }
+        assert!(!rbac::enforce(
+            "bob",
+            writer,
+            "obj://config/users/bob/settings",
+            "write",
+            None
+        )
+        .await);
+        for resource in [
+            "obj://config/users/bob/settings",
+            "obj://config/users/bob/agents/writer.example.com/key",
+            "obj://config/users/bob/agents/reader.example.com/key",
+            "obj://config/security/bob/key",
+        ] {
+            assert!(!rbac::enforce("bob", reader, resource, "read", None).await);
+            assert!(!rbac::enforce("root", reader, resource, "read", None).await);
+        }
+        for key in ["settings", "profile", "spec", "key"] {
+            let resource = format!(
+                "obj://config/users/bob/agents/reader.example.com/{key}"
+            );
+            for action in ["write", "create", "delete", "update", "delegate"] {
+                assert!(!rbac::enforce("root", reader, &resource, action, None).await);
+            }
+        }
+        for resource in [
+            "obj://config/users/bob/agents/reader.example.com/info",
+            "obj://config/users/bob/apps/reader.example.com/info",
+            "obj://config/services/reader.example.com@bob/instances/ood1",
+        ] {
+            assert!(rbac::enforce("bob", reader, resource, "write", None).await);
+        }
+        assert!(!rbac::enforce(
+            "root",
+            reader,
+            "obj://config/users/bob/agents/readerXexampleXcom/info",
+            "write",
+            None
+        )
+        .await);
+        let mailbox = MailboxAddress::new(
+            readonly.agent_did.clone(),
+            Some("session.1".into()),
+        )
+        .unwrap();
+        for resource in [
+            mailbox.owner_resource(),
+            mailbox.resource(MailboxKind::Inbox),
+            mailbox.resource(MailboxKind::Sent),
+            mailbox.resource(MailboxKind::RequestBox),
+        ] {
+            assert!(rbac::enforce("bob", reader, &resource, "write", None).await);
+            assert!(rbac::enforce(
+                &readonly.agent_did.to_string(),
+                "system:control-panel",
+                &resource,
+                "write",
+                None
+            )
+            .await);
+        }
+        let owner_mailbox = MailboxAddress::new(
+            DID::new("web", "bob.example.com"),
+            Some("session.1".into()),
+        )
+        .unwrap();
+        for resource in [
+            owner_mailbox.owner_resource(),
+            owner_mailbox.resource(MailboxKind::Inbox),
+            owner_mailbox.resource(MailboxKind::Sent),
+        ] {
+            assert!(!rbac::enforce("bob", reader, &resource, "write", None).await);
+            assert!(!rbac::enforce(
+                &readonly.agent_did.to_string(),
+                "system:control-panel",
+                &resource,
+                "write",
+                None
+            )
+            .await);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_binding_restricts_a_shared_runtime() {
+        let mut reader = agent_spec("bob", "reader");
+        reader.permission_mode = AgentPermissionMode::ReadOnly;
+        let mut writer = agent_spec("bob", "writer");
+        writer.binding.target_app_instance_id = reader.binding.target_app_instance_id.clone();
+        let input = [&reader, &writer]
+            .into_iter()
+            .map(|spec| {
+                (
+                    agent_spec_key("bob", &spec.agent_id),
+                    serde_json::to_string(spec).unwrap(),
+                )
+            })
+            .collect();
+        let actions = update_rbac(&input, &NodeScheduler::new_empty(1))
+            .await
+            .unwrap();
+        let Some(KVAction::Update(policy)) = actions.get("system/rbac/policy") else {
+            panic!("RBAC policy should be generated");
+        };
+        assert!(policy.contains("g, app:reader.example.com, agent_read_only"));
+        assert!(!policy.contains("agent_read_write"));
+    }
 }
 
 pub(crate) struct SchedulePlan {
@@ -1582,7 +1929,13 @@ fn validate_beta22_app_state(input: &HashMap<String, String>) -> Result<()> {
         )
     })?;
     let registry: AppRegistry = serde_json::from_str(registry_raw)?;
-    let mut reserved = BTreeSet::from(["_".to_string(), "www".to_string(), "sys".to_string()]);
+    let mut reserved = BTreeSet::from([
+        "_".to_string(),
+        "www".to_string(),
+        "sys".to_string(),
+        "homestation".to_string(),
+        "share".to_string(),
+    ]);
     if let Some(raw) = input.get("services/gateway/settings") {
         let settings: ZoneGatewaySettings = serde_json::from_str(raw)?;
         reserved.extend(settings.shortcuts.keys().cloned());

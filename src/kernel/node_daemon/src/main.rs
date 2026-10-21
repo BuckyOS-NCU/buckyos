@@ -13,6 +13,7 @@ mod kernel_mgr; // support manager kernel service (run in native, run for system
 mod kevent_server;
 mod local_app_mgr;
 mod node_daemon;
+mod paios_images;
 mod region_probe;
 mod run_item;
 mod run_plist;
@@ -21,6 +22,7 @@ mod sn_zone_info;
 #[cfg(test)]
 mod test_app_loader;
 mod zone_boot_resolve;
+mod wslc;
 
 #[cfg(target_os = "windows")]
 mod win_srv;

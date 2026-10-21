@@ -17,6 +17,8 @@ use buckyos_api::{
     TaskExecutor, TaskGrantScope, TaskGrantSubject, TaskManagerClient, TaskOutcome, TaskPhase,
     TaskWaitReason, TaskWaitReasonKind, OPENDAN_AGENT_TURN_TASK_SCHEMA_ID,
 };
+use agent_tool::xllm::XllmDeps;
+use agent_tool::{ShellTaskManager, ZoneShellTaskBackend, ZoneShellTasks};
 use libopendan::host::Supervisor;
 use libopendan::protocol::*;
 use libopendan::runner::{TurnTaskEnd, TurnTaskOpen, TurnTaskSink, TurnTaskStatus};
@@ -271,6 +273,23 @@ impl TaskService for ZoneTaskService {
     }
 }
 
+/// xllm deps of a zone host: `shell` commands that outlive their wait are
+/// tasks of the zone's TaskMgr (`tool.shell/v1`), answered for by any
+/// process of the host; the process's own task manager is the fallback
+/// when TaskMgr cannot be reached.
+pub fn zone_xllm_deps(agent_did: &str, owner_user: Option<String>) -> XllmDeps {
+    let mut deps = XllmDeps::default();
+    let shell_tasks = ZoneShellTasks::new(
+        Arc::new(ZoneShellTaskBackend),
+        agent_did,
+        owner_user,
+        deps.local_tasks.clone(),
+    );
+    deps.buckyos_tasks = shell_tasks.resolver(None);
+    deps.shell_tasks = Some(shell_tasks);
+    deps
+}
+
 /// User part of an app principal (`app:<app>@<user>`).
 pub fn owner_of(who: &str) -> Option<String> {
     who.rsplit_once('@')
@@ -286,6 +305,15 @@ pub struct TurnTasks {
 }
 
 fn wait_reason(w: &WaitingFor, message: &str) -> TaskWaitReason {
+    // A question asked through a notification: the user's human task.
+    if w.kind == WaitingKind::Input && !w.human_tasks.is_empty() {
+        return TaskWaitReason {
+            kind: TaskWaitReasonKind::HumanInput,
+            code: Some("ask_user".to_string()),
+            related_task_id: w.human_tasks.first().cloned(),
+            message: Some(message.to_string()),
+        };
+    }
     let (kind, code) = match w.kind {
         WaitingKind::Children => (TaskWaitReasonKind::ChildTask, "sub_sessions"),
         WaitingKind::Tool => (TaskWaitReasonKind::Dependency, "tool"),
@@ -422,6 +450,13 @@ impl CancelBridge {
                 format!("stop:task:{task_id}"),
                 ControlCommand::Stop {
                     reason: Some(format!("task {task_id} was canceled")),
+                    // The task of a Goal Session's Turn is one Activation:
+                    // canceling it never ends the Goal.
+                    scope: if e.kind == SessionKind::Goal {
+                        StopScope::Turn
+                    } else {
+                        StopScope::Session
+                    },
                 },
             );
             match self.agent.sessions().post_input(&e.session_id, &input).await {

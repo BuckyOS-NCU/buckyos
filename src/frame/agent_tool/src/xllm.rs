@@ -79,12 +79,12 @@ use llm_context::deps::{
 use llm_context::error::{ErrorSource, LLMComputeError, ProviderFailure};
 use llm_context::observation::Observation;
 use llm_context::outcome::{BudgetKind, ContextOutput, LLMContextOutcome, ResumeFill};
-use llm_context::tasks::{task_state_observation, RunningTaskResolver};
 use llm_context::request::{
     BudgetSpec, ContextOwnerRef, ContextThreshold, ErrorPolicy, LLMContextRequest, ModelPolicy,
     OutputSpec, ToolMode, ToolPolicy,
 };
 use llm_context::state::{LLMContextSnapshot, Suspension};
+use llm_context::tasks::{task_state_observation, RunningTaskResolver};
 use llm_context::{LLMContext, LLMContextInterruptHandle, XmlStepRenderer};
 
 use crate::exec_tracking::{HostRunInfo, InflightAction};
@@ -99,7 +99,9 @@ use crate::runtime::files::LocalFileBackend;
 use crate::runtime::{
     AgentRuntime, RuntimeConfig, RuntimeDescriptor, RuntimeInfo, RuntimeOpenCtx, Sandbox,
 };
-use crate::tasks::{task_tools, CompositeTaskResolver, InProcessTaskManager};
+use crate::tasks::{
+    task_tools, CompositeTaskResolver, InProcessTaskManager, ShellTaskContext, ShellTaskManager,
+};
 use crate::tool::TypedToolHandle;
 use crate::{
     AgentTool, AgentToolError, AgentToolResult, AgentToolStatus, BinOverlayConfig, EditFileTool,
@@ -126,10 +128,13 @@ pub const DEFAULT_LOCK_DIR: &str = "~/.xllm/locks";
 /// 内置工具组 `bash` 提供的命令执行工具名（`shell`）。
 pub const TOOL_EXEC: &str = TOOL_SHELL;
 pub const BUILTIN_TOOL_GROUP_BASH: &str = "bash";
+/// 内置工具组 `bash_core`：`read`（`read_file` 的超集）/ `write_file` /
+/// `edit_file` / `shell`，不含 task 工具——长命令由 `XllmDeps.task_cli`
+/// 经 task CLI 桥跟进；宿主没有 task 命令时仍带上三个 task 工具。
+pub const BUILTIN_TOOL_GROUP_BASH_CORE: &str = "bash_core";
 /// 运行时协议版本；resume 时校验当前执行器是否能处理保存的协议。
-pub const RUNTIME_PROTOCOL_VERSION: &str = "xllm/1";
-/// `run.json` 记录格式版本（3：有效 runtime 配置与执行目标，快照格式 3；5：`handover`，宿主 Run 的 behavior 交接点）；resume 只接受当前版本。
-pub const RUN_RECORD_VERSION: u32 = 5;
+pub const RUNTIME_PROTOCOL_VERSION: &str = "xllm/2";
+pub const RUN_RECORD_VERSION: u32 = 6;
 /// 默认 context 压缩阈值（token window 的 75%）。
 pub const DEFAULT_CONTEXT_YIELD_RATIO: f32 = 0.75;
 
@@ -663,7 +668,9 @@ impl ToolsConfig {
             self.bash_tools = over.bash_tools.clone();
         }
         if let Some(sh) = &over.shell {
-            self.shell.get_or_insert_with(Default::default).merge_over(sh);
+            self.shell
+                .get_or_insert_with(Default::default)
+                .merge_over(sh);
         }
     }
 }
@@ -772,6 +779,14 @@ pub struct LlmContextFile {
     pub run_logs: Option<RunLogLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_format: Option<ResultFormat>,
+    /// The final reply is one JSON value (implied by `json_schema`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<bool>,
+    /// JSON Schema of the final reply: handed to the provider as structured
+    /// output and checked on the reply (hosted runs: a reply contract with
+    /// one repair).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1197,7 +1212,11 @@ fn parse_tools_config(ctx: &YamlCtx<'_>, field: &str, v: &Yaml) -> Result<ToolsC
         Some(v) => {
             let f = join_field(field, "shell");
             let obj = ctx.expect_map(&f, v)?;
-            ctx.check_keys(&f, obj, &["mode", "wait_ms", "timeout_ms", "max_timeout_ms"])?;
+            ctx.check_keys(
+                &f,
+                obj,
+                &["mode", "wait_ms", "timeout_ms", "max_timeout_ms"],
+            )?;
             let mode = match ctx.get_str(&f, obj, "mode")? {
                 None => None,
                 Some(s) => Some(match s.trim().to_ascii_lowercase().as_str() {
@@ -1422,6 +1441,8 @@ pub fn parse_llm_context_file(path: &Path, raw: &str) -> Result<LlmContextFile, 
             "loop_model",
             "run_logs",
             "result_format",
+            "json",
+            "json_schema",
             "tools",
             "prompt",
         ],
@@ -1509,6 +1530,19 @@ pub fn parse_llm_context_file(path: &Path, raw: &str) -> Result<LlmContextFile, 
         None => None,
         Some(s) => {
             Some(ResultFormat::parse(&s).map_err(|e| ctx.err("result_format", e.to_string()))?)
+        }
+    };
+    let json = ctx.get_bool("", m, "json")?;
+    let json_schema = match m.get("json_schema") {
+        None | Some(Yaml::Null) => None,
+        Some(v @ Yaml::Mapping(_)) => Some(
+            serde_json::to_value(v).map_err(|e| ctx.err("json_schema", e.to_string()))?,
+        ),
+        Some(other) => {
+            return Err(ctx.err(
+                "json_schema",
+                format!("expected a JSON Schema object, got {}", yaml_kind(other)),
+            ))
         }
     };
     let tools = match m.get("tools") {
@@ -1604,6 +1638,8 @@ pub fn parse_llm_context_file(path: &Path, raw: &str) -> Result<LlmContextFile, 
         loop_model,
         run_logs,
         result_format,
+        json,
+        json_schema,
         tools,
         prompt,
     })
@@ -1669,6 +1705,10 @@ pub struct MergedConfig {
     pub run_logs: Option<RunLogLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_format: Option<ResultFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<Value>,
     #[serde(default)]
     pub tools: ToolsConfig,
     #[serde(default)]
@@ -1751,6 +1791,8 @@ pub fn merge_config_layers(layers: &[ConfigLayer]) -> Result<MergedConfig, XllmE
         scalar!(loop_model, "loop_model");
         scalar!(run_logs, "run_logs");
         scalar!(result_format, "result_format");
+        scalar!(json, "json");
+        scalar!(json_schema, "json_schema");
         if let Some(t) = &f.tools {
             merged.tools.merge_over(t);
             merged.sources.insert("tools".into(), src.clone());
@@ -2226,7 +2268,14 @@ pub fn compute_tools_config(
         .cloned()
         .unwrap_or_else(|| "default".into());
     cfg.merge_over(&merged.tools);
-    for key in ["enabled", "tools2actions", "tools", "actions", "bash_tools", "shell"] {
+    for key in [
+        "enabled",
+        "tools2actions",
+        "tools",
+        "actions",
+        "bash_tools",
+        "shell",
+    ] {
         sources.insert(key.to_string(), top_src.clone());
     }
     sources.insert(
@@ -2613,7 +2662,7 @@ pub fn build_runtime_protocol_for(
         s.push_str(intro.trim_end());
         s.push('\n');
     } else {
-    s.push_str(&format!(
+        s.push_str(&format!(
         "You are running inside xllm ({RUNTIME_PROTOCOL_VERSION}), a one-shot task runner: complete the task given in the user message and deliver one final result. There is no follow-up conversation, so do not ask the user questions; if something essential is missing, state it in the final result. Use only the material provided and the results you obtain during this run; distinguish verified facts from assumptions.\n"
     ));
     }
@@ -2623,7 +2672,13 @@ pub fn build_runtime_protocol_for(
                 s.push_str("\nExecution loop (native function calling):\n");
                 s.push_str("- When you need to act, call one or more of the provided tools; their results are returned to you and you decide the next step. Only the tools declared for this run exist.\n");
                 s.push_str("- A failed tool call is not the end of the task: read the error, adjust, and continue within the tool iteration limit.\n");
-                s.push_str("- When the task is complete, reply with the final result as plain assistant text and no tool calls. That text is delivered verbatim to the caller.\n");
+                if tools.native.iter().any(|tool| tool.name == "report") {
+                    s.push_str("- Submit a report with report({report: \"free text or Markdown\", artifacts: [\"relative/file\" or \"cyfile:…\"], result: <optional JSON>, is_end: false}). Omitted is_end means false: it records progress without ending the context or sending a user message.\n");
+                    s.push_str("- To request completion, call report with is_end: true and a nonempty final report. The host validates and persists it, returns the tool receipt, and completes the current context without another model reply. It skips later calls in that batch; a rejected report returns an error and can be corrected.\n");
+                    s.push_str("- Final report delivery and Session completion follow the host policy. Child contexts return to their caller. Plain assistant text with no tool calls yields the current Turn; it completes a Session only when the host permits ordinary Done completion.\n");
+                } else {
+                    s.push_str("- When the task is complete, reply with the final result as plain assistant text and no tool calls. That text is delivered verbatim to the caller.\n");
+                }
             } else {
                 s.push_str("\nExecution loop: no tools or actions are available in this run. Answer directly in a single reply; do not request or describe tool calls. Your reply is delivered verbatim to the caller.\n");
             }
@@ -2635,15 +2690,21 @@ pub fn build_runtime_protocol_for(
             let has_actions = tools.enabled && !tools.actions.is_empty();
             let has_native = tools.enabled && !tools.native.is_empty();
             s.push_str("\nExecution loop (behavior protocol): every reply MUST be one XML document with this shape:\n");
-            s.push_str("<response>\n  <observation>what the previous action results tell you (omit on the first step)</observation>\n  <thinking>brief reasoning about what to do next</thinking>\n");
+            s.push_str("<response>\n  <observation>what the previous action results tell you (omit on the first step)</observation>\n  <intent>the next move, in one short sentence</intent>\n");
             if has_actions {
                 s.push_str("  <actions>\n    ...zero or more actions, executed in order...\n  </actions>\n");
             }
-            s.push_str("  <report><![CDATA[the final result, only when the task is complete]]></report>\n</response>\n");
+            s.push_str("  <report end=\"true\"><![CDATA[the complete final result]]></report>\n</response>\n");
             s.push_str("Rules:\n");
+            s.push_str("- <report> or <report end=\"false\"> submits a progress report and continues the context. Use <report end=\"true\"> only to submit the complete, nonempty final result and request completion. The final report content is delivered verbatim to the caller.\n");
+            s.push_str("- A final report cannot share a reply with actions, sendmsg, native tool calls, or a nonempty next_behavior. Observe action results before submitting it. Use only true or false for end and at most one report per reply.\n");
+            s.push_str("- next_behavior is reserved for host scheduling, including WAIT_USER_MSG; END and done are invalid. A report without end=\"true\" never implies completion.\n");
+            if matches!(flavor, HostProtocolFlavor::Session { .. }) {
+                s.push_str("- A report may include sibling <artifacts> containing a JSON array of relative file paths and <result> containing any JSON value. These require a report in the same response. The host validates and persists the submission; completion applies to the current context, with child reports returned to their caller.\n");
+                s.push_str("- A reply whose only content is a progress report (no actions, no sendmsg, no next_behavior) is how you wait while work this session started (sub sessions) is still running: the step ends and the session wakes you when that work reports. When nothing it started is running, the report is only a progress report and you continue.\n");
+            }
             if has_actions {
-                s.push_str("- To keep working, put one or more actions inside <actions> and do NOT include <report>; the results come back in the next message.\n");
-                s.push_str("- To finish, reply with no <actions> and put the complete final result inside <report>. The <report> content is delivered verbatim to the caller.\n");
+                s.push_str("- To act, put one or more actions inside <actions>; the results come back in the next message. You may include a progress report with end=\"false\".\n");
                 s.push_str("- Actions run in order; the first failed action stops the rest of that step. Read the error, adjust, and continue within the tool iteration limit.\n");
                 s.push_str("- Only the actions listed below exist; do not invent others. Put multi-line or special-character values inside <![CDATA[ ... ]]>.\n");
                 s.push_str("Available actions:\n");
@@ -2651,14 +2712,20 @@ pub fn build_runtime_protocol_for(
                     s.push_str(&render_action_usage(t));
                     s.push('\n');
                 }
+                if has_native {
+                    s.push_str("- Native function-call tools are also declared for this run; a reply that uses them is treated as a step with actions.\n");
+                }
+            } else if has_native {
+                // No XML actions, but tools: the run acts through them (a
+                // run told it has nothing to act with ends at its first step).
+                s.push_str("- To act, call one or more of the native function-call tools declared for this run (never inside <actions>); their results come back to you and you may call more. Only the declared tools exist.\n");
+                s.push_str("- A failed tool call is not the end of the task: read the error, adjust, and continue within the tool iteration limit.\n");
+                s.push_str("- A reply without tool calls is the <response> document of the step: without <report end=\"true\"> the work continues with the next step. Submit <report end=\"true\"> with the complete final result only after you have done the work and observed the results.\n");
             } else {
-                s.push_str("- No actions are available in this run: reply with a single <response> whose <report> contains the complete final result. Do not include <actions>.\n");
-            }
-            if has_native {
-                s.push_str("- Native function-call tools are also declared for this run; a reply that uses them is treated as a step with actions.\n");
+                s.push_str("- No actions or tools are available in this run: reply with a single <response> whose <report end=\"true\"> contains the complete final result. Do not include <actions>.\n");
             }
             if json {
-                s.push_str("- Output constraint: the content of <report> MUST be exactly one valid JSON value.\n");
+                s.push_str("- Output constraint: the content of the final <report end=\"true\"> MUST be exactly one valid JSON value.\n");
             }
         }
     }
@@ -2701,7 +2768,7 @@ fn build_rules_system_text(loop_model: LoopModel, tools: &EffectiveTools) -> Str
         .native
         .iter()
         .chain(&tools.actions)
-        .any(|tool| tool.source == "groupname:bash")
+        .any(|tool| tool.source == "groupname:bash" || tool.source == "groupname:bash_core")
     {
         lines.push(match tools.filesystem_policy {
             FilesystemPolicy::Workspace => "Builtin file tools and shell's cwd are restricted to the working directory. Shell commands are not sandboxed and run with the current user's permissions.",
@@ -3392,50 +3459,118 @@ impl LLMResultParser for XllmActionParser {
                 .map(|e| e.text().trim().to_string())
                 .filter(|s| !s.is_empty())
         };
-        let thought = first_text("thinking");
+        // `<intent>` is the protocol tag; `<intent>` stays as a legacy alias.
+        let thought = first_text("intent").or_else(|| first_text("thinking"));
         let observation = first_text("observation");
-        let mut next_behavior = first_text("next_behavior");
-        let self_report = region_children
+        if region_children
+            .iter()
+            .filter(|el| el.name == "next_behavior")
+            .count()
+            > 1
+        {
+            return Err("a decision must contain at most one next_behavior".into());
+        }
+        let next_behavior = first_text("next_behavior");
+        let reports: Vec<_> = region_children
             .iter()
             .filter(|e| e.name == "report")
-            .last()
-            .map(|e| e.text());
+            .collect();
+        if reports.len() > 1 {
+            return Err("a decision must contain at most one report".into());
+        }
+        let self_report = reports.first().map(|e| e.text());
+        let report_end = match reports.first() {
+            Some(report) => {
+                let attrs: Vec<_> = report
+                    .attrs
+                    .iter()
+                    .filter(|(key, _)| key == "end")
+                    .collect();
+                if attrs.len() > 1 {
+                    return Err("report has duplicate end attributes".into());
+                }
+                match attrs.first().map(|(_, value)| value.as_str()) {
+                    None | Some("false") => false,
+                    Some("true") => true,
+                    Some(_) => return Err("report end must be true or false".into()),
+                }
+            }
+            None => false,
+        };
+        let report_payload = |name: &str| -> Result<Option<Value>, String> {
+            let elements: Vec<_> = region_children
+                .iter()
+                .filter(|el| el.name == name)
+                .collect();
+            if elements.len() > 1 {
+                return Err(format!("a decision must contain at most one {name}"));
+            }
+            let Some(element) = elements.first() else {
+                return Ok(None);
+            };
+            if self_report.is_none() {
+                return Err(format!("{name} requires a report in the same decision"));
+            }
+            serde_json::from_str(&element.text())
+                .map(Some)
+                .map_err(|error| format!("invalid report {name} JSON: {error}"))
+        };
+        let report_artifacts = report_payload("artifacts")?
+            .map(serde_json::from_value::<Vec<String>>)
+            .transpose()
+            .map_err(|error| format!("report artifacts must be an array of strings: {error}"))?
+            .unwrap_or_default();
+        let report_result = report_payload("result")?;
 
         let mut do_actions = Vec::new();
         let mut messages_to_send = Vec::new();
         let mut auto_id = 0u32;
-        if let Some(actions_el) = region_children.iter().find(|e| e.name == "actions") {
-            for el in actions_el.children() {
-                if el.name == "sendmsg" && !self.actions.contains_key("sendmsg") {
-                    messages_to_send.push(SendMessageRecord {
-                        target: el.attr("target").unwrap_or("user").to_string(),
-                        body: el.text(),
-                    });
-                    continue;
-                }
-                do_actions.push(self.element_to_call(&el, &mut auto_id));
+        let action_elements: Vec<_> = region_children
+            .iter()
+            .filter(|el| el.name == "actions")
+            .flat_map(XmlElement::children)
+            .chain(
+                region_children
+                    .iter()
+                    .filter(|el| el.name == "sendmsg")
+                    .cloned(),
+            )
+            .collect();
+        if report_end
+            && (!action_elements.is_empty()
+                || region_children
+                    .iter()
+                    .any(|el| el.name == "actions" && !el.body.trim().is_empty()))
+        {
+            return Err("a final report cannot be combined with actions or sendmsg".into());
+        }
+        for el in action_elements {
+            if el.name == "sendmsg" && !self.actions.contains_key("sendmsg") {
+                messages_to_send.push(SendMessageRecord {
+                    target: el.attr("target").unwrap_or("user").to_string(),
+                    body: el.text(),
+                });
+                continue;
             }
+            do_actions.push(self.element_to_call(&el, &mut auto_id));
         }
         if !provider_calls.is_empty() {
             do_actions = provider_calls;
         }
-        // oneshot 终止规则：没有动作、带 report 的一步就是最终答案。
-        if do_actions.is_empty()
-            && messages_to_send.is_empty()
-            && self_report.is_some()
-            && next_behavior.is_none()
-        {
-            next_behavior = Some("done".to_string());
-        }
-        Ok(LLMBehaviorResult {
+        let result = LLMBehaviorResult {
             do_actions,
             next_behavior,
             assistant_text: raw_text,
             observation,
             thought,
             self_report,
+            report_end,
+            report_artifacts,
+            report_result,
             messages_to_send,
-        })
+        };
+        result.validate()?;
+        Ok(result)
     }
 }
 
@@ -3635,6 +3770,15 @@ pub struct XllmDeps {
     /// 宿主可访问 buckyos task-mgr 时注入的 task 解析器（long-tool TODO §4）；
     /// 进程内 task-mgr 总是存在。
     pub buckyos_tasks: Option<Arc<dyn RunningTaskResolver>>,
+    /// The task manager of this process (`local:` tasks): one per process,
+    /// so a task outlives the run (and the tool set) that handed it over.
+    pub local_tasks: Arc<InProcessTaskManager>,
+    /// Where `shell` hands a command that outlived its wait. `None`: the
+    /// process's own task manager (`local_tasks`). A host whose tasks live
+    /// in a task service (the zone's TaskMgr) sets its manager here.
+    pub shell_tasks: Option<Arc<dyn ShellTaskManager>>,
+    /// What a handed-over command belongs to (set by the host per run).
+    pub shell_task_context: ShellTaskContext,
     pub runtime_env: BTreeMap<String, String>,
     pub runtime_path_prefix: Vec<PathBuf>,
     /// 为 true 时不获取工作目录互斥锁（宿主自行协调，例如 libOpenDAN 的
@@ -3642,6 +3786,50 @@ pub struct XllmDeps {
     pub skip_workdir_lock: bool,
     /// Opening of the runtime protocol of hosted runs (`prepare_hosted`).
     pub host_protocol: HostProtocolFlavor,
+    /// Which of xllm's own sections a hosted run appends after the host's
+    /// system text (`prepare_hosted`). Default: all of them.
+    pub host_prompt_sections: HostPromptSections,
+    /// Host facts appended to the `shell` tool's description (e.g. the
+    /// commands its PATH provides). Part of the tool schema: keep it stable.
+    pub shell_note: Option<String>,
+    /// The command that follows a `shell` task when the task tools are not
+    /// offered (`group:bash_core`), e.g. `agent-session task`: it must reach
+    /// this run's task resolver through `XLLM_TASK_ENDPOINT`. `None`:
+    /// `bash_core` keeps the task tools.
+    pub task_cli: Option<String>,
+}
+
+/// The sections xllm appends to a hosted run's system text. A host that
+/// states the capabilities, commands and loop rules itself (an Agent
+/// Session's UI conversation) turns them off; xllm still computes the
+/// runtime protocol and records it in run.json (`prompt.runtime_protocol`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostPromptSections {
+    /// `## capabilities`: the tools of the run and the filesystem policy.
+    pub capabilities: bool,
+    /// `## cmd_manual`: the documented commands (`bash_tools`).
+    pub cmd_manual: bool,
+    /// `## runtime_protocol`: the loop rules. Only a function call loop can
+    /// run without it (the behavior loop's reply shape is defined there).
+    pub runtime_protocol: bool,
+}
+
+impl Default for HostPromptSections {
+    fn default() -> Self {
+        Self {
+            capabilities: true,
+            cmd_manual: true,
+            runtime_protocol: true,
+        }
+    }
+}
+
+impl HostPromptSections {
+    pub const NONE: Self = Self {
+        capabilities: false,
+        cmd_manual: false,
+        runtime_protocol: false,
+    };
 }
 
 impl Default for XllmDeps {
@@ -3653,10 +3841,16 @@ impl Default for XllmDeps {
             lock_dir: None,
             runtime: None,
             buckyos_tasks: None,
+            local_tasks: InProcessTaskManager::new(),
+            shell_tasks: None,
+            shell_task_context: ShellTaskContext::default(),
             runtime_env: BTreeMap::new(),
             runtime_path_prefix: Vec::new(),
             skip_workdir_lock: false,
             host_protocol: HostProtocolFlavor::OneShot,
+            host_prompt_sections: HostPromptSections::default(),
+            shell_note: None,
+            task_cli: None,
         }
     }
 }
@@ -3713,11 +3907,21 @@ pub struct XllmToolManager {
     /// The run the tools belong to (execution directories).
     run: RunBindingSlot,
     resolver: Arc<CompositeTaskResolver>,
+    /// The task CLI bridge over `resolver` (`bash_core` with a task
+    /// command); served as long as this manager lives.
+    task_bridge: Option<crate::task_bridge::TaskBridge>,
 }
 
 impl XllmToolManager {
     pub fn new(workdir: PathBuf, run_id: &str, loop_model: LoopModel) -> Self {
-        Self::with_run_binding(workdir, run_id, loop_model, new_run_binding_slot(), None)
+        Self::with_run_binding(
+            workdir,
+            run_id,
+            loop_model,
+            new_run_binding_slot(),
+            InProcessTaskManager::new(),
+            None,
+        )
     }
 
     pub fn with_run_binding(
@@ -3725,9 +3929,9 @@ impl XllmToolManager {
         run_id: &str,
         loop_model: LoopModel,
         run: RunBindingSlot,
+        tasks: Arc<InProcessTaskManager>,
         buckyos_tasks: Option<Arc<dyn RunningTaskResolver>>,
     ) -> Self {
-        let tasks = InProcessTaskManager::new();
         let mut resolver = CompositeTaskResolver::new(tasks.clone(), run.clone());
         if let Some(b) = buckyos_tasks {
             resolver = resolver.with_buckyos(b);
@@ -3753,7 +3957,26 @@ impl XllmToolManager {
             tasks,
             run,
             resolver: Arc::new(resolver),
+            task_bridge: None,
         }
+    }
+
+    /// Serve this run's task resolver to commands (`XLLM_TASK_ENDPOINT`)
+    /// and word task hints for `cli`. `None` when no bridge can be served
+    /// here (the caller keeps the task tools then).
+    pub fn serve_task_bridge(&mut self, cli: &str) -> Option<String> {
+        if self.task_bridge.is_none() {
+            match crate::task_bridge::serve(self.resolver.clone()) {
+                Ok(bridge) => self.task_bridge = Some(bridge),
+                Err(e) => {
+                    log::warn!("task bridge not served: {e}");
+                    return None;
+                }
+            }
+        }
+        self.resolver
+            .set_followup(llm_context::tasks::TaskFollowup::Command(cli.to_string()));
+        self.task_bridge.as_ref().map(|b| b.endpoint().to_string())
     }
 
     /// The task manager `shell` hands long commands to.
@@ -4250,7 +4473,19 @@ fn shell_runtime_note(descriptor: &RuntimeDescriptor) -> ShellRuntimeNote {
     }
 }
 
-/// 内置组 `bash`：`read_file` / `write_file` / `edit_file` / `shell`。
+/// How `shell` commands of a builtin group follow tasks and what the host
+/// adds to its description.
+#[derive(Clone, Default)]
+struct ShellExtras {
+    followup: llm_context::tasks::TaskFollowup,
+    endpoint: Option<String>,
+    note: Option<String>,
+    context: ShellTaskContext,
+}
+
+/// 内置组 `bash`：`read_file` / `write_file` / `edit_file` / `shell`；
+/// `core`（`bash_core`）以 `read` 取代 `read_file`。
+#[allow(clippy::too_many_arguments)]
 fn builtin_bash_group(
     workdir: &Path,
     filesystem_policy: FilesystemPolicy,
@@ -4258,7 +4493,9 @@ fn builtin_bash_group(
     files: Arc<dyn FileBackend>,
     shell: &ShellSettings,
     runtime: ShellRuntimeNote,
-    tasks: Arc<InProcessTaskManager>,
+    tasks: Arc<dyn ShellTaskManager>,
+    core: bool,
+    extras: ShellExtras,
 ) -> Vec<Arc<dyn AgentTool>> {
     let mut cfg = FileToolConfig::new(workdir.to_path_buf());
     cfg.backend = files;
@@ -4279,11 +4516,20 @@ fn builtin_bash_group(
         .with_mode(shell.mode)
         .with_default_wait_ms(shell.wait_ms)
         .with_runtime_note(runtime)
-        .with_tasks(tasks);
-    vec![
+        .with_tasks(tasks)
+        .with_task_context(extras.context)
+        .with_task_followup(extras.followup)
+        .with_task_endpoint(extras.endpoint)
+        .with_note(extras.note);
+    let reader: Arc<dyn AgentTool> = if core {
+        Arc::new(crate::read_tool::ReadTool::new(cfg.clone()))
+    } else {
         Arc::new(TypedToolHandle::with_null_host(ReadFileTool::new(
             cfg.clone(),
-        ))),
+        )))
+    };
+    vec![
+        reader,
         Arc::new(TypedToolHandle::with_null_host(WriteFileTool::new(
             cfg.clone(),
             audit.clone(),
@@ -4314,12 +4560,39 @@ async fn expand_tool_sources(
         let desc = src.describe();
         match src {
             ToolSource::Group { groupname } => {
-                if groupname != BUILTIN_TOOL_GROUP_BASH {
+                let core = groupname == BUILTIN_TOOL_GROUP_BASH_CORE;
+                if groupname != BUILTIN_TOOL_GROUP_BASH && !core {
                     return Err(XllmError::Tools(format!(
-                        "unknown builtin tool group `{groupname}` (available: {BUILTIN_TOOL_GROUP_BASH})"
+                        "unknown builtin tool group `{groupname}` (available: {BUILTIN_TOOL_GROUP_BASH}, {BUILTIN_TOOL_GROUP_BASH_CORE})"
                     )));
                 }
-                let tasks = manager.tasks();
+                let mut extras = ShellExtras {
+                    note: deps.shell_note.clone(),
+                    context: ShellTaskContext {
+                        run: Some(manager.run_binding()),
+                        ..deps.shell_task_context.clone()
+                    },
+                    ..Default::default()
+                };
+                // `bash_core` follows tasks with the host's command when a
+                // bridge can be served; otherwise with the task tools.
+                let mut task_tools_needed = shell.mode == ShellMode::Auto;
+                if core && task_tools_needed {
+                    if let Some(cli) = deps.task_cli.as_deref() {
+                        if let Some(endpoint) = manager.serve_task_bridge(cli) {
+                            extras.followup =
+                                llm_context::tasks::TaskFollowup::Command(cli.to_string());
+                            extras.endpoint = Some(endpoint);
+                            task_tools_needed = false;
+                        }
+                    }
+                }
+                // A host's task manager takes the handed-over commands;
+                // without one they stay in this process.
+                let tasks: Arc<dyn ShellTaskManager> = match &deps.shell_tasks {
+                    Some(host) => host.clone(),
+                    None => manager.tasks(),
+                };
                 for t in builtin_bash_group(
                     workdir,
                     filesystem_policy,
@@ -4328,10 +4601,12 @@ async fn expand_tool_sources(
                     shell,
                     runtime.clone(),
                     tasks,
+                    core,
+                    extras,
                 ) {
                     out.push(manager.register(t, &desc)?);
                 }
-                if shell.mode == ShellMode::Auto {
+                if task_tools_needed {
                     // The model follows a command that became a task with
                     // these (§4); registered with the group that can create
                     // tasks.
@@ -4398,7 +4673,8 @@ pub(crate) async fn build_runtime_toolset(
         workdir.to_path_buf(),
         run_id,
         loop_model,
-        run,
+        run.clone(),
+        deps.local_tasks.clone(),
         deps.buckyos_tasks.clone(),
     );
     let mut eff = EffectiveTools {
@@ -5459,10 +5735,56 @@ pub struct RunHandover {
 
 /// `next_behavior` 是否指向另一个 behavior（而不是结束 / 等待输入）。
 pub fn is_handover_target(next_behavior: &str) -> bool {
-    !next_behavior.trim().is_empty()
-        && !next_behavior.eq_ignore_ascii_case(llm_context::NEXT_BEHAVIOR_END)
-        && !next_behavior.eq_ignore_ascii_case("done")
-        && next_behavior != "WAIT_USER_MSG"
+    !next_behavior.trim().is_empty() && next_behavior != "WAIT_USER_MSG"
+}
+
+fn ensure_workspace_host_runner(record: &RunRecord) -> Result<(), XllmError> {
+    if record.host.as_ref().is_some_and(|host| {
+        host.extra.get("workspace_binding").is_some_and(|binding| !binding.is_null())
+    }) {
+        return Err(XllmError::NotResumable {
+            run_id: record.run_id.clone(),
+            reason: "managed workspace execution requires its Session host to verify the immutable binding and hold the workspace writer lock; use xagent run".into(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_host_report_not_pending(record: &RunRecord) -> Result<(), XllmError> {
+    if record
+        .host
+        .as_ref()
+        .and_then(|host| host.extra.get("reports"))
+        .and_then(Value::as_array)
+        .is_some_and(|reports| {
+            reports
+                .iter()
+                .any(|report| report.get("is_end").and_then(Value::as_bool) == Some(true))
+        })
+    {
+        return Err(XllmError::NotResumable {
+            run_id: record.run_id.clone(),
+            reason: "an accepted final report requires its host to finish the submission; drive the session with its host runner".into(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_host_final_step_not_pending(
+    record: &RunRecord,
+    store: &RunStore,
+) -> Result<(), XllmError> {
+    if record.host.is_some() && record.config.loop_model == LoopModel::Behavior {
+        if let Some(idx) = record.latest_snapshot_idx {
+            if store.get_snapshot(&record.run_id, idx)?.state.report_end {
+                return Err(XllmError::NotResumable {
+                    run_id: record.run_id.clone(),
+                    reason: "the final XML report requires Session host validation; drive the session with its host runner".into(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 impl RunRecord {
@@ -5556,8 +5878,17 @@ impl RunRecord {
         !self.status.is_terminal()
     }
 
+    /// The command that continues this run (`agent_tool xllm`; the runs
+    /// directory is named so it is found from any working directory).
     pub fn resume_command(&self) -> String {
-        format!("xllm --resume --run {}", self.run_id)
+        match &self.runs_dir {
+            Some(dir) => format!(
+                "agent_tool xllm --resume --run {} --runs-dir {}",
+                self.run_id,
+                crate::runtime::shell_quote(dir)
+            ),
+            None => format!("agent_tool xllm --resume --run {}", self.run_id),
+        }
     }
 }
 
@@ -6422,6 +6753,15 @@ impl XllmTask {
                 ResultFormat::Raw
             }
         };
+        // `--json` / an SDK schema, or the `.llm_context` keys.
+        let json_out = overrides.json
+            || merged.json == Some(true)
+            || overrides.json_schema.is_some()
+            || merged.json_schema.is_some();
+        let json_schema = overrides
+            .json_schema
+            .clone()
+            .or_else(|| merged.json_schema.clone());
         let run_logs = match (overrides.run_logs, merged.run_logs) {
             (Some(l), _) => {
                 sources.insert("run_logs".into(), "cli".into());
@@ -6485,7 +6825,7 @@ impl XllmTask {
                 RunStore::disk(resolve_config_path(DEFAULT_RUNS_DIR, &base_dir))
             }
         };
-        if overrides.json && loop_model == LoopModel::Behavior && result_format == ResultFormat::Raw
+        if json_out && loop_model == LoopModel::Behavior && result_format == ResultFormat::Raw
         {
             return Err(XllmError::Capability(
                 "--json cannot be satisfied with `loop_model: behavior` and `result_format: raw` (the raw behavior response is XML); use e.g. `result_format: result.report`".into(),
@@ -6561,7 +6901,7 @@ impl XllmTask {
                 .ok_or_else(|| XllmError::Capability("runtime info unavailable".into()))?,
         );
         let prompt = if structured {
-            let runtime_protocol = build_runtime_protocol(loop_model, &tools, overrides.json);
+            let runtime_protocol = build_runtime_protocol(loop_model, &tools, json_out);
             PromptPlan {
                 mode: PromptMode::Custom,
                 group: None,
@@ -6590,7 +6930,7 @@ impl XllmTask {
                 loop_model,
                 tools: &tools,
                 env: &env,
-                json: overrides.json,
+                json: json_out,
             })?
         };
 
@@ -6747,8 +7087,8 @@ impl XllmTask {
             limits,
             run_logs,
             result_format,
-            json: overrides.json,
-            json_schema: overrides.json_schema.clone(),
+            json: json_out,
+            json_schema,
             disable_capabilities: overrides.disable_capabilities.clone(),
             tools,
             config_files: merged.files.clone(),
@@ -6853,6 +7193,18 @@ impl XllmTask {
             },
         };
         let loop_model = merged.loop_model.unwrap_or(LoopModel::FunctionCall);
+        let sections = deps.host_prompt_sections;
+        if !sections.runtime_protocol && loop_model != LoopModel::FunctionCall {
+            return Err(XllmError::Capability(format!(
+                "{origin}: the runtime protocol defines the reply shape of the behavior loop; only a function call loop can run without it"
+            )));
+        }
+        let json = merged.json == Some(true) || merged.json_schema.is_some();
+        if json && loop_model != LoopModel::FunctionCall {
+            return Err(XllmError::Capability(format!(
+                "{origin}: a JSON reply (json / json_schema) needs loop_model function_call; a behavior loop reply is its XML step"
+            )));
+        }
         let limits = RunLimits {
             max_tokens: merged.max_tokens,
             max_tool_iterations: merged
@@ -6880,7 +7232,7 @@ impl XllmTask {
         let runtime_config = runtime.config();
         let runtime_descriptor = runtime.descriptor().clone();
         let runtime_protocol =
-            build_runtime_protocol_for(&deps.host_protocol, loop_model, &tools, false);
+            build_runtime_protocol_for(&deps.host_protocol, loop_model, &tools, json);
         let mut template_env = TemplateEnv::for_new_run(
             manager
                 .runtime_info()
@@ -6889,21 +7241,31 @@ impl XllmTask {
         template_env.runtime.remove("current_time");
         template_env.runtime.remove("timezone");
         let rendered_host_system = template_env.render(host_system, &format!("host:{origin}"))?;
+        let mut appended = Vec::new();
+        if sections.capabilities {
+            appended.push(format!(
+                "## capabilities\n{}",
+                build_rules_system_text(loop_model, &tools).trim_end()
+            ));
+        }
+        if sections.cmd_manual {
+            if let Some(manual) = build_cmd_manual_system_text(&tools) {
+                appended.push(format!("## cmd_manual\n{}", manual.trim_end()));
+            }
+        }
+        if sections.runtime_protocol {
+            appended.push(format!("## runtime_protocol\n{}", runtime_protocol.trim_end()));
+        }
         let mut system = rendered_host_system.trim_end().to_string();
+        for section in appended {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&section);
+        }
         if !system.is_empty() {
-            system.push_str("\n\n");
+            system.push('\n');
         }
-        system.push_str(&format!(
-            "## capabilities\n{}\n",
-            build_rules_system_text(loop_model, &tools).trim_end()
-        ));
-        if let Some(manual) = build_cmd_manual_system_text(&tools) {
-            system.push_str(&format!("\n## cmd_manual\n{}\n", manual.trim_end()));
-        }
-        system.push_str(&format!(
-            "\n## runtime_protocol\n{}\n",
-            runtime_protocol.trim_end()
-        ));
         let prompt = PromptPlan {
             mode: PromptMode::Custom,
             group: None,
@@ -6932,8 +7294,8 @@ impl XllmTask {
             limits,
             run_logs: merged.run_logs.unwrap_or(RunLogLevel::Warn),
             result_format: merged.result_format.clone().unwrap_or(ResultFormat::Raw),
-            json: false,
-            json_schema: None,
+            json,
+            json_schema: merged.json_schema.clone(),
             disable_capabilities: Vec::new(),
             tools,
             config_files: vec![origin.to_string()],
@@ -7014,6 +7376,64 @@ impl HostedTask {
     }
 }
 
+struct HostedReportUnavailable {
+    spec: ToolSpec,
+}
+
+#[async_trait]
+impl AgentTool for HostedReportUnavailable {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn calling(&self) -> crate::CallingConventions {
+        crate::CallingConventions::ALL
+    }
+
+    async fn call(
+        &self,
+        _: &SessionRuntimeContext,
+        _: Value,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        Err(AgentToolError::ExecFailed(
+            "report requires the Session host executor; resume this Session with its host to submit a report".into(),
+        ))
+    }
+}
+
+fn restore_host_report_tool(record: &RunRecord, deps: &XllmDeps) -> XllmDeps {
+    let mut restored = deps.clone();
+    if !deps.host_tools.contains_key("report")
+        && record
+            .host
+            .as_ref()
+            .is_some_and(|host| host.assembled_by == "libopendan")
+    {
+        if let Some(tool) = record
+            .config
+            .tools
+            .native
+            .iter()
+            .chain(record.config.tools.actions.iter())
+            .find(|tool| tool.name == "report" && tool.source == "name:report")
+        {
+            restored.host_tools.insert(
+                "report".into(),
+                Arc::new(HostedReportUnavailable {
+                    spec: ToolSpec {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        args_schema: tool.args_schema.clone(),
+                        output_schema: json!({"type":"object"}),
+                        usage: None,
+                    },
+                }),
+            );
+        }
+    }
+    restored
+}
+
 /// Rebuild the tool set of a saved run from its recorded sources and policy
 /// (what `XllmRun::resume` does), bound to the run id.
 pub async fn rebuild_toolset(
@@ -7040,8 +7460,10 @@ pub async fn rebuild_toolset(
     open.env = deps.runtime_env.clone();
     open.path_prefix = deps.runtime_path_prefix.clone();
     restore_host_environment(record, &mut open)?;
+    let restored_deps = restore_host_report_tool(record, deps);
     let (runtime, _eff, mut manager) =
-        crate::runtime::open_runtime(&record.config.runtime, &open, &tools_cfg, deps).await?;
+        crate::runtime::open_runtime(&record.config.runtime, &open, &tools_cfg, &restored_deps)
+            .await?;
     if runtime.descriptor() != &record.config.runtime_descriptor {
         return Err(XllmError::RuntimeMismatch(
             "saved runtime target or workdir changed".into(),
@@ -7226,7 +7648,17 @@ pub fn hosted_request(
             provider_options: None,
         },
         tool_policy,
-        output: OutputSpec::Text,
+        // A JSON reply of a hosted run is a contract: one repair, then the
+        // host gets the raw reply (`ContextOutput::Invalid`).
+        output: if cfg.json {
+            OutputSpec::Json {
+                schema: cfg.json_schema.clone(),
+                strict: true,
+                max_repairs: Some(1),
+            }
+        } else {
+            OutputSpec::Text
+        },
         budget: BudgetSpec {
             max_total_tokens: None,
             max_completion_tokens: cfg.limits.max_tokens,
@@ -7691,6 +8123,9 @@ impl XllmRun {
                 ),
             });
         }
+        ensure_workspace_host_runner(&record)?;
+        ensure_host_report_not_pending(&record)?;
+        ensure_host_final_step_not_pending(&record, store)?;
         if let Some(seq) = record.host_commit_pending {
             return Err(XllmError::NotResumable {
                 run_id: record.run_id.clone(),
@@ -7739,6 +8174,9 @@ impl XllmRun {
         // Holding the run lock: re-read, then make sure no execution of the
         // previous executor is still alive and settle in-flight actions.
         let mut record = store.read_record(&run_id_s)?;
+        ensure_workspace_host_runner(&record)?;
+        ensure_host_report_not_pending(&record)?;
+        ensure_host_final_step_not_pending(&record, store)?;
         if record.host_commit_pending.is_some() {
             return Err(XllmError::NotResumable {
                 run_id: run_id_s.clone(),
@@ -7973,15 +8411,19 @@ impl XllmRun {
         let probe = LLMContextDeps::new(Arc::new(NoopLlm), Arc::new(NoopTools));
         let probe = if record.config.loop_model == LoopModel::Behavior {
             probe
-                .with_result_parser(Arc::new(XllmActionParser::new(&record.config.tools.actions)))
+                .with_result_parser(Arc::new(XllmActionParser::new(
+                    &record.config.tools.actions,
+                )))
                 .with_step_renderer(Arc::new(step_renderer(record.host.is_some())))
         } else {
             probe
         };
-        let filled = LLMContext::resume(snap, ResumeFill::ToolResults { results }, probe)
-            .map_err(|e| XllmError::NotResumable {
-                run_id: record.run_id.clone(),
-                reason: format!("cannot fill the suspended tool results: {e}"),
+        let filled =
+            LLMContext::resume(snap, ResumeFill::ToolResults { results }, probe).map_err(|e| {
+                XllmError::NotResumable {
+                    run_id: record.run_id.clone(),
+                    reason: format!("cannot fill the suspended tool results: {e}"),
+                }
             })?;
         let new_idx = store.put_snapshot(&record.run_id, &filled.snapshot())?;
         record.latest_snapshot_idx = Some(new_idx);
@@ -8224,6 +8666,7 @@ impl XllmRun {
             OutputSpec::Json {
                 schema: cfg.json_schema.clone(),
                 strict: false,
+                max_repairs: None,
             }
         } else {
             OutputSpec::Text
@@ -8400,6 +8843,20 @@ impl XllmRun {
                     behavior_result,
                     ..
                 } => {
+                    if self.record().host.is_some()
+                        && behavior_result
+                            .as_ref()
+                            .is_some_and(|result| result.report_end)
+                    {
+                        let calls = self.llm.calls();
+                        self.update(|record| {
+                            record.status = RunStatus::Paused;
+                            record.last_error = None;
+                            record.usage.main = Some(usage);
+                            record.usage.llm_requests += calls;
+                        })?;
+                        return Ok(RunOutcome::Paused(self.record()));
+                    }
                     // A hosted run that hands over to another behavior is not
                     // finished: it yields at the hand-over point and its host
                     // session commits the transfer.
@@ -8430,7 +8887,9 @@ impl XllmRun {
                                 text
                             }
                         }
-                        ContextOutput::Text { .. } => response.message.text_content(),
+                        ContextOutput::Text { .. } | ContextOutput::Invalid { .. } => {
+                            response.message.text_content()
+                        }
                     };
                     return self.finish_with_response(raw, usage);
                 }
@@ -8811,6 +9270,79 @@ pub fn build_result_view(
 // =========================================================================
 // 测试
 // =========================================================================
+
+#[cfg(test)]
+mod behavior_protocol_tests {
+    use super::*;
+
+    fn tool(name: &str) -> ResolvedTool {
+        ResolvedTool {
+            name: name.into(),
+            description: String::new(),
+            args_schema: serde_json::json!({"type": "object"}),
+            source: "t".into(),
+        }
+    }
+
+    fn protocol(native: &[&str], actions: &[&str]) -> String {
+        let tools = EffectiveTools {
+            enabled: true,
+            native: native.iter().map(|n| tool(n)).collect(),
+            actions: actions.iter().map(|n| tool(n)).collect(),
+            ..Default::default()
+        };
+        build_runtime_protocol_for(
+            &HostProtocolFlavor::Session { intro: "intro".into() },
+            LoopModel::Behavior,
+            &tools,
+            false,
+        )
+    }
+
+    /// Native tools without XML actions: the run is told to act with them,
+    /// never that nothing is available.
+    #[test]
+    fn native_tools_only_are_the_way_to_act() {
+        let p = protocol(&["shell", "read_file"], &[]);
+        assert!(!p.contains("No actions"), "{p}");
+        assert!(p.contains("call one or more of the native function-call tools"), "{p}");
+        assert!(p.contains("without tool calls"), "{p}");
+        assert!(!p.contains("<actions>\n"), "{p}");
+    }
+
+    #[test]
+    fn actions_and_native_tools_both_described() {
+        let p = protocol(&["read_file"], &["shell"]);
+        assert!(p.contains("put one or more actions inside <actions>"), "{p}");
+        assert!(p.contains("Native function-call tools are also declared"), "{p}");
+        assert!(!p.contains("No actions"), "{p}");
+        let p = protocol(&[], &["shell"]);
+        assert!(!p.contains("Native function-call tools"), "{p}");
+    }
+
+    #[test]
+    fn without_actions_or_tools_the_reply_is_the_result() {
+        let p = protocol(&[], &[]);
+        assert!(p.contains("No actions or tools are available"), "{p}");
+        assert!(!p.contains("native function-call tools"), "{p}");
+    }
+
+    /// Only a session explains that a progress report alone hands control
+    /// back (and when it is accepted); a one-shot run keeps its rules.
+    #[test]
+    fn a_progress_report_alone_yields_only_in_a_session() {
+        let p = protocol(&[], &["shell"]);
+        assert!(p.contains("only content is a progress report"), "{p}");
+        let tools = EffectiveTools {
+            enabled: true,
+            actions: vec![tool("shell")],
+            ..Default::default()
+        };
+        let one_shot =
+            build_runtime_protocol_for(&HostProtocolFlavor::OneShot, LoopModel::Behavior, &tools, false);
+        assert!(!one_shot.contains("only content is a progress report"), "{one_shot}");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -9682,7 +10214,7 @@ tools:
         let parser = XllmActionParser::new(&tools);
         let xml = r#"```xml
 <response>
-  <thinking>plan</thinking>
+  <intent>plan</intent>
   <actions>
     <shell><![CDATA[ls -la && echo "<done>"]]></shell>
     <write_file path="a.txt"><![CDATA[hi
@@ -9710,15 +10242,23 @@ there]]></write_file>
         assert_eq!(r.thought.as_deref(), Some("plan"));
         assert!(r.next_behavior.is_none());
         assert!(r.self_report.is_none());
+        // Legacy alias: `<thinking>` still parses as the step intent.
+        let legacy = parser
+            .parse(&AiResponse::text(
+                "<response><thinking>old</thinking><actions><shell>ls</shell></actions></response>",
+            ))
+            .unwrap();
+        assert_eq!(legacy.thought.as_deref(), Some("old"));
 
         let done = parser
             .parse(&AiResponse::text(
-                "<response><report><![CDATA[final <answer>]]></report></response>",
+                r#"<response><report end="true"><![CDATA[final <answer>]]></report></response>"#,
             ))
             .unwrap();
         assert!(done.do_actions.is_empty());
         assert_eq!(done.self_report.as_deref(), Some("final <answer>"));
-        assert_eq!(done.next_behavior.as_deref(), Some("done"));
+        assert!(done.next_behavior.is_none());
+        assert!(done.report_end);
 
         // 未知标签仍生成调用（由 ToolManager 报 not available）。
         let unk = parser
@@ -9728,6 +10268,237 @@ there]]></write_file>
             .unwrap();
         assert_eq!(unk.do_actions[0].name, "nope");
         assert!(parser.parse(&AiResponse::text("   ")).is_err());
+    }
+
+    #[test]
+    fn host_final_report_requires_host_recovery() {
+        let mut record = RunRecord::synthetic("report-run", Path::new("/tmp"), RunStatus::Paused);
+        assert!(ensure_host_report_not_pending(&record).is_ok());
+        record.host = Some(HostRunInfo {
+            assembled_by: "libopendan".into(),
+            session_id: Some("session".into()),
+            runtime_kind: None,
+            runtime_id: None,
+            env_check: Value::Null,
+            extra: json!({"reports": [{"id": "first", "is_end": false}]}),
+        });
+        assert!(ensure_host_report_not_pending(&record).is_ok());
+        record.host.as_mut().unwrap().extra["reports"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": "final", "is_end": true}));
+        assert!(matches!(
+            ensure_host_report_not_pending(&record),
+            Err(XllmError::NotResumable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn hosted_sections_can_be_disabled() {
+        let env = Env::new();
+        let cfg = json!({"tools": {"enabled": true}});
+        for bits in 0..8u8 {
+            let sections = HostPromptSections {
+                capabilities: bits & 1 != 0,
+                cmd_manual: bits & 2 != 0,
+                runtime_protocol: bits & 4 != 0,
+            };
+            let mut deps = env.deps(ScriptedLlm::new(vec![]));
+            deps.host_prompt_sections = sections;
+            let hosted =
+                XllmTask::prepare_hosted(&env.workdir, &cfg, "session.json", "HOST TEXT", &deps)
+                    .await
+                    .unwrap();
+            let system = &hosted.prompt.system_prompt;
+            assert!(system.starts_with("HOST TEXT"), "{system}");
+            assert_eq!(system.contains("## capabilities"), sections.capabilities, "{system}");
+            assert_eq!(system.contains("## cmd_manual"), sections.cmd_manual, "{system}");
+            assert_eq!(
+                system.contains("## runtime_protocol"),
+                sections.runtime_protocol,
+                "{system}"
+            );
+            // Recorded for diagnosis either way.
+            assert!(!hosted.prompt.runtime_protocol.is_empty());
+            if bits == 0 {
+                assert_eq!(system, "HOST TEXT\n");
+            }
+        }
+        // The behavior loop's reply shape lives in the runtime protocol.
+        let mut deps = env.deps(ScriptedLlm::new(vec![]));
+        deps.host_prompt_sections = HostPromptSections::NONE;
+        let err = XllmTask::prepare_hosted(
+            &env.workdir,
+            &json!({"loop_model": "behavior"}),
+            "session.json",
+            "",
+            &deps,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, XllmError::Capability(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_hosted_json_schema_is_a_reply_contract() {
+        let env = Env::new();
+        let deps = env.deps(ScriptedLlm::new(vec![]));
+        let schema = json!({"type": "object", "required": ["reply"], "properties": {"reply": {"type": "string"}}});
+        let hosted = XllmTask::prepare_hosted(
+            &env.workdir,
+            &json!({"tools": {"enabled": true}, "json_schema": schema}),
+            "session.json",
+            "",
+            &deps,
+        )
+        .await
+        .unwrap();
+        assert!(hosted.config.json);
+        assert_eq!(hosted.config.json_schema.as_ref(), Some(&schema));
+        assert!(hosted.prompt.runtime_protocol.contains("exactly one valid JSON value"));
+        let req = hosted.build_request(
+            ContextOwnerRef::OneShot { id: "t".into() },
+            "trace",
+            "objective",
+            "",
+            Vec::new(),
+        );
+        assert_eq!(
+            req.output,
+            OutputSpec::Json {
+                schema: Some(schema),
+                strict: true,
+                max_repairs: Some(1)
+            }
+        );
+        // A plain hosted run stays text; a behavior loop cannot take JSON.
+        let plain = XllmTask::prepare_hosted(&env.workdir, &json!({}), "s.json", "", &deps)
+            .await
+            .unwrap();
+        assert!(!plain.config.json);
+        assert!(XllmTask::prepare_hosted(
+            &env.workdir,
+            &json!({"loop_model": "behavior", "json": true}),
+            "s.json",
+            "",
+            &deps
+        )
+        .await
+        .is_err());
+        // The `.llm_context` file keys are validated.
+        assert!(XllmTask::prepare_hosted(
+            &env.workdir,
+            &json!({"json_schema": "not a schema"}),
+            "s.json",
+            "",
+            &deps
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn hosted_report_placeholder_preserves_schema_and_rejects_submission() {
+        let env = Env::new();
+        let deps = env.deps(ScriptedLlm::new(vec![]));
+        let mut record = RunRecord::synthetic("host-report", &env.workdir, RunStatus::Paused);
+        let schema = json!({"type":"object", "properties":{"report":{"type":"string"}}});
+        record.config.tools.native.push(ResolvedTool {
+            name: "report".into(),
+            description: "Submit to the Session host".into(),
+            args_schema: schema.clone(),
+            source: "name:report".into(),
+        });
+        assert!(!restore_host_report_tool(&record, &deps)
+            .host_tools
+            .contains_key("report"));
+        record.host = Some(HostRunInfo {
+            assembled_by: "libopendan".into(),
+            session_id: Some("session".into()),
+            runtime_kind: None,
+            runtime_id: None,
+            env_check: Value::Null,
+            extra: Value::Null,
+        });
+        let restored = restore_host_report_tool(&record, &deps);
+        let tool = restored.host_tools.get("report").unwrap();
+        assert_eq!(tool.spec().args_schema, schema);
+        let ctx = SessionRuntimeContext {
+            trace_id: "test".into(),
+            agent_name: "test".into(),
+            behavior: "test".into(),
+            tool_call_index: 0,
+            wakeup_id: "test".into(),
+            session_id: "session".into(),
+            read_token_limit: 0,
+        };
+        let error = tool
+            .call(&ctx, json!({"report":"final", "is_end":true}))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires the Session host executor"));
+        assert!(record.host.as_ref().unwrap().extra.is_null());
+        assert!(deps.host_tools.is_empty());
+    }
+
+    #[test]
+    fn behavior_report_end_protocol_rejects_ambiguous_decisions() {
+        let parser = XllmActionParser::default();
+        for xml in [
+            r#"<response><report>progress</report></response>"#,
+            r#"<response><report end="false">progress</report></response>"#,
+            r#"<response><report end="false">progress</report><next_behavior>CHECK</next_behavior></response>"#,
+            r#"<response><report>progress</report><next_behavior>WAIT_USER_MSG</next_behavior></response>"#,
+        ] {
+            let parsed = parser.parse(&AiResponse::text(xml)).unwrap();
+            assert!(!parsed.report_end, "{xml}");
+            assert_eq!(parsed.self_report.as_deref(), Some("progress"));
+        }
+        let parsed = parser.parse(&AiResponse::text(
+            r#"<response><actions/><report end="true">final</report><artifacts>["out.txt"]</artifacts><result>{"ok":true}</result></response>"#,
+        )).unwrap();
+        assert!(parsed.report_end);
+        assert!(parsed.next_behavior.is_none());
+        assert_eq!(parsed.report_artifacts, vec!["out.txt"]);
+        assert_eq!(parsed.report_result, Some(json!({"ok": true})));
+        for xml in [
+            r#"<response><report end="true">final</report><actions><shell>echo side-effect</shell></actions></response>"#,
+            r#"<response><report end="true">final</report><actions><sendmsg>hello</sendmsg></actions></response>"#,
+            r#"<response><report end="true">final</report><sendmsg>hello</sendmsg></response>"#,
+            r#"<response><report end="true">final</report><next_behavior>CHECK</next_behavior></response>"#,
+            r#"<response><report end="true">final</report><next_behavior>WAIT_USER_MSG</next_behavior></response>"#,
+            r#"<response><report end="true"> </report></response>"#,
+            r#"<response><report end="TRUE">final</report></response>"#,
+            r#"<response><report end=" true ">final</report></response>"#,
+            r#"<response><report end="yes">final</report></response>"#,
+            r#"<response><report end="false" end="true">final</report></response>"#,
+            r#"<response><report>first</report><report>second</report></response>"#,
+            r#"<response><report>progress</report><next_behavior>END</next_behavior></response>"#,
+            r#"<response><report>progress</report><next_behavior>done</next_behavior></response>"#,
+            r#"<response><thinking>finished</thinking></response>"#,
+            r#"<response><artifacts>[]</artifacts></response>"#,
+            r#"<response><result>null</result></response>"#,
+            r#"<response><report>progress</report><artifacts>{}</artifacts></response>"#,
+            r#"<response><report>progress</report><result>invalid</result></response>"#,
+            r#"<response><report>progress</report><result>1</result><result>2</result></response>"#,
+        ] {
+            assert!(parser.parse(&AiResponse::text(xml)).is_err(), "{xml}");
+        }
+        let native = AiToolCall {
+            name: "shell".into(),
+            args: HashMap::from([("command".into(), json!("echo side-effect"))]),
+            call_id: "native-1".into(),
+        };
+        let conflict = AiResponse::from_parts(
+            Some(r#"<response><report end="true">final</report></response>"#.into()),
+            vec![native.clone()],
+            vec![],
+        );
+        assert!(parser.parse(&conflict).is_err());
+        let native_only = AiResponse::from_parts(None, vec![native], vec![]);
+        assert_eq!(parser.parse(&native_only).unwrap().do_actions.len(), 1);
     }
 
     #[test]
@@ -9809,7 +10580,7 @@ there]]></write_file>
         let err = extract_result(r#"{"other":1}"#, &fmt).unwrap_err();
         assert!(err.to_string().contains("missing"), "{err}");
         let xml =
-            "<response><thinking>t</thinking><report><![CDATA[done & dusted]]></report></response>";
+            "<response><intent>t</intent><report><![CDATA[done & dusted]]></report></response>";
         let v = extract_result(xml, &fmt).unwrap();
         assert_eq!(
             v,
@@ -10212,6 +10983,202 @@ there]]></write_file>
     }
 
     #[tokio::test]
+    async fn hosted_xml_final_report_waits_for_session_validation() {
+        let env = Env::new();
+        env.write(
+            "project/.llm_context",
+            "loop_model: behavior\nresult_format: result.report\n",
+        );
+        let llm = ScriptedLlm::new(vec![text(
+            r#"<response><report end="true">proposed final</report><artifacts>["missing.txt"]</artifacts></response>"#,
+        )]);
+        let deps = env.deps(llm.clone());
+        let prepared = XllmTask::prepare(
+            &env.workdir,
+            TaskInput::question("finish"),
+            env.overrides(),
+            &deps,
+        )
+        .await
+        .unwrap();
+        let mut run = XllmRun::start(prepared, deps).await.unwrap();
+        run.update(|record| {
+            record.host = Some(HostRunInfo {
+                assembled_by: "libopendan".into(),
+                session_id: Some("session".into()),
+                runtime_kind: None,
+                runtime_id: None,
+                env_check: Value::Null,
+                extra: Value::Null,
+            })
+        })
+        .unwrap();
+        let outcome = run.execute().await.unwrap();
+        assert!(matches!(outcome, RunOutcome::Paused(_)));
+        let record = outcome.record();
+        assert!(record.result.is_none());
+        assert!(record.handover.is_none());
+        let snapshot = env
+            .store()
+            .get_snapshot(&record.run_id, record.latest_snapshot_idx.unwrap())
+            .unwrap();
+        assert!(snapshot.state.report_end);
+        assert_eq!(
+            snapshot.state.steps.last().unwrap().report_artifacts,
+            vec!["missing.txt"]
+        );
+        assert_eq!(llm.calls(), 1);
+        drop(run);
+        let takeover = ScriptedLlm::new(vec![]);
+        for _ in 0..2 {
+            let result = XllmRun::resume(
+                &env.store(),
+                Some(&record.run_id),
+                None,
+                ResumeLimits::default(),
+                env.deps(takeover.clone()),
+            )
+            .await;
+            match result {
+                Err(XllmError::NotResumable { reason, .. }) => {
+                    assert!(reason.contains("Session host validation"))
+                }
+                _ => panic!("hosted final report must return to the Session host"),
+            }
+        }
+        assert_eq!(takeover.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn behavior_progress_report_continues_until_explicit_final_report() {
+        let env = Env::new();
+        env.write(
+            "project/.llm_context",
+            "loop_model: behavior\nresult_format: result.report\n",
+        );
+        let llm = ScriptedLlm::new(vec![
+            text("<response><report>intermediate finding</report></response>"),
+            text(r#"<response><report end="true">verified final finding</report></response>"#),
+        ]);
+        let outcome = env
+            .run(
+                TaskInput::question("verify it"),
+                env.overrides(),
+                llm.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RunOutcome::Completed(_)));
+        assert_eq!(llm.calls(), 2);
+        let record = outcome.record();
+        assert_eq!(
+            record.result.as_ref().unwrap().extracted,
+            Some(ExtractedValue::Text {
+                text: "verified final finding".into()
+            })
+        );
+        assert!(record
+            .config
+            .tools
+            .native
+            .iter()
+            .all(|tool| tool.name != "report"));
+        assert!(record
+            .config
+            .tools
+            .actions
+            .iter()
+            .all(|tool| tool.name != "report"));
+        let snapshot = env
+            .store()
+            .get_snapshot(&record.run_id, record.latest_snapshot_idx.unwrap())
+            .unwrap();
+        assert!(snapshot.state.report_end);
+        assert_eq!(
+            snapshot.state.last_report.as_deref(),
+            Some("verified final finding")
+        );
+        assert_eq!(
+            snapshot.state.steps.last().unwrap().self_report.as_deref(),
+            Some("verified final finding")
+        );
+        let mut interrupted_record = record.clone();
+        interrupted_record.status = RunStatus::Paused;
+        interrupted_record.result = None;
+        env.store().write_record(&interrupted_record).unwrap();
+        let takeover_llm = ScriptedLlm::new(vec![]);
+        let mut resumed = match XllmRun::resume(
+            &env.store(),
+            Some(&record.run_id),
+            None,
+            ResumeLimits::default(),
+            env.deps(takeover_llm.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            ResumeStart::Run(run) => run,
+            _ => panic!("expected resumable run"),
+        };
+        let recovered = resumed.execute().await.unwrap();
+        assert!(matches!(recovered, RunOutcome::Completed(_)));
+        assert_eq!(takeover_llm.calls(), 0);
+        assert_eq!(recovered.record().result, record.result);
+    }
+
+    #[tokio::test]
+    async fn behavior_final_report_conflicts_do_not_dispatch_native_or_xml_actions() {
+        for native in [false, true] {
+            let env = Env::new();
+            env.write(
+                "project/.llm_context",
+                &format!("loop_model: behavior\nresult_format: result.report\ntools:\n  enabled: true\n  tools2actions: {}\n", !native),
+            );
+            let conflict = if native {
+                Ok(AiResponse::from_parts(
+                    Some(
+                        r#"<response><report end="true">invalid final</report></response>"#.into(),
+                    ),
+                    vec![AiToolCall {
+                        name: "write_file".into(),
+                        args: HashMap::from([
+                            ("path".into(), json!("must-not-exist.txt")),
+                            ("content".into(), json!("side effect")),
+                        ]),
+                        call_id: "conflict-native".into(),
+                    }],
+                    vec![],
+                ))
+            } else {
+                text(
+                    r#"<response><report end="true">invalid final</report><actions><write_file path="must-not-exist.txt">side effect</write_file></actions></response>"#,
+                )
+            };
+            let llm = ScriptedLlm::new(vec![
+                conflict,
+                text(r#"<response><report end="true">corrected final</report></response>"#),
+            ]);
+            let outcome = env
+                .run(
+                    TaskInput::question("verify protocol"),
+                    env.overrides(),
+                    llm.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(outcome, RunOutcome::Completed(_)), "{outcome:?}");
+            assert_eq!(llm.calls(), 2);
+            assert!(!env.workdir.join("must-not-exist.txt").exists());
+            assert_eq!(
+                outcome.record().result.as_ref().unwrap().extracted,
+                Some(ExtractedValue::Text {
+                    text: "corrected final".into()
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn behavior_loop_end_to_end_with_tools2actions() {
         let env = Env::new();
         env.write(
@@ -10219,8 +11186,8 @@ there]]></write_file>
             "loop_model: behavior\nresult_format: result.report\ntools:\n  enabled: true\n  tools2actions: true\n",
         );
         let llm = ScriptedLlm::new(vec![
-            text("<response><thinking>run</thinking><actions><shell><![CDATA[echo behavior-77]]></shell></actions></response>"),
-            text("<response><observation>saw it</observation><report><![CDATA[{\"report\":\"结论 77\"}]]></report></response>"),
+            text("<response><intent>run</intent><actions><shell><![CDATA[echo behavior-77]]></shell></actions></response>"),
+            text("<response><observation>saw it</observation><report end=\"true\"><![CDATA[{\"report\":\"结论 77\"}]]></report></response>"),
         ]);
         let o = env
             .run(TaskInput::question("do it"), env.overrides(), llm.clone())
@@ -10277,7 +11244,7 @@ there]]></write_file>
         let llm = ScriptedLlm::new(vec![
             text(r#"<response><actions><read_file path="fixture.txt"><![CDATA[]]></read_file></actions></response>"#),
             text("<response><actions><read_file><![CDATA[missing.txt]]></read_file></actions></response>"),
-            text(r#"<response><actions><write_file path="excess.txt"><![CDATA[excess]]></write_file></actions><next_behavior>END</next_behavior></response>"#),
+            text(r#"<response><actions><write_file path="excess.txt"><![CDATA[excess]]></write_file></actions></response>"#),
         ]);
         let outcome = env
             .run(
@@ -10861,7 +11828,9 @@ there]]></write_file>
         );
         assert_eq!(cfg.filesystem_policy, Some(FilesystemPolicy::Unrestricted));
         assert_eq!(cfg.enabled, Some(false));
-        assert!(sources["filesystem_policy"].replace('\\', "/").ends_with("src/.llm_context"));
+        assert!(sources["filesystem_policy"]
+            .replace('\\', "/")
+            .ends_with("src/.llm_context"));
         for raw in [
             "tools:\n  filesystem_policy: invalid\n",
             "prompt:\n  tools:\n    filesystem_policy: false\n",
@@ -11101,7 +12070,10 @@ there]]></write_file>
             "after-resume"
         );
         let cwd = std::fs::read_to_string(env.project().join("resumed-cwd.txt")).unwrap();
-        assert_eq!(Path::new(cwd.trim()).canonicalize().unwrap(), env.project().canonicalize().unwrap());
+        assert_eq!(
+            Path::new(cwd.trim()).canonicalize().unwrap(),
+            env.project().canonicalize().unwrap()
+        );
     }
 
     fn exec_manager(workdir: &Path) -> XllmToolManager {
@@ -11119,6 +12091,8 @@ there]]></write_file>
             &shell,
             ShellRuntimeNote::native(),
             manager.tasks(),
+            false,
+            ShellExtras::default(),
         ) {
             manager.register(t, "groupname:bash").expect("register");
         }
@@ -11208,8 +12182,11 @@ there]]></write_file>
     #[tokio::test]
     async fn auto_mode_turns_a_long_command_into_a_task() {
         let dir = tempfile::tempdir().unwrap();
-        let mut manager =
-            XllmToolManager::new(dir.path().to_path_buf(), "run-test", LoopModel::FunctionCall);
+        let mut manager = XllmToolManager::new(
+            dir.path().to_path_buf(),
+            "run-test",
+            LoopModel::FunctionCall,
+        );
         let shell = ShellSettings {
             mode: ShellMode::Auto,
             wait_ms: 200,
@@ -11223,6 +12200,8 @@ there]]></write_file>
             &shell,
             ShellRuntimeNote::native(),
             manager.tasks(),
+            false,
+            ShellExtras::default(),
         ) {
             manager.register(t, "groupname:bash").expect("register");
         }
@@ -11230,7 +12209,10 @@ there]]></write_file>
             manager.register(t, "groupname:bash").expect("register");
         }
         let obs = manager
-            .call_tool(exec_call("echo early; sleep 1; echo late"), ToolCallCtx::noop())
+            .call_tool(
+                exec_call("echo early; sleep 1; echo late"),
+                ToolCallCtx::noop(),
+            )
             .await
             .unwrap();
         let Observation::Success {
@@ -11264,7 +12246,10 @@ there]]></write_file>
             panic!("{obs:?}")
         };
         assert!(content.as_str().unwrap().contains("late"), "{content}");
-        assert!(content.as_str().unwrap().contains("exited with code 0"), "{content}");
+        assert!(
+            content.as_str().unwrap().contains("exited with code 0"),
+            "{content}"
+        );
         let dir_obs = manager
             .call_tool(
                 AiToolCall {
@@ -11277,6 +12262,113 @@ there]]></write_file>
             .await
             .unwrap();
         assert!(matches!(dir_obs, Observation::Success { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_core_follows_tasks_through_the_cli_bridge() {
+        let env = Env::new();
+        let cfg = json!({
+            "tools": {
+                "enabled": true,
+                "tools": [{"groupname": "bash_core"}],
+                "shell": {"mode": "auto", "wait_ms": 200}
+            }
+        });
+        // Without a task command the group keeps the task tools.
+        let deps = env.deps(ScriptedLlm::new(vec![]));
+        let hosted = XllmTask::prepare_hosted(&env.workdir, &cfg, "s.json", "", &deps)
+            .await
+            .unwrap();
+        let names: Vec<String> = hosted.config.tools.native.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(
+            names,
+            ["read", "write_file", "edit_file", "shell", "wait_task", "get_task_state", "cancel_task"]
+        );
+        // With one: four tools, and commands reach the run's tasks.
+        let mut deps = env.deps(ScriptedLlm::new(vec![]));
+        deps.task_cli = Some("agent-session task".into());
+        deps.shell_note = Some("PATH provides `agent-session`.".into());
+        let hosted = XllmTask::prepare_hosted(&env.workdir, &cfg, "s.json", "", &deps)
+            .await
+            .unwrap();
+        let names: Vec<String> = hosted.config.tools.native.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(names, ["read", "write_file", "edit_file", "shell"]);
+        let shell = hosted
+            .config
+            .tools
+            .native
+            .iter()
+            .find(|t| t.name == "shell")
+            .unwrap();
+        assert!(shell.description.contains("`agent-session task wait <task_id>`"), "{}", shell.description);
+        assert!(shell.description.ends_with("PATH provides `agent-session`."), "{}", shell.description);
+        assert!(!shell.description.contains("wait_task"), "{}", shell.description);
+
+        let manager = hosted.manager;
+        let call = |command: &str, id: &str| AiToolCall {
+            name: TOOL_SHELL.into(),
+            args: HashMap::from([("command".to_string(), Value::String(command.into()))]),
+            call_id: id.into(),
+        };
+        let obs = manager
+            .call_tool(call(&format!("printf %s \"${}\"", crate::task_bridge::ENV_TASK_ENDPOINT), "c0"), ToolCallCtx::noop())
+            .await
+            .unwrap();
+        let Observation::Success { content, .. } = obs else { panic!("{obs:?}") };
+        let endpoint = content.as_str().unwrap().lines().last().unwrap_or_default().trim().to_string();
+        assert!(endpoint.starts_with('@') || endpoint.starts_with('/'), "{content}");
+
+        let obs = manager
+            .call_tool(call("echo early; sleep 1; echo late", "c1"), ToolCallCtx::noop())
+            .await
+            .unwrap();
+        let Observation::Success { content, tool_result, .. } = obs else { panic!("{obs:?}") };
+        let text = content.as_str().unwrap();
+        assert!(text.contains("agent-session task wait local:shell:c1"), "{text}");
+        let task_id = tool_result.unwrap().task_id.unwrap();
+        let req = |op, wait_ms| crate::task_bridge::TaskBridgeRequest {
+            op,
+            task_id: task_id.clone(),
+            wait_ms,
+        };
+        let running = crate::task_bridge::call(&endpoint, &req(crate::task_bridge::TaskOp::State, None))
+            .await
+            .unwrap();
+        assert_eq!(running.state, "running", "{running:?}");
+        assert!(running.text.contains("agent-session task state"), "{}", running.text);
+        let done = crate::task_bridge::call(&endpoint, &req(crate::task_bridge::TaskOp::Wait, Some(5000)))
+            .await
+            .unwrap();
+        assert_eq!(done.state, "finished", "{done:?}");
+        assert_eq!(done.exit_code(), 0);
+        // The very text the task tools return for the same state.
+        let state = manager.resolver().state(&task_id).await;
+        let Observation::Success { content, .. } =
+            llm_context::tasks::task_state_observation("", &task_id, &state)
+        else {
+            panic!()
+        };
+        assert_eq!(done.text, content.as_str().unwrap());
+        assert!(done.text.contains("late") && done.text.contains("exited with code 0"));
+        let unknown = crate::task_bridge::call(
+            &endpoint,
+            &crate::task_bridge::TaskBridgeRequest {
+                op: crate::task_bridge::TaskOp::Cancel,
+                task_id: "local:shell:nope".into(),
+                wait_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(unknown.exit_code(), 0, "{unknown:?}");
+        // The bridge ends with the run's tools.
+        drop(manager);
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(crate::task_bridge::call(&endpoint, &req(crate::task_bridge::TaskOp::State, None))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -11408,9 +12500,9 @@ there]]></write_file>
             "loop_model: behavior\nresult_format: result.report\ntools:\n  enabled: true\n  tools2actions: true\n",
         );
         let llm = ScriptedLlm::new(vec![
-            text("<response><thinking>run</thinking><actions><shell><![CDATA[echo behavior-88]]></shell></actions></response>"),
+            text("<response><intent>run</intent><actions><shell><![CDATA[echo behavior-88]]></shell></actions></response>"),
             context_refusal(),
-            text("<response><report><![CDATA[{\"report\":\"ok 88\"}]]></report></response>"),
+            text("<response><report end=\"true\"><![CDATA[{\"report\":\"ok 88\"}]]></report></response>"),
         ]);
         let o = env
             .run(TaskInput::question("do it"), env.overrides(), llm.clone())
@@ -11548,9 +12640,9 @@ there]]></write_file>
             .iter()
             .flat_map(|m| m.content.iter())
             .find_map(|c| match c {
-                AiContent::ToolResult { call_id, content, .. } if call_id == "c1" => {
-                    Some(format!("{content:?}"))
-                }
+                AiContent::ToolResult {
+                    call_id, content, ..
+                } if call_id == "c1" => Some(format!("{content:?}")),
                 _ => None,
             })
             .expect("filled result");

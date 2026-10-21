@@ -34,8 +34,8 @@ uv run start.py --all
 uv run start.py --reinstall release
 # 检查激活状态、进程、端口和日志
 uv run check.py
-# 在已有 Zone 中以前台宿主机进程调试 Jarvis（默认 owner 为 devtest）
-./debug_jarvis.sh
+# 在已有 Zone 中以前台宿主机进程调试某个已创建的 Agent（默认 owner 为 devtest，默认取其名下第一个 ready 的 Agent）
+./debug_jarvis.sh devtest --agent <agent_id>
 # 停止 BuckyOS 进程和相关应用容器
 uv run stop.py
 ```
@@ -52,7 +52,24 @@ uv run stop.py
 )
 ```
 
-`debug_jarvis.sh` 会构建 `opendan`、`libopendan`、`agent_tool_cli_dev`，停止对应 Jarvis 容器并占用其服务端口；退出后由 node-daemon 恢复容器。Agent 包读取 `src/apps/jarvis_runtime/agent/`。更多参数和独立 `--dev` 模式见 `src/frame/opendan/README.md`。
+`debug_jarvis.sh` 会构建 `opendan`、`libopendan`、`agent_tool_cli_dev`，停止该 Agent 的构造 App 容器并占用其服务端口；退出后由 node-daemon 恢复容器。Agent 包读取 `src/apps/jarvis_agent/agent/`。更多参数和独立 `--dev` 模式见 `src/frame/opendan/README.md`。
+
+### paios 镜像的本地开发迭代
+
+涉及容器内的 OpenDAN、`agent_tool`、`xagent`、OpenDAN WebUI、Worker 工具或入口脚本时，需要重建 `paios/aios` 镜像。以下命令在 **`buckyos/` 仓库根目录**运行：
+
+```bash
+./build_aios --local-test
+uv run src/start.py --skip-update
+```
+
+`--local-test` 默认只构建本机架构，使用 `local/aios-test` 镜像仓库名，复用 Cargo 构建产物且不推送镜像；构建成功后为已安装的 BuckyOS 写入 `$BUCKYOS_ROOT/etc/devenv.json` 的 `aios` 覆盖（未设置 `BUCKYOS_ROOT` 时为 `/opt/buckyos`）。随后重启会重建应用容器，使其使用新镜像；每轮修改重复上述命令即可。需要同步更新宿主机服务时，先构建对应模块，再运行不带 `--skip-update` 的 `start.py`。
+
+区分两份本地配置：仓库根目录的 `devenv.json` 为普通 `build_aios` / `build_exttool` 提供默认镜像仓库名；node-daemon 实际读取的是 `$BUCKYOS_ROOT/etc/devenv.json`，例如 `{"aios": "local/aios-test", "exttool": "local/exttool-test"}`。字段填写不带 tag 的仓库名，运行时自动追加 `:latest-amd64` 或 `:latest-aarch64`。这些是个人开发配置，通常不提交到 Git。`start.py --all` 会保留含本地镜像覆盖的运行时 `devenv.json`，并在命令末尾提示；要恢复默认的 `paios/aios` / `paios/exttool`，手动删除对应覆盖键后重启。
+
+node-daemon 从不拉取 paios 镜像。开发安装（没有 `$BUCKYOS_ROOT/bin/paios-images/paios_images.json`）直接使用本地的 `<repo>:latest-<arch>`，缺失时 deploy 报错；`uv run build.py` 会预拉取 `paios/aios`、`paios/exttool` 的 `latest-<arch>`（被 `devenv.json` 覆盖的除外），`start.py` 启动后发现缺镜像会打印 `docker pull` 命令。更新到新的 `latest` 用 `docker pull`；镜像变化后重启或等下一次状态检查，Worker 容器会按新镜像重建。正式安装包带清单和镜像 tar，锁定到配套镜像（见 `doc/app_service/rust_app_loader.md` §9.1.1）。
+
+修改 ExtTool 内容时，使用 `./build_exttool --image local/exttool-test --arch amd64`（ARM64 使用 `aarch64`），并在运行时 `devenv.json` 设置 `exttool`。ExtTool 卷按镜像 id 命名（`buckyos-exttool-<id12>`），镜像重建后下一次 deploy 会自动播种新卷，旧卷不再使用，可在确认无容器使用后删除。
 
 ### 测试与验证
 
@@ -95,7 +112,7 @@ WebUI 在各自目录运行 `pnpm install`、`pnpm build`。Desktop 和 OpenDAN 
 | `src/frame/lib_opendan/` | Cargo package 为 `libopendan`，承载 Agent State、Session 驱动和 `xagent`；与 `llm_context`、`agent_tool` 协作。 |
 | `src/frame/desktop/` | Desktop 和控制面板 WebUI，构建后安装到 `bin/control-panel/web/`。 |
 | `src/frame/opendan/web/`、`src/kernel/node_active/` | OpenDAN WebUI、节点激活 WebUI。 |
-| `src/apps/` | 内置应用包：`sys_test` 与 `jarvis_runtime`；Jarvis 配置、提示词和行为模板在 `jarvis_runtime/agent/`。 |
+| `src/apps/` | 内置应用包：`sys_test` 与 `jarvis_agent`；`jarvis_agent` 是系统内置的 Agent 模板（登记在 `system/install_settings.agent_templates`），配置、提示词和行为模板在 `jarvis_agent/agent/`。 |
 | `src/rootfs/` | 部署模板与构建产物汇总目录；修改前区分手写配置、脚本与生成的二进制/Web/SDK 产物。 |
 | `src/bucky_project.yaml` | devkit 的构建模块、安装映射、数据保留/清理规则和发布配置。 |
 | `src/tools/` | SDK/CLI 分发包构建脚本、脚本测试、Agent 辅助工具等；系统 `buckyos` CLI 分发到 `rootfs/libexec/buckyos-tool/`。 |
@@ -115,7 +132,7 @@ WebUI 在各自目录运行 `pnpm install`、`pnpm build`。Desktop 和 OpenDAN 
 - **`logs/`**：服务日志；**`etc/`**：配置、`node_identity.json` 等；**`security/`**：私钥、keyref 等身份材料。
 - **`data/home/`**：用户数据；**`data/srv/`**：服务持久数据及 Zone 共享数据；**`storage/`**：内核持久存储。
 - **`data/var/`**、**`data/cache/`**、**`local/`**：服务运行数据、缓存、本机服务数据，生命周期与持久用户数据不同。
-- **`data/home/<owner_user_id>/.local/share/<app_id>/agents/<agent_id>/`**：宿主机上的 OpenDAN AgentRootFS。Jarvis runtime 的 AppId 是 `jarvis.buckyos.bns.did`；AgentId 从实际 `AgentSpec` 读取，不能用短名 `jarvis` 代替。
+- **`data/home/<owner_user_id>/.local/share/<app_id>/agents/<agent_id>/`**：宿主机上的 OpenDAN AgentRootFS。每个 Agent 基于模板构造一个独立 App，其 AppId 等于 AgentId（如 `xiaobai.test.buckyos.io`），AppInstanceId 为 `<agent_id>@<owner>`；AgentId 从实际 `AgentSpec` 读取，不能用短名代替。
 
 路径与容器映射详见 `doc/path_usage.md`，Agent 路径装配见 `src/frame/opendan/src/main.rs`。诊断先运行 `check.py`：未激活时重点检查 `3182`，已激活时检查网关 `80/3180`、system-config `3200`、verify-hub `3300`、control-panel `4020`。脚本退出码为 0 也可能只是 `Activation Ready`，执行 DV 前还需确认输出中的激活状态和服务状态。
 
@@ -148,6 +165,28 @@ WebUI 在各自目录运行 `pnpm install`、`pnpm build`。Desktop 和 OpenDAN 
 - 主要改动入口文件
 - 是否影响文档、协议、共享类型、数据结构、第三方依赖
 
+## cmd_skills 联动维护
+
+cmd_skills 是 Agent 完成一类事的命令手册（加可选命令），是对应功能的交付物，不是一次性文档。机制与写法见 [OpenDAN Agent 开发指南](doc/sdk/OpenDAN_Agent_Dev_Guide.md) §2.3–2.4。
+
+- **位置**：内置手册源码在 `src/apps/jarvis_agent/agent/cmd_skills/<name>.md`（随 Jarvis 的 `agent` 子包分发）；front matter 的 `name` / `description` / `requires` 是发现索引，由 `agent-session skill list`（`src/frame/lib_opendan/src/skills.rs`）输出。选择说明在 Jarvis 的 `behaviors/{analyze_intent,goal,plan}.toml`，UI 默认手册在 `agent.toml` 的 `default_cmd_skills`；冻结在 `src/frame/lib_opendan/src/state/behaviors.rs`，装配在 `runner/assembler.rs`（`## Commands`），命令 PATH 在 `runtime/mod.rs`（`tools/<skill>/bin`）。skill 包样例在 `test/skills_pikg_sample/`。
+- **工具实现原则**：访问 BuckyOS 的 Agent 工具优先用 TypeScript 基于 buckyos-websdk 编写，源码随 runtime 可读、Agent 可据此派生。人也会用的系统、App、发布命令放 websdk `cli/modules`（`buckyos` 命令唯一源码）；Agent 专用的配方类工具（AIGC、媒体合成）放 `src/tools/buckyos-agent`；某个 skill 自带的命令放 skill 包的 `tools/<skill>/bin`。xllm 等 runtime 层保留 Rust。
+- **同一变更内检查手册**：修改用户可见的 CLI、API、配置、运行路径或发布流程时，按下表找出受影响的手册，在同一变更中更新手册与示例；判断不受影响时写明依据，不能只因代码编译通过就跳过。跨仓库（websdk、devkit、cyfs-gateway）的实现变化也要检查 BuckyOS 分发的手册。手册指向当前源码或命令 schema（`--help`、`buckyos command describe`），不复制会过期的接口说明。
+
+| 实现变更 | 检查的手册与验证 |
+| --- | --- |
+| system-config、Control Panel、身份/RBAC、scheduler/node-daemon、日志诊断、路径及版本信息、容器内 Tool 挂载与 launcher | `buckyos_admin`：设置生效、权限失败、诊断与源码版本核验、容器内 `buckyos` 可用 |
+| websdk SDK API、`buckyos-agent` 的 `commands/` 范本与 `lib/` | 引用这些源码的手册（`aigc_*`、`buckyos_admin`、`opendan_agent_dev`）：范本仍可照抄运行，派生工具示例可执行 |
+| AICC 协议、provider 能力、媒体 CLI、Task/结果/下载和消息附件 | `aigc_image`、`aigc_audio`、`aigc_video`：真实生成、长任务恢复、交付可访问 |
+| xllm 参数、模型路由、工具开关、上下文/behavior 协议 | `xllm`：示例调用、结构化结果、上下文与执行边界 |
+| SDK/Tool、PIKG/AppDoc、devkit、Installer/Repo/BNS、系统/镜像发布 | `buckyos_dev_release`、`buckyos_app_dev` 及相关场景：构建、包验证、测试安装、发布回读 |
+| AIWorkspace schema/RPC、对象/资源、renderer、Wish/Block 执行器、模板格式 | `aiworkspace_template_dev`（暂缓，恢复后生效）：新建、导出导入、引用和运行 |
+| skill 安装 kRPC、PIKG 的 `agent_skills` 子包、AgentRoot 的 `cmd_skills/` / `goal_skills/` / `tools/` 布局 | `opendan_agent_dev` 及所有内置手册的打包位置：安装、列表、选择、删除 |
+| AgentRootFS、Loader、Session/Behavior、cmd_skill 冻结/装配、PATH/helper、模板和扩展分发 | `opendan_agent_dev`、`ui_core` 及受影响的专项手册：发现/选择/执行、冻结与升级 |
+
+- **完成条件**：提交说明列出受影响的 skills、修改或无需修改的依据、验证命令与结果、尚未实测的 provider / 平台。删除失效命令，不用兼容说明掩盖当前版本不可用；同步生成来源与分发产物，不能只改打包副本。
+- **回归**：手册纯文字改动核对路径、命令和链接；CLI、协议、runtime 或打包变更运行相关用例（`cargo test -p libopendan --test xagent_lib work_sessions_take`、`--test xagent_cli skills_are`、`cargo test -p opendan`）和最小场景。真实生成、发布等需要环境的测试如实标为未验证，不能用 mock 通过替代。
+
 ## 常用术语与领域知识
 
 - **Zone**：BuckyOS 为了区别于传统“集群/云”而使用的术语，指用户拥有的逻辑云/集群，是系统管理和调度的基本范围。
@@ -157,7 +196,7 @@ WebUI 在各自目录运行 `pnpm install`、`pnpm build`。Desktop 和 OpenDAN 
 - **NodeGateway**：每台节点本地的统一网关能力，通常就是本机 `cyfs-gateway`，常见一致入口为 `127.0.0.1:3180`。（docker内不同)
 - **SN (Super Node)**：公网协助节点，为 Zone 提供 DDNS、证书挑战和转发/中继能力。
 - **OpenDAN**：Agent runtime 基础设施；当前 `opendan` 是 Agent Loader，一个进程托管一个 Agent，核心 Session/State 能力在 `libopendan` 等库中。Zone 内以 AppService 身份运行，支持容器和宿主机调试；独立 `--dev` 模式使用本地文件队列。
-- **Jarvis**：用户可启用的默认 Agent，其 runtime 应用包在 `src/apps/jarvis_runtime/`，通过 OpenDAN 加载。
+- **Jarvis**：系统内置的 Agent 模板（RootFS 模板），包在 `src/apps/jarvis_agent/`。系统不预建 Agent 身份；用户通过 Add Agent 向导（桌面 Jarvis 引导入口或 Users and Agents）为自己创建 Agent，control_panel 基于模板为它构造独立 App，由 OpenDAN 加载。
 - **App / AppInstance / Agent**：AppId 标识应用，AppInstanceId 标识某用户的应用实例；Agent 拥有独立 DID/AgentId，通过 `AgentSpec.binding` 绑定 runtime 的 AppInstanceId 与 service name，不能把 Agent 身份等同于 App 身份。共享定义见 `src/kernel/buckyos-api/src/app_schema.rs`。
 - **DID**：BuckyOS 的身份基础设施。仓库里最常见的是 `User(Owner) DID`、`Device DID`、`Zone DID`,`Agent DID` 四类。
   - **Config 在身份语境中的特殊含义**：受 CYFS 历史命名影响，代码里的 `UserConfig`、`DeviceConfig` 往往本质上就是 DID Document，而不是普通运行配置。

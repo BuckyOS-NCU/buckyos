@@ -34,7 +34,9 @@ const OFFICIAL_PROTOCOL_SOURCE_HOSTS: Record<string, Set<string>> = {
   glm: new Set(["docs.z.ai", "docs.bigmodel.cn"]),
   deepseek: new Set(["api-docs.deepseek.com"]),
   doubao: new Set(["www.volcengine.com", "docs.volcengine.com"]),
+  "doubao-agent-plan": new Set(["www.volcengine.com", "docs.volcengine.com"]),
   "doubao-tts": new Set(["www.volcengine.com", "docs.volcengine.com"]),
+  "doubao-speech": new Set(["www.volcengine.com", "docs.volcengine.com"]),
   qwen: new Set(["www.alibabacloud.com", "help.aliyun.com"]),
   "sn-ai-provider": new Set(["github.com", "developers.openai.com"]),
 };
@@ -53,6 +55,7 @@ export type ProviderProtocolContract = {
   base_contract_id?: string;
   api_version: string;
   api_types: string[];
+  test_model_ids?: Record<string, string>;
   variant_api_types?: string[];
   operation: string;
   http_method: string;
@@ -65,8 +68,14 @@ export type ProviderProtocolContract = {
   allowed_body_fields: string[];
   body_field_types: Record<
     string,
-    Array<"string" | "number" | "boolean" | "array" | "object">
+    Array<"string" | "number" | "integer" | "boolean" | "array" | "object">
   >;
+  body_field_formats?: Record<string, "http_url" | "http_url_or_data_uri">;
+  required_body_values?: Record<string, unknown>;
+  json_string_body_values?: Record<string, Record<string, unknown>>;
+  required_body_paths?: string[];
+  forbidden_body_paths?: string[];
+  canonical_request_overrides?: Record<string, unknown>;
   generation_config?: {
     allowed_fields: string[];
     thinking_level_values?: string[];
@@ -92,7 +101,8 @@ export type ProviderProtocolContract = {
     | "openai_video"
     | "glm_video"
     | "doubao_video"
-    | "qwen_media";
+    | "qwen_media"
+    | "doubao_asr";
   async_steps?: Array<{
     name: "poll" | "result" | "cancel";
     http_method: string;
@@ -101,6 +111,8 @@ export type ProviderProtocolContract = {
   }>;
   success_content_type?: string;
   success_fixture?: Record<string, unknown>;
+  inline_artifact_success_fixture?: Record<string, unknown>;
+  inline_artifact_payload_paths?: string[];
   success_chunk_fixtures?: Array<Record<string, unknown>>;
   async_result_fixture?: Record<string, unknown>;
   success_fixture_base64?: string;
@@ -127,6 +139,8 @@ export type ProviderProtocolCatalog = {
     credential_type: "api_key" | "bearer";
     instance_fields?: { region?: string; workspace?: string; account?: string };
     official_first_party_model_ids?: Record<string, string[]>;
+    official_aggregated_model_ids?: Record<string, string[]>;
+    wire_distinct_model_ids?: Record<string, string[]>;
     official_variant_sources?: string[];
     official_variant_rules?: Array<{
       model_ids: string[];
@@ -159,7 +173,6 @@ function object(value: unknown, field: string): Record<string, unknown> {
   }
   return value as Record<string, unknown>;
 }
-
 function nonEmptyString(value: unknown, field: string): string {
   if (typeof value !== "string" || !value.trim()) {
     throw new Error(`${field} must be a non-empty string`);
@@ -262,6 +275,45 @@ export function validateProviderProtocolCatalog(
         }
       }
     }
+    if (provider.official_aggregated_model_ids !== undefined) {
+      const aggregatedModelIds = object(
+        provider.official_aggregated_model_ids,
+        `${driver}.official_aggregated_model_ids`,
+      );
+      for (const [apiType, modelIds] of Object.entries(aggregatedModelIds)) {
+        stringArray(modelIds, `${driver}.official_aggregated_model_ids.${apiType}`);
+      }
+    }
+    if (provider.wire_distinct_model_ids !== undefined) {
+      const distinctModels = object(
+        provider.wire_distinct_model_ids,
+        `${driver}.wire_distinct_model_ids`,
+      );
+      for (const [apiType, rawModelIds] of Object.entries(distinctModels)) {
+        const modelIds = stringArray(
+          rawModelIds,
+          `${driver}.wire_distinct_model_ids.${apiType}`,
+        );
+        const officialPool = (provider.official_first_party_model_ids as
+          | Record<string, string[]>
+          | undefined)?.[apiType];
+        for (const modelId of modelIds) {
+          if (officialPool && !officialPool.includes(modelId)) {
+            throw new Error(
+              `${driver}.wire_distinct_model_ids.${apiType} contains ${modelId} outside its official model pool`,
+            );
+          }
+          if (!(provider.contracts as ProviderProtocolContract[]).some((contract) =>
+            contract.api_types.includes(apiType) &&
+            contract.test_model_ids?.[apiType] === modelId
+          )) {
+            throw new Error(
+              `${driver} has no distinct wire contract for ${apiType}/${modelId}`,
+            );
+          }
+        }
+      }
+    }
     if (provider.official_variant_rules !== undefined) {
       const sources = stringArray(
         provider.official_variant_sources,
@@ -340,8 +392,30 @@ export function validateProviderProtocolCatalog(
         nonEmptyString(contract[field], `${id}.${field}`);
       }
       stringArray(contract.api_types, `${id}.api_types`);
+      const contractTestModelIds = contract.test_model_ids === undefined
+        ? {}
+        : object(contract.test_model_ids, `${id}.test_model_ids`);
+      for (const [apiType, modelId] of Object.entries(contractTestModelIds)) {
+        if (!(contract.api_types as string[]).includes(apiType)) {
+          throw new Error(`${id}.test_model_ids.${apiType} is not declared by the contract`);
+        }
+        nonEmptyString(modelId, `${id}.test_model_ids.${apiType}`);
+        const hasOfficialPool = provider.official_first_party_model_ids !== undefined ||
+          provider.official_aggregated_model_ids !== undefined;
+        const officialPool = [
+          ...((provider.official_first_party_model_ids as
+            | Record<string, string[]>
+            | undefined)?.[apiType] ?? []),
+          ...((provider.official_aggregated_model_ids as
+            | Record<string, string[]>
+            | undefined)?.[apiType] ?? []),
+        ];
+        if (hasOfficialPool && !officialPool.includes(String(modelId))) {
+          throw new Error(`${id}.test_model_ids.${apiType} is absent from its official model pool`);
+        }
+      }
       for (const apiType of contract.api_types as string[]) {
-        if (!testModelIds[apiType]) {
+        if (!contractTestModelIds[apiType] && !testModelIds[apiType]) {
           throw new Error(`${id} has no ${driver}.test_model_ids.${apiType}`);
         }
       }
@@ -360,6 +434,42 @@ export function validateProviderProtocolCatalog(
         contract.body_field_types,
         `${id}.body_field_types`,
       );
+      if (contract.required_body_values !== undefined) {
+        const requiredBodyValues = object(
+          contract.required_body_values,
+          `${id}.required_body_values`,
+        );
+        for (const pointer of Object.keys(requiredBodyValues)) {
+          if (!pointer.startsWith("/")) {
+            throw new Error(`${id}.required_body_values keys must be JSON pointers`);
+          }
+        }
+      }
+      if (contract.json_string_body_values !== undefined) {
+        const values = object(
+          contract.json_string_body_values,
+          `${id}.json_string_body_values`,
+        );
+        for (const [pointer, expected] of Object.entries(values)) {
+          if (!pointer.startsWith("/")) {
+            throw new Error(`${id}.json_string_body_values keys must be JSON pointers`);
+          }
+          object(expected, `${id}.json_string_body_values.${pointer}`);
+        }
+      }
+      if (contract.canonical_request_overrides !== undefined) {
+        object(
+          contract.canonical_request_overrides,
+          `${id}.canonical_request_overrides`,
+        );
+      }
+      for (const field of ["required_body_paths", "forbidden_body_paths"] as const) {
+        if (contract[field] === undefined) continue;
+        const pointers = stringArray(contract[field], `${id}.${field}`);
+        if (pointers.some((pointer) => !pointer.startsWith("/"))) {
+          throw new Error(`${id}.${field} entries must be JSON pointers`);
+        }
+      }
       for (const required of contract.required_body_fields as string[]) {
         if (!allowed.has(required)) {
           throw new Error(`${id} required field ${required} is not allowed`);
@@ -406,12 +516,29 @@ export function validateProviderProtocolCatalog(
         const types = stringArray(rawTypes, `${id}.body_field_types.${field}`);
         if (
           types.some((type) =>
-            !["string", "number", "boolean", "array", "object"].includes(type)
+            !["string", "number", "integer", "boolean", "array", "object"].includes(type)
           )
         ) {
           throw new Error(
             `${id}.body_field_types.${field} contains invalid type`,
           );
+        }
+      }
+      if (contract.body_field_formats !== undefined) {
+        const formats = object(
+          contract.body_field_formats,
+          `${id}.body_field_formats`,
+        );
+        for (const [field, format] of Object.entries(formats)) {
+          if (!allowed.has(field)) {
+            throw new Error(`${id} format field ${field} is not allowed`);
+          }
+          if (!(bodyFieldTypes[field] as unknown[] | undefined)?.includes("string")) {
+            throw new Error(`${id} format field ${field} must accept strings`);
+          }
+          if (format !== "http_url" && format !== "http_url_or_data_uri") {
+            throw new Error(`${id}.body_field_formats.${field} is invalid`);
+          }
         }
       }
       if (contract.generation_config !== undefined) {
@@ -576,6 +703,36 @@ export function validateProviderProtocolCatalog(
           `${id}.success_fixture is invalid: ${fixtureErrors.join("; ")}`,
         );
       }
+      if (contract.inline_artifact_success_fixture !== undefined) {
+        object(
+          contract.inline_artifact_success_fixture,
+          `${id}.inline_artifact_success_fixture`,
+        );
+        const paths = stringArray(
+          contract.inline_artifact_payload_paths,
+          `${id}.inline_artifact_payload_paths`,
+        );
+        if (paths.length === 0 || paths.some((path) => !path.startsWith("/"))) {
+          throw new Error(
+            `${id}.inline_artifact_payload_paths must contain JSON pointers`,
+          );
+        }
+        for (const path of paths) {
+          const payload = (contract.inline_artifact_success_fixture as Record<string, unknown>);
+          const value = path.split("/").slice(1).reduce<unknown>((current, segment) => {
+            if (Array.isArray(current)) return current[Number(segment)];
+            if (current && typeof current === "object") {
+              return (current as Record<string, unknown>)[segment];
+            }
+            return undefined;
+          }, payload);
+          if (typeof value !== "string" || value.length === 0) {
+            throw new Error(`${id}.inline_artifact_payload_paths entry ${path} is not a string`);
+          }
+        }
+      } else if (contract.inline_artifact_payload_paths !== undefined) {
+        throw new Error(`${id}.inline_artifact_payload_paths requires a fixture`);
+      }
     }
   }
   for (const required of REQUIRED_T15_PROVIDER_DRIVERS) {
@@ -627,7 +784,11 @@ export function validateProviderProtocolCatalog(
         ? body.base_resp as Record<string, unknown>
         : undefined;
       const nativeApplicationError = fixture.status === 200 &&
-        Number(baseResponse?.status_code) > 0;
+        (Number(baseResponse?.status_code) > 0 ||
+          Object.entries(fixture.headers ?? {}).some(([name, value]) =>
+            name.toLowerCase() === "x-api-status-code" &&
+            !["0", "20000000", "20000001", "20000002"].includes(value)
+          ));
       if (
         !Number.isInteger(fixture.status) ||
         (Number(fixture.status) < 400 && !nativeApplicationError)
@@ -707,6 +868,18 @@ export function protocolContract(
   return contract;
 }
 
+export function contractTestModelId(
+  provider: ProviderProtocolCatalog["providers"][number],
+  contract: ProviderProtocolContract,
+  apiType: string,
+): string {
+  const model = contract.test_model_ids?.[apiType] ?? provider.test_model_ids[apiType];
+  if (!model) {
+    throw new Error(`${contract.id} has no test model for ${apiType}`);
+  }
+  return model;
+}
+
 function pathPattern(template: string): RegExp {
   const escaped = template.replace(/[.+?^${}()|[\]\\]/g, "\\$&")
     .replace(/\\\{[^}]+\\\}/g, "[^/]+");
@@ -778,7 +951,13 @@ export function validateProviderRequest(
   for (
     const [name, expected] of Object.entries(contract.required_headers ?? {})
   ) {
-    if (request.headers.get(name) !== expected) {
+    const actual = request.headers.get(name);
+    if (
+      expected === "<uuid>"
+        ? !actual ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(actual)
+        : actual !== expected
+    ) {
       errors.push(`header ${name} must equal ${expected}`);
     }
   }
@@ -801,6 +980,45 @@ export function validateProviderRequest(
     return errors;
   }
   const body = request.body as Record<string, unknown>;
+  const pointerValue = (pointer: string): unknown =>
+    pointer.split("/").slice(1).reduce<unknown>((value, token) => {
+      const key = token.replace(/~1/g, "/").replace(/~0/g, "~");
+      return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)[key]
+        : undefined;
+    }, body);
+  for (const [pointer, expected] of Object.entries(contract.required_body_values ?? {})) {
+    const actual = pointerValue(pointer);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      errors.push(`body ${pointer} must equal ${JSON.stringify(expected)}`);
+    }
+  }
+  for (const [pointer, expected] of Object.entries(contract.json_string_body_values ?? {})) {
+    const actual = pointerValue(pointer);
+    if (typeof actual !== "string") {
+      errors.push(`body ${pointer} must be a JSON string`);
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(actual);
+      if (JSON.stringify(parsed) !== JSON.stringify(expected)) {
+        errors.push(`body ${pointer} JSON must equal ${JSON.stringify(expected)}`);
+      }
+    } catch {
+      errors.push(`body ${pointer} must contain valid JSON`);
+    }
+  }
+  for (const pointer of contract.required_body_paths ?? []) {
+    const actual = pointerValue(pointer);
+    if (actual === undefined || actual === null || actual === "") {
+      errors.push(`body ${pointer} is required`);
+    }
+  }
+  for (const pointer of contract.forbidden_body_paths ?? []) {
+    if (pointerValue(pointer) !== undefined) {
+      errors.push(`body ${pointer} is forbidden`);
+    }
+  }
   const requiredFields = [
     ...contract.required_body_fields,
     ...(contract.required_body_fields_by_api_type?.[apiType] ?? []),
@@ -814,16 +1032,69 @@ export function validateProviderRequest(
   for (const field of Object.keys(body)) {
     if (!allowed.has(field)) errors.push(`unknown body field ${field}`);
     const expectedTypes = contract.body_field_types[field];
-    if (
-      expectedTypes && !expectedTypes.includes(
-        Array.isArray(body[field])
-          ? "array"
-          : body[field] !== null && typeof body[field] === "object"
-          ? "object"
-          : typeof body[field] as never,
-      )
-    ) {
+    const actualType = Array.isArray(body[field])
+      ? "array"
+      : body[field] !== null && typeof body[field] === "object"
+      ? "object"
+      : typeof body[field];
+    if (expectedTypes && !(
+      expectedTypes.includes(actualType as never) ||
+      actualType === "number" && expectedTypes.includes("integer") &&
+        Number.isInteger(body[field])
+    )) {
       errors.push(`body field ${field} has invalid type`);
+    }
+  }
+  for (const [field, format] of Object.entries(contract.body_field_formats ?? {})) {
+    const value = body[field];
+    if (value === undefined || value === null) continue;
+    if (format === "http_url" || format === "http_url_or_data_uri") {
+      const dataUri = typeof value === "string" &&
+        /^data:[^;,\s]+;base64,[A-Za-z0-9+/]+={0,2}$/.test(value);
+      try {
+        const url = new URL(String(value));
+        if (
+          typeof value !== "string" ||
+          (!["http:", "https:"].includes(url.protocol) &&
+            !(format === "http_url_or_data_uri" && dataUri))
+        ) {
+          errors.push(
+            format === "http_url"
+              ? `body field ${field} must be an HTTP(S) URL`
+              : `body field ${field} must be an HTTP(S) URL or Base64 data URI`,
+          );
+        }
+      } catch {
+        if (!(format === "http_url_or_data_uri" && dataUri)) {
+          errors.push(
+            format === "http_url"
+              ? `body field ${field} must be an HTTP(S) URL`
+              : `body field ${field} must be an HTTP(S) URL or Base64 data URI`,
+          );
+        }
+      }
+    }
+  }
+  if (contract.id === "doubao.translation.responses.v3") {
+    const input = body.input;
+    const userTextBlocks = Array.isArray(input)
+      ? input.flatMap((item) => {
+        const record = recordValue(item);
+        if (record?.role !== "user" || !Array.isArray(record.content)) return [];
+        return record.content.filter((block) => recordValue(block)?.type === "input_text");
+      })
+      : [];
+    const options = userTextBlocks.length === 1
+      ? recordValue(recordValue(userTextBlocks[0])?.translation_options)
+      : undefined;
+    if (!options || typeof options.target_language !== "string" || !options.target_language.trim()) {
+      errors.push("Doubao translation requests require one user input_text translation_options.target_language");
+    } else if (
+      Object.keys(options).some((name) => !["source_language", "target_language"].includes(name)) ||
+      options.source_language !== undefined &&
+        (typeof options.source_language !== "string" || !options.source_language.trim())
+    ) {
+      errors.push("Doubao translation_options contains invalid fields");
     }
   }
   if (contract.api_types.includes("decision")) {
@@ -995,7 +1266,11 @@ function validateNestedProviderBody(
     );
   }
   if (contract.operation === "responses.create" && Array.isArray(body.input)) {
-    validateOpenAiResponsesInput(body.input, errors);
+    validateOpenAiResponsesInput(
+      body.input,
+      errors,
+      contract.id === "qwen.responses.compatible-v1",
+    );
   }
   if (
     contract.operation === "chat.completions.create" &&
@@ -1091,6 +1366,7 @@ function validateNestedProviderBody(
 function validateOpenAiResponsesInput(
   input: unknown[],
   errors: string[],
+  allowInputVideo = false,
 ): void {
   input.forEach((item, index) => {
     const message = recordValue(item);
@@ -1159,7 +1435,12 @@ function validateOpenAiResponsesInput(
       }
       if (
         role !== "assistant" &&
-        !["input_text", "input_image", "input_file"].includes(type)
+        ![
+          "input_text",
+          "input_image",
+          "input_file",
+          ...(allowInputVideo ? ["input_video"] : []),
+        ].includes(type)
       ) {
         errors.push(
           `body field input[${index}].content[${partIndex}].type=${type}; ${role} message content is invalid`,
@@ -1607,6 +1888,9 @@ function providerErrorCode(fixture: ProtocolErrorFixture): string {
   const baseResponse = body.base_resp && typeof body.base_resp === "object"
     ? body.base_resp as Record<string, unknown>
     : undefined;
+  const header = body.header && typeof body.header === "object"
+    ? body.header as Record<string, unknown>
+    : undefined;
   for (
     const value of [
       error?.code,
@@ -1615,6 +1899,10 @@ function providerErrorCode(fixture: ProtocolErrorFixture): string {
       body.code,
       body.error_type,
       baseResponse?.status_code,
+      header?.code,
+      Object.entries(fixture.headers ?? {}).find(([name]) =>
+        name.toLowerCase() === "x-api-status-code"
+      )?.[1],
     ]
   ) {
     if (value !== undefined && value !== null && String(value)) {
@@ -1629,6 +1917,12 @@ function providerErrorRetriable(fixture: ProtocolErrorFixture): boolean {
     name.toLowerCase() === "x-fal-retryable"
   )?.[1];
   if (explicit) return explicit.toLowerCase() === "true";
+  const businessCode = Object.entries(fixture.headers ?? {}).find(([name]) =>
+    name.toLowerCase() === "x-api-status-code"
+  )?.[1];
+  if (businessCode === "45000131" || businessCode?.startsWith("550")) {
+    return true;
+  }
   return fixture.status === 429 || fixture.status >= 500 ||
     [
       "rate_limit",
@@ -1674,6 +1968,7 @@ export function buildT15Manifest(
   for (const provider of catalog.providers) {
     for (const contract of provider.contracts) {
       for (const apiType of contract.api_types) {
+        const contractModel = contract.test_model_ids?.[apiType];
         const common: Partial<AcceptanceCase> = {
           layer: "T1.5",
           priority: "P0",
@@ -1688,7 +1983,9 @@ export function buildT15Manifest(
           session: "isolated-per-case",
           provider_driver: provider.provider_driver,
           provider_instance: `t15-${provider.provider_driver}`,
-          model_selector: null,
+          model_selector: contractModel
+            ? { kind: "exact", value: contractModel }
+            : null,
           api_type: apiType,
           method: methodsForApiType(apiType)[0] ?? apiType,
           execution_mode: "immediate",
@@ -1734,6 +2031,22 @@ export function buildT15Manifest(
             expected_wire_fixture:
               `${contract.id}.request.task-result-artifact`,
             response_fixture: `${contract.id}.success`,
+          } as AcceptanceCase);
+        }
+        if (apiType === "llm" && contract.inline_artifact_success_fixture) {
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.inline-artifact-provider-state`,
+            ),
+            tags: [
+              ...common.tags!,
+              "task_result_artifact",
+              "inline_artifact_provider_state",
+            ],
+            mock_scenario: "inline_artifact_success",
+            expected_wire_fixture: `${contract.id}.request.inline-artifact-provider-state`,
+            response_fixture: `${contract.id}.inline-artifact-success`,
           } as AcceptanceCase);
         }
         const artifactIdentity = contract.provider_artifact_identity;
@@ -1857,7 +2170,8 @@ export function buildT15Manifest(
               contract.async_protocol === "minimax_video" ||
               contract.async_protocol === "minimax_video_v2" ||
               contract.async_protocol === "glm_video" ||
-              contract.async_protocol === "doubao_video"
+              contract.async_protocol === "doubao_video" ||
+              contract.async_protocol === "doubao_asr"
               ? ["async_poll_timeout"] as const
               : ["async_poll_timeout", "async_artifact_unavailable"] as const;
           for (const scenario of terminalFailureScenarios) {
@@ -1873,13 +2187,7 @@ export function buildT15Manifest(
               expected_wire_fixture: `${contract.id}.request.async`,
               response_fixture: `${contract.id}.${scenario}`,
               timeout_ms: scenario === "async_poll_timeout"
-              ? contract.async_protocol === "google_lro" ||
-                    contract.async_protocol === "minimax_video" ||
-                    contract.async_protocol === "minimax_video_v2" ||
-                    contract.async_protocol === "glm_video" ||
-                    contract.async_protocol === "doubao_video"
-                  ? 3_500
-                  : 1_500
+                ? 5_000
                 : common.timeout_ms,
             } as AcceptanceCase);
           }
@@ -1961,6 +2269,23 @@ export function buildT15Manifest(
     case_id: "t1.5.openai.openai.responses.v1.llm.cloud-update",
     tags: [...cloudUpdateBase.tags, "cloud_update"],
     cleanup: [...cloudUpdateBase.cleanup, "restore_cloud_provider_rules"],
+  });
+  const qwenResponsesBase = cases.find((testCase) =>
+    testCase.provider_driver === "qwen" &&
+    testCase.protocol_contract_id === "qwen.responses.compatible-v1" &&
+    testCase.api_type === "llm" &&
+    testCase.mock_scenario === "success"
+  );
+  if (!qwenResponsesBase) {
+    throw new Error("Qwen Responses LLM contract is required for the video input case");
+  }
+  cases.push({
+    ...qwenResponsesBase,
+    case_id: "t1.5.qwen.qwen.responses.compatible-v1.llm.video-input",
+    tags: [...qwenResponsesBase.tags, "video_input"],
+    model_selector: { kind: "exact", value: "qwen3.8-omni-flash" },
+    expected_wire_fixture:
+      "qwen.responses.compatible-v1.request.video-input",
   });
   const historyProviders = new Set([
     "openai",

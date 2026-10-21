@@ -97,6 +97,10 @@
               "type": "null"
             }
           ]
+        },
+        "todo": {
+          "description": "A hand-over to this behavior (`next_behavior`) executes the session's next serial Todo: the host admits it and hands its body over as the sub task (`create_sub_context` only).",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -157,6 +161,13 @@
     "BehaviorPromptConfig": {
       "additionalProperties": false,
       "properties": {
+        "goal_activation": {
+          "description": "Goal Sessions: template of the Goal header (variable `goal`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "anyOf": [
             {
@@ -194,6 +205,55 @@
         },
         "system": {
           "description": "System template of the behavior's context.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "BehaviorReply": {
+      "additionalProperties": false,
+      "description": "`[reply]`: the reply contract of a behavior's context. The final reply (an assistant text without tool calls) is one JSON value matching `schema`: the provider enforces it natively where it can, the host checks it and asks for one correction (`OutputSpec::Json { max_repairs: Some(1) }`). Function call loop only.",
+      "properties": {
+        "asks_field": {
+          "description": "An array field of the reply that must list every question the context asked the user (`agent-session ask-user`), one entry each.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema": {
+          "description": "JSON Schema of the reply (an object schema)."
+        }
+      },
+      "required": [
+        "schema"
+      ],
+      "type": "object"
+    },
+    "BehaviorToolConfig": {
+      "additionalProperties": false,
+      "description": "`[tool]`: a sub context behavior offered to its callers as a named function. Calling it runs the behavior exactly like `call_behavior` does; the declaration only decides what the caller's model sees.",
+      "properties": {
+        "description": {
+          "default": "",
+          "description": "When to call it: the caller's routing guide.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Function name (letters, digits, `_`); default: the behavior name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parameters": {
+          "description": "JSON Schema of the arguments (an object); default: `{task: string}`."
+        },
+        "task": {
+          "description": "Template of the sub context's task (`{{args.<name>}}` only); default: the arguments as JSON (or `args.task` with the default parameters).",
           "type": [
             "string",
             "null"
@@ -381,6 +441,26 @@
         }
       ],
       "default": {}
+    },
+    "reply": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BehaviorReply"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tool": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BehaviorToolConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "title": "BehaviorConfig",

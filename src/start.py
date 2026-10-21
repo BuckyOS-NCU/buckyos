@@ -1,11 +1,14 @@
 #!/usr/bin/env -S uv run
 
 import argparse
+import json
+from contextlib import contextmanager
 import os
 import shutil
 import subprocess
 import sys
 import platform
+import tempfile
 from pathlib import Path
 
 
@@ -57,7 +60,7 @@ def _print_help() -> int:
                 f"  cd {SCRIPT_DIR} && uv run ./start.py [options]",
                 "",
                 "Options:",
-                "  --all                 Fresh dev install before startup.",
+                "  --all                 Fresh dev install before startup; preserve etc/devenv.json.",
                 "  --reinstall [GROUP]   Fresh install before startup, optionally running make_config.ts GROUP.",
                 "  --skip-update         Skip file update and only restart BuckyOS.",
                 "  -h, --help            Show this help message.",
@@ -192,6 +195,28 @@ def resolve_buckyos_root() -> Path:
     print(f"BUCKYOS_ROOT not set, using default: {default_root}")
     return Path(default_root).expanduser()
 
+
+@contextmanager
+def _preserve_devenv_config(enabled: bool):
+    if not enabled:
+        yield None
+        return
+
+    devenv_path = resolve_buckyos_root() / "etc" / "devenv.json"
+    if not devenv_path.is_file():
+        yield None
+        return
+
+    with tempfile.TemporaryDirectory(prefix="buckyos-devenv-") as temporary:
+        backup_path = Path(temporary) / "devenv.json"
+        shutil.copy2(devenv_path, backup_path)
+        try:
+            yield devenv_path
+        finally:
+            devenv_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup_path, devenv_path)
+
+
 def kill_all_processes():
     """Kill all related BuckyOS processes"""
     print("Stopping all BuckyOS processes...")
@@ -233,6 +258,58 @@ def update_files(install_all=False,config_group_name=None):
 
     
 
+def _missing_paios_images(buckyos_root: Path) -> list[str]:
+    """paios images node_daemon needs but cannot find, in local image mode.
+
+    Release installs pin the images in bin/paios-images/ and load them from the
+    bundled tarballs; dev installs use <repo>:latest-<arch> from the local store
+    (repo overridable in etc/devenv.json). node_daemon never pulls either.
+    """
+    if (buckyos_root / "bin" / "paios-images" / "paios_images.json").is_file():
+        return []
+    docker = _find_command("docker")
+    if docker is None:
+        return []
+    arch = "aarch64" if platform.machine().lower() in ("arm64", "aarch64") else "amd64"
+    repos = {"aios": "paios/aios", "exttool": "paios/exttool"}
+    try:
+        overrides = json.loads((buckyos_root / "etc" / "devenv.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        overrides = {}
+    if isinstance(overrides, dict):
+        for name in repos:
+            value = overrides.get(name)
+            if isinstance(value, str) and value.strip():
+                repos[name] = value.strip()
+    missing = []
+    for repo in repos.values():
+        reference = f"{repo}:latest-{arch}"
+        inspected = subprocess.run(
+            [docker, "image", "inspect", reference],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **_windows_subprocess_kwargs(),
+        )
+        if inspected.returncode != 0:
+            missing.append(reference)
+    return missing
+
+
+def _warn_missing_paios_images(buckyos_root: Path) -> None:
+    missing = _missing_paios_images(buckyos_root)
+    if not missing:
+        return
+    print("")
+    print("!" * 72)
+    print("WARNING: paios images missing; Agents and script apps will fail to deploy.")
+    print("node_daemon does not pull them. Get them with one of:")
+    for reference in missing:
+        print(f"  docker pull {reference}")
+    print("  uv run build.py            (from the repository root; pre-pulls them)")
+    print("  ./build_aios --local-test  (build the worker image from local source)")
+    print("!" * 72)
+
+
 def start_system():
     """Start BuckyOS system"""
     print("Starting BuckyOS system...")
@@ -258,6 +335,7 @@ def start_system():
         print(f"BuckyOS system started: {node_daemon_path}")
         print(f"node_daemon pid: {pid}")
         print("System is running in background...")
+        _warn_missing_paios_images(Path(buckyos_root))
         
     except Exception as e:
         print(f"Failed to start system: {e}")
@@ -292,17 +370,24 @@ def main(argv: list[str] | None = None) -> int:
     if need_update and not _sdk_tool_distribution_ready():
         return 2
     
-    # Step 1: Kill all processes
-    kill_all_processes()
-    
-    if install_all or need_update:
-        # Step 2: Update files
-        update_files(install_all,config_group_name)
+    with _preserve_devenv_config(options.all) as preserved_devenv:
+        # Step 1: Kill all processes
+        kill_all_processes()
+
+        if install_all or need_update:
+            # Step 2: Update files
+            update_files(install_all,config_group_name)
     
     # Step 3: Start system
     start_system()
     
     print("=== BuckyOS Startup Complete ===")
+    if preserved_devenv is not None:
+        print(f"Note: Preserved local development config: {preserved_devenv}")
+        print(
+            "Local image overrides in this file still apply. "
+            "Remove the aios/exttool overrides and restart to use the default images."
+        )
     return 0
 
 if __name__ == "__main__":

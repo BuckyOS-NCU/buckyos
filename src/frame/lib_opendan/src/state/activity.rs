@@ -36,6 +36,10 @@ pub struct ActiveSession {
     pub overlap: Vec<String>,
     pub possibly_interrupted: bool,
     pub driver: String,
+    /// The session that created it (a sub session's parent).
+    pub parent: Option<String>,
+    /// What it is about (UI sessions), as last reported.
+    pub topic: Option<Topic>,
 }
 
 pub(super) struct FsActivity {
@@ -80,7 +84,10 @@ pub fn refs_overlap(a: &str, b: &str) -> bool {
 }
 
 fn same_target(me: &RegistryEntry, other: &RegistryEntry) -> bool {
-    (me.workspace.is_some() && me.workspace == other.workspace)
+    (me.workspace
+        .as_ref()
+        .zip(other.workspace.as_ref())
+        .is_some_and(|(a, b)| a.workspace_id == b.workspace_id))
         || (me.artifact_id.is_some() && me.artifact_id == other.artifact_id)
 }
 
@@ -137,6 +144,8 @@ impl ActivityView for FsActivity {
                 overlap,
                 possibly_interrupted,
                 driver: e.driver.principal.clone(),
+                parent: e.origin.as_ref().and_then(|o| o.parent_session.clone()),
+                topic: e.status.topic.clone(),
             });
         }
         out.sort_by(|a, b| {

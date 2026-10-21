@@ -67,6 +67,7 @@ CLI：`post <sid> --json <file | ->` 接受逻辑记录（`schema`、`from`、`a
 | `to` / `to_session` | Session 不校验、不路由；只用于渲染所在会话和推出回复目标 |
 | 附件 | `content.refs` 的 `DataObj`（有 ObjId）；本机文件先登记进 NamedStore |
 | `delivery` | 各字段 ≤ 256 字节；未知字段忽略 |
+| `delivery.context` | 为 `true` 时这条消息只是会话里较早的消息，作为其后输入的资料（如群聊请求附带的群上下文）：它不单独组成批次、不构成请求，说话人照常保留；缺省 `false`，不输出 |
 
 构造 helper（只做构造，不引入新的线格式）：`text_msg(from, agent, text)`（`kind = chat`，带 `created_at_ms` 与 `nonce`）、`attach(msg, obj_id, name)`、`reply_to(msg, target)`、`PostedInput::msg(poster, msg, delivery)`（校验并以 ObjId 为 key）。
 
@@ -119,9 +120,12 @@ payload 中的未知字段忽略（producer 可以比 consumer 新）；未知 c
 | `event`，`source = task:<id>` 且有挂起调用在等该 task | 消费，`event_dropped{reason: pending_call}` | 只触发一次 resolver 查询；结果以 ToolResult 回填原 run / Turn |
 | `event`，没有匹配的有效订阅 | 消费，`event_dropped{reason: unsubscribed}` | 无；timer、系统事件没有兜底例外 |
 
-- 订阅匹配：给出 `subscription_id` 时必须存在且来源相符；未给出时取第一个来源相符的显式或隐式订阅。每个 Session 都有一个隐式 semi 订阅：用户时区（`_user_timezone`，`source = system:user_timezone`）。
+- 订阅匹配：给出 `subscription_id` 时必须存在且来源相符；未给出时取第一个来源相符的显式或隐式订阅。每个 Session 都有一个隐式 semi 订阅：用户时区（`_user_timezone`，`source = system:user_timezone`）。Goal Session（模板 `goal`）另有隐式 active 订阅 `_goal_activation`（`source = system:goal`）。UI Session（模板 `ui`，`group` 经 `base` 继承）另有隐式 semi 订阅 `_notify`（`source = system:notify`）。`system:<id>` 的订阅也匹配子 id `system:<id>:<sub>`。
+- **通知的观察（`_notify`）**：Agent 的系统通知另投进它与用户的某个会话后，msg-center 在 Agent 自己的 INBOX 该会话写一条 `buckyos.notify.delivered` 记录；宿主（OpenDAN Loader 的 msg bridge）把它转成该会话 UI Session 的 `AgentEvent{subscription_id: "_notify", source: system:notify:<notify_id>, event: "delivered", summary}`（key `notify:<notify_id>:<会话>`）。每条通知是独立的半订阅状态（来源带通知 id），不唤醒 Session、不开 Turn，随下一批受控输入出现在快照中；`summary` 是一行 `[notify <id>] <kind>/<level> from <goal …|session …> at <UTC>: <title> — <message 摘要> (options: id=label, …) — check the current state with `agent-session notify show <id>``。会话还没有 UI Session 时宿主照常新建一代，回复坐标取自记录的 `reply_route`；UI Session 只在有受控输入时 bootstrap，单有观察不会开口。第一段只有“已投递”事件，状态由 Agent 按需查询。
+- **Goal 问题的回答**：Goal 的 `questions` 由驱动者在 Activation 关闭前发成 `input` 通知（幂等键 `goal:<goal_id>:q:<sha256(text) 前 16 位>`）；通知结束后宿主投递 `AgentEvent{subscription_id: "_goal_activation", source: system:goal, event: "answer", summary}`（key `goal:<goal_id>:answer:<notify_id>`），成为 Activation 原因 `answer`（`ref` = notify_id）；该 Activation 关闭时问题记下 `status` 与 `answer`，Goal 头的 `<open_questions>` 带上它们。
+- **Goal 的运行机会**：运行时（宿主或 CLI）向 Goal 当前 epoch 的 Goal Session 投递 `AgentEvent{subscription_id: "_goal_activation", source: system:goal, event, summary}`：`event = created | reopened | restarted`（epoch 开始，key `goal:<goal_id>:start:<epoch>`，每个 epoch 只投一次）、`scheduled`（定时，key `goal:<goal_id>:scheduled:<slot>:<missed>`，`missed` = 自上次以来经过的槽数，>1 表示停机期间错过的槽已合并为这一次）、`activate`（手动，key `goal:<goal_id>:activate:<request_id>`）。UI 转交的反馈是 Agent 自己发给自己的 `msg`（`delivery.from_name = "feedback from <来源>"`、`conversation_name = "goal <goal_id>"`）。积压的多个运行机会、Work 的结束（`_child`，Goal Session 按 `goal_id` 收取，跨 epoch 只收一次）与反馈合成一个 Activation 的输入批次，各自成为该 Activation 的 `reasons[]`。Goal 暂停时这些输入留在队列。
 - subscribe / unsubscribe 与事件按投递 index 生效：`event A → unsubscribe → event B` 中 A 按当时有效的订阅处理，unsubscribe 清理该订阅尚未注入的状态，B 丢弃。已被 active 订阅接受的事件不因之后的 unsubscribe 改判。
-- 挂起工具（PendingTool）或子 context 进行期间，msg / Input event 留在队列，不能填补缺失的 ToolResult；control 继续处理。
+- 挂起工具（PendingTool）或子 context 进行期间，msg / Input event 留在队列，不能填补缺失的 ToolResult；control 继续处理。唯一的例外是等用户回答的调用（`userinput:`，§9）：它取一条 msg 作为结果。
 - 先提交 state.json（消费位置、`pending_events`、worklog），再确认输入源。
 
 ## 4. 消费进度（state.json）
@@ -179,7 +183,7 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 | `on_input` | 选中的 msg / Input event | control、Observe 事件、队列通知本身不构成此入口 |
 | `on_context_switch` | 交接：切换 behavior、进入子 context、经交接批次返回的子结果 | 延续当前 Turn；工具触发的子调用返回仍是 ToolResult |
 
-一次装配只选一个入口（`on_init` → `on_context_switch` → `on_input`），允许消费的外部输入并入该批。`input.mode`：`batch`（默认，批次预算内取多条）或 `single`（总共取一条），未选的留在队列。模板与策略取自接收批次的 context（`prompt.*` / `input.*`，behavior 条目按字段覆盖 Session 的）。模板报错、或已有选中的输入却渲染出空文本：报错并保留现场，不消费、不确认。
+一次装配只选一个入口（`on_init` → `on_context_switch` → `on_input`），允许消费的外部输入并入该批。`input.mode`：`batch`（默认，批次预算内取多条）或 `single`（总共取一条），未选的留在队列。`delivery.context` 的消息不计入预算，随其后第一条被选中的输入一起进入批次；其后还没有输入时整组留在队列，不单独触发。模板与策略取自接收批次的 context（`prompt.*` / `input.*`，behavior 条目按字段覆盖 Session 的）。模板报错、或已有选中的输入却渲染出空文本：报错并保留现场，不消费、不确认。
 
 ### 6.2 内建渲染（跨语言逐字节一致）
 
@@ -204,6 +208,7 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 | `group` | `delivery.conversation_name`，缺省取 `to[0]` | 仅群消息 |
 | `session` | `to_session` | 非空时 |
 | `mentioned` | `mentions.dids` 含 Agent DID | 仅为 true 时（`all` 不算） |
+| `context` | `delivery.context` | 仅为 true 时 |
 | `reply_to` / `edit_of` / `redacts` / `thread` | `thread.reply_to`、`relates_to` | 值为目标消息的 ObjId |
 | `format` | `content.format` | 仅 `text/*` 且非 `text/plain` 时 |
 | `title` | `content.title` | 非空时 |
@@ -214,13 +219,13 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 
 属性值转义 `& < > "`。只有一条纯文本消息时也使用 `<msg>`。`machine` 与 `ServiceDid` 引用不在内建渲染中出现。
 
-内建模板：`<session_input hook="…" time="<批次时间>">` 元素，依次包含交接状态（`<context_switch to>`、`<process_result>`、`<sub_task>`）、bootstrap 的 `<task>` / `<scope>`、`input.text`、`<perceptions>`、`<hints>`、活动 session 列表、`<runtime>`。半订阅快照的内建形式：`<semi_subscription_snapshot>` 内每个状态版本一个 `<event>` 元素（终结版本在前）。
+内建模板（UI Session 除外，见 §6.5）：`<session_input hook="…" time="<批次时间>">` 元素，依次包含交接状态（`<context_switch to>`、`<process_result>`、`<sub_task>`）、bootstrap 的 `<task>` / `<scope>`、`input.text`、`<perceptions>`、`<hints>`、活动 session 列表、`<runtime>`。半订阅快照的内建形式：`<semi_subscription_snapshot>` 内每个状态版本一个 `<event>` 元素（终结版本在前）。
 
 协议时间与内建渲染一律 UTC。用户时区与 Session 绑定（`session.timezone`，IANA 名），其初始值与后续变化经隐式 semi 订阅进入半订阅快照，不取 Runner 所在机器的时区，变化本身不唤醒推理。
 
 ### 6.3 自定义模板
 
-模板引擎是 `llm_context::prompt_engine`（upon，`__EXEC__` 关闭）。只含块标签（`{% for %}`、`{% if %}`、`{% endfor %}` …）的行不产生输出行；输出去掉首尾空白。可用变量：`input.{hook, time, messages[], events[], items[], text, count}`（视图字段见 `runner/input_view.rs`；条件用布尔字段 `msg.is_group`、`msg.mentions.me`、`ev.terminal`、`item.is_msg`）、`session.*`、`runtime.*`、`handover`、各内建块（`task_text`、`handover_text`、`perceptions_text`、`hints_text`、`active_sessions_text`、`runtime_text`、`builtin`）。
+模板引擎是 `llm_context::prompt_engine`（upon，`__EXEC__` 关闭）。只含块标签（`{% for %}`、`{% if %}`、`{% endfor %}` …）的行不产生输出行；输出去掉首尾空白。可用变量：`input.{hook, time, messages[], events[], items[], text, count}`（视图字段见 `runner/input_view.rs`；条件用布尔字段 `msg.is_group`、`msg.mentions.me`、`msg.context`、`ev.terminal`、`item.is_msg`）、`session.*`、`runtime.*`、`handover`、各内建块（`task_text`、`handover_text`、`perceptions_text`、`hints_text`、`active_sessions_text`、`runtime_text`、`builtin`）。
 
 命名格式 `{{ value | render_format: "名称" }}`（未知格式或对象形状不符是模板错误；声明支持空值的格式对空值输出空串）：
 
@@ -241,6 +246,51 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 
 `inline` 的请求被 provider 拒绝（永久或未知的 provider 错误：模型不接受图片 / 文档，或对象不可读）时，Session 机械降级一次：去掉该 run 中 user 消息的媒体块，在其文本末尾追加一行说明，发布改写后的快照并重试；快照的 `host.libopendan.media_degraded = true` 记录它已发生，同一个 run 不再降级。文本自足保证附件仍可按 ObjId / 路径读取。
 
+### 6.5 UI Session 的 chat 格式
+
+`session.kind = ui`（一对一与群聊的会话 Session）的内建模板是 chat 格式：只有变化了的背景行，然后是输入本身。没有 `<session_input>` 包装、`<task>`、`<runtime>` JSON、`<active_sessions>`，半订阅状态也不单独成一条快照消息（并入背景行）。
+
+```text
+<<background_context>>
+- current_time 2026-10-16T10:45:45-07:00 (America/Los_Angeles)
+- runtime native on lzc-pve, cwd …/sessions/<sid>
+- work work-12481d…: running — reviewing PR #667 diff
+- [notify n_01] input/timely from session work-… : Which branch? … — check the current state with `agent-session notify show n_01`
+- hint: owner prefers replies in Chinese (noticed 2026-10-02)
+<</background_context>>
+你好 Jarvis
+```
+
+事件批次（没有消息）：
+
+```text
+<<background_context>>
+- work work-12481d…: finished (succeeded) — 1 P2 issue found. Read: agent-session read-session work-12481d… --report
+<</background_context>>
+<<inputs>>
+<event key="child:work-12481d…:finished@26" source="session:work-12481d…" event="finished" seq="26" terminal="true">sub session work-12481d… finished (succeeded): 1 P2 issue found</event>
+<</inputs>>
+```
+
+背景行（每行一个稳定 key；文本为一行）：
+
+| key | 内容 | 来源 |
+|---|---|---|
+| `time` | `current_time <用户时区的本地时间> (<IANA 名>)`；没有 `session.timezone` 时 UTC | 批次时间 + `session.timezone` |
+| `runtime` | `runtime <kind> on <hostname>, cwd <cwd>` | 运行时状态 |
+| `channel` | 本批最后一条消息经过的隧道 DID | `delivery.tunnel` |
+| `work:<sid>` | 本 Session 创建的子 Session：运行中 → 状态与活动摘要；本批送达其结束 → `finished (<outcome>) — <一行状态>. Read: agent-session read-session <sid> --report`；等输入 / 等决定 | 活动视图（`parent = 本 sid`）、本批的子 Session 事件 |
+| `ui:<sid>` | 其它 UI Session 的 topic 标题 | 活动视图（登记表 `status.topic`） |
+| `session:<sid>` | 与本 Session 目标相同或范围重叠的其它活动 Session（避让规则） | 活动视图 |
+| `event:<key>` | 半订阅状态版本：`_notify` 的通知行原样（`[notify <id>] …`）；其它为 `<source> <event>: <summary>`。用户时区事件不单列（由 `time` 行承载） | `pending_events`（同 §5 的选择与预算） |
+| `hint:<id>` | `hint: <sentence> (noticed <time>)` | 按 `state.topic.tags` 召回的 hints |
+
+- **只显示变化的行**：`state.background_shown` 记录每个 key 上次显示时的内容摘要；摘要变了才显示。`time` 行另按 5 秒粒度：距上次显示不足 `BACKGROUND_TIME_STEP_MS = 5000` 且时区未变时不显示。本批候选里没有的 key 从记录中删除（再出现时重新显示）。所有行都没有变化时整个 `<<background_context>>` 块省略。
+- 新记录随批次 receipt 提交（`extra.background`，见 §7），恢复时与 receipt 一起应用；显示了哪些半订阅版本仍记在 receipt 的 `events` 里。
+- **消息**：一对一时只写原文，不写 key / from / time；附件每个一行 `[attachment <media> "<name>" -> <path 或 ObjId>]`；回复 / 编辑等关系有才写一行（`(replying to <ObjId>)`）。一个批次有多条消息时每条前加一行 `[<发言人> <本地时间 HH:MM:SS>]`。**群聊**保留 §6.2 的 `<msg>` 元素（发言人与 `context="true"` 是群聊语义的根本），与事件一起放在 `<<inputs>>` 里。
+- **事件**：保留 `<event>` 元素（属性是用 CLI 回查的依据），放在 `<<inputs>> … <</inputs>>` 中、消息原文之前；子 Session 事件的摘要对 UI 父 Session 只有一行，不附 `report:`。
+- 交接块（`<context_switch>` 等）与 TodoList 视图有时照旧放在最前。自定义模板可用 `background`（行数组）与 `background_text`（整块文本）。
+
 ## 7. 输入 receipt 与提交
 
 每个批次由有序的 1–2 条 user 消息组成：有待注入的半订阅状态时先是快照消息，再是受控输入消息，一次注入，中间不推理、不发布快照。receipt 与消息写在**同一份**快照的 `state.host.libopendan.input_receipts[]`：
@@ -256,6 +306,7 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
   "bootstrap": false, "after_step": 7, "extra": { "continuation": true }, "at_ms": 0 }
 ```
 
+- `extra.background`（chat 格式）：本批之后的 `state.background_shown`，应用 receipt 时整体替换。
 - 批次 ID = `(run_id, input_seq)`，每个 run 从 1 开始连续。`opens_turn` 只看提交时有没有打开的 Turn；半订阅快照不独立计 Turn。
 - `inputs`：本批消费的 msg 与 Input event。Runner 自己合成的输入（被跟踪的后台 task 完成）用 `src = "_task"`、`key = task:<task_id>:terminal`，没有消费位置。
 - `events`：快照消息实际注入的状态版本；应用时按 `(subscription_id, source, key)`（有 `seq` 时一并核对）从 `pending_events` 精确清除。处理 v7 期间收到 v8，提交 v7 不删除 v8。
@@ -271,7 +322,7 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 
 bridge 只转换来源并可靠投递（先 `post`，成功后再确认上游；重投由 `key` 去重）；不渲染、不决定投递策略、不写 Session state。
 
-**msg bridge**（`bridge/msg.rs::route_msg_record`，纯函数）：MsgObject 原样上总线，只做过滤、分流和补 `delivery`。按顺序：记录发送者与 `msg.from` 不一致 → 丢弃；群邀请通知、Agent 自己的群消息回显 → 丢弃；正文 / refs / machine 全空 → 丢弃；`relates_to.rel = reaction` → 丢弃；纯文本且匹配已登记斜杠命令、发送者是 session 驱动者或 Agent owner → 映射到 Session 控制的命令投递 `control`（`/stop` → `stop`，key `ctl:<ObjId>`），其它已登记命令由应用自行处理；其余（含 `edit` / `redact`）原样投递。Session 不解析正文：未被识别的斜杠文本就是普通消息。
+**msg bridge**（`bridge/msg.rs::route_msg_record`，纯函数）：MsgObject 原样上总线，只做过滤、分流和补 `delivery`。按顺序：记录发送者与 `msg.from` 不一致 → 丢弃；群邀请通知、Agent 自己的群消息回显 → 丢弃；正文 / refs / machine 全空 → 丢弃；`relates_to.rel = reaction` → 丢弃；发送者身份（`record.ingress.extra.principal_did`，没有时 `record.from`）不是 Agent 的 Owner → 丢弃（推理之前过滤，正文里的名字或声明不算）；群消息在宿主不允许群聊时、或 `mentions.dids` 不含 Agent DID 时 → 丢弃；纯文本且匹配已登记斜杠命令 → 映射到 Session 控制的命令投递 `control`（`/stop` → `stop`，key `ctl:<ObjId>`），其它已登记命令由应用自行处理；其余（含 `edit` / `redact`）原样投递。Session 不解析正文：未被识别的斜杠文本就是普通消息。`context_msg_record` 把同一会话里较早的记录（任何人的，Agent 自己的除外）转成 `delivery.context = true` 的上下文消息，供宿主随请求一起投递。
 
 **task bridge**（`bridge/task.rs::task_event`）：把 task 状态映射成 `AgentEvent{source: task:<task_id>}`（`updated` / `finished` / `unknown`，终态 `terminal = true`）。通知只加速检查，task 状态 API 才是权威来源。
 
@@ -285,6 +336,12 @@ bridge 只转换来源并可靠投递（先 `post`，成功后再确认上游；
 - **并行等待**：调用已返回、task 继续运行。run 结束而 Session 未 finished 时，仍在运行的 task 记入 `state.watched_tasks`；之后每轮用保存的 task id 查询，结束时合成 `AgentEvent{source: task:<id>, terminal: true}`：有显式订阅按其 active / semi 处理，否则作为 Input 事件。不依赖输入队列或通知；finished 的 Session 不因 task 完成而重开。
 - 经外部服务创建任务的工具用在途记录里的 `idempotency_key`（由 run 与 call 的稳定身份导出）作为幂等键。
 - 崩溃恢复：run 的终态已落盘而 state 尚未提交时，重做的结束从 run.json 的 `host.extra.tasks` 取回仍需跟踪的 task（[Session Directory Protocol](<Session Directory Protocol.md>) §7），其完成只交付一次。
+- **向用户提问（`userinput:`）**：`agent-session ask-user "<问题>" [--option <id>=<label>]... [--allow-text]` 返回 `Pending{task_id: "userinput:<call_id>", detail: {question, input: {kind: text | choice, options: [{id, label}], allow_text}}}`（schema `user_input_request`）。只有 Session 解析这个前缀：
+  - 允许条件：有输入队列、`wait_user_msg = allowed`、不是子 Session；否则该调用直接得到错误结果，run 不挂起。task id 必须是本次调用的 `call_id`（命令放在管道或脚本里无效）。问题在快照挂起之前记入 run.json `host.extra.asks[<call_id>]`。
+  - 等待：`waiting_for = {kind: input, refs: ["userinput:<call_id>"]}`，Turn 保持打开；问题以 `question` 出站（[Session Directory Protocol](<Session Directory Protocol.md>) §5 `outbox`），与写入这个等待状态是同一次提交——提交之前没有任何消息会被当作答案。
+  - 回填：此后路由出的第一条 msg（`delivery.context` 的除外）就是答案，只取一条，其余留在队列；它以 `ResumeFill::ToolResults` 填为该调用的结果 `{text, attachments: [{obj_id, name}], option, in_reply_to_question, msg_id, from, at_ms}`（schema `user_input_answer`），同一快照里追加一张输入 receipt（`inputs = [该 msg]`、`parts = []`、`extra.user_input = <call_id>`，加入打开的 Turn），按 §7 提交与确认。`in_reply_to_question`：该消息 `relates_to = {rel: thread}` 的目标是本 Turn 占位或问题的 ObjId；`option`：`content.machine = {intent: "agent_ask.answer", data: {call_id, option}}` 且 `call_id` 匹配时的选项 id。关系与 machine 只是线索，任何下一条消息都是答案。
+  - 事件、`_child` 与半订阅观察照旧留给调用方，不进提问的 run；同批有其它挂起调用时，它们的等待都结束才回填。stop：按“用户未回答”回填（`Cancelled`）。独立 xllm 不能解析 `userinput:`，拒绝接手。主 context 自己的 `WAIT_USER_MSG` 与子 context 的哨兵语义不变。
+  - **经通知提问**：没有输入队列的 Work（模板 `work`，`session.policy.ask_user_timeout_secs > 0`，缺省 10800）在宿主有通知服务时同样允许 `ask-user`。登记时 run.json `host.extra.asks[<call_id>].notify = {deadline_ms}`；在写入等待状态之前发出 `input` 通知（等级 `timely`，幂等键 `<sid>:<turn>:ask:<call_id>`，`expires_at_ms = deadline_ms`，来源含 session / turn / call 与所属会话），拿到的 `notify_id`、`task_id` 记入同一处；`waiting_for = {kind: input, refs: ["userinput:<call_id>"], deadline_ms, human_tasks: [task_id]}`。每次 drive 查询通知：`answered` → 结果为 `user_input_answer`，另带 `via: "notification"`、`notify_id`，`msg_id` 为空，`text` 取文字回答，没有时取选项 label；`dismissed / expired / canceled` 或到达截止时间（先以 `ask_timeout` 撤销）→ 结果为 `{"answered": false, "reason": "timeout | dismissed | canceled", "note": …}`。这是普通的工具结果（不是错误），不经输入 receipt。stop：撤销通知（`turn_stopped`）并按“用户未回答”回填。Goal 内调用得到错误结果，提示把问题写进 `questions`。
 
 ## 10. Sub Session：创建、汇报与等待
 

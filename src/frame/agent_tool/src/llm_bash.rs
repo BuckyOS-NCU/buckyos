@@ -32,7 +32,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{timeout as tokio_timeout, Duration};
 
 use crate::path_utils::to_abs_path;
-use crate::tasks::{InProcessTaskManager, ShellTask};
+use crate::tasks::{ShellTaskContext, ShellTaskManager, ShellTask};
 use crate::tool::CallingConventions;
 use crate::{
     build_builtin_tool_result, AgentTool, AgentToolError, AgentToolResult, AgentToolStatus,
@@ -261,7 +261,15 @@ pub struct LlmBashConfig {
     pub runtime: ShellRuntimeNote,
     /// `auto` mode: where a command that outlives `wait_ms` goes. Without
     /// it the tool behaves as `wait`.
-    pub tasks: Option<Arc<InProcessTaskManager>>,
+    pub tasks: Option<Arc<dyn ShellTaskManager>>,
+    /// What a handed-over command belongs to (session, Turn task, run).
+    pub task_context: ShellTaskContext,
+    /// How the model follows a command that became a task.
+    pub task_followup: llm_context::tasks::TaskFollowup,
+    /// The run's task bridge (`XLLM_TASK_ENDPOINT` of every command).
+    pub task_endpoint: Option<String>,
+    /// Host facts appended to the description (e.g. what PATH provides).
+    pub note: Option<String>,
 }
 
 impl std::fmt::Debug for LlmBashConfig {
@@ -280,6 +288,9 @@ impl std::fmt::Debug for LlmBashConfig {
             .field("default_wait_ms", &self.default_wait_ms)
             .field("runtime", &self.runtime)
             .field("tasks", &self.tasks.is_some())
+            .field("task_followup", &self.task_followup)
+            .field("task_endpoint", &self.task_endpoint)
+            .field("note", &self.note)
             .finish()
     }
 }
@@ -300,6 +311,10 @@ impl LlmBashConfig {
             default_wait_ms: DEFAULT_AUTO_WAIT_MS,
             runtime: ShellRuntimeNote::native(),
             tasks: None,
+            task_context: ShellTaskContext::default(),
+            task_followup: llm_context::tasks::TaskFollowup::Tools,
+            task_endpoint: None,
+            note: None,
         }
     }
 
@@ -354,8 +369,28 @@ impl LlmBashConfig {
         self
     }
 
-    pub fn with_tasks(mut self, tasks: Arc<InProcessTaskManager>) -> Self {
+    pub fn with_tasks(mut self, tasks: Arc<dyn ShellTaskManager>) -> Self {
         self.tasks = Some(tasks);
+        self
+    }
+
+    pub fn with_task_context(mut self, ctx: ShellTaskContext) -> Self {
+        self.task_context = ctx;
+        self
+    }
+
+    pub fn with_task_followup(mut self, followup: llm_context::tasks::TaskFollowup) -> Self {
+        self.task_followup = followup;
+        self
+    }
+
+    pub fn with_task_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.task_endpoint = endpoint;
+        self
+    }
+
+    pub fn with_note(mut self, note: Option<String>) -> Self {
+        self.note = note.filter(|n| !n.trim().is_empty());
         self
     }
 
@@ -1132,7 +1167,7 @@ impl BashRunner for LocalProcessBashRunner {
     async fn start(
         &self,
         _ctx: &SessionRuntimeContext,
-        req: BashRunRequest,
+        mut req: BashRunRequest,
     ) -> Result<Box<dyn CommandHandle>, AgentToolError> {
         match req.target {
             BashTarget::Local => {}
@@ -1142,6 +1177,7 @@ impl BashRunner for LocalProcessBashRunner {
                 )));
             }
         }
+        crate::runtime_context::refresh_appclient_session_env(&mut req.env).await?;
         let (dir, temp) = self.exec_dir(req.call_id.as_deref());
         let mut builder = tokio::fs::DirBuilder::new();
         builder.recursive(true);
@@ -1617,7 +1653,9 @@ impl ShellTool {
         let cancellable = handle.cancellable();
         let locator = handle.locator();
         let task = ShellTask::new(command, handle, &self.config.runtime.kind);
-        let task_id = tasks.register_shell(call_id, task);
+        let task_id = tasks
+            .take_over(&self.config.task_context, call_id, task)
+            .await;
         let mut text = format!(
             "`{command}` is still running after {wait_ms}ms ({} elapsed); it continues as task {task_id} ({locator}).",
             fmt_elapsed(progress.elapsed_ms)
@@ -1627,7 +1665,7 @@ impl ShellTool {
             text.push_str(progress.output_tail.trim_end());
         }
         text.push('\n');
-        text.push_str(&llm_context::tasks::next_step_hint(&task_id, cancellable));
+        text.push_str(&self.config.task_followup.hint(&task_id, cancellable));
         let details = json!({
             "command": command,
             "task_id": task_id,
@@ -1726,7 +1764,7 @@ impl AgentTool for ShellTool {
             "bash"
         };
         let mut description = format!(
-            "Run a command in this run's runtime ({}) with {} syntax. {} ",
+            "Run a command in this run's runtime ({}) with {} syntax. It starts in the working directory unless cwd is given; it is not sandboxed and runs with the current user's permissions. {} ",
             self.config.runtime.kind,
             language,
             self.config.runtime.lifecycle_sentence()
@@ -1742,15 +1780,25 @@ impl AgentTool for ShellTool {
                 }
             )),
             ShellMode::Auto => description.push_str(&format!(
-                "Waits up to wait_ms (default {}s, max {} min) for the command to finish; a command still running then continues as a task and this call returns its task_id with the output so far — follow up with `wait_task` / `get_task_state`. Raise wait_ms for commands you expect to take long (builds, tests). ",
+                "Waits up to wait_ms (default {}s, max {} min) for the command to finish; a command still running then continues as a task and this call returns its task_id with the output so far — follow up with {}. Raise wait_ms for commands you expect to take long (builds, tests). ",
                 default_wait_ms / 1000,
-                MAX_AUTO_WAIT_MS / 60_000
+                MAX_AUTO_WAIT_MS / 60_000,
+                match &self.config.task_followup {
+                    llm_context::tasks::TaskFollowup::Tools =>
+                        "`wait_task` / `get_task_state`".to_string(),
+                    llm_context::tasks::TaskFollowup::Command(cli) =>
+                        format!("`{cli} wait <task_id>` / `{cli} state <task_id>`"),
+                }
             )),
         }
         if self.config.runtime.powershell() {
             description.push_str("Use Windows paths, $env:NAME for environment variables, Get-Content for reading files, and Start-Sleep for delays. Start a long-lived service with Start-Process -WindowStyle Hidden and return without -Wait. Long output keeps its beginning and end.");
         } else {
             description.push_str("Start a long-lived service with nohup / setsid and return at once; on Unix, processes started with `&` / nohup in the foreground command's process group also end when that command is interrupted or times out. Long output keeps its beginning and end.");
+        }
+        if let Some(note) = &self.config.note {
+            description.push(' ');
+            description.push_str(note.trim());
         }
         let mut properties = json!({
             "command": {
@@ -1883,6 +1931,13 @@ impl AgentTool for ShellTool {
         let mut env = env;
         if let Some(id) = call_id.as_ref().filter(|id| !id.is_empty()) {
             env.push((ENV_CALL_ID.to_string(), id.clone()));
+        }
+        // Commands following this run's tasks reach its resolver here.
+        if let Some(endpoint) = &self.config.task_endpoint {
+            env.push((
+                crate::task_bridge::ENV_TASK_ENDPOINT.to_string(),
+                endpoint.clone(),
+            ));
         }
         let request = BashRunRequest {
             command: command.clone(),

@@ -16,6 +16,7 @@ import type {
 } from '../app/ai-center/datamodel/routing'
 import { normalizeFinanceTotals } from '../app/ai-center/datamodel/transforms'
 import { toAiccRpcCallOptions } from './aicc_rpc_options'
+import { toProviderInstanceRules } from './provider_model_selection'
 import type {
   AIStatus,
   ApiNamespace,
@@ -30,10 +31,12 @@ import type {
   ProviderConfig,
   ProviderSetupCatalog,
   ProviderRuntimeType,
+  ProviderSetupGroup,
   ProviderStatus,
   ProviderType,
   ProviderView,
   RouteTrace,
+  SelectableInventoryModel,
   RoutePolicy,
   SchedulerProfile,
   GlobalRoutingView,
@@ -58,6 +61,7 @@ export type {
   ProviderSetupCatalog,
   ProviderType,
   RoutePolicy,
+  SelectableInventoryModel,
   RouteTrace,
   GlobalRoutingView,
   StoreSnapshot,
@@ -129,13 +133,35 @@ const BUILTIN_PROVIDER_NAMES: Array<[ProviderType, string, string, string]> = [
   ['kimi', 'Moonshot Kimi', 'https://api.moonshot.ai/v1', 'kimi-chat'],
   ['glm', 'Z.ai GLM', 'https://api.z.ai/api/paas/v4', 'glm-chat'],
   ['deepseek', 'DeepSeek', 'https://api.deepseek.com', 'deepseek-responses'],
-  ['doubao', 'Doubao (Volcengine Ark)', 'https://ark.cn-beijing.volces.com/api/v3', 'doubao-responses'],
+  ['doubao', 'Doubao (Volcengine Ark Standard Account)', 'https://ark.cn-beijing.volces.com/api/v3', 'doubao-responses'],
+  ['doubao-speech', 'Doubao Speech (Volcengine Doubao Voice)', 'https://openspeech.bytedance.com/api/v3/tts', 'doubao-responses'],
+  ['doubao-agent-plan', 'Doubao (Volcengine Ark Agent Plan)', 'https://ark.cn-beijing.volces.com/api/plan/v3', 'doubao-responses'],
   ['qwen', 'Qwen（阿里云百炼）', 'https://{workspace}.{region}.maas.aliyuncs.com/compatible-mode/v1', 'qwen-responses'],
 ]
 
 const PROVIDER_INFLUENCE_ORDER = new Map<ProviderType, number>(
   BUILTIN_PROVIDER_NAMES.map(([profile], index) => [profile, index]),
 )
+
+const MOCK_DOUBAO_SPEECH_MODELS: SelectableInventoryModel[] = [
+  { id: 'doubao-seed-tts-2.0', label: 'Doubao Speech Synthesis 2.0' },
+  { id: 'doubao-seed-icl-2.0', label: 'Doubao Voice Clone 2.0' },
+]
+
+function doubaoSetupGroup(provider_profile_id: ProviderType): ProviderSetupGroup {
+  const account = provider_profile_id === 'doubao-agent-plan'
+    ? { account_type: 'agent_plan', account_type_label: 'Agent Plan', default: false }
+    : provider_profile_id === 'doubao-speech'
+      ? { account_type: 'speech', account_type_label: 'Doubao Speech', default: false }
+      : { account_type: 'standard', account_type_label: 'Standard account', default: true }
+  return { id: 'doubao', display_name: 'Doubao (Volcengine Ark)', ...account }
+}
+
+function isDoubaoProfile(provider_profile_id: ProviderType): boolean {
+  return provider_profile_id === 'doubao'
+    || provider_profile_id === 'doubao-speech'
+    || provider_profile_id === 'doubao-agent-plan'
+}
 
 const MOCK_PROVIDER_SETUP_CATALOG: ProviderSetupCatalog = {
   catalog_revision: 1,
@@ -150,16 +176,36 @@ const MOCK_PROVIDER_SETUP_CATALOG: ProviderSetupCatalog = {
         eu: 'https://eu.openrouter.ai/api/v1',
       }
       : {} as Record<string, string>,
-    operation_base_urls: provider_profile_id === 'doubao'
+    operation_base_urls: provider_profile_id === 'doubao-agent-plan'
       ? {
-        'ark.images.generate': 'https://ark.cn-beijing.volces.com/api/v3',
-        'ark.contents.generate': 'https://ark.cn-beijing.volces.com/api/v3',
-        'tts.unidirectional': 'https://openspeech.bytedance.com/api/v3/tts',
-      }
+        'ark.images.generate': 'https://ark.cn-beijing.volces.com/api/plan/v3',
+        'ark.contents.generate': 'https://ark.cn-beijing.volces.com/api/plan/v3',
+        'tts.unidirectional': 'https://openspeech.bytedance.com/api/v3/plan/tts',
+      } as Record<string, string>
+      : provider_profile_id === 'doubao-speech'
+        ? {
+          'tts.unidirectional': 'https://openspeech.bytedance.com/api/v3/tts',
+        } as Record<string, string>
+      : provider_profile_id === 'doubao'
+        ? {
+          'ark.images.generate': 'https://ark.cn-beijing.volces.com/api/v3',
+          'ark.contents.generate': 'https://ark.cn-beijing.volces.com/api/v3',
+        } as Record<string, string>
       : undefined,
     protocol_adapter_id,
+    discovery_behavior_id: provider_profile_id === 'doubao-speech' || provider_profile_id === 'fal'
+      ? 'catalog-only'
+      : `${provider_profile_id}-models`,
     provider_rules_id: provider_profile_id,
-    ui_hints: {},
+    ui_hints: isDoubaoProfile(provider_profile_id)
+      ? {
+        setup_group: doubaoSetupGroup(provider_profile_id),
+        ...(provider_profile_id === 'doubao-speech'
+          ? { selectable_inventory_models: MOCK_DOUBAO_SPEECH_MODELS }
+          : {}),
+      }
+      : {},
+    setup_group: isDoubaoProfile(provider_profile_id) ? doubaoSetupGroup(provider_profile_id) : undefined,
     endpoint_hints: provider_profile_id === 'openrouter'
       ? {
         global: { label: 'Global' },
@@ -179,7 +225,7 @@ const MOCK_PROVIDER_SETUP_CATALOG: ProviderSetupCatalog = {
         }
         : provider_profile_id === 'glm' || provider_profile_id === 'minimax'
         ? { region: { mode: 'optional', default_value: 'global', allowed_values: ['global', 'china'] } }
-        : provider_profile_id === 'doubao'
+        : provider_profile_id === 'doubao' || provider_profile_id === 'doubao-agent-plan'
           ? { policy_region: { mode: 'optional', default_value: 'unknown', allowed_values: ['unknown', 'cn', 'other'] } }
           : {},
   })),
@@ -1207,15 +1253,13 @@ function toProviderWritePayload(draft: WizardDraft): Record<string, unknown> {
     region: draft.region?.trim() || undefined,
     workspace: draft.workspace?.trim() || undefined,
     account: draft.account?.trim() || undefined,
-    instance_rules: draft.policy_region?.trim()
-      ? { policy_region: draft.policy_region.trim(), exclude_models: [], model_driver_overrides: {} }
-      : undefined,
+    instance_rules: toProviderInstanceRules(draft),
     auto_sync_models: draft.auto_sync_models,
   }
 }
 
 function toCredential(apiKey: string): Record<string, unknown> {
-  return { api_token: { locked: apiKey.trim() } }
+  return { api_token: { inline_secret: apiKey.trim() } }
 }
 
 function toUsageSummary(raw: {
@@ -2491,10 +2535,13 @@ function toProviderSetupCatalog(
         region_base_urls: asStringRecord(entry.region_base_urls),
         operation_base_urls: asStringRecord(entry.operation_base_urls),
         protocol_adapter_id: asNonEmptyString(entry.protocol_adapter_id, ''),
+        discovery_behavior_id: asNonEmptyString(entry.discovery_behavior_id, ''),
         provider_rules_id: asOptionalString(entry.provider_rules_id),
         ui_hints: asRecord(entry.ui_hints),
+        setup_group: toProviderSetupGroup(entry.ui_hints),
         endpoint_hints: toProviderEndpointHints(entry.ui_hints),
         connection_fields: toProviderConnectionFields(entry.ui_hints),
+        selectable_inventory_models: toSelectableInventoryModels(entry.ui_hints),
       }
     })
     .filter((item): item is NonNullable<typeof item> => item !== null)
@@ -2512,6 +2559,37 @@ function toProviderSetupCatalog(
       protocol_family_id,
       display_name: `${labelFromPath(protocol_family_id)} compatible`,
     })),
+  }
+}
+
+function toSelectableInventoryModels(value: unknown): SelectableInventoryModel[] {
+  const declared = asRecord(value).selectable_inventory_models
+  if (!Array.isArray(declared)) return []
+  const result: SelectableInventoryModel[] = []
+  const seen = new Set<string>()
+  for (const item of declared) {
+    const entry = asRecord(item)
+    const id = asOptionalString(entry.id)
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    result.push({ id, label: asOptionalString(entry.label) ?? id })
+  }
+  return result
+}
+
+function toProviderSetupGroup(value: unknown): KnownProviderProfile['setup_group'] {
+  const group = asRecord(asRecord(value).setup_group)
+  const id = asOptionalString(group.id)
+  const displayName = asOptionalString(group.display_name)
+  const accountType = asOptionalString(group.account_type)
+  const accountTypeLabel = asOptionalString(group.account_type_label)
+  if (!id || !displayName || !accountType || !accountTypeLabel) return undefined
+  return {
+    id,
+    display_name: displayName,
+    account_type: accountType,
+    account_type_label: accountTypeLabel,
+    default: group.default === true,
   }
 }
 

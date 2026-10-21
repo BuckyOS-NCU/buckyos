@@ -76,6 +76,12 @@ pub struct SessionSpec {
     /// the driver's first drive.
     #[serde(default)]
     pub freeze: bool,
+    /// Goal Sessions: the Goal and epoch (see [`ensure_goal_session`]).
+    #[serde(default)]
+    pub goal: Option<GoalBinding>,
+    /// The agent's owner (DID), when the creator knows it.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// Input channel of a session (xAgent §4.7).
@@ -124,6 +130,8 @@ impl SessionSpec {
             input_channel: None,
             outbound: None,
             freeze: false,
+            goal: None,
+            owner: None,
         }
     }
 }
@@ -134,6 +142,7 @@ fn same_session_identity(c: &SessionConfig, agent_did: &str, spec: &SessionSpec,
         && c.session.created_by.principal == who
         && c.session.driver.principal == driver
         && c.session.idempotency_key == spec.idempotency_key
+        && c.workspace == spec.workspace
 }
 
 /// Create a session directory under `parent_dir` (any location, §4.1),
@@ -150,6 +159,11 @@ pub async fn create_session(
     channels: &dyn InputChannelFactory,
 ) -> Result<SessionDir> {
     let mut spec = spec;
+    if spec.kind == SessionKind::Goal && (spec.goal.is_none() || spec.session_id.is_none()) {
+        return Err(OpenDanError::InvalidArgument(
+            "goal sessions are created by the host for a goal (`xagent goal create`, kRPC goals.create)".into(),
+        ));
+    }
     if spec.kind == SessionKind::Ui && spec.route_key.is_none() {
         // Not bound to a mailbox (a local dialogue): a route of its own.
         spec.route_key = Some(match &spec.idempotency_key {
@@ -252,10 +266,14 @@ pub async fn create_session(
             task_binding: spec.task_binding.clone(),
             timezone: spec.timezone.clone(),
             policy: spec.policy.clone(),
+            goal: spec.goal.clone(),
+            owner: spec.owner.clone(),
         },
         prompt: spec.prompt.clone(),
         runtime: spec.runtime.clone(),
         workspace: spec.workspace.clone(),
+        workspace_binding: crate::runtime::resolve_workspace(agent, spec.workspace.as_ref())
+            .await?,
         artifact_id: spec.artifact_id.clone(),
         subscriptions: spec.subscriptions.clone(),
         channels: Channels {
@@ -265,6 +283,7 @@ pub async fn create_session(
         },
         extensions: spec.extensions.clone(),
     };
+    crate::runtime::validate_workspace_workdir(&config)?;
     if spec.freeze {
         match crate::state::freeze_config(&mut config, agent.behaviors(), who).await {
             Ok(()) => {}
@@ -313,6 +332,19 @@ pub async fn create_session(
         artifact_id: existing.artifact_id.clone(),
         objective: existing.session.objective.clone(),
         scope: existing.session.scope.clone(),
+        goal_id: existing
+            .session
+            .goal
+            .as_ref()
+            .map(|g| g.goal_id.clone())
+            .or_else(|| {
+                existing
+                    .session
+                    .origin
+                    .as_ref()
+                    .and_then(|o| o.goal.as_ref())
+                    .map(|g| g.goal_id.clone())
+            }),
         status: SessionStatus::created(crate::now_ms()),
         unreachable: false,
         location_rev: 0,
@@ -431,13 +463,9 @@ pub async fn create_self_improve_session(
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubWorkspace {
-    /// The parent's working directory (shared; the activity view keeps the
-    /// sessions apart).
     #[default]
     Inherit,
-    /// An agent workspace of its own.
-    New,
-    /// The agent workspace `<agent_root>/workspace/<id>`.
+    None,
     Id(String),
 }
 
@@ -460,6 +488,11 @@ pub struct SubSessionSpec {
     pub class: Option<String>,
     #[serde(default)]
     pub behavior: Option<String>,
+    /// The sub session's cmd_skills, chosen now (at most
+    /// [`MAX_CMD_SKILLS`]). `None`: a Work parent's frozen choice (the
+    /// manuals still installed), else the template's default.
+    #[serde(default)]
+    pub cmd_skills: Option<Vec<String>>,
     #[serde(default)]
     pub workspace: SubWorkspace,
     /// Explicit runtime id requirement (`None`: inherit the parent's
@@ -494,9 +527,8 @@ pub fn dialogue_excerpt(sd: &SessionDir, n: usize) -> Result<String> {
         };
         let (role, text) = match e.body {
             WorklogBody::UserMessage { content, .. } => ("user", content),
-            WorklogBody::AssistantMessage { assistant, .. } | WorklogBody::Step { assistant, .. } => {
-                ("assistant", assistant)
-            }
+            WorklogBody::AssistantMessage { assistant, .. }
+            | WorklogBody::Step { assistant, .. } => ("assistant", assistant),
             _ => continue,
         };
         if text.trim().is_empty() {
@@ -527,6 +559,164 @@ async fn session_depth(agent: &dyn AgentStateClient, entry: &RegistryEntry) -> R
     Ok(depth)
 }
 
+/// Idempotency key of a sub session: its creating call, or the explicit
+/// key (`None`: neither, every creation is a new session).
+fn sub_session_key(parent_sid: &str, sub: &SubSessionSpec) -> Option<String> {
+    match (&sub.call, &sub.key) {
+        (Some((run, call)), _) => Some(format!("sub:{}", ids::h(&[parent_sid, run, call]))),
+        (None, Some(k)) => Some(format!("sub:{}", ids::h(&[parent_sid, k]))),
+        (None, None) => None,
+    }
+}
+
+/// The id [`create_sub_session`] gives the sub session `sub` of
+/// `parent_sid` created by `who` — known before it exists, so a creator can
+/// record it first and find it again after a crash. Needs an idempotency
+/// identity (`sub.call` or `sub.key`).
+pub fn sub_session_id(
+    agent: &dyn AgentStateClient,
+    who: &str,
+    parent_sid: &str,
+    sub: &SubSessionSpec,
+) -> Result<String> {
+    let key = sub_session_key(parent_sid, sub).ok_or_else(|| {
+        OpenDanError::InvalidArgument("a sub session id is only known for a creating call or a key".into())
+    })?;
+    let class = sub.class.clone().unwrap_or_else(|| "work".to_string());
+    let template = crate::template::SessionTemplate::load(&class, agent.agent_root())?;
+    ids::derive_session_id(template.kind, agent.agent_did(), who, Some(&key), None)
+}
+
+/// Apply `accept | discard` to a finished Work that has no input queue,
+/// where no drive would ever apply a posted decision: under the session's
+/// own lock, by its driver (`who`). The artifact version, when there is
+/// one, is decided first. Returns the new acceptance.
+pub async fn decide_unqueued(
+    agent: &dyn AgentStateClient,
+    who: &str,
+    sid: &str,
+    decision: &str,
+    note: Option<&str>,
+) -> Result<Acceptance> {
+    let entry = agent
+        .sessions()
+        .lookup(sid)
+        .await?
+        .ok_or_else(|| OpenDanError::NotFound(format!("session {sid}")))?;
+    let sd = SessionDir::open(&entry.location)?;
+    let holder = HolderInfo {
+        runner_id: ids::new_runner_id(),
+        principal: who.to_string(),
+        host: Some(crate::runtime::native_host_id()),
+        pid: std::process::id(),
+        runtime_id: None,
+    };
+    let lease = match sd.acquire(holder)? {
+        crate::lock::Acquire::Acquired(l) => l,
+        crate::lock::Acquire::Busy(info) => {
+            return Err(OpenDanError::Busy {
+                resource: format!("session:{sid}"),
+                holder: info.and_then(|i| serde_json::to_value(i).ok()),
+            })
+        }
+    };
+    let result = decide_locked(agent, &sd, &lease, who, decision, note).await;
+    lease.release();
+    result
+}
+
+async fn decide_locked(
+    agent: &dyn AgentStateClient,
+    sd: &SessionDir,
+    lease: &crate::lock::Lease,
+    who: &str,
+    decision: &str,
+    note: Option<&str>,
+) -> Result<Acceptance> {
+    let mut s = sd.load(lease)?;
+    if s.config.session.kind != SessionKind::Work || !s.state.is_finished() {
+        return Err(OpenDanError::InvalidArgument(format!(
+            "session {} is not a finished work session: a decision applies to a result",
+            sd.sid()
+        )));
+    }
+    let target = match decision {
+        "accept" => Acceptance::Accepted,
+        "discard" => Acceptance::Discarded,
+        other => {
+            return Err(OpenDanError::InvalidArgument(format!(
+                "decide takes accept | discard, not `{other}`"
+            )))
+        }
+    };
+    if s.state.acceptance == target {
+        return Ok(target);
+    }
+    let valid = match target {
+        Acceptance::Accepted => s.state.acceptance == Acceptance::Pending,
+        _ => matches!(s.state.acceptance, Acceptance::Pending | Acceptance::Accepted),
+    };
+    if !valid {
+        return Err(OpenDanError::InvalidArgument(format!(
+            "decide `{decision}` is not valid while acceptance is {:?}",
+            s.state.acceptance
+        )));
+    }
+    let mut head_after = None;
+    if let Some(aid) = s.config.artifact_id.clone() {
+        let holder = HolderInfo {
+            runner_id: ids::new_runner_id(),
+            principal: who.to_string(),
+            host: Some(crate::runtime::native_host_id()),
+            pid: std::process::id(),
+            runtime_id: None,
+        };
+        let alease = match agent.locks().acquire(&format!("artifact:{aid}"), holder)? {
+            crate::lock::Acquire::Acquired(l) => l,
+            crate::lock::Acquire::Busy(info) => {
+                return Err(OpenDanError::Busy {
+                    resource: format!("artifact:{aid}"),
+                    holder: info.and_then(|i| serde_json::to_value(i).ok()),
+                })
+            }
+        };
+        let ver = format!("v-{}", sd.sid());
+        let r = agent.artifacts().decide(&alease, &aid, &ver, decision).await;
+        alease.release();
+        head_after = Some(r?.head_after);
+    }
+    let mut report = Value::Null;
+    if target == Acceptance::Discarded {
+        let r = DiscardReport {
+            reverted: Vec::new(),
+            workspace: if s.config.workspace.is_some() { "unsupported" } else { "none" }.into(),
+            unsupported: crate::runner::side_effects_of(&s)?,
+            head_moved_to: head_after,
+            note: note.map(str::to_string),
+        };
+        report = serde_json::to_value(&r).unwrap_or(Value::Null);
+        let mut result = s.state.result.clone().unwrap_or_else(|| serde_json::json!({}));
+        result["discard_report"] = report.clone();
+        s.state.result = Some(result);
+    }
+    s.state.acceptance = target;
+    s.state.pending_decision = None;
+    s.append_worklog(
+        lease,
+        vec![WorklogBody::Decide {
+            decision: decision.to_string(),
+            by: who.to_string(),
+            report,
+        }],
+    )?;
+    s.commit_state(lease)?;
+    let status = s.status(lease.epoch());
+    if let Err(e) = agent.sessions().report_state(lease, sd.sid(), status).await {
+        log::warn!("report state of {}: {e}", sd.sid());
+    }
+    Ok(target)
+}
+
 /// Create a sub session of `parent_sid`: registered with
 /// `origin = {parent_session, report, created_by_call}`, driven by the
 /// parent's driver, not advanced here. Idempotent for the same creating
@@ -546,26 +736,65 @@ pub async fn create_sub_session(
         .ok_or_else(|| OpenDanError::NotFound(format!("parent session {parent_sid}")))?;
     let parent_dir = SessionDir::open(&parent.location)?;
     let pcfg = parent_dir.config()?;
-    let key = match (&sub.call, &sub.key) {
-        (Some((run, call)), _) => format!("sub:{}", ids::h(&[parent_sid, run, call])),
-        (None, Some(k)) => format!("sub:{}", ids::h(&[parent_sid, k])),
-        (None, None) => format!("sub:{}", uuid::Uuid::new_v4().simple()),
-    };
+    let key = sub_session_key(parent_sid, &sub)
+        .unwrap_or_else(|| format!("sub:{}", uuid::Uuid::new_v4().simple()));
     let class = sub.class.clone().unwrap_or_else(|| "work".to_string());
     let template = crate::template::SessionTemplate::load(&class, agent.agent_root())?;
+    if template.kind == SessionKind::Goal {
+        return Err(OpenDanError::InvalidArgument(
+            "a goal session is never a sub session: create a goal (`agent-session goal create`)".into(),
+        ));
+    }
     let sid = ids::derive_session_id(template.kind, agent.agent_did(), who, Some(&key), None)?;
     // The same call again: the session it created, never a second one.
     if let Some(existing) = agent.sessions().lookup(&sid).await? {
         return SessionDir::open(&existing.location);
     }
+    // An explicit runtime is one of the agent's registered runtimes, usable
+    // now; the agent's own environment needs no requirement of its own.
+    let runtime_requirement = match sub.runtime_id.as_deref() {
+        None => None,
+        Some(id) => {
+            let record = agent.runtimes().lookup(id).await?.ok_or_else(|| {
+                OpenDanError::Bind(format!("runtime `{id}` is not registered (see `runtime list`)"))
+            })?;
+            if record.availability != RuntimeAvailability::Available {
+                return Err(OpenDanError::Bind(format!(
+                    "runtime `{id}` is not available: {}",
+                    record
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| format!("{:?}", record.availability))
+                )));
+            }
+            (!is_native_runtime(&record.runtime_id)).then(|| record.runtime_id.clone())
+        }
+    };
     let policy = &pcfg.session.policy;
-    let siblings = agent
-        .sessions()
-        .children_of(&[parent_sid.to_string()])
-        .await?
-        .into_iter()
-        .filter(|e| e.status.run_state != RunState::Finished)
-        .count();
+    // A Goal's Work counts for the Goal, whichever epoch created it.
+    let goal_origin = match &pcfg.session.goal {
+        Some(binding) => Some(crate::goal::work_admission(agent, &pcfg, &parent_dir, binding).await?),
+        None => None,
+    };
+    let siblings = match &goal_origin {
+        Some(g) => agent
+            .sessions()
+            .query(&RegistryQuery {
+                goal_id: Some(g.goal_id.clone()),
+                ..Default::default()
+            })
+            .await?
+            .into_iter()
+            .filter(|e| e.kind != SessionKind::Goal && e.status.run_state != RunState::Finished)
+            .count(),
+        None => agent
+            .sessions()
+            .children_of(&[parent_sid.to_string()])
+            .await?
+            .into_iter()
+            .filter(|e| e.status.run_state != RunState::Finished)
+            .count(),
+    };
     if siblings >= policy.max_sub_sessions as usize {
         return Err(OpenDanError::InvalidArgument(format!(
             "session {parent_sid} already has {siblings} unfinished sub sessions (max_sub_sessions = {}); wait for one or stop it",
@@ -594,31 +823,83 @@ pub async fn create_sub_session(
             .state()
             .ok()
             .and_then(|s| s.open_turn_task().map(|t| t.task_id.clone()))
-            .or_else(|| pcfg.session.origin.as_ref().and_then(|o| o.parent_task.clone())),
+            .or_else(|| {
+                pcfg.session
+                    .origin
+                    .as_ref()
+                    .and_then(|o| o.parent_task.clone())
+            }),
+        goal: goal_origin,
     });
     spec.timezone = pcfg.session.timezone.clone();
     spec.prompt.llm_context = pcfg.prompt.llm_context.clone();
     spec.runtime = pcfg.runtime.clone();
     // The binding identity is the sub session's own: only an explicit
     // requirement is carried, the runtime configuration is inherited.
-    spec.runtime.requirement.runtime_id = sub.runtime_id.clone();
+    spec.runtime.requirement.runtime_id = runtime_requirement;
     spec.policy.max_session_depth = policy.max_session_depth;
     if let Some(b) = sub.behavior.clone() {
         spec.prompt.behavior = Some(b);
     }
-    spec.freeze = spec.prompt.behavior.is_some() || pcfg.prompt.frozen.is_some();
-    spec.workspace = match &sub.workspace {
-        SubWorkspace::Inherit => Some(pcfg.workspace.clone().unwrap_or(WorkspaceRef::External {
-            path: parent_dir
-                .path()
-                .canonicalize()
-                .unwrap_or_else(|_| parent_dir.path().to_path_buf())
-                .display()
-                .to_string(),
-        })),
-        SubWorkspace::New => Some(WorkspaceRef::Agent { id: sid.clone() }),
-        SubWorkspace::Id(id) => Some(WorkspaceRef::Agent { id: id.clone() }),
+    spec.prompt.cmd_skills = match &sub.cmd_skills {
+        Some(names) => {
+            crate::state::check_cmd_skill_names(names)?;
+            names.clone()
+        }
+        // A Work hands its manuals on to the work it splits off; a UI's or
+        // a Goal's own manuals are never a Work's.
+        None if pcfg.session.kind == SessionKind::Work => {
+            let chosen: Vec<String> = match &pcfg.prompt.frozen {
+                Some(f) => f.cmd_skills.iter().map(|c| c.name.clone()).collect(),
+                None => pcfg.prompt.cmd_skills.clone(),
+            };
+            let installed: Vec<String> = agent
+                .behaviors()
+                .skills(Some(SkillKind::Cmd))
+                .await?
+                .into_iter()
+                .map(|m| m.name)
+                .collect();
+            chosen.into_iter().filter(|n| installed.contains(n)).collect()
+        }
+        None => spec.prompt.cmd_skills.clone(),
     };
+    spec.freeze = spec.prompt.behavior.is_some()
+        || pcfg.prompt.frozen.is_some()
+        || !spec.prompt.cmd_skills.is_empty();
+    spec.workspace = match &sub.workspace {
+        SubWorkspace::Inherit => pcfg.workspace.clone(),
+        SubWorkspace::None => None,
+        SubWorkspace::Id(id) => {
+            if pcfg
+                .workspace
+                .as_ref()
+                .is_some_and(|w| w.workspace_id != *id)
+                || (pcfg.workspace.is_none() && pcfg.session.kind != SessionKind::Ui)
+            {
+                return Err(OpenDanError::InvalidArgument(
+                    "a child session cannot acquire a different workspace through inheritance"
+                        .into(),
+                ));
+            }
+            Some(WorkspaceRef {
+                workspace_id: id.clone(),
+                access: pcfg
+                    .workspace
+                    .as_ref()
+                    .map(|w| w.access)
+                    .unwrap_or_default(),
+            })
+        }
+    };
+    if let Some(runtime) = spec
+        .prompt
+        .llm_context
+        .get_mut("runtime")
+        .and_then(Value::as_object_mut)
+    {
+        runtime.remove("workdir");
+    }
     if sub.interactive {
         spec.input_channel = Some(InputChannel::Queue);
         spec.policy.wait_user_msg = WaitPolicy::Allowed;

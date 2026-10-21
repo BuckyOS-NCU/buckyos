@@ -16,7 +16,7 @@ use serde_json::Value;
 /// without an input queue). 4: input templates, `input.mode / media`,
 /// `session.timezone`, event sources of subscriptions. Earlier versions are
 /// read-only until migrated.
-pub const SESSION_CONFIG_SCHEMA: &str = "opendan.session_config/5";
+pub const SESSION_CONFIG_SCHEMA: &str = "opendan.session_config/7";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +25,9 @@ pub enum SessionKind {
     Work,
     SelfImprove,
     SelfCheck,
+    /// The context of a Goal (`state/goals/<goal_id>`): one per `(goal,
+    /// epoch)`, created by the host, never a sub session.
+    Goal,
 }
 
 impl SessionKind {
@@ -34,6 +37,7 @@ impl SessionKind {
             SessionKind::Work => "work",
             SessionKind::SelfImprove => "self_improve",
             SessionKind::SelfCheck => "self_check",
+            SessionKind::Goal => "goal",
         }
     }
 
@@ -44,6 +48,7 @@ impl SessionKind {
             SessionKind::Work => "work",
             SessionKind::SelfImprove => "si",
             SessionKind::SelfCheck => "sc",
+            SessionKind::Goal => "goal",
         }
     }
 }
@@ -86,6 +91,28 @@ pub struct Origin {
     /// every task this session's Turns get.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task: Option<String>,
+    /// Created by an Activation of a Goal: the Goal and the revision the
+    /// Work was given (kept when the Goal is revised later).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<GoalOrigin>,
+}
+
+/// `origin.goal` of a Work created by a Goal Session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GoalOrigin {
+    pub goal_id: String,
+    pub revision: u64,
+    pub epoch: u64,
+    pub activation_seq: u64,
+    pub at_ms: u64,
+}
+
+/// `session.goal` of a Goal Session: the Goal it works for. The definition
+/// is read from the Goal, never copied here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GoalBinding {
+    pub goal_id: String,
+    pub epoch: u64,
 }
 
 /// What a parent receives from a sub session without subscribing: the
@@ -114,6 +141,9 @@ pub enum WaitPolicy {
     FinishFailed,
     /// Treated as the delivered result.
     FinishCompleted,
+    /// Nobody answers now: the Turn ends (needs input), the session goes on
+    /// waiting for its next input (Goal Sessions).
+    EndTurn,
 }
 
 /// Material of the semi-subscription snapshot and the fresh view.
@@ -138,11 +168,21 @@ fn default_sub_sessions() -> u8 {
 fn default_session_depth() -> u8 {
     2
 }
+fn default_ask_user_timeout() -> u64 {
+    DEFAULT_ASK_USER_TIMEOUT_SECS
+}
+
+/// How long a Work waits for the answer to a question it asked through a
+/// notification (`[session.work] ask_user_timeout_secs`; 0: Works do not
+/// ask).
+pub const DEFAULT_ASK_USER_TIMEOUT_SECS: u64 = 10_800;
 
 /// `session.policy`: the session template resolved at creation (xAgent
 /// §4.7) and frozen with the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionPolicy {
+    #[serde(default)]
+    pub completion: super::CompletionPolicy,
     #[serde(default)]
     pub wait_user_msg: WaitPolicy,
     #[serde(default)]
@@ -158,17 +198,23 @@ pub struct SessionPolicy {
     /// Nesting depth of sub sessions below this session's root.
     #[serde(default = "default_session_depth")]
     pub max_session_depth: u8,
+    /// A session without a user reading it (a Work) asks through a
+    /// notification and waits at most this long for the answer.
+    #[serde(default = "default_ask_user_timeout")]
+    pub ask_user_timeout_secs: u64,
 }
 
 impl Default for SessionPolicy {
     fn default() -> Self {
         Self {
+            completion: super::CompletionPolicy::default(),
             wait_user_msg: WaitPolicy::default(),
             observe: ObserveScope::default(),
             load_hints: true,
             max_process_depth: default_process_depth(),
             max_sub_sessions: default_sub_sessions(),
             max_session_depth: default_session_depth(),
+            ask_user_timeout_secs: default_ask_user_timeout(),
         }
     }
 }
@@ -281,6 +327,13 @@ pub struct SessionSection {
     pub timezone: Option<String>,
     #[serde(default, skip_serializing_if = "SessionPolicy::is_default")]
     pub policy: SessionPolicy,
+    /// Goal Sessions: the Goal and epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<GoalBinding>,
+    /// The agent's owner (DID), when the host knows it: a UI session tells
+    /// its peer apart from the owner by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 fn default_class() -> String {
@@ -349,6 +402,13 @@ pub struct PromptSection {
     /// Behaviors and identity frozen from the agent's catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen: Option<super::behavior::FrozenPrompt>,
+    /// The cmd_skills of the session (`<agent_root>/cmd_skills/<name>.md`,
+    /// at most [`super::behavior::MAX_CMD_SKILLS`]): chosen when the session
+    /// is created (`agent.toml [session.<class>] default_cmd_skills`,
+    /// `create-worksession --cmd-skill`), frozen with the behaviors
+    /// (`frozen.cmd_skills`) and rendered as `## Commands`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmd_skills: Vec<String>,
     /// Bootstrap inputs of a session created without an input queue: `msg`
     /// records only, at most [`super::input::MAX_PENDING_INPUTS`], never
     /// changed after creation. The runner reads them as the read-only source
@@ -445,6 +505,10 @@ pub struct InputTemplates {
     /// The snapshot message placed before a controlled input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semi_subscription_snapshot: Option<String>,
+    /// Goal Sessions: the Goal header placed before the first batch of an
+    /// Activation (variable `goal`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_activation: Option<String>,
 }
 
 impl InputTemplates {
@@ -461,6 +525,10 @@ impl InputTemplates {
                 .semi_subscription_snapshot
                 .clone()
                 .or_else(|| base.semi_subscription_snapshot.clone()),
+            goal_activation: self
+                .goal_activation
+                .clone()
+                .or_else(|| base.goal_activation.clone()),
         }
     }
 }
@@ -480,6 +548,8 @@ pub struct BehaviorPrompt {
     pub on_context_switch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semi_subscription_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_activation: Option<String>,
 }
 
 impl BehaviorPrompt {
@@ -493,6 +563,7 @@ impl BehaviorPrompt {
             on_input: self.on_input.clone(),
             on_context_switch: self.on_context_switch.clone(),
             semi_subscription_snapshot: self.semi_subscription_snapshot.clone(),
+            goal_activation: self.goal_activation.clone(),
         }
     }
 }
@@ -558,12 +629,54 @@ pub struct BehaviorEntry {
     pub llm_context: Value,
     #[serde(default)]
     pub inherit: InheritMode,
+    /// `[tool]` of the behavior: offered to callers that whitelist
+    /// `behavior:<name>` as a named function running this sub context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<super::behavior::BehaviorToolConfig>,
+    /// The behavior executes the session's serial Todos: a `next_behavior`
+    /// hand-over to it admits the next one (TodoList, `[entry] todo`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub todo: bool,
+    /// `[reply]`: the context's final reply is a JSON value of this
+    /// contract (function call loop only). A fork may declare its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<super::behavior::BehaviorReply>,
 }
 
 impl BehaviorEntry {
+    /// Behaviors whose `[tool]` this context offers (`behavior:<name>` in
+    /// its tool list).
+    pub fn behavior_tools(&self) -> Vec<String> {
+        self.llm_context
+            .pointer("/tools/tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .filter_map(|n| n.strip_prefix(super::behavior::BEHAVIOR_TOOL_PREFIX))
+            .map(str::to_string)
+            .collect()
+    }
+
     pub fn validate(&self, name: &str) -> std::result::Result<(), String> {
+        if self.todo && self.mode != ContextMode::CreateSubContext {
+            return Err(format!(
+                "behavior `{name}`: a Todo executor (`[entry] todo = true`) is entered as create_sub_context"
+            ));
+        }
+        if let Some(t) = &self.tool {
+            if !self.mode.is_sub_context() {
+                return Err(format!(
+                    "behavior `{name}`: [tool] runs the behavior as a sub context; its entry mode must be create_sub_context or fork"
+                ));
+            }
+            t.validate(name)?;
+        }
         if !self.llm_context.is_null() && !self.llm_context.is_object() {
             return Err(format!("behavior `{name}`: llm_context must be an object"));
+        }
+        if let Some(r) = &self.reply {
+            r.validate(name)?;
         }
         match self.mode {
             ContextMode::Fork => {
@@ -625,13 +738,30 @@ pub struct RuntimeSection {
     pub env: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAccess {
+    ReadOnly,
+    #[default]
+    ReadWrite,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WorkspaceRef {
-    /// Agent internal workspace `<agent_root>/workspace/<id>`.
-    Agent { id: String },
-    /// Directory owned by a user / application.
-    External { path: String },
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRef {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub access: WorkspaceAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceBinding {
+    pub workspace_id: String,
+    pub revision: u64,
+    pub location_revision: u64,
+    pub runtime_host: String,
+    pub location: super::WorkspaceLocation,
+    pub access: WorkspaceAccess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -688,7 +818,13 @@ impl SubscriptionSource {
             }
             SubscriptionSource::Task { task_id } => source_kind == "task" && source_id == task_id,
             SubscriptionSource::Timer { name } => source_kind == "timer" && source_id == name,
-            SubscriptionSource::System { id } => source_kind == "system" && source_id == id,
+            SubscriptionSource::System { id } => {
+                source_kind == "system"
+                    && (source_id == id
+                        || source_id
+                            .strip_prefix(id.as_str())
+                            .is_some_and(|rest| rest.starts_with(':')))
+            }
         }
     }
 }
@@ -697,6 +833,14 @@ impl SubscriptionSource {
 /// time zone (`source = system:user_timezone`).
 pub const USER_TIMEZONE_SUBSCRIPTION: &str = "_user_timezone";
 pub const USER_TIMEZONE_SOURCE_ID: &str = "user_timezone";
+
+/// Id of the implicit semi subscription of UI sessions on the notifications
+/// shown in their conversation (`source = system:notify:<notify_id>`; a
+/// `system:<id>` subscription also takes the sub ids `<id>:<sub>`).
+pub const NOTIFY_SUBSCRIPTION: &str = "_notify";
+pub const NOTIFY_SOURCE_ID: &str = "notify";
+/// Event of a notification that reached the session's conversation.
+pub const NOTIFY_EVENT_DELIVERED: &str = "delivered";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Subscription {
@@ -775,6 +919,8 @@ pub struct SessionConfig {
     pub runtime: RuntimeSection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_binding: Option<WorkspaceBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -860,8 +1006,27 @@ impl SessionConfig {
         };
         let map: BTreeMap<String, BehaviorEntry> = serde_json::from_value(b.clone())
             .map_err(|e| format!("extensions.opendan.behaviors: {e}"))?;
+        let mut functions: BTreeMap<String, &str> = BTreeMap::new();
         for (name, entry) in &map {
             entry.validate(name)?;
+            if let Some(t) = &entry.tool {
+                let f = t.function_name(name);
+                if let Some(other) = functions.insert(f.clone(), name) {
+                    return Err(format!(
+                        "behaviors `{other}` and `{name}` both declare the function `{f}`"
+                    ));
+                }
+            }
+        }
+        for (name, entry) in &map {
+            for target in entry.behavior_tools() {
+                if !map.get(&target).is_some_and(|t| t.tool.is_some()) {
+                    return Err(format!(
+                        "behavior `{name}` offers `{}{target}`, but `{target}` is not a frozen sub context behavior with a [tool] declaration",
+                        super::behavior::BEHAVIOR_TOOL_PREFIX
+                    ));
+                }
+            }
         }
         Ok(map)
     }
@@ -881,6 +1046,9 @@ impl SessionConfig {
                 input: None,
                 llm_context: Value::Null,
                 inherit: InheritMode::RecentDialogue,
+                tool: None,
+                todo: false,
+                reply: None,
             });
         }
         Err(format!(

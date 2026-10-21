@@ -55,24 +55,44 @@ pub(super) fn watched_view(status: &SessionStatus, watch: &[String]) -> Value {
 pub struct SessionCheckpointHook {
     shared: Arc<Shared>,
     run: RunHandle,
+    rounds: Arc<super::rounds::RoundCounter>,
 }
 
 impl SessionCheckpointHook {
-    pub fn new(shared: Arc<Shared>, run: RunHandle) -> Self {
-        Self { shared, run }
+    pub fn new(
+        shared: Arc<Shared>,
+        run: RunHandle,
+        rounds: Arc<super::rounds::RoundCounter>,
+    ) -> Self {
+        Self {
+            shared,
+            run,
+            rounds,
+        }
     }
 
     async fn boundary(&self, snapshot: &LLMContextSnapshot) -> Result<()> {
         let sh = &self.shared;
         sh.lease.check()?;
+        super::drive::verify_workspace_admission(sh).await?;
         // Tool results first: publish and clear covered in-flight actions.
         self.run.checkpoint_with_results(snapshot, None)?;
+        super::rounds::flush_counts(sh, &self.run, &self.rounds).await?;
+        super::reports::sync_xml(sh, &self.run, snapshot).await?;
         // Controls, rejected records, Observe events. msg / Input events
         // stay queued for the next controlled input.
         route_inputs(sh, true, &[]).await?;
-        if sh.session.lock().await.state.stop_requested {
+        let (stop, turn_stop) = {
+            let s = sh.session.lock().await;
+            (s.state.stop_requested, s.state.turn_stop_requested)
+        };
+        if stop || turn_stop {
             if let Some(h) = sh.interrupt.lock().expect("interrupt lock").as_ref() {
-                h.interrupt("session stop requested");
+                h.interrupt(if stop {
+                    "session stop requested"
+                } else {
+                    "turn stop requested"
+                });
             }
             return Ok(());
         }
@@ -110,12 +130,81 @@ impl SessionCheckpointHook {
 
 #[async_trait]
 impl CheckpointHook for SessionCheckpointHook {
+    async fn before_tool_call(
+        &self,
+        snapshot: &LLMContextSnapshot,
+    ) -> std::result::Result<(), String> {
+        self.shared.lease.check().map_err(|e| e.to_string())?;
+        super::drive::verify_workspace_admission(&self.shared)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.run
+            .checkpoint_with_results(snapshot, None)
+            .map_err(|e| e.to_string())?;
+        super::rounds::flush_counts(&self.shared, &self.run, &self.rounds)
+            .await
+            .map_err(|e| e.to_string())?;
+        super::reports::sync_xml(&self.shared, &self.run, snapshot)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn validate_report(
+        &self,
+        _snapshot: &LLMContextSnapshot,
+        result: &llm_context::behavior_loop::LLMBehaviorResult,
+        step_index: u32,
+    ) -> std::result::Result<(), String> {
+        let args = super::reports::ReportArgs {
+            report: result.self_report.clone().unwrap_or_default(),
+            artifacts: result.report_artifacts.clone(),
+            result: result.report_result.clone(),
+            is_end: result.report_end,
+        };
+        if self
+            .run
+            .reports()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|r| r.source == ReportSource::Behavior { step_index })
+        {
+            return Ok(());
+        }
+        super::reports::validate(&self.shared, &self.run, &args)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn before_inference(
         &self,
         snapshot: &LLMContextSnapshot,
     ) -> std::result::Result<Option<Injection>, String> {
         self.boundary(snapshot).await.map_err(|e| e.to_string())?;
         Ok(None)
+    }
+
+    /// Hand-overs to a Todo executor and yields are the session's to judge
+    /// (TodoList §2.2): refused, they are corrected in the same run.
+    async fn review_decision(
+        &self,
+        snapshot: &LLMContextSnapshot,
+        result: &llm_context::LLMBehaviorResult,
+        _step_index: u32,
+        decision: llm_context::StepDecision,
+    ) -> Option<llm_context::DecisionVerdict> {
+        let run_id = self.run.run_id();
+        match decision {
+            llm_context::StepDecision::Handover => {
+                let target = result.next_behavior.as_deref()?.trim();
+                if !agent_tool::xllm::is_handover_target(target) {
+                    return None;
+                }
+                super::todos::review_handover(&self.shared, run_id, target).await
+            }
+            llm_context::StepDecision::Yield => {
+                super::todos::review_yield(&self.shared, run_id, snapshot).await
+            }
+        }
     }
 }
 

@@ -12,23 +12,33 @@ import {
 } from 'react'
 import {
   AtSign,
+  Circle,
+  CircleDot,
   File,
   FolderOpen,
   ImageIcon,
+  ListChecks,
+  Mic,
   Paperclip,
   Send,
+  Smile,
+  Square,
   X,
 } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
-import { displayedContent, messageObjId } from '../history/relations'
-import { getMessageSenderName, type MessageObject, type MsgMentions, type MsgRelation } from '../../protocol/msgobj'
+import { displayedContent, effectiveContent, messageObjId } from '../history/relations'
+import { agentAskQuestionText, buildAgentAskAnswer, getMessageSenderName, type MachineContent, type MessageObject, type MsgMentions, type MsgRelation, type VoiceNote } from '../../protocol/msgobj'
+import { formatVoiceDuration, voiceRecordingSupported } from '../media/voice'
+import { EmojiPanel } from './EmojiPanel'
+import { VoiceRecorder } from './VoiceRecorder'
+import { isStopCommand, mergeMentions, type AnswerInputState } from './inputState'
 import { applyMention, collectMentions, matchMentionCandidates, mentionQueryAt, type MentionCandidate, type MentionQuery } from './mentions'
 import {
   createAttachmentItem,
   extractTransferFiles,
   filesFromInputList,
   formatAttachmentSize,
-  getAttachmentPathKey,
+  getAttachmentKey,
   MAX_ATTACHMENT_BYTES,
   revokeAttachmentItem,
   type ComposerAttachmentInput,
@@ -41,8 +51,10 @@ const COMPOSER_FIELD_MIN_HEIGHT = 44
 const COMPOSER_FIELD_CHROME = 18
 
 function sameAttachmentInputs(a: readonly ComposerAttachmentInput[], b: readonly ComposerAttachmentInput[]) {
-  return a.length === b.length && a.every((item, index) => item.file === b[index].file && item.relativePath === b[index].relativePath)
+  return a.length === b.length && a.every((item, index) => item.file === b[index].file && item.relativePath === b[index].relativePath && item.voice === b[index].voice)
 }
+
+const attachmentInput = ({ file, relativePath, voice }: ComposerAttachmentInput): ComposerAttachmentInput => ({ file, relativePath, ...(voice ? { voice } : {}) })
 
 export interface ConversationComposerSubmitPayload {
   attachments: ComposerAttachmentItem[]
@@ -51,6 +63,17 @@ export interface ConversationComposerSubmitPayload {
   relatesTo?: MsgRelation
   /** Structured mentions picked in the composer; absent when none. */
   mentions?: MsgMentions
+  /** `content.machine`: an answer that picked an option (`agent_ask.answer`). */
+  machine?: MachineContent
+  /** The only attachment is a voice note recorded in the composer. */
+  voice?: VoiceNote
+  localId?: string
+  submittedAt?: number
+}
+
+/** The question the conversation's input state locks the composer to, and who asked it. */
+export interface ComposerAnswer extends AnswerInputState {
+  askerName: string
 }
 
 /** A message the next send relates to: a reply quotes it, an edit replaces its text. */
@@ -71,12 +94,21 @@ interface ConversationComposerProps {
   /** Max height for the entire composer (in px). Used to compute inner constraints. */
   maxHeight?: number
   onSendMessage: (payload: ConversationComposerSubmitPayload) => void | Promise<void>
+  /** Submitted payloads not sent yet, the one being sent included; called whenever that list changes. */
+  onQueueChange?: (queued: ConversationComposerSubmitPayload[]) => void
   initialDraft?: string
   initialAttachments?: ComposerAttachmentInput[]
   onAttachmentsChange?: (attachments: ComposerAttachmentInput[]) => Promise<void> | undefined
   onDraftChange?: (value: string) => Promise<void> | undefined
   relation?: ComposerRelation | null
   onCancelRelation?: () => void
+  /**
+   * Set by the conversation, not by the user (`inputState.ts`): everything
+   * sent answers this question, there is no way to cancel it, and a choice
+   * question replaces the input with its options. `/stop` still goes out as
+   * the command it is.
+   */
+  answer?: ComposerAnswer | null
   /** Members offered while typing `@` and by the @ button (group sessions only). */
   mentionCandidates?: MentionCandidate[]
   canMentionAll?: boolean
@@ -87,7 +119,7 @@ const ConversationComposerInner = forwardRef<
   ConversationComposerHandle,
   ConversationComposerProps
 >(function ConversationComposer(
-  { placeholder, maxHeight, onSendMessage, initialDraft = '', initialAttachments = [], onAttachmentsChange, onDraftChange, relation = null, onCancelRelation, mentionCandidates = [], canMentionAll = false },
+  { placeholder, maxHeight, onSendMessage, onQueueChange, initialDraft = '', initialAttachments = [], onAttachmentsChange, onDraftChange, relation = null, onCancelRelation, answer = null, mentionCandidates = [], canMentionAll = false },
   ref,
 ) {
   const { t } = useI18n()
@@ -114,6 +146,9 @@ const ConversationComposerInner = forwardRef<
   useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
   const sendCallback = useRef(onSendMessage)
   useEffect(() => { sendCallback.current = onSendMessage }, [onSendMessage])
+  const queueCallback = useRef(onQueueChange)
+  useEffect(() => { queueCallback.current = onQueueChange }, [onQueueChange])
+  const reportQueue = useCallback(() => queueCallback.current?.([...sendQueue.current]), [])
   const attachmentsCallback = useRef(onAttachmentsChange)
   useEffect(() => { attachmentsCallback.current = onAttachmentsChange }, [onAttachmentsChange])
   const draftCallback = useRef(onDraftChange)
@@ -140,13 +175,17 @@ const ConversationComposerInner = forwardRef<
   }, [inputValue, flushDraft])
   useEffect(() => flushDraft, [flushDraft])
   useEffect(() => {
-    const inputs = attachments.map(({ file, relativePath }) => ({ file, relativePath }))
+    const inputs = attachments.map(attachmentInput)
     if (sameAttachmentInputs(inputs, persistedAttachments.current)) return
     persistedAttachments.current = inputs
     flushDraft()
     if (attachmentsCallback.current) void attachmentsCallback.current(inputs)?.catch(() => setSendError('true'))
   }, [attachments, flushDraft])
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [emojiOpen, setEmojiOpen] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const [canRecord] = useState(voiceRecordingSupported)
+  const [canPickFolder] = useState(() => 'webkitdirectory' in document.createElement('input') && !window.matchMedia?.('(pointer: coarse)').matches)
   const attachmentsRef = useRef<ComposerAttachmentItem[]>([])
   const composerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -169,6 +208,15 @@ const ConversationComposerInner = forwardRef<
   }
   useEffect(() => { if (relation) inputRef.current?.focus() }, [relation])
 
+  // A choice question shows its options instead of the input until the user
+  // picks "Other…" (allowed only when the question accepts free text).
+  const answerKey = answer ? messageObjId(answer.question) ?? answer.ask.call_id : null
+  const [freeTextFor, setFreeTextFor] = useState<string | null>(null)
+  const choice = answer?.ask.input.kind === 'choice' && freeTextFor !== answerKey ? answer : null
+  const showInput = !choice
+  const questionText = answer ? agentAskQuestionText(effectiveContent(answer.question).content ?? '', answer.ask) : ''
+  const [directSend, setDirectSend] = useState<string | null>(null)
+
   // Message input area max is 50% of the composer's max height
   const messageInputMaxHeight = maxHeight != null ? Math.floor(maxHeight / 2) : undefined
 
@@ -184,7 +232,7 @@ const ConversationComposerInner = forwardRef<
     const limit = messageInputMaxHeight != null ? Math.max(COMPOSER_FIELD_MIN_HEIGHT, messageInputMaxHeight - COMPOSER_FIELD_CHROME) : scrollHeight
     element.style.height = `${Math.min(scrollHeight, limit)}px`
     element.style.overflowY = scrollHeight > limit ? 'auto' : 'hidden'
-  }, [inputValue, messageInputMaxHeight])
+  }, [inputValue, messageInputMaxHeight, showInput])
 
   useEffect(() => {
     const element = directoryInputRef.current
@@ -225,7 +273,7 @@ const ConversationComposerInner = forwardRef<
   }, [mentionOpen, activeMentionIndex]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (!pickerOpen && !mentionOpen) {
+    if (!pickerOpen && !mentionOpen && !emojiOpen) {
       return
     }
 
@@ -233,6 +281,7 @@ const ConversationComposerInner = forwardRef<
       if (!composerRef.current?.contains(event.target as Node)) {
         setPickerOpen(false)
         setMentionQuery(null)
+        setEmojiOpen(false)
       }
     }
 
@@ -241,7 +290,7 @@ const ConversationComposerInner = forwardRef<
     return () => {
       document.removeEventListener('pointerdown', handlePointerDown)
     }
-  }, [pickerOpen, mentionOpen])
+  }, [pickerOpen, mentionOpen, emojiOpen])
 
   const appendAttachmentInputs = useCallback((selected: ComposerAttachmentInput[]) => {
     const items = selected.filter(item => item.file.size <= MAX_ATTACHMENT_BYTES)
@@ -251,17 +300,17 @@ const ConversationComposerInner = forwardRef<
     }
 
     setAttachments((previous) => {
-      const existingKeys = new Set(previous.map(getAttachmentPathKey))
+      const existingKeys = new Set(previous.map(getAttachmentKey))
       const nextInputs: ComposerAttachmentInput[] = []
 
       items.forEach((item) => {
-        const pathKey = getAttachmentPathKey(item)
+        const itemKey = getAttachmentKey(item)
 
-        if (existingKeys.has(pathKey)) {
+        if (existingKeys.has(itemKey)) {
           return
         }
 
-        existingKeys.add(pathKey)
+        existingKeys.add(itemKey)
         nextInputs.push(item)
       })
 
@@ -302,7 +351,7 @@ const ConversationComposerInner = forwardRef<
     const items = failed.flatMap(item => item.attachments)
     if (!mounted.current) {
       const draft = [text, latestDraft.current].filter(Boolean).join('\n')
-      const inputs = [...items, ...attachmentsRef.current].map(({ file, relativePath }) => ({ file, relativePath }))
+      const inputs = [...items, ...attachmentsRef.current].map(attachmentInput)
       items.forEach(revokeAttachmentItem)
       latestDraft.current = draft
       persistedDraft.current = draft
@@ -313,8 +362,8 @@ const ConversationComposerInner = forwardRef<
     }
     setInputValue(current => [text, current].filter(Boolean).join('\n'))
     setAttachments(current => {
-      const keys = new Set(current.map(getAttachmentPathKey))
-      return [...items.filter(item => !keys.has(getAttachmentPathKey(item))), ...current]
+      const keys = new Set(current.map(getAttachmentKey))
+      return [...items.filter(item => !keys.has(getAttachmentKey(item))), ...current]
     })
   }, [])
 
@@ -328,11 +377,13 @@ const ConversationComposerInner = forwardRef<
           await sendCallback.current(next)
         } catch (error) {
           const failed = sendQueue.current.splice(0)
+          reportQueue()
           restoreFailedSends(failed)
           if (mounted.current) setSendError(error instanceof Error && error.message ? error.message : 'true')
           break
         }
         sendQueue.current.shift()
+        reportQueue()
         next.attachments.forEach(revokeAttachmentItem)
         if (mounted.current) setPendingSends(sendQueue.current.length)
       }
@@ -340,7 +391,26 @@ const ConversationComposerInner = forwardRef<
       draining.current = false
       if (mounted.current) setPendingSends(sendQueue.current.length)
     }
-  }, [restoreFailedSends])
+  }, [reportQueue, restoreFailedSends])
+
+  /** Queues one message (the reply, edit or answer in progress applies to it) and starts sending. */
+  const enqueue = useCallback((text: string, items: ComposerAttachmentItem[]) => {
+    const target = relation ? messageObjId(relation.message) : undefined
+    // In the answer state everything typed answers the question, except a
+    // bare `/stop`, which the Agent takes as a command on its own.
+    const reply = answer && !(isStopCommand(text) && items.length === 0) ? buildAgentAskAnswer(answer.question, answer.ask, { text }) : undefined
+    const relatesTo: MsgRelation | undefined = answer ? reply?.relates_to : relation && target ? { rel: relation.kind === 'edit' ? 'edit' : 'thread', target } : undefined
+    const mentions = mergeMentions(collectMentions(text, picked, mentionAll), answer?.mentions)
+    const editing = relation?.kind === 'edit'
+    const voice = !editing && items.length === 1 ? items[0].voice : undefined
+    sendQueue.current.push({ attachments: editing ? [] : items, content: text, ...(voice ? { voice } : {}), ...(relatesTo ? { relatesTo } : {}), ...(mentions ? { mentions } : {}), localId: crypto.randomUUID(), submittedAt: Date.now() })
+    reportQueue()
+    if (relation) onCancelRelation?.()
+    setPicked([]); setMentionAll(false); setMentionQuery(null)
+    setPendingSends(sendQueue.current.length)
+    setSendError(false)
+    void drainSendQueue()
+  }, [drainSendQueue, relation, onCancelRelation, picked, mentionAll, answer, reportQueue])
 
   const handleSend = useCallback(() => {
     const text = inputValue.trim()
@@ -349,22 +419,68 @@ const ConversationComposerInner = forwardRef<
       return
     }
 
-    const target = relation ? messageObjId(relation.message) : undefined
-    const relatesTo: MsgRelation | undefined = relation && target ? { rel: relation.kind === 'edit' ? 'edit' : 'thread', target } : undefined
-    const mentions = collectMentions(text, picked, mentionAll)
-    sendQueue.current.push({ attachments: relation?.kind === 'edit' ? [] : attachments, content: text, ...(relatesTo ? { relatesTo } : {}), ...(mentions ? { mentions } : {}) })
-    if (relation) onCancelRelation?.()
-    setPicked([]); setMentionAll(false); setMentionQuery(null)
-    setPendingSends(sendQueue.current.length)
-    setSendError(false)
+    enqueue(text, attachments)
     setOversizeNames([])
     setInputValue('')
     latestDraft.current = ''
     flushDraft()
     setAttachments([])
     inputRef.current?.focus()
-    void drainSendQueue()
-  }, [attachments, drainSendQueue, flushDraft, inputValue, relation, onCancelRelation, picked, mentionAll])
+  }, [attachments, enqueue, flushDraft, inputValue])
+
+  const sendVoice = useCallback((file: File, voice: VoiceNote) => {
+    enqueue('', [createAttachmentItem({ file, voice })])
+  }, [enqueue])
+
+  const handleRecordingChange = useCallback((active: boolean) => {
+    setRecording(active)
+    if (active) { setEmojiOpen(false); setPickerOpen(false) }
+  }, [])
+
+  /** Puts the emoji at the caret; the input keeps its focus (and a phone its keyboard state). */
+  const insertEmoji = useCallback((emoji: string) => {
+    const textarea = inputRef.current
+    const start = textarea?.selectionStart ?? inputValue.length
+    const end = textarea?.selectionEnd ?? inputValue.length
+    const text = `${inputValue.slice(0, start)}${emoji}${inputValue.slice(end)}`
+    const caret = start + emoji.length
+    setInputValue(text)
+    requestAnimationFrame(() => {
+      if (textarea?.value === text) textarea.setSelectionRange(caret, caret)
+    })
+  }, [inputValue])
+
+  const closeEmoji = useCallback(() => {
+    setEmojiOpen(false)
+    inputRef.current?.focus()
+  }, [])
+
+  /**
+   * A picked option or the stop button: sent at once, apart from the typed
+   * draft, which stays as it is. `key` marks what is being sent.
+   */
+  const sendDirect = useCallback(async (key: string, payload: ConversationComposerSubmitPayload) => {
+    setDirectSend(key)
+    setSendError(false)
+    try {
+      await sendCallback.current(payload)
+    } catch (error) {
+      if (mounted.current) setSendError(error instanceof Error && error.message ? error.message : 'true')
+    } finally {
+      if (mounted.current) setDirectSend(null)
+    }
+  }, [])
+
+  const pickOption = useCallback((option: string) => {
+    if (!answer) return
+    const reply = buildAgentAskAnswer(answer.question, answer.ask, { option })
+    if (!reply) return
+    void sendDirect(`option:${option}`, { attachments: [], content: reply.text, relatesTo: reply.relates_to, ...(reply.machine ? { machine: reply.machine } : {}), ...(answer.mentions ? { mentions: answer.mentions } : {}) })
+  }, [answer, sendDirect])
+
+  const sendStop = useCallback(() => {
+    void sendDirect('stop', { attachments: [], content: '/stop', ...(answer?.mentions ? { mentions: answer.mentions } : {}) })
+  }, [answer, sendDirect])
 
   /** Replaces the `@word` at the caret with the picked mention. */
   const pickMention = useCallback((option: MentionCandidate | 'all') => {
@@ -424,7 +540,8 @@ const ConversationComposerInner = forwardRef<
 
     if (event.key === 'Escape') {
       setPickerOpen(false)
-      if (relation) onCancelRelation?.()
+      if (emojiOpen) setEmojiOpen(false)
+      else if (relation) onCancelRelation?.()
     }
   }
 
@@ -468,14 +585,23 @@ const ConversationComposerInner = forwardRef<
   }
 
   const hasDraft = relation?.kind === 'edit' ? Boolean(inputValue.trim()) : hasAttachments || Boolean(inputValue.trim())
+  // An empty input offers a voice note in place of the send button (Telegram);
+  // a recording keeps it until the note is sent or discarded.
+  const showVoice = canRecord && showInput && (recording || (!hasDraft && relation?.kind !== 'edit'))
   const showMentions = mentionCandidates.length > 0 || canMentionAll
+  const answerBusy = directSend !== null || pendingSends > 0
+  const stopButton = answer ? (
+    <button type="button" className="mh-answer-action" disabled={answerBusy} onClick={sendStop} title={t('messagehub.answer.stopHint')} data-testid="answer-stop">
+      <Square size={11} aria-hidden />{t('messagehub.answer.stop')}
+    </button>
+  ) : null
 
   return (
     <div
       ref={composerRef}
       data-testid="message-composer"
       aria-busy={pendingSends > 0}
-      onKeyDown={(event) => { if (event.key === 'Escape') setPickerOpen(false) }}
+      onKeyDown={(event) => { if (event.key === 'Escape') { setPickerOpen(false); setEmojiOpen(false) } }}
       className="relative z-20 flex min-h-0 flex-shrink-0 flex-col"
       style={{
         borderTop: '1px solid var(--cp-border)',
@@ -532,6 +658,12 @@ const ConversationComposerInner = forwardRef<
         </div>
       ) : null}
 
+      {emojiOpen && showInput ? (
+        <div className="absolute bottom-full left-2 right-2 z-40 mb-2 flex justify-end sm:left-auto sm:right-3">
+          <EmojiPanel onPick={insertEmoji} onClose={closeEmoji} />
+        </div>
+      ) : null}
+
       {mentionOpen ? (
         <div id={mentionListId} role="listbox" aria-label={t('messagehub.mention.pick')} data-testid="mention-picker" className="shell-scrollbar absolute bottom-full left-4 z-40 mb-2 max-h-56 w-60 max-w-[calc(100%-2rem)] overflow-y-auto rounded-2xl p-1.5 shadow-lg" style={{ background: 'color-mix(in srgb, var(--cp-surface) 96%, white)', border: '1px solid var(--cp-border)' }}>
           {mentionOptions.map((option, index) => {
@@ -556,6 +688,42 @@ const ConversationComposerInner = forwardRef<
         </div>
       ) : null}
 
+      {answer && !choice ? (
+        <div className="flex items-center gap-2 border-b px-3 py-1 text-[12px]" style={{ borderColor: 'var(--cp-border)' }} data-testid="composer-answer" data-kind="text">
+          <span className="shrink-0 font-semibold" style={{ color: 'var(--cp-accent)' }}>{t('messagehub.answer.banner', undefined, { name: answer.askerName })}</span>
+          <span className="min-w-0 flex-1 truncate" style={{ color: 'var(--cp-muted)' }} title={questionText}>{questionText}</span>
+          {answer.ask.input.kind === 'choice' ? <button type="button" className="mh-answer-action" onClick={() => setFreeTextFor(null)} data-testid="answer-back-to-options"><ListChecks size={13} aria-hidden />{t('messagehub.answer.backToOptions')}</button> : null}
+          {stopButton}
+        </div>
+      ) : null}
+
+      {choice ? (
+        <div className="flex flex-col gap-2 px-3 pb-3 pt-2" data-testid="composer-answer" data-kind="choice">
+          <div className="flex items-center gap-2 text-[12px]">
+            <span className="min-w-0 flex-1 truncate font-semibold" style={{ color: 'var(--cp-accent)' }}>{t('messagehub.answer.banner', undefined, { name: choice.askerName })}</span>
+            {stopButton}
+          </div>
+          {questionText ? <p className="max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-[14px] leading-[1.45]" style={{ color: 'var(--cp-text)' }} data-testid="answer-question">{questionText}</p> : null}
+          <div role="group" aria-label={t('messagehub.answer.options')} className="flex max-h-60 flex-col gap-1.5 overflow-y-auto">
+            {choice.ask.input.options.map(option => {
+              const sending = directSend === `option:${option.id}`
+              return (
+                <button key={option.id} type="button" className="mh-answer-option" aria-pressed={sending} disabled={answerBusy} onClick={() => pickOption(option.id)} data-testid="answer-option" data-option={option.id}>
+                  {sending ? <CircleDot size={16} aria-hidden style={{ color: 'var(--cp-accent)' }} /> : <Circle size={16} aria-hidden style={{ color: 'var(--cp-muted)' }} />}
+                  <span className="min-w-0 flex-1 break-words">{option.label}</span>
+                </button>
+              )
+            })}
+            {choice.ask.input.allow_text ? (
+              <button type="button" className="mh-answer-option" style={{ color: 'var(--cp-muted)' }} disabled={answerBusy} onClick={() => { setFreeTextFor(answerKey); requestAnimationFrame(() => inputRef.current?.focus()) }} data-testid="answer-other">
+                <Circle size={16} aria-hidden />
+                <span className="min-w-0 flex-1">{t('messagehub.answer.other')}</span>
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       {relation ? (
         <div className="flex items-center gap-2 border-b px-3 py-1.5 text-[12px]" style={{ borderColor: 'var(--cp-border)' }} data-testid="composer-relation" data-kind={relation.kind}>
           <span className="shrink-0 font-semibold" style={{ color: 'var(--cp-accent)' }}>{t(relation.kind === 'edit' ? 'messagehub.message.editing' : 'messagehub.message.replyingTo', undefined, { name: getMessageSenderName(relation.message) })}</span>
@@ -565,7 +733,7 @@ const ConversationComposerInner = forwardRef<
       ) : null}
 
       {/* Message input area – top, max 50% of composer */}
-      <div className="flex flex-shrink-0 flex-col px-2 py-2 md:px-3">
+      {showInput ? <div className="flex flex-shrink-0 flex-col px-2 py-2 md:px-3">
         <div
           className="relative flex min-w-0 items-end gap-0.5 rounded-[22px] border px-0.5 transition-[border-color,box-shadow] focus-within:border-[color:color-mix(in_srgb,var(--cp-accent)_55%,var(--cp-border))] focus-within:shadow-[0_0_0_3px_color-mix(in_srgb,var(--cp-accent)_14%,transparent)]"
           style={{ background: 'var(--cp-message-canvas)', borderColor: 'var(--cp-border)' }}
@@ -573,11 +741,11 @@ const ConversationComposerInner = forwardRef<
           <button
             className="flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center rounded-full"
             style={{ color: 'var(--cp-muted)' }}
-            onClick={() => setPickerOpen((previous) => !previous)}
+            onClick={() => { if (canPickFolder) setPickerOpen((previous) => !previous); else fileInputRef.current?.click() }}
             type="button"
             aria-label={t('messagehub.addAttachment', 'Add attachment')}
-            aria-haspopup="menu"
-            aria-expanded={pickerOpen}
+            aria-haspopup={canPickFolder ? 'menu' : undefined}
+            aria-expanded={canPickFolder ? pickerOpen : undefined}
             title={t('messagehub.addAttachment', 'Add attachment')}
           >
             <Paperclip size={18} />
@@ -608,9 +776,9 @@ const ConversationComposerInner = forwardRef<
             onPaste={(event) => {
               void handlePaste(event)
             }}
-            placeholder={placeholder}
+            placeholder={answer ? t('messagehub.answer.placeholder') : placeholder}
             rows={1}
-            aria-label={placeholder}
+            aria-label={answer ? t('messagehub.answer.placeholder') : placeholder}
             aria-autocomplete={showMentions ? 'list' : undefined}
             aria-controls={mentionOpen ? mentionListId : undefined}
             aria-activedescendant={mentionOpen ? mentionOptionId(activeMentionIndex) : undefined}
@@ -621,30 +789,50 @@ const ConversationComposerInner = forwardRef<
             }}
           />
           <button
-            onClick={handleSend}
-            disabled={!hasDraft}
-            className="group flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center disabled:cursor-not-allowed"
+            className="flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center rounded-full"
+            style={{ color: emojiOpen ? 'var(--cp-accent)' : 'var(--cp-muted)' }}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              setPickerOpen(false)
+              setEmojiOpen(previous => !previous)
+              if (window.matchMedia?.('(pointer: coarse)').matches) inputRef.current?.blur()
+            }}
             type="button"
-            aria-label={t('messagehub.send', 'Send')}
-            title={t('messagehub.send', 'Send')}
+            aria-label={t('messagehub.emoji.open')}
+            aria-haspopup="dialog"
+            aria-expanded={emojiOpen}
+            title={t('messagehub.emoji.open')}
+            data-testid="emoji-button"
           >
-            <span
-              className="flex h-8 w-8 items-center justify-center rounded-full transition-colors"
-              style={{
-                background: hasDraft
-                  ? 'var(--cp-message-self-bg)'
-                  : 'color-mix(in srgb, var(--cp-text) 8%, transparent)',
-                color: hasDraft ? 'var(--cp-message-self-text)' : 'color-mix(in srgb, var(--cp-muted) 70%, transparent)',
-              }}
-            >
-              <Send size={16} />
-            </span>
+            <Smile size={19} />
           </button>
+          {showVoice ? <VoiceRecorder onSend={sendVoice} onActiveChange={handleRecordingChange} /> : (
+            <button
+              onClick={handleSend}
+              disabled={!hasDraft}
+              className="group flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center disabled:cursor-not-allowed"
+              type="button"
+              aria-label={t('messagehub.send', 'Send')}
+              title={t('messagehub.send', 'Send')}
+            >
+              <span
+                className="flex h-8 w-8 items-center justify-center rounded-full transition-colors"
+                style={{
+                  background: hasDraft
+                    ? 'var(--cp-message-self-bg)'
+                    : 'color-mix(in srgb, var(--cp-text) 8%, transparent)',
+                  color: hasDraft ? 'var(--cp-message-self-text)' : 'color-mix(in srgb, var(--cp-muted) 70%, transparent)',
+                }}
+              >
+                <Send size={16} />
+              </span>
+            </button>
+          )}
         </div>
-      </div>
+      </div> : null}
 
       {/* Attachment area – bottom, fills remaining space */}
-      {hasAttachments ? (
+      {hasAttachments && showInput ? (
         <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-2">
           <div
             className="flex items-center justify-between gap-3 px-1"
@@ -774,6 +962,15 @@ const MemoAttachmentCard = memo(function AttachmentCard({
               {metaLine}
             </p>
           </div>
+        </div>
+      ) : attachment.voice ? (
+        <div className="flex items-center gap-2.5 px-2.5 py-2.5" data-testid="voice-draft">
+          <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full" style={{ background: 'var(--cp-accent)', color: 'var(--cp-message-self-text)' }}>
+            <Mic size={18} aria-hidden />
+          </span>
+          <p className="min-w-0 flex-1 truncate text-[11px] font-medium" style={{ color: 'var(--cp-text)' }} title={displayPath}>
+            {t('messagehub.voice.label')} · {formatVoiceDuration(attachment.voice.duration_ms)}
+          </p>
         </div>
       ) : (
         <div className="flex items-center gap-2.5 px-2.5 py-2.5">

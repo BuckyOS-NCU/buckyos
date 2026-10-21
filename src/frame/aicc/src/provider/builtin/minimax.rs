@@ -86,6 +86,17 @@ mod tests {
         );
         assert_eq!(profile.credential.kind, CredentialKind::NamedHeader);
         assert_eq!(
+            known.ui_hints["instance_fields"]["region"]["mode"],
+            "required"
+        );
+        assert!(known.ui_hints["instance_fields"]["region"]
+            .get("default_value")
+            .is_none());
+        assert_eq!(
+            known.ui_hints["access_endpoints"]["china"]["label"],
+            "China"
+        );
+        assert_eq!(
             resolve_minimax_connection(Default::default())
                 .unwrap()
                 .base_url,
@@ -115,12 +126,76 @@ mod tests {
             rules.patterns[1].operations["llm"],
             CLAUDE_MESSAGES_OPERATION_ID
         );
+        assert_eq!(rules.patterns[0].request_rules[0].defaults["top_p"], 0.95);
+        assert!(rules.patterns[0].request_rules[0]
+            .remove
+            .contains(&"/stop".to_owned()));
         assert_eq!(rules.patterns[1].request_rules[0].defaults["top_p"], 0.9);
         assert!(rules.patterns[1].request_rules[0]
             .remove
             .contains(&"/stop".to_owned()));
         assert_eq!(models.model_driver_id, MINIMAX_PROVIDER_PROFILE_ID);
+        assert!(models
+            .models
+            .iter()
+            .any(|model| model.id == "MiniMax-M3.1-Flash-Preview"));
         assert!(models.models.iter().any(|model| model.id == "MiniMax-M2.7"));
+        assert!(models.models.iter().any(|model| model.id == "music-3.0"));
+        assert!(rules.models.iter().any(|model| model.id == "music-3.0"));
+        assert!(rules.variants.iter().any(|variant| {
+            variant.variant == "reasoning-max"
+                && variant.provider_options["output_config"]["effort"] == "max"
+        }));
+        let h3 = rules
+            .models
+            .iter()
+            .find(|model| model.id == "MiniMax-H3")
+            .unwrap();
+        let h3_max = rules
+            .models
+            .iter()
+            .find(|model| model.id == "MiniMax-H3-Max")
+            .unwrap();
+        assert_eq!(
+            h3.provider_options["minimax_video_v2_constraints"],
+            serde_json::json!({
+                "min_duration_seconds": 4,
+                "max_duration_seconds": 15,
+                "resolutions": ["768P", "2K"]
+            })
+        );
+        assert_eq!(
+            h3_max.provider_options["minimax_video_v2_constraints"],
+            serde_json::json!({
+                "min_duration_seconds": 5,
+                "max_duration_seconds": 15,
+                "resolutions": ["480P", "768P"]
+            })
+        );
+        assert_eq!(
+            rules.static_inventory_models,
+            vec![
+                "asr-1.0",
+                "speech-2.8-hd",
+                "speech-2.8-turbo",
+                "image-01",
+                "MiniMax-H3",
+                "MiniMax-H3-Max",
+            ]
+        );
+        assert!(!rules
+            .static_inventory_models
+            .contains(&"image-01-live".to_owned()));
+        assert!(!rules
+            .static_inventory_models
+            .contains(&"music-3.0".to_owned()));
+        assert_eq!(
+            known.ui_hints["selectable_inventory_models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            rules.static_inventory_models.len()
+        );
         assert_eq!(contract.base_adapter_id, CLAUDE_MESSAGES_ADAPTER_ID);
         assert_eq!(
             adapter.base_adapter_id.as_deref(),

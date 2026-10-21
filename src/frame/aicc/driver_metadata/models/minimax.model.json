@@ -3,11 +3,36 @@
   "schema_version": 2,
   "schema_revision": 0,
   "model_driver_id": "minimax",
-  "revision_seq": 3,
+  "revision_seq": 9,
   "required_features": [],
   "models": [
     {
-      "id": "minimax-m3",
+      "id": "MiniMax-M3.1-Flash-Preview",
+      "parameter_scale": "m3.1",
+      "api_types": [
+        "llm",
+        "vision.ocr",
+        "vision.caption"
+      ],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 524288,
+        "streaming": true,
+        "tool_call": true,
+        "reasoning": true,
+        "vision": true
+      },
+      "llm": {
+        "spec": "minimax-standard",
+        "effort": "max",
+        "default_effort": "max",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "experimental",
+        "weight": 31
+      }
+    },
+    {
+      "id": "MiniMax-M3",
       "parameter_scale": "m3",
       "api_types": [
         "llm",
@@ -15,12 +40,14 @@
         "vision.caption"
       ],
       "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 524288,
         "streaming": true,
         "tool_call": true,
         "reasoning": true,
         "vision": true
       },
-      "llm": {"spec": "minimax-standard", "effort": "native", "default_effort": "native", "supported_efforts": ["native"], "stability": "stable", "weight": 30}
+      "llm": {"spec": "minimax-standard", "effort": "native", "default_effort": "native", "supported_efforts": ["native", "none"], "stability": "stable", "weight": 30}
     },
     {
       "id": "MiniMax-M2.7",
@@ -225,13 +252,13 @@
     {
       "id": "MiniMax-H3",
       "api_types": ["video.txt2video", "video.img2video"],
-      "logical_mounts": ["video.txt2video.minimax", "video.txt2video.{model}", "video.img2video.minimax", "video.img2video.{model}", "video.txt2video.minimax.{model}"],
+      "logical_mounts": ["video.txt2video.minimax_h3", "video.txt2video.minimax", "video.txt2video.{model}", "video.img2video.minimax_h3", "video.img2video.minimax", "video.img2video.{model}", "video.txt2video.minimax.{model}"],
       "capabilities": {}
     },
     {
       "id": "MiniMax-H3-Max",
       "api_types": ["video.txt2video", "video.img2video"],
-      "logical_mounts": ["video.txt2video.minimax", "video.txt2video.{model}", "video.img2video.minimax", "video.img2video.{model}", "video.txt2video.minimax.{model}"],
+      "logical_mounts": ["video.txt2video.minimax_h3", "video.txt2video.minimax", "video.txt2video.{model}", "video.img2video.minimax_h3", "video.img2video.minimax", "video.img2video.{model}", "video.txt2video.minimax.{model}"],
       "capabilities": {}
     },
     {
@@ -250,6 +277,12 @@
       "id": "MiniMax-Hailuo-02",
       "api_types": ["video.txt2video", "video.img2video"],
       "logical_mounts": ["video.txt2video.minimax", "video.txt2video.{model}", "video.img2video.minimax", "video.img2video.{model}", "video.txt2video.minimax.{model}", "video.txt2video.hailuo", "video.img2video.hailuo"],
+      "capabilities": {}
+    },
+    {
+      "id": "music-3.0",
+      "api_types": ["audio.music"],
+      "logical_mounts": ["audio.music.minimax", "audio.music.{model}", "audio.music.minimax.{model}"],
       "capabilities": {}
     },
     {

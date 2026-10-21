@@ -46,6 +46,7 @@ use crate::kernel_mgr::*;
 use crate::kevent_server::*;
 use crate::local_app_mgr::LocalAppRunItem;
 use crate::run_item::*;
+use crate::run_plist::begin_run_plist_batch;
 use crate::service_pkg::*;
 use crate::sn_zone_info::{load_sn_zone_info, relay_node_for_keep_tunnel, save_sn_zone_info};
 use crate::zone_boot_resolve::{
@@ -1235,6 +1236,17 @@ async fn node_main(
         return Ok(false);
     }
 
+    let _run_plist_batch = begin_run_plist_batch();
+    let mut managed_service_names = node_config
+        .kernel
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    managed_service_names.insert("cyfs-gateway".to_string());
+    if is_ood {
+        managed_service_names.insert("system-config".to_string());
+    }
+    begin_service_process_round(&managed_service_names).await;
     let kernel_stream = stream::iter(node_config.kernel);
     let kernel_task =
         kernel_stream.for_each_concurrent(4, |(kernel_service_name, kernel_cfg)| async move {
@@ -1365,6 +1377,7 @@ async fn node_daemon_main_loop(
     let mut node_gateway_info_id: Option<ObjId> = None;
     let mut keep_tunnel_config_id: Option<ObjId> = None;
     let mut network_observer = NetworkObserver::new(NetworkObserverConfig::default());
+    let mut device_sampler = DeviceSystemInfoSampler::new();
     let mut last_zone_info_refresh: Option<Instant> = None;
     let mut sn_zone_info = match load_sn_zone_info() {
         Ok(zone_info) => zone_info,
@@ -1389,6 +1402,8 @@ async fn node_daemon_main_loop(
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         loop_step += 1;
         info!("node daemon main loop step:{}", loop_step);
+        let loop_started = Instant::now();
+        let (scans_before, pid_checks_before, fast_hits_before) = service_process_check_counts();
 
         let buckyos_runtime = get_buckyos_api_runtime();
         if buckyos_runtime.is_err() {
@@ -1422,14 +1437,14 @@ async fn node_daemon_main_loop(
         {
             last_zone_info_refresh = Some(Instant::now());
             let previous_relay_node = relay_node_for_keep_tunnel(
-                device_doc.net_id.as_deref(),
+                device_doc,
                 zone_document.sn.as_deref(),
                 sn_zone_info.as_ref(),
             );
             match refresh_sn_zone_info(device_doc, device_private_key, &zone_document).await {
                 Ok(new_zone_info) => {
                     let new_relay_node = relay_node_for_keep_tunnel(
-                        device_doc.net_id.as_deref(),
+                        device_doc,
                         zone_document.sn.as_deref(),
                         new_zone_info.as_ref(),
                     );
@@ -1447,7 +1462,9 @@ async fn node_daemon_main_loop(
         let now = buckyos_get_unix_timestamp();
         if now - last_register_time > 30 {
             let mut device_info = DeviceInfo::from_device_doc(device_doc);
-            let fill_result = device_info.auto_fill_by_system_info().await;
+            let fill_result = device_info
+                .auto_fill_by_system_info_with_sampler(&mut device_sampler)
+                .await;
             if fill_result.is_err() {
                 error!(
                     "auto fill device info failed! {}",
@@ -1567,7 +1584,7 @@ async fn node_daemon_main_loop(
                 let new_node_gateway_config = new_node_gateway_config.unwrap();
                 let sn = zone_document.sn.clone();
                 let relay_node = relay_node_for_keep_tunnel(
-                    device_doc.net_id.as_deref(),
+                    device_doc,
                     sn.as_deref(),
                     sn_zone_info.as_ref(),
                 );
@@ -1687,6 +1704,15 @@ async fn node_daemon_main_loop(
                 }
             }
         }
+        let (scans, pid_checks, fast_hits) = service_process_check_counts();
+        info!(
+            "node daemon main loop work: step={} elapsed_ms={} process_scans={} pid_checks={} fast_hits={}",
+            loop_step,
+            loop_started.elapsed().as_millis(),
+            scans - scans_before,
+            pid_checks - pid_checks_before,
+            fast_hits - fast_hits_before
+        );
     }
     Ok(())
 }
@@ -1757,6 +1783,7 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
         real_machine_config = machine_config.unwrap();
     }
     info!("machine_config: {:?}", &real_machine_config);
+    crate::paios_images::spawn_preload();
 
     init_name_lib(&real_machine_config.web3_bridge)
         .await
@@ -1928,7 +1955,7 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
         }
     };
     let sn_host_name = relay_node_for_keep_tunnel(
-        device_doc.net_id.as_deref(),
+        &device_doc,
         zone_document.sn.as_deref(),
         sn_zone_info.as_ref(),
     );
@@ -2262,21 +2289,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             Ok(name_client::NameInfo::new(name))
         }
 
-        async fn query_did(
-            &self,
-            did: &DID,
-            doc_type: Option<name_client::DidDocType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> name_lib::NSResult<EncodedDocument> {
-            Err(name_lib::NSError::NotFound(format!(
-                "{}#{}",
-                did.to_string(),
-                doc_type
-                    .as_ref()
-                    .map(name_client::DidDocType::as_str)
-                    .unwrap_or("")
-            )))
-        }
     }
 
     async fn ensure_name_client_for_tests() {
@@ -2290,18 +2302,16 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             let _ = name_client::IS_NAME_LIB_INITED.set(true);
         }
         let client = name_client::GLOBAL_NAME_CLIENT.get().unwrap();
-        client
-            .add_provider(Box::new(EmptyNameProvider), Some(-100))
-            .await;
-        client
-            .add_method_supplement("bns", Box::new(EmptyNameProvider))
-            .await;
-        client.set_local_authority_override(
+        client.add_dns_provider(Box::new(EmptyNameProvider)).await;
+        client.lock_document(
             DID::new("bns", "alice"),
             DidDocType::Owner,
             test_owner_document(),
-            "node-daemon-test",
-            None,
+            name_client::LockOptions {
+                scope: "node-daemon-test".to_string(),
+                simulate_history: true,
+                ..Default::default()
+            },
         );
     }
 
@@ -2545,15 +2555,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let resolved_info = name_client::resolve_did_ex(
             &peer_did,
             Some(name_client::DOC_TYPE_INFO),
-            name_client::ResolvePolicy::default(),
+            name_client::Revision::current(),
+            name_client::ResolveOpts::default(),
         )
         .await
         .unwrap();
-        assert_eq!(
-            resolved_info.document_metadata.buckyos.document_status,
-            None
-        );
-        assert_eq!(resolved_info.document_metadata.deactivated, None);
+        assert!(resolved_info.type_state.is_none());
+        assert!(!resolved_info.is_disabled());
     }
 
     #[tokio::test]

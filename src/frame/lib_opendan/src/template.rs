@@ -29,6 +29,7 @@ pub struct SessionTemplate {
     pub kind: SessionKind,
     pub turns: Turns,
     pub wait_user_msg: WaitPolicy,
+    pub completion: CompletionPolicy,
     pub input: InputChannel,
     pub observe: ObserveScope,
     pub load_hints: bool,
@@ -36,13 +37,62 @@ pub struct SessionTemplate {
     pub max_process_depth: u8,
     pub max_sub_sessions: u8,
     pub max_session_depth: u8,
+    /// How long a session that asks through a notification waits for the
+    /// answer (0: it does not ask).
+    pub ask_user_timeout_secs: u64,
     /// Subscriptions the template registers (there is no "delivered without
     /// a subscription" rule).
     pub implicit_subscriptions: Vec<Subscription>,
+    /// Goal Sessions: what a Goal leaves out of its budget and schedule.
+    pub goal: Option<GoalDefaults>,
+    /// `agent.toml [session.<class>] objective`: the session's objective
+    /// for hosts that create it without one of their own (a UI session's
+    /// design intent; built-in: [`UI_OBJECTIVE`] / [`GROUP_OBJECTIVE`]).
+    pub objective: Option<String>,
+    /// `agent.toml [session.<class>] default_cmd_skills`: the command
+    /// manuals a session of this class takes when its creator chooses none
+    /// (`cmd_skills/<name>.md`).
+    pub default_cmd_skills: Vec<String>,
+}
+
+/// Objective of a one-to-one UI session: what the conversation is for,
+/// not what one request asks (ARCH §194: a UI session has no fixed purpose).
+pub const UI_OBJECTIVE: &str = "The long-lived conversation of this agent with one user. Answer what a conversation can answer; hand work that must happen outside the conversation to intent analysis and relay what it created; when a work session or goal reports back, relay the result; notice and keep what you learn about the user. The conversation never ends by itself.";
+
+/// Objective of a group UI session.
+pub const GROUP_OBJECTIVE: &str = "The long-lived presence of this agent in one group, serving its owner only. Answer what a conversation can answer; hand work that must happen outside the conversation to intent analysis and relay what it created; when a work session or goal reports back, relay the result. The conversation never ends by itself.";
+
+/// `agent.toml [session.goal]` defaults of every Goal (`budget`,
+/// `min_interval_secs`), over the built-in ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalDefaults {
+    pub budget: GoalBudget,
+    pub min_interval_secs: u64,
+}
+
+impl Default for GoalDefaults {
+    fn default() -> Self {
+        Self {
+            budget: GoalBudget {
+                activation: ActivationBudget {
+                    max_total_tokens: Some(400_000),
+                    max_runs: Some(8),
+                },
+                period: PeriodBudget {
+                    window_secs: Some(86_400),
+                    max_total_tokens: None,
+                    max_activations: None,
+                    max_works: Some(24),
+                },
+            },
+            min_interval_secs: 60,
+        }
+    }
 }
 
 impl SessionTemplate {
-    /// The built-in templates: `work`, `ui`, `self_improve`, `self_check`.
+    /// The built-in templates: `work`, `ui`, `self_improve`, `self_check`,
+    /// `goal`.
     pub fn builtin(class: &str) -> Option<Self> {
         let policy = SessionPolicy::default();
         let base = |kind, turns, wait, input, observe, hints| SessionTemplate {
@@ -50,6 +100,7 @@ impl SessionTemplate {
             kind,
             turns,
             wait_user_msg: wait,
+            completion: CompletionPolicy::Natural,
             input,
             observe,
             load_hints: hints,
@@ -57,7 +108,11 @@ impl SessionTemplate {
             max_process_depth: policy.max_process_depth,
             max_sub_sessions: policy.max_sub_sessions,
             max_session_depth: policy.max_session_depth,
+            ask_user_timeout_secs: policy.ask_user_timeout_secs,
             implicit_subscriptions: Vec::new(),
+            goal: None,
+            objective: None,
+            default_cmd_skills: Vec::new(),
         };
         Some(match class {
             "work" => base(
@@ -69,15 +124,27 @@ impl SessionTemplate {
                 false,
             ),
             // The long-lived dialogue entry: bound to one conversation by
-            // its `route_key`, replies leave through the outbound sink.
-            "ui" => base(
-                SessionKind::Ui,
-                Turns::Unbounded,
-                WaitPolicy::Allowed,
-                InputChannel::Queue,
-                ObserveScope::EventsAndActive,
-                true,
-            ),
+            // its `route_key`, replies leave through the outbound sink. It
+            // observes the notifications shown in its conversation.
+            "ui" => {
+                let mut t = base(
+                    SessionKind::Ui,
+                    Turns::Unbounded,
+                    WaitPolicy::Allowed,
+                    InputChannel::Queue,
+                    ObserveScope::EventsAndActive,
+                    true,
+                );
+                t.implicit_subscriptions.push(Subscription {
+                    id: NOTIFY_SUBSCRIPTION.into(),
+                    mode: SubscriptionMode::Semi,
+                    source: SubscriptionSource::System {
+                        id: NOTIFY_SOURCE_ID.into(),
+                    },
+                    watch: Vec::new(),
+                });
+                t
+            }
             "self_improve" => base(
                 SessionKind::SelfImprove,
                 Turns::One,
@@ -103,6 +170,31 @@ impl SessionTemplate {
                     },
                     watch: Vec::new(),
                 });
+                t
+            }
+            // The context of one epoch of a Goal: every Activation is one
+            // Turn; between them it waits for the next run opportunity the
+            // runtime posts (`system:goal`), a Work's end or a message
+            // handed over from a UI. Nobody answers it directly: a question
+            // ends the Activation.
+            "goal" => {
+                let mut t = base(
+                    SessionKind::Goal,
+                    Turns::Unbounded,
+                    WaitPolicy::EndTurn,
+                    InputChannel::Queue,
+                    ObserveScope::EventsAndActive,
+                    true,
+                );
+                t.implicit_subscriptions.push(Subscription {
+                    id: GOAL_ACTIVATION_SUBSCRIPTION.into(),
+                    mode: SubscriptionMode::Active,
+                    source: SubscriptionSource::System {
+                        id: GOAL_SOURCE_ID.into(),
+                    },
+                    watch: Vec::new(),
+                });
+                t.goal = Some(GoalDefaults::default());
                 t
             }
             _ => return None,
@@ -144,7 +236,7 @@ impl SessionTemplate {
             }
             (None, None) => {
                 return Err(OpenDanError::InvalidArgument(format!(
-                    "unknown session class `{class}` (built-in: work, ui, self_improve, self_check; others need agent.toml [session.{class}])"
+                    "unknown session class `{class}` (built-in: work, ui, self_improve, self_check, goal; others need agent.toml [session.{class}])"
                 )))
             }
         };
@@ -167,6 +259,9 @@ impl SessionTemplate {
                 _ => return Err(bad("turns")),
             };
         }
+        if let Some(v) = parse("completion")? {
+            t.completion = serde_json::from_value(v).map_err(|_| bad("completion"))?;
+        }
         if let Some(v) = parse("wait_user_msg")? {
             t.wait_user_msg = serde_json::from_value(v).map_err(|_| bad("wait_user_msg"))?;
         }
@@ -180,7 +275,32 @@ impl SessionTemplate {
             t.load_hints = v.as_bool().ok_or_else(|| bad("load_hints"))?;
         }
         if let Some(v) = over.get("default_behavior") {
-            t.default_behavior = Some(v.as_str().ok_or_else(|| bad("default_behavior"))?.to_string());
+            t.default_behavior = Some(
+                v.as_str()
+                    .ok_or_else(|| bad("default_behavior"))?
+                    .to_string(),
+            );
+        }
+        if let Some(v) = over.get("objective") {
+            t.objective = Some(v.as_str().ok_or_else(|| bad("objective"))?.to_string())
+                .filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = over.get("default_cmd_skills") {
+            t.default_cmd_skills = v
+                .as_array()
+                .ok_or_else(|| bad("default_cmd_skills"))?
+                .iter()
+                .map(|n| n.as_str().map(str::to_string).ok_or_else(|| bad("default_cmd_skills")))
+                .collect::<Result<_>>()?;
+            crate::state::check_cmd_skill_names(&t.default_cmd_skills).map_err(|e| {
+                OpenDanError::InvalidArgument(format!("agent.toml [session.{class}] default_cmd_skills: {e}"))
+            })?;
+        }
+        if let Some(v) = over.get("ask_user_timeout_secs") {
+            t.ask_user_timeout_secs = v
+                .as_integer()
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| bad("ask_user_timeout_secs"))?;
         }
         for (key, slot) in [
             ("max_process_depth", &mut t.max_process_depth),
@@ -194,17 +314,44 @@ impl SessionTemplate {
                     .ok_or_else(|| bad(key))?;
             }
         }
+        if let Some(g) = t.goal.as_mut() {
+            if let Some(v) = parse("budget")? {
+                let budget: GoalBudget = serde_json::from_value(v)
+                    .map_err(|e| OpenDanError::InvalidArgument(format!("agent.toml [session.{class}] budget: {e}")))?;
+                g.budget = budget.over(&g.budget);
+            }
+            if let Some(v) = over.get("min_interval_secs") {
+                g.min_interval_secs = v
+                    .as_integer()
+                    .and_then(|n| u64::try_from(n).ok())
+                    .ok_or_else(|| bad("min_interval_secs"))?;
+            }
+        }
         Ok(t)
+    }
+
+    /// The objective of a session of this template created without one:
+    /// `agent.toml`'s, else the built-in design intent of a UI session
+    /// (`group`: one bound to a group conversation).
+    pub fn objective_or_default(&self, group: bool) -> String {
+        match &self.objective {
+            Some(o) => o.clone(),
+            None if self.kind == SessionKind::Ui && group => GROUP_OBJECTIVE.to_string(),
+            None if self.kind == SessionKind::Ui => UI_OBJECTIVE.to_string(),
+            None => String::new(),
+        }
     }
 
     pub fn policy(&self) -> SessionPolicy {
         SessionPolicy {
             wait_user_msg: self.wait_user_msg,
+            completion: self.completion,
             observe: self.observe,
             load_hints: self.load_hints,
             max_process_depth: self.max_process_depth,
             max_sub_sessions: self.max_sub_sessions,
             max_session_depth: self.max_session_depth,
+            ask_user_timeout_secs: self.ask_user_timeout_secs,
         }
     }
 
@@ -228,6 +375,7 @@ impl SessionTemplate {
         };
         spec.policy = self.policy();
         spec.prompt.behavior = self.default_behavior.clone();
+        spec.prompt.cmd_skills = self.default_cmd_skills.clone();
         spec.subscriptions = self.implicit_subscriptions.clone();
         spec.input_channel = Some(self.input);
         self.settle_input(&mut spec);
@@ -240,10 +388,12 @@ impl SessionTemplate {
             .subscriptions
             .iter()
             .any(|s| !matches!(s.source, SubscriptionSource::Session { .. }));
-        spec.input_channel = Some(if external || spec.input_channel == Some(InputChannel::Queue) {
-            InputChannel::Queue
-        } else {
-            self.input
-        });
+        spec.input_channel = Some(
+            if external || spec.input_channel == Some(InputChannel::Queue) {
+                InputChannel::Queue
+            } else {
+                self.input
+            },
+        );
     }
 }

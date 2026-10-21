@@ -39,7 +39,7 @@ system-config 是 Zone 内的 KV 真相源。value 在存储层是字符串，�
 | `users/<user_id>/doc` | 用户 DID Document / Owner Document。 | scheduler 初始化管理员；control-panel 创建/接受用户 | system-config DID resolver、登录和权限流程。 |
 | `users/<user_id>/key` | 用户私钥材料。 | control-panel 创建用户 | 用户身份管理。敏感数据。 |
 | `users/<user_id>/apps/<app_id>/spec` | `AppServiceSpec`，以 AppId 为 key、以 AppInstanceId 绑定 Owner；AppName/AppHostName/AppIndex 是 registry 同 revision 的只读投影。 | scheduler InstallPlan executor | scheduler 调度、rdb_mgr、Control Panel 展示和生命周期管理。Control Panel 安装器不得直接创建该 key。 |
-| `users/<user_id>/agents/<agent_id>/spec` | `AgentSpec`，保存 AgentDocument snapshot、AgentId、generation 和指向普通 runtime AppInstanceId/service_name 的 `AgentServiceBinding`。 | scheduler bootstrap/Agent 安装事务 | gateway、service discovery、RBAC、Control Panel Agent 管理。 |
+| `users/<user_id>/agents/<agent_id>/spec` | `AgentSpec`，保存 AgentDocument snapshot、AgentId、generation、`permission_mode`（`read_write` 默认 / `read_only`）和指向普通 runtime AppInstanceId/service_name 的 `AgentServiceBinding`。 | Control Panel Agent 创建事务 | gateway、service discovery、RBAC、Control Panel Agent 管理；权限模式由创建时的 UI/API 授权保存，Agent 自己的 AgentRoot 始终读写。 |
 | `users/<user_id>/apps/<app_id>/install_record` | `InstallRecord`：DID/AppDoc 快照、Package Meta ObjectId、PIKG digest、目标 DeploymentIdentity、task/fingerprint 和安装状态。 | scheduler InstallPlan executor；Control Panel 后续状态收敛 | 安装审计、升级判断和状态聚合。 |
 | `users/<user_id>/agents/<agent_id>/install_record` | `AgentInstallRecord`，记录 AgentId、AgentDoc ObjectId、binding target、generation 和绑定状态。 | scheduler bootstrap/Agent 安装事务 | Agent binding 审计与管理。 |
 | `users/<user_id>/apps/<app_id>/settings` | app 自有 settings JSON。schema 由 app 约定。 | app runtime 通过 `update_my_settings`；也可由管理界面写入 | app runtime 通过 `get_my_settings` 读取。 |
@@ -48,7 +48,7 @@ system-config 是 Zone 内的 KV 真相源。value 在存储层是字符串，�
 | `users/<user_id>/agents/<agent_id>/info` | Agent app 自有 info 路径，RBAC 中允许 Agent 写。当前未发现系统组件固定 schema。 | Agent app 自己 | Agent 自有运行信息。 |
 | `users/<user_id>/samba/settings` | `UserSambaInfo`，包含 `is_enable` 和 SMB 密码。 | SMB/用户设置流程 | smb-service 读取后生成本机 SMB 用户配置。 |
 | `users/<user_id>/desktop/<session_id>/_meta` | 桌面 UI session 元数据，包含名称和创建/更新时间。 | control-panel UI session manager | 桌面状态同步与管理。 |
-| `users/<user_id>/desktop/<session_id>/<state_key>` | 桌面 UI session 的单项状态 JSON。已知 state key 包括 `appearance`、`window_layout`、`app_items_layout`、`widgets_layout`。 | control-panel UI session manager | 桌面状态恢复。 |
+| `users/<user_id>/desktop/<session_id>/<state_key>` | 桌面 UI session 的单项状态 JSON。已知 state key 包括 `appearance`、`window_layout`、`app_items_layout`、`widgets_layout`（桌面上有哪些项目不在这里，而是用户 home 下的 `Desktop` 文件夹）。 | control-panel UI session manager | 桌面状态恢复。 |
 
 `users/<user_id>/apps/<app_id>/spec` 与 `users/<user_id>/agents/<agent_id>/spec` 分别保存普通 App desired state 和 Agent identity/binding。beta 2.2 不读取旧 `config` 或旧 Agent AppServiceSpec。
 
@@ -117,7 +117,7 @@ verify-hub 的私钥不在 `services/verify-hub/settings`，而在 `security/ver
 
 | Key | 内容 | 主要写入方 | 主要读取方/意义 |
 | --- | --- | --- | --- |
-| `services/msg-center/settings` | msg-center 设置。当前初始化包含 `telegram_tunnel`，其中有 `enabled`、`tunnel_did`、`tunnel_id`、ingress/egress 支持、gateway mode、bindings。 | scheduler 初始化 | msg-center 启动和 reload 时读取。 |
+| `services/msg-center/settings` | msg-center 设置。当前初始化包含 `telegram_tunnel`：`enabled=true`、`transport_did`、`tunnel_instance_id`、ingress/egress 支持、`gateway.mode=bot_api`、空 `bindings`。激活不写入任何 Bot Token。 | scheduler 初始化 | msg-center 启动和 reload 时读取。 |
 
 ### repo-service
 
@@ -162,7 +162,7 @@ AI provider 的运行时主配置仍是 `services/aicc/settings`；`services/con
 
 | Key | 内容 | 主要写入方 | 主要读取方/意义 |
 | --- | --- | --- | --- |
-| `system/install_settings` | 安装期 seed 配置。`pre_install_apps` 每项只包含严格版本化的 `pikg_path` 和 `PreInstallPlanSeed`；raw path 是 `$BUCKYOS_ROOT` 相对路径。 | rootfs boot template / scheduler 初始化原样导入 | Control Panel 登录且 InstallRunner 启动后消费；canonicalize 到 `data/cache`、复制到 immutable staging 并生成标准安装任务。Scheduler 不打开 PIKG，也不为普通预装 App 生成 execution record。 |
+| `system/install_settings` | 安装期 seed 配置。`pre_install_apps` 每项只包含严格版本化的 `pikg_path` 和 `PreInstallPlanSeed`；`agent_templates` 每项为 `{schema_version, pikg_path}`，登记系统内置 Agent 模板（Jarvis），只作为构造 Agent App 的来源，不安装为运行实例；raw path 是 `$BUCKYOS_ROOT` 相对路径。 | rootfs boot template / scheduler 初始化原样导入 | Control Panel 登录且 InstallRunner 启动后消费；canonicalize 到 `data/cache`、复制到 immutable staging 并生成标准安装任务。Scheduler 不打开 PIKG，也不为普通预装 App 生成 execution record。 |
 | `system/control_panel/pre_install_apps/<app_id>` | 预装 seed 尚未成功创建标准 Task 时的最小观测状态，记录 path、digest、task/fingerprint 或 structured error。Task 创建后 TaskManager 是唯一 Stage 真相源。 | Control Panel PreInstallReconciler | Control Panel 诊断和后台低频重试；Scheduler 不读取。 |
 | `system/app_registry` | 严格 versioned `AppRegistry`，保存稳定 AppName、AppHostName 和按 AppInstance 分配的 AppIndex。 | scheduler InstallPlan/shortcut executor（唯一 writer，完整 JSON CAS） | scheduler 校验所有 AppSpec 投影并分配默认 hostname/端口索引。 |
 | `system/scheduler/install_plan_executions/<execution_key>` | `InstallPlanExecutionRecord`，保存 claim、commit point、registry/spec revision、错误和幂等结果。 | scheduler | submit/status/cancel/retry、重启恢复和 CAS 冲突处理。 |

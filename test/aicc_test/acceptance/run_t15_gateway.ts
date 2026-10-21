@@ -7,7 +7,8 @@ import { buildFinancialReport } from "./finance.ts";
 import {
   type GatewaySession,
   loginGateway,
-  loginSudoSystemConfig,
+  loginRefreshingSudoSystemConfig,
+  openAiccArtifact,
   type RpcClient,
 } from "./gateway.ts";
 import {
@@ -52,6 +53,7 @@ type Options = {
   mockControlUrl: string;
   mockPort: number;
   startLocalMock: boolean;
+  publicNamedObjectBaseUrl?: string;
   configAllowsMutation: boolean;
   cliAllowsMutation: boolean;
   providers: string[];
@@ -136,6 +138,7 @@ function options(args: string[]): Options {
     mockControlUrl: "",
     mockPort: 18081,
     startLocalMock: false,
+    publicNamedObjectBaseUrl: process.env.AICC_T15_PUBLIC_NAMED_OBJECT_BASE_URL,
     configAllowsMutation: process.env.AICC_T15_ALLOW_CONFIG_MUTATION === "true",
     cliAllowsMutation: false,
     providers: [],
@@ -178,6 +181,8 @@ function options(args: string[]): Options {
       parsed.timeoutMs = Number(required(args, index++, arg));
     } else if (arg === "--provider-min-interval-ms") {
       parsed.providerMinIntervalMs = Number(required(args, index++, arg));
+    } else if (arg === "--public-named-object-base-url") {
+      parsed.publicNamedObjectBaseUrl = required(args, index++, arg);
     } else if (arg === "--report-dir") {
       parsed.reportDir = required(args, index++, arg);
     } else if (arg === "--start-local-mock") parsed.startLocalMock = true;
@@ -209,12 +214,48 @@ function options(args: string[]): Options {
   if (!parsed.mockControlUrl) parsed.mockControlUrl = parsed.mockBaseUrl;
   parsed.mockBaseUrl = parsed.mockBaseUrl.replace(/\/+$/, "");
   parsed.mockControlUrl = parsed.mockControlUrl.replace(/\/+$/, "");
+  if (parsed.publicNamedObjectBaseUrl) {
+    const url = new URL(parsed.publicNamedObjectBaseUrl);
+    if (url.protocol !== "https:") {
+      throw new Error("--public-named-object-base-url must use HTTPS");
+    }
+    parsed.publicNamedObjectBaseUrl = parsed.publicNamedObjectBaseUrl.replace(
+      /\/+$/,
+      "",
+    );
+  }
   if (!parsed.configAllowsMutation || !parsed.cliAllowsMutation) {
     throw new Error(
       "T1.5 requires AICC_T15_ALLOW_CONFIG_MUTATION=true and --allow-config-mutation; temporary Provider instances are deleted in cleanup",
     );
   }
   return parsed;
+}
+
+async function overridePublicNamedObjectBaseUrl(input: {
+  systemConfig: RpcClient;
+  aicc: RpcClient;
+  baseUrl: string;
+}): Promise<(systemConfig: RpcClient, aicc: RpcClient) => Promise<void>> {
+  const key = "services/aicc/settings";
+  const raw = await input.systemConfig.call("sys_config_get", { key }) as {
+    value?: unknown;
+  };
+  if (typeof raw.value !== "string") {
+    throw new Error("services/aicc/settings is missing");
+  }
+  const backup = raw.value;
+  const settings = JSON.parse(backup) as Record<string, unknown>;
+  settings.public_named_object_base_url = input.baseUrl;
+  await input.systemConfig.call("sys_config_set", {
+    key,
+    value: JSON.stringify(settings),
+  });
+  await input.aicc.call("service.reload_settings", {});
+  return async (systemConfig, aicc) => {
+    await systemConfig.call("sys_config_set", { key, value: backup });
+    await aicc.call("service.reload_settings", {});
+  };
 }
 
 async function waitMock(baseUrl: string, timeoutMs = 15_000): Promise<void> {
@@ -246,7 +287,7 @@ async function selectMock(
       contract_id: testCase.protocol_contract_id,
       api_type: testCase.api_type,
       scenario: testCase.mock_scenario,
-      selection_seed: selectionSeed,
+      selection_seed: `${selectionSeed ?? "t15"}:${testCase.case_id}`,
     }),
   });
   if (!response.ok) {
@@ -303,6 +344,7 @@ async function addProvider(
     "fal",
     "glm",
     "doubao",
+    "doubao-speech",
     "qwen",
   ]);
   const catalogModels = provider.official_first_party_model_ids ??
@@ -311,11 +353,23 @@ async function addProvider(
         [apiType, modelId],
       ) => [apiType, [modelId]]),
     );
+  const discoveryModels = Object.fromEntries(
+    [...new Set([
+      ...Object.keys(catalogModels),
+      ...Object.keys(provider.official_aggregated_model_ids ?? {}),
+    ])].map((apiType) => [
+      apiType,
+      [...new Set([
+        ...(catalogModels[apiType] ?? []),
+        ...(provider.official_aggregated_model_ids?.[apiType] ?? []),
+      ])],
+    ]),
+  );
   const configuredModels = new Map<
     string,
     { apiTypes: Set<string>; remoteMethods: Set<string> }
   >();
-  for (const [apiType, modelIds] of Object.entries(catalogModels)) {
+  for (const [apiType, modelIds] of Object.entries(discoveryModels)) {
     for (const providerModelId of modelIds) {
       const model = configuredModels.get(providerModelId) ?? {
         apiTypes: new Set<string>(),
@@ -329,6 +383,17 @@ async function addProvider(
       ) {
         model.remoteMethods.add(operation);
       }
+      configuredModels.set(providerModelId, model);
+    }
+  }
+  for (const contract of provider.contracts) {
+    for (const [apiType, providerModelId] of Object.entries(contract.test_model_ids ?? {})) {
+      const model = configuredModels.get(providerModelId) ?? {
+        apiTypes: new Set<string>(),
+        remoteMethods: new Set<string>(),
+      };
+      model.apiTypes.add(apiType);
+      model.remoteMethods.add(contract.operation);
       configuredModels.set(providerModelId, model);
     }
   }
@@ -357,7 +422,7 @@ async function addProvider(
         ([operation, path]) => [operation, `${mockBaseUrl}${path}`],
       ),
     ),
-    credentials: { api_token: { locked: `t15-mock-${driver}` } },
+    credentials: { api_token: { inline_secret: `t15-mock-${driver}` } },
     ...provider.instance_fields,
     ...(catalogDiscovery ? { discovery: catalogDiscovery } : {}),
     auto_sync_models: driver !== "google-gemini",
@@ -421,7 +486,7 @@ async function addCustomProvider(
         ([operation, path]) => [operation, `${mockBaseUrl}${path}`],
       ),
     ),
-    credentials: { api_token: { locked: `t15-mock-custom-${driver}` } },
+    credentials: { api_token: { inline_secret: `t15-mock-custom-${driver}` } },
     auth: {
       mode: "api_key",
       credential_ref: "api_token",
@@ -474,6 +539,45 @@ async function addCustomProvider(
   }
 }
 
+function validateAggregatedInventory(
+  catalog: ProviderProtocolCatalog,
+  driver: string,
+  inventory: ProviderInventory,
+): void {
+  const declared = catalog.providers.find((provider) =>
+    provider.provider_driver === driver
+  )?.official_aggregated_model_ids;
+  if (!declared) return;
+  const expected = new Map<string, Set<string>>();
+  for (const [apiType, modelIds] of Object.entries(declared)) {
+    for (const modelId of modelIds) {
+      const apiTypes = expected.get(modelId) ?? new Set<string>();
+      apiTypes.add(apiType);
+      expected.set(modelId, apiTypes);
+    }
+  }
+  for (const [modelId, expectedApiTypes] of expected) {
+    const model = inventory.models.find((candidate) =>
+      candidate.provider_model_id === modelId
+    );
+    if (!model) {
+      throw new Error(`aggregated model ${modelId} is absent from ${driver} inventory`);
+    }
+    const actualApiTypes = new Set(model.api_types);
+    const missing = [...expectedApiTypes].filter((apiType) =>
+      !actualApiTypes.has(apiType)
+    );
+    const extra = [...actualApiTypes].filter((apiType) =>
+      !expectedApiTypes.has(apiType)
+    );
+    if (missing.length > 0 || extra.length > 0) {
+      throw new Error(
+        `aggregated model ${modelId} API types differ: missing=[${missing.join(",")}] extra=[${extra.join(",")}]`,
+      );
+    }
+  }
+}
+
 function inventories(value: unknown): ProviderInventory[] {
   return inventoriesFromModelsList(value);
 }
@@ -482,6 +586,7 @@ async function waitInventory(
   session: GatewaySession,
   instance: string,
   timeoutMs: number,
+  requiredModelIds: readonly string[] = [],
 ): Promise<ProviderInventory> {
   const deadline = Date.now() + timeoutMs;
   let last: ProviderInventory[] = [];
@@ -490,7 +595,15 @@ async function waitInventory(
     const found = last.find((inventory) =>
       inventory.provider_instance_name === instance
     );
-    if (found && found.models.length > 0) return found;
+    if (
+      found && found.models.length > 0 &&
+      requiredModelIds.every((modelId) =>
+        found.models.some((model) =>
+          model.provider_model_id === modelId ||
+          model.provider_actual_model_id === modelId
+        )
+      )
+    ) return found;
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
   }
   throw new Error(
@@ -540,7 +653,18 @@ async function refreshProviderInventory(
   await session.aicc.call("provider.refresh_models", {
     provider_instance_name: instance,
   });
-  return await waitInventory(session, instance, timeoutMs);
+  const requiredModelIds = requiredVariantModelIds(provider);
+  return await waitInventory(session, instance, timeoutMs, requiredModelIds);
+}
+
+function requiredVariantModelIds(
+  provider: ProviderProtocolCatalog["providers"][number],
+): string[] {
+  return [
+    ...new Set(
+      (provider.official_variant_rules ?? []).flatMap((rule) => rule.model_ids),
+    ),
+  ];
 }
 
 async function refreshLogin(
@@ -638,6 +762,7 @@ export function buildT15TypedParams(
         : "openai";
       const structuredOutput = requestKey.endsWith(".structured-output");
       const providerSwitch = requestKey.endsWith(".provider-switch");
+      const videoInput = requestKey.endsWith(".video-input");
       const providerState = typedOptions.foreignProviderState;
       return {
         ...common,
@@ -777,6 +902,22 @@ export function buildT15TypedParams(
               content: [{ type: "text", text: "Return the marker now." }],
             },
           ]
+          : videoInput
+          ? [{
+            role: "user",
+            content: [
+              { type: "text", text: "Describe the video." },
+              {
+                type: "document",
+                source: {
+                  kind: "url",
+                  url: "https://example.test/video.mp4",
+                  mime_hint: "video/mp4",
+                },
+                title: "video.mp4",
+              },
+            ],
+          }]
           : [{
             role: "user",
             content: [{ type: "text", text: "Return BUCKYOS-AICC-4827." }],
@@ -859,7 +1000,13 @@ export function buildT15TypedParams(
     case "audio.tts":
       return { ...common, text: "BuckyOS 4827", voice: {} };
     case "audio.asr":
-      return { ...common, audio: resource("audio/wav") };
+      return {
+        ...common,
+        audio: resource("audio/wav"),
+        ...(exactModelId.startsWith("doubao-seed-asr-")
+          ? { diarization: true }
+          : {}),
+      };
     case "audio.music":
       return {
         ...common,
@@ -1144,6 +1291,22 @@ function firstReusableArtifact(value: unknown): Record<string, unknown> {
   return source;
 }
 
+async function downloadUrlArtifacts(
+  value: unknown,
+  gatewayUrl: string,
+  sessionToken: string,
+): Promise<number> {
+  const urls = [...new Set(artifactSources(value)
+    .map((source) => source.url)
+    .filter((url): url is string => typeof url === "string"))];
+  for (const url of urls) {
+    const response = await openAiccArtifact({ gatewayUrl, sessionToken, url });
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length === 0) throw new Error(`artifact URL returned an empty body: ${url}`);
+  }
+  return urls.length;
+}
+
 function containsString(value: unknown, needle: string): boolean {
   if (typeof value === "string") return value.includes(needle);
   if (Array.isArray(value)) {
@@ -1219,6 +1382,7 @@ async function executeCase(
   catalog: ProviderProtocolCatalog,
   testCase: AcceptanceCase,
   inventory: ProviderInventory,
+  gatewayUrl: string,
   controlUrl: string,
   runId: string,
   timeoutMs: number,
@@ -1231,6 +1395,11 @@ async function executeCase(
   let terminalValue: unknown;
   try {
     selectedExactModel = exactModel(catalog, testCase, inventory);
+    const contract = protocolContract(
+      catalog,
+      testCase.provider_driver!,
+      testCase.protocol_contract_id!,
+    );
     let historyMessage: Record<string, unknown> | undefined;
     if (
       testCase.tags.includes("native_history") ||
@@ -1261,14 +1430,17 @@ async function executeCase(
     }
     const result = await session.aicc.call(
       testCase.method,
-      buildT15TypedParams(
-        testCase.api_type!,
-        selectedExactModel,
-        runId,
-        testCase.execution_mode,
-        testCase.case_id,
-        { historyMessage },
-      ),
+      {
+        ...buildT15TypedParams(
+          testCase.api_type!,
+          selectedExactModel,
+          runId,
+          testCase.execution_mode,
+          testCase.case_id,
+          { historyMessage },
+        ),
+        ...(contract.canonical_request_overrides ?? {}),
+      },
     ) as Record<string, unknown>;
     if (testCase.mock_scenario === "async_cancel") {
       if (result.status !== "running" || typeof result.task_id !== "string") {
@@ -1302,15 +1474,29 @@ async function executeCase(
             testCase.protocol_contract_id!,
           ),
         );
-        if (testCase.tags.includes("task_result_artifact")) {
-          const resultPayload = taskResultPayload(terminalValue);
-          if (containsBase64Resource(resultPayload)) {
-            throw new Error(
-              `TaskMgr result retained inline base64 resource instead of a stable artifact reference: ${
-                artifactResultSummary(terminalValue)
-              }`,
-            );
+        const resultPayload = taskResultPayload(terminalValue);
+        if (containsBase64Resource(resultPayload)) {
+          throw new Error(
+            `TaskMgr result retained inline base64 ResourceRef: ${artifactResultSummary(terminalValue)}`,
+          );
+        }
+        if (testCase.tags.includes("inline_artifact_provider_state")) {
+          for (const pointer of contract.inline_artifact_payload_paths ?? []) {
+            const payload = pointer.split("/").slice(1).reduce<unknown>((current, segment) => {
+              if (Array.isArray(current)) return current[Number(segment)];
+              if (current && typeof current === "object") {
+                return (current as Record<string, unknown>)[segment];
+              }
+              return undefined;
+            }, contract.inline_artifact_success_fixture);
+            if (typeof payload === "string" && containsString(resultPayload, payload)) {
+              throw new Error(
+                `TaskMgr result retained Provider inline artifact payload from ${pointer}`,
+              );
+            }
           }
+        }
+        if (testCase.tags.includes("task_result_artifact")) {
           if (!hasReferencedArtifact(resultPayload)) {
             throw new Error(
               `TaskMgr result did not expose a named object or URL artifact reference: ${
@@ -1318,6 +1504,7 @@ async function executeCase(
               }`,
             );
           }
+          await downloadUrlArtifacts(resultPayload, gatewayUrl, session.sessionToken);
         }
       }
     }
@@ -1934,13 +2121,30 @@ export function variantCells(
   }
   return runtimeVariants.flatMap((model) =>
     model.api_types.map((apiType) => {
-      const contract = catalog.providers.find((provider) =>
-        provider.provider_driver === inventory.provider_driver
-      )
-        ?.contracts.find((candidate) =>
+      const candidates = provider.contracts.filter((candidate) =>
           candidate.api_types.includes(apiType) ||
           candidate.variant_api_types?.includes(apiType)
         );
+      const baseModelId = model.provider_actual_model_id ??
+        model.provider_model_id.slice(0, model.provider_model_id.lastIndexOf(":"));
+      const aggregated = new Set(
+        provider.official_aggregated_model_ids?.[apiType] ?? [],
+      );
+      const firstParty = new Set(
+        provider.official_first_party_model_ids?.[apiType] ?? [],
+      );
+      const contract = candidates.length <= 1
+        ? candidates[0]
+        : candidates.find((candidate) => {
+          const testModelId = candidate.test_model_ids?.[apiType];
+          if (aggregated.has(baseModelId)) {
+            return testModelId !== undefined && aggregated.has(testModelId);
+          }
+          if (firstParty.has(baseModelId)) {
+            return testModelId === undefined || firstParty.has(testModelId);
+          }
+          return false;
+        });
       if (!contract) {
         throw new Error(
           `${inventory.provider_driver} metadata variant ${model.provider_model_id} has no T1.5 contract for ${apiType}`,
@@ -2039,6 +2243,11 @@ async function main(): Promise<void> {
   let restoreCloudConfig:
     | ((refreshedSystemConfig?: RpcClient) => Promise<void>)
     | undefined;
+  let restoreNamedObjectSettings:
+    | ((systemConfig: RpcClient, aicc: RpcClient) => Promise<void>)
+    | undefined;
+  let namedObjectSystemConfig: RpcClient | undefined;
+  let namedObjectAicc: RpcClient | undefined;
   let cloudRevision = 0;
   let cloudCleanupRevision = 0;
   let cloudActive = false;
@@ -2051,12 +2260,21 @@ async function main(): Promise<void> {
       password: input.password,
       appId: input.appId,
     });
-    let sudoSystemConfig = await loginSudoSystemConfig({
+    let sudoSystemConfig = await loginRefreshingSudoSystemConfig({
       gatewayUrl: input.gatewayUrl,
       username: input.username,
       password: input.password,
       appId: input.appId,
     });
+    if (input.publicNamedObjectBaseUrl) {
+      namedObjectSystemConfig = sudoSystemConfig;
+      namedObjectAicc = session.aicc;
+      restoreNamedObjectSettings = await overridePublicNamedObjectBaseUrl({
+        systemConfig: sudoSystemConfig,
+        aicc: session.aicc,
+        baseUrl: input.publicNamedObjectBaseUrl,
+      });
+    }
     if (cloudCaseRequested) {
       cloudAdmin = session.aicc;
       cloudSystemConfig = sudoSystemConfig;
@@ -2104,7 +2322,7 @@ async function main(): Promise<void> {
           password: input.password,
           appId: input.appId,
         });
-        sudoSystemConfig = await loginSudoSystemConfig({
+        sudoSystemConfig = await loginRefreshingSudoSystemConfig({
           gatewayUrl: input.gatewayUrl,
           username: input.username,
           password: input.password,
@@ -2130,7 +2348,13 @@ async function main(): Promise<void> {
       await addProvider(session, catalog, driver, instance, input.mockBaseUrl);
       created.push(instance);
       phase = `provider:${driver}:inventory`;
-      let inventory = await waitInventory(session, instance, input.timeoutMs);
+      let inventory = await waitInventory(
+        session,
+        instance,
+        input.timeoutMs,
+        requiredVariantModelIds(provider),
+      );
+      validateAggregatedInventory(catalog, driver, inventory);
       providerInstances.set(driver, instance);
       providerInventories.set(driver, inventory);
       const manifest = validateCaseManifest(
@@ -2149,6 +2373,12 @@ async function main(): Promise<void> {
       }
       await withMockQuotaTruth({
         systemConfig: sudoSystemConfig,
+        refreshSystemConfig: () => loginRefreshingSudoSystemConfig({
+          gatewayUrl: input.gatewayUrl,
+          username: input.username,
+          password: input.password,
+          appId: input.appId,
+        }),
         userId: session.userId,
         appId: "system:control-panel",
         inventories: [inventory],
@@ -2223,6 +2453,7 @@ async function main(): Promise<void> {
                 catalog,
                 testCase,
                 effectiveInventory,
+                input.gatewayUrl,
                 input.mockControlUrl,
                 runId,
                 input.timeoutMs,
@@ -2274,6 +2505,7 @@ async function main(): Promise<void> {
                   expected_aicc_error_code: undefined,
                   expected_provider_error_code: undefined,
                   expected_retriable: undefined,
+                  timeout_ms: 30_000,
                   tags: testCase.tags.filter((tag) => tag !== "official_error"),
                 };
                 const recovery = await executeCase(
@@ -2281,6 +2513,7 @@ async function main(): Promise<void> {
                   catalog,
                   recoveryCase,
                   inventory,
+                  input.gatewayUrl,
                   input.mockControlUrl,
                   `${runId}:health-recovery`,
                   input.timeoutMs,
@@ -2342,6 +2575,12 @@ async function main(): Promise<void> {
       session = await refreshLogin(input, session);
       await withMockQuotaTruth({
         systemConfig: sudoSystemConfig,
+        refreshSystemConfig: () => loginRefreshingSudoSystemConfig({
+          gatewayUrl: input.gatewayUrl,
+          username: input.username,
+          password: input.password,
+          appId: input.appId,
+        }),
         userId: session.userId,
         appId: "system:control-panel",
         inventories: [...providerInventories.values()],
@@ -2416,7 +2655,7 @@ async function main(): Promise<void> {
           password: input.password,
           appId: input.appId,
         });
-        sudoSystemConfig = await loginSudoSystemConfig({
+        sudoSystemConfig = await loginRefreshingSudoSystemConfig({
           gatewayUrl: input.gatewayUrl,
           username: input.username,
           password: input.password,
@@ -2451,6 +2690,12 @@ async function main(): Promise<void> {
       const inventory = await waitInventory(session, instance, input.timeoutMs);
       await withMockQuotaTruth({
         systemConfig: sudoSystemConfig,
+        refreshSystemConfig: () => loginRefreshingSudoSystemConfig({
+          gatewayUrl: input.gatewayUrl,
+          username: input.username,
+          password: input.password,
+          appId: input.appId,
+        }),
         userId: session.userId,
         appId: "system:control-panel",
         inventories: [inventory],
@@ -2466,6 +2711,7 @@ async function main(): Promise<void> {
               catalog,
               testCase,
               inventory,
+              input.gatewayUrl,
               input.mockControlUrl,
               runId,
               input.timeoutMs,
@@ -2519,7 +2765,7 @@ async function main(): Promise<void> {
           appId: input.appId,
         });
         cloudAdmin = session.aicc;
-        cloudSystemConfig = await loginSudoSystemConfig({
+        cloudSystemConfig = await loginRefreshingSudoSystemConfig({
           gatewayUrl: input.gatewayUrl,
           username: input.username,
           password: input.password,
@@ -2554,6 +2800,24 @@ async function main(): Promise<void> {
           });
         }
       }
+    }
+    const restoreSystemConfig = cloudSystemConfig ?? namedObjectSystemConfig;
+    const restoreAicc = cloudAdmin ?? namedObjectAicc;
+    if (restoreNamedObjectSettings && restoreSystemConfig && restoreAicc) {
+      await restoreNamedObjectSettings(restoreSystemConfig, restoreAicc).catch(
+        (error) =>
+          results.push({
+            case_id: "t1.5.cleanup.public-named-object-base-url",
+            provider_driver: null,
+            method: "sys_config_set/service.reload_settings",
+            scenario: null,
+            status: "failed",
+            diagnostic: String(error),
+            captured_requests: 0,
+            started_at: new Date().toISOString(),
+            elapsed_ms: 0,
+          }),
+      );
     }
     if (cloudFixture && cloudAdmin) {
       let shouldRemoveCloudRules = cloudActive;

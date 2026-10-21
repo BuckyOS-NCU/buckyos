@@ -144,7 +144,7 @@ user:      Step Action Results
 
 | 模式 | 心智模型 | context / run | system 与历史 | 结束语义 |
 | --- | --- | --- | --- | --- |
-| `switch_context` | 切到另一个各自保有历史的 context | 当前 run 挂起进 `process_stack`(`FrameRole::Parked`);目标有自己挂起的 run 就恢复,否则新建 | 目标自己的 system / 工具 / 模型;新建时的历史只按 `inherit`;其它 context 的快照 / 历史不会接上来 | 回到原 context 要显式 `next_behavior`;`END` / `done` 按 Session 结束条件处理,不会自动弹回 |
+| `switch_context` | 切到另一个各自保有历史的 context | 当前 run 挂起进 `process_stack`(`FrameRole::Parked`);目标有自己挂起的 run 就恢复,否则新建 | 目标自己的 system / 工具 / 模型;新建时的历史只按 `inherit`;其它 context 的快照 / 历史不会接上来 | 回到原 context 要显式 `next_behavior`;显式结束报告按 Session 完成策略处理,不会自动弹回 |
 | `create_sub_context` | 换 system 的子任务调用,结束后返回 | 调用方作为 `FrameRole::Caller` 帧入栈;每次调用新建子 run | 目标自己的 system 和配置 + 任务输入 + `inherit` 选择的调用方历史(`derive_child`) | 子 context 无论以什么结束都返回调用方(`process_done`),只交回结果 |
 | `fork` | 保留 system 和完整历史的分支,结束后返回 | 同上 | 调用方的 system、配置和分叉点之前的完整有效历史(`fork_snapshot`) | 同上 |
 
@@ -168,7 +168,7 @@ libopendan 用"换 run"实现这两点:`switch_context` / `create_sub_context` �
 - 不把前一个 context 的 `steps`、`history_summaries` 或 hot tail 复制给 B,也不把别的 context 的快照接到 B 已有的 run 上。
 - 每个 run 的 `step_index` 各自编号,在 Session 内不全局唯一。
 - 下一次 drive 循环在 B 的 run 上提交 `on_behavior_switch` 输入批次,`<session_input hook="on_behavior_switch">` 里带 `<behavior_switch to="B"/>`。
-- 回到原 context 需要 LLM 显式 `next_behavior` 切回;`END` / `done` 按 Session 结束条件处理(Turn completed,再按 `end_condition` 结束 Session 或等待输入),不会自动弹回上一个 context。
+- 回到原 context 需要 LLM 显式 `next_behavior` 切回;显式结束报告按 Session 完成策略处理(Turn completed,再按 `end_condition` 结束 Session 或等待输入),不会自动弹回上一个 context。
 
 所以 `switch_context` 适合长期并列的独立工作流,不是"带上下文的分支执行"。
 
@@ -201,7 +201,7 @@ libopendan 用"换 run"实现这两点:`switch_context` / `create_sub_context` �
 
 子 context 无论以什么结束都返回调用方(`finish_run` 写 outcome `process_done`、出栈让调用方 run 重新成为 live run,结果放进 `state.process_result`):
 
-- `END` / 只带 `<report>` 的终止 Step → `status=ok`,结果是终止 Step 的 `<report>`,没有就取最后的回答文本;
+- 显式 `<report end="true">` 或获准的工具结束提交 → `status=ok`,结果是终止 Step 的 `<report>`,没有就取最后的回答文本;
 - `WAIT_USER_MSG` → `status=needs_user_input`:子 context 从不消费调用方的输入队列,由调用方决定是否去问用户;
 - 不可重试错误、预算耗尽、交接到未配置的 behavior → `status=failed`;
 - 在子 context 内交接到 `switch_context` 目标也只是返回(子 context 不离开自己的调用)。
@@ -212,7 +212,7 @@ child 的 Step 不写回调用方的 context;Session worklog 记录 child 的过
 
 交接点(run.json 的 `handover`)随快照先落盘,再提交 state;崩溃后 reconcile(`runner/reconcile.rs::redo_transfer`)恰好补交一次,state 用 `LiveRun.handover_at_ms` / `ProcessFrame.handover_at_ms` 记住已提交的交接。
 
-尚未实现:UI Stop 后补充输入(H3)、`report` 工具与显式完成策略(H4)。
+UI Stop 后补充输入(H3)已于 2026-10-10 暂缓,不纳入当前实现与验收,不适用于 Work;终态 Work 不 reopen,后续修改创建新 Task / 新 Work。`report` 工具与可选 `explicit_report` 完成策略(H4)已实现。XML 使用 `<report end="true">` 请求结束，普通 report 只更新报告；最终报告与所有动作、非空 next_behavior 互斥，END/done 进入纠错。见[Context 调度支持 TODO](../../notepads/llm-context-switch-support-todo.md)。
 
 > 旧 opendan Runtime(`src/frame/opendan/src/agent_session.rs` 的 `switch_behavior` / `apply_switch_*` / `handle_process_end`)是另一套实现:按 session class 的 `switch_mode` 切换,用 `apply_overrides_to_snapshot` 替换 request 侧(system prompt、tool policy 等),挂起的 process 快照存成 `.meta/behavior_<entry>.snap`,child `END` 时把 report 写成 parent `step_history` 里的 `<history_input source="process_return:...">`,independent 再入时 `reset_tool_iterations` / `reset_errors`,`END` 弹回上一 process、栈空才结束。这些是旧 Runtime 的私有 helper 和磁盘布局,不是新设计接口,待下一阶段 opendan 按 libopendan 的抽象重构接入。
 
@@ -244,7 +244,7 @@ assistant/tool: 进行中 Step 的 inner transcript(Step 内原生工具 loop �
 <<step_history>>
 <step_record behavior="plan" index="1" started_at_ms="..." ended_at_ms="..." compression="full">
 <observation>Todos were created successfully.</observation>
-<thought>The plan is ready, so execution should start.</thought>
+<intent>The plan is ready, so execution should start.</intent>
 <actions>
 - Run todo add "T01"
 
@@ -507,7 +507,7 @@ user:
 
 唯一表明刚才发生过切出的痕迹,是并入 step 1 的交接批次。**`writer` 的 step stream 不会被合并进 `plan` 的 context**;`switch_context` 不交回 report,`writer` 的结果要靠 worklog / 工作区里的产物才能看到。
 
-如果之后再切入 `writer`,会恢复 run_C,看到的是它自己越来越长的 Step 流。多条历史流并行存在,只通过交接批次衔接。`writer` 或 `plan` 输出 `END` / `done` 时按 Session 结束条件处理(Turn completed,再按 `end_condition` 结束 Session 或等待输入),不会自动弹回另一个 context;Session 结束时 `process_stack` 被清空。
+如果之后再切入 `writer`,会恢复 run_C,看到的是它自己越来越长的 Step 流。多条历史流并行存在,只通过交接批次衔接。`writer` 或 `plan` 提交结束报告时按 Session 完成策略处理(Turn completed,再按 `end_condition` 结束 Session 或等待输入),不会自动弹回另一个 context;Session 结束时 `process_stack` 被清空。
 
 ### `create_sub_context`:换 system 的子任务
 
@@ -528,14 +528,14 @@ user:
   <<step_history>>
   <step_record behavior="plan" index="0" compression="full">
   <observation></observation>
-  <thought>The task should be split into doc inspection, edit, and verification.</thought>
+  <intent>The task should be split into doc inspection, edit, and verification.</intent>
   <actions>
   - …(compact action result)
   </actions>
   </step_record>
   <step_record behavior="plan" index="1" compression="full">
   <observation>The edit scope is one Markdown document.</observation>
-  <thought>The plan phase is complete; execution should start.</thought>
+  <intent>The plan phase is complete; execution should start.</intent>
   <actions>
   No action.
   </actions>
@@ -543,7 +543,7 @@ user:
   <</step_history>>
 
 assistant:
-  <response><thinking>I should edit the document now.</thinking><actions>…</actions></response>
+  <response><intent>I should edit the document now.</intent><actions>…</actions></response>
 
 user:
   <<last_step_action_results behavior="do" step="2">>
@@ -556,7 +556,7 @@ assistant:
 
 关键点:
 
-- `plan` 的 step(包括最后一条带 `next_behavior=do` 的 step)以 `<step_record>` 形式进入 `do` 的 `step_history`,**不**作为 `do` 的 hot pair。`<step_record>` 只有 observation / thought / actions 三个槽位(没有 `<thinking>` 时 thought 回退为原始回复文本),没有单独的 `<report>` / `<next_behavior>` 字段。**不**要在 prompt / template 层人为造出跨 behavior 的 hot pair。
+- `plan` 的 step(包括最后一条带 `next_behavior=do` 的 step)以 `<step_record>` 形式进入 `do` 的 `step_history`,**不**作为 `do` 的 hot pair。`<step_record>` 只有 observation / intent / actions 三个槽位(没有 `<intent>` 时 thought 回退为原始回复文本),没有单独的 `<report>` / `<next_behavior>` 字段。**不**要在 prompt / template 层人为造出跨 behavior 的 hot pair。
 - `do` 的第一个 Step 编号接着 `plan`(这里是 2),不从 0 开始;继承的 step 不由 run_B 重复写入 worklog。
 - `inherit: none` 时没有 `<<step_history>>`,child 只有 system + 交接批次;`recent_dialogue` 时 system 之后是 `<session_history>`。由 `next_behavior` 触发时 `<sub_task>` 是固定文本,任务要靠继承的历史或共享状态理解;由 `call_behavior` 触发时是调用的 `task` 参数。
 
@@ -578,7 +578,7 @@ user:
   <<last_step_action_results behavior="plan" step="0">> … <</last_step_action_results>>
 
 assistant:
-  <response><thinking>start doing</thinking><next_behavior>do</next_behavior></response>   (plan step 1)
+  <response><intent>start doing</intent><next_behavior>do</next_behavior></response>   (plan step 1)
 
 user:
   <<last_step_action_results behavior="plan" step="1">>
@@ -619,7 +619,7 @@ user:
   Your result returns to the caller: finish with your report; do not ask the user.</sub_task></session_input>
 
 assistant:
-  <response><thinking>Run the research actions.</thinking><actions>…</actions></response>   (分支的 step 2)
+  <response><intent>Run the research actions.</intent><actions>…</actions></response>   (分支的 step 2)
 …
 assistant:
   <response><report><![CDATA[research result X]]></report></response>

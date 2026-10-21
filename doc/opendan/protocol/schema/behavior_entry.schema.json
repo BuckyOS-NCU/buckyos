@@ -6,6 +6,12 @@
       "additionalProperties": false,
       "description": "`prompt` of a behavior entry.",
       "properties": {
+        "goal_activation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "on_context_switch": {
           "type": [
             "string",
@@ -32,6 +38,55 @@
         },
         "system": {
           "description": "Application system prompt of the context (replaces `prompt.system`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "BehaviorReply": {
+      "additionalProperties": false,
+      "description": "`[reply]`: the reply contract of a behavior's context. The final reply (an assistant text without tool calls) is one JSON value matching `schema`: the provider enforces it natively where it can, the host checks it and asks for one correction (`OutputSpec::Json { max_repairs: Some(1) }`). Function call loop only.",
+      "properties": {
+        "asks_field": {
+          "description": "An array field of the reply that must list every question the context asked the user (`agent-session ask-user`), one entry each.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema": {
+          "description": "JSON Schema of the reply (an object schema)."
+        }
+      },
+      "required": [
+        "schema"
+      ],
+      "type": "object"
+    },
+    "BehaviorToolConfig": {
+      "additionalProperties": false,
+      "description": "`[tool]`: a sub context behavior offered to its callers as a named function. Calling it runs the behavior exactly like `call_behavior` does; the declaration only decides what the caller's model sees.",
+      "properties": {
+        "description": {
+          "default": "",
+          "description": "When to call it: the caller's routing guide.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Function name (letters, digits, `_`); default: the behavior name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parameters": {
+          "description": "JSON Schema of the arguments (an object); default: `{task: string}`."
+        },
+        "task": {
+          "description": "Template of the sub context's task (`{{args.<name>}}` only); default: the arguments as JSON (or `args.task` with the default parameters).",
           "type": [
             "string",
             "null"
@@ -187,6 +242,32 @@
         }
       ],
       "description": "`prompt.system` and the input templates of the context. A system prompt is not allowed for `fork`."
+    },
+    "reply": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BehaviorReply"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`[reply]`: the context's final reply is a JSON value of this contract (function call loop only). A fork may declare its own."
+    },
+    "todo": {
+      "description": "The behavior executes the session's serial Todos: a `next_behavior` hand-over to it admits the next one (TodoList, `[entry] todo`).",
+      "type": "boolean"
+    },
+    "tool": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BehaviorToolConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`[tool]` of the behavior: offered to callers that whitelist `behavior:<name>` as a named function running this sub context."
     }
   },
   "required": [

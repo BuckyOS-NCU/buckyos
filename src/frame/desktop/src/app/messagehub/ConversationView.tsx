@@ -1,16 +1,12 @@
 import {
   ArrowLeft,
-  Bot,
   FileUp,
   Lock,
   Menu,
   MoreVertical,
   Pin,
   Ticket,
-  SlidersHorizontal,
   SquarePen,
-  User,
-  Users,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useI18n } from '../../i18n/provider'
@@ -22,19 +18,25 @@ import { ConversationMessageActionsContext } from './conversation/history/action
 import type { ConversationMessageReader } from './conversation/history/types'
 import {
   ConversationComposer,
+  type ComposerAnswer,
   type ComposerRelation,
   type ConversationComposerHandle,
   type ConversationComposerSubmitPayload,
 } from './conversation/input/ConversationComposer'
+import { conversationInputState } from './conversation/input/inputState'
 import { messageObjId, messageSummaryText, ownReactionId } from './conversation/history/relations'
 import { SessionPanel } from './conversation/SessionPanel'
 import { isTransferWithFiles, type ComposerAttachmentInput } from './conversation/input/attachmentDraft'
 import { ConversationMediaScopeContext } from './conversation/media/context'
-import type { DID, MessageObject } from './protocol/msgobj'
+import { notifySessionCategory, type DID, type MessageObject } from './protocol/msgobj'
+import { useNotifyFilteredReader } from './notify'
+import { NOTIFY_FILTERS, type NotifyFilter } from './notify/model'
 import type { Entity, Session, SessionAccess, MessageHubContext } from './types'
-import { useMessageHubRuntime, useMessageHubStore, type EntityAdmission } from './store'
+import { useMessageHubRuntime, useMessageHubStore } from './store'
+import { RequestBanner } from './RelationPanel'
 import { friendlyDidName } from './api/projection'
 import { parseGroupNotice, withinWindow } from './groupModel'
+import { HubAvatar } from './HubAvatar'
 
 interface ConversationViewProps {
   entity: Entity
@@ -45,6 +47,7 @@ interface ConversationViewProps {
   onOpenSessionSidebar: () => void
   onOpenDetails: () => void
   onSendMessage: (payload: ConversationComposerSubmitPayload) => void | Promise<void>
+  onQueueChange?: (queued: ConversationComposerSubmitPayload[]) => void
   onResend?: (message: MessageObject) => Promise<void>
   context?: MessageHubContext
   access?: SessionAccess | null
@@ -62,12 +65,12 @@ interface ConversationViewProps {
   sessionCount: number
   leadingPane?: ReactNode
   isSessionSidebarOpen?: boolean
+  /** Unread messages of the entity's other sessions, shown on the session list button. */
+  otherSessionsUnread?: number
   historyStatus?: 'idle' | 'loading' | 'ready' | 'error'
   hasOlder?: boolean
   onLoadOlder?: () => Promise<boolean>
   onVisibleMessages?: (recordIds: string[]) => void
-  admission?: EntityAdmission | null
-  onAdmission?: (action: 'accept' | 'block') => Promise<void>
   onOpenEntity?: (id: string) => void
   /** Opens the forward target picker for a message. */
   onForward?: (message: MessageObject) => void
@@ -90,16 +93,16 @@ export function ConversationView({
   onOpenSessionSidebar,
   onOpenDetails,
   onSendMessage,
+  onQueueChange,
   onResend,
   context: contextProp, access, title = session?.title ?? '', onOpenSessionDetails, onCreate, creationReason, defaultSessionError, onRetryDefaultSession, draft, draftAttachments, onAttachmentsChange, onDraftChange, showActions = true,
   leadingPane = null,
   isSessionSidebarOpen = false,
+  otherSessionsUnread = 0,
   historyStatus = 'ready',
   hasOlder = false,
   onLoadOlder,
   onVisibleMessages,
-  admission = null,
-  onAdmission,
   onOpenEntity,
   onForward,
   sessionPanelDetails,
@@ -111,23 +114,14 @@ export function ConversationView({
   useMessageHubRuntime()
   const context = contextProp ?? store.defaultContext()
   const runtime = session ? store.runtimeFor(context, session.id) : []
-  const [admissionPending, setAdmissionPending] = useState(false)
-  const [admissionError, setAdmissionError] = useState(false)
   const requestCount = session?.requestCount ?? 0
-  const showAdmissionBanner = requestCount > 0 && admission?.accessLevel !== 'friend'
-  const runAdmission = async (action: 'accept' | 'block') => {
-    if (!onAdmission || admissionPending) return
-    setAdmissionPending(true); setAdmissionError(false)
-    try { await onAdmission(action) } catch { setAdmissionError(true) } finally { setAdmissionPending(false) }
-  }
   const canSend = access === undefined || access?.mode === 'read_write'
+  // A notification session (`sysnotify:*`) is not a conversation: its cards are filtered, never answered by typing.
+  const notifyCategory = session ? notifySessionCategory(session.id) : undefined
+  const [notifyFilter, setNotifyFilter] = useState<NotifyFilter>('all')
+  const historyReader = useNotifyFilteredReader(messageReader, notifyCategory ? notifyFilter : 'all')
   const isGroup = entity.type === 'group'
   const subtitle = session ? [title, session.binding.kind === 'tunnel' ? session.binding.connectionName : ''].filter(Boolean).join(' · ') : t('messagehub.noSessions')
-  const admissionDetail = [
-    t('messagehub.requestBanner', undefined, { count: requestCount }),
-    admission?.accessLevel ? t(`messagehub.access.${admission.accessLevel}`) : '',
-    admission?.temporaryExpiresAt ? t('messagehub.temporaryUntil', undefined, { time: new Date(admission.temporaryExpiresAt).toLocaleString() }) : '',
-  ].filter(Boolean).join(' · ')
   const bodyRef = useRef<HTMLDivElement>(null)
   const composerRef = useRef<ConversationComposerHandle>(null)
   const dragDepthRef = useRef(0)
@@ -139,6 +133,11 @@ export function ConversationView({
   const isOwner = context.mode === 'self' && context.ownerDid === context.viewerDid
   const [relation, setRelation] = useState<ComposerRelation | null>(null)
   const sessionId = session?.id
+  // The input state follows the timeline: an open question locks the
+  // composer to answering it and replaces a reply or edit the user picked.
+  const inputState = useMemo(() => conversationInputState(messageReader.timeline ?? [], context.ownerDid, { group: isGroup }), [messageReader, context.ownerDid, isGroup])
+  const answerState = inputState.mode === 'answer' ? inputState : null
+  if (answerState && relation) setRelation(null)
   const pinned = session ? store.preferences(context, session.id).pinnedMessage ?? null : null
   const pinnedId = pinned?.id
   const [panelInset, setPanelInset] = useState(0)
@@ -185,7 +184,8 @@ export function ConversationView({
           // Outside a group a redact is a request the peer's client honours by
           // default; nothing enforces it, so either side may ask for any message.
           const redact = canSend && (!isGroup || (own ? withinWindow(group?.messageRules.recallWindowMs, message.created_at_ms, now) : group?.can.redactAny ?? false))
-          return { reply: canSend, react: canSend, edit, redact, recall: redact && isGroup && own }
+          // While a question is open nothing but its answer may be sent.
+          return { reply: canSend && !answerState, react: canSend, edit: edit && !answerState, redact, recall: redact && isGroup && own }
         },
         reply: (message: MessageObject) => setRelation({ kind: 'reply', message }),
         edit: (message: MessageObject) => setRelation({ kind: 'edit', message }),
@@ -205,8 +205,12 @@ export function ConversationView({
         },
       } : undefined,
       readReceipt: sessionId ? (message: MessageObject) => store.readReceipt(context, sessionId, message) : undefined,
+      handleNotify: isOwner,
+      answerFriendRequests: isOwner,
     }
-  }, [canSend, onResend, onSendMessage, store, snapshot, context.ownerDid, context.viewerDid, context.mode, isOwner, isGroup, sessionId, group, onOpenEntity, onForward, onOpenMessage, pinnedId, t]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [canSend, onResend, onSendMessage, store, snapshot, context.ownerDid, context.viewerDid, context.mode, isOwner, isGroup, sessionId, group, onOpenEntity, onForward, onOpenMessage, pinnedId, t, answerState]) // eslint-disable-line react-hooks/exhaustive-deps
+  const askerName = answerState ? messageActions.displayName(answerState.question.from) : ''
+  const answer = useMemo<ComposerAnswer | null>(() => answerState ? { ...answerState, askerName } : null, [answerState, askerName])
 
   useEffect(() => {
     if (!focusMessageId || !sessionId) return
@@ -313,28 +317,26 @@ export function ConversationView({
           <ArrowLeft size={20} />
         </button>
 
-        <button onClick={onOpenSessionSidebar} aria-label={t('messagehub.sessions')} title={t('messagehub.sessions')} className="flex min-h-11 min-w-11 items-center justify-center" style={{ color: isSessionSidebarOpen ? 'var(--cp-accent)' : 'var(--cp-muted)' }} type="button"><Menu size={18} /></button>
+        <button onClick={onOpenSessionSidebar} aria-label={t('messagehub.sessions')} title={otherSessionsUnread > 0 ? t('messagehub.otherSessionsUnread', '{{count}} unread in other sessions', { count: otherSessionsUnread }) : t('messagehub.sessions')} className="relative flex min-h-11 min-w-11 items-center justify-center" style={{ color: isSessionSidebarOpen ? 'var(--cp-accent)' : 'var(--cp-muted)' }} type="button"><Menu size={18} />{otherSessionsUnread > 0 && <span data-testid="other-sessions-unread" className="absolute right-0.5 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-[color:var(--cp-accent)] px-1 text-[10px] font-semibold leading-none text-white">{otherSessionsUnread}</span>}</button>
         <div className="min-w-0 flex-1">
           {/* On touch layouts the whole title block is one entity target; session
               details stay on the ⋮ button. */}
           <button onClick={onOpenDetails} className="flex min-h-11 w-full min-w-0 flex-col justify-center text-left md:hidden" type="button" aria-label={`${t('messagehub.entityDetails')}: ${entity.name}`}>
-            <span className="flex max-w-full items-center gap-1.5"><EntityTypeIcon type={entity.type} /><span className="truncate text-base font-semibold">{entity.name}</span></span>
+            <span className="flex max-w-full items-center gap-1.5"><HubAvatar type={entity.type} name={entity.name} avatar={entity.avatar} size={20} systemNotify={entity.systemNotify} /><span className="truncate text-base font-semibold">{entity.name}</span></span>
             <span className="block max-w-full truncate text-xs text-[color:var(--cp-muted)]">{subtitle}</span>
           </button>
-          <button onClick={onOpenDetails} className="hidden max-w-full items-center gap-1.5 text-left md:flex" type="button" aria-label={`${t('messagehub.entityDetails')}: ${entity.name}`} title={t('messagehub.entityDetails')}><EntityTypeIcon type={entity.type} /><span className="truncate text-[15px] font-semibold">{entity.name}</span></button>
+          <button onClick={onOpenDetails} className="hidden max-w-full items-center gap-1.5 text-left md:flex" type="button" aria-label={`${t('messagehub.entityDetails')}: ${entity.name}`} title={t('messagehub.entityDetails')}><HubAvatar type={entity.type} name={entity.name} avatar={entity.avatar} size={22} systemNotify={entity.systemNotify} /><span className="truncate text-[15px] font-semibold">{entity.name}</span></button>
           <button onClick={onOpenSessionDetails} disabled={!session} type="button" className="hidden max-w-full truncate text-xs text-[color:var(--cp-muted)] md:block" aria-label={t('messagehub.sessionDetails')} title={t('messagehub.sessionDetails')}>{subtitle}</button>
           <div role="status" data-testid="session-runtime" className="truncate text-xs text-[color:var(--cp-accent)]">{runtime.map(state => `${state.memberDid === context.ownerDid ? t('messagehub.you') : session?.members[state.memberDid]?.nickname || entity.name} · ${t(`messagehub.runtime.${state.status}`)}${state.statusLine ? ` · ${state.statusLine}` : ''}`).join(' · ')}</div>
         </div>
         {onCreate && <button type="button" onClick={onCreate} disabled={!!creationReason} title={creationReason ? t(`messagehub.reason.${creationReason}`) : t('messagehub.newSession')} aria-label={t('messagehub.newSession')} className="flex min-h-11 min-w-11 items-center justify-center rounded-lg text-[color:var(--cp-muted)] disabled:opacity-40"><SquarePen size={18} /></button>}
         <button onClick={onOpenSessionDetails} disabled={!session} aria-label={t('messagehub.sessionDetails')} title={t('messagehub.sessionDetails')} className="flex min-h-11 min-w-11 items-center justify-center rounded-lg text-[color:var(--cp-muted)] disabled:opacity-40" type="button"><MoreVertical size={18} /></button>
       </div>
-      {session && showAdmissionBanner && <div role="note" data-testid="request-banner" title={admissionDetail} className="flex shrink-0 items-center gap-2 border-b border-[color:var(--cp-border)] bg-[color:color-mix(in_srgb,var(--cp-warning)_12%,var(--cp-surface))] px-3 py-1 text-[13px]">
-        <span className="min-w-0 flex-1 truncate font-medium">{t('messagehub.requestPending', undefined, { count: requestCount })}{admission?.accessLevel && admission.accessLevel !== 'stranger' ? <span className="font-normal text-[color:var(--cp-muted)]"> · {t(`messagehub.access.${admission.accessLevel}`)}</span> : null}</span>
-        {admission?.canChange && admission.accessLevel !== 'friend' && <button type="button" disabled={admissionPending} className="min-h-11 shrink-0 rounded-lg px-3 font-medium text-[color:var(--cp-accent)] disabled:opacity-40 md:min-h-9" onClick={() => void runAdmission('accept')}>{t('messagehub.acceptContact')}</button>}
-        {admission?.canChange && admission.accessLevel !== 'block' && <button type="button" disabled={admissionPending} className="min-h-11 shrink-0 rounded-lg px-3 text-[color:var(--cp-danger)] disabled:opacity-40 md:min-h-9" onClick={() => void runAdmission('block')}>{t('messagehub.blockContact')}</button>}
-      </div>}
-      {session && showAdmissionBanner && admissionError && <p role="alert" className="shrink-0 px-3 py-1 text-xs text-[color:var(--cp-danger)]">{t('messagehub.admissionFailed')}</p>}
+      {session ? <RequestBanner entity={entity} context={context} requestCount={requestCount} /> : null}
 
+      {notifyCategory ? <div role="group" aria-label={t('messagehub.notify.filter.label')} className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-[color:var(--cp-border)] bg-[color:var(--cp-surface)] px-3 py-1.5" data-testid="notify-filter">
+        {NOTIFY_FILTERS.map(value => <button key={value} type="button" className="mh-notify-filter" aria-pressed={notifyFilter === value} onClick={() => setNotifyFilter(value)} data-filter={value}>{t(`messagehub.notify.filter.${value}`)}</button>)}
+      </div> : null}
       {defaultSessionError && <div role="alert" className="flex shrink-0 items-center gap-2 px-3 py-2 text-xs text-[color:var(--cp-danger)]"><span>{t('messagehub.operationFailed')}</span><button type="button" className="min-h-8 rounded-lg border border-[color:var(--cp-border)] px-2" onClick={onRetryDefaultSession}>{t('messagehub.retry')}</button></div>}
       <div className="relative flex min-h-0 flex-1">
         {leadingPane}
@@ -356,9 +358,9 @@ export function ConversationView({
               <ConversationMessageActionsContext.Provider value={messageActions}>
               <ConversationHistoryPane
                 ref={historyPaneRef}
-                reader={messageReader}
+                reader={historyReader}
                 showActions={showActions}
-                emptyLabel={t(!session ? 'messagehub.noSessions' : historyStatus === 'loading' ? 'messagehub.loadingHistory' : historyStatus === 'error' ? 'messagehub.historyFailed' : canSend ? 'messagehub.startConversation' : 'messagehub.noMessages')}
+                emptyLabel={t(!session ? 'messagehub.noSessions' : historyStatus === 'loading' ? 'messagehub.loadingHistory' : historyStatus === 'error' ? 'messagehub.historyFailed' : notifyCategory ? `messagehub.notify.empty.${notifyFilter}` : canSend ? 'messagehub.startConversation' : 'messagehub.noMessages')}
                 selfDid={selfDid}
                 isGroup={isGroup}
                 peerMarkdown={entity.type === 'agent'}
@@ -371,7 +373,7 @@ export function ConversationView({
             </ConversationMediaScopeContext.Provider>
           </div>
 
-          {canSend ? <ConversationComposer
+          {notifyCategory ? null : canSend ? <ConversationComposer
             initialDraft={draft}
             initialAttachments={draftAttachments}
             onAttachmentsChange={onAttachmentsChange}
@@ -380,8 +382,10 @@ export function ConversationView({
             placeholder={t('messagehub.inputPlaceholder', 'Message...')}
             maxHeight={composerMaxHeight}
             onSendMessage={handleSendMessage}
-            relation={relation}
+            onQueueChange={onQueueChange}
+            relation={answer ? null : relation}
             onCancelRelation={() => setRelation(null)}
+            answer={answer}
             mentionCandidates={isGroup ? mentionCandidates : undefined}
             canMentionAll={isGroup && (group?.can.mentionAll ?? false)}
           /> : <div className="flex shrink-0 items-center justify-center gap-2 border-t border-[color:var(--cp-border)] bg-[color:var(--cp-surface)] px-4 py-3 text-[13px] text-[color:var(--cp-muted)]" data-testid="composer-readonly"><Lock size={14} className="shrink-0" aria-hidden /><span>{access?.readOnlyReason ? t(`messagehub.reason.${access.readOnlyReason}`) : creationReason ? t(`messagehub.reason.${creationReason}`) : t('messagehub.noSessions')}</span></div>}
@@ -435,15 +439,3 @@ export function ConversationView({
 }
 
 
-function EntityTypeIcon({ type }: { type: string }) {
-  switch (type) {
-    case 'agent':
-      return <Bot size={16} />
-    case 'group':
-      return <Users size={16} />
-    case 'service':
-      return <SlidersHorizontal size={16} />
-    default:
-      return <User size={16} />
-  }
-}

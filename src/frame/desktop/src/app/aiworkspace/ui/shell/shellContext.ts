@@ -6,6 +6,7 @@
 import { createContext, useContext, useSyncExternalStore } from 'react'
 import type { AiwsClient } from '../../api/client'
 import type { EntityEnvelope } from '../../api/types'
+import { localizedLabels } from '../../i18n'
 import { workspaceUrl } from '../../links'
 import { useUserState } from '../../state/hooks'
 import { CANVAS_MODES, type CanvasMode } from '../blocks/registry'
@@ -16,7 +17,10 @@ export type TopMode = 'sources' | 'canvas' | 'show'
 
 /** The right panel shows one kind of content at a time (§3.2). */
 export type SideTab = 'inspector' | 'relations' | 'annotations' | 'collab' | 'edits' | 'wish'
-export const SIDE_TAB_LABEL: Record<SideTab, string> = { inspector: '属性', relations: '引用与依赖', annotations: '批注', collab: '协作', edits: '修改状态', wish: '许愿格' }
+export const SIDE_TAB_LABEL: Readonly<Record<SideTab, string>> = localizedLabels({
+  inspector: 'aiworkspace.shell.side.inspector', relations: 'aiworkspace.shell.side.relations', annotations: 'aiworkspace.shell.side.annotations',
+  collab: 'aiworkspace.shell.side.collab', edits: 'aiworkspace.shell.side.edits', wish: 'aiworkspace.shell.side.wish',
+})
 export const CANVAS_SIDE_TABS: SideTab[] = ['inspector', 'relations', 'annotations', 'collab', 'edits']
 export const SOURCES_SIDE_TABS: SideTab[] = ['collab', 'edits']
 
@@ -84,10 +88,12 @@ export interface ShellApi {
   phone: boolean
   /** The Mock processing panel and other developer tools are shown (dev server or dev override). */
   devTools: boolean
-  /** Who this window acts as; a dev-override identity has no login session to end. */
-  identity: { principal: string | null; dev: boolean }
+  /** Who this window acts as; a dev-override identity has no login session to end; a guest came through a public link. */
+  identity: { principal: string | null; dev: boolean; guest: boolean }
   /** Log out through the Desktop's sign-in flow (after the workspace's leave check). */
   logout: () => void
+  /** A guest signs in (the Desktop login, coming back to this address). */
+  login: () => void
   home: (() => void) | null
   /** Offline actions (prepare, take over, reopen) run one at a time; their failure stays visible. */
   runOffline: (label: string, work: () => Promise<void>) => void
@@ -112,6 +118,11 @@ export function useCanvasMode(): CanvasMode {
 }
 
 export const ZOOM_PRESETS = [25, 50, 75, 100, 150, 200]
+
+/** The grant subject of a public link (store `PUBLIC_SUBJECT`): everyone, signed in or not — and what the
+ * one-click public link grants (§8.3). */
+export const PUBLIC_SUBJECT = 'public'
+export const PUBLIC_LINK_CAPABILITIES = ['read', 'comment'] as const
 
 /** An access link (§8.3): it names the workspace and Surface, carries no credential and grants nothing. */
 export function shareLink(workspaceId: string, surfaceId: string | null): string {

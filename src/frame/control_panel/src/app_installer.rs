@@ -51,10 +51,15 @@ const UNINSTALL_TASK_TYPE: &str = "app.uninstall";
 const START_TASK_TYPE: &str = "app.start";
 const WAIT_INTERVAL_MS: u64 = 1_000;
 const WAIT_TIMEOUT_SECS: u64 = 45;
+const AGENT_SKILLS_PUBLISH_DIR: &str = "agent_skills";
 
 #[derive(Clone)]
 enum PackageSource {
     Directory(PathBuf),
+    DirectoryExcept {
+        path: PathBuf,
+        exclude: PathBuf,
+    },
     File {
         path: PathBuf,
         packaged_name: Option<String>,
@@ -194,6 +199,27 @@ pub struct PublishOutput {
     /// 发布状态：发布到 Repo/NamedStore 与发布 App DID 是两个动作；
     /// 这里只完成前者，App Document 仍是未经权威发布的 candidate。
     pub publish_status: &'static str,
+}
+
+pub(crate) fn register_app_doc_authority(
+    app_did: &name_lib::DID,
+    app_doc_value: Value,
+    scope: &str,
+) -> Result<(), RPCErrors> {
+    let name_client = name_client::get_name_client().ok_or_else(|| {
+        RPCErrors::ReasonError("name client unavailable for local App authority".to_string())
+    })?;
+    // 本机 locker(hosts 语义):本 Zone 的 App Document 在本进程内闭环解析。
+    name_client.lock_document(
+        app_did.clone(),
+        name_client::DidDocType::Custom(crate::app_install_resolver::APP_DID_DOC_TYPE.to_string()),
+        name_lib::EncodedDocument::JsonLd(app_doc_value),
+        name_client::LockOptions {
+            scope: scope.to_string(),
+            ..Default::default()
+        },
+    );
+    Ok(())
 }
 
 fn task_data_value<T: Serialize>(data: T) -> Result<Value, RPCErrors> {
@@ -1249,21 +1275,42 @@ impl AppInstaller {
                         "Agent app template missing `pkg_list.agent`".to_string(),
                     )
                 })?;
-                if app_doc_template.pkg_list.agent_skills.is_some() {
-                    return Err(RPCErrors::ReasonError(
-                        "Agent publish does not support `pkg_list.agent_skills` yet".to_string(),
-                    ));
-                }
                 if app_doc_template.pkg_list.agent_tools.is_some() {
                     return Err(RPCErrors::ReasonError(
                         "Agent publish does not support `pkg_list.agent_tools` yet".to_string(),
                     ));
                 }
-                let sub_pkgs = vec![ScannedSubPkg {
-                    key: "agent".to_string(),
-                    desc: agent_desc,
-                    source: PackageSource::Directory(local_dir.to_path_buf()),
-                }];
+                let sub_pkgs = match app_doc_template.pkg_list.agent_skills.clone() {
+                    Some(skills_desc) => {
+                        let skills_dir = local_dir.join(AGENT_SKILLS_PUBLISH_DIR);
+                        if !skills_dir.is_dir() {
+                            return Err(RPCErrors::ReasonError(format!(
+                                "Agent template declares `pkg_list.agent_skills` but `{}` is not a directory",
+                                skills_dir.display()
+                            )));
+                        }
+                        vec![
+                            ScannedSubPkg {
+                                key: "agent".to_string(),
+                                desc: agent_desc,
+                                source: PackageSource::DirectoryExcept {
+                                    path: local_dir.to_path_buf(),
+                                    exclude: skills_dir.clone(),
+                                },
+                            },
+                            ScannedSubPkg {
+                                key: "agent_skills".to_string(),
+                                desc: skills_desc,
+                                source: PackageSource::Directory(skills_dir),
+                            },
+                        ]
+                    }
+                    None => vec![ScannedSubPkg {
+                        key: "agent".to_string(),
+                        desc: agent_desc,
+                        source: PackageSource::Directory(local_dir.to_path_buf()),
+                    }],
+                };
 
                 Ok(PublishScanPlan {
                     app_bundle: None,
@@ -1626,8 +1673,14 @@ impl AppInstaller {
         }
     }
 
-    async fn create_tar_gz(&self, src_dir: &Path, tarball_path: &Path) -> Result<(), RPCErrors> {
+    async fn create_tar_gz(
+        &self,
+        src_dir: &Path,
+        exclude: Option<&Path>,
+        tarball_path: &Path,
+    ) -> Result<(), RPCErrors> {
         let src_dir = src_dir.to_path_buf();
+        let exclude = exclude.map(Path::to_path_buf);
         let tarball_path = tarball_path.to_path_buf();
 
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -1644,6 +1697,7 @@ impl AppInstaller {
                 tar: &mut Builder<GzEncoder<StdFile>>,
                 path: &Path,
                 base: &Path,
+                exclude: Option<&Path>,
             ) -> io::Result<()> {
                 for entry in std::fs::read_dir(path)? {
                     let entry = entry?;
@@ -1653,14 +1707,14 @@ impl AppInstaller {
                         .and_then(|name| name.to_str())
                         .map(|name| name.starts_with('.'))
                         .unwrap_or(false);
-                    if skip {
+                    if skip || exclude == Some(path.as_path()) {
                         continue;
                     }
 
                     let relative = path.strip_prefix(base).unwrap();
                     if path.is_dir() {
                         tar.append_dir(relative, &path)?;
-                        append_dir_all(tar, &path, base)?;
+                        append_dir_all(tar, &path, base, exclude)?;
                     } else {
                         tar.append_file(relative, &mut StdFile::open(&path)?)?;
                     }
@@ -1668,7 +1722,7 @@ impl AppInstaller {
                 Ok(())
             }
 
-            append_dir_all(&mut tar, &src_dir, &src_dir).map_err(|error| {
+            append_dir_all(&mut tar, &src_dir, &src_dir, exclude.as_deref()).map_err(|error| {
                 format!(
                     "Append files from `{}` into archive failed: {error}",
                     src_dir.display()
@@ -1693,7 +1747,9 @@ impl AppInstaller {
         source: &PackageSource,
     ) -> Result<PathBuf, RPCErrors> {
         match source {
-            PackageSource::Directory(path) => Ok(path.clone()),
+            PackageSource::Directory(path) | PackageSource::DirectoryExcept { path, .. } => {
+                Ok(path.clone())
+            }
             PackageSource::File {
                 path,
                 packaged_name,
@@ -1736,7 +1792,12 @@ impl AppInstaller {
             "{}.tar.gz",
             Self::sanitize_publish_name(archive_base_name)
         ));
-        self.create_tar_gz(&staged_dir, &tarball_path).await?;
+        let exclude = match source {
+            PackageSource::DirectoryExcept { exclude, .. } => Some(exclude.as_path()),
+            _ => None,
+        };
+        self.create_tar_gz(&staged_dir, exclude, &tarball_path)
+            .await?;
 
         let file_template = FileObject::default();
         let (file_object, _file_obj_id, _file_obj_str) = cacl_file_object(
@@ -1756,11 +1817,8 @@ impl AppInstaller {
             ))
         })?;
 
-        match source {
-            PackageSource::Directory(_) => {}
-            PackageSource::File { .. } => {
-                let _ = fs::remove_dir_all(&staged_dir).await;
-            }
+        if let PackageSource::File { .. } = source {
+            let _ = fs::remove_dir_all(&staged_dir).await;
         }
 
         Ok(PreparedPayload {
@@ -1868,7 +1926,7 @@ impl AppInstaller {
         Ok(())
     }
 
-    fn set_sub_pkg_desc(
+    pub(crate) fn set_sub_pkg_desc(
         app_doc: &mut AppDoc,
         key: &str,
         desc: SubPkgDesc,
@@ -1897,11 +1955,74 @@ use crate::{ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{RPCRequest, RPCResponse, RPCResult};
 
 #[derive(Debug, Clone)]
-pub(crate) struct PreInstallSubmitOutcome {
+pub(crate) struct InternalInstallOutcome {
     pub action: String,
     pub task_id: Option<String>,
     pub app_instance_id: buckyos_api::AppInstanceId,
     pub plan_fingerprint: String,
+}
+
+/// Why control_panel installs a PIKG on its own behalf. The intent is part of
+/// the immutable task identity, so a rebuilt Agent runtime never replays the
+/// task of an earlier Agent that used the same name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InternalInstall<'a> {
+    Preinstall,
+    /// `supersedes`: the failed runtime install this attempt replaces, so a
+    /// retry gets its own task instead of colliding with the failed one.
+    AgentRuntime {
+        agent_doc_object_id: &'a ObjId,
+        supersedes: Option<&'a str>,
+    },
+}
+
+impl InternalInstall<'_> {
+    fn material(&self) -> Value {
+        match self {
+            Self::Preinstall => json!({ "kind": "preinstall" }),
+            Self::AgentRuntime {
+                agent_doc_object_id,
+                supersedes,
+            } => json!({
+                "kind": "agent_runtime",
+                "agent_doc_object_id": agent_doc_object_id,
+                "supersedes": supersedes,
+            }),
+        }
+    }
+
+    fn origin(&self) -> AppSubmitOrigin {
+        match self {
+            Self::Preinstall => AppSubmitOrigin::Preinstall,
+            Self::AgentRuntime { .. } => AppSubmitOrigin::AgentRuntime,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppSubmitOrigin {
+    Rpc,
+    Preinstall,
+    AgentRuntime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppSubmitRoute {
+    Install,
+    RegisterAgentTemplate,
+    Reject,
+}
+
+/// Agent PIKGs submitted by users register templates; only the internally
+/// constructed Agent runtime App is deployed as an Agent App.
+pub(crate) fn app_submit_route(app_type: AppType, origin: AppSubmitOrigin) -> AppSubmitRoute {
+    match (app_type, origin) {
+        (AppType::Agent, AppSubmitOrigin::Rpc) => AppSubmitRoute::RegisterAgentTemplate,
+        (AppType::Agent, AppSubmitOrigin::Preinstall) => AppSubmitRoute::Reject,
+        (AppType::Agent, AppSubmitOrigin::AgentRuntime) => AppSubmitRoute::Install,
+        (_, AppSubmitOrigin::AgentRuntime) => AppSubmitRoute::Reject,
+        _ => AppSubmitRoute::Install,
+    }
 }
 
 impl ControlPanelServer {
@@ -2044,11 +2165,13 @@ impl ControlPanelServer {
         }
     }
 
-    fn install_error_to_rpc(error: buckyos_api::InstallError) -> RPCErrors {
+    pub(crate) fn install_error_to_rpc(error: buckyos_api::InstallError) -> RPCErrors {
         RPCErrors::ReasonError(serde_json::to_string(&error).unwrap_or_else(|_| error.to_string()))
     }
 
-    fn parse_install_source(req: &RPCRequest) -> Result<buckyos_api::InstallSource, RPCErrors> {
+    pub(crate) fn parse_install_source(
+        req: &RPCRequest,
+    ) -> Result<buckyos_api::InstallSource, RPCErrors> {
         if let Some(value) = req.params.get("source") {
             return serde_json::from_value(value.clone())
                 .map_err(|error| RPCErrors::ParseRequestError(format!("invalid source: {error}")));
@@ -2095,9 +2218,13 @@ impl ControlPanelServer {
             ));
         }
         let digest = Self::require_param_str(&req, "pikg_digest")?;
-        let size = req.params.get("size").and_then(Value::as_u64).ok_or_else(|| {
-            RPCErrors::ParseRequestError("size must be an unsigned integer".to_string())
-        })?;
+        let size = req
+            .params
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError("size must be an unsigned integer".to_string())
+            })?;
         let purpose = match Self::param_str(&req, "purpose").as_deref() {
             None | Some("inspect") => buckyos_api::PikgStagingPurpose::Inspect,
             Some("install") => buckyos_api::PikgStagingPurpose::Install,
@@ -3076,7 +3203,7 @@ impl ControlPanelServer {
         Ok(())
     }
 
-    async fn release_app_mutation_key(lease: &AppMutationLease) {
+    pub(crate) async fn release_app_mutation_key(lease: &AppMutationLease) {
         let mutation_key = lease.key.as_str();
         let Ok(runtime) = get_buckyos_api_runtime() else {
             return;
@@ -3103,7 +3230,7 @@ impl ControlPanelServer {
             .await;
     }
 
-    async fn find_app_submit_replay(
+    pub(crate) async fn find_app_submit_replay(
         &self,
         principal: &RpcAuthPrincipal,
         idempotency_key: &str,
@@ -3197,14 +3324,15 @@ impl ControlPanelServer {
         }
     }
 
-    fn preinstall_intent_id(
+    fn internal_intent_id(
+        intent: InternalInstall<'_>,
         owner_user_id: &str,
         app_id: &buckyos_api::AppId,
         pikg_digest: &str,
         seed: &buckyos_api::PreInstallPlanSeed,
     ) -> Result<String, RPCErrors> {
         let material = serde_json::json!({
-            "kind": "preinstall",
+            "intent": intent.material(),
             "owner_user_id": owner_user_id,
             "app_id": app_id,
             "pikg_digest": pikg_digest,
@@ -3216,42 +3344,46 @@ impl ControlPanelServer {
             .split_once(':')
             .map(|(_, digest)| digest)
             .ok_or_else(|| {
-                RPCErrors::ReasonError("pre-install intent ObjectId is malformed".to_string())
+                RPCErrors::ReasonError("internal install intent ObjectId is malformed".to_string())
             })?;
         Ok(format!("t-{}", &digest[..32]))
     }
 
-    fn preinstall_idempotency_key(
+    fn internal_idempotency_key(
+        intent: InternalInstall<'_>,
         owner_user_id: &str,
         app_id: &buckyos_api::AppId,
         pikg_digest: &str,
         plan_fingerprint: &str,
     ) -> String {
         let material = serde_json::json!({
-            "kind": "preinstall",
+            "intent": intent.material(),
             "owner_user_id": owner_user_id,
             "app_id": app_id,
             "pikg_digest": pikg_digest,
             "plan_fingerprint": plan_fingerprint,
         });
         let (object_id, _) = build_named_object_by_json("preidem", &material);
-        format!("preinstall:{}", object_id.to_string().replace(':', "-"))
+        format!(
+            "internal-install:{}",
+            object_id.to_string().replace(':', "-")
+        )
     }
 
-    fn preinstall_retry_idempotency_key(retry_of_task_id: &str, plan_fingerprint: &str) -> String {
+    fn internal_retry_idempotency_key(retry_of_task_id: &str, plan_fingerprint: &str) -> String {
         let material = serde_json::json!({
-            "kind": "preinstall_retry",
+            "kind": "internal_install_retry",
             "retry_of_task_id": retry_of_task_id,
             "plan_fingerprint": plan_fingerprint,
         });
         let (object_id, _) = build_named_object_by_json("preretry", &material);
         format!(
-            "preinstall-retry:{}",
+            "internal-install-retry:{}",
             object_id.to_string().replace(':', "-")
         )
     }
 
-    fn preinstall_replay_matches(
+    fn internal_replay_matches(
         task: &buckyos_api::Task,
         owner_user_id: &str,
         plan_fingerprint: &str,
@@ -3296,7 +3428,7 @@ impl ControlPanelServer {
             }))
     }
 
-    async fn resume_preinstall_replay(
+    async fn resume_internal_replay(
         &self,
         principal: &RpcAuthPrincipal,
         owner_user_id: &str,
@@ -3304,11 +3436,11 @@ impl ControlPanelServer {
         plan_fingerprint: &str,
         mut task: buckyos_api::Task,
         mut idempotency_key: String,
-    ) -> Result<PreInstallSubmitOutcome, RPCErrors> {
+    ) -> Result<InternalInstallOutcome, RPCErrors> {
         const MAX_RETRY_CHAIN_DEPTH: usize = 32;
 
         for _ in 0..MAX_RETRY_CHAIN_DEPTH {
-            if !Self::preinstall_replay_matches(
+            if !Self::internal_replay_matches(
                 &task,
                 owner_user_id,
                 plan_fingerprint,
@@ -3318,7 +3450,7 @@ impl ControlPanelServer {
                     buckyos_api::InstallStage::Inspect,
                     buckyos_api::InstallErrorCode::IdempotencyConflict,
                     false,
-                    "pre-install idempotency key belongs to different immutable input",
+                    "internal install idempotency key belongs to different immutable input",
                 )));
             }
 
@@ -3326,7 +3458,7 @@ impl ControlPanelServer {
                 || (task.phase == TaskPhase::Terminal && task.outcome == Some(TaskOutcome::Failed));
             if should_retry {
                 let retry_key =
-                    Self::preinstall_retry_idempotency_key(&task.task_id, plan_fingerprint);
+                    Self::internal_retry_idempotency_key(&task.task_id, plan_fingerprint);
                 if let Some(retry_task) = self
                     .find_app_submit_replay(principal, retry_key.as_str())
                     .await?
@@ -3337,7 +3469,7 @@ impl ControlPanelServer {
                                 buckyos_api::InstallStage::Inspect,
                                 buckyos_api::InstallErrorCode::IdempotencyConflict,
                                 false,
-                                "pre-install retry idempotency key belongs to a different predecessor task",
+                                "internal install retry idempotency key belongs to a different predecessor task",
                             ),
                         ));
                     }
@@ -3358,7 +3490,7 @@ impl ControlPanelServer {
                     .await
                     .map_err(Self::install_error_to_rpc)?;
                 self.install_runner.spawn_run(retry_task_id.clone());
-                return Ok(PreInstallSubmitOutcome {
+                return Ok(InternalInstallOutcome {
                     action: "retry".to_string(),
                     task_id: Some(retry_task_id),
                     app_instance_id: app_instance_id.clone(),
@@ -3369,15 +3501,15 @@ impl ControlPanelServer {
             if task.phase == TaskPhase::Terminal {
                 let message = match task.outcome {
                     Some(TaskOutcome::Succeeded) => format!(
-                        "pre-install task {} succeeded but the AppSpec is missing",
+                        "internal install task {} succeeded but the AppSpec is missing",
                         task.task_id
                     ),
                     Some(TaskOutcome::Canceled) => {
-                        format!("pre-install task {} was canceled", task.task_id)
+                        format!("internal install task {} was canceled", task.task_id)
                     }
                     Some(TaskOutcome::Failed) => unreachable!("failed task handled above"),
                     None => format!(
-                        "pre-install task {} is terminal without an outcome",
+                        "internal install task {} is terminal without an outcome",
                         task.task_id
                     ),
                 };
@@ -3390,7 +3522,7 @@ impl ControlPanelServer {
             }
 
             self.install_runner.spawn_run(task.task_id.clone());
-            return Ok(PreInstallSubmitOutcome {
+            return Ok(InternalInstallOutcome {
                 action: "replay".to_string(),
                 task_id: Some(task.task_id),
                 app_instance_id: app_instance_id.clone(),
@@ -3402,14 +3534,16 @@ impl ControlPanelServer {
             buckyos_api::InstallStage::Inspect,
             buckyos_api::InstallErrorCode::Conflict,
             false,
-            "pre-install retry chain exceeds the supported depth",
+            "internal install retry chain exceeds the supported depth",
         )))
     }
 
-    /// Internal pre-install entry. It uses the same inspect, action matrix,
-    /// mutation ownership, TaskManager persistence and runner path as apps.submit.
-    pub(crate) async fn submit_preinstall(
+    /// Internal install entry for rootfs seeds and Agent runtime Apps. It uses
+    /// the same inspect, action matrix, mutation ownership, TaskManager
+    /// persistence and runner path as apps.submit.
+    pub(crate) async fn submit_internal_install(
         &self,
+        intent: InternalInstall<'_>,
         owner_user_id: &str,
         app_id: &buckyos_api::AppId,
         pikg_digest: &str,
@@ -3417,28 +3551,14 @@ impl ControlPanelServer {
         pikg_app_doc: &buckyos_api::AppDoc,
         staging_handle: &str,
         seed: &buckyos_api::PreInstallPlanSeed,
-    ) -> Result<PreInstallSubmitOutcome, RPCErrors> {
-        let client = self.app_installer.system_config_client().await?;
-        let spec_key = format!("users/{owner_user_id}/apps/{app_id}/spec");
-        match client.get(&spec_key).await {
-            Ok(value) => {
-                let spec: AppServiceSpec = serde_json::from_str(&value.value)
-                    .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
-                if spec.state == ServiceState::Deleted {
-                    return Ok(PreInstallSubmitOutcome { action: "user_removed".into(), task_id: None,
-                        app_instance_id: spec.app_instance_id, plan_fingerprint: String::new() });
-                }
-            }
-            Err(SystemConfigError::KeyNotFound(_)) => {}
-            Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
-        }
+    ) -> Result<InternalInstallOutcome, RPCErrors> {
         let canonical_app_id = buckyos_api::AppId::from_app_did(pikg_app_doc.app_did())
             .map_err(RPCErrors::ReasonError)?;
         let expected_owner = pikg_app_doc.app_did().upper_did().ok_or_else(|| {
-            RPCErrors::ReasonError("pre-install AppDID has no structural owner".to_string())
+            RPCErrors::ReasonError("internal install AppDID has no structural owner".to_string())
         })?;
         let app_doc_value = serde_json::to_value(pikg_app_doc).map_err(|error| {
-            RPCErrors::ReasonError(format!("serialize pre-install AppDoc failed: {error}"))
+            RPCErrors::ReasonError(format!("serialize internal install AppDoc failed: {error}"))
         })?;
         let (canonical_app_doc_object_id, _) =
             build_named_object_by_json(buckyos_api::OBJ_TYPE_APP_DOC, &app_doc_value);
@@ -3450,21 +3570,14 @@ impl ControlPanelServer {
                 buckyos_api::InstallStage::Resolve,
                 buckyos_api::InstallErrorCode::VerificationFailed,
                 false,
-                "pre-install AppDID, structural owner or canonical AppDoc ObjectId is inconsistent",
+                "internal install AppDID, structural owner or canonical AppDoc ObjectId is inconsistent",
             )));
         }
-        let name_client = name_client::get_name_client().ok_or_else(|| {
-            RPCErrors::ReasonError("name client unavailable for pre-install authority".to_string())
-        })?;
-        name_client.set_local_authority_override(
-            pikg_app_doc.app_did().clone(),
-            name_client::DidDocType::Custom(
-                crate::app_install_resolver::APP_DID_DOC_TYPE.to_string(),
-            ),
-            name_lib::EncodedDocument::JsonLd(app_doc_value),
-            "rootfs-preinstall",
-            None,
-        );
+        let scope = match intent {
+            InternalInstall::Preinstall => "rootfs-preinstall",
+            InternalInstall::AgentRuntime { .. } => "agent-runtime",
+        };
+        register_app_doc_authority(pikg_app_doc.app_did(), app_doc_value, scope)?;
         let principal = RpcAuthPrincipal {
             username: owner_user_id.to_string(),
             owner_user_id: owner_user_id.to_string(),
@@ -3473,6 +3586,7 @@ impl ControlPanelServer {
             owner_did: String::new(),
             is_user_session: false,
             is_control_panel_session: true,
+            agent_permission_mode: None,
         };
         let mut options = serde_json::json!({
             "policy": "SYSTEM_INTERNAL",
@@ -3480,12 +3594,12 @@ impl ControlPanelServer {
         });
         if let Some(target) = seed.target.as_ref() {
             options["target"] = serde_json::to_value(target).map_err(|error| {
-                RPCErrors::ReasonError(format!("serialize pre-install target failed: {error}"))
+                RPCErrors::ReasonError(format!("serialize internal install target failed: {error}"))
             })?;
         }
         if let Some(install_params) = seed.install_params.as_ref() {
             options["install_params"] = serde_json::to_value(install_params).map_err(|error| {
-                RPCErrors::ReasonError(format!("serialize pre-install params failed: {error}"))
+                RPCErrors::ReasonError(format!("serialize internal install params failed: {error}"))
             })?;
         }
         let source = buckyos_api::InstallSource::local_pikg(staging_handle.to_string());
@@ -3498,7 +3612,7 @@ impl ControlPanelServer {
             }),
         );
         let planning_task_id =
-            Self::preinstall_intent_id(owner_user_id, app_id, pikg_digest, seed)?;
+            Self::internal_intent_id(intent, owner_user_id, app_id, pikg_digest, seed)?;
         let mut inspection = self
             .inspect_from_rpc(
                 &request,
@@ -3525,7 +3639,7 @@ impl ControlPanelServer {
                 buckyos_api::InstallStage::Inspect,
                 buckyos_api::InstallErrorCode::VerificationFailed,
                 false,
-                "pre-install map key, AppDID-derived AppId or owner scope does not match",
+                "internal install AppId or owner scope does not match the inspected plan",
             )));
         }
         match &inspection.plan.source_identity {
@@ -3540,7 +3654,7 @@ impl ControlPanelServer {
                     buckyos_api::InstallStage::Inspect,
                     buckyos_api::InstallErrorCode::VerificationFailed,
                     false,
-                    "pre-install PIKG digest or AppDoc identity does not bind the final plan",
+                    "internal install PIKG digest or AppDoc identity does not bind the final plan",
                 )))
             }
         }
@@ -3551,7 +3665,7 @@ impl ControlPanelServer {
                 buckyos_api::InstallStage::Inspect,
                 buckyos_api::InstallErrorCode::InvalidPackage,
                 false,
-                "pre-install plan has no selected packages or required contents",
+                "internal install plan has no selected packages or required contents",
             )));
         }
 
@@ -3559,7 +3673,7 @@ impl ControlPanelServer {
             .as_ref()
             .is_some_and(|spec| spec.deployment.app_doc_object_id == inspection.plan.app.object_id)
         {
-            return Ok(PreInstallSubmitOutcome {
+            return Ok(InternalInstallOutcome {
                 action: "satisfied".to_string(),
                 task_id: None,
                 app_instance_id: inspection.plan.app_instance_id,
@@ -3567,7 +3681,8 @@ impl ControlPanelServer {
             });
         }
 
-        let idempotency_key = Self::preinstall_idempotency_key(
+        let idempotency_key = Self::internal_idempotency_key(
+            intent,
             owner_user_id,
             app_id,
             pikg_digest,
@@ -3578,7 +3693,7 @@ impl ControlPanelServer {
             .await?
         {
             return self
-                .resume_preinstall_replay(
+                .resume_internal_replay(
                     &principal,
                     owner_user_id,
                     &inspection.plan.app_instance_id,
@@ -3591,11 +3706,12 @@ impl ControlPanelServer {
 
         request.params["idempotency_key"] = Value::String(idempotency_key.clone());
         request.params["plan"] = serde_json::to_value(&inspection.plan).map_err(|error| {
-            RPCErrors::ReasonError(format!("serialize pre-install plan failed: {error}"))
+            RPCErrors::ReasonError(format!("serialize internal install plan failed: {error}"))
         })?;
         request.params["approved_plan_fingerprint"] =
             Value::String(inspection.plan.plan_fingerprint.clone());
-        self.handle_apps_submit(request, Some(&principal)).await?;
+        self.submit_app(request, Some(&principal), intent.origin())
+            .await?;
         let task = self
             .find_app_submit_replay(&principal, idempotency_key.as_str())
             .await?
@@ -3604,7 +3720,7 @@ impl ControlPanelServer {
                     "apps.submit succeeded without a persisted install task".to_string(),
                 )
             })?;
-        Ok(PreInstallSubmitOutcome {
+        Ok(InternalInstallOutcome {
             action: if installed.is_some() {
                 "upgrade".to_string()
             } else {
@@ -3616,11 +3732,20 @@ impl ControlPanelServer {
         })
     }
 
-    /// Authoritative six-cell action matrix for first install/upgrade/satisfied.
     pub(crate) async fn handle_apps_submit(
         &self,
         req: RPCRequest,
         principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        self.submit_app(req, principal, AppSubmitOrigin::Rpc).await
+    }
+
+    /// Authoritative six-cell action matrix for first install/upgrade/satisfied.
+    async fn submit_app(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+        origin: AppSubmitOrigin,
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
         let idempotency_key = Self::require_param_str(&req, "idempotency_key")?;
@@ -3694,6 +3819,23 @@ impl ControlPanelServer {
                     buckyos_api::InstallErrorCode::PlanStale,
                     false,
                     "submitted plan no longer matches authoritative source inspection",
+                )));
+            }
+        }
+        match app_submit_route(inspection.plan.app_doc.get_app_type(), origin) {
+            AppSubmitRoute::Install => {}
+            AppSubmitRoute::RegisterAgentTemplate => {
+                let result = self
+                    .register_agent_template(&req, principal, &inspection)
+                    .await?;
+                return Ok(RPCResponse::new(RPCResult::Success(result), req.seq));
+            }
+            AppSubmitRoute::Reject => {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::ConfigBlocked,
+                    false,
+                    "Agent templates cannot be pre-installed as Apps, and Agent runtime installs must be Agent Apps",
                 )));
             }
         }
@@ -4235,7 +4377,9 @@ mod submit_action_tests {
             "bob"
         )
         .is_err());
-        assert!(parse_installed_spec(&key, "{}", &app_instance_id, &spec.app_did, "alice").is_err());
+        assert!(
+            parse_installed_spec(&key, "{}", &app_instance_id, &spec.app_did, "alice").is_err()
+        );
     }
 
     fn device_principal() -> RpcAuthPrincipal {
@@ -4247,6 +4391,7 @@ mod submit_action_tests {
             owner_did: "did:bns:devtest".to_string(),
             is_user_session: false,
             is_control_panel_session: false,
+            agent_permission_mode: None,
         }
     }
 
@@ -4353,15 +4498,19 @@ mod submit_action_tests {
     }
 
     #[test]
-    fn preinstall_intent_and_idempotency_bind_immutable_inputs() {
+    fn internal_intent_and_idempotency_bind_immutable_inputs() {
         let app_id = buckyos_api::AppId::parse("demo.buckyos.bns.did").unwrap();
         let seed = buckyos_api::PreInstallPlanSeed::default();
+        let pre = InternalInstall::Preinstall;
         let first =
-            ControlPanelServer::preinstall_intent_id("alice", &app_id, "digest-a", &seed).unwrap();
+            ControlPanelServer::internal_intent_id(pre, "alice", &app_id, "digest-a", &seed)
+                .unwrap();
         let replay =
-            ControlPanelServer::preinstall_intent_id("alice", &app_id, "digest-a", &seed).unwrap();
+            ControlPanelServer::internal_intent_id(pre, "alice", &app_id, "digest-a", &seed)
+                .unwrap();
         let changed =
-            ControlPanelServer::preinstall_intent_id("alice", &app_id, "digest-b", &seed).unwrap();
+            ControlPanelServer::internal_intent_id(pre, "alice", &app_id, "digest-b", &seed)
+                .unwrap();
         assert_eq!(first, replay);
         assert_ne!(first, changed);
         assert_eq!(first.len(), 34);
@@ -4369,17 +4518,118 @@ mod submit_action_tests {
         assert!(first[2..].bytes().all(|byte| byte.is_ascii_hexdigit()
             && (!byte.is_ascii_alphabetic() || byte.is_ascii_lowercase())));
 
-        let first_key =
-            ControlPanelServer::preinstall_idempotency_key("alice", &app_id, "digest-a", "plan-a");
-        let changed_key =
-            ControlPanelServer::preinstall_idempotency_key("alice", &app_id, "digest-a", "plan-b");
+        let first_key = ControlPanelServer::internal_idempotency_key(
+            pre, "alice", &app_id, "digest-a", "plan-a",
+        );
+        let changed_key = ControlPanelServer::internal_idempotency_key(
+            pre, "alice", &app_id, "digest-a", "plan-b",
+        );
         assert_ne!(first_key, changed_key);
 
-        let retry = ControlPanelServer::preinstall_retry_idempotency_key("task-a", "plan-a");
-        let retry_replay = ControlPanelServer::preinstall_retry_idempotency_key("task-a", "plan-a");
-        let next_retry = ControlPanelServer::preinstall_retry_idempotency_key("task-b", "plan-a");
+        let old_agent = ObjId::new_by_raw("agentdoc".to_string(), vec![1; 32]);
+        let new_agent = ObjId::new_by_raw("agentdoc".to_string(), vec![2; 32]);
+        let old_runtime = InternalInstall::AgentRuntime {
+            agent_doc_object_id: &old_agent,
+            supersedes: None,
+        };
+        let new_runtime = InternalInstall::AgentRuntime {
+            agent_doc_object_id: &new_agent,
+            supersedes: None,
+        };
+        let retried_runtime = InternalInstall::AgentRuntime {
+            agent_doc_object_id: &old_agent,
+            supersedes: Some("t-failed"),
+        };
+        assert_ne!(
+            ControlPanelServer::internal_intent_id(old_runtime, "alice", &app_id, "digest-a", &seed)
+                .unwrap(),
+            ControlPanelServer::internal_intent_id(
+                retried_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                &seed
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            ControlPanelServer::internal_intent_id(
+                old_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                &seed
+            )
+            .unwrap(),
+            ControlPanelServer::internal_intent_id(
+                new_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                &seed
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            ControlPanelServer::internal_idempotency_key(
+                old_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                "plan-a"
+            ),
+            ControlPanelServer::internal_idempotency_key(
+                new_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                "plan-a"
+            )
+        );
+        assert_ne!(
+            first_key,
+            ControlPanelServer::internal_idempotency_key(
+                old_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                "plan-a"
+            )
+        );
+
+        let retry = ControlPanelServer::internal_retry_idempotency_key("task-a", "plan-a");
+        let retry_replay = ControlPanelServer::internal_retry_idempotency_key("task-a", "plan-a");
+        let next_retry = ControlPanelServer::internal_retry_idempotency_key("task-b", "plan-a");
         assert_eq!(retry, retry_replay);
         assert_ne!(retry, next_retry);
+    }
+
+    #[test]
+    fn agent_pikg_submit_registers_template_unless_it_is_the_agent_runtime() {
+        assert_eq!(
+            app_submit_route(AppType::Agent, AppSubmitOrigin::Rpc),
+            AppSubmitRoute::RegisterAgentTemplate
+        );
+        assert_eq!(
+            app_submit_route(AppType::Agent, AppSubmitOrigin::AgentRuntime),
+            AppSubmitRoute::Install
+        );
+        assert_eq!(
+            app_submit_route(AppType::Agent, AppSubmitOrigin::Preinstall),
+            AppSubmitRoute::Reject
+        );
+        assert_eq!(
+            app_submit_route(AppType::Web, AppSubmitOrigin::Rpc),
+            AppSubmitRoute::Install
+        );
+        assert_eq!(
+            app_submit_route(AppType::AppService, AppSubmitOrigin::Preinstall),
+            AppSubmitRoute::Install
+        );
+        assert_eq!(
+            app_submit_route(AppType::Web, AppSubmitOrigin::AgentRuntime),
+            AppSubmitRoute::Reject
+        );
     }
 }
 
@@ -4683,32 +4933,6 @@ mod tests {
     }
 
     #[test]
-    fn publish_example_agent_skills_is_rejected() {
-        let installer = test_installer();
-        let template = AppDoc::builder(
-            AppType::Agent,
-            "demo-agent-skills",
-            "0.1.0",
-            "tester",
-            &test_owner(),
-        )
-        .agent_pkg(SubPkgDesc::new("tester_demo-agent-skills-agent#0.1.0"))
-        .agent_skills_pkg(SubPkgDesc::new("tester_demo-agent-skills-skills#0.1.0"))
-        .build()
-        .expect("build agent template with skills");
-        let dir = temp_test_dir("agent-skills-rejected");
-        std::fs::write(dir.join("prompt.md"), "hello").expect("write prompt");
-
-        let error = match installer.scan_publish_sources(AppType::Agent, &dir, &template) {
-            Ok(_) => panic!("agent skills should be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("agent_skills"));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn publish_example_agent_sub_pkg_meta_can_be_viewed_locally() {
         let installer = test_installer();
         let template = build_agent_template();
@@ -4741,5 +4965,138 @@ mod tests {
         assert_eq!(sub_pkg_meta.name, "tester_demo-agent-agent");
         assert!(final_doc._base.content.is_empty());
         assert_eq!(final_doc._base.size, 0);
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use name_lib::DID;
+
+    fn test_installer() -> AppInstaller {
+        AppInstaller::new()
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{}-{}", prefix, Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn pinned(pkg_id: &str) -> SubPkgDesc {
+        SubPkgDesc::new(pkg_id)
+            .package_meta_object_id(ObjId::new_by_raw("pkg".to_string(), vec![1; 32]))
+    }
+
+    fn build_agent_skills_template() -> AppDoc {
+        AppDoc::builder(
+            AppType::Agent,
+            "demo-agent-skills",
+            "0.1.0",
+            "tester",
+            &DID::from_str("did:bns:tester").expect("parse test did"),
+        )
+        .agent_pkg(pinned("all.agent.demo-agent-skills.tester.bns.did#0.1.0"))
+        .agent_skills_pkg(pinned(
+            "all.agent_skills.demo-agent-skills.tester.bns.did#0.1.0",
+        ))
+        .build()
+        .expect("build agent template with skills")
+    }
+
+    #[test]
+    fn publish_example_agent_skills_come_from_their_sub_dir() {
+        let installer = test_installer();
+        let template = build_agent_skills_template();
+        let dir = temp_test_dir("agent-skills-publish");
+        std::fs::write(dir.join("prompt.md"), "hello").expect("write prompt");
+
+        let error = match installer.scan_publish_sources(AppType::Agent, &dir, &template) {
+            Ok(_) => panic!("agent skills without their directory should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("agent_skills"));
+
+        let skills_dir = dir.join(AGENT_SKILLS_PUBLISH_DIR);
+        std::fs::create_dir_all(skills_dir.join("cmd_skills")).expect("create skills dir");
+        let scan_plan = installer
+            .scan_publish_sources(AppType::Agent, &dir, &template)
+            .expect("scan agent with skills");
+        assert_eq!(scan_plan.sub_pkgs.len(), 2);
+        assert_eq!(scan_plan.sub_pkgs[0].key, "agent");
+        match &scan_plan.sub_pkgs[0].source {
+            PackageSource::DirectoryExcept { path, exclude } => {
+                assert_eq!(path, &dir);
+                assert_eq!(exclude, &skills_dir);
+            }
+            other => panic!("unexpected source: {:?}", std::mem::discriminant(other)),
+        }
+        assert_eq!(scan_plan.sub_pkgs[1].key, "agent_skills");
+        match &scan_plan.sub_pkgs[1].source {
+            PackageSource::Directory(path) => assert_eq!(path, &skills_dir),
+            other => panic!("unexpected source: {:?}", std::mem::discriminant(other)),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn publish_agent_payload_leaves_out_the_skills_dir() {
+        let installer = test_installer();
+        let dir = temp_test_dir("agent-skills-tar");
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join(AGENT_SKILLS_PUBLISH_DIR).join("cmd_skills"))
+            .expect("create skills dir");
+        std::fs::write(src.join("prompt.md"), "hello").expect("write prompt");
+        std::fs::write(
+            src.join(AGENT_SKILLS_PUBLISH_DIR)
+                .join("cmd_skills")
+                .join("hello.md"),
+            "hello",
+        )
+        .expect("write skill");
+        let tarball = dir.join("agent.tar.gz");
+        installer
+            .create_tar_gz(&src, Some(&src.join(AGENT_SKILLS_PUBLISH_DIR)), &tarball)
+            .await
+            .expect("create agent tar");
+
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(
+            StdFile::open(&tarball).expect("open tar"),
+        ));
+        let paths: Vec<String> = archive
+            .entries()
+            .expect("tar entries")
+            .map(|entry| {
+                entry
+                    .expect("tar entry")
+                    .path()
+                    .expect("entry path")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(paths, vec!["prompt.md".to_string()]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn publish_example_agent_tools_is_rejected() {
+        let installer = test_installer();
+        let mut template = build_agent_skills_template();
+        template.pkg_list.agent_tools = Some(pinned(
+            "all.agent_tools.demo-agent-skills.tester.bns.did#0.1.0",
+        ));
+        let dir = temp_test_dir("agent-tools-rejected");
+        std::fs::create_dir_all(dir.join(AGENT_SKILLS_PUBLISH_DIR)).expect("create skills dir");
+
+        let error = match installer.scan_publish_sources(AppType::Agent, &dir, &template) {
+            Ok(_) => panic!("agent tools should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("agent_tools"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

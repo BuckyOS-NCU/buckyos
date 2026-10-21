@@ -32,6 +32,8 @@ pub struct Shared {
     pub dir: SessionDir,
     /// `self_improve` lease of a self-improve session.
     pub kind_lease: Mutex<Option<Arc<Lease>>>,
+    pub workspace_lease: Mutex<Option<Arc<Lease>>>,
+    pub workspace_failure: Mutex<Option<String>>,
     /// Task resolver of the run opened last in this drive: answers for the
     /// background tasks the session still follows after that run ended.
     pub tasks: Mutex<Option<Arc<dyn RunningTaskResolver>>>,
@@ -43,6 +45,12 @@ pub struct Shared {
     pub task_status: Mutex<Option<(String, super::turn_task::TurnTaskStatus)>>,
     /// Serializes hand-overs of the outbox.
     pub flush: tokio::sync::Mutex<()>,
+    /// The driving process's stop was applied to a Goal Session's
+    /// Activation (once per drive).
+    pub external_stop_applied: std::sync::atomic::AtomicBool,
+    /// Functions that run a sub context (`call_behavior` and the behaviors'
+    /// `[tool]` names) offered to the runs of this drive.
+    pub behavior_functions: Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// A Turn closed by a commit of this drive.
@@ -115,13 +123,21 @@ impl WaitingRun {
             .collect()
     }
 
-    /// Earliest `until_ms` of the suspended calls.
+    /// Earliest `until_ms` of the suspended calls (a question asked through
+    /// a notification: its deadline).
     pub(super) fn deadline_ms(&self) -> Option<u64> {
         self.snapshot
             .state
             .pending_calls()
             .iter()
-            .filter_map(|p| p.until_ms)
+            .filter_map(|p| {
+                p.until_ms.or_else(|| {
+                    p.task_id
+                        .strip_prefix(USER_INPUT_TASK_PREFIX)
+                        .and_then(|c| self.run.ask_notify(c))
+                        .map(|a| a.deadline_ms)
+                })
+            })
             .min()
     }
 }

@@ -1,10 +1,11 @@
 import { z } from 'zod'
 import type { MessageObject } from './protocol/msgobj'
-import type { MessageHubStore } from './store/types'
-import type { Entity, GroupInvitation, GroupMember, GroupRole, GroupSessionParticipant, MessageHubContext } from './types'
+import type { GroupInvitation, GroupMember, GroupRole, GroupSessionParticipant } from './types'
 
 export const GROUP_INVITATION_INTENT = 'buckyos.group_invitation'
 export const GROUP_MEMBER_LIMIT = 100
+/** A group holds single native identities: people and Agents, never another group or an external account. */
+export const GROUP_MEMBER_KINDS: Array<'user' | 'agent'> = ['user', 'agent']
 
 export const createGroupSchema = z.object({
   name: z.string().trim().max(64),
@@ -33,34 +34,6 @@ export function defaultGroupName(memberNames: string[]): string {
   if (names.length === 0) return ''
   const head = names.slice(0, 3).join(', ')
   return names.length > 3 ? `${head} +${names.length - 3}` : head
-}
-
-/**
- * People and agents reachable over a native BuckyOS connection. A group only
- * accepts single-entity DIDs (user, agent, device): nested groups and DID
- * Collections are deferred (v2 §13), so another group is never a candidate.
- */
-export function groupMemberCandidates(entities: Entity[], ownerDid: string, hasNative: (entity: Entity) => boolean, blocked: (entity: Entity) => boolean = () => false): Entity[] {
-  const seen = new Set<string>()
-  const result: Entity[] = []
-  const visit = (entity: Entity) => {
-    if (seen.has(entity.id)) return
-    seen.add(entity.id)
-    if ((entity.type === 'person' || entity.type === 'agent') && entity.id !== ownerDid && entity.id.startsWith('did:') && !entity.id.startsWith('did:msgtunnel:') && hasNative(entity) && !blocked(entity)) result.push(entity)
-    entity.children?.forEach(visit)
-  }
-  entities.forEach(visit)
-  return result.sort((a, b) => a.name.localeCompare(b.name))
-}
-
-/** Group member candidates of the owner's contact list, as offered by the member picker. */
-export function memberCandidates(store: MessageHubStore, context: MessageHubContext): Entity[] {
-  return groupMemberCandidates(
-    store.entities(context),
-    context.ownerDid,
-    entity => store.connections(context, entity.id).some(choice => choice.binding.kind === 'native'),
-    entity => store.admission(context, entity.id)?.accessLevel === 'block',
-  )
 }
 
 /** A personal group notification (`invite`, `pending_approval`, `rejected`, `removed`, `owner_transfer`, `session_invite`, `session_removed`). */
@@ -106,10 +79,17 @@ export function parseGroupInvitation(message: MessageObject): GroupInvitation | 
   return parseGroupNotice(message)?.invitation ?? null
 }
 
-const knownGroupErrors = new Set(['capability-denied', 'member-already-participating', 'member-must-be-single-entity', 'member-limit', 'owner-must-transfer-first', 'owner-required', 'controller-required', 'role-not-allowed', 'invite-expired', 'invite-already-expired', 'invitation-mismatch', 'transfer-mismatch', 'owner-transfer-pending', 'agent-owner-required', 'invite-required', 'join-not-allowed', 'member-not-pending', 'use-transfer-owner', 'cannot-moderate-owner', 'revision-conflict', 'invalid-invite-link', 'guests-not-allowed', 'guest-limit', 'not-a-session-guest', 'session-archived', 'post-not-allowed', 'not-found', 'blocked', 'rate-limited', 'invalid-group-name', 'session-limit'])
+const knownGroupErrors = new Set(['agent-group-disabled', 'capability-denied', 'member-already-participating', 'member-must-be-single-entity', 'member-limit', 'owner-must-transfer-first', 'owner-required', 'controller-required', 'role-not-allowed', 'invite-expired', 'invite-already-expired', 'invitation-mismatch', 'transfer-mismatch', 'owner-transfer-pending', 'agent-owner-required', 'invite-required', 'join-not-allowed', 'member-not-pending', 'use-transfer-owner', 'cannot-moderate-owner', 'revision-conflict', 'invalid-invite-link', 'guests-not-allowed', 'guest-limit', 'not-a-session-guest', 'session-archived', 'post-not-allowed', 'not-found', 'blocked', 'rate-limited', 'invalid-group-name', 'session-limit'])
+
+/** The Agent has not been allowed to join group chats (its Users and Agents setting). */
+export function isAgentGroupDisabled(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes('agent-group-disabled') || message.includes('agent_group_disabled')
+}
 
 /** User-facing text for a group operation failure; unknown host reasons are shown verbatim. */
 export function groupErrorText(t: (key: string, fallback?: string, variables?: Record<string, string | number>) => string, error: unknown): string {
+  if (isAgentGroupDisabled(error)) return t('messagehub.groupError.agent-group-disabled')
   const message = error instanceof Error ? error.message : String(error)
   const reason = message.replace(/^rejected:\s*/, '').match(/[a-z0-9]+(?:-[a-z0-9]+)+/)?.[0] ?? (message === 'agent_observer' ? 'agent_observer' : 'unknown')
   if (reason === 'agent_observer') return t('messagehub.reason.agent_observer')
@@ -119,14 +99,6 @@ export function groupErrorText(t: (key: string, fallback?: string, variables?: R
 /** Text of an invite link: the group DID plus the token issued by `group.create_invite_link`. */
 export function formatInviteLink(groupDid: string, token: string): string {
   return `${groupDid}?invite=${encodeURIComponent(token)}`
-}
-
-/** A pasted invite link (or a bare group DID, which asks to join without a token). */
-export function parseInviteLink(input: string): { groupDid: string; invite?: string } | null {
-  const trimmed = input.trim()
-  const match = trimmed.match(/^(did:[^?\s]+)(?:\?invite=([^&\s]+))?$/)
-  if (!match) return null
-  return match[2] ? { groupDid: match[1], invite: decodeURIComponent(match[2]) } : { groupDid: match[1] }
 }
 
 /** Whether an edit / recall window (`EditRule`) still allows acting on a message sent at `start`. */

@@ -481,6 +481,7 @@ impl AgentTool for Spawn {
                 "wait": { "type": "boolean" }, "key": { "type": "string" },
                 "interactive": { "type": "boolean" }, "post_to": { "type": "string" },
                 "behavior": { "type": "string" },
+                "parent_objective": { "type": "string" },
                 "text": { "type": "string" } } }),
             output_schema: json!({ "type": "object" }),
             usage: None,
@@ -496,7 +497,12 @@ impl AgentTool for Spawn {
         _ctx: &SessionRuntimeContext,
         args: Value,
     ) -> Result<AgentToolResult, AgentToolError> {
-        let text = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let text = |k: &str| {
+            args.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
         // `post`: answer a sub session that waits for input.
         if let Some(to) = args.get("post_to").and_then(Value::as_str) {
             let input = msg(text("text"));
@@ -515,9 +521,28 @@ impl AgentTool for Spawn {
             behavior: args.get("behavior").and_then(Value::as_str).map(str::to_string),
             ..Default::default()
         };
-        let sd = create_sub_session(self.agent.as_ref(), APP, &self.parent, sub, self.channels.as_ref())
-            .await
-            .map_err(|e| AgentToolError::ExecFailed(e.to_string()))?;
+        let parent = if let Some(objective) = args.get("parent_objective").and_then(Value::as_str) {
+            self.agent
+                .sessions()
+                .query(&RegistryQuery::default())
+                .await
+                .map_err(|error| AgentToolError::ExecFailed(error.to_string()))?
+                .into_iter()
+                .find(|entry| entry.objective == objective)
+                .map(|entry| entry.session_id)
+                .ok_or_else(|| AgentToolError::ExecFailed("parent objective not found".into()))?
+        } else {
+            self.parent.clone()
+        };
+        let sd = create_sub_session(
+            self.agent.as_ref(),
+            APP,
+            &parent,
+            sub,
+            self.channels.as_ref(),
+        )
+        .await
+        .map_err(|e| AgentToolError::ExecFailed(e.to_string()))?;
         let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
         let mut r = AgentToolResult::from_details(json!({ "session_id": sd.sid(), "status": "created" }))
             .with_tool("spawn")
@@ -549,6 +574,7 @@ fn spawn_host(env: &Env, llm: Arc<dyn LlmClient>, parent: &SessionDir) -> HostDe
         xllm,
         assembler: Arc::new(libopendan::runner::DefaultAssembler::default()),
         session_cli: None,
+        session_helpers: Vec::new(),
         app_tools: Vec::new(),
         options: RunnerOptions {
             poll_interval: Duration::from_millis(50),
@@ -559,7 +585,9 @@ fn spawn_host(env: &Env, llm: Arc<dyn LlmClient>, parent: &SessionDir) -> HostDe
         max_child_concurrency: 4,
         bridges: Vec::new(),
         outbound: None,
+        objects: None,
         turn_tasks: None,
+        notify: None,
         runtime_id: None,
     }
 }
@@ -726,9 +754,8 @@ async fn sub_session_limits_and_unreported_children() {
     assert_eq!(ccfg.session.origin.as_ref().unwrap().parent_session.as_deref(), Some(parent.sid()));
     assert_eq!(ccfg.session.driver.principal, APP);
     assert!(
-        matches!(&ccfg.workspace, Some(WorkspaceRef::External { path }) if path.ends_with(parent.sid())),
-        "shares the parent's working directory: {:?}",
-        ccfg.workspace
+        ccfg.workspace.is_none(),
+        "an unbound child uses its own SessionDir"
     );
     // The parent finishes without waiting for a child that does not report.
     let llm = ScriptedLlm::new(|_, _| text("done alone"));
@@ -755,7 +782,7 @@ async fn a_stopped_parent_stops_its_sub_sessions() {
             post_blocking(
                 &qd,
                 &q,
-                PostedInput::control(APP, "stop-1", ControlCommand::Stop { reason: None }),
+                PostedInput::control(APP, "stop-1", ControlCommand::stop(None)),
             );
             return tool_call("p1", "shell", json!({ "command": "sleep 30" }));
         }
@@ -842,7 +869,7 @@ async fn semi_snapshot_precedes_a_context_switch_input() {
                 "{snapshot}"
             );
             assert!(input.contains("hook=\"on_context_switch\""), "{input}");
-            text("<response><report><![CDATA[reviewed]]></report></response>")
+            text("<response><report end=\"true\"><![CDATA[reviewed]]></report></response>")
         }
     });
     let r = drive(&sd, &env.deps(llm.clone()), StopWhen::TurnClosed).await;
@@ -853,7 +880,11 @@ async fn semi_snapshot_precedes_a_context_switch_input() {
     let switched = read_worklog(&sd)
         .into_iter()
         .find_map(|e| match e.body {
-            WorklogBody::InputBatch { hook, events, .. } if hook.as_deref() == Some("on_context_switch") => Some(events),
+            WorklogBody::InputBatch { hook, events, .. }
+                if hook.as_deref() == Some("on_context_switch") =>
+            {
+                Some(events)
+            }
             _ => None,
         })
         .expect("a hand-over batch");
@@ -873,7 +904,7 @@ async fn an_interactive_sub_session_asks_its_parent() {
         if is_child(req) {
             // Behavior loop of the child: ask, then deliver.
             return if all.contains("the color is blue") {
-                text("<response><report><![CDATA[painted blue]]></report></response>")
+                text("<response><report end=\"true\"><![CDATA[painted blue]]></report></response>")
             } else {
                 text("<response><report><![CDATA[which color?]]></report><next_behavior>WAIT_USER_MSG</next_behavior></response>")
             };
@@ -963,9 +994,25 @@ async fn progress_is_observed_and_the_parent_waits_for_children() {
     .await
     .unwrap();
     // The child asks without delivering anything: its Turn stays open.
-    let child_llm = ScriptedLlm::new(|_, _| text("<response><next_behavior>WAIT_USER_MSG</next_behavior></response>"));
-    let r = drive(&child, &frozen_deps(&env, agent.clone(), child_llm), StopWhen::Idle).await;
-    assert!(matches!(r, DriveResult::Idle { run_state: RunState::Waiting, .. }), "{r:?}");
+    let child_llm = ScriptedLlm::new(|_, _| {
+        text("<response><next_behavior>WAIT_USER_MSG</next_behavior></response>")
+    });
+    let r = drive(
+        &child,
+        &frozen_deps(&env, agent.clone(), child_llm),
+        StopWhen::Idle,
+    )
+    .await;
+    assert!(
+        matches!(
+            r,
+            DriveResult::Idle {
+                run_state: RunState::Waiting,
+                ..
+            }
+        ),
+        "{r:?}"
+    );
     let entry = agent.sessions().lookup(child.sid()).await.unwrap().unwrap();
     assert_eq!(entry.status.waiting_for, Some(WaitingKind::Input));
     assert!(entry.status.turn_open);
@@ -1035,6 +1082,422 @@ async fn the_timer_bridge_posts_subscribed_events() {
         text("tock")
     });
     let r = drive(&sd, &env.deps(llm.clone()), StopWhen::TurnClosed).await;
-    assert!(matches!(r, DriveResult::TurnClosed { status: TurnStatus::Completed, .. }), "{r:?}");
+    assert!(
+        matches!(
+            r,
+            DriveResult::TurnClosed {
+                status: TurnStatus::Completed,
+                ..
+            }
+        ),
+        "{r:?}"
+    );
     assert_eq!(llm.count(), 1);
+}
+
+#[tokio::test]
+async fn a_waited_child_hands_the_workspace_back_to_its_parent() {
+    let env = Env::new();
+    let directory = env.root.join("shared-project");
+    std::fs::create_dir(&directory).unwrap();
+    let mut spec = parent_spec("delegate within one workspace and wait");
+    spec.workspace = Some(env.workspace(&directory).await);
+    let parent = env.create_work(spec).await;
+    let llm = ScriptedLlm::new(|req, _| {
+        if is_child(req) {
+            if has_tool_result(req, "child-write").is_some() {
+                return text("child updated the project");
+            }
+            return tool_call(
+                "child-write",
+                "shell",
+                json!({"command":"echo child > handover.txt"}),
+            );
+        }
+        if has_tool_result(req, "parent-write").is_some() {
+            return text("parent completed the project");
+        }
+        match has_tool_result(req, "delegate") {
+            Some(result) => {
+                assert!(result.contains("child updated the project"), "{result}");
+                tool_call(
+                    "parent-write",
+                    "shell",
+                    json!({"command":"echo parent >> handover.txt"}),
+                )
+            }
+            None => tool_call(
+                "delegate",
+                "spawn",
+                json!({
+                    "objective":"child work", "report":"final", "wait":true, "key":"handover",
+                }),
+            ),
+        }
+    });
+    let mut host = spawn_host(&env, llm.clone(), &parent);
+    host.options.max_wait = Duration::from_millis(100);
+    let parent_deps = host.runner_deps(&parent, StopSignal::default()).unwrap();
+    let waiting = drive(&parent, &parent_deps, StopWhen::TurnClosed).await;
+    assert!(
+        matches!(waiting, DriveResult::TurnOpen { .. }),
+        "{waiting:?}"
+    );
+    let children = host
+        .agent
+        .sessions()
+        .children_of(&[parent.sid().into()])
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 1);
+    let child = SessionDir::open(&children[0].location).unwrap();
+    assert_eq!(
+        parent.config().unwrap().workspace,
+        child.config().unwrap().workspace
+    );
+    let child_deps = host.runner_deps(&child, StopSignal::default()).unwrap();
+    let lease = parent
+        .acquire(parent_deps.holder())
+        .unwrap()
+        .into_result("parent")
+        .unwrap();
+    assert!(matches!(
+        drive(&child, &child_deps, StopWhen::Finished).await,
+        DriveResult::Busy { .. }
+    ));
+    let run_id = parent.state().unwrap().live_run.unwrap().run_id;
+    let original = parent.runs().record(&run_id).unwrap();
+    let mut unsafe_record = original.clone();
+    let mut unresolved = unsafe_record.inflight[0].clone();
+    unresolved.call_id = "unresolved-background-write".into();
+    unresolved.tool = "shell".into();
+    unresolved.args = "{}".into();
+    unsafe_record.inflight.push(unresolved);
+    {
+        let _run_lock = parent.runs().try_lock(&run_id).unwrap().unwrap();
+        parent.runs().store().write_record(&unsafe_record).unwrap();
+    }
+    drop(lease);
+    assert!(matches!(
+        drive(&child, &child_deps, StopWhen::Finished).await,
+        DriveResult::Busy { .. }
+    ));
+    assert_eq!(llm.count(), 1);
+    {
+        let _lease = parent
+            .acquire(parent_deps.holder())
+            .unwrap()
+            .into_result("parent")
+            .unwrap();
+        let _run_lock = parent.runs().try_lock(&run_id).unwrap().unwrap();
+        parent.runs().store().write_record(&original).unwrap();
+    }
+    let child_result = drive(&child, &child_deps, StopWhen::Finished).await;
+    assert!(
+        matches!(
+            child_result,
+            DriveResult::Finished {
+                outcome: Some(Outcome::Succeeded),
+                ..
+            }
+        ),
+        "{child_result:?}"
+    );
+    let result = drive(&parent, &parent_deps, StopWhen::TurnClosed).await;
+    assert!(
+        matches!(
+            result,
+            DriveResult::TurnClosed {
+                status: TurnStatus::Completed,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.join("handover.txt")).unwrap(),
+        "child\nparent\n"
+    );
+    assert_eq!(llm.count(), 5);
+}
+
+#[tokio::test]
+async fn the_host_completes_a_workspace_delegation_chain_without_wait_timeouts() {
+    let env = Env::new();
+    let directory = env.root.join("shared-project");
+    std::fs::create_dir(&directory).unwrap();
+    let mut spec = parent_spec("root work");
+    spec.workspace = Some(env.workspace(&directory).await);
+    let parent = env.create_work(spec).await;
+    let llm = ScriptedLlm::new(|req, _| {
+        let system = system_of(req);
+        if system.contains("grandchild work") {
+            return if has_tool_result(req, "write-c").is_some() {
+                text("grandchild finished")
+            } else {
+                tool_call(
+                    "write-c",
+                    "shell",
+                    json!({"command":"echo grandchild > handover.txt"}),
+                )
+            };
+        }
+        let (delegate, write, objective, command, answer) = if system.contains("child work") {
+            (
+                "delegate-c",
+                "write-b",
+                "grandchild work",
+                "echo child >> handover.txt",
+                "child finished",
+            )
+        } else {
+            (
+                "delegate-b",
+                "write-a",
+                "child work",
+                "echo parent >> handover.txt",
+                "parent finished",
+            )
+        };
+        if has_tool_result(req, write).is_some() {
+            return text(answer);
+        }
+        if has_tool_result(req, delegate).is_some() {
+            return tool_call(write, "shell", json!({"command":command}));
+        }
+        tool_call(
+            delegate,
+            "spawn",
+            json!({"objective":objective,"report":"final","wait":true,"key":delegate,
+                "parent_objective": if system.contains("child work") { Some("child work") } else { None },
+            }),
+        )
+    });
+    let mut host = spawn_host(&env, llm.clone(), &parent);
+    host.options.max_wait = RunnerOptions::default().max_wait;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        run_session(
+            &host,
+            &parent,
+            StopWhen::TurnClosed,
+            StopSignal::default(),
+            false,
+        ),
+    )
+    .await;
+    let result = result.expect("workspace handoff must not wait for max_wait");
+    assert!(
+        matches!(
+            result.result,
+            DriveResult::TurnClosed {
+                status: TurnStatus::Completed,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    assert!(result.children.is_empty(), "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("handover.txt")).unwrap(),
+        "grandchild\nchild\nparent\n"
+    );
+    assert_eq!(llm.count(), 8);
+}
+
+#[tokio::test]
+async fn stopping_a_workspace_handoff_interrupts_the_child_and_parent() {
+    let env = Env::new();
+    let directory = env.root.join("shared-project");
+    std::fs::create_dir(&directory).unwrap();
+    let mut spec = parent_spec("wait for child until stopped");
+    spec.workspace = Some(env.workspace(&directory).await);
+    let parent = env.create_work(spec).await;
+    let llm = ScriptedLlm::new(|req, _| {
+        if is_child(req) {
+            return tool_call(
+                "child-long-write",
+                "shell",
+                json!({"command":"touch child-started; sleep 30"}),
+            );
+        }
+        tool_call(
+            "delegate",
+            "spawn",
+            json!({"objective":"child work","wait":true,"report":"final","key":"cancel"}),
+        )
+    });
+    let mut host = spawn_host(&env, llm, &parent);
+    host.options.max_wait = RunnerOptions::default().max_wait;
+    let stop = StopSignal::default();
+    let child_stop = stop.clone();
+    let driven = parent.clone();
+    let run = tokio::spawn(async move {
+        run_session(&host, &driven, StopWhen::TurnClosed, child_stop, false).await
+    });
+    for _ in 0..100 {
+        if directory.join("child-started").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(directory.join("child-started").exists());
+    stop.request();
+    let result = tokio::time::timeout(Duration::from_secs(3), run)
+        .await
+        .expect("stop cannot wait for the handoff timeout")
+        .unwrap();
+    assert!(
+        matches!(
+            result.result,
+            DriveResult::TurnClosed {
+                status: TurnStatus::Stopped,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    assert_eq!(parent.state().unwrap().outcome, Some(Outcome::Stopped));
+    assert!(result.children.is_empty(), "{result:?}");
+}
+
+fn skill_names(sd: &SessionDir) -> Vec<String> {
+    sd.config()
+        .unwrap()
+        .prompt
+        .frozen
+        .map(|f| f.cmd_skills.into_iter().map(|c| c.name).collect())
+        .unwrap_or_default()
+}
+
+async fn system_text_of(sd: &SessionDir) -> String {
+    use libopendan::runner::SessionAssembler;
+    BehaviorAssembler::default()
+        .system_text(&sd.config().unwrap(), None)
+        .await
+        .unwrap()
+}
+
+/// cmd_skills (opendan-builtin-cmd-skills-todo I01–I04): a work session
+/// takes the manuals chosen when it is created — known names, each once, at
+/// most 8 — frozen in that order and rendered as `## Commands` without
+/// their front matter. A Work's sub session inherits its choice, a
+/// conversation's manual is never inherited, a Todo's `--skill` replaces
+/// it. Installing, changing or removing a manual reaches new sessions only.
+#[tokio::test]
+async fn work_sessions_take_the_cmd_skills_chosen_at_creation() {
+    let env = Env::new();
+    write_catalog(&env);
+    write(&env.agent_root.join("behaviors/explore.toml"), "[prompt]\nmode = \"behavior\"\nsystem = \"EXPLORE\"\n");
+    write(
+        &env.agent_root.join("cmd_skills/admin.md"),
+        "---\nname: admin\ndescription: settings and diagnosis\nrequires: the buckyos command\n---\nADMIN-V1 manual\n",
+    );
+    write(&env.agent_root.join("cmd_skills/image.md"), "---\ndescription: images\n---\nIMAGE-V1 manual");
+    write(&env.agent_root.join("cmd_skills/ui_core.md"), "UI manual");
+    let agent = env.agent();
+    let ch = env.channels();
+    let listed = agent.behaviors().skills(Some(SkillKind::Cmd)).await.unwrap();
+    assert_eq!(listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["admin", "image", "ui_core"]);
+    assert_eq!(listed[0].description, "settings and diagnosis");
+    assert_eq!(listed[0].requires, "the buckyos command");
+
+    let mut ui = frozen_spec("conversation");
+    ui.prompt.cmd_skills = vec!["ui_core".into()];
+    ui.policy.max_sub_sessions = 32;
+    ui.policy.max_session_depth = 4;
+    let ui = env.create_work(ui).await;
+    assert!(system_text_of(&ui).await.contains("## Commands\nUI manual"), "a UI's one manual is its text");
+    let sub = |key: &str, names: Option<&[&str]>| SubSessionSpec {
+        objective: "child work".into(),
+        key: Some(key.into()),
+        cmd_skills: names.map(|n| n.iter().map(|s| s.to_string()).collect()),
+        report: ReportMode::None,
+        ..Default::default()
+    };
+    let create = |key: &'static str, parent: String, names: Option<&'static [&'static str]>| {
+        let agent = agent.clone();
+        let ch = ch.clone();
+        async move { create_sub_session(agent.as_ref(), APP, &parent, sub(key, names), ch.as_ref()).await }
+    };
+
+    let w1 = create("w1", ui.sid().into(), Some(&["admin", "image"])).await.unwrap();
+    assert_eq!(skill_names(&w1), ["admin", "image"]);
+    let system = system_text_of(&w1).await;
+    let (admin, image) = (system.find("### admin\nADMIN-V1 manual").unwrap(), system.find("### image\nIMAGE-V1 manual").unwrap());
+    assert!(admin < image, "in the order chosen: {system}");
+    assert!(system.contains("## Commands\nThe manuals below were chosen for this session"), "{system}");
+    assert!(!system.contains("settings and diagnosis") && !system.contains("UI manual"), "{system}");
+
+    let plain = create("w0", ui.sid().into(), None).await.unwrap();
+    assert!(skill_names(&plain).is_empty(), "a conversation's manual is not a Work's");
+    assert!(!system_text_of(&plain).await.contains("## Commands"));
+
+    let err = create("bad1", ui.sid().into(), Some(&["nope"])).await.unwrap_err();
+    assert!(err.to_string().contains("no cmd_skill `nope`") && err.to_string().contains("admin, image, ui_core"), "{err}");
+    let err = create("bad2", ui.sid().into(), Some(&["a", "b", "c", "d", "e", "f", "g", "h", "i"])).await.unwrap_err();
+    assert!(err.to_string().contains("at most 8"), "{err}");
+    let err = create("bad3", ui.sid().into(), Some(&["admin", "admin"])).await.unwrap_err();
+    assert!(err.to_string().contains("named twice"), "{err}");
+
+    // A Work hands its choice on; an explicit choice replaces it.
+    let w2 = create("w2", w1.sid().into(), None).await.unwrap();
+    assert_eq!(skill_names(&w2), ["admin", "image"]);
+    let w3 = create("w3", w1.sid().into(), Some(&["image"])).await.unwrap();
+    assert_eq!(skill_names(&w3), ["image"]);
+
+    // A Todo's skills go to its exploration; without any it inherits.
+    let store = libopendan::todos::store_of(&w1);
+    let todo = |title: &str, skills: Vec<String>| libopendan::todos::NewTodo {
+        title: title.into(),
+        content: "look".into(),
+        mode: libopendan::todos::TodoMode::Explore,
+        accept: Vec::new(),
+        scope: None,
+        evidence: Vec::new(),
+        skills,
+        after: Vec::new(),
+        batch: None,
+    };
+    let t1 = store.update(|l| l.add(todo("with", vec!["image".into()]), 1)).unwrap();
+    let t2 = store.update(|l| l.add(todo("without", Vec::new()), 1)).unwrap();
+    let opts = libopendan::todos::ExploreOptions::default();
+    let d1 = libopendan::todos::dispatch(agent.as_ref(), APP, ch.as_ref(), &w1, &t1, &opts).await.unwrap();
+    let d2 = libopendan::todos::dispatch(agent.as_ref(), APP, ch.as_ref(), &w1, &t2, &opts).await.unwrap();
+    assert_eq!(skill_names(&SessionDir::open(&d1.path).unwrap()), ["image"]);
+    assert_eq!(skill_names(&SessionDir::open(&d2.path).unwrap()), ["admin", "image"]);
+
+    // Changing a manual: the running Work keeps its frozen text.
+    write(&env.agent_root.join("cmd_skills/admin.md"), "ADMIN-V2 manual");
+    assert!(system_text_of(&w1).await.contains("ADMIN-V1 manual"));
+    let w4 = create("w4", ui.sid().into(), Some(&["admin"])).await.unwrap();
+    assert!(system_text_of(&w4).await.contains("ADMIN-V2 manual"));
+
+    // Install / remove: new sessions see the change, earlier ones keep theirs.
+    use base64::Engine;
+    let pkg = libopendan::skills::SkillPackage {
+        package: "extra-skills".into(),
+        version: "1.0.0".into(),
+        pikg_digest: None,
+        files: [(
+            "cmd_skills/extra.md".to_string(),
+            libopendan::skills::SkillFile {
+                content: base64::engine::general_purpose::STANDARD.encode("---\ndescription: extra\n---\nEXTRA manual"),
+                executable: false,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let r = agent.behaviors().install_skills(&pkg, false, APP).await.unwrap();
+    assert_eq!(r.skills[0].origin, "installed");
+    let w5 = create("w5", ui.sid().into(), Some(&["admin", "extra"])).await.unwrap();
+    assert!(system_text_of(&w5).await.contains("### extra\nEXTRA manual"));
+    agent.behaviors().remove_skill(SkillKind::Cmd, "extra", APP).await.unwrap();
+    let err = create("w6", ui.sid().into(), Some(&["extra"])).await.unwrap_err();
+    assert!(err.to_string().contains("no cmd_skill `extra`"), "{err}");
+    assert!(system_text_of(&w5).await.contains("EXTRA manual"), "frozen before the removal");
+    // An inherited manual removed since is left out, not an error.
+    let w7 = create("w7", w5.sid().into(), None).await.unwrap();
+    assert_eq!(skill_names(&w7), ["admin"]);
 }

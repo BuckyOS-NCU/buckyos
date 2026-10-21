@@ -607,6 +607,14 @@ impl ControlPanelServer {
             .and_then(|value| Self::normalize_session_token(Some(value)))
     }
 
+    /// The Gateway SSO session cookie (host-only, renewed by `/sso_refresh`): what a browser page signed in
+    /// at the Zone root carries on plain loads it cannot add headers to, such as an image.
+    pub(super) fn extract_http_sso_session_cookie(
+        req: &http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Option<String> {
+        Self::extract_http_cookie(req, GATEWAY_SSO_SESSION_COOKIE)
+    }
+
     fn extract_http_cookie(
         req: &http::Request<BoxBody<Bytes, ServerError>>,
         cookie_name: &str,
@@ -890,6 +898,7 @@ impl ControlPanelServer {
                 | "auth.issue_sso_token"
                 | "user.invite.get"
                 | "user.invite.accept"
+                | "zone.presentation.get"
         )
     }
 
@@ -1241,8 +1250,23 @@ impl ControlPanelServer {
                 owner_did: device.owner.to_string(),
                 is_user_session: false,
                 is_control_panel_session: false,
+                agent_permission_mode: None,
             }));
         }
+        let agent_permission_mode = if claims.principal_kind == TokenPrincipalKind::App {
+            match &claims.target {
+                AuthTarget::App { app_instance_id } => {
+                    buckyos_api::load_agent_permission_mode(
+                        system_config_client.as_ref(),
+                        app_instance_id,
+                    )
+                    .await?
+                }
+                AuthTarget::System { .. } => None,
+            }
+        } else {
+            None
+        };
         let settings_path = format!("users/{}/settings", username);
         let settings_val = system_config_client
             .get(&settings_path)
@@ -1282,6 +1306,7 @@ impl ControlPanelServer {
             owner_did,
             is_user_session,
             is_control_panel_session,
+            agent_permission_mode,
         }))
     }
 

@@ -9,7 +9,7 @@
 3. 通过各 Provider instance 的线上模型完成其支持的 API type 推理。
 4. 通过 message-tunnel、MessageHub、msg-center 和 Jarvis 完成真实多模态、多轮消息任务。
 
-本文是测试需求文档，不规定唯一的 runner 实现方式。具体 case manifest、Mock Provider、fixture、报告器和执行脚本可以复用 `doc/aicc/maintenance/acceptance` 与 `test/jarvis_media_dv` 中已有设计和实现。
+本文是测试需求文档，不规定唯一的 runner 实现方式。当前 T1/T1.5/T2 的 case manifest、Mock Provider、fixture、报告器和执行脚本见 [验收工具](../../test/aicc_test/acceptance/README.md)，T3 见 [Jarvis Media DV](../../test/jarvis_media_dv/README.md)。[maintenance/acceptance](maintenance/acceptance/README.md) 保留旧 L1–L4 设计拆分，仅用于历史追溯，不能替代当前分层与 runner。
 
 ## 2. 适用范围
 
@@ -154,6 +154,34 @@ T2 为每个获准测试的 Provider instance 枚举全部 active、已配置且
 
 Fal 这类异构端点市场必须把 endpoint 视为协议与能力边界。每个进入 T1.5/T2 的 endpoint 都必须有独立官方 Schema 或官方文档证据；不得把市场中的其他端点视为同一 adapter 的协议兼容模型。
 
+### 4.5 路由暴露契约
+
+能力基线中的每个可执行单元必须按以下粒度拥有独立、显式的路由暴露声明：
+
+```text
+Provider Profile × Model Rule × canonical API type × Exposure Mode
+```
+
+Exposure Mode 只能是：
+
+- `logical_routable`：产品承诺通过一个公开 logical entrypoint 调用。契约必须声明入口；T1 必须验证入口经默认树引用、family path、model logical mount、运行时 inventory、operation 和 adapter 构成完整闭环。
+- `exact_only`：产品只承诺精确模型调用。契约必须给出产品原因；该模型/API 不得挂载任何 logical path，T1 必须验证 exact 数据面调用成功且 logical candidate 集合不包含它。
+- `excluded`：该规则不是可执行 inventory，必须说明排除原因和生命周期依据。
+- `not_applicable`：该 Provider Profile、Model Rule 不支持该 API type，必须由能力基线或继承关系明确说明。
+
+`exact_only` 不能由“当前 metadata 没有 logical mount”推断。路由暴露契约必须独立于 Provider metadata、Model Driver metadata、运行时 inventory 和现有日志维护；否则同一个 metadata 缺陷可能同时删除实现和期望结果，使测试错误通过。新增或修改能力规则时，必须在同一变更中更新路由暴露契约。
+
+Preflight 必须双向验证：
+
+1. 每个 Provider Profile 和每条 Model Rule 都被契约登记，契约中不存在能力基线之外的 profile 或规则。
+2. 每个 active/preview `Model Rule × API type` 恰好得到一个 exposure 分类；未分类数量必须为零。
+3. `logical_routable` 有合法且属于同一 API type 的 logical entrypoint。
+4. `exact_only` 没有 logical entrypoint，并具有非空原因。
+5. `excluded`、`not_applicable` 不能掩盖能力基线中 active/preview 的可执行 API。
+6. 契约 revision 明确绑定能力基线 revision，并冻结完整 `Provider Profile × Model Rule × API type` cell 集合；即使只在既有规则中增加 API type，任一侧单独变化也必须失败。
+
+Preflight 报告必须按 Provider Profile 和 API type 汇总 `logical_routable`、`exact_only`、`excluded`、`not_applicable` 与 `unclassified` 数量，其中 `unclassified` 必须为零。集合级“每个 canonical API 至少出现一次”只能作为值域检查，不能代替上述矩阵完整性检查。
+
 ## 5. 总体分层
 
 | 层级 | 被测主链路 | 模型 | 核心目标 |
@@ -248,6 +276,23 @@ Mock Provider 必须位于 Provider HTTP/远端协议边界，不能只替换 AI
 - 合法但不存在的模型。
 - 非法精确模型名、非法逻辑路径和不存在的 Provider instance。
 - 已禁用、已下线、未挂载和 metadata 损坏的模型。
+
+T1 Runner 必须加载 4.5 节的独立路由暴露契约，并基于 `models.list` 为本轮实际 inventory 生成 `Provider Profile × Model Rule × API type × Exposure Mode` cell。生成过程不得只为每个 API type 挑选一个全局首选模型，也不得以图片、视频、音频或任何单一模态写特化白名单。文生图、文生视频、文生音频、embedding、vision、decision、rerank、LLM 等均由同一参数化规则产生。
+
+对于 `logical_routable` cell，至少验证：
+
+- logical entrypoint 可解析，且 route trace 展示完整引用链；
+- 候选属于目标 Provider Profile、匹配目标 Model Rule 并支持目标 API type；
+- inventory、operation 与 adapter 均存在；
+- 期望路径缺 mount、悬空引用、错误 API operation 或无 adapter 时失败。
+
+对于 `exact_only` cell，至少验证：
+
+- 运行时 inventory 中该 API 没有 logical mount；
+- exact typed method 可到达目标 Provider instance、operation 和 adapter；
+- 使用对应 logical entrypoint 时，该 exact model 不进入候选集合。
+
+运行时出现契约未分类的 model/API、声明之外的 logical mount，或契约期待 logical route 但 inventory 缺少闭环，均按 `baseline_mismatch` 阻断，不得自动降级为 skipped 或 exact-only。
 
 `route.resolve` 只用于逻辑模型解析。精确模型应通过要求 exact model 的数据面接口或现有 exact 调用路径测试，主要验证解析、api_type、capability、instance、adapter 和默认不 fallback。不得把 `route.resolve(exact_model)` 当作正式需求。
 
@@ -418,7 +463,7 @@ T1.5 必须把近期线上失败沉淀为跨 Provider 回归用例，而不能�
 - OpenAI Responses 同 Provider 历史必须以 Mock 返回的完整 output item 驱动下一轮请求，逐项比较 item 的顺序、ID、status、annotations、reasoning opaque 字段和 tool call；canonical block 只能用于跨 Provider 降级，不能与对应原生 item 重复发送。
 - OpenRouter Responses 的 completed output item 必须逐字段、逐数组顺序原样回传；仅验证提取出的 reasoning 文本不算通过。
 - Claude canonical JSON Schema 必须 lowering 到 `output_config.format`；Claude 5 Mock 必须拒绝 `thinking.type=enabled` 和 `budget_tokens`，并验证旧配置已转换为 adaptive thinking 且不覆盖显式 effort。
-- Provider 返回图片、音频、视频、OCR/segment 等媒体 artifact 时，不论 Provider driver 是 Gemini、OpenAI、Fal、MiniMax 还是其他实现，AICC 提交给 TaskMgr 的最终 result 必须使用 `NamedObject` 或 URL 等稳定资源引用，不得保留 inline base64 导致 TaskMgr result 提交失败或 task 停留在非终态。
+- 每个 Provider success cell 都必须检查 TaskMgr 最终 result 的任意层级不存在 `ResourceRef::Base64`。Provider 返回图片、音频、视频、OCR/segment 等媒体 artifact 时，不论 Provider driver 是 Gemini、OpenAI、Fal、MiniMax 还是其他实现，最终 result 必须使用 `NamedObject` 或已登记 URL 等稳定资源引用；对官方响应中存在已知内联媒体字段的协议，还必须记录 fixture payload 路径并断言同一 payload 没有以裸字符串或 data URL 残留在 `provider_state` / `provider_states`。
 
 对会生成图片、视频、音频等可二次创作内容的 Provider，T1.5 协议契约还必须显式声明内容标识能力。声明必须来自具体 adapter 对应的 Provider 官方协议，而不是从 AICC 实现、metadata 或历史日志推断；官方资料未明确返回可复用标识或未声明可用标识作为输入时，该协议点必须标记为不支持，不得猜测。契约至少包含：
 
@@ -442,7 +487,7 @@ T1.5 必须把近期线上失败沉淀为跨 Provider 回归用例，而不能�
 - 官方正常响应到 AICC typed response、task、usage、finish reason、tool call 和 artifact 的映射。
 - Provider 返回内容标识时，必须验证该标识按 artifact name 或官方结果结构绑定到 AICC artifact，并在提交 TaskMgr result 前去除仅供内部复用的敏感原生标识；报告只记录标识存在性和脱敏摘要。
 - 对所有携带 provider-native history 的协议，至少一个 cell 必须使用 Mock 第一轮官方响应的 typed message 构造第二轮请求，执行真实 `decode -> canonical history -> encode`，并比较完整原生单元；只手工拼 canonical 历史不能作为 round-trip 通过证据。
-- TaskMgr 终态 result 的 artifact/resource 表示必须可追踪、可下载或可授权读取；T1.5 中所有产生 artifact 的成功用例都要断言 result 已提交成功且不包含 inline base64 资源。
+- TaskMgr 终态 result 的 artifact/resource 表示必须可追踪、可下载或可授权读取；T1.5 中所有 Provider success cell 都检查无 inline `ResourceRef::Base64`，所有产生 artifact 的成功用例还要断言 result 已提交成功、具有稳定引用，并且官方 fixture 的已知二进制 payload 未在 ProviderState 中留下字符串副本。
 
 Mock Provider 必须先按官方 schema 校验请求，再返回官方格式响应。宽松接受未知字段、错误字段名、错误路径或错误 content type 的 Mock 不能作为通过证据。
 
@@ -559,7 +604,7 @@ T2 不覆盖同一 API type 的格式全集、多输入规模边界、参数排�
 
 - 请求命中 baseline 指定的 Provider instance 和 exact model。
 - Provider 返回真实 operation/request ID，或有其他可审计证据证明发生了线上调用。
-- task 达到正确终态，输出 schema、消息类型、artifact MIME 和可读性符合该 API type。
+- task 达到正确终态，输出 schema、消息类型、artifact MIME 和可读性符合该 API type；Provider 返回 URL artifact 时必须通过 AICC `/kapi/aicc/artifact/open` 下载验证，不得由 runner 直接请求 Provider URL。
 - 对含生成前置的二次创作单元，source task、source artifact、target task、Provider operation/request ID、exact model、Provider instance 和资源引用必须在报告中关联；如果 adapter 复用了 provider 原生内容标识，报告只能记录脱敏摘要和复用命中，不得泄露完整标识。
 - 推理结果通过 9.4 节规定的确定性断言或语义 rubric。
 - usage、cost、trace 和 Provider operation ID 归因到目标 instance、模型和 API type。
@@ -855,6 +900,7 @@ run_id
 - planned、passed、failed、provider_restricted、skipped、not_applicable、review 数量。
 - 每次 attempt、耗时、错误码、failure class 和脱敏诊断。
 - T1 路由分支/组合覆盖率。
+- T1 路由暴露矩阵按 Provider Profile、Model Rule、API type 和 Exposure Mode 的 planned/passed/failed 明细，以及 logical/exact-only/excluded/not-applicable/unclassified 汇总。
 - T1.5 按 Provider、adapter/API version、API type 的官方协议请求/响应/错误覆盖率及证据 revision。
 - T1.5 同一 session `source 四元组 x target 四元组` 切换矩阵的 planned/passed/failed/skipped 明细、合并依据和 provider_state 转换证据。
 - T1.5 artifact task-result 回归用例的 planned/passed/failed/skipped 明细，覆盖 Provider driver、API type、资源表示、TaskMgr task 终态和 inline base64 清除证据。
@@ -904,13 +950,14 @@ T2/T3 会访问真实 Provider、真实消息入口或修改运行环境。CodeA
 每次 Provider、模型、metadata、路由或 adapter 变更后，至少执行：
 
 1. 更新官方能力证据和 release baseline。
-2. 更新 AICC metadata、inventory、api_type 和 adapter。
-3. 对比官方能力与 AICC 声明，确保双向一致。
-4. 更新受影响的 T1/T1.5/T2 case manifest。
-5. 执行受影响 case。
-6. 执行该 Provider 的 T1.5 协议回归和受影响的 T2 `ProviderInstance × model × API-Type` 单元。
-7. 执行全量发布验收。
-8. 验证事实配置、运营策略和路由配置的回滚。
+2. 更新独立路由暴露契约，显式声明新增或变化的 logical/exact-only/例外单元。
+3. 更新 AICC metadata、inventory、api_type 和 adapter。
+4. 对比官方能力、路由暴露契约与 AICC 声明，确保三方一致。
+5. 更新受影响的 T1/T1.5/T2 case manifest。
+6. 执行受影响 case。
+7. 执行该 Provider 的 T1.5 协议回归和受影响的 T2 `ProviderInstance × model × API-Type` 单元。
+8. 执行全量发布验收。
+9. 验证事实配置、运营策略和路由配置的回滚。
 
 ## 15. 建议实施里程碑
 

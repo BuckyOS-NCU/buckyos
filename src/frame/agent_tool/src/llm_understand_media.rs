@@ -16,6 +16,10 @@ use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+mod image_fit;
+
+use image_fit::{fit_image_for_vision, ImageLimits, ImagePreprocess};
+
 use crate::xllm::{
     ensure_buckyos_runtime, AiccLlmClient, LoopModel, RunOutcome, TaskInput, TaskOverrides,
     XllmDeps, XllmRun, XllmTask,
@@ -297,11 +301,28 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
     };
     let mime = resolved_media.mime.clone();
     let resolved_source_kind = resource_source_kind(&resolved_media.source);
-    let media_content =
-        match prepare_media_content(resolved_media, opts.session_id.as_deref()).await {
-            Ok(content) => content,
-            Err(err) => return (build_error_result(&opts, err), CLI_EXIT_ERROR),
-        };
+    let PreparedMedia {
+        content: media_content,
+        image_preprocess,
+    } = match prepare_media_content(resolved_media, opts.session_id.as_deref()).await {
+        Ok(prepared) => prepared,
+        Err(err) => return (build_error_result(&opts, err), CLI_EXIT_ERROR),
+    };
+    if let Some(preprocess) = &image_preprocess {
+        log::info!(
+            "llm_understand_media: image preprocess; media_id={} actions={:?} original={}x{} {} {}B sent={}x{} {} {}B",
+            media_id,
+            preprocess.actions,
+            preprocess.original.width,
+            preprocess.original.height,
+            preprocess.original.mime,
+            preprocess.original.bytes,
+            preprocess.sent.width,
+            preprocess.sent.height,
+            preprocess.sent.mime,
+            preprocess.sent.bytes
+        );
+    }
 
     let model_alias = match opts.model.clone().or_else(|| route_model(&mime)) {
         Some(model) => model,
@@ -397,11 +418,32 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
             );
             let mut result = build_error_result(&opts, message);
             add_run_context(&mut result, &work_dir, &run_id, Some(&mime));
+            attach_image_preprocess(&mut result, image_preprocess.as_ref());
             return (result, CLI_EXIT_ERROR);
         }
     };
 
-    build_outcome_result(outcome, &mime, &work_dir, &run_id, &opts.goal, &media_id)
+    let (mut result, code) =
+        build_outcome_result(outcome, &mime, &work_dir, &run_id, &opts.goal, &media_id);
+    attach_image_preprocess(&mut result, image_preprocess.as_ref());
+    (result, code)
+}
+
+/// 图片原始/实际送出的尺寸写进 details；缩过图时在 output 末尾提醒主干 agent。
+fn attach_image_preprocess(result: &mut AgentToolResult, preprocess: Option<&ImagePreprocess>) {
+    let Some(preprocess) = preprocess else {
+        return;
+    };
+    if let Value::Object(map) = &mut result.details {
+        map.insert(
+            "media_preprocess".to_string(),
+            serde_json::to_value(preprocess).unwrap_or(Value::Null),
+        );
+    }
+    if let (Some(output), Some(note)) = (result.output.as_mut(), preprocess.caller_note()) {
+        output.push('\n');
+        output.push_str(&note);
+    }
 }
 
 /// 媒体侧 context 的执行配置：无工具、JSON 报告、关闭 web_search。
@@ -872,11 +914,16 @@ fn local_path_from_object(
 }
 
 fn looks_like_object_id(value: &str) -> bool {
-    // Object ids in this system are typed (`cyfile:<base32>`, `chunk:<…>`).
+    // Object ids in this system are typed (`cyfile:<…>`, a chunk id such as
+    // `mix256:<…>` / `sha256:<…>`): whatever ndn-lib parses as an `ObjId`,
+    // with no path separator or whitespace.
+    if value.contains(['/', '\\']) || value.chars().any(char::is_whitespace) {
+        return false;
+    }
     matches!(
         value.split_once(':').map(|(kind, _)| kind),
         Some("cyfile") | Some("chunk") | Some("objid") | Some("obj")
-    )
+    ) || ndn_lib::ObjId::new(value).is_ok()
 }
 
 fn looks_like_path(value: &str) -> bool {
@@ -1336,16 +1383,31 @@ fn default_model_alias(mime: &str) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+struct PreparedMedia {
+    content: Vec<AiContent>,
+    image_preprocess: Option<ImagePreprocess>,
+}
+
+impl From<Vec<AiContent>> for PreparedMedia {
+    fn from(content: Vec<AiContent>) -> Self {
+        Self {
+            content,
+            image_preprocess: None,
+        }
+    }
+}
+
 async fn prepare_media_content(
     media: ResolvedMedia,
     session_id: Option<&str>,
-) -> Result<Vec<AiContent>, String> {
+) -> Result<PreparedMedia, String> {
     if is_image_mime(&media.mime) {
-        return Ok(vec![AiContent::image(media.source)]);
+        return prepare_image_content(media).await;
     }
     if is_audio_mime(&media.mime) {
         let transcript = transcribe_audio(media.source, session_id).await?;
-        return Ok(audio_transcript_content(&transcript));
+        return Ok(audio_transcript_content(&transcript).into());
     }
     if is_archive_mime(&media.mime) {
         return Err(format!(
@@ -1357,7 +1419,8 @@ async fn prepare_media_content(
         return Ok(vec![AiContent::Document {
             source: media.source,
             title: Some("media input".to_string()),
-        }]);
+        }]
+        .into());
     }
 
     let frames = extract_video_frames(&media).await?;
@@ -1370,7 +1433,63 @@ async fn prepare_media_content(
         content.push(AiContent::text(format!("Frame at {timestamp:.3} seconds:")));
         content.push(AiContent::image(frame));
     }
-    Ok(content)
+    Ok(content.into())
+}
+
+/// 过大、格式不被 vision 模型接受或带 EXIF 旋转的图片先在本地处理（见 image_fit）；
+/// URL 图片也先下载，否则看不到尺寸。
+async fn prepare_image_content(media: ResolvedMedia) -> Result<PreparedMedia, String> {
+    let bytes = media_bytes(&media.source, "image").await?;
+    let fitted = fit_image_for_vision(bytes, &media.mime, ImageLimits::from_env()).await?;
+    let mut content = Vec::with_capacity(2);
+    if let Some(note) = fitted.preprocess.model_note() {
+        content.push(AiContent::text(note));
+    }
+    content.push(AiContent::image(ResourceRef::Base64 {
+        mime: fitted.mime,
+        data_base64: general_purpose::STANDARD.encode(fitted.bytes),
+    }));
+    Ok(PreparedMedia {
+        content,
+        image_preprocess: Some(fitted.preprocess),
+    })
+}
+
+async fn media_bytes(source: &ResourceRef, kind: &str) -> Result<Vec<u8>, String> {
+    let bytes = match source {
+        ResourceRef::Base64 { data_base64, .. } => general_purpose::STANDARD
+            .decode(data_base64)
+            .map_err(|err| format!("decode {kind} base64 failed: {err}"))?,
+        ResourceRef::Url { url, .. } => reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| format!("download {kind} failed: {err}"))?
+            .error_for_status()
+            .map_err(|err| format!("download {kind} failed: {err}"))?
+            .bytes()
+            .await
+            .map_err(|err| format!("read downloaded {kind} failed: {err}"))?
+            .to_vec(),
+        ResourceRef::NamedObject { .. } => {
+            return Err(format!("named_object {kind} was not resolved to bytes"))
+        }
+    };
+    if bytes.is_empty() {
+        return Err(format!("{kind} has empty content"));
+    }
+    Ok(bytes)
+}
+
+fn media_temp_dir(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
 }
 
 async fn transcribe_audio(source: ResourceRef, session_id: Option<&str>) -> Result<String, String> {
@@ -1441,37 +1560,8 @@ fn audio_transcript_content(transcript: &str) -> Vec<AiContent> {
 }
 
 async fn extract_video_frames(media: &ResolvedMedia) -> Result<Vec<(f64, ResourceRef)>, String> {
-    let bytes = match &media.source {
-        ResourceRef::Base64 { data_base64, .. } => general_purpose::STANDARD
-            .decode(data_base64)
-            .map_err(|err| format!("decode video base64 failed: {err}"))?,
-        ResourceRef::Url { url, .. } => reqwest::Client::new()
-            .get(url)
-            .send()
-            .await
-            .map_err(|err| format!("download video failed: {err}"))?
-            .error_for_status()
-            .map_err(|err| format!("download video failed: {err}"))?
-            .bytes()
-            .await
-            .map_err(|err| format!("read downloaded video failed: {err}"))?
-            .to_vec(),
-        ResourceRef::NamedObject { .. } => {
-            return Err("named_object video was not resolved to bytes".to_string())
-        }
-    };
-    if bytes.is_empty() {
-        return Err("video has empty content".to_string());
-    }
-
-    let temp_dir = std::env::temp_dir().join(format!(
-        "llm-understand-video-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let bytes = media_bytes(&media.source, "video").await?;
+    let temp_dir = media_temp_dir("llm-understand-video");
     tokio::fs::create_dir_all(&temp_dir)
         .await
         .map_err(|err| format!("create video frame temp dir failed: {err}"))?;
@@ -1518,6 +1608,10 @@ async fn extract_video_frames(media: &ResolvedMedia) -> Result<Vec<(f64, Resourc
         let frame_count = configured_count
             .min((duration * 2.0).ceil() as usize)
             .max(1);
+        let max_edge = image_fit::video_frame_max_long_edge();
+        let scale_filter = format!(
+            "scale='min(iw,{max_edge})':'min(ih,{max_edge})':force_original_aspect_ratio=decrease"
+        );
         let mut frames = Vec::with_capacity(frame_count);
         for index in 0..frame_count {
             let timestamp = duration * (index as f64 + 0.5) / frame_count as f64;
@@ -1526,7 +1620,7 @@ async fn extract_video_frames(media: &ResolvedMedia) -> Result<Vec<(f64, Resourc
                 .args(["-v", "error", "-y", "-ss", &format!("{timestamp:.6}")])
                 .arg("-i")
                 .arg(&input_path)
-                .args(["-frames:v", "1", "-q:v", "2"])
+                .args(["-frames:v", "1", "-vf", &scale_filter, "-q:v", "2"])
                 .arg(&frame_path)
                 .output()
                 .await
@@ -1656,7 +1750,9 @@ fn scrub_value(value: &Value) -> Value {
 fn parse_report_output(output: &ContextOutput) -> Result<UnderstandingReport, String> {
     let value = match output {
         ContextOutput::Json { content } => content.clone(),
-        ContextOutput::Text { content } => parse_jsonish(content)?,
+        ContextOutput::Text { content } | ContextOutput::Invalid { content, .. } => {
+            parse_jsonish(content)?
+        }
     };
     let mut report: UnderstandingReport =
         serde_json::from_value(value).map_err(|err| err.to_string())?;
@@ -1722,7 +1818,9 @@ fn render_report(report: &UnderstandingReport) -> String {
 
 fn output_to_text(output: &ContextOutput) -> String {
     match output {
-        ContextOutput::Text { content } => content.clone(),
+        ContextOutput::Text { content } | ContextOutput::Invalid { content, .. } => {
+            content.clone()
+        }
         ContextOutput::Json { content } => {
             serde_json::to_string_pretty(content).unwrap_or_else(|_| content.to_string())
         }
@@ -1733,6 +1831,7 @@ fn context_output_kind(output: &ContextOutput) -> &'static str {
     match output {
         ContextOutput::Text { .. } => "text",
         ContextOutput::Json { .. } => "json",
+        ContextOutput::Invalid { .. } => "invalid",
     }
 }
 
@@ -1865,20 +1964,26 @@ impl ToolManager for NoopToolManager {
     }
 }
 
-const USAGE: &str = r#"Usage: agent_tool llm_understand_media --media <json> --goal <text> [options]
+const USAGE: &str = r#"Usage: llm_understand_media <file | object id | url> [--goal <text>] [options]
+       agent_tool llm_understand_media --media <json | locator> [--goal <text>] [options]
 
-Required:
-  --media <json>          Media locator, e.g. {"kind":"named_object","obj_id":"cyfile:…","mime_hint":"image/png"},
+Media (one of):
+  <locator>               A local file (relative to the current directory or absolute), an object id
+                          (cyfile:…, a chunk id such as mix256:…; e.g. an attachment of a message) or an http(s) URL.
+  --media <json>          The same as a JSON ResourceRef, e.g. {"kind":"named_object","obj_id":"cyfile:…","mime_hint":"image/png"},
                           {"kind":"local_file","path":"/abs/frame.png"}, or {"url":"https://…"}.
-  --goal <text>           Understanding goal.
 
 Options:
+  --goal <text>           What to find out (default: describe the content in detail).
   --history-file <path>   JSON Vec<AiMessage> parent history snapshot.
   --work-dir <path>       LocalLLMContext working directory.
   --model <alias>         AICC logical model alias; default image route is llm.vision.
   --max-completion-tokens <n>  Positive output budget; default 2048, rounded up to 2048/4096/8192 tiers.
   -h, --help              Show this help.
 "#;
+
+/// The goal of a CLI call without `--goal`.
+const DEFAULT_CLI_GOAL: &str = "Describe this content in detail: what it shows or says, any text in it (verbatim), its structure, and anything notable, so that someone who cannot see it can work with it.";
 
 #[derive(Debug)]
 struct CliOpts {
@@ -1928,14 +2033,23 @@ impl CliOpts {
         let mut max_completion_tokens = None;
 
         let mut idx = 0;
+        fn set_media(value: Value, media: &mut Option<Value>) -> Result<(), ParseError> {
+            if media.replace(value).is_some() {
+                return Err(ParseError::Bad("give one media only".to_string()));
+            }
+            Ok(())
+        }
         while idx < args.len() {
             match args[idx].as_str() {
                 "-h" | "--help" => return Err(ParseError::Help),
                 "--media" => {
                     let raw = next_value(args, &mut idx, "--media")?;
-                    media = Some(serde_json::from_str(&raw).map_err(|err| {
-                        ParseError::Bad(format!("--media must be JSON ResourceRef: {err}"))
-                    })?);
+                    // A JSON ResourceRef, or a bare locator.
+                    let value = match serde_json::from_str::<Value>(&raw) {
+                        Ok(v @ Value::Object(_)) => v,
+                        _ => Value::String(raw),
+                    };
+                    set_media(value, &mut media)?;
                 }
                 "--goal" => goal = Some(next_value(args, &mut idx, "--goal")?),
                 "--history-file" => {
@@ -1952,17 +2066,23 @@ impl CliOpts {
                         "--max-completion-tokens",
                     )?);
                 }
-                other => return Err(ParseError::Bad(format!("unknown flag `{other}`"))),
+                other if other.starts_with("--") => {
+                    return Err(ParseError::Bad(format!("unknown flag `{other}`")))
+                }
+                // The locator itself (`llm_understand_media photo.png`).
+                locator => set_media(Value::String(locator.to_string()), &mut media)?,
             }
             idx += 1;
         }
 
         Ok(Self {
-            media: media.ok_or_else(|| ParseError::Bad("missing --media".to_string()))?,
+            media: media.ok_or_else(|| {
+                ParseError::Bad("missing media: a file, an object id (cyfile:…) or a url".to_string())
+            })?,
             goal: goal
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| ParseError::Bad("missing non-empty --goal".to_string()))?,
+                .unwrap_or_else(|| DEFAULT_CLI_GOAL.to_string()),
             history_file,
             work_dir,
             model,
@@ -2006,6 +2126,41 @@ fn normalize_completion_tokens(value: u32) -> u32 {
 mod tests {
     use super::*;
     use buckyos_api::{AiToolResultContent, AiUsage};
+
+    fn cli(args: &[&str]) -> Result<CliOpts, ParseError> {
+        CliOpts::parse(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn chunk_ids_are_object_ids() {
+        let chunk = "mix256:8d11eaa912debbdd30ccbbebbdae7ac4950b321afaaf740dd98ad76af3d7cfdc19c9";
+        assert!(looks_like_object_id(chunk));
+        assert!(matches!(
+            parse_media_locator(chunk),
+            Ok(MediaSource::Resource(ResourceRef::NamedObject { .. }))
+        ));
+        assert!(!looks_like_object_id("notes/a.png"));
+        assert!(!looks_like_object_id("a.png"));
+    }
+
+    #[test]
+    fn the_cli_takes_a_bare_locator_and_a_default_goal() {
+        let o = cli(&["photo.png"]).ok().unwrap();
+        assert_eq!(o.media, Value::String("photo.png".into()));
+        assert_eq!(o.goal, DEFAULT_CLI_GOAL);
+        let o = cli(&["cyfile:abc", "--goal", "what error is shown?"]).ok().unwrap();
+        assert_eq!(o.media, Value::String("cyfile:abc".into()));
+        assert_eq!(o.goal, "what error is shown?");
+        // `--media` takes JSON or a locator.
+        let o = cli(&["--media", r#"{"kind":"local_file","path":"/a.png"}"#]).ok().unwrap();
+        assert_eq!(o.media["path"], "/a.png");
+        let o = cli(&["--media", "https://example.com/a.png"]).ok().unwrap();
+        assert_eq!(o.media, Value::String("https://example.com/a.png".into()));
+        assert!(matches!(cli(&[]), Err(ParseError::Bad(_))));
+        assert!(matches!(cli(&["a.png", "b.png"]), Err(ParseError::Bad(_))));
+        assert!(matches!(cli(&["a.png", "--nope"]), Err(ParseError::Bad(_))));
+        assert!(matches!(cli(&["--help"]), Err(ParseError::Help)));
+    }
 
     #[test]
     fn purify_history_omits_media_payloads() {
@@ -2200,7 +2355,8 @@ mod tests {
                 None,
             )
             .await
-            .expect("non-archive media should be forwarded");
+            .expect("non-archive media should be forwarded")
+            .content;
             assert!(matches!(
                 &content[0],
                 AiContent::Document {
@@ -2223,6 +2379,59 @@ mod tests {
         .await
         .expect_err("archives must be extracted before understanding");
         assert!(err.contains("must be extracted first"));
+    }
+
+    #[tokio::test]
+    async fn oversized_images_are_downscaled_with_a_note_for_the_model() {
+        fn png_base64(width: u32, height: u32) -> String {
+            let mut bytes = Vec::new();
+            image::RgbImage::new(width, height)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            general_purpose::STANDARD.encode(bytes)
+        }
+        let prepare = |data_base64: String| {
+            prepare_media_content(
+                ResolvedMedia {
+                    source: ResourceRef::Base64 {
+                        mime: "image/png".to_string(),
+                        data_base64,
+                    },
+                    mime: "image/png".to_string(),
+                },
+                None,
+            )
+        };
+
+        let small = png_base64(32, 32);
+        let prepared = prepare(small.clone()).await.expect("small image");
+        assert_eq!(prepared.content.len(), 1);
+        assert!(matches!(
+            &prepared.content[0],
+            AiContent::Image { source: ResourceRef::Base64 { data_base64, .. } } if *data_base64 == small
+        ));
+        assert!(prepared.image_preprocess.expect("probe info").actions.is_empty());
+
+        let prepared = prepare(png_base64(4096, 1024)).await.expect("large image");
+        assert!(matches!(
+            &prepared.content[0],
+            AiContent::Text { text } if text.contains("downscaled from 4096x1024 to 2048x512")
+        ));
+        assert!(matches!(&prepared.content[1], AiContent::Image { .. }));
+
+        let mut result = build_error_result(
+            &RunOpts::from_tool_args(json!({
+                "media": { "kind": "url", "url": "https://example.test/image.png" },
+                "goal": "describe the image"
+            }))
+            .unwrap(),
+            "boom",
+        );
+        result.output = Some("Conclusion:\nok".to_string());
+        attach_image_preprocess(&mut result, prepared.image_preprocess.as_ref());
+        assert_eq!(result.details["media_preprocess"]["sent"]["width"], 2048);
+        assert_eq!(result.details["media_preprocess"]["original"]["width"], 4096);
+        assert!(result.output.unwrap().ends_with("analyze the crop."));
     }
 
     #[test]

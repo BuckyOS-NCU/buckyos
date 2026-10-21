@@ -9,7 +9,10 @@
   display: none;
 }
 
-:root {
+/* Theme tokens. `.cp-theme-light` / `.cp-theme-dark` give a subtree a fixed theme whatever the page uses (an AI
+   Workspace stage renders its content for the stage's own background). */
+:root,
+.cp-theme-light {
   color-scheme: light;
   --cp-bg: oklch(0.966 0.014 286);
   --cp-bg-strong: oklch(0.925 0.022 284);
@@ -48,7 +51,9 @@
     0 14px 36px color-mix(in srgb, var(--cp-shadow) 16%, transparent);
   --cp-ease-emphasis: cubic-bezier(0.19, 1, 0.22, 1);
   --cp-ease-smooth: cubic-bezier(0.22, 1, 0.36, 1);
+}
 
+:root {
   /* Grid Slot system — Medium density (default) */
   --grid-columns: 4;
   --grid-gap: 2px;
@@ -70,7 +75,8 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-:root[data-theme='dark'] {
+:root[data-theme='dark'],
+.cp-theme-dark {
   color-scheme: dark;
   --cp-bg: oklch(0.22 0.022 274);
   --cp-bg-strong: oklch(0.18 0.02 272);
@@ -267,6 +273,42 @@ a {
   background: var(--cp-accent);
   border-color: color-mix(in srgb, var(--cp-accent) 70%, transparent);
   transform: scale(1.1);
+}
+
+/* A picture wallpaper can be light or dark anywhere, so the desktop's own text goes light with a shadow, as on
+   phone home screens; the theme colours above only suit the built-in background. */
+main[data-wallpaper='image'] .desktop-icon-label {
+  color: #fff;
+  text-shadow:
+    0 1px 2px rgb(0 0 0 / 0.6),
+    0 0 8px rgb(0 0 0 / 0.35);
+}
+
+main[data-wallpaper='image'] .swiper-pagination-bullet {
+  background: rgb(255 255 255 / 0.55);
+  border-color: rgb(0 0 0 / 0.18);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+}
+
+main[data-wallpaper='image'] .swiper-pagination-bullet-active {
+  background: #fff;
+}
+
+/* A new picture fades in over the theme background instead of popping in. */
+.desktop-wallpaper-image {
+  animation: desktop-wallpaper-in 240ms var(--cp-ease-smooth);
+}
+
+@keyframes desktop-wallpaper-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .desktop-wallpaper-image {
+    animation: none;
+  }
 }
 
 .swiper {
@@ -685,6 +727,14 @@ a {
   }
   50% {
     transform: scale(1.03);
+  }
+}
+
+/* Desktop taskbar cards and panels opening out of the taskbar. */
+@keyframes cp-taskbar-pop {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
   }
 }
 

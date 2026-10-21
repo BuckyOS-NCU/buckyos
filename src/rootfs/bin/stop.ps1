@@ -55,6 +55,7 @@ $processNames = @(
   "nfs-server",
   "nfs_server",
   "aiworkspace",
+  "homestation",
   "repo-service",
   "repo_service",
   "control-panel",
@@ -63,7 +64,8 @@ $processNames = @(
   "task_manager",
   "kmsg",
   "msg_center",
-  "opendan"
+  "opendan",
+  "workflow"
 )
 
 foreach ($name in $processNames) {

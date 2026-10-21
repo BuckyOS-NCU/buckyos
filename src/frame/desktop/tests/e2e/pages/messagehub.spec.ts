@@ -165,7 +165,8 @@ async function details(page: import('@playwright/test').Page) {
 
 test('New Session includes native users and selecting an empty user creates one reusable default', async ({ page }) => {
   await openHub(page)
-  await page.getByRole('button', { name: 'New Session', exact: true }).first().click()
+  await page.getByTestId('hub-create-menu').click()
+  await page.getByRole('menuitem', { name: 'New Session', exact: true }).click()
   const dialog = page.getByRole('dialog')
   const target = dialog.getByRole('combobox').first()
   await expect(target.locator('option', { hasText: 'Bob Zhang' })).toHaveCount(1)
@@ -183,6 +184,21 @@ test('New Session includes native users and selecting an empty user creates one 
   await page.getByRole('button', { name: /^Bob Zhang/ }).dblclick()
   await expect(page.locator('textarea')).toHaveValue('Draft in the default session')
   expect(await page.evaluate(context => window.__messageHubMock.sessions(context, 'did:buckyos:person:bob').length, OWN)).toBe(1)
+})
+
+test('New Session finds someone new by DID and starts a conversation with them', async ({ page }) => {
+  await openHub(page)
+  await page.getByTestId('hub-create-menu').click()
+  await page.getByRole('menuitem', { name: 'New Session', exact: true }).click()
+  const dialog = page.getByRole('dialog')
+  await dialog.getByTestId('new-session-find').locator('summary').click()
+  await dialog.getByLabel('Find people').fill('did:bns:nora')
+  await dialog.getByTestId('find-people-result').filter({ hasText: 'Nora' }).getByRole('button', { name: 'Choose' }).click()
+  await expect(dialog.getByRole('combobox').first()).toHaveValue('did:bns:nora')
+  await dialog.getByRole('button', { name: 'Create', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Entity details: Nora' }).last()).toBeVisible()
+  expect(await page.evaluate(context => window.__messageHubMock.sessions(context, 'did:bns:nora').length, OWN)).toBe(1)
 })
 
 test('agent entity entry creates a missing default and skips pinned or tunnel sessions', async ({ page }) => {
@@ -210,6 +226,22 @@ test('agent entity entry creates a missing default and skips pinned or tunnel se
   await page.getByRole('button', { name: /^CodeAssistant/ }).click()
   await expect(page.locator('textarea')).toBeVisible()
   expect(await page.evaluate(({ context, agent }) => window.__messageHubMock.sessions(context, agent, 'active').filter(session => session.binding.kind === 'native').length, { context: OWN, agent: CODER })).toBe(1)
+})
+
+test('unread of other sessions shows on the session list button and archived toggle', async ({ page }) => {
+  await openHub(page)
+  const unreadOf = (exclude: string) => page.evaluate(({ context, agent, exclude }) => window.__messageHubMock.sessions(context, agent).reduce((sum, session) => session.id === exclude ? sum : sum + session.unreadCount, 0), { context: OWN, agent: CODER, exclude })
+  const sessionsButton = page.getByRole('button', { name: 'Sessions', exact: true })
+  const expected = await unreadOf('session-coder-1')
+  expect(expected).toBeGreaterThan(0)
+  await expect(sessionsButton.getByTestId('other-sessions-unread')).toHaveText(`${expected}`)
+  await expect(sessionsButton).toHaveAttribute('title', `${expected} unread in other sessions`)
+  await sessionsButton.click()
+  await page.locator('[data-session-id="session-coder-ask"] button').first().click()
+  await expect(sessionsButton.getByTestId('other-sessions-unread')).toHaveText(`${await unreadOf('session-coder-ask')}`)
+  await page.evaluate(({ context }) => window.__messageHubMock.manage(context, 'session-coder-ask', 'archive'), { context: OWN })
+  if (!await page.getByTestId('session-sidebar').isVisible()) await sessionsButton.click()
+  await expect(page.getByTestId('session-sidebar').getByTestId('archived-unread')).toHaveText('1')
 })
 
 test('default creation can retry and a delayed completion cannot replace a newer entity selection', async ({ page }) => {
@@ -244,6 +276,7 @@ for (const width of [1440, 375]) {
     await page.locator('textarea').fill('First message in its own session')
     await page.locator('textarea').press('Enter')
     await expect(page.getByTestId('conversation-history')).toHaveAttribute('data-raw-count', '1')
+    await expect(page.getByTestId('conversation-history').getByTestId('delivery-status')).toHaveAttribute('data-status', 'sent')
     await expect(page.locator('textarea')).toHaveValue('')
     await page.reload()
     await expect(page.getByTestId('conversation-history').getByText('First message in its own session', { exact: true })).toBeVisible()
@@ -645,8 +678,7 @@ test('rapid sends are queued in order while typing continues; a failure returns 
     await expect(input).toHaveValue('')
   }
   await expect(history).toHaveAttribute('data-raw-count', '5')
-  const sent = await page.evaluate(async ({ context, id }) => (await window.__messageHubMock.reader(context, id).readRange(0, 10)).map(message => message.content.content), { context: OWN, id })
-  expect(sent).toEqual(['FAST1', 'FAST2', 'FAST3', 'FAST4', 'FAST5'])
+  await expect.poll(() => page.evaluate(async ({ context, id }) => (await window.__messageHubMock.reader(context, id).readRange(0, 10)).map(message => message.ui_local_id ? 'pending' : message.content.content), { context: OWN, id }), { timeout: 10_000 }).toEqual(['FAST1', 'FAST2', 'FAST3', 'FAST4', 'FAST5'])
   await expect.poll(() => page.evaluate(({ context, id }) => window.__messageHubMock.draft(context, id), { context: OWN, id })).toBe('')
 
   await page.evaluate(() => window.__messageHubMock.configure({ delayMs: 400, failNext: 'send_failure' }))
@@ -672,7 +704,9 @@ test('touch controls have names and 44px targets; message status is readable tex
     page.getByRole('button', { name: /^Entity details:/ }),
     page.getByRole('button', { name: 'Session details', exact: true }),
     composer.getByRole('button', { name: 'Add attachment', exact: true }),
-    composer.getByRole('button', { name: 'Send', exact: true }),
+    composer.getByRole('button', { name: 'Emoji', exact: true }),
+    // An empty input offers a voice message in place of Send.
+    composer.getByRole('button', { name: 'Record a voice message', exact: true }),
   ]
   for (const target of targets) {
     const box = await target.boundingBox()
@@ -682,6 +716,9 @@ test('touch controls have names and 44px targets; message status is readable tex
   await page.locator('input[type="file"]').first().setInputFiles('package.json')
   await expect(composer.getByRole('button', { name: 'Remove package.json', exact: true })).toBeVisible()
   await page.locator('textarea').fill('Status check')
+  const send = await composer.getByRole('button', { name: 'Send', exact: true }).boundingBox()
+  expect(send?.width ?? 0).toBeGreaterThanOrEqual(44)
+  expect(send?.height ?? 0).toBeGreaterThanOrEqual(44)
   await page.locator('textarea').press('Enter')
   await expect(page.getByTestId('conversation-history').getByRole('img', { name: 'Sent', exact: true })).toBeVisible()
 })
@@ -761,6 +798,7 @@ test('leaving an observed owner rewrites the address and the standalone route le
   await page.reload()
   await expect(page.getByTestId('owner-banner')).toHaveCount(0)
   await expect(page.locator('textarea')).toBeVisible()
-  await page.getByTestId('messagehub-home').first().click()
+  await page.getByTestId('hub-more-menu').click()
+  await page.getByTestId('messagehub-home').click()
   await expect.poll(() => new URL(page.url()).pathname).toBe('/')
 })

@@ -279,6 +279,18 @@ pub(super) fn validate_provider_rules(
         "static_inventory_models",
         catalog.static_inventory_models.iter().map(String::as_str),
     )?;
+    validate_nonempty_strings(
+        CatalogKind::ProviderRules,
+        &catalog.provider_profile_id,
+        "model_driver_overrides.provider_model_id",
+        catalog.model_driver_overrides.keys().map(String::as_str),
+    )?;
+    validate_nonempty_strings(
+        CatalogKind::ProviderRules,
+        &catalog.provider_profile_id,
+        "model_driver_overrides.target",
+        catalog.model_driver_overrides.values().map(String::as_str),
+    )?;
     if catalog.schema_revision == 0 && !catalog.static_inventory_models.is_empty() {
         return Err(CatalogBuildError::InvalidValue {
             owner: catalog.provider_profile_id.clone(),
@@ -371,6 +383,7 @@ fn validate_provider_rule_data(
             || !matches!(
                 key.as_str(),
                 "max_context_tokens"
+                    | "max_output_tokens"
                     | "decision.max_questions"
                     | "decision.max_options"
                     | "decision.max_levels"
@@ -1203,6 +1216,31 @@ pub(super) fn validate_references(
         }
     }
     for (owner, catalog) in provider_rules {
+        for target in catalog.document.model_driver_overrides.values() {
+            let (driver, model) =
+                target
+                    .split_once('/')
+                    .ok_or_else(|| CatalogBuildError::InvalidValue {
+                        owner: owner.clone(),
+                        field: "model_driver_overrides.target",
+                        reason: "requires <model_driver_id>/<model_id>".to_owned(),
+                    })?;
+            let driver_catalog =
+                model_drivers
+                    .get(driver)
+                    .ok_or_else(|| CatalogBuildError::UnknownReference {
+                        owner: owner.clone(),
+                        field: "model_driver_overrides.target",
+                        target: target.clone(),
+                    })?;
+            if !driver_catalog.exact_index.contains_key(model) {
+                return Err(CatalogBuildError::UnknownReference {
+                    owner: owner.clone(),
+                    field: "model_driver_overrides.target",
+                    target: target.clone(),
+                });
+            }
+        }
         for variant in &catalog.document.variants {
             require_model_driver(
                 model_drivers,

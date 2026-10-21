@@ -16,7 +16,7 @@ use super::input::{AgentEvent, EventReceipt, EventSource, ReplyRoute};
 /// 5: session input protocol 3 — `pending_events`, `reply`,
 /// `watched_tasks`, accepted Input events per source; `pending_task_calls`
 /// removed. Earlier versions are read-only until migrated.
-pub const SESSION_STATE_SCHEMA: &str = "opendan.session_state/5";
+pub const SESSION_STATE_SCHEMA: &str = "opendan.session_state/6";
 
 /// Upper bound on `inputs.recent_keys` (bounded dedup cache).
 pub const RECENT_KEYS_LIMIT: usize = 256;
@@ -95,6 +95,10 @@ pub struct WaitingFor {
     pub refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u64>,
+    /// TaskMgr human tasks the wait depends on: questions asked through a
+    /// notification (`ask-user` of a Work).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub human_tasks: Vec<String>,
 }
 
 /// Inputs of one logical Turn that entered a run. The input batch that
@@ -191,9 +195,21 @@ pub struct ChildCall {
     pub mode: ContextMode,
     pub behavior: String,
     pub trigger: CallTrigger,
-    /// Task given to the child (tool trigger: the call's `task` argument).
+    /// Task given to the child (tool trigger: the call's `task` argument;
+    /// a Todo executor: the admitted Todo's body).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// The serial Todo attempt this call executes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo: Option<TodoBinding>,
+}
+
+/// A sub context call bound to a serial Todo attempt (TodoList §2.1):
+/// its result is written back to that attempt when the call returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TodoBinding {
+    pub todo_id: String,
+    pub attempt: u32,
 }
 
 /// Suspended behavior process (its run is kept, §4.4).
@@ -294,6 +310,9 @@ pub enum OutboxPurpose {
     Placeholder,
     /// The reply of a Turn as an edit of its placeholder.
     FinalEdit,
+    /// A question to the user while the Turn is open (`ask-user`): a
+    /// `thread` message on the placeholder, carrying `agent_ask`.
+    Question,
 }
 
 impl OutboxPurpose {
@@ -631,6 +650,10 @@ pub struct Topic {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_report: Option<super::ReportSubmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_report: Option<super::ReportSubmission>,
     pub schema: String,
     pub rev: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -715,6 +738,10 @@ pub struct SessionState {
     /// Stop requested through `control(stop)`; applied at the next safe point.
     #[serde(default)]
     pub stop_requested: bool,
+    /// Only the open Turn is to be stopped (`control(stop, scope = turn)`, or
+    /// any stop of a Goal Session): the session goes on waiting afterwards.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_stop_requested: bool,
     /// An input batch to commit without new input (context switch, sub
     /// context call / return through `next_behavior`); it joins the open Turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -726,14 +753,35 @@ pub struct SessionState {
     /// call's tool result when the caller's run is opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_result: Option<Value>,
+    /// Revision of the TodoList (`todos.json`) last shown to the session's
+    /// top-level context in an input batch: the compact view is rendered
+    /// again only when the list changed since (0: never shown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub todo_view_rev: u64,
+    /// Goal Sessions: the Goal State it owns and the Activation in
+    /// progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<super::goal::GoalSessionState>,
+    /// Chat input format (UI sessions): the background context lines last
+    /// shown, `key → digest` (`time` → the epoch ms it was shown at). A
+    /// line is shown again only when its digest changes; the time line at
+    /// most every [`BACKGROUND_TIME_STEP_MS`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub background_shown: BTreeMap<String, String>,
     #[serde(default)]
     pub updated_at_ms: u64,
 }
+
+/// The time line of the background context changes at most this often
+/// (an LLM is a high-latency system: the design assumes 5 s).
+pub const BACKGROUND_TIME_STEP_MS: u64 = 5_000;
 
 impl SessionState {
     pub fn initial(worklog: WorklogBoundary, now_ms: u64) -> Self {
         Self {
             schema: SESSION_STATE_SCHEMA.to_string(),
+            latest_report: None,
+            final_report: None,
             rev: 1,
             writer: None,
             run_state: RunState::Created,
@@ -767,8 +815,12 @@ impl SessionState {
             last_error: None,
             pending_decision: None,
             stop_requested: false,
+            turn_stop_requested: false,
             internal_continuation: None,
             process_result: None,
+            todo_view_rev: 0,
+            goal: None,
+            background_shown: BTreeMap::new(),
             updated_at_ms: now_ms,
         }
     }

@@ -13,11 +13,18 @@
 //! - `loader.status`: hosting state, modules, recent errors.
 //! - `agent.profile`, `agent.profile_set`, `usage.models`, `ui.bindings`:
 //!   the home page ([`crate::home`]).
+//! - `goals.*` of the facade, plus `goals.activate` / `goals.post` (a run
+//!   opportunity / a message for a Goal); a Goal changed here is reconciled
+//!   by the host right away.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use buckyos_api::{
+    load_agent_permission_mode, validate_verify_hub_token_claims, AgentPermissionMode,
+    AppInstanceId, AuthTarget, TokenPrincipalKind, TokenUse,
+};
 use buckyos_http_server::{serve_http_by_rpc_handler, HttpServer, ServerError, ServerResult, StreamInfo};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -115,6 +122,7 @@ impl StateService {
             Access::Open { who } => Ok(who.clone()),
             Access::Zone {
                 owner,
+                app_id,
                 trust_loopback,
                 ..
             } => {
@@ -126,6 +134,7 @@ impl StateService {
                 })?;
                 let runtime = buckyos_api::get_buckyos_api_runtime()?;
                 let token = runtime.verify_trusted_session_token(token).await?;
+                let claims = validate_verify_hub_token_claims(&token, TokenUse::Session)?;
                 let user = token
                     .sub
                     .clone()
@@ -135,23 +144,22 @@ impl StateService {
                         "{user} is not the owner of this agent"
                     )));
                 }
+                if claims.principal_kind == TokenPrincipalKind::App {
+                    let AuthTarget::App { app_instance_id } = &claims.target else {
+                        return Err(RPCErrors::InvalidToken(
+                            "an app principal requires an app target".to_string(),
+                        ));
+                    };
+                    let client = runtime.get_system_config_client().await?;
+                    let mode = load_agent_permission_mode(client.as_ref(), app_instance_id).await?;
+                    authorize_agent_method(mode, app_instance_id, app_id, owner, &req.method)?;
+                }
                 Ok(match token.appid.as_deref().filter(|a| !a.is_empty()) {
                     Some(app) => format!("app:{app}@{user}"),
                     None => format!("did:bns:{user}"),
                 })
             }
         }
-    }
-
-    fn profile(&self) -> Value {
-        let (owner_did, desktop_url) = match &self.access {
-            Access::Zone { owner, zone_host, .. } => (
-                Some(format!("did:bns:{owner}")),
-                zone_host.as_ref().map(|h| format!("https://{h}")),
-            ),
-            Access::Open { .. } => (None, None),
-        };
-        self.home.profile(self.agent.as_ref(), owner_did, desktop_url)
     }
 
     async fn read_session(&self, params: &Value) -> Result<Value, OpenDanError> {
@@ -167,6 +175,7 @@ impl StateService {
                     "session": cfg.session,
                     "runtime": cfg.runtime,
                     "workspace": cfg.workspace,
+                    "workspace_binding": cfg.workspace_binding,
                     "subscriptions": cfg.subscriptions,
                     "channels": cfg.channels,
                     "behavior": cfg.prompt.behavior,
@@ -271,6 +280,17 @@ impl StateService {
                     self.host(&sid, "input").await;
                 }
             }
+            if method.starts_with("goals.") && is_write(method) {
+                // The host acts on the change now (its session, its epoch).
+                let id = param::<String>(params, "goal_id")
+                    .ok()
+                    .or_else(|| result.as_ref().ok().and_then(|g| g["goal_id"].as_str().map(str::to_string)));
+                if let Some(id) = id {
+                    if let Err(e) = self.supervisor.goal_changed(&id).await {
+                        log::warn!("service: goal {id} not reconciled yet: {e}");
+                    }
+                }
+            }
             return result;
         }
         match method {
@@ -279,7 +299,10 @@ impl StateService {
             "session.stop" => {
                 let sid: String = param(params, "sid")?;
                 let reason = param::<Option<String>>(params, "reason")?;
-                self.post_control(who, &sid, ControlCommand::Stop { reason }).await
+                // A Goal Session only stops its open Activation; the session
+                // itself ends with its Goal.
+                let scope = param::<Option<StopScope>>(params, "scope")?.unwrap_or_default();
+                self.post_control(who, &sid, ControlCommand::Stop { reason, scope }).await
             }
             "session.decide" => {
                 let sid: String = param(params, "sid")?;
@@ -309,13 +332,33 @@ impl StateService {
                 self.host(&sid, "input").await;
                 Ok(json!({ "index": index, "key": input.key }))
             }
-            "agent.profile" => Ok(self.profile()),
+            "agent.profile" => self.home.profile(self.agent.as_ref()).await,
             "agent.profile_set" => {
-                self.home.set_profile(params)?;
-                Ok(self.profile())
+                self.home.set_profile(params).await?;
+                self.home.profile(self.agent.as_ref()).await
             }
             "usage.models" => self.home.usage_models(self.agent.as_ref()).await,
             "ui.bindings" => self.home.ui_bindings(self.agent.as_ref()).await,
+            "home.workspaces" => self.home.workspaces(self.agent.as_ref()).await,
+            "goals.activate" => {
+                let id: String = param(params, "goal_id")?;
+                let reason = param::<Option<String>>(params, "reason")?
+                    .unwrap_or_else(|| format!("activated by {who}"));
+                let request = param::<Option<String>>(params, "request_id")?
+                    .unwrap_or_else(libopendan::ids::new_runner_id);
+                let index = self.supervisor.goal_activate(&id, &request, &reason).await?;
+                Ok(json!({ "index": index, "key": libopendan::goal::activate_key(&id, &request) }))
+            }
+            "goals.post" => {
+                let id: String = param(params, "goal_id")?;
+                let text: String = param(params, "text")?;
+                let from = match param::<Option<String>>(params, "session")? {
+                    Some(s) => format!("session:{s}"),
+                    None => who.to_string(),
+                };
+                let (index, key) = self.supervisor.goal_feedback(&id, &text, &from).await?;
+                Ok(json!({ "index": index, "key": key }))
+            }
             "loader.status" => Ok(json!({
                 "agent_did": self.info.agent_did,
                 "agent_id": self.info.agent_id,
@@ -326,6 +369,7 @@ impl StateService {
                 "modules": *self.info.modules.lock().expect("modules"),
                 "hosted": self.supervisor.status(),
                 "ui": self.ui.as_ref().map(|u| u.status()),
+                "goals": self.supervisor.goals().map(|g| g.status()),
                 "errors": *self.info.errors.lock().expect("errors"),
             })),
             other => Err(OpenDanError::InvalidArgument(format!("unknown method `{other}`"))),
@@ -333,11 +377,87 @@ impl StateService {
     }
 }
 
+fn authorize_agent_method(
+    mode: Option<AgentPermissionMode>,
+    caller: &AppInstanceId,
+    target_app_id: &str,
+    target_owner: &str,
+    method: &str,
+) -> Result<(), RPCErrors> {
+    if mode != Some(AgentPermissionMode::ReadOnly) || is_read(method) {
+        return Ok(());
+    }
+    if caller.app_id().as_str() == target_app_id
+        && caller.owner_user_id() == target_owner
+        && method != "agent.profile_set"
+        && (is_write(method) || is_operation(method))
+    {
+        return Ok(());
+    }
+    Err(RPCErrors::NoPermission(format!(
+        "read-only Agent cannot call {method} on this Agent"
+    )))
+}
+
+fn is_read(method: &str) -> bool {
+    matches!(
+        method,
+        "agent.info"
+            | "sessions.lookup"
+            | "sessions.query"
+            | "sessions.children_of"
+            | "activity.active"
+            | "perception.last_seq"
+            | "perception.cursor"
+            | "perception.backlog"
+            | "perception.read"
+            | "cognition.recall_hints"
+            | "artifacts.head"
+            | "artifacts.version"
+            | "artifacts.versions"
+            | "artifacts.list"
+            | "workspaces.lookup"
+            | "workspaces.query"
+            | "workspaces.list"
+            | "workspaces.runtime_impact"
+            | "runtimes.list"
+            | "runtimes.lookup"
+            | "behaviors.identity"
+            | "behaviors.get"
+            | "behaviors.list"
+            | "behaviors.revision"
+            | "behaviors.cmd_skill"
+            | "skills.list"
+            | "goals.list"
+            | "goals.get"
+            | "goals.revision"
+            | "goals.changes"
+            | "goals.state"
+            | "goals.epoch_state"
+            | "goals.activations"
+            | "goals.schedule"
+            | "notify.state"
+            | "notify.list"
+            | "session.read"
+            | "session.worklog"
+            | "agent.profile"
+            | "usage.models"
+            | "ui.bindings"
+            | "home.workspaces"
+            | "loader.status"
+    )
+}
+
 /// Methods outside the Agent State facade that change something.
 fn is_operation(method: &str) -> bool {
     matches!(
         method,
-        "session.stop" | "session.decide" | "session.post" | "agent.profile_set"
+        "session.stop"
+            | "session.decide"
+            | "session.post"
+            | "agent.profile_set"
+            | "goals.activate"
+            | "goals.post"
     )
 }
 
@@ -407,5 +527,82 @@ impl HttpServer for StateService {
 
     fn http3_port(&self) -> Option<u16> {
         None
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    const OWN_APP: &str = "reader.test.buckyos.io";
+    const OTHER_APP: &str = "helper.test.buckyos.io";
+
+    fn authorize(mode: Option<AgentPermissionMode>, method: &str, target: &str) -> bool {
+        let caller = format!("{OWN_APP}@alice").parse::<AppInstanceId>().unwrap();
+        authorize_agent_method(mode, &caller, target, "alice", method).is_ok()
+    }
+
+    #[test]
+    fn read_only_agent_can_observe_own_and_other_agents() {
+        for method in [
+            "agent.info", "sessions.lookup", "sessions.query", "sessions.children_of",
+            "activity.active", "perception.last_seq", "perception.cursor", "perception.backlog",
+            "perception.read", "cognition.recall_hints", "artifacts.head", "artifacts.version",
+            "artifacts.versions", "artifacts.list", "workspaces.lookup", "workspaces.query",
+            "workspaces.list", "workspaces.runtime_impact", "runtimes.list", "runtimes.lookup",
+            "behaviors.identity", "behaviors.get", "behaviors.list", "behaviors.revision",
+            "behaviors.cmd_skill", "skills.list", "goals.list", "goals.get", "goals.revision",
+            "goals.changes", "goals.state", "goals.epoch_state", "goals.activations",
+            "goals.schedule", "notify.state", "notify.list", "session.read", "session.worklog",
+            "agent.profile", "usage.models", "ui.bindings", "home.workspaces", "loader.status",
+        ] {
+            for target in [OWN_APP, OTHER_APP] {
+                assert!(authorize(Some(AgentPermissionMode::ReadOnly), method, target), "{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_agent_writes_only_its_own_state() {
+        for method in [
+            "sessions.register", "sessions.post_input", "sessions.verify",
+            "cognition.notebook_append", "artifacts.decide", "workspaces.create",
+            "workspaces.import", "workspaces.discover", "workspaces.check", "workspaces.update",
+            "workspaces.archive", "workspaces.unregister", "workspaces.set_runtime_available",
+            "runtimes.register", "runtimes.update", "runtimes.check", "runtimes.unregister",
+            "goals.create", "goals.revise", "goals.set_status", "goals.reopen", "goals.restart",
+            "notify.send", "notify.cancel", "notify.answer", "skills.install", "skills.remove",
+            "session.stop", "session.decide", "session.post", "goals.activate", "goals.post",
+        ] {
+            assert!(authorize(Some(AgentPermissionMode::ReadOnly), method, OWN_APP), "{method}");
+            assert!(!authorize(Some(AgentPermissionMode::ReadOnly), method, OTHER_APP), "{method}");
+        }
+        let caller = format!("{OWN_APP}@bob").parse::<AppInstanceId>().unwrap();
+        assert!(authorize_agent_method(
+            Some(AgentPermissionMode::ReadOnly), &caller, OWN_APP, "alice", "session.post"
+        ).is_err());
+    }
+
+    #[test]
+    fn read_only_agent_cannot_edit_profiles_or_call_unclassified_methods() {
+        for method in [
+            "agent.profile_set", "goals.write_state", "goals.append_activations",
+            "goals.prepare_epoch", "goals.end_epoch", "goals.write_schedule",
+            "agent.future_get", "sessions.delete", "unknown",
+        ] {
+            for target in [OWN_APP, OTHER_APP] {
+                assert!(!authorize(Some(AgentPermissionMode::ReadOnly), method, target), "{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_write_agents_and_normal_apps_keep_existing_access() {
+        for mode in [None, Some(AgentPermissionMode::ReadWrite)] {
+            for target in [OWN_APP, OTHER_APP] {
+                assert!(authorize(mode, "agent.profile_set", target));
+                assert!(authorize(mode, "session.post", target));
+            }
+        }
     }
 }

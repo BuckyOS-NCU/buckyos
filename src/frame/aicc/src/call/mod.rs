@@ -401,6 +401,7 @@ impl<'a> CallResolver<'a> {
                 "thinking",
                 "thinking_budget",
                 "enable_thinking",
+                "preserve_thinking",
             ] {
                 if let Some(value) = variant_options.get(key) {
                     normalized
@@ -2223,6 +2224,8 @@ mod tests {
                 "claude",
                 "deepseek",
                 "doubao",
+                "doubao-agent-plan",
+                "doubao-speech",
                 "fal",
                 "gemini",
                 "glm",
@@ -2279,7 +2282,7 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         assert_eq!(golden, documented);
-        assert_eq!(golden.len(), 101);
+        assert_eq!(golden.len(), 119);
         assert!(golden.contains(&"typesafe|typesafe-systemone|decision|systemone.evaluate".into()));
         assert!(golden.contains(&"openai|openai-responses|llm|responses.create".into()));
         assert!(
@@ -2290,6 +2293,17 @@ mod tests {
         assert!(golden.contains(&"kimi|kimi-chat|vision.caption|chat.completions.create".into()));
         assert!(golden.contains(&"deepseek|deepseek-responses|vision.ocr|responses.create".into()));
         assert!(golden.contains(&"doubao|doubao-responses|vision.caption|responses.create".into()));
+        assert!(
+            golden.contains(&"doubao-speech|doubao-responses|audio.tts|tts.unidirectional".into())
+        );
+        assert!(
+            golden.contains(&"doubao-speech|doubao-responses|audio.asr|asr.recognize.flash".into())
+        );
+        assert!(golden
+            .contains(&"doubao-speech|doubao-responses|audio.asr|asr.recognize.submit".into()));
+        assert!(golden.contains(
+            &"doubao-agent-plan|doubao-responses|image.txt2img|ark.images.generate".into()
+        ));
         assert!(golden
             .contains(&"gemini|gemini-interactions|video.extend|models.predictLongRunning".into()));
         assert!(golden.contains(&"fal|fal-queue|image.upscale|queue.submit".into()));
@@ -2299,6 +2313,7 @@ mod tests {
         assert!(golden
             .contains(&"minimax|minimax-messages|video.txt2video|video_generation.create".into()));
         assert!(golden.contains(&"qwen|qwen-responses|llm|responses.create".into()));
+        assert!(golden.contains(&"qwen|qwen-responses|llm|chat.completions.create".into()));
         assert!(golden.contains(&"sn|sn-openai|llm|responses.create".into()));
     }
     #[test]

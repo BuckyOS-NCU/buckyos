@@ -16,22 +16,22 @@ use agent_tool::{
     AgentTool, AgentToolError, AgentToolResult, AgentToolStatus, CallingConventions,
     SessionRuntimeContext, ToolSpec, TOOL_SHELL,
 };
-use llm_context::state::LLMContextSnapshot;
-use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use async_trait::async_trait;
 use buckyos_api::AiToolCall;
 use llm_context::deps::{ToolCallCtx, ToolDispatchError, ToolManager, ToolSpecLite};
 use llm_context::observation::Observation;
+use llm_context::state::LLMContextSnapshot;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 use crate::lock::Lease;
 use crate::protocol::{
-    BehaviorEntry, ChildCall, CallTrigger, Touching, TOOL_CALL_BEHAVIOR,
+    BehaviorEntry, BehaviorToolConfig, CallTrigger, ChildCall, Touching, BEHAVIOR_TOOL_PREFIX,
+    TOOL_CALL_BEHAVIOR, TOOL_REPORT,
 };
 use crate::session::runs::RunHandle;
 
 use super::flush::canonical_args;
-
 
 /// `read_only | idempotent | side_effect | unknown` of a tool name.
 pub fn classify_effect(tool: &str) -> &'static str {
@@ -40,6 +40,7 @@ pub fn classify_effect(tool: &str) -> &'static str {
         // The call itself changes nothing: what the sub context does is
         // tracked by its own run.
         TOOL_CALL_BEHAVIOR => "read_only",
+        TOOL_REPORT => "idempotent",
         "write_file" | "edit_file" => "side_effect",
         t if t == TOOL_SHELL => "unknown",
         _ => "unknown",
@@ -48,6 +49,7 @@ pub fn classify_effect(tool: &str) -> &'static str {
 
 /// Session-aware tool manager wrapping xllm's tool set.
 pub struct SessionToolManager {
+    shared: Arc<super::shared::Shared>,
     inner: Arc<dyn Sandbox>,
     run: RunHandle,
     lease: Arc<Lease>,
@@ -63,6 +65,7 @@ pub struct SessionToolManager {
 
 impl SessionToolManager {
     pub fn new(
+        shared: Arc<super::shared::Shared>,
         inner: Arc<dyn Sandbox>,
         run: RunHandle,
         lease: Arc<Lease>,
@@ -72,6 +75,7 @@ impl SessionToolManager {
     ) -> Self {
         let seen_tasks = Mutex::new(run.noted_tasks().into_iter().collect());
         Self {
+            shared,
             inner,
             run,
             lease,
@@ -121,11 +125,31 @@ impl ToolManager for SessionToolManager {
         if let Err(e) = self.lease.check() {
             return Err(ToolDispatchError::not_started(e.to_string()));
         }
+        if let Err(e) = super::drive::verify_workspace_admission(&self.shared).await {
+            return Err(ToolDispatchError::not_started(e.to_string()));
+        }
         if let Err(e) = self.run.require_execution_admitted() {
             return Err(ToolDispatchError::not_started(e.to_string()));
         }
         *self.current_tool.lock().expect("current tool") = Some(call.name.clone());
-        let effect = classify_effect(&call.name);
+        if call.name == TOOL_REPORT && self.inner.has_tool(TOOL_REPORT) {
+            return super::reports::call(&self.shared, &self.run, &call)
+                .await
+                .map_err(|e| ToolDispatchError::not_started(e.to_string()));
+        }
+        // Running a sub context changes nothing by itself: what it does is
+        // tracked by its own run.
+        let effect = if self
+            .shared
+            .behavior_functions
+            .lock()
+            .expect("behavior functions")
+            .contains(&call.name)
+        {
+            "read_only"
+        } else {
+            classify_effect(&call.name)
+        };
         if effect != "read_only" {
             let action = InflightAction {
                 call_id: call.call_id.clone(),
@@ -136,10 +160,7 @@ impl ToolManager for SessionToolManager {
                 // tool that creates a task in an external service uses it as
                 // the idempotency key, so a crash between creating and
                 // recording the task finds the same task again.
-                idempotency_key: Some(crate::ids::h(&[
-                    self.run.run_id(),
-                    call.call_id.as_str(),
-                ])),
+                idempotency_key: Some(crate::ids::h(&[self.run.run_id(), call.call_id.as_str()])),
                 step_index: None,
                 started_at_ms: crate::now_ms(),
             };
@@ -154,9 +175,28 @@ impl ToolManager for SessionToolManager {
         // A tool that answers `Pending { task_id }` suspends the run: the
         // session waits for the task outside the context (the run's
         // resolver answers for it) and fills the result on resume.
+        let call_id = call.call_id.clone();
         let result = self.inner.call_tool(call, ctx).await;
-        if let Ok(Observation::Success { tool_result, .. } | Observation::Error { tool_result, .. }) =
-            &result
+        // A question to the user is the session's own task.
+        if let Ok(Observation::Pending {
+            task_id,
+            tool_result,
+            ..
+        }) = &result
+        {
+            if super::ask::is_user_input(task_id) {
+                let detail = tool_result.as_ref().and_then(|t| t.detail.as_ref());
+                if let Some(refused) =
+                    super::ask::on_pending(&self.shared, &self.run, &call_id, task_id, detail).await
+                {
+                    return Ok(refused);
+                }
+                return result;
+            }
+        }
+        if let Ok(
+            Observation::Success { tool_result, .. } | Observation::Error { tool_result, .. },
+        ) = &result
         {
             if let Some((task_id, t)) = tool_result
                 .as_ref()
@@ -196,20 +236,32 @@ impl ToolManager for SessionToolManager {
 /// this runner resolves it.
 pub const SUB_CONTEXT_TASK_PREFIX: &str = "subctx:";
 
-/// `call_behavior({behavior, task})`: run a sub context (`create_sub_context`
-/// / `fork` target) and return its result as this call's tool result. The
-/// tool only validates and suspends; the session runs the child (§4.4).
-pub struct CallBehaviorTool {
-    /// Behaviors that can be called (sub context modes only).
-    targets: BTreeMap<String, BehaviorEntry>,
+/// A tool that runs a sub context (`create_sub_context` / `fork` target)
+/// and returns its result as this call's tool result: the generic
+/// `call_behavior({behavior, task})`, or the named function a behavior
+/// declares with `[tool]`. The tool only validates and suspends; the
+/// session runs the child (§4.4).
+pub struct BehaviorTool {
+    kind: BehaviorToolKind,
     /// Sub contexts already in progress above the run this tool belongs to.
     depth: usize,
     /// `session.policy.max_process_depth`.
     max_depth: usize,
 }
 
-impl CallBehaviorTool {
-    pub fn new(
+enum BehaviorToolKind {
+    /// `call_behavior`: any sub context behavior, named in the arguments.
+    Any(BTreeMap<String, BehaviorEntry>),
+    /// One behavior's `[tool]`.
+    Named {
+        behavior: String,
+        tool: BehaviorToolConfig,
+    },
+}
+
+impl BehaviorTool {
+    /// `call_behavior` over the session's sub context behaviors.
+    pub fn any(
         behaviors: &BTreeMap<String, BehaviorEntry>,
         depth: usize,
         max_depth: usize,
@@ -220,37 +272,87 @@ impl CallBehaviorTool {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         (!targets.is_empty()).then_some(Self {
-            targets,
+            kind: BehaviorToolKind::Any(targets),
             depth,
             max_depth,
         })
     }
+
+    /// The named functions the behaviors declare, keyed by the tool list
+    /// entry that offers them (`behavior:<name>`).
+    pub fn named(
+        behaviors: &BTreeMap<String, BehaviorEntry>,
+        depth: usize,
+        max_depth: usize,
+    ) -> Vec<(String, Self)> {
+        behaviors
+            .iter()
+            .filter(|(_, e)| e.mode.is_sub_context())
+            .filter_map(|(name, e)| {
+                let tool = e.tool.clone()?;
+                Some((
+                    format!("{BEHAVIOR_TOOL_PREFIX}{name}"),
+                    Self {
+                        kind: BehaviorToolKind::Named {
+                            behavior: name.clone(),
+                            tool,
+                        },
+                        depth,
+                        max_depth,
+                    },
+                ))
+            })
+            .collect()
+    }
+}
+
+/// The behavior a named function runs (`[tool]` of a frozen behavior).
+pub(super) fn behavior_of_function(
+    behaviors: &BTreeMap<String, BehaviorEntry>,
+    function: &str,
+) -> Option<(String, BehaviorToolConfig)> {
+    behaviors.iter().find_map(|(name, e)| {
+        e.tool
+            .as_ref()
+            .filter(|t| e.mode.is_sub_context() && t.function_name(name) == function)
+            .map(|t| (name.clone(), t.clone()))
+    })
 }
 
 #[async_trait]
-impl AgentTool for CallBehaviorTool {
+impl AgentTool for BehaviorTool {
     fn spec(&self) -> ToolSpec {
-        let list = self
-            .targets
-            .iter()
-            .map(|(k, e)| format!("{k} ({})", e.mode.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        ToolSpec {
-            name: TOOL_CALL_BEHAVIOR.into(),
-            description: format!(
-                "Run a sub task in a sub context and get its result as this call's result. The sub context cannot ask the user; state the goal and the expected output in `task`. Available behaviors: {list}."
-            ),
-            args_schema: json!({
-                "type": "object",
-                "properties": {
-                    "behavior": { "type": "string", "description": "behavior to run" },
-                    "task": { "type": "string", "description": "what the sub context must do and return" }
-                },
-                "required": ["behavior", "task"]
-            }),
-            output_schema: json!({ "type": "object" }),
-            usage: Some(format!("{TOOL_CALL_BEHAVIOR} behavior=<name> task=<text>")),
+        match &self.kind {
+            BehaviorToolKind::Any(targets) => {
+                let list = targets
+                    .iter()
+                    .map(|(k, e)| format!("{k} ({})", e.mode.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ToolSpec {
+                    name: TOOL_CALL_BEHAVIOR.into(),
+                    description: format!(
+                        "Run a sub task in a sub context and get its result as this call's result. State the goal and the expected output in `task`. Available behaviors: {list}."
+                    ),
+                    args_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "behavior": { "type": "string", "description": "behavior to run" },
+                            "task": { "type": "string", "description": "what the sub context must do and return" }
+                        },
+                        "required": ["behavior", "task"]
+                    }),
+                    output_schema: json!({ "type": "object" }),
+                    usage: Some(format!("{TOOL_CALL_BEHAVIOR} behavior=<name> task=<text>")),
+                }
+            }
+            BehaviorToolKind::Named { behavior, tool } => ToolSpec {
+                name: tool.function_name(behavior),
+                description: tool.description.trim().to_string(),
+                args_schema: tool.args_schema(),
+                output_schema: json!({ "type": "object" }),
+                usage: None,
+            },
         }
     }
 
@@ -263,25 +365,39 @@ impl AgentTool for CallBehaviorTool {
         _ctx: &SessionRuntimeContext,
         args: Value,
     ) -> std::result::Result<AgentToolResult, AgentToolError> {
-        let behavior = args
-            .get("behavior")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .ok_or_else(|| AgentToolError::InvalidArgs("`behavior` is required".into()))?;
-        let task = args
-            .get("task")
-            .or_else(|| args.get("body"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| AgentToolError::InvalidArgs("`task` is required".into()))?;
-        if !self.targets.contains_key(behavior) {
-            return Err(AgentToolError::InvalidArgs(format!(
-                "behavior `{behavior}` cannot be called as a sub context (available: {})",
-                self.targets.keys().cloned().collect::<Vec<_>>().join(", ")
-            )));
-        }
+        let (behavior, task, tool_name) = match &self.kind {
+            BehaviorToolKind::Any(targets) => {
+                let behavior = args
+                    .get("behavior")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .ok_or_else(|| AgentToolError::InvalidArgs("`behavior` is required".into()))?;
+                let task = args
+                    .get("task")
+                    .or_else(|| args.get("body"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| AgentToolError::InvalidArgs("`task` is required".into()))?;
+                if !targets.contains_key(behavior) {
+                    return Err(AgentToolError::InvalidArgs(format!(
+                        "behavior `{behavior}` cannot be called as a sub context (available: {})",
+                        targets.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )));
+                }
+                (behavior.to_string(), task.to_string(), TOOL_CALL_BEHAVIOR.to_string())
+            }
+            BehaviorToolKind::Named { behavior, tool } => {
+                let task = tool.render_task(&args);
+                if task.is_empty() {
+                    return Err(AgentToolError::InvalidArgs(
+                        "the arguments give the sub context no task".into(),
+                    ));
+                }
+                (behavior.clone(), task, tool.function_name(behavior))
+            }
+        };
         if self.depth >= self.max_depth {
             return Err(AgentToolError::ExecFailed(format!(
                 "sub contexts are nested {} deep already; do the work in this context",
@@ -298,7 +414,7 @@ impl AgentTool for CallBehaviorTool {
             ));
         }
         let mut r = AgentToolResult::from_details(json!({ "behavior": behavior, "task": task }))
-            .with_tool(TOOL_CALL_BEHAVIOR)
+            .with_tool(&tool_name)
             .with_status(AgentToolStatus::Pending);
         r.task_id = Some(format!("{SUB_CONTEXT_TASK_PREFIX}{call_id}"));
         r.summary = format!("sub context `{behavior}` started");
@@ -308,9 +424,10 @@ impl AgentTool for CallBehaviorTool {
 
 /// The sub context call a `PendingTool` snapshot waits for, if that is what
 /// it is suspended on (exactly one pending call, made through
-/// `call_behavior`).
+/// `call_behavior` or a behavior's named function).
 pub(super) fn pending_sub_call(
     snapshot: &LLMContextSnapshot,
+    behaviors: &BTreeMap<String, BehaviorEntry>,
     mode_of: impl Fn(&str) -> crate::error::Result<BehaviorEntry>,
 ) -> crate::error::Result<Option<ChildCall>> {
     let pending = snapshot.state.pending_calls();
@@ -327,7 +444,13 @@ pub(super) fn pending_sub_call(
             .and_then(Value::as_str)
             .map(|s| s.trim().to_string())
     };
-    let behavior = arg("behavior").unwrap_or_default();
+    let (behavior, task) = match behavior_of_function(behaviors, &p.call.name) {
+        Some((behavior, tool)) => (behavior, Some(tool.render_task(&Value::Object(p.call.args.clone().into_iter().collect())))),
+        None => (
+            arg("behavior").unwrap_or_default(),
+            arg("task").or_else(|| arg("body")),
+        ),
+    };
     let entry = mode_of(&behavior)?;
     Ok(Some(ChildCall {
         mode: entry.mode,
@@ -336,6 +459,7 @@ pub(super) fn pending_sub_call(
             call_id: p.call.call_id.clone(),
             task_id: p.task_id.clone(),
         },
-        task: arg("task").or_else(|| arg("body")),
+        task,
+        todo: None,
     }))
 }

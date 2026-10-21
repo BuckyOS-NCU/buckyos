@@ -2,9 +2,23 @@
   "format": "buckyos.aicc.provider-rules-catalog",
   "schema_version": 1,
   "schema_revision": 1,
-  "revision_seq": 4,
+  "revision_seq": 5,
   "provider_profile_id": "deepseek",
-  "models": [],
+  "model_driver_overrides": {
+    "deepseek-flash": "deepseek/deepseek-v4.1-flash",
+    "deepseek-v4-flash": "deepseek/deepseek-v4.1-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek/deepseek-v4.1-flash"
+  },
+  "models": [
+    {
+      "id": "deepseek-chat",
+      "exclude": true
+    },
+    {
+      "id": "deepseek-reasoner",
+      "exclude": true
+    }
+  ],
   "patterns": [
     {
       "match": "*",
@@ -58,10 +72,10 @@
       "variant": "reasoning-none",
       "match": {
         "origin_model_id": [
+          "deepseek-v4.1-flash",
           "deepseek-v4-flash",
           "deepseek-v4-pro",
-          "deepseek-v4-flash-vision-exp",
-          "deepseek-v4.1-flash"
+          "deepseek-v4-flash-vision-exp"
         ],
         "variant": "reasoning-none"
       },
@@ -76,6 +90,8 @@
       "variant": "reasoning-low",
       "match": {
         "origin_model_id": [
+          "deepseek-v4.1-flash",
+          "deepseek-v4-flash",
           "deepseek-v4-pro"
         ],
         "variant": "reasoning-low"
@@ -91,10 +107,10 @@
       "variant": "reasoning-high",
       "match": {
         "origin_model_id": [
+          "deepseek-v4.1-flash",
           "deepseek-v4-flash",
           "deepseek-v4-pro",
-          "deepseek-v4-flash-vision-exp",
-          "deepseek-v4.1-flash"
+          "deepseek-v4-flash-vision-exp"
         ],
         "variant": "reasoning-high"
       },
@@ -109,10 +125,10 @@
       "variant": "reasoning-max",
       "match": {
         "origin_model_id": [
+          "deepseek-v4.1-flash",
           "deepseek-v4-flash",
           "deepseek-v4-pro",
-          "deepseek-v4-flash-vision-exp",
-          "deepseek-v4.1-flash"
+          "deepseek-v4-flash-vision-exp"
         ],
         "variant": "reasoning-max"
       },

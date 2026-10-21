@@ -648,3 +648,337 @@ fn serve_handles_posted_input_until_the_session_is_stopped() {
 }
 
 fn _unused(_: &Path) {}
+
+#[test]
+fn workspace_commands_preserve_identity_and_create_fixed_session_bindings() {
+    let cli = Cli::new();
+    let directory = cli.root.join("project");
+    let path = directory.to_str().unwrap();
+    let args = [
+        "workspace",
+        "create",
+        "--directory",
+        path,
+        "--name",
+        "Project",
+        "--key",
+        "project-1",
+    ];
+    let (code, created, err) = cli.run(&args);
+    assert_eq!(code, 0, "{err}");
+    let id = created["workspace_id"].as_str().unwrap();
+    let (code, retry, err) = cli.run(&args);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(retry["workspace_id"], id);
+    let sd = cli.create(&["--objective", "work in project", "--workspace", id]);
+    let cfg = sd.config().unwrap();
+    assert_eq!(cfg.workspace.as_ref().unwrap().workspace_id, id);
+    assert_eq!(
+        cfg.workspace_binding.as_ref().unwrap().location.directory,
+        directory
+    );
+    std::fs::write(directory.join("result.txt"), "retained").unwrap();
+    let (code, _, err) = cli.run(&["workspace", "set-runtime", "local", "unavailable"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, listed, err) = cli.run(&["workspace", "list"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["availability"], "runtime_unavailable");
+    assert_eq!(
+        sd.config().unwrap().workspace_binding,
+        cfg.workspace_binding
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.join("result.txt")).unwrap(),
+        "retained"
+    );
+}
+
+#[test]
+fn workspace_import_and_unregister_never_delete_project_files() {
+    let cli = Cli::new();
+    let directory = cli.root.join("existing");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("README.md"), "user content").unwrap();
+    let path = directory.to_str().unwrap();
+    let (code, record, err) = cli.run(&[
+        "workspace",
+        "import",
+        "--directory",
+        path,
+        "--name",
+        "Existing",
+        "--key",
+        "import-1",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let id = record["workspace_id"].as_str().unwrap();
+    let rev = record["revision"].to_string();
+    let (code, _, _) = cli.run(&["workspace", "unregister", id, "--expected-revision", "0"]);
+    assert_ne!(code, 0);
+    let (code, _, err) = cli.run(&["workspace", "unregister", id, "--expected-revision", &rev]);
+    assert_eq!(code, 0, "{err}");
+    let (code, list, err) = cli.run(&["workspace", "list"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(list.as_array().unwrap().is_empty());
+    assert!(directory.join(WORKSPACE_METADATA_FILE).is_file());
+    assert_eq!(
+        std::fs::read_to_string(directory.join("README.md")).unwrap(),
+        "user content"
+    );
+}
+
+fn call_report(id: &str, args: Value) -> Result<Value, u16> {
+    Ok(json!({ "role": "assistant", "content": null, "tool_calls": [{
+        "id": id, "type": "function",
+        "function": { "name": "report", "arguments": args.to_string() }
+    }]}))
+}
+
+/// Goals from the command line: `goal create` (idempotent by key), `goal
+/// serve` hosts them (the Goal Session, an Activation with the mock
+/// provider), `goal show / activate / pause / revise`, permissions by the
+/// calling session, exit codes of a conflict and a refusal.
+#[test]
+fn goals_from_the_command_line() {
+    let cli = Cli::new();
+    let llm = MockLlm::start(|req, _| {
+        assert!(system_of(req).contains("(goal session)"), "{}", system_of(req));
+        let header = messages(req)
+            .iter()
+            .map(text_of)
+            .find(|t| t.starts_with("<goal_activation"))
+            .unwrap_or_default();
+        assert!(header.contains("<objective>keep notes.md short</objective>"), "{header}");
+        call_report("r1", json!({ "report": "notes are short", "is_end": true, "result": { "decision": "no_action" } }))
+    });
+    let lc = llm.llm_context(json!({}));
+    let create = ["goal", "create", "--objective", "keep notes.md short", "--every", "300", "--start", "--key", "k1"];
+    let (code, g, err) = cli.run(&create);
+    assert_eq!(code, 0, "{g} {err}");
+    let goal_id = g["goal_id"].as_str().unwrap().to_string();
+    let sid = g["session"]["sid"].as_str().unwrap().to_string();
+    let (_, again, _) = cli.run(&create);
+    assert_eq!(again["goal_id"], goal_id.as_str());
+    let (code, _, err) = cli.run(&["new", "--class", "goal", "--objective", "x", "--no-run"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("goal create"), "{err}");
+    let (_, list, _) = cli.run(&["goal", "list"]);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    let mut serve = cli
+        .command(&["goal", "serve", "--llm-context", &lc, "--poll-ms", "50"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let activations = |cli: &Cli| -> usize {
+        let (_, v, _) = cli.run(&["goal", "show", &goal_id, "--activations", "10"]);
+        v["activations"].as_array().map(|a| a.len()).unwrap_or(0)
+    };
+    let started = Instant::now();
+    while activations(&cli) < 1 {
+        assert!(started.elapsed() < Duration::from_secs(30), "no activation");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, v, _) = cli.run(&["goal", "show", &goal_id, "--state", "--schedule", "--activations", "5"]);
+    assert_eq!(v["activations"][0]["decision"], "no_action");
+    assert_eq!(v["activations"][0]["reasons"][0]["kind"], "created");
+    assert_eq!(v["session"]["session_id"], sid.as_str());
+    assert_eq!(v["state"]["usage"]["activations"], 1);
+    assert_eq!(v["schedule"]["start_posted_epoch"], 1);
+    // A manual run opportunity.
+    let (code, v, err) = cli.run(&["goal", "activate", &goal_id, "--reason", "look again"]);
+    assert_eq!(code, 0, "{v} {err}");
+    let started = Instant::now();
+    while activations(&cli) < 2 {
+        assert!(started.elapsed() < Duration::from_secs(30), "no second activation");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // From inside its own session the goal may not pause itself.
+    let out = cli
+        .command(&["goal", "pause", &goal_id])
+        .env("OPENDAN_SESSION_ID", &sid)
+        .output()
+        .unwrap();
+    let (code, _, err) = parse(out);
+    assert_eq!(code, 6, "{err}");
+    // ... but it may show itself without naming it.
+    let out = cli
+        .command(&["goal", "show"])
+        .env("OPENDAN_SESSION_ID", &sid)
+        .output()
+        .unwrap();
+    let (code, v, err) = parse(out);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(v["goal"]["goal_id"], goal_id.as_str());
+    let (code, _, err) = cli.run(&["goal", "revise", &goal_id, "--expected-revision", "7", "--objective", "x"]);
+    assert_eq!(code, 5, "{err}");
+    let (code, v, _) = cli.run(&["goal", "revise", &goal_id, "--expected-revision", "1", "--objective", "keep notes.md short"]);
+    assert_eq!((code, v["revision"].as_u64()), (0, Some(1)), "no change is no revision");
+    let (code, v, err) = cli.run(&["goal", "pause", &goal_id, "--reason", "holiday"]);
+    assert_eq!((code, v["status"].as_str()), (0, Some("paused")), "{err}");
+    let _ = serve.kill();
+    let _ = serve.wait();
+    assert!(llm.count() >= 2);
+}
+
+/// `ask-user` prints the pending result the `shell` tool forwards; it only
+/// runs as a call of a session's run and checks its options.
+#[test]
+fn ask_user_prints_a_pending_question() {
+    let cli = Cli::new();
+    let ask = |args: &[&str], env: bool| {
+        let mut c = cli.command(&[&["ask-user"], args].concat());
+        if env {
+            c.env("OPENDAN_SESSION_ID", "ui-1").env(agent_tool::llm_bash::ENV_CALL_ID, "c9");
+        }
+        parse(c.output().unwrap())
+    };
+    let (code, _, err) = ask(&["which one?"], false);
+    assert_eq!(code, 2, "{err}");
+    let (code, v, err) = ask(&["which one?", "--option", "a=docs/", "--option", "b=everything", "--allow-text"], true);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(v["status"], "pending");
+    assert_eq!(v["task_id"], "userinput:c9");
+    assert_eq!(v["tool"], "ask-user");
+    let request: UserInputRequest = serde_json::from_value(v["detail"].clone()).unwrap();
+    assert_eq!(request.question, "which one?");
+    assert_eq!(request.input.kind, UserInputKind::Choice);
+    assert_eq!(request.input.options[1].label, "everything");
+    assert!(request.input.allow_text);
+    let (code, v, _) = ask(&["free text?"], true);
+    assert_eq!((code, v["detail"]["input"]["kind"].as_str()), (0, Some("text")));
+    for bad in [
+        vec!["q", "--option", "a=only one"],
+        vec!["q", "--option", "a=x", "--option", "a=y"],
+        vec!["q", "--option", "no-label"],
+        vec!["q", "--allow-text"],
+        vec!["  "],
+    ] {
+        let (code, _, err) = ask(&bad, true);
+        assert_eq!(code, 2, "{bad:?}: {err}");
+    }
+}
+
+/// A skill PIKG as `buckyos pikg pack` writes it: APPDOC.json (app_type
+/// `agent_skills`), PACKAGE_META.json and the `agent_skills.tar.gz` payload.
+fn skill_pikg(path: &Path, files: &[(&str, &str, u32)]) {
+    use sha2::{Digest, Sha256};
+    let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
+    for (name, text, mode) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(text.len() as u64);
+        h.set_mode(*mode);
+        h.set_cksum();
+        tar.append_data(&mut h, name, text.as_bytes()).unwrap();
+    }
+    let payload = tar.into_inner().unwrap().finish().unwrap();
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&payload)));
+    let objid = "pkg:00";
+    let app = json!({
+        "doc_type": "app", "name": "hello-skills", "version": "0.1.0", "app_type": "agent_skills",
+        "pkg_list": { "agent_skills": { "pkg_id": "all.agent_skills.hello#0.1.0", "pkg_objid": objid } }
+    });
+    let meta = json!({
+        "@schema": "buckyos.pikg.package-meta.v1",
+        "package_objects": { objid: { "name": "all.agent_skills.hello", "size": payload.len(), "version": "0.1.0" } },
+        "content_index": { digest.clone(): {
+            "sub_pkg_name": "agent_skills", "path": "agent_skills.tar.gz", "format": "tar.gz",
+            "size": payload.len(), "digest": digest
+        }}
+    });
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, bytes) in [
+        ("APPDOC.json", app.to_string().into_bytes()),
+        ("PACKAGE_META.json", meta.to_string().into_bytes()),
+        ("agent_skills.tar.gz", payload),
+    ] {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(&bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+/// `skill list | install | remove` and `create-worksession --cmd-skill`
+/// (opendan-builtin-cmd-skills-todo I01, I08): a skill PIKG installs its
+/// manuals and commands, a Work created afterwards takes the ones chosen,
+/// an unknown name is refused, and a removed skill cannot be chosen again.
+#[test]
+fn skills_are_installed_listed_chosen_and_removed() {
+    let cli = Cli::new();
+    let root = cli.root.join("agent_root");
+    std::fs::create_dir_all(root.join("cmd_skills")).unwrap();
+    std::fs::write(root.join("cmd_skills/admin.md"), "---\ndescription: settings\n---\nADMIN manual").unwrap();
+    let pikg = cli.root.join("hello-skills-0.1.0.pikg");
+    skill_pikg(
+        &pikg,
+        &[
+            ("cmd_skills/hello.md", "---\nname: hello\ndescription: say hello\nrequires: nothing\n---\nRun `hello`.", 0o644),
+            ("tools/hello/bin/hello", "#!/bin/sh\necho hello\n", 0o755),
+            ("goal_skills/greet.md", "---\ndescription: greet daily\n---\nGreet.", 0o644),
+        ],
+    );
+    let (code, v, err) = cli.run(&["skill", "install", pikg.to_str().unwrap()]);
+    assert_eq!(code, 0, "{v} {err}");
+    assert_eq!(v["package"], "hello-skills");
+    assert!(v["skills"].as_array().unwrap().iter().all(|s| s["install"]["pikg_digest"].as_str().unwrap().starts_with("sha256:")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(root.join("tools/hello/bin/hello")).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "commands stay executable");
+    }
+    let (code, v, _) = cli.run(&["skill", "list", "--json"]);
+    assert_eq!(code, 0);
+    let names: Vec<(String, String, String)> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["kind"].as_str().unwrap().into(), s["name"].as_str().unwrap().into(), s["origin"].as_str().unwrap().into()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("cmd".to_string(), "admin".to_string(), "local".to_string()),
+            ("cmd".into(), "hello".into(), "installed".into()),
+            ("goal".into(), "greet".into(), "installed".into()),
+        ]
+    );
+    // Installed again: the same package updates its own skills.
+    let (code, _, err) = cli.run(&["skill", "install", pikg.to_str().unwrap()]);
+    assert_eq!(code, 0, "{err}");
+
+    let parent = cli.create(&["--objective", "parent work"]);
+    let create = |extra: &[&str]| {
+        let mut args = vec!["create-worksession", "--objective", "child", "--report", "none"];
+        args.extend_from_slice(extra);
+        let out = cli.command(&args).env("OPENDAN_SESSION_ID", parent.sid()).output().unwrap();
+        parse(out)
+    };
+    let (code, v, err) = create(&["--cmd-skill", "hello", "--cmd-skill", "admin", "--key", "c1"]);
+    assert_eq!(code, 0, "{v} {err}");
+    let child = SessionDir::open(v["path"].as_str().unwrap()).unwrap();
+    let frozen = child.config().unwrap().prompt.frozen.unwrap();
+    assert_eq!(frozen.cmd_skills.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["hello", "admin"]);
+    assert_eq!(frozen.cmd_skills[0].text, "Run `hello`.");
+    let (code, _, err) = create(&["--cmd-skill", "nope", "--key", "c2"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("no cmd_skill `nope`"), "{err}");
+
+    let (code, v, err) = cli.run(&["skill", "remove", "hello"]);
+    assert_eq!(code, 0, "{v} {err}");
+    assert!(!root.join("tools/hello").exists() && !root.join("cmd_skills/hello.md").exists());
+    let (code, _, err) = cli.run(&["skill", "remove", "admin"]);
+    assert_eq!(code, 2, "a skill that was not installed is not removed here: {err}");
+    let (code, _, err) = create(&["--cmd-skill", "hello", "--key", "c3"]);
+    assert_eq!(code, 2, "{err}");
+    let frozen = child.config().unwrap().prompt.frozen.unwrap();
+    assert_eq!(frozen.cmd_skills[0].text, "Run `hello`.", "the earlier Work keeps its manual");
+
+    // Not a skill package.
+    std::fs::write(cli.root.join("bad.pikg"), "not a zip").unwrap();
+    let (code, _, err) = cli.run(&["skill", "install", cli.root.join("bad.pikg").to_str().unwrap()]);
+    assert_eq!(code, 2, "{err}");
+}

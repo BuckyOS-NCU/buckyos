@@ -410,7 +410,7 @@ fn provider_add() -> ProviderAddRequest {
         ProviderInstanceType::CloudApi,
         "openai",
         "https://api.example/v1",
-        serde_json::from_value(json!({"api_token": {"locked": "top-secret"}})).unwrap(),
+        serde_json::from_value(json!({"api_token": {"inline_secret": "top-secret"}})).unwrap(),
     );
     request.protocol_adapter_id = Some("openai-responses".to_string());
     request
@@ -418,6 +418,11 @@ fn provider_add() -> ProviderAddRequest {
 
 fn sn_provider(name: &str, auth: Value) -> ProviderSettings {
     let non_deletable = auth.get("mode").and_then(Value::as_str) == Some("dynamic_login");
+    let credentials = if non_deletable {
+        json!({"device_token": {"runtime_ref": "runtime://device-jwt"}})
+    } else {
+        json!({"api_token": {"inline_secret": "top-secret"}})
+    };
     ProviderSettings {
         provider_instance_name: name.to_string(),
         provider_type: ProviderInstanceType::CloudApi,
@@ -426,8 +431,7 @@ fn sn_provider(name: &str, auth: Value) -> ProviderSettings {
         protocol_adapter_id: "sn-openai".to_string(),
         base_url: "https://sn.buckyos.ai/api/v1/ai".to_string(),
         operation_base_urls: BTreeMap::new(),
-        credentials: serde_json::from_value(json!({"api_token": {"locked": "top-secret"}}))
-            .unwrap(),
+        credentials: serde_json::from_value(credentials).unwrap(),
         enabled: true,
         region: None,
         workspace: None,
@@ -817,8 +821,10 @@ async fn provider_list_returns_disabled_instances_revision_and_no_credentials() 
         protocol_adapter_id: "openai-responses".to_string(),
         base_url: "https://api.example/v1".to_string(),
         operation_base_urls: BTreeMap::new(),
-        credentials: serde_json::from_value(json!({"api_token": {"locked": "must-not-leak"}}))
-            .unwrap(),
+        credentials: serde_json::from_value(
+            json!({"api_token": {"inline_secret": "must-not-leak"}}),
+        )
+        .unwrap(),
         enabled: false,
         region: None,
         workspace: None,
@@ -827,7 +833,7 @@ async fn provider_list_returns_disabled_instances_revision_and_no_credentials() 
         auth: Some(
             serde_json::from_value(json!({
                 "mode": "api_key",
-                "credential_ref": "locked://disabled-provider/api_token",
+                "credential_ref": "inline-secret://disabled-provider/api_token",
                 "credential_kind": "bearer"
             }))
             .unwrap(),
@@ -872,7 +878,7 @@ async fn provider_list_returns_disabled_instances_revision_and_no_credentials() 
     let wire = serde_json::to_string(&response).unwrap();
     assert!(!wire.contains("must-not-leak"));
     assert!(!wire.contains("credential_ref"));
-    assert!(!wire.contains("locked://"));
+    assert!(!wire.contains("inline-secret://"));
 }
 
 #[tokio::test]
@@ -999,7 +1005,7 @@ fn builtin_tree(inventories: &[ModelProviderInventory]) -> ModelRegistry {
 }
 
 #[test]
-fn model_catalog_preserves_known_models_and_empty_specs_without_providers() {
+fn model_catalog_preserves_known_models_and_specs_without_providers() {
     let catalog = crate::model::llm_tests::builtin_catalog();
     let view = model_catalog_json(&catalog, &builtin_tree(&[]), &[]);
     let vendors = view["vendors"].as_array().unwrap();
@@ -1050,39 +1056,23 @@ fn model_catalog_preserves_known_models_and_empty_specs_without_providers() {
         .find(|model| model["id"] == "qwen3.5-27b")
         .unwrap();
     assert_eq!(model["metadata"]["local_deployable"], true);
-    let openai = vendors
-        .iter()
-        .find(|vendor| vendor["id"] == "openai")
-        .unwrap();
-    for (spec, model, effort) in [
-        ("gpt-nano", "gpt-6-luna", "none"),
-        ("gpt-mini", "gpt-6-luna", "low"),
-        ("gpt-standard", "gpt-6-sol", "medium"),
-        ("gpt-pro", "gpt-6-sol", "high"),
-        ("gpt-max", "gpt-6-astra", "high"),
-        ("gpt-codex", "gpt-6-sol", "xhigh"),
+    for model_id in [
+        "qwen3.8-max",
+        "qwen3.8-flash",
+        "qwen3.8-omni-flash",
+        "qwen3.7-plus",
     ] {
-        let entry = openai["specs"]
+        let model = qwen["models"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["id"] == spec)
+            .find(|model| model["id"] == model_id)
             .unwrap();
-        let members = entry["members"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|member| member["model_id"] == model)
-            .collect::<Vec<_>>();
-        assert_eq!(members.len(), 1, "{spec}");
-        assert_eq!(members[0]["target"], format!("llm.{model}:{effort}"));
-        assert_eq!(members[0]["weight"], 60.0);
-        assert_eq!(members[0]["active"], false);
+        assert_eq!(
+            model["metadata"]["api_types"],
+            json!(["llm", "vision.caption", "vision.ocr"])
+        );
     }
-    assert!(vendors
-        .iter()
-        .flat_map(|vendor| vendor["specs"].as_array().unwrap())
-        .any(|spec| spec["members"] == json!([])));
 }
 
 #[test]
@@ -1106,11 +1096,11 @@ fn model_catalog_joins_canonical_identity_deduplicates_variants_and_tracks_local
     ]);
     let mut cloud = provider_public_view(&sn_provider(
         "cloud",
-        json!({"mode": "api_key", "credential_ref": "locked://cloud/api_token", "credential_kind": "bearer"}),
+        json!({"mode": "api_key", "credential_ref": "inline-secret://cloud/api_token", "credential_kind": "bearer"}),
     ));
     let mut local = provider_public_view(&sn_provider(
         "local",
-        json!({"mode": "api_key", "credential_ref": "locked://local/api_token", "credential_kind": "bearer"}),
+        json!({"mode": "api_key", "credential_ref": "inline-secret://local/api_token", "credential_kind": "bearer"}),
     ));
     local.provider_type = ProviderInstanceType::LocalInference;
     let model_in = |view: &Value| {
@@ -1280,7 +1270,7 @@ fn builtin_logical_tree_is_not_an_inventory_snapshot() {
             .model_drivers()
             .map(|driver| driver.specs.len())
             .sum::<usize>(),
-        50
+        51
     );
     let mut task = None;
     let mut count = 0;
@@ -1402,7 +1392,8 @@ async fn update_and_delete_use_revision_cas_without_exposing_credentials() {
     let mut update = ProviderUpdateRequest::new("primary", 5);
     update.base_url = Some("https://api.updated.example/v1".to_string());
     update.credential = Some(
-        serde_json::from_value(json!({"api_token": {"locked": "replacement-secret"}})).unwrap(),
+        serde_json::from_value(json!({"api_token": {"inline_secret": "replacement-secret"}}))
+            .unwrap(),
     );
     let response = fixture
         .service
@@ -1499,7 +1490,7 @@ async fn api_key_sn_provider_can_be_deleted() {
             "sn-router-api-key",
             json!({
                 "mode": "api_key",
-                "credential_ref": "locked://sn-router-api-key/api_token",
+                "credential_ref": "inline-secret://sn-router-api-key/api_token",
                 "credential_kind": "bearer"
             }),
         )];
@@ -1543,8 +1534,10 @@ async fn management_reads_and_krpc_dispatch_use_one_runtime_view() {
             protocol_adapter_id: "openai-responses".to_string(),
             base_url: "https://api.example/v1".to_string(),
             operation_base_urls: BTreeMap::new(),
-            credentials: serde_json::from_value(json!({"api_token": {"locked": "not-returned"}}))
-                .unwrap(),
+            credentials: serde_json::from_value(
+                json!({"api_token": {"inline_secret": "not-returned"}}),
+            )
+            .unwrap(),
             enabled: true,
             region: None,
             workspace: None,
@@ -1671,6 +1664,27 @@ fn task_manager_errors_are_redacted() {
 }
 
 #[test]
+fn task_manager_payload_and_transport_errors_are_classified_without_leaking_details() {
+    let oversized = task_manager_error(
+        "runner_complete task_id=t-secret",
+        RPCErrors::ReasonError("rpc call error: 413 Payload Too Large".to_string()),
+    );
+    assert_eq!(
+        oversized.message,
+        "TaskMgr rejected an oversized AICC result"
+    );
+    assert!(!oversized.retriable);
+
+    let unavailable = task_manager_error(
+        "runner_complete task_id=t-secret",
+        RPCErrors::S2sTransientError("top-secret transport detail".to_string()),
+    );
+    assert_eq!(unavailable.message, "TaskMgr is temporarily unavailable");
+    assert!(unavailable.retriable);
+    assert!(!format!("{unavailable:?}").contains("top-secret"));
+}
+
+#[test]
 fn inline_artifact_replacement_updates_nested_output_values() {
     let old = buckyos_api::ResourceRef::base64("image/png".to_string(), "cG5n".to_string());
     let new = buckyos_api::ResourceRef::url(
@@ -1706,6 +1720,26 @@ fn inline_artifact_collection_finds_nested_base64_resources() {
         &found[0],
         buckyos_api::ResourceRef::Base64 { mime, .. } if mime == "image/png"
     ));
+}
+
+#[test]
+fn materialized_output_rejects_known_payload_leaks_outside_resource_refs() {
+    let named = buckyos_api::ResourceRef::NamedObject {
+        obj_id: ndn_lib::ObjId::new("cyfile:010203").unwrap(),
+    };
+    let output = ProtocolOutput {
+        value: json!({
+            "image": named,
+            "provider_states": [{"value": {"result": "cG5n"}}]
+        }),
+        usage: None,
+        artifacts: Vec::new(),
+    };
+    let error = assert_materialized_output_has_no_inline_payloads(&output, &["cG5n".to_string()])
+        .unwrap_err();
+    assert!(error
+        .message
+        .contains("retained an inline artifact payload"));
 }
 
 fn quota_record() -> QuotaTruthRecord {
@@ -2079,6 +2113,40 @@ fn non_llm_tasks_use_explicit_spec_links_and_require_the_requested_api() {
 }
 
 #[test]
+fn deepseek_flash_vision_apis_are_explicitly_routable() {
+    let mut inventory = crate::model::llm_tests::inventory(
+        "deepseek",
+        "deepseek-v4.1-flash",
+        "deepseek-flash",
+        "deepseek-main",
+        &["high"],
+    );
+    inventory.models[0].api_types.extend([
+        buckyos_api::ApiType::VisionOcr,
+        buckyos_api::ApiType::VisionCaption,
+    ]);
+    let registry = builtin_tree(&[inventory]);
+    for (logical_model, api_type) in [
+        ("vision.ocr", buckyos_api::ApiType::VisionOcr),
+        ("vision.caption", buckyos_api::ApiType::VisionCaption),
+    ] {
+        let candidates = registry
+            .resolve_candidates(logical_model, api_type)
+            .unwrap();
+        assert_eq!(candidates.candidates.len(), 1, "{logical_model}");
+        assert_eq!(
+            candidates.candidates[0].model.exact_model.as_str(),
+            "deepseek-flash:reasoning-high@deepseek-main"
+        );
+        assert!(candidates.candidates[0].paths.iter().any(|path| {
+            path.logical_paths
+                .iter()
+                .any(|logical_path| logical_path == "llm.deepseek-flash")
+        }));
+    }
+}
+
+#[test]
 fn media_family_preferences_remain_static_and_cannot_be_bypassed_by_auto_mounts() {
     let empty = builtin_tree(&[]);
     let directory = model_directory_json(&empty);
@@ -2096,7 +2164,7 @@ fn media_family_preferences_remain_static_and_cannot_be_bypassed_by_auto_mounts(
             .unwrap()
             .starts_with(&format!("{task}."))));
     }
-    assert_eq!(media_count, 55);
+    assert_eq!(media_count, 57);
     let mut contract_count = 0;
     for line in include_str!("model_defaults.rs").lines() {
         let Some((left, right)) = line.split_once(" -> ") else {
@@ -2127,11 +2195,19 @@ fn media_family_preferences_remain_static_and_cannot_be_bypassed_by_auto_mounts(
         );
         contract_count += 1;
     }
-    assert_eq!(contract_count, 55);
+    assert_eq!(contract_count, 57);
 
     assert_eq!(
         dir_item(&directory, "image.txt2img", "gpt_image")["weight"],
         json!(3.0)
+    );
+    assert_eq!(
+        dir_item(&directory, "image.txt2img", "minimax")["weight"],
+        json!(1.0)
+    );
+    assert_eq!(
+        dir_item(&directory, "image.img2img", "minimax")["weight"],
+        json!(1.0)
     );
     let mut model =
         crate::model::llm_tests::inventory("openai", "gpt-image-2", "image", "provider", &[]);
@@ -2147,6 +2223,34 @@ fn media_family_preferences_remain_static_and_cannot_be_bypassed_by_auto_mounts(
         loaded_directory["image.txt2img"],
         directory["image.txt2img"]
     );
+
+    let mut minimax = crate::model::llm_tests::inventory(
+        "minimax",
+        "image-01",
+        "image-01",
+        "minimax-provider",
+        &[],
+    );
+    minimax.models[0].api_types = vec![
+        buckyos_api::ApiType::ImageTextToImage,
+        buckyos_api::ApiType::ImageImageToImage,
+    ];
+    minimax.models[0].logical_mounts = vec![
+        "image.txt2img.minimax".into(),
+        "image.img2img.minimax".into(),
+    ];
+    let loaded = builtin_tree(&[minimax]);
+    for (path, api_type) in [
+        ("image.txt2img", buckyos_api::ApiType::ImageTextToImage),
+        ("image.img2img", buckyos_api::ApiType::ImageImageToImage),
+    ] {
+        let candidates = loaded.resolve_candidates(path, api_type).unwrap();
+        assert_eq!(candidates.candidates.len(), 1, "{path}");
+        assert_eq!(
+            candidates.candidates[0].model.exact_model.as_str(),
+            "image-01@minimax-provider"
+        );
+    }
 }
 
 fn dir_item<'a>(directory: &'a Value, path: &str, name: &str) -> &'a Value {

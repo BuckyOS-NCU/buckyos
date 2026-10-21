@@ -19,9 +19,11 @@ import { Camera } from '../ui/canvas/render/camera'
 import { RenderHost } from '../ui/canvas/render/RenderHost'
 import { useSurfaceLayout } from '../ui/canvas/useSurfaceLayout'
 import type { Transition } from './controller'
-import { DEFAULT_BACKGROUND, eyeOf, FADE_MS, fitStage, flyPath, stageView, viewOfEye, type Rect, type ResolvedStep, type View } from './model'
+import { DEFAULT_BACKGROUND, eyeOf, FADE_MS, fitStage, flyPath, stageTheme, stageView, viewOfEye, type Rect, type ResolvedStep, type View } from './model'
 
 const READY_MAX_MS = 300
+/** On stage nothing is laid out. */
+const NO_LAYOUT = () => false
 
 export interface StageCanvasProps {
   stage: StageSize
@@ -86,7 +88,7 @@ function SurfaceLayer({ surfaceId, camera, active, focus, hide, editing, onEditi
   return (
     <div className={`aiws-stage-layer${active ? ' is-active' : ''}`} data-testid={`aiws-stage-layer-${surfaceId}`} data-active={active ? 'true' : undefined} aria-hidden={!active}>
       <RenderHost surfaceId={surfaceId} mode="show" camera={camera} laid={laid} index={index} selection={noSelection} onSelectionChange={() => undefined}
-        editing={active && !passive ? editing : null} onEditingChange={(id) => { if (!passive) onEditingChange(id) }} canLayout={false} onCommitLayout={() => undefined}
+        editing={active && !passive ? editing : null} onEditingChange={(id) => { if (!passive) onEditingChange(id) }} canLayout={NO_LAYOUT} onCommitLayout={() => undefined}
         onContextMenu={() => undefined} onOpenEntity={() => undefined} gesturesPaused={passive} prefetch={prefetch} hidden={hidden} />
     </div>
   )
@@ -269,8 +271,10 @@ export function StageCanvas(props: StageCanvasProps) {
   const hole = mask.hole
   const background = props.background ?? DEFAULT_BACKGROUND
   const page = current?.kind === 'frame' ? props.pageBackground ?? background : background
+  // the content is drawn for the page it sits on, not for the Desktop theme: the presented picture is the same on every screen
+  const theme = stageTheme(page)
   return (
-    <div ref={rootRef} className={`aiws-stage-canvas${passive ? ' is-passive' : ''}`} data-testid="aiws-stage-canvas" data-step={current?.step.id} data-surface={displayed ?? undefined} data-free={free ? 'true' : undefined}
+    <div ref={rootRef} className={`aiws-stage-canvas cp-theme-${theme}${passive ? ' is-passive' : ''}`} data-testid="aiws-stage-canvas" data-step={current?.step.id} data-surface={displayed ?? undefined} data-free={free ? 'true' : undefined} data-stage-theme={theme}
       style={{ ['--aiws-stage-bg' as string]: page, ['--aiws-stage-letterbox' as string]: background }}>
       {layers.map((surfaceId) => {
         const focus = [current, next].flatMap((s) => (s?.surfaceId === surfaceId && s.rect ? [s.rect] : []))

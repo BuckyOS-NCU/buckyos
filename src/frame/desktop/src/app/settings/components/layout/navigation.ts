@@ -1,4 +1,4 @@
-import { Code, Network, Palette, Settings, Shield } from 'lucide-react'
+import { Code, FolderLock, Globe, Network, Palette, Settings, Shield } from 'lucide-react'
 
 export const settingsPageGroups = [
   {
@@ -34,6 +34,13 @@ export const settingsPageDefinitions = [
     label: 'Appearance',
   },
   {
+    key: 'zone',
+    group: 'system',
+    icon: Globe,
+    labelKey: 'settings.nav.zone',
+    label: 'Zone Config',
+  },
+  {
     key: 'cluster',
     group: 'network-security',
     icon: Network,
@@ -46,6 +53,13 @@ export const settingsPageDefinitions = [
     icon: Shield,
     labelKey: 'settings.nav.privacy',
     label: 'Privacy',
+  },
+  {
+    key: 'file-permissions',
+    group: 'network-security',
+    icon: FolderLock,
+    labelKey: 'settings.nav.filePermissions',
+    label: 'File Permissions',
   },
   {
     key: 'developer',

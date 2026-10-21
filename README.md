@@ -11,10 +11,10 @@ The current source tree targets **Beta2.2 / 0.7.0**, with the official launch pl
 - **Web Desktop and Control Panel**: a shared desktop with application windows, Settings, Users & Agents, AI Center, Task Center, and application management.
 - **FileBrowser and Preview**: built-in file browsing and preview interfaces. FileBrowser connects to `nfs-server` for file operations; background copy jobs use Task Manager.
 - **MessageHub and Message Center**: a built-in messaging app backed by `msg-center`, with conversation history, attachments, read state, and session archive/restore/delete. The service provides DID-based mailboxes, contacts, self-hosted groups, native messaging, and a Telegram tunnel.
-- **OpenDAN and Jarvis**: the Rust agent runtime supports configurable session classes and behavior loops, memory and workspace tools, message/event routing, delegated tasks, and requests for human input. Jarvis is packaged as a versioned `.pikg` application; its prompts, behaviors, and translations live in [`src/apps/jarvis_runtime/agent`](src/apps/jarvis_runtime/agent).
+- **OpenDAN and Jarvis**: OpenDAN is the Rust agent runtime, supporting configurable session classes and behavior loops, memory and workspace tools, message/event routing, delegated tasks, and requests for human input. Jarvis is the built-in Agent template, packaged as a versioned `.pikg` application; its prompts, behaviors, and translations live in [`src/apps/jarvis_agent/agent`](src/apps/jarvis_agent/agent).
 - **AI Compute Center (AICC)**: provider and model management, logical model routing, usage logging, and adapters for text and media capabilities. AI Center exposes these controls in the desktop.
 - **Workflow and Task Manager**: workflow definitions and runs, scheduled tasks, task progress/control, and human approval or intervention. Workflow and OpenDAN integrate with Task Manager and `kevent` to exchange task updates.
-- **Application delivery and SDK/CLI**: `.pikg` packages, validated installation plans, per-user application instances, and gateway routing. The TypeScript SDK and `buckyos` CLI are built together and bundled into the system; Rust services use `buckyos-api`.
+- **Application delivery and SDK/CLI**: `.pikg` packages, validated installation plans, per-user application instances, and gateway routing. Start with the [PIKG documentation index](doc/pikg/README.md). The TypeScript SDK and `buckyos` CLI are built together and bundled into the system; Rust services use `buckyos-api`.
 - **System infrastructure**: `system-config`, the scheduler, and `node-daemon` manage desired state and deployment; `verify-hub` and RBAC handle login and authorization. `kmsg` and `kevent` provide messaging and event notification, while `repo-service` and named-object storage support content delivery.
 - **Development workflow**: platform build/packaging pipelines, local development verification (DV) tests, and contributor guidance under [`harness/`](harness/README.md).
 
@@ -45,7 +45,7 @@ cd buckyos
 
 To develop the SDK/CLI locally, also clone `buckyos-websdk` alongside these repositories with `git clone --branch main https://github.com/buckyos/buckyos-websdk.git`. This checkout is optional; without it, the build uses the published npm package `buckyos@latest`.
 
-The build needs a stable Rust toolchain and platform C/C++ build tools, Python 3.12+, `uv`, Node.js with npm and pnpm, and Deno. Docker is needed for container applications; tmux is used by development tools. The current CI uses Node.js 24, pnpm 10.13.1, and Deno 2.9.2.
+The build needs a stable Rust toolchain and platform C/C++ build tools, Python 3.12+, `uv`, Node.js with npm and pnpm, and Deno. Container applications need Docker, or [WSL containers on Windows](doc/windows_wslc.md) without Docker Desktop; tmux is used by development tools. The current CI uses Node.js 24, pnpm 10.13.1, and Deno 2.9.2.
 
 To bootstrap the platform dependencies, inspect and run [`devenv.py`](devenv.py):
 

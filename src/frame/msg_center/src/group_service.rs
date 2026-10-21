@@ -44,6 +44,7 @@ fn expected(v: &Value, current: &str) -> Result<()> {
 fn within(window: Option<u64>, start: u64, now: u64) -> bool {
     window.is_none_or(|w| w > 0 && now.saturating_sub(start) <= w)
 }
+const AGENT_GROUP_DISABLED: &str = "agent_group_disabled";
 const JOIN_METHODS: &[&str] = &[
     "group.accept_invitation",
     "group.request_join",
@@ -101,12 +102,48 @@ impl MessageCenter {
         let actor = self.group_actor(&ctx).await?;
         self.group_rpc_authenticated(method, p, ctx, actor).await
     }
+    /// The App an Agent is built into (AppId == AgentId) speaks for that
+    /// Agent when it runs as the Agent's owner.
+    async fn is_agent_runtime_of(
+        &self,
+        ctx: &RPCContext,
+        runtime: &GroupActor,
+        agent: &DID,
+    ) -> Result<bool> {
+        let Some(client) = runtime.client.as_deref() else {
+            return Ok(false);
+        };
+        let Ok(agent_id) = buckyos_api::AgentId::from_agent_did(agent) else {
+            return Ok(false);
+        };
+        let app_id = client.strip_prefix("app:").unwrap_or(client);
+        let app_id = app_id.split('@').next().unwrap_or(app_id);
+        if app_id != agent_id.as_str() {
+            return Ok(false);
+        }
+        let Some(caller) = self.caller_identity(ctx).await? else {
+            return Ok(false);
+        };
+        if caller.principal_kind != TokenPrincipalKind::App {
+            return Ok(false);
+        }
+        let verifier = self.token_verifier.get();
+        let owner = verifier.resolve_user_did(&caller.user_id).await?;
+        Ok(verifier
+            .agent_owner(agent)
+            .await?
+            .is_some_and(|agent_owner| agent_owner == owner))
+    }
+
     pub(crate) async fn group_message_actor(
         &self,
         ctx: &RPCContext,
         msg: &MsgObject,
     ) -> Result<GroupActor> {
         let mut actor = self.group_actor(ctx).await?;
+        if actor.did != msg.from && self.is_agent_runtime_of(ctx, &actor, &msg.from).await? {
+            actor.did = msg.from.clone();
+        }
         if let Some((_, _, instance)) =
             crate::contact_mgr::ContactMgr::parse_msgtunnel_did(&msg.from)
         {
@@ -141,17 +178,37 @@ impl MessageCenter {
         }
         if method == "group.list_by_member" {
             let mut groups = vec![];
+            let mut invitations = vec![];
             for g in self.groups.list().await? {
-                if g.lifecycle != "deleted"
-                    && (g.role(&actor.did).is_some()
-                        || g.sessions.keys().any(|s| g.effective(Some(s), &actor.did)))
-                    && g.check_client(&actor).is_ok()
+                if g.lifecycle == "deleted" || g.check_client(&actor).is_err() {
+                    continue;
+                }
+                let record = g.members.get(&actor.did.to_string());
+                if g.role(&actor.did).is_some()
+                    || g.sessions.keys().any(|s| g.effective(Some(s), &actor.did))
                 {
-                    groups.push(self.group_doc(&g)?);
+                    let mut item = self.group_doc(&g)?;
+                    item["member"] = json!({
+                        "state": record.map(|m| m.state),
+                        "role": g.role(&actor.did),
+                    });
+                    groups.push(item);
+                } else if let Some(m) = record.filter(|m| {
+                    matches!(m.state, MemberStatus::Invited | MemberStatus::PendingAdminApproval)
+                }) {
+                    // Groups the caller is asked into or waits to be approved for.
+                    let mut item = self.group_doc(&g)?;
+                    item["member"] = json!({
+                        "state": m.state,
+                        "invitation_id": m.invitation_id,
+                        "invited_by": m.invited_by,
+                        "expires_at_ms": m.expires_at_ms,
+                    });
+                    invitations.push(item);
                 }
             }
             let joined = self.joined_groups(&actor.did).await?;
-            return Ok(json!({"items":groups,"joined":joined}));
+            return Ok(json!({"items":groups,"invitations":invitations,"joined":joined}));
         }
         let group: DID = field(&p, "group_did")?;
         if method == "group.sync_joined" {
@@ -314,6 +371,9 @@ impl MessageCenter {
                 }
             }
         }
+        if JOIN_METHODS.contains(&method) {
+            self.require_group_enabled_agent(&actor.did).await?;
+        }
         let mut tx = self.groups.begin(&group).await?;
         if tx.state.lifecycle == "deleted" {
             return Err(missing());
@@ -425,10 +485,11 @@ impl MessageCenter {
         Ok(json!({"member_did":member,"attested_by":a.did,"source_event":input["source_event"]}))
     }
 
-    /// Entity kind of a member (`user`, `agent`, `device`), taken from its DID
-    /// Document. Shadow endpoints are platform users and `did:dev` keys are
-    /// devices; a document that cannot be fetched right now yields `unknown`
-    /// and is retried when the member becomes active.
+    /// Entity kind of a member (`user`, `agent`, `device`), taken from its
+    /// owner document, else its default DID Document. Shadow endpoints are
+    /// platform users and `did:dev` keys are devices; a document that cannot be
+    /// fetched right now yields `unknown` and is retried when the member
+    /// becomes active.
     async fn resolve_entity_kind(&self, d: &DID) -> Result<String> {
         if d.method == "msgtunnel" {
             return Ok("user".into());
@@ -446,66 +507,47 @@ impl MessageCenter {
         if d.method == "dev" {
             return Ok("device".into());
         }
-        let doc = match name_client::resolve_did(d, None).await {
-            Ok(doc) => doc.to_json_value().map_err(db_error)?,
-            Err(_) => return Ok("unknown".into()),
+        let doc = match name_client::resolve_did(d, Some(name_lib::DidDocType::Owner)).await {
+            Ok(doc) => doc,
+            Err(_) => match name_client::resolve_did(d, None).await {
+                Ok(doc) => doc,
+                Err(_) => return Ok("unknown".into()),
+            },
         };
-        let context: Option<name_lib::DIDContext> = doc
-            .get("@context")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(db_error)?;
-        let declared = doc
-            .get("entity_type")
-            .or_else(|| doc.get("type"))
-            .or_else(|| doc.get("doc_type"))
-            .and_then(Value::as_str);
-        let kind = match declared {
-            Some("user" | "owner") => "user",
-            Some("agent") => "agent",
-            Some("device") => "device",
-            Some(_) => return Err(denied("member-must-be-single-entity")),
-            None if context
-                .as_ref()
-                .is_some_and(|c| c.contains("https://buckyos.org/ns/owner/v1")) =>
-            {
-                "user"
-            }
-            None if context
-                .as_ref()
-                .is_some_and(|c| c.contains("https://buckyos.org/ns/agent/v1")) =>
-            {
-                "agent"
-            }
-            None if context
-                .as_ref()
-                .is_some_and(|c| c.contains("https://buckyos.org/ns/device/v1")) =>
-            {
-                "device"
-            }
-            _ => return Err(denied("member-must-be-single-entity")),
-        };
-        if doc["id"] != json!(d) {
-            return Err(denied("member-document-mismatch"));
+        let doc = doc.to_json_value().map_err(db_error)?;
+        Ok(member_entity_kind(d, &doc)?.to_string())
+    }
+
+    /// A zone Agent takes part in groups only while its `allow_group` setting
+    /// is on; other members are not restricted here.
+    async fn require_group_enabled_agent(&self, d: &DID) -> Result<()> {
+        if d.method == "msgtunnel" || !self.is_local_recipient(d) {
+            return Ok(());
         }
-        Ok(kind.to_string())
+        match self.token_verifier.get().zone_agent(d).await? {
+            Some(agent) if !agent.allow_group => Err(denied(AGENT_GROUP_DISABLED)),
+            _ => Ok(()),
+        }
     }
 
     /// The invited member's side of the consent: same-Zone users answer by
-    /// their Contact Mgr policy towards the inviter, agents only accept their
-    /// owner's invitations (anyone else's go to the owner for confirmation),
-    /// and remote members still confirm explicitly (cross-Zone auto-accept is
-    /// a TODO). Returns the decision and who receives the invitation notice.
+    /// their Contact Mgr policy towards the inviter; agents refuse every
+    /// invitation while `allow_group` is off, otherwise accept their owner's
+    /// invitations and send anyone else's to the owner for confirmation;
+    /// remote members still confirm explicitly (cross-Zone auto-accept is a
+    /// TODO). Returns the decision and who receives the invitation notice.
     async fn member_consent(&self, inviter: &DID, d: &DID) -> Result<(MemberConsent, DID)> {
         if d.method == "msgtunnel" || !self.is_local_recipient(d) {
             return Ok((MemberConsent::Ask, d.clone()));
         }
-        if let Some(owner) = self.token_verifier.get().agent_owner(d).await? {
-            return Ok(if owner == *inviter {
+        if let Some(agent) = self.token_verifier.get().zone_agent(d).await? {
+            if !agent.allow_group {
+                return Err(denied(AGENT_GROUP_DISABLED));
+            }
+            return Ok(if agent.owner == *inviter {
                 (MemberConsent::Accept, d.clone())
             } else {
-                (MemberConsent::Ask, owner)
+                (MemberConsent::Ask, agent.owner)
             });
         }
         let access = self
@@ -3212,4 +3254,34 @@ impl MessageCenter {
         }
         Ok(())
     }
+}
+
+/// Entity kind declared by a member's DID Document.
+pub(crate) fn member_entity_kind(d: &DID, doc: &Value) -> Result<&'static str> {
+    let context: Option<name_lib::DIDContext> = doc
+        .get("@context")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(db_error)?;
+    let has_context = |ns: &str| context.as_ref().is_some_and(|c| c.contains(ns));
+    let declared = doc
+        .get("entity_type")
+        .or_else(|| doc.get("type"))
+        .or_else(|| doc.get("doc_type"))
+        .and_then(Value::as_str);
+    let kind = match declared {
+        Some("user" | "owner") => "user",
+        Some("agent") => "agent",
+        Some("device") => "device",
+        Some(_) => return Err(denied("member-must-be-single-entity")),
+        None if has_context("https://buckyos.org/ns/owner/v1") => "user",
+        None if has_context("https://buckyos.org/ns/agent/v1") => "agent",
+        None if has_context("https://buckyos.org/ns/device/v1") => "device",
+        _ => return Err(denied("member-must-be-single-entity")),
+    };
+    if doc["id"] != json!(d) {
+        return Err(denied("member-document-mismatch"));
+    }
+    Ok(kind)
 }

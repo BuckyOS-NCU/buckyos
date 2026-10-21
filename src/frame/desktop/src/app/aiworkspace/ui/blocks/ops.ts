@@ -1,7 +1,8 @@
 /* Operation builders shared by Block definitions and insertion. */
 
 import { describeError } from '../../api/session'
-import type { AssetContent, Json, Operation } from '../../api/types'
+import { aiwsT } from '../../i18n'
+import type { AssetContent, CellPayload, Json, KeyedContent, Operation } from '../../api/types'
 import type { WorkspaceStore } from '../../state/store'
 import type { CreateArgs, RenderContext } from './registry'
 
@@ -37,23 +38,34 @@ export async function replaceAsset(store: WorkspaceStore, entityId: string, file
     const uploaded = await store.session.uploadAsset(file, file.name)
     const revs = current.content.key_revs ?? {}
     const outcome = await store.submit({
-      editId: `key:${entityId}:object_id`, label: `替换资产 ${current.content.payload.file_name ?? entityId}`,
+      editId: `key:${entityId}:object_id`, label: aiwsT('aiworkspace.blocks.edit.replaceAsset', { name: current.content.payload.file_name ?? entityId }),
       operations: [{ op: 'entity.set_keys', entity_id: entityId, keys: [
         { key: 'object_id', value: uploaded.object_id, expect: { rev: revs.object_id ?? 0 } },
         { key: 'file_name', value: file.name, expect: { rev: revs.file_name ?? 0 } },
       ] }],
     })
-    return outcome.status === 'accepted' || outcome.status === 'saved_locally' ? null : '替换未被接受，见“需要处理”'
+    return outcome.status === 'accepted' || outcome.status === 'saved_locally' ? null : aiwsT('aiworkspace.blocks.asset.replaceRejected')
   } catch (error) {
-    return `上传失败：${describeError(error)}`
+    return aiwsT('aiworkspace.blocks.asset.uploadFailed', { error: describeError(error) })
   }
 }
 
-/** Merge `patch` into a Cell's `config` (null removes a key): one undoable write, guarded by the key's version. */
+const configChains = new Map<string, Promise<unknown>>()
+
+/** Merge `patch` into a Cell's `config` (null removes a key): one undoable write, guarded by the key's version.
+ * Patches of one Cell run one after another, each on the configuration as it is then (quick successive tool clicks
+ * would otherwise write against a version the previous click already replaced). */
 export function setCellConfig(context: RenderContext, store: WorkspaceStore, patch: Record<string, Json | null>, label: string) {
-  const config: Record<string, Json> = { ...(context.payload.config ?? {}) }
-  for (const [key, value] of Object.entries(patch)) { if (value === null) delete config[key]; else config[key] = value }
-  void store.submit({ editId: `config:${context.cell.entity_id}`, label, operations: [{ op: 'entity.set_keys', entity_id: context.cell.entity_id, keys: [{ key: 'config', value: config, expect: { rev: context.keyRevs.config ?? 0 } }] }] })
+  const id = context.cell.entity_id
+  const run = async () => {
+    const read = await store.session.read<KeyedContent<CellPayload>>(id)
+    const config: Record<string, Json> = { ...(read.content.payload.config ?? {}) }
+    for (const [key, value] of Object.entries(patch)) { if (value === null) delete config[key]; else config[key] = value }
+    await store.submit({ editId: `config:${id}`, label, operations: [{ op: 'entity.set_keys', entity_id: id, keys: [{ key: 'config', value: config, expect: { rev: read.content.key_revs.config ?? 0 } }] }] })
+  }
+  const next = (configChains.get(id) ?? Promise.resolve()).then(run, run)
+  configChains.set(id, next)
+  void next.finally(() => { if (configChains.get(id) === next) configChains.delete(id) })
 }
 
 /** Set (or with null, remove) one key of a Cell. */

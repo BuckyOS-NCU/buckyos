@@ -4,24 +4,22 @@ import { z } from 'zod'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMessageHubStore } from './store'
 import { hubButtonClass, hubInputClass } from './SessionDialogs'
-import { memberCandidates } from './groupModel'
+import { RelationSection } from './RelationPanel'
 import { GroupPanel } from './GroupPanel'
 import {
   X,
-  Bot,
   Users,
-  User,
   Bell,
   BellOff,
   Pin,
   PinOff,
-  Tag,
   Link2,
   Edit3,
   UsersRound,
 } from 'lucide-react'
 import { useI18n } from '../../i18n/provider'
 import type { EntityDetail, MessageHubContext } from './types'
+import { HubAvatar } from './HubAvatar'
 
 interface EntityDetailsProps {
   entity: EntityDetail
@@ -32,30 +30,9 @@ interface EntityDetailsProps {
 }
 
 function DetailAvatar({ entity }: { entity: EntityDetail }) {
-  const colors: Record<string, string> = {
-    person: 'var(--cp-accent)',
-    agent: 'var(--cp-success)',
-    group: 'var(--cp-warning)',
-    service: 'var(--cp-danger)',
-  }
-  const icons: Record<string, React.ReactNode> = {
-    person: <User size={32} />,
-    agent: <Bot size={32} />,
-    group: <Users size={32} />,
-    service: <Tag size={32} />,
-  }
-
   return (
-    <div
-      className="flex items-center justify-center rounded-full mx-auto"
-      style={{
-        width: 80,
-        height: 80,
-        background: `color-mix(in srgb, ${colors[entity.type]} 18%, transparent)`,
-        color: colors[entity.type],
-      }}
-    >
-      {icons[entity.type]}
+    <div className="mx-auto flex w-fit">
+      <HubAvatar type={entity.type} name={entity.name} avatar={entity.avatar} size={80} systemNotify={entity.systemNotify} />
     </div>
   )
 }
@@ -90,7 +67,7 @@ export function EntityDetails({ entity, context, onClose, onCreateGroup }: Entit
   const { t } = useI18n()
   const store = useMessageHubStore()
   const groupInfo = context && entity.type === 'group' ? store.group(context, entity.id) : null
-  const canStartGroup = Boolean(onCreateGroup && context?.mode === 'self' && context.ownerDid === context.viewerDid && memberCandidates(store, context).some(candidate => candidate.id === entity.id))
+  const canStartGroup = Boolean(onCreateGroup && context?.mode === 'self' && context.ownerDid === context.viewerDid && (entity.type === 'person' || entity.type === 'agent') && entity.id.startsWith('did:') && !entity.id.startsWith('did:msgtunnel:') && entity.accessLevel !== 'block' && store.connections(context, entity.id).some(choice => choice.binding.kind === 'native'))
 
   const typeLabels: Record<string, string> = {
     person: t('messagehub.entityType.person', 'Person'),
@@ -322,34 +299,12 @@ export function EntityDetails({ entity, context, onClose, onCreateGroup }: Entit
           </button>
         </div>
 
-        {context && <AdmissionSection key={`admission:${entity.id}`} entity={entity} context={context} />}
-        {context && <CreationPolicyEditor key={entity.id} entity={entity} context={context} />}
+        {/* The system notify sender is neither a contact to admit nor a peer to start sessions with. */}
+        {context && !entity.systemNotify && <RelationSection key={`relation:${entity.id}`} entity={entity} context={context} />}
+        {context && !entity.systemNotify && <CreationPolicyEditor key={entity.id} entity={entity} context={context} />}
       </div>
     </div>
   )
-}
-
-function AdmissionSection({ entity, context }: { entity: EntityDetail; context: MessageHubContext }) {
-  const { t } = useI18n(), store = useMessageHubStore()
-  const admission = store.admission(context, entity.id)
-  const [pending, setPending] = useState(false), [status, setStatus] = useState('')
-  if (!admission) return null
-  const act = async (action: 'accept' | 'block') => {
-    if (pending) return
-    setPending(true); setStatus('')
-    try { await store.setAdmission(context, entity.id, action); setStatus('saved') } catch { setStatus('operationFailed') } finally { setPending(false) }
-  }
-  return <div className="mb-4 rounded-xl p-3" style={{ background: 'color-mix(in srgb, var(--cp-text) 4%, transparent)' }} data-testid="entity-admission">
-    <p className="text-xs" style={{ color: 'var(--cp-muted)' }}>{t('messagehub.admission')}</p>
-    <p className="mt-1 text-sm">{t(`messagehub.access.${admission.accessLevel ?? 'stranger'}`)}{admission.temporaryExpiresAt ? ` · ${t('messagehub.temporaryUntil', undefined, { time: new Date(admission.temporaryExpiresAt).toLocaleString() })}` : ''}</p>
-    {(entity.requestCount ?? 0) > 0 && <p className="mt-1 text-xs">{t('messagehub.requestBanner', undefined, { count: entity.requestCount ?? 0 })}</p>}
-    <p className="mt-1 text-xs" style={{ color: 'var(--cp-muted)' }}>{t('messagehub.admissionHint')}</p>
-    {admission.canChange && <div className="mt-2 flex flex-wrap gap-2">
-      {admission.accessLevel !== 'friend' && <button type="button" disabled={pending} className={hubButtonClass} onClick={() => void act('accept')}>{t('messagehub.acceptContact')}</button>}
-      {admission.accessLevel !== 'block' && <button type="button" disabled={pending} className={`${hubButtonClass} text-[color:var(--cp-danger)]`} onClick={() => void act('block')}>{t('messagehub.blockContact')}</button>}
-    </div>}
-    {status && <p role={status === 'saved' ? 'status' : 'alert'} className="mt-1 text-xs">{t(`messagehub.${status}`)}</p>}
-  </div>
 }
 
 const policySchema = z.object({ policy: z.enum(['default', 'allow', 'deny']) })

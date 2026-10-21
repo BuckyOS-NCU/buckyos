@@ -7,6 +7,9 @@
 //!   state/perception/.cursor.json        consolidation cursor
 //!   state/artifacts/<aid>/artifact.json  artifact head
 //!   state/artifacts/<aid>/versions/v-<sid>.json
+//!   state/goals/<goal_id>/               goal, state, activations, schedule
+//!   state/workspaces/<wid>.json          workspace registrations
+//!   state/runtimes/<runtime_id>.json     runtime registrations
 //!   memory/ notebook/ attention_signals/ cognition (agent_tool)
 //!   .locks/self_improve.lease  .locks/artifact/<aid>.lease
 //! ```
@@ -23,9 +26,12 @@ use super::activity::FsActivity;
 use super::artifacts::FsArtifacts;
 use super::behaviors::FsBehaviorCatalog;
 use super::cognition::FsCognition;
+use super::goals::FsGoals;
 use super::locks::FsLocks;
 use super::perception::FsPerception;
 use super::registry::FsRegistry;
+use super::runtimes::FsRuntimes;
+use super::workspaces::FsWorkspaces;
 use super::*;
 
 /// Paths of the AgentRoot layout.
@@ -78,12 +84,42 @@ impl AgentLayout {
             .join(format!("{ver}.json"))
     }
 
+    pub fn goals_dir(&self) -> PathBuf {
+        self.root.join("state").join("goals")
+    }
+
+    pub fn workspaces_dir(&self) -> PathBuf {
+        self.root.join("state").join("workspaces")
+    }
+
+    pub fn workspace_entry(&self, wid: &str) -> PathBuf {
+        self.workspaces_dir().join(format!("{wid}.json"))
+    }
+
+    pub fn runtimes_dir(&self) -> PathBuf {
+        self.root.join("state").join("runtimes")
+    }
+
+    pub fn runtime_entry(&self, runtime_id: &str) -> PathBuf {
+        self.runtimes_dir().join(format!("{runtime_id}.json"))
+    }
+
     pub fn locks_dir(&self) -> PathBuf {
         self.root.join(".locks")
     }
 
     /// Lock file of an agent-level resource.
     pub fn lock_path(&self, resource: &str) -> Result<PathBuf> {
+        if resource == "workspaces" {
+            return Ok(self.locks_dir().join("workspaces.lock"));
+        }
+        if resource == "runtimes" {
+            return Ok(self.locks_dir().join("runtimes.lock"));
+        }
+        if let Some(wid) = resource.strip_prefix("workspace:") {
+            super::workspaces::validate_workspace_id(wid)?;
+            return Ok(self.locks_dir().join("workspace").join(format!("{wid}.lease")));
+        }
         if resource == "self_improve" {
             return Ok(self.locks_dir().join("self_improve.lease"));
         }
@@ -109,9 +145,6 @@ impl AgentLayout {
         self.root.join("notebook")
     }
 
-    pub fn workspace_dir(&self, wid: &str) -> PathBuf {
-        self.root.join("workspace").join(wid)
-    }
 }
 
 /// File-based `AgentStateClient` (V3). Requires the runner to see the
@@ -125,8 +158,12 @@ pub struct FsAgentStateClient {
     perception: FsPerception,
     cognition: FsCognition,
     artifacts: FsArtifacts,
+    workspaces: FsWorkspaces,
+    runtimes: FsRuntimes,
     locks: FsLocks,
     behaviors: FsBehaviorCatalog,
+    goals: FsGoals,
+    notify: Option<crate::notify::LocalNotify>,
 }
 
 impl FsAgentStateClient {
@@ -145,6 +182,8 @@ impl FsAgentStateClient {
             layout.sessions_dir(),
             layout.perception_dir(),
             layout.artifacts_dir(),
+            layout.workspaces_dir(),
+            layout.goals_dir(),
             layout.locks_dir(),
         ] {
             std::fs::create_dir_all(&d).map_err(|e| OpenDanError::io(&d, e))?;
@@ -156,8 +195,12 @@ impl FsAgentStateClient {
             perception: FsPerception::new(layout.clone()),
             cognition: FsCognition::new(layout.clone()),
             artifacts: FsArtifacts::new(layout.clone()),
+            workspaces: FsWorkspaces::new(layout.clone(), agent_did),
+            runtimes: FsRuntimes::new(layout.clone()),
             locks: FsLocks::new(layout.clone()),
             behaviors: FsBehaviorCatalog::new(layout.root.clone()),
+            goals: FsGoals::new(layout.clone(), agent_did),
+            notify: crate::notify::LocalNotify::open_if_enabled(&layout.root, agent_did),
             layout,
             did: agent_did.to_string(),
             id,
@@ -208,11 +251,26 @@ impl AgentStateClient for FsAgentStateClient {
         &self.artifacts
     }
 
+    fn workspaces(&self) -> &dyn WorkspaceManager {
+        &self.workspaces
+    }
+
+    fn runtimes(&self) -> &dyn RuntimeRegistry {
+        &self.runtimes
+    }
+
     fn locks(&self) -> &dyn LockManager {
         &self.locks
     }
 
     fn behaviors(&self) -> &dyn BehaviorCatalog {
         &self.behaviors
+    }
+
+    fn goals(&self) -> &dyn GoalStore {
+        &self.goals
+    }
+    fn notifies(&self) -> Option<&dyn crate::notify::NotifyHost> {
+        self.notify.as_ref().map(|n| n as &dyn crate::notify::NotifyHost)
     }
 }

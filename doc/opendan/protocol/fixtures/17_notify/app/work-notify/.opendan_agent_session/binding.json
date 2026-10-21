@@ -1,0 +1,12 @@
+{
+  "schema": "opendan.binding/4",
+  "target": {
+    "host": "${FIXTURE_HOST}",
+    "uid": "${FIXTURE_UID}"
+  },
+  "runtime_id": "rt-fixture-native",
+  "kind": "native",
+  "workdir": "${FIXTURE_ROOT}/app/work-notify",
+  "bound_at_ms": 1792411645730,
+  "bound_by": "rn-873954b870d24585"
+}

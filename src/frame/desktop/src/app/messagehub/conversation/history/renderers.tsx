@@ -1,6 +1,13 @@
 import { useI18n } from '../../../../i18n/provider'
 import { isActionMessage } from '../../sessionModel'
-import { groupErrorText, parseGroupNotice } from '../../groupModel'
+import { groupErrorText, isAgentGroupDisabled, parseGroupNotice } from '../../groupModel'
+import { AgentGroupSettingsLink } from '../../AgentGroupSettingsLink'
+import { parseFriendNotice } from '../../friendNotice'
+import { useEntityRelation } from '../../relation'
+import { networkActions } from '../../../../components/network/cache'
+import { useNetworkDialogs } from '../../../../components/network/dialogs'
+import { useNetworkResource } from '../../../../components/network/hooks'
+import { networkErrorText } from '../../../../components/network/relation'
 import { memo, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import {
   AlertCircle,
@@ -15,25 +22,36 @@ import {
   Reply,
   SmilePlus,
   Trash2,
+  UserPlus,
   Users,
 } from 'lucide-react'
 import {
   getMessageDeliveryStatus,
   getMessageSenderName,
   getMessageStableId,
+  messageNotify,
+  messageVoice,
   type RefItem,
   type DID,
   type MessageDeliveryStatus,
   type MessageObject,
+  type VoiceNote,
 } from '../../protocol/msgobj'
 import { MessageAttachmentView } from '../media/MediaAttachment'
+import { VoiceNoteView } from '../media/VoiceNote'
+import { emojiOnlyCount } from '../input/emoji'
 import { knownAttachmentKind } from '../media/objectCache'
-import { attachmentKindOf, attachmentMediaType, attachmentOfRef, isHttpUri, type AttachmentKind } from '../media/source'
+import { outgoingUpload } from '../../store/outgoing'
+import type { OutgoingUpload } from '../../store/types'
+import { formatAttachmentSize } from '../input/attachmentDraft'
+import { attachmentKindOf, attachmentMediaType, attachmentOfRef, isHttpUri, type AttachmentKind, type MessageAttachment } from '../media/source'
 import { ConversationMessageActionsContext } from './actions'
 import { MessageMarkdown } from './MessageMarkdown'
 import { getObjectAccess } from './objectAccess'
 import { displayedContent, effectiveContent, mentionsViewer, messageObjId, messageRelations, messageSummaryText, ownReactionId } from './relations'
 import { MessageTaskArea } from '../tasks/MessageTask'
+import { AgentQuestions } from './AgentQuestions'
+import { NotifyCard } from '../../notify/NotifyCard'
 import type { ConversationListItem } from './types'
 
 const QUICK_REACTIONS = ['👍', '❤️', '😂', '🎉']
@@ -93,9 +111,13 @@ type MessageRenderer = (
 const messageRenderers: readonly MessageRenderer[] = [
   message => isActionMessage(message) ? <ActionMessage message={message} /> : null,
   message => message.ui_unavailable === true ? <UnavailableMessage message={message} /> : null,
+  (message, context) => parseFriendNotice(message) ? <FriendRequestMessage message={message} context={context} /> : null,
   (message, context) => parseGroupNotice(message) ? <GroupNoticeMessage message={message} context={context} /> : null,
   (message, context) => messageRelations(message)?.redacted ? <RedactedMessage message={message} context={context} /> : null,
+  (message, context) => messageNotify(message) ? <NotifyMessage message={message} context={context} /> : null,
+  (message, context) => voiceOf(message, context.messageIndex) ? <VoiceMessage message={message} context={context} /> : null,
   (message, context) => hasAttachmentRefs(message) ? <AttachmentMessage message={message} context={context} /> : null,
+  (message, context) => isBigEmoji(message) ? <BigEmojiMessage message={message} context={context} /> : null,
   (message, context) => isTextFormat(effectiveContent(message).format) ? <TextMessage message={message} context={context} /> : null,
   renderFallbackMessage,
 ]
@@ -221,6 +243,61 @@ function TextMessage({ message, context: { isGroup, selfDid, continued, peerMark
   )
 }
 
+/** Nothing but one to three emoji: shown large on the canvas, without a bubble. */
+function isBigEmoji(message: MessageObject): boolean {
+  const content = effectiveContent(message)
+  return isTextFormat(content.format) && !(content.refs?.length) && emojiOnlyCount(content.content ?? '') > 0
+}
+
+function BigEmojiMessage({ message, context: { isGroup, selfDid, continued } }: { message: MessageObject; context: MessageRenderContext }) {
+  const details = useBubbleDetails(message)
+  const isSelf = message.from === selfDid
+  const text = displayedContent(message).trim()
+  return (
+    <div className={rowClass(isSelf, continued)}>
+      <div className={`mh-bubble ${bubbleWidthClass} flex flex-col ${isSelf ? 'items-end' : 'items-start'}`} style={framelessStyle()} data-testid="message-emoji" data-message-id={messageObjId(message)} {...details}>
+        {!isSelf && isGroup && !continued ? <p className="mb-1 text-[13px] font-semibold" style={{ color: 'var(--cp-accent)' }}>{getMessageSenderName(message)}</p> : null}
+        <ReplyQuote message={message} />
+        <p className="mh-big-emoji" data-count={emojiOnlyCount(text)}>{text}</p>
+        <div className="max-w-full">
+          <MessageFooter message={message} isSelf={isSelf} deliveryStatus={getMessageDeliveryStatus(message)} selfDid={selfDid} frameless />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** The voice note of a message (`MsgObject.voice`): its only `data_obj` ref, while no edit replaced the content. */
+function voiceOf(message: MessageObject, messageIndex: number): { voice: VoiceNote; attachment: MessageAttachment & { objId: string } } | null {
+  const voice = messageVoice(message)
+  if (!voice || messageRelations(message)?.edited) return null
+  const refs = (message.content.refs ?? []).filter(ref => ref.target.type === 'data_obj')
+  if (refs.length !== 1) return null
+  const attachment = attachmentOfRef(refs[0], `${getMessageStableId(message, messageIndex)}#0`)
+  return attachment?.objId ? { voice, attachment: { ...attachment, objId: attachment.objId } } : null
+}
+
+function VoiceMessage({ message, context }: { message: MessageObject; context: MessageRenderContext }) {
+  const details = useBubbleDetails(message)
+  const note = voiceOf(message, context.messageIndex)
+  if (!note) return null
+  const isSelf = message.from === context.selfDid
+  const caption = displayedContent(message).trim()
+  const upload = outgoingUpload(message)
+  return (
+    <div className={rowClass(isSelf, context.continued)}>
+      <div className={`mh-bubble ${bubbleWidthClass} min-w-[200px]`} style={bubbleStyle(isSelf, context.continued)} data-testid="message-voice" data-message-id={messageObjId(message)} {...details}>
+        {!isSelf && context.isGroup && !context.continued ? <p className="mb-1 text-[13px] font-semibold" style={{ color: 'var(--cp-accent)' }}>{getMessageSenderName(message)}</p> : null}
+        <ReplyQuote message={message} />
+        <VoiceNoteView id={messageObjId(message) ?? note.attachment.id} objId={note.attachment.objId} voice={note.voice} isSelf={isSelf} />
+        {upload ? <UploadProgress upload={upload} alignEnd={isSelf} /> : null}
+        {caption ? <p className={`${bodyTextClass} mt-1.5 whitespace-pre-wrap break-words`}>{caption}</p> : null}
+        <MessageFooter message={message} isSelf={isSelf} deliveryStatus={getMessageDeliveryStatus(message)} selfDid={context.selfDid} />
+      </div>
+    </div>
+  )
+}
+
 /** The quoted target of a `thread` message. */
 function ReplyQuote({ message }: { message: MessageObject }) {
   const { t } = useI18n()
@@ -318,7 +395,7 @@ function useMessageActionSet(message: MessageObject, mode: ActionMode) {
     edit: can?.edit ?? false,
     redact: can?.redact ?? false,
     recall: can?.recall ?? false,
-    copy: plain && (displayedContent(message).trim().length > 0 || (effectiveContent(message).refs?.length ?? 0) > 0),
+    copy: plain && (displayedContent(message).trim().length > 0 || ((effectiveContent(message).refs?.length ?? 0) > 0 && !messageVoice(message))),
     forward: sendable && !!forward,
     remove: !!remove,
     pin: sendable && !!pin && !!messageObjId(message),
@@ -478,6 +555,7 @@ function MessageFooter({ message, isSelf, deliveryStatus, selfDid, frameless = f
     <>
       <MessageHoverBar message={message} isSelf={isSelf} selfDid={selfDid} mode={relations?.redacted ? 'redacted' : mode} />
       {mode === 'message' && !relations?.redacted ? <MessageTaskArea message={message} /> : null}
+      {mode === 'message' && !relations?.redacted && relations?.thread ? <AgentQuestions message={message} selfDid={selfDid} /> : null}
       <ReactionChips message={message} isSelf={selfTone} selfDid={selfDid} />
       <div className="mt-1 flex items-center justify-end gap-1">
         {record?.boxKind === 'REQUEST_BOX' ? <span className="mr-auto rounded-full px-1.5 text-[11px] leading-[18px]" data-testid="request-chip" style={{ background: 'color-mix(in srgb, var(--cp-warning) 16%, transparent)', color: 'color-mix(in srgb, var(--cp-warning) 70%, var(--cp-text))' }}>{t('messagehub.requestShort')}</span> : null}
@@ -586,13 +664,16 @@ function AttachmentMessage({ message, context }: { message: MessageObject; conte
   const frameless = refs.length > 0 && refs.every((ref, index) => isMediaKind(resolved[index] ?? expectedKind(ref, `${messageId}#${index}`)))
   const sender = !isSelf && context.isGroup && !context.continued ? <p className="text-[13px] font-semibold mb-1" style={{ color: 'var(--cp-accent)' }}>{senderName}</p> : null
   const items = refs.map((ref, index) => <MessageRef key={`${index}:${ref.target.type === 'data_obj' ? ref.target.obj_id : ref.target.did}`} item={ref} id={`${messageId}#${index}`} isSelf={isSelf && !frameless} index={index} onKind={reportKind} />)
+  const upload = outgoingUpload(message)
+  const progress = upload ? <UploadProgress upload={upload} alignEnd={isSelf} /> : null
   if (frameless) {
     return (
       <div className={rowClass(isSelf, context.continued)}>
         <div className={`mh-bubble ${bubbleWidthClass} flex min-w-[160px] flex-col ${isSelf ? 'items-end' : 'items-start'}`} style={framelessStyle()} data-testid="message-media" data-message-id={messageObjId(message)} {...details}>
           {sender}
           <ReplyQuote message={message} />
-          <div className={`flex max-w-full flex-col gap-2 ${isSelf ? 'items-end' : 'items-start'}`} data-no-details>{items}</div>
+          <div className={`flex max-w-full flex-col gap-2 ${isSelf ? 'items-end' : 'items-start'}`} style={upload ? { opacity: 0.7 } : undefined} data-no-details>{items}</div>
+          {progress}
           {caption.length > 0 ? <div className={`${bodyTextClass} mt-1.5 max-w-full whitespace-pre-wrap break-words`} style={bubbleStyle(isSelf, true)} data-testid="message-media-caption">{captionBody}</div> : null}
           <div className="max-w-full">
             <MessageFooter message={message} isSelf={isSelf} deliveryStatus={deliveryStatus} selfDid={context.selfDid} frameless />
@@ -613,9 +694,26 @@ function AttachmentMessage({ message, context }: { message: MessageObject; conte
         {sender}
         <ReplyQuote message={message} />
         <div className="flex flex-col gap-2" data-no-details>{items}</div>
+        {progress}
         {caption.length > 0 ? <div className={`${bodyTextClass} mt-2 whitespace-pre-wrap break-words`}>{captionBody}</div> : null}
         <MessageFooter message={message} isSelf={isSelf} deliveryStatus={deliveryStatus} selfDid={context.selfDid} />
       </div>
+    </div>
+  )
+}
+
+function UploadProgress({ upload, alignEnd }: { upload: OutgoingUpload; alignEnd: boolean }) {
+  const { t } = useI18n()
+  const percent = upload.phase === 'uploading' && upload.total > 0 ? Math.min(100, Math.round((upload.loaded / upload.total) * 100)) : undefined
+  const text = upload.phase === 'uploading'
+    ? t('messagehub.upload.uploading', undefined, { percent: percent ?? 0, loaded: formatAttachmentSize(upload.loaded), total: formatAttachmentSize(upload.total) })
+    : t(`messagehub.upload.${upload.phase}`)
+  return (
+    <div className="mt-1.5 flex w-full min-w-[160px] max-w-[320px] flex-col gap-1" role="status" data-testid="upload-progress" data-phase={upload.phase} data-percent={percent}>
+      <div className="h-1 overflow-hidden rounded-full" style={{ background: 'color-mix(in srgb, currentColor 16%, transparent)' }}>
+        <div className={`h-full rounded-full transition-[width] duration-300 ${percent === undefined && upload.phase === 'preparing' ? 'w-1/3 animate-pulse' : ''}`} style={{ background: 'var(--cp-accent)', ...(percent !== undefined ? { width: `${percent}%` } : upload.phase === 'queued' ? { width: 0 } : {}) }} />
+      </div>
+      <span className={`text-[11px] tabular-nums opacity-75 ${alignEnd ? 'text-right' : ''}`}>{text}</span>
     </div>
   )
 }
@@ -740,12 +838,81 @@ function ActionMessage({ message }: { message: MessageObject }) {
   return <div data-testid="action-message" className="mx-auto my-2 max-w-xl rounded-lg bg-[color:color-mix(in_srgb,var(--cp-text)_5%,transparent)] px-3 py-2 text-center text-xs text-[color:var(--cp-muted)] break-words">{summary}</div>
 }
 
+/** A System Notify card: the record in a category session, or a copy in a conversation with its Agent. */
+function NotifyMessage({ message, context }: { message: MessageObject; context: MessageRenderContext }) {
+  const data = messageNotify(message)
+  if (!data) return null
+  return (
+    <div className={rowClass(false, context.continued)}>
+      <NotifyCard message={message} data={data} className={`${bubbleWidthClass} w-[420px] min-w-[240px]`} style={{ ...bubbleStyle(false, context.continued), padding: 12 }} footer={<MessageFooter message={message} isSelf={false} mode="card" />} />
+    </div>
+  )
+}
+
+/** A `buckyos.friend` request: the request's current state from msg-center, and its answers for the owner. */
+function FriendRequestMessage({ message, context }: { message: MessageObject; context: MessageRenderContext }) {
+  const { t } = useI18n()
+  const actions = useContext(ConversationMessageActionsContext)
+  const dialogs = useNetworkDialogs()
+  const requests = useNetworkResource('friendRequests')
+  const notice = parseFriendNotice(message)
+  const outgoing = message.from === context.selfDid
+  const peer = outgoing ? message.to?.[0] ?? '' : message.from
+  const relation = useEntityRelation(peer || null)
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState('')
+  if (!notice || notice.action !== 'request') return renderFallbackMessage(message, context)
+  const request = requests.data?.find(item => item.request_id === notice.requestId)
+  const state = request?.state ?? (relation?.friendState === 'friend' ? 'accepted' : undefined)
+  const name = actions.displayName?.(peer) ?? notice.profileHint?.name ?? peer
+  const canAnswer = actions.answerFriendRequests && !outgoing && state === 'pending'
+  const run = async (operation: () => Promise<unknown>) => {
+    setPending(true); setError('')
+    try { await operation() } catch (failure) { setError(networkErrorText(t, failure)) } finally { setPending(false) }
+  }
+  const block = async () => {
+    const confirmed = await dialogs.confirm({ strength: 'explicit', danger: true, title: t('network.confirm.block.title', undefined, { name }), body: t('network.confirm.block.body', undefined, { name }), consequences: [t('network.confirm.block.c1'), t('network.confirm.block.c2')], confirmLabel: t('network.action.block') })
+    if (!confirmed) return
+    await run(async () => {
+      await networkActions.respondFriendRequest(notice.requestId, 'ignore')
+      await networkActions.blockContact(peer)
+    })
+  }
+  const primaryClass = 'min-h-11 rounded-lg px-3 text-sm font-semibold text-white disabled:opacity-50 md:min-h-9'
+  const secondaryClass = 'min-h-11 rounded-lg border px-3 text-sm disabled:opacity-50 md:min-h-9'
+  return (
+    <div className={rowClass(outgoing, context.continued)}>
+      <div className={`${bubbleWidthClass} w-72 min-w-[220px]`} style={{ ...bubbleStyle(false, context.continued), padding: 12 }} data-testid="friend-notice" data-state={state ?? 'unknown'}>
+        <div className="flex items-center gap-2.5">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full" style={{ background: 'color-mix(in srgb, var(--cp-accent) 16%, transparent)', color: 'var(--cp-accent)' }} aria-hidden><UserPlus size={17} /></span>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-xs" style={{ color: 'var(--cp-muted)' }}>{t(outgoing ? 'messagehub.friend.sent' : 'messagehub.friend.received')}</p>
+            <p className="truncate text-[15px] font-semibold" title={peer}>{name}</p>
+          </div>
+        </div>
+        {notice.message ? <p className="mt-2 whitespace-pre-wrap break-words text-sm">{notice.message}</p> : null}
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {canAnswer ? <>
+            <button type="button" className={primaryClass} style={{ background: 'var(--cp-accent)' }} disabled={pending} onClick={() => void run(() => networkActions.respondFriendRequest(notice.requestId, 'accept'))}>{t('network.action.accept_request')}</button>
+            <button type="button" className={secondaryClass} style={{ borderColor: 'var(--cp-border)' }} disabled={pending} onClick={() => void run(() => networkActions.respondFriendRequest(notice.requestId, 'ignore'))}>{t('myNetwork.requests.ignore')}</button>
+            <button type="button" className={secondaryClass} style={{ borderColor: 'var(--cp-border)', color: 'var(--cp-danger)' }} disabled={pending} onClick={() => void block()}>{t('network.action.block')}</button>
+          </> : state ? <span className="text-xs font-medium" style={{ color: state === 'accepted' ? 'var(--cp-success)' : 'var(--cp-muted)' }} data-testid="friend-notice-state">{t(`messagehub.friend.state.${state}${outgoing && state === 'pending' ? 'Outgoing' : ''}`, undefined, { name })}</span> : null}
+          {actions.answerFriendRequests && outgoing && state === 'pending' ? <button type="button" className={secondaryClass} style={{ borderColor: 'var(--cp-border)' }} disabled={pending} onClick={() => void run(() => networkActions.cancelFriendRequest(notice.requestId))}>{t('network.action.cancel_request')}</button> : null}
+        </div>
+        {error ? <p role="alert" className="mt-2 text-xs" style={{ color: 'var(--cp-danger)' }}>{error}</p> : null}
+        <MessageFooter message={message} isSelf={outgoing} mode="card" />
+      </div>
+    </div>
+  )
+}
+
 function GroupNoticeMessage({ message, context }: { message: MessageObject; context: MessageRenderContext }) {
   const { t } = useI18n()
   const actions = useContext(ConversationMessageActionsContext)
   const [state, setState] = useState<'idle' | 'pending' | 'done'>('idle')
   const [outcome, setOutcome] = useState('')
   const [error, setError] = useState('')
+  const [agentGroupDisabled, setAgentGroupDisabled] = useState(false)
   const notice = parseGroupNotice(message)
   const view = notice ? actions.groupNotice?.(message) : null
   if (!notice || !view) return renderFallbackMessage(message, context)
@@ -754,8 +921,8 @@ function GroupNoticeMessage({ message, context }: { message: MessageObject; cont
   const invitation = notice.invitation
   const run = (operation: ((message: MessageObject) => Promise<void>) | undefined, doneKey: string) => {
     if (!operation || state === 'pending') return
-    setState('pending'); setError('')
-    void operation(message).then(() => { setState('done'); setOutcome(doneKey) }, failure => { setState('idle'); setError(groupErrorText(t, failure)) })
+    setState('pending'); setError(''); setAgentGroupDisabled(false)
+    void operation(message).then(() => { setState('done'); setOutcome(doneKey) }, failure => { setState('idle'); setError(groupErrorText(t, failure)); setAgentGroupDisabled(isAgentGroupDisabled(failure)) })
   }
   const forAgent = invitation?.memberDid && invitation.memberDid !== context.selfDid ? nameOf(invitation.memberDid) : undefined
   const line = invitation ? (forAgent ? t('messagehub.group.invitedAgent', undefined, { name: inviter, agent: forAgent }) : t('messagehub.group.invitedBy', undefined, { name: inviter }))
@@ -810,6 +977,7 @@ function GroupNoticeMessage({ message, context }: { message: MessageObject; cont
           </div>
         ) : null}
         {error ? <p role="alert" className="mt-2 text-xs" style={{ color: 'var(--cp-danger)' }}>{error}</p> : null}
+        {agentGroupDisabled && invitation?.memberDid ? <AgentGroupSettingsLink agentDid={invitation.memberDid} name={nameOf(invitation.memberDid)} /> : null}
         <MessageFooter message={message} isSelf={false} mode="card" />
       </div>
     </div>

@@ -570,8 +570,7 @@ process-chain DSL 时就尾大不掉。要么不要，要么一次性全要。
 
 2. **`[capabilities]` 的最终 schema**：§5.3 留空。需要在同一个段下表达三类能力（v2 内建 Action /
    skill bundle / 传统 function-call tool），且每类都有"上层引用 + 下层细节定义"的解耦诉求。需要
-   等 [Agent Skill](./Agent%20Skill.md) 与 ToolManager 的配置形态一起定下来再收敛。在那之前 §5.2
-   草案里这段就只是占位。
+   以 [当前 cmd/goal skill 机制](../sdk/OpenDAN_Agent_Dev_Guide.md) 为现行依据；本段与 ToolManager 的组合配置只是后续设计，§5.2 草案的占位不定义当前 skill 安装格式。
 
 3. **session class 内多 behavior 时的事件路由**：dispatcher 把事件送进 session，session 把事件交给
    `current_behavior`，behavior 通过 prompt 表达自己的反应——不需要"event → behavior"的二级路由。
@@ -590,7 +589,7 @@ process-chain DSL 时就尾大不掉。要么不要，要么一次性全要。
    `.toml`，需要扩到 enum 或返回候选列表，并把"两种形态同名存在"的错误检查放在加载入口。
 
 7. **Channel 类型的对外接口**：`type = "msg_center" | "kevent" | "http" | ...` 的清单需要定一个准入
-   表，跟 [Agent Session 的事件订阅](./Agent%20Session的事件订阅.md) §2 三种模式对齐。
+   表，跟 [Agent Session 架构设计 §12.7](<OpenDAN Agent Session架构设计.md#127-事件订阅与三种等待模式>) 的三种模式对齐。
 
 8. **prompt 三段模板的默认值**：`[prompt].on_input_msg` / `on_input_event` 缺省走 runtime 内建的
    最小模板——这两个内建模板的具体形态需要跟 [Render_Prompt_Template_Variables](./Render_Prompt_Template_Variables.md)

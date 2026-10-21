@@ -31,18 +31,20 @@
  * move, resize or turn, the lines bound to them are re-routed and repainted per frame without React; dragging
  * near the edge of the canvas pans it. */
 
-import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent as ReactWheelEvent } from 'react'
+import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { Lock, RotateCw } from 'lucide-react'
 import type { Placement } from '../../../api/types'
 import { ConnectorFrame } from '../connectors/ConnectorFrame'
 import { LineRegistry } from '../connectors/registry'
-import { anchorLabel, findAnchor, SIDE_VEC } from '../connectors/anchors'
+import { findAnchor, SIDE_VEC, type Shape } from '../connectors/anchors'
 import { anchorsOf, anchorWorld, cubicAt, decompose, dist, ELBOW_STUB, facingAnchor, leftOf, materialize, nearest, pathData, routeBetween, routeConnector, sideAnchor, visibleAnchors, type ConnectorGeometry, type Seg, type TargetGeom } from '../connectors/geometry'
 import { CONNECTOR_PAD, connectorAdjacency, hasBoundEnd, lookupIn, RECT_FORM, routeLaid, type Override, type TargetForm } from '../connectors/layout'
 import { LABEL_FONT, sameAnchor, type Anchor, type ConnectorData, type Route } from '../connectors/model'
 import type { ConnectorChange, EndSpec, NewConnector } from '../connectors/ops'
 import { paintConnector } from '../connectors/paint'
 import { describeError } from '../../../api/session'
+import { aiwsT } from '../../../i18n'
+import { useAiwsText } from '../../../useAiwsText'
 import { testHooks } from '../../../api/testHooks'
 import { useStore } from '../../../state/hooks'
 import { BlockHost, type Lod } from '../../blocks/BlockHost'
@@ -51,8 +53,9 @@ import { BlockMetaContext, BlockMetaSink, requestIntent, type BlockMeta } from '
 import { blockRegistry, modePolicy, type CanvasMode, type HoverAffordance } from '../../blocks/registry'
 import { usePointerType } from '../../blocks/useBlockContext'
 import { FreshnessBadge } from '../../sources/FreshnessBadge'
+import { anchorName } from '../drawioText'
 import { angleFrom, centerOf, containsPoint, corners, normalizeRotation, resizeRotated, rotatePoint } from '../geometry'
-import { movedPlacement, relativeTo, topLevel, type Laid } from '../layout'
+import { groupAt, movedPlacement, relativeTo, topLevel, type Laid } from '../layout'
 import { Camera, intersects, type Rect } from './camera'
 import { SpatialIndex } from './spatialIndex'
 import { TouchGestures, type OneFingerDrag, type Point, type TouchActions } from './touch'
@@ -100,7 +103,8 @@ export interface RenderHostProps {
   onSelectionChange: (next: Set<string>) => void
   editing: string | null
   onEditingChange: (id: string | null) => void
-  canLayout: boolean
+  /** Can this user move, resize and rotate the Block (the canvas's editors: all; a commenter: its own notes)? */
+  canLayout: (id: string) => boolean
   onCommitLayout: (changes: LayoutChange[]) => void
   onContextMenu: (point: { screenX: number; screenY: number; worldX: number; worldY: number }, blockId: string | null) => void
   onOpenEntity: (entityId: string) => void
@@ -125,6 +129,8 @@ export interface RenderHostProps {
   prefetch?: ReadonlySet<string>
   /** Blocks laid out but not drawn (a show hides Frames and a step's hidden Blocks). */
   hidden?: ReadonlySet<string>
+  /** The Surface's own background colour (draw.io 导入 TODO §2.5): the canvas takes the theme that reads on it. */
+  background?: string | null
 }
 
 /** Where a dragged line end would attach: a Block, the anchor on it, the point, and whether the pointer is on that
@@ -135,7 +141,7 @@ type Drag =
   | { kind: 'pan'; lastX: number; lastY: number; moved: boolean }
   /** `lines`: lines re-routed per frame (bound to a moved Block, or moved with a bound end). */
   | { kind: 'move'; ids: string[]; affected: string[]; lines: string[]; shifted: ReadonlySet<string>; startX: number; startY: number; dx: number; dy: number; moved: boolean; clicked: string; additive: boolean; wasSelected: boolean; ghost?: boolean }
-  | { kind: 'resize'; id: string; handle: string; startX: number; startY: number; start: Rect; rotation: number; aspect: 'free' | 'locked'; current: Rect; lines: string[] }
+  | { kind: 'resize'; id: string; handle: string; startX: number; startY: number; start: Rect; rotation: number; aspect: 'free' | 'locked'; current: Rect; lines: string[]; backing?: string }
   | { kind: 'rotate'; id: string; center: Point; startAngle: number; start: number; current: number; lines: string[] }
   | { kind: 'marquee'; startX: number; startY: number; current: Rect | null; additive: boolean; moved: boolean }
   /** Drawing a new line from `from`. */
@@ -177,6 +183,21 @@ function dragSegment(pts: Point[], k: number, dx: number, dy: number): Point[] {
   if (k === 0) { const s1 = stub(pts[0], pts[1]); return [s1, shift(s1), shift(pts[1]), ...pts.slice(2, n)] }
   if (k === n - 1) { const e1 = stub(pts[n], pts[n - 1]); return [...pts.slice(1, n - 1), shift(pts[n - 1]), shift(e1), e1] }
   return pts.slice(1, n).map((p, i) => (i + 1 === k || i + 1 === k + 1 ? shift(p) : p))
+}
+
+/** A Block's outline in screen space (hover, snap target): its rectangle, ellipse or polygon. */
+function Outline({ shape, rect, transform, className, testId }: { shape: Shape; rect: Rect; transform?: string; className: string; testId?: string }) {
+  if (shape === 'ellipse') return <ellipse className={className} data-testid={testId} cx={rect.x + rect.w / 2} cy={rect.y + rect.h / 2} rx={rect.w / 2} ry={rect.h / 2} transform={transform} />
+  if (shape === 'rect') return <rect className={className} data-testid={testId} x={rect.x} y={rect.y} width={rect.w} height={rect.h} transform={transform} />
+  const points = shape.poly.map((p) => `${Math.round((rect.x + p.x * rect.w) * 10) / 10},${Math.round((rect.y + p.y * rect.h) * 10) / 10}`).join(' ')
+  return <polygon className={className} data-testid={testId} points={points} transform={transform} />
+}
+
+/** The fixed theme of a canvas with its own background: light ink on a dark page, dark on a light one. */
+function backgroundTheme(hex: string): string {
+  const n = parseInt(hex.slice(1), 16)
+  const luminance = (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255
+  return luminance > 0.5 ? 'cp-theme-light' : 'cp-theme-dark'
 }
 
 type MountState = 'mounted' | 'hidden'
@@ -233,6 +254,7 @@ function lodFor(rect: Rect, zoom: number, pinned: boolean): Lod {
 export function RenderHost(props: RenderHostProps) {
   const { camera, laid, index, selection, mode, editing, canLayout } = props
   const store = useStore()
+  const { t } = useAiwsText()
   const budget = useContext(BudgetContext)
   const rootRef = useRef<HTMLDivElement>(null)
   const worldRef = useRef<HTMLDivElement>(null)
@@ -295,7 +317,7 @@ export function RenderHost(props: RenderHostProps) {
   }
   const frameEl = (id: string) => frames.current.get(id) ?? lines.get(id)?.el
   /** Can the user change this line's ends, bends and label here (mouse; touch only selects lines)? */
-  const lineEditable = (id: string) => policy.layout && canLayout && pointer === 'mouse' && !laid.get(id)?.locked && Boolean(store.outline.get(id)?.capabilities.includes('update'))
+  const lineEditable = (id: string) => policy.layout && canLayout(id) && pointer === 'mouse' && !laid.get(id)?.locked && Boolean(store.outline.get(id)?.capabilities.includes('update'))
   /** Hover changes at once (the outline); affordances follow after a short delay and leave at once. */
   const changeHover = (id: string | null) => {
     if (id === hover) return
@@ -348,7 +370,7 @@ export function RenderHost(props: RenderHostProps) {
     for (const [id, state] of mounts) {
       if (state === 'hidden') { hidden += 1; continue }
       const l = laid.get(id)
-      if (l && !l.isGroup && !l.connector && lodFor(l.rect, zoom, pinned.has(id)) === 'placeholder') placeholders += 1
+      if (l && !l.isGroup && !l.connector && !blockRegistry.get(l.entity.view_type ?? '')?.pureUi && lodFor(l.rect, zoom, pinned.has(id)) === 'placeholder') placeholders += 1
       else mounted += 1
     }
     hooks.canvas = { surfaceId: props.surfaceId, blocks: laid.size, mounted, hidden, placeholders, editors: budget.used('editors'), html: budget.used('html'), zoom, mode }
@@ -385,6 +407,11 @@ export function RenderHost(props: RenderHostProps) {
     const top = editing ? index.get(editing) : undefined
     if (top && !top.line && (top.turned ? containsPoint(top.turned.rect, top.turned.rotation, x, y) : x >= top.rect.x && x <= top.rect.x + top.rect.w && y >= top.rect.y && y <= top.rect.y + top.rect.h)) return top
     return index.hit(x, y, { slop: LINE_HIT_PX / camera.zoom, lineTolerance: (item) => lines.halfWidth(item.id) })
+  }
+  /** What a press on a Block means: a group's backing (its frame or shape, draw.io 导入 TODO §2.2) stands for the group. */
+  const asTarget = <T extends { id: string }>(hit: T | null): T | null => {
+    const l = hit ? laid.get(hit.id) : undefined
+    return hit && l?.backing ? { ...hit, id: l.parentId } : hit
   }
   /** Where a dragged line end at screen point `p` attaches (§4.3): an anchor within SNAP_PX of the pointer (the
    * top-most Block's, then the nearest), else — inside a Block — its anchor facing `toward`, else nothing. Lines,
@@ -473,6 +500,9 @@ export function RenderHost(props: RenderHostProps) {
     blockSizes.set(id, next)
     return next
   }
+  /** The group a Block moved by (dx, dy) lands in: the top-most group (not moving, not locked) under its centre, or the Surface. */
+  const dropParent = (l: Laid, dx: number, dy: number, moving: ReadonlySet<string>): string =>
+    groupAt(laid, { x: l.rect.x + l.rect.w / 2 + dx, y: l.rect.y + l.rect.h / 2 + dy }, props.surfaceId, moving)
   const finishDrag = useCallback((cancel: boolean) => {
     // a move that is still waiting for its frame counts: a fast gesture must not end as a click
     if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = 0; flushMoveRef.current?.() }
@@ -496,10 +526,13 @@ export function RenderHost(props: RenderHostProps) {
       selectionLayerRef.current?.removeAttribute('transform')
       if (!cancel && drag.moved) {
         const changes: LayoutChange[] = []
+        const moving = new Set(drag.affected.concat(drag.ids))
         for (const id of drag.ids) {
           const l = laid.get(id)
           if (!l) continue
-          changes.push({ id, placement: movedPlacement(laid, l, drag.dx, drag.dy) })
+          // dropped into a group (a lane, a container) it joins it; dragged out of its group it leaves it (draw.io 导入 TODO §2.2)
+          const parent = l.connector ? l.parentId : dropParent(l, drag.dx, drag.dy, moving)
+          changes.push(parent !== l.parentId ? { id, parentId: parent, placement: movedPlacement(laid, l, drag.dx, drag.dy, parent) } : { id, placement: movedPlacement(laid, l, drag.dx, drag.dy) })
         }
         if (changes.length > 0) props.onCommitLayout(changes)
       } else if (!drag.moved && !cancel) click(drag.clicked, drag.additive, drag.wasSelected)
@@ -510,6 +543,9 @@ export function RenderHost(props: RenderHostProps) {
       const el = frames.current.get(drag.id)
       const l = laid.get(drag.id)
       if (el && l) { el.style.left = `${l.rect.x}px`; el.style.top = `${l.rect.y}px`; el.style.width = `${l.rect.w}px`; el.style.height = `${l.rect.h}px` }
+      const back = drag.backing ? frames.current.get(drag.backing) : undefined
+      const bl = drag.backing ? laid.get(drag.backing) : undefined
+      if (back && bl) { back.style.left = `${bl.rect.x}px`; back.style.top = `${bl.rect.y}px`; back.style.width = `${bl.rect.w}px`; back.style.height = `${bl.rect.h}px` }
       if (!cancel && l && (drag.current.w !== drag.start.w || drag.current.h !== drag.start.h || drag.current.x !== drag.start.x || drag.current.y !== drag.start.y)) {
         props.onCommitLayout([{ id: drag.id, placement: relativeTo(laid, l.parentId, drag.current, l.rotation) }])
       }
@@ -539,7 +575,7 @@ export function RenderHost(props: RenderHostProps) {
       const to = drag.end.binding
       // a loop needs two different anchors the pointer was on (§4.3)
       if (from && to && from.entity_id === to.entity_id && (drag.loose || !drag.endExact || sameAnchor(from.anchor, to.anchor))) {
-        store.notify('info', '首尾连在同一个对象上时，两端要放在它两个不同的锚点上。')
+        store.notify('info', aiwsT('aiworkspace.canvas.line.loopNeedsTwoAnchors'))
         return
       }
       // the stored corners are where the ends are now (an `auto` start depends on where the end went)
@@ -555,7 +591,7 @@ export function RenderHost(props: RenderHostProps) {
       const other = drag.which === 'start' ? data.end : data.start
       const mine = drag.end.binding
       if (mine && other && mine.entity_id === other.entity_id && (!drag.endExact || sameAnchor(mine.anchor, other.anchor))) {
-        store.notify('info', '首尾连在同一个对象上时，两端要放在它两个不同的锚点上。')
+        store.notify('info', aiwsT('aiworkspace.canvas.line.loopNeedsTwoAnchors'))
         return
       }
       const geom = l.connector.geom
@@ -602,7 +638,7 @@ export function RenderHost(props: RenderHostProps) {
       return
     }
     const hand = props.tool === 'hand'
-    const hit = policy.select && !hand ? hitAt(w.x, w.y) : null
+    const hit = policy.select && !hand ? asTarget(hitAt(w.x, w.y)) : null
     const pan = event.button === 1 || event.button === 2 || spaceHeld.current || hand || (!policy.select && event.button === 0) || (mode === 'view' && !hit && event.button === 0)
     if (event.button === 2 && !spaceHeld.current) return // context menu
     rootRef.current?.setPointerCapture(event.pointerId)
@@ -625,7 +661,7 @@ export function RenderHost(props: RenderHostProps) {
         return
       }
       // locked Blocks are selected but never moved, also as part of a selection (§7.2)
-      const ids = policy.layout && canLayout ? topLevel(laid, wasSelected && !additive ? new Set(selection) : new Set([id])).filter((moved) => !laid.get(moved)?.locked) : []
+      const ids = policy.layout ? topLevel(laid, wasSelected && !additive ? new Set(selection) : new Set([id])).filter((moved) => !laid.get(moved)?.locked && canLayout(moved)) : []
       const affected = ids.flatMap((moved) => [moved, ...descendantsOf(moved)])
       const touching = linesTouching(affected)
       if (!wasSelected && !additive) props.onSelectionChange(new Set([id]))
@@ -679,12 +715,12 @@ export function RenderHost(props: RenderHostProps) {
     return again
   }
   const beginLineEnd = (event: ReactPointerEvent<Element>, id: string, which: 'start' | 'end') => {
-    if (dragRef.current || !lineEditable(id) && !(policy.layout && canLayout)) return
+    if (dragRef.current || !lineEditable(id) && !(policy.layout && canLayout(id))) return
     event.stopPropagation()
     event.preventDefault()
     if (secondPress(`end:${id}:${which}`, event)) {
       const l = laid.get(id)
-      if ((which === 'start' ? l?.connector?.geom.start : l?.connector?.geom.end)?.state === 'broken') store.notify('info', '这一端连接的对象已不在这张画布上或无法访问。拖动这个端点到一个对象上即可重新连接，拖到空白处则改为普通端点。')
+      if ((which === 'start' ? l?.connector?.geom.start : l?.connector?.geom.end)?.state === 'broken') store.notify('info', aiwsT('aiworkspace.canvas.line.brokenEnd'))
       return
     }
     rootRef.current?.setPointerCapture(event.pointerId)
@@ -757,7 +793,7 @@ export function RenderHost(props: RenderHostProps) {
       const typing = Boolean((event.target as Element | null)?.closest?.('[data-role="editor"], input, textarea, select, [contenteditable="true"], .aiws-near, .aiws-menu, .aiws-popover'))
       const p = screenPoint(event)
       const w = camera.toWorld(p.x, p.y)
-      const hit = typing ? null : hitAt(w.x, w.y)
+      const hit = typing ? null : asTarget(hitAt(w.x, w.y))
       changeHover(hit?.id ?? null)
       return
     }
@@ -814,8 +850,11 @@ export function RenderHost(props: RenderHostProps) {
         current.current = { x, y, w, h }
         const el = frames.current.get(current.id)
         if (el) { el.style.left = `${x}px`; el.style.top = `${y}px`; el.style.width = `${w}px`; el.style.height = `${h}px` }
+        // a group's backing follows the group (its frame is its look)
+        const back = current.backing ? frames.current.get(current.backing) : undefined
+        if (back) { back.style.left = `${x}px`; back.style.top = `${y}px`; back.style.width = `${w}px`; back.style.height = `${h}px` }
         const resized = current.current
-        rerouteLines(current.lines, (id) => (id === current.id ? { rect: resized, rotation: current.rotation } : undefined))
+        rerouteLines(current.lines, (id) => (id === current.id || id === current.backing ? { rect: resized, rotation: current.rotation } : undefined))
         setResizePreview({ id: current.id, rect: current.current })
         const p = screenPoint({ clientX: point.x, clientY: point.y })
         setHint({ x: p.x, y: p.y, text: `${w} × ${h}` })
@@ -923,17 +962,26 @@ export function RenderHost(props: RenderHostProps) {
     finishDrag(false)
   }
 
-  const onWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
-    const target = event.target as HTMLElement
-    // a scrollable editor keeps its own wheel
-    const scrollable = target.closest<HTMLElement>('.aiws-table-scroll, .aiws-prose-host, textarea, .aiws-html-host')
-    if (scrollable && scrollable.scrollHeight > scrollable.clientHeight && !event.ctrlKey && !event.metaKey) return
-    event.preventDefault()
-    const p = screenPoint(event)
-    if (event.ctrlKey || event.metaKey) camera.zoomAt(p.x, p.y, Math.exp(-event.deltaY * 0.0015))
-    else if (event.shiftKey) camera.panBy(-event.deltaY, 0)
-    else camera.panBy(-event.deltaX, -event.deltaY)
-  }
+  useLayoutEffect(() => {
+    const root = rootRef.current
+    if (!root) return
+    const onWheel = (event: WheelEvent) => {
+      if (event.defaultPrevented) return
+      const target = event.target instanceof Element ? event.target : null
+      const scrollable = target?.closest<HTMLElement>('.aiws-table-scroll, .aiws-prose-host, textarea, .aiws-html-host')
+      const dx = event.shiftKey ? event.deltaY : event.deltaX
+      const dy = event.shiftKey ? 0 : event.deltaY
+      if (scrollable && !event.ctrlKey && !event.metaKey &&
+        ((dx !== 0 && scrollable.scrollWidth > scrollable.clientWidth) || (dy !== 0 && scrollable.scrollHeight > scrollable.clientHeight))) return
+      event.preventDefault()
+      if (event.ctrlKey || event.metaKey) {
+        const rect = root.getBoundingClientRect()
+        camera.zoomAt(event.clientX - rect.left, event.clientY - rect.top, Math.exp(-event.deltaY * 0.0015))
+      } else camera.panBy(-dx, -dy)
+    }
+    root.addEventListener('wheel', onWheel, { passive: false })
+    return () => root.removeEventListener('wheel', onWheel)
+  }, [camera])
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
@@ -951,7 +999,7 @@ export function RenderHost(props: RenderHostProps) {
   /** The context menu of the Block at `p` (selecting it first) or of the blank spot. */
   const openMenuAt = (p: Point) => {
     const w = camera.toWorld(p.x, p.y)
-    const hit = policy.select ? hitAt(w.x, w.y) : null
+    const hit = policy.select ? asTarget(hitAt(w.x, w.y)) : null
     if (hit && !selection.has(hit.id)) props.onSelectionChange(new Set([hit.id]))
     props.onContextMenu({ screenX: p.x, screenY: p.y, worldX: w.x, worldY: w.y }, hit?.id ?? null)
   }
@@ -970,10 +1018,10 @@ export function RenderHost(props: RenderHostProps) {
     const w = camera.toWorld(p.x, p.y)
     if (props.placing && !spaceHeld.current) { event.preventDefault(); props.onPlace?.(w); return null }
     const tappable = Boolean(target?.closest(TAPPABLE))
-    const hit = policy.select && props.tool !== 'hand' ? hitAt(w.x, w.y) : null
+    const hit = policy.select && props.tool !== 'hand' ? asTarget(hitAt(w.x, w.y)) : null
     // edit mode: a drag that starts on a Block moves it, as with the mouse (a locked one is only selected; a line
     // is only selected — touch edits of lines come with touch editing, §6.5)
-    if (hit && !tappable && policy.layout && canLayout && !laid.get(hit.id)?.locked && !laid.get(hit.id)?.connector) { beginPointer(event); return { kind: 'delegate' } }
+    if (hit && !tappable && policy.layout && canLayout(hit.id) && !laid.get(hit.id)?.locked && !laid.get(hit.id)?.connector) { beginPointer(event); return { kind: 'delegate' } }
     // the selected Block's own scrollable content scrolls under the finger
     const scroller = hit && selection.has(hit.id) ? scrollerWithin(target, frames.current.get(hit.id)) : null
     return scroller ? { kind: 'scroll', element: scroller } : { kind: 'pan' }
@@ -981,8 +1029,8 @@ export function RenderHost(props: RenderHostProps) {
   const tapAt = (p: Point, target: Element | null) => {
     if (props.tool === 'hand' || (target?.closest(TAPPABLE) && target.closest('.aiws-frame-block'))) return // a control in a Block took the tap
     const w = camera.toWorld(p.x, p.y)
-    const hit = policy.select ? hitAt(w.x, w.y) : null
-    if (editing && editing !== hit?.id) endEditing()
+    const hit = policy.select ? asTarget(hitAt(w.x, w.y)) : null
+    if (editing && editing !== hit?.id && laid.get(editing)?.parentId !== hit?.id) endEditing()
     if (hit) props.onSelectionChange(new Set([hit.id]))
     else if (selection.size > 0) props.onSelectionChange(new Set())
   }
@@ -990,7 +1038,7 @@ export function RenderHost(props: RenderHostProps) {
     const w = camera.toWorld(p.x, p.y)
     const hit = policy.select && props.tool !== 'hand' ? hitAt(w.x, w.y) : null
     const l = hit ? laid.get(hit.id) : undefined
-    if (hit && l && !l.isGroup && !l.connector && policy.editContent) { props.onEditingChange(hit.id); props.onSelectionChange(new Set([hit.id])); return }
+    if (hit && l && !l.isGroup && !l.connector && policy.editContent) { props.onEditingChange(hit.id); props.onSelectionChange(new Set([l.backing ? l.parentId : hit.id])); return }
     camera.animateTo(l ? camera.fitted(l.bounds, 24) : camera.zoomedAt(p.x, p.y, 2))
   }
   useLayoutEffect(() => {
@@ -1026,13 +1074,13 @@ export function RenderHost(props: RenderHostProps) {
   /** Double-clicking the rotation handle turns the Block back upright. */
   const resetRotation = (id: string) => {
     const l = laid.get(id)
-    if (l && l.rotation && !l.locked && policy.layout && canLayout) props.onCommitLayout([{ id, placement: relativeTo(laid, l.parentId, l.rect, 0) }])
+    if (l && l.rotation && !l.locked && policy.layout && canLayout(id)) props.onCommitLayout([{ id, placement: relativeTo(laid, l.parentId, l.rect, 0) }])
   }
   /** When a handle was last pressed: the root's double-click (retargeted there by pointer capture) is not an "edit". */
   const handleDownAt = useRef(0)
   const rotateDownAt = useRef(-1000)
   const beginResize = (event: ReactPointerEvent<Element>, id: string, handle: string) => {
-    if (!policy.layout || !canLayout || dragRef.current) return
+    if (!policy.layout || !canLayout(id) || dragRef.current) return
     const l = laid.get(id)
     if (!l || l.locked) return
     handleDownAt.current = event.timeStamp
@@ -1041,11 +1089,11 @@ export function RenderHost(props: RenderHostProps) {
     rootRef.current?.setPointerCapture(event.pointerId)
     setDragging(true)
     shiftHeld.current = event.shiftKey
-    dragRef.current = { kind: 'resize', id, handle, startX: event.clientX, startY: event.clientY, start: { ...l.rect }, rotation: l.rotation, aspect: metaSink.get(id)?.aspect ?? 'free', current: { ...l.rect }, lines: adjacency.get(id) ?? [] }
+    dragRef.current = { kind: 'resize', id, handle, startX: event.clientX, startY: event.clientY, start: { ...l.rect }, rotation: l.rotation, aspect: metaSink.get(id)?.aspect ?? 'free', current: { ...l.rect }, lines: [...(adjacency.get(id) ?? []), ...(l.backingId ? adjacency.get(l.backingId) ?? [] : [])], backing: l.backingId }
     worldRef.current?.classList.add('is-moving')
   }
   const beginRotate = (event: ReactPointerEvent<Element>, id: string) => {
-    if (!policy.layout || !canLayout || dragRef.current) return
+    if (!policy.layout || !canLayout(id) || dragRef.current) return
     const l = laid.get(id)
     if (!l || l.locked || l.isGroup) return
     event.stopPropagation()
@@ -1066,9 +1114,9 @@ export function RenderHost(props: RenderHostProps) {
     try {
       if (affordance.run) { affordance.run(meta.context); return }
       const action = meta.context.definition.actions?.find((candidate) => candidate.id === affordance.action)
-      if (action) void Promise.resolve(action.run(meta.context, store)).catch((error: unknown) => store.notify('error', `动作失败：${describeError(error)}`))
+      if (action) void Promise.resolve(action.run(meta.context, store)).catch((error: unknown) => store.notify('error', aiwsT('aiworkspace.canvas.actionFailed', { reason: describeError(error) })))
     } catch (error) {
-      store.notify('error', `动作失败：${describeError(error)}`)
+      store.notify('error', aiwsT('aiworkspace.canvas.actionFailed', { reason: describeError(error) }))
     }
   }
 
@@ -1092,7 +1140,8 @@ export function RenderHost(props: RenderHostProps) {
       continue
     }
     const isPinned = pinned.has(id)
-    const lod = l.isGroup ? 'full' : lodFor(l.rect, zoom, isPinned)
+    // pure UI Blocks (shapes, frames) draw cheaply at any size: a thin line or a small label never becomes a placeholder
+    const lod = l.isGroup || blockRegistry.get(l.entity.view_type ?? '')?.pureUi ? 'full' : lodFor(l.rect, zoom, isPinned)
     frameList.push(
       <div
         key={id}
@@ -1109,7 +1158,8 @@ export function RenderHost(props: RenderHostProps) {
         style={{ left: l.rect.x, top: l.rect.y, width: l.rect.w, height: l.rect.h, rotate: l.rotation ? `${l.rotation}deg` : undefined, display: state === 'hidden' ? 'none' : undefined, visibility: props.hidden?.has(id) ? 'hidden' : undefined, zIndex: editing === id ? laid.size + 1 : l.paint + 1 }}
       >
         {l.isGroup ? (
-          <div className="aiws-group-chrome"><span className="aiws-group-title">{l.entity.title ?? l.entity.name ?? '分组'}</span></div>
+          // an untitled group (an imported container, a swimlane: its frame shows the title) draws no label
+          l.entity.title ? <div className="aiws-group-chrome"><span className="aiws-group-title">{l.entity.title}</span></div> : null
         ) : lod === 'placeholder' ? (
           <div className="aiws-block-placeholder" data-testid={`aiws-placeholder-${id}`}>{l.entity.title ?? l.entity.view_type ?? ''}</div>
         ) : (
@@ -1141,7 +1191,7 @@ export function RenderHost(props: RenderHostProps) {
   const hoverLaid = hover && !selection.has(hover) ? laid.get(hover) : undefined
   const hoverShape = hoverLaid ? shapeFor(hoverLaid.entity.entity_id) : null
   const hoverMeta = hover ? metaSink.get(hover) : undefined
-  const single = selected.length === 1 && policy.layout && canLayout && !selected[0].locked && !selected[0].line && editing !== selected[0].id && !dragging ? selected[0] : null
+  const single = selected.length === 1 && policy.layout && canLayout(selected[0].id) && !selected[0].locked && !selected[0].line && editing !== selected[0].id && !dragging ? selected[0] : null
   const singleLaid = single ? laid.get(single.id) : undefined
   const handles = single ? (['nw', 'ne', 'se', 'sw'] as const).map((h, i) => ({ h, ...corners(single.rect, single.rotation)[i] })) : []
   const edges = single ? (['n', 'e', 's', 'w'] as const).map((h, i) => {
@@ -1180,17 +1230,17 @@ export function RenderHost(props: RenderHostProps) {
   const haloWidth = (id: string, extra: number) => lines.halfWidth(id) * 2 * camera.zoom + extra
   // a Block move re-routes lines without React: their halos would lag, so they hide until it ends
   const showHalos = !dragging || linePreview !== null
-  const lineId = selected.length === 1 && selected[0].line && mode === 'edit' && policy.layout && canLayout && !selected[0].locked && editing !== selected[0].id && !dragging ? selected[0].id : null
+  const lineId = selected.length === 1 && selected[0].line && mode === 'edit' && policy.layout && canLayout(selected[0].id) && !selected[0].locked && editing !== selected[0].id && !dragging ? selected[0].id : null
   const lineG = lineId ? lineGeom(lineId) : undefined
   const canBend = lineId ? lineEditable(lineId) : false
   const lineEnds = lineG && lineId ? (['start', 'end'] as const).map((which) => ({ which, end: lineG[which], at: toScreenPt(lineG[which].point), binding: laid.get(lineId)?.connector?.data[which] ?? null })) : []
   /** Which anchor of which Block a bound end is on, in words. */
   const endPlace = (binding: { entity_id: string; anchor: Anchor } | null): string | null => {
     if (!binding) return null
-    const name = store.outline.get(binding.entity_id)?.title || '对象'
+    const name = store.outline.get(binding.entity_id)?.title || t('aiworkspace.canvas.line.object')
     const id = binding.anchor.id
     const target = targetOf(binding.entity_id)
-    return `连接在「${name}」的${anchorLabel(target ? findAnchor(anchorsOf(target), id) : undefined, id)}锚点`
+    return t('aiworkspace.canvas.line.endPlace', { name, anchor: anchorName(target ? findAnchor(anchorsOf(target), id) : undefined, id, t) })
   }
   const lineControls = lineG && canBend && lineG.route !== 'elbow' && !lineG.auto ? lineG.pts.slice(1, -1).map(toScreenPt) : []
   const lineMids = lineG && canBend ? (lineG.route === 'curve'
@@ -1214,7 +1264,7 @@ export function RenderHost(props: RenderHostProps) {
   })() : []
   // the anchors of the Block a dragged end (or the connector tool) is over; the chosen one stands out
   const snap = linePreview?.snap ?? (props.tool === 'connector' && !dragging ? toolSnap : null)
-  const snapShape = snap ? { rect: camera.rectToScreen(snap.target.rect), rotation: snap.target.rotation, ellipse: snap.target.shape === 'ellipse' } : null
+  const snapShape = snap ? { rect: camera.rectToScreen(snap.target.rect), rotation: snap.target.rotation, shape: snap.target.shape } : null
   const snapSpots = snap ? visibleAnchors(snap.target, camera.zoom) : []
   const snapOn = snap && (snap.exact || linePreview) ? snap.anchor.id : null
 
@@ -1230,7 +1280,7 @@ export function RenderHost(props: RenderHostProps) {
   return (
     <div
       ref={rootRef}
-      className={`aiws-canvas aiws-canvas-mode-${mode}${props.tool === 'hand' ? ' is-hand' : ''}${props.placing ? ' is-placing' : ''}${hover && laid.get(hover)?.connector && !dragging && policy.select ? ' is-line-hover' : ''}`}
+      className={`aiws-canvas aiws-canvas-mode-${mode}${props.background ? ` ${backgroundTheme(props.background)}` : ''}${props.tool === 'hand' ? ' is-hand' : ''}${props.placing ? ' is-placing' : ''}${hover && laid.get(hover)?.connector && !dragging && policy.select ? ' is-line-hover' : ''}`}
       data-testid="aiws-canvas"
       data-surface-id={props.surfaceId}
       data-mode={mode}
@@ -1238,12 +1288,13 @@ export function RenderHost(props: RenderHostProps) {
       data-zoom={zoom.toFixed(2)}
       data-settled={settled}
       data-pointer={pointer}
+      data-background={props.background ?? undefined}
+      style={props.background ? { backgroundColor: props.background } : undefined}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={(event) => { if (event.pointerType !== 'touch') finishDrag(true) }}
       onDragStart={(event) => { if (!insideEditor(event.target)) event.preventDefault() }}
-      onWheel={onWheel}
       onContextMenu={onContextMenu}
       onPointerLeave={() => {
         if (!dragRef.current) { changeHover(null); setToolSnap(null) }
@@ -1262,7 +1313,8 @@ export function RenderHost(props: RenderHostProps) {
         // rich text opens with the caret where the double-click was (§4.4)
         if (l.entity.view_type === 'richtext') requestIntent(hit.id, `caret:${event.clientX},${event.clientY}`)
         props.onEditingChange(hit.id)
-        props.onSelectionChange(new Set([hit.id]))
+        // a group's backing is edited (its title) with the group still selected
+        props.onSelectionChange(new Set([l.backing ? l.parentId : hit.id]))
       }}
     >
       <BlockMetaContext.Provider value={metaSink}>
@@ -1274,9 +1326,8 @@ export function RenderHost(props: RenderHostProps) {
           : <rect key={`cut:${id}`} className="aiws-cut-outline" data-testid={`aiws-cut-${id}`} x={rect.x} y={rect.y} width={rect.w} height={rect.h} transform={turned(rect, rotation)} />)}
         {hoverShape && hoverLaid?.connector && policy.select && !dragging && <path className="aiws-line-hover" data-testid="aiws-hover-outline" d={linePath(hoverLaid.entity.entity_id)} strokeWidth={haloWidth(hoverLaid.entity.entity_id, 4)} />}
         {showHalos && selected.filter((x) => x.line).map(({ id, locked }) => <path key={`halo:${id}`} className={`aiws-line-halo${locked ? ' is-locked' : ''}`} data-testid={`aiws-selection-${id}`} d={linePath(id)} strokeWidth={haloWidth(id, 6)} />)}
-        {hoverShape && hoverLaid && !hoverLaid.connector && policy.select && !dragging && (hoverMeta?.shape === 'ellipse'
-          ? <ellipse className="aiws-hover-outline" data-testid="aiws-hover-outline" cx={hoverShape.rect.x + hoverShape.rect.w / 2} cy={hoverShape.rect.y + hoverShape.rect.h / 2} rx={hoverShape.rect.w / 2} ry={hoverShape.rect.h / 2} transform={turned(hoverShape.rect, hoverShape.rotation)} />
-          : <rect className={`aiws-hover-outline${hoverLaid.isGroup ? ' is-group' : ''}`} data-testid="aiws-hover-outline" x={hoverShape.rect.x} y={hoverShape.rect.y} width={hoverShape.rect.w} height={hoverShape.rect.h} transform={turned(hoverShape.rect, hoverShape.rotation)} />)}
+        {hoverShape && hoverLaid && !hoverLaid.connector && policy.select && !dragging && (
+          <Outline shape={hoverMeta?.shape ?? 'rect'} rect={hoverShape.rect} transform={turned(hoverShape.rect, hoverShape.rotation)} className={`aiws-hover-outline${hoverLaid.isGroup ? ' is-group' : ''}`} testId="aiws-hover-outline" />)}
         <g ref={selectionLayerRef}>
           {selected.filter((x) => !x.line).map(({ id, rect, rotation, locked }) => (
             <rect key={id} className={`aiws-selection-box${selected.length > 1 ? ' is-member' : ''}${locked ? ' is-locked' : ''}${laid.get(id)?.isGroup ? ' is-group' : ''}`} data-testid={`aiws-selection-${id}`} x={rect.x} y={rect.y} width={rect.w} height={rect.h} transform={turned(rect, rotation)} />
@@ -1295,9 +1346,7 @@ export function RenderHost(props: RenderHostProps) {
         {marquee && <rect className="aiws-marquee" data-testid="aiws-marquee" x={marquee.x} y={marquee.y} width={marquee.w} height={marquee.h} />}
         {snapShape && snap && (
           <g className="aiws-snap" data-testid={`aiws-snap-${snap.id}`} data-anchor={snap.anchor.id} data-exact={snap.exact ? 'true' : 'false'}>
-            {snapShape.ellipse
-              ? <ellipse className="aiws-snap-outline" cx={snapShape.rect.x + snapShape.rect.w / 2} cy={snapShape.rect.y + snapShape.rect.h / 2} rx={snapShape.rect.w / 2} ry={snapShape.rect.h / 2} transform={turned(snapShape.rect, snapShape.rotation)} />
-              : <rect className="aiws-snap-outline" x={snapShape.rect.x} y={snapShape.rect.y} width={snapShape.rect.w} height={snapShape.rect.h} transform={turned(snapShape.rect, snapShape.rotation)} />}
+            <Outline shape={snapShape.shape} rect={snapShape.rect} transform={turned(snapShape.rect, snapShape.rotation)} className="aiws-snap-outline" />
             {snapSpots.map(({ def, point }) => {
               const at = toScreenPt(point)
               const on = def.id === snapOn
@@ -1308,24 +1357,24 @@ export function RenderHost(props: RenderHostProps) {
         {linePreview && linePreview.id === null && <path className="aiws-line-preview" data-testid="aiws-line-preview" d={pathData(screenSegs(linePreview.geom.segs))} />}
         {lineId && lineG && (
           <g className="aiws-line-handles" data-testid={`aiws-line-handles-${lineId}`}>
-            {lineLabel && <rect className="aiws-line-label-handle" data-testid="aiws-line-label-handle" x={lineLabel.x - 3} y={lineLabel.y - 2} width={lineLabel.w + 6} height={lineLabel.h + 4} rx={4} onPointerDown={(event) => beginLabelDrag(event, lineId)}><title>拖动标签；双击编辑</title></rect>}
+            {lineLabel && <rect className="aiws-line-label-handle" data-testid="aiws-line-label-handle" x={lineLabel.x - 3} y={lineLabel.y - 2} width={lineLabel.w + 6} height={lineLabel.h + 4} rx={4} onPointerDown={(event) => beginLabelDrag(event, lineId)}><title>{t('aiworkspace.canvas.line.labelHandle')}</title></rect>}
             {lineMids.map(({ at, long }, i) => long && !underLabel(at) && (
               <g key={`mid:${i}`} className="aiws-line-handle aiws-line-mid" data-testid={`aiws-line-mid-${i}`} onPointerDown={(event) => beginLineHandle(event, lineId, i, true)}>
                 <circle className="aiws-line-handle-hit" cx={at.x} cy={at.y} r={8} /><circle className="aiws-line-dot" cx={at.x} cy={at.y} r={4} />
-                <title>{lineG.route === 'elbow' ? '拖动这一段' : '拖动添加折点'}</title>
+                <title>{t(lineG.route === 'elbow' ? 'aiworkspace.canvas.line.segmentHandle' : 'aiworkspace.canvas.line.midHandle')}</title>
               </g>
             ))}
             {lineControls.map((at, i) => (
               <g key={`ctl:${i}`} className="aiws-line-handle aiws-line-control" data-testid={`aiws-line-control-${i}`} onPointerDown={(event) => beginLineHandle(event, lineId, i, false)}>
                 <circle className="aiws-line-handle-hit" cx={at.x} cy={at.y} r={8} /><circle className="aiws-line-dot" cx={at.x} cy={at.y} r={4} />
-                <title>拖动折点（Shift 水平 / 垂直）；双击删除</title>
+                <title>{t('aiworkspace.canvas.line.controlHandle')}</title>
               </g>
             ))}
             {lineEnds.map(({ which, end, at, binding }) => (
               <g key={which} className={`aiws-line-handle aiws-line-end is-${end.state}`} data-testid={`aiws-line-end-${which}`} data-state={end.state} data-anchor={binding?.anchor.id} onPointerDown={(event) => beginLineEnd(event, lineId, which)}>
                 <circle className="aiws-line-handle-hit" cx={at.x} cy={at.y} r={9} /><circle className="aiws-line-dot" cx={at.x} cy={at.y} r={5} />
                 {end.state === 'broken' && <text className="aiws-line-bang" x={at.x} y={at.y}>!</text>}
-                <title>{end.state === 'broken' ? '端点不可用：拖到对象上重新连接（双击查看说明）' : `${end.state === 'bound' ? `${endPlace(binding)}。` : ''}拖动重新连接；拖到空白处断开`}</title>
+                <title>{end.state === 'broken' ? t('aiworkspace.canvas.line.brokenEndTip') : end.state === 'bound' ? t('aiworkspace.canvas.line.boundEndTip', { place: endPlace(binding) ?? '' }) : t('aiworkspace.canvas.line.freeEndTip')}</title>
               </g>
             ))}
           </g>
@@ -1333,19 +1382,19 @@ export function RenderHost(props: RenderHostProps) {
         {connectHandles.map(({ side, anchor, x, y }) => (
           <g key={`connect:${side}`} className="aiws-connect-handle" data-testid={`aiws-connect-${side}`} onPointerDown={(event) => beginConnectFrom(event, single!.id, anchor)}>
             <circle className="aiws-connect-hit" cx={x} cy={y} r={CONNECT_DOT + 6} /><circle className="aiws-connect-dot" cx={x} cy={y} r={CONNECT_DOT} />
-            <title>拖出连接线</title>
+            <title>{t('aiworkspace.canvas.line.connectHandle')}</title>
           </g>
         ))}
       </svg>
       <div className="aiws-overlay-html">
         {rotateAt && single && (
-          <div className="aiws-rotate-handle" role="button" aria-label="旋转（Shift 吸附 15°，双击归零）" title="旋转（Shift 吸附 15°，双击归零）" data-testid="aiws-rotate-handle"
+          <div className="aiws-rotate-handle" role="button" aria-label={t('aiworkspace.canvas.rotateHandle')} title={t('aiworkspace.canvas.rotateHandle')} data-testid="aiws-rotate-handle"
             style={{ left: rotateAt.x, top: rotateAt.y, width: sizes.rotate, height: sizes.rotate }}
             onPointerDown={(event) => beginRotate(event, single.id)}>
             <RotateCw size={pointer === 'touch' ? 18 : 14} aria-hidden="true" />
           </div>
         )}
-        {lockBadge && <div className="aiws-lock-badge" data-testid="aiws-lock-badge" title="已锁定：不能移动、缩放或删除" style={{ left: lockBadge.x, top: lockBadge.y }}><Lock size={12} aria-hidden="true" /></div>}
+        {lockBadge && <div className="aiws-lock-badge" data-testid="aiws-lock-badge" title={t('aiworkspace.canvas.lockedBadge')} style={{ left: lockBadge.x, top: lockBadge.y }}><Lock size={12} aria-hidden="true" /></div>}
         {affordMeta && affordances.map(({ a, at }) => a.kind === 'label' ? (
           <div key={a.id} className={`aiws-afford aiws-afford-label at-${a.at}`} data-testid={`aiws-afford-${a.id}`} style={at}>
             {a.icon && <a.icon size={12} aria-hidden="true" />}<span className="aiws-afford-text">{a.label}</span>

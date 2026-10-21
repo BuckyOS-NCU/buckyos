@@ -49,6 +49,10 @@ pub struct SessionStatus {
     pub last_runner: Option<LastRunner>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<Value>,
+    /// What the conversation is about (UI sessions: from their structured
+    /// reply); other sessions see it in their background context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<super::state::Topic>,
     #[serde(default)]
     pub updated_at_ms: u64,
 }
@@ -75,6 +79,7 @@ impl SessionStatus {
             activity: Activity::default(),
             last_runner: None,
             last_error: None,
+            topic: None,
             updated_at_ms: now_ms,
         }
     }
@@ -114,6 +119,9 @@ pub struct RegistryEntry {
     /// Initial activity declaration copied from the session scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<super::config::Scope>,
+    /// The Goal a Goal Session works for, or that created a Work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
     pub status: SessionStatus,
     /// `verify` marks entries whose location disappeared (never deleted).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -123,8 +131,13 @@ pub struct RegistryEntry {
     pub location_rev: u64,
 }
 
-/// One line of `state/perception/<sid>.jsonl`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// One line of `state/perception/<sid>.jsonl` (Memory requirements A.5).
+///
+/// Runtime records (`run_digest`, `task_outcome`, `task_discarded`) only feed
+/// consolidation; `observation` records are what Sessions write. After a
+/// consolidation disposes a record, cleanup keeps the line with its identity,
+/// key, source and `cleared` marker and drops the body.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PerceptionRecord {
     pub seq: u64,
     pub at_ms: u64,
@@ -144,6 +157,95 @@ pub struct PerceptionRecord {
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub refs: Value,
+    /// Writer-given replay key, unique within the session file (A.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Digest of the observed content, kept after cleanup so a replay with
+    /// different content is still a conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    /// Subjects (bound by the host) and object range of the observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<agent_tool::agent_memory::Scope>,
+    /// Classification hint (`preference`, `correction`, …); not a cognition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_kind: Option<String>,
+    /// `explicit` when the user asked to remember.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_intent: Option<String>,
+    /// Cognitions (`item_…@rev`) this observation was derived from or
+    /// corrects (echo and correction references, E-15, §4.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cites: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchors: Option<PerceptionAnchors>,
+    /// When the described thing happened (may be an estimate); `at_ms` is
+    /// when it was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+    /// Original event (session event, tool call, task / goal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<agent_tool::agent_memory::SourceRef>,
+    /// Raw mentions and the candidates the component found for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
+    /// Synthesized later (a missing run digest), not an original observation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backfilled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared: Option<ClearedMarker>,
+}
+
+/// Interpretation anchors of an observation (§4.2); the intent's own anchor
+/// wins over the environment's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PerceptionAnchors {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Mention {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<MentionCandidate>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MentionCandidate {
+    pub object_id: String,
+    pub canonical_name: String,
+    /// Why it is a candidate (`alias:<text>`).
+    pub basis: String,
+}
+
+/// What remains of a disposed record after cleanup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClearedMarker {
+    /// `absorbed | duplicate | discarded`.
+    pub outcome: String,
+    pub occasion_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cognition_refs: Vec<String>,
+    pub at_ms: u64,
+}
+
+impl PerceptionRecord {
+    /// `<sid>:<seq>`.
+    pub fn reference(&self) -> String {
+        format!("{}:{}", self.session_id, self.seq)
+    }
+
+    /// Written by the Runtime, not observed by a Session (A.9).
+    pub fn is_runtime(&self) -> bool {
+        matches!(self.kind.as_str(), "run_digest" | "task_outcome" | "task_discarded")
+    }
 }
 
 fn session_source() -> String {
@@ -242,6 +344,9 @@ pub struct RegistryQuery {
     pub artifact_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_decision: Option<bool>,
+    /// Sessions of a Goal: its Goal Sessions (every epoch) and its Work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
 }
 
 impl Default for RegistryQuery {
@@ -253,6 +358,7 @@ impl Default for RegistryQuery {
             not_finished_or_pending: None,
             artifact_id: None,
             pending_decision: None,
+            goal_id: None,
         }
     }
 }

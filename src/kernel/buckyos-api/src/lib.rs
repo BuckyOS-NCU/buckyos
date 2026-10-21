@@ -3,13 +3,16 @@ use std::env;
 
 use log::{info, warn};
 
-mod content_mgr_client;
 mod control_panel;
 mod device_identity;
 mod msg_center_client;
+mod msg_contact;
+mod msg_notify;
 mod aiworkspace_client;
+mod homestation_client;
 mod nfs_server_client;
 mod nfs_copy;
+mod nfs_share;
 pub mod msg_queue;
 mod scheduler_client;
 mod sn_user_client;
@@ -28,6 +31,7 @@ mod zone_gateway;
 mod aicc_client;
 mod aicc_decision;
 mod aicc_usage_log;
+mod agent_permissions;
 mod app_availability;
 mod app_doc;
 mod app_identity;
@@ -52,12 +56,12 @@ pub mod test_config;
 pub use aicc_client::*;
 pub use aicc_decision::*;
 pub use aicc_usage_log::*;
+pub use agent_permissions::*;
 pub use app_availability::*;
 pub use app_doc::*;
 pub use app_identity::*;
 pub use app_install::*;
 pub use app_schema::*;
-pub use content_mgr_client::*;
 pub use control_panel::*;
 pub use cyfs_gateway_api::{
     generate_sn_device_token, get_real_sn_host_name, sn_auth_login, sn_auth_register,
@@ -68,7 +72,10 @@ pub use cyfs_gateway_api::{
 };
 pub use device_identity::*;
 pub use msg_center_client::*;
+pub use msg_contact::*;
+pub use msg_notify::*;
 pub use aiworkspace_client::*;
+pub use homestation_client::*;
 pub use nfs_server_client::*;
 pub use repo_client::*;
 pub use scheduler_client::*;
@@ -77,6 +84,7 @@ pub use system_config::*;
 pub use task_dispatcher::*;
 pub use task_mgr::*;
 pub use nfs_copy::*;
+pub use nfs_share::*;
 pub use taskdata::*;
 pub use thunk_object::*;
 pub use verify_hub_client::*;
@@ -618,6 +626,23 @@ pub fn generate_aiworkspace_doc() -> AppDoc {
     )
     .show_name("AI Workspace Service")
     // One writer per Workspace folder on this node: must never be multi-instanced.
+    .selector_type(SelectorType::Single)
+    .build()
+    .unwrap()
+}
+
+pub fn generate_homestation_doc() -> AppDoc {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    let owner_did = DID::from_str("did:bns:buckyos").unwrap();
+    AppDoc::builder(
+        AppType::Service,
+        HOMESTATION_UNIQUE_ID,
+        VERSION,
+        "did:bns:buckyos",
+        &owner_did,
+    )
+    .show_name("HomeStation Service")
+    // Heads of one entry are numbered by a single writer (§16.5): never multi-instanced.
     .selector_type(SelectorType::Single)
     .build()
     .unwrap()

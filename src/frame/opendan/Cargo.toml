@@ -21,12 +21,15 @@ http-body-util = { workspace = true }
 kRPC = { workspace = true }
 name-lib = { workspace = true }
 ndn-lib = { workspace = true }
+ndn-toolkit = { workspace = true }
 buckyos-kit = { workspace = true }
 buckyos-http-server = { workspace = true }
 buckyos-api = { path = "../../kernel/buckyos-api" }
 llm_context = { path = "../llm_context" }
 agent_tool = { path = "../agent_tool" }
+agent_tool_cli_dev = { path = "../agent_tool_cli_dev" }
 libopendan = { path = "../lib_opendan" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+base64 = { workspace = true }

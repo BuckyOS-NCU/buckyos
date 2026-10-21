@@ -332,6 +332,16 @@ export interface WizardDraft {
   auth_mode: AuthMode
   api_key: string
   auto_sync_models: boolean
+  discovery_behavior_id?: string
+  /** Complete profile-owned list used to derive exclusions for live discovery. */
+  selectable_inventory_models?: string[]
+  /** Subset of `selectable_inventory_models`; undefined publishes all of them. */
+  selected_inventory_models?: string[]
+}
+
+export interface SelectableInventoryModel {
+  id: string
+  label: string
 }
 
 export interface KnownProviderProfile {
@@ -341,10 +351,22 @@ export interface KnownProviderProfile {
   region_base_urls: Record<string, string>
   operation_base_urls?: Record<string, string>
   protocol_adapter_id: string
+  discovery_behavior_id: string
   provider_rules_id?: string
   ui_hints: Record<string, unknown>
   endpoint_hints: Record<string, ProviderEndpointHint>
   connection_fields: Partial<Record<'region' | 'workspace' | 'account' | 'policy_region', ProviderConnectionField>>
+  setup_group?: ProviderSetupGroup
+  /** Models whose account entitlement cannot be inferred from discovery. */
+  selectable_inventory_models?: SelectableInventoryModel[]
+}
+
+export interface ProviderSetupGroup {
+  id: string
+  display_name: string
+  account_type: string
+  account_type_label: string
+  default: boolean
 }
 
 export interface ProviderEndpointHint {

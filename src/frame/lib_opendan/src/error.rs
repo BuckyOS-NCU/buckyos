@@ -71,6 +71,8 @@ pub enum OpenDanError {
     SessionReadonly { session_id: String, reason: String },
     #[error("runtime mismatch: session is bound to {bound}, runner provides {provided}")]
     RuntimeMismatch { bound: String, provided: String },
+    #[error("workspace binding invalid: {0}")]
+    WorkspaceBindingInvalid(String),
     #[error("bind error: {0}")]
     Bind(String),
     #[error("{0}")]
@@ -85,6 +87,20 @@ pub enum OpenDanError {
     Tool(String),
     #[error("artifact error: {0}")]
     Artifact(String),
+    /// A Goal changed meanwhile (revision / status / epoch), or the change
+    /// is not a valid transition from its current status.
+    #[error("goal conflict: {0}")]
+    GoalConflict(String),
+    /// The Goal's period budget refuses the request (a new Work, a fire).
+    #[error("goal budget exhausted: {0}")]
+    GoalBudgetExhausted(String),
+    /// The caller's kind may not do this (Goal rules by caller type).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    /// A notification is not in a state the request applies to (closed,
+    /// another kind); the message carries its current state.
+    #[error("notify conflict: {0}")]
+    NotifyConflict(String),
     #[error("{0}")]
     Other(String),
 }
@@ -133,12 +149,17 @@ impl OpenDanError {
             OpenDanError::SessionReadonly { .. } => "session_readonly",
             OpenDanError::RuntimeMismatch { .. } => "runtime_mismatch",
             OpenDanError::Bind(_) => "bind_failed",
+            OpenDanError::WorkspaceBindingInvalid(_) => "workspace_binding_invalid",
             OpenDanError::RecoveryBlocked(_) => "recovery_blocked",
             OpenDanError::Channel(_) => "channel",
             OpenDanError::Llm(_) => "llm",
             OpenDanError::Xllm(_) => "xllm",
             OpenDanError::Tool(_) => "tool",
             OpenDanError::Artifact(_) => "artifact",
+            OpenDanError::GoalConflict(_) => "goal_conflict",
+            OpenDanError::GoalBudgetExhausted(_) => "goal_budget_exhausted",
+            OpenDanError::Forbidden(_) => "forbidden",
+            OpenDanError::NotifyConflict(_) => "notify_conflict",
             OpenDanError::Other(_) => "other",
         };
         let mut v = serde_json::json!({

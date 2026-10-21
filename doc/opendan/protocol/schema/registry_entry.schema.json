@@ -68,6 +68,42 @@
       ],
       "type": "object"
     },
+    "GoalOrigin": {
+      "description": "`origin.goal` of a Work created by a Goal Session.",
+      "properties": {
+        "activation_seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "activation_seq",
+        "at_ms",
+        "epoch",
+        "goal_id",
+        "revision"
+      ],
+      "type": "object"
+    },
     "LastRunner": {
       "description": "Driver of the last commit (Q9: which runner advanced the session).",
       "properties": {
@@ -112,6 +148,17 @@
             "string",
             "null"
           ]
+        },
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoalOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Created by an Activation of a Goal: the Goal and the revision the Work was given (kept when the Goal is revised later)."
         },
         "intent_ref": {
           "type": [
@@ -215,13 +262,24 @@
       "type": "object"
     },
     "SessionKind": {
-      "enum": [
-        "ui",
-        "work",
-        "self_improve",
-        "self_check"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "ui",
+            "work",
+            "self_improve",
+            "self_check"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The context of a Goal (`state/goals/<goal_id>`): one per `(goal, epoch)`, created by the host, never a sub session.",
+          "enum": [
+            "goal"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "SessionStatus": {
       "description": "Cached status of a session (the truth is its own state.json).",
@@ -285,6 +343,17 @@
         "run_state": {
           "$ref": "#/definitions/RunState"
         },
+        "topic": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Topic"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the conversation is about (UI sessions: from their structured reply); other sessions see it in their background context."
+        },
         "turn_open": {
           "description": "A Turn is open (work in progress, or waiting inside it).",
           "type": "boolean"
@@ -311,6 +380,21 @@
         "rev",
         "run_state"
       ],
+      "type": "object"
+    },
+    "Topic": {
+      "properties": {
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "default": "",
+          "type": "string"
+        }
+      },
       "type": "object"
     },
     "Touching": {
@@ -350,47 +434,32 @@
       ],
       "type": "string"
     },
+    "WorkspaceAccess": {
+      "enum": [
+        "read_only",
+        "read_write"
+      ],
+      "type": "string"
+    },
     "WorkspaceRef": {
-      "oneOf": [
-        {
-          "description": "Agent internal workspace `<agent_root>/workspace/<id>`.",
-          "properties": {
-            "id": {
-              "type": "string"
-            },
-            "kind": {
-              "enum": [
-                "agent"
-              ],
-              "type": "string"
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkspaceAccess"
             }
-          },
-          "required": [
-            "id",
-            "kind"
           ],
-          "type": "object"
+          "default": "read_write"
         },
-        {
-          "description": "Directory owned by a user / application.",
-          "properties": {
-            "kind": {
-              "enum": [
-                "external"
-              ],
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "path"
-          ],
-          "type": "object"
+        "workspace_id": {
+          "type": "string"
         }
-      ]
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
     }
   },
   "description": "`state/sessions/<sid>.json`.",
@@ -418,6 +487,13 @@
     },
     "driver": {
       "$ref": "#/definitions/DriverRef"
+    },
+    "goal_id": {
+      "description": "The Goal a Goal Session works for, or that created a Work.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "idempotency_key": {
       "type": [

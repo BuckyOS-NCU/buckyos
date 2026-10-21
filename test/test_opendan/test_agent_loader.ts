@@ -7,12 +7,17 @@
  *     --unsafely-ignore-certificate-errors test_agent_loader.ts [text]
  *
  * Env: BUCKYOS_TEST_ZONE_HOST (test.buckyos.io), BUCKYOS_TEST_ADMIN_USER
- * (devtest), BUCKYOS_TEST_ADMIN_PASSWORD (bucky2025), BUCKYOS_TEST_AGENT_DID
- * (did:web:jarvis.<zone>), OPENDAN_URL (http://127.0.0.1:10016/kapi/opendan),
+ * (devtest), BUCKYOS_TEST_ADMIN_PASSWORD (bucky2025), the agent as
+ * agent_target.ts selects it (BUCKYOS_TEST_AGENT_CREATE=<name> |
+ * BUCKYOS_TEST_AGENT_ID=<agent_id> | the user's first ready agent; OPENDAN_URL),
  * OPENDAN_REPLY_TIMEOUT_S (180), OPENDAN_FOLLOW_S (0: after the reply, keep
- * printing further messages of the agent until its sessions are idle).
+ * printing further messages of the agent until its sessions are idle),
+ * OPENDAN_ATTACH (a local file: uploaded as a chunk through the zone's NDM
+ * proxy and attached to the message as a data object).
+ * The message is sent as the agent's owner: anyone else is not answered.
  */
 import { buckyos } from "buckyos";
+import { resolveAgent } from "./agent_target.ts";
 
 type JsonRecord = Record<string, unknown>;
 type RpcClient = { call(method: string, params: JsonRecord): Promise<unknown> };
@@ -31,12 +36,9 @@ const hashPassword = buckyos.hashPassword as unknown as (
 const zoneHost = Deno.env.get("BUCKYOS_TEST_ZONE_HOST")?.trim() || "test.buckyos.io";
 const adminUser = Deno.env.get("BUCKYOS_TEST_ADMIN_USER")?.trim() || "devtest";
 const adminPassword = Deno.env.get("BUCKYOS_TEST_ADMIN_PASSWORD")?.trim() || "bucky2025";
-const agentDid = Deno.env.get("BUCKYOS_TEST_AGENT_DID")?.trim() || `did:web:jarvis.${zoneHost}`;
-const opendanUrl = Deno.env.get("OPENDAN_URL")?.trim() || "http://127.0.0.1:10016/kapi/opendan";
 const replyTimeoutMs = Number(Deno.env.get("OPENDAN_REPLY_TIMEOUT_S") || "180") * 1000;
 const followSeconds = Number(Deno.env.get("OPENDAN_FOLLOW_S") || "0");
 const text = Deno.args[0] || "你好，请用一句话介绍你自己。";
-const selfDid = `did:bns:${adminUser}`;
 let lastNonce = Date.now();
 
 function nextNonce(): number {
@@ -85,6 +87,12 @@ function recordText(item: JsonRecord): string {
 }
 
 const token = await login();
+const { agentDid, ownerDid: selfDid, opendanUrl } = await resolveAgent(
+  (method, params) => zone("control-panel", method, params, token),
+  adminUser,
+  zoneHost,
+);
+console.log(`agent ${agentDid} at ${opendanUrl}`);
 const msg = (method: string, params: JsonRecord) => zone("msg-center", method, params, token);
 const dan = (method: string, params: JsonRecord = {}, t: string | null = token) =>
   new KRpcClient(opendanUrl, t, nextNonce()).call(method, params);
@@ -111,6 +119,27 @@ const before = (await dan("sessions.query", {})) as JsonRecord[];
 console.log(`  ✓ ${status.who} hosts ${agentDid}; ${before.length} session(s) registered`);
 
 console.log(`2. send: ${text}`);
+let refs: JsonRecord[] | undefined;
+const attach = Deno.env.get("OPENDAN_ATTACH")?.trim();
+if (attach) {
+  const { ndm_proxy, ndn } = await import("buckyos") as unknown as {
+    ndm_proxy: { createNdmProxyClient(o: JsonRecord): { putChunk(id: string, bytes: Uint8Array): Promise<unknown> } };
+    ndn: { ChunkId: { fromMix256Result(len: number, hash: Uint8Array): { toString(): string } }; sha256Bytes(b: Uint8Array): Uint8Array };
+  };
+  const bytes = await Deno.readFile(attach);
+  const objId = ndn.ChunkId.fromMix256Result(bytes.byteLength, ndn.sha256Bytes(bytes)).toString();
+  const proxy = ndm_proxy.createNdmProxyClient({
+    endpoint: `https://${zoneHost}`,
+    sessionToken: token,
+    // The proxy path keeps the object id's `:` unescaped.
+    fetcher: (request: RequestInfo | URL, init?: RequestInit) =>
+      fetch(typeof request === "string" ? request.replaceAll("%3A", ":").replaceAll("%3a", ":") : request, init),
+  });
+  await proxy.putChunk(objId, bytes);
+  const label = attach.split("/").pop() ?? attach;
+  refs = [{ role: "input", target: { type: "data_obj", obj_id: objId }, label }];
+  console.log(`  ✓ uploaded ${label} as ${objId}`);
+}
 const sentAt = Date.now();
 const sent = asRecord(await msg("msg.post_send", {
   msg: {
@@ -119,7 +148,7 @@ const sent = asRecord(await msg("msg.post_send", {
     kind: "chat",
     created_at_ms: sentAt,
     nonce: Math.floor(Math.random() * Number.MAX_SAFE_INTEGER),
-    content: { format: "text/plain", content: text },
+    content: { format: "text/plain", content: text, ...(refs ? { refs } : {}) },
   },
   idempotency_key: `opendan-accept-${sentAt}`,
 }), "post_send");

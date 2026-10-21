@@ -50,8 +50,11 @@ import type { DeleteRequest } from './dialogs/OperationDialogs'
 import { operationFeedback, useOperationFeedback } from './data/operationFeedback'
 import type { BatchTask } from './data/operationFeedback'
 import { MoveTargetDialog } from './dialogs/MoveTargetDialog'
+import { PermissionsDialog } from './dialogs/PermissionsDialog'
+import type { PermissionsRequest } from './dialogs/PermissionsDialog'
 import type { TargetRequest } from './dialogs/MoveTargetDialog'
 import { commandState } from './menu/commands'
+import { SHARE_DIALOG_PATH, useSystemDialog } from '../../sysdlg'
 import './filebrowser.css'
 import type { FileItem } from './data/FolderReader'
 import { installFileBrowserData } from './data/install'
@@ -105,7 +108,7 @@ type BrowserPane = ReturnType<typeof useBrowserPane>
 const FILE_DRAG_TYPE = 'application/x-buckyos-file-items'
 let draggedFiles: { token: string; pane: BrowserPane; items: FileItem[] } | null = null
 
-export function FileBrowserView({ windowId }: { windowId?: string }) {
+export function FileBrowserView({ windowId, openRequest }: { windowId?: string; openRequest?: { requestId: string; path: string } }) {
   const { t } = useI18n()
   const isMobile = useMediaQuery('(max-width: 900px)')
   // Tailwind xl — the preview sidebar only exists at this width, so the
@@ -131,6 +134,14 @@ export function FileBrowserView({ windowId }: { windowId?: string }) {
   useEffect(() => { const refresh = () => refreshCopyCapability((n) => n + 1); window.addEventListener('files-copy-capability', refresh); return () => window.removeEventListener('files-copy-capability', refresh) }, [])
   const [closedTabs, setClosedTabs] = useState<BrowserTab[]>([])
   const [focusedSide, setFocusedSide] = useState<'left' | 'right'>('left')
+  // A launch that names a folder (the Desktop folder, a folder on the desktop) shows it in the left pane.
+  const handledOpenRequest = useRef<string | null>(null)
+  useEffect(() => {
+    if (!openRequest || handledOpenRequest.current === openRequest.requestId) return
+    handledOpenRequest.current = openRequest.requestId
+    left.navigate(openRequest.path)
+    setFocusedSide('left')
+  }, [openRequest, left])
 
   const [advancedMode, setAdvancedMode] = useState(false)
   const [listPreferences, setListPreferences] = useState<{ fullColumns: boolean; density: 'compact' | 'comfortable'; nameWidth: number }>(() => {
@@ -153,6 +164,8 @@ export function FileBrowserView({ windowId }: { windowId?: string }) {
   const { batchTask, conflictRequest } = useOperationFeedback()
   const { setBatchTask } = operationFeedback
   const [targetRequest, setTargetRequest] = useState<TargetRequest | null>(null)
+  const [permissionsRequest, setPermissionsRequest] = useState<PermissionsRequest | null>(null)
+  const systemDialog = useSystemDialog()
   const busyRef = useRef(false)
   const [dragTarget, setDragTarget] = useState<string | null>(null)
   const [pathEditSignal, setPathEditSignal] = useState(0)
@@ -907,6 +920,17 @@ export function FileBrowserView({ windowId }: { windowId?: string }) {
         if (first) requestRename(pane, first)
         break
       case 'move-to': requestMove(pane, entries); break
+      case 'share':
+        if (first) void systemDialog.open(SHARE_DIALOG_PATH, { source: first.entry.path, title: first.entry.name })
+        break
+      case 'permissions':
+        if (first) setPermissionsRequest({ path: first.entry.path, name: first.entry.name, onSaved: () => pane.list.reload() })
+        break
+      case 'folder-permissions': {
+        const path = dfsPathOf(context.currentUrl)
+        if (path) setPermissionsRequest({ path, name: path.slice(path.lastIndexOf('/') + 1) || path, onSaved: () => pane.list.reload() })
+        break
+      }
       case 'move-other': {
         const path = String(action.args?.path ?? '')
         if (path) void moveSelected(pane, entries, path)
@@ -1095,6 +1119,7 @@ export function FileBrowserView({ windowId }: { windowId?: string }) {
     <ConflictDialog request={conflictRequest?.ownerId === windowId ? conflictRequest : null} />
     <CopyTasks ownerId={windowId} reveal={(path) => livePanes.current[0].revealOriginal(path)} />
     {targetRequest && <MoveTargetDialog request={targetRequest} onClose={() => setTargetRequest(null)} />}
+    {permissionsRequest && <PermissionsDialog key={permissionsRequest.path} request={permissionsRequest} onClose={() => setPermissionsRequest(null)} />}
     <BatchResults task={batchTask?.ownerId === windowId ? batchTask : null} onClose={() => setBatchTask(null)} />
     {dragTarget && <div className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-xl border-2 border-dashed border-[color:var(--cp-accent)] bg-[color:var(--cp-surface)]/90 p-6">{t('filebrowser.operation.dropDestination', 'Drop into {{path}}', { path: displayPath(dragTarget) })}</div>}
   </>

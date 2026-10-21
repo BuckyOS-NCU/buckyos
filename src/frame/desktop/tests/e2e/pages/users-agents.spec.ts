@@ -1,59 +1,5 @@
 import { expect, test } from '@playwright/test'
 
-function placeUsersAgentsOnFirstPage() {
-  window.localStorage.setItem(
-    'buckyos.layout.desktop.v2',
-    JSON.stringify({
-      version: 1,
-      formFactor: 'desktop',
-      deadZone: { top: 0, bottom: 8, left: 5, right: 5 },
-      pages: [
-        {
-          id: 'desktop-page-1',
-          items: [
-            {
-              id: 'app-users-agents',
-              type: 'app',
-              appId: 'users-agents',
-              x: 0,
-              y: 0,
-              w: 1,
-              h: 1,
-            },
-          ],
-        },
-      ],
-    }),
-  )
-}
-
-function placeMyNetworkOnFirstPage() {
-  window.localStorage.setItem(
-    'buckyos.layout.desktop.v2',
-    JSON.stringify({
-      version: 1,
-      formFactor: 'desktop',
-      deadZone: { top: 0, bottom: 8, left: 5, right: 5 },
-      pages: [
-        {
-          id: 'desktop-page-1',
-          items: [
-            {
-              id: 'app-my-network',
-              type: 'app',
-              appId: 'my-network',
-              x: 0,
-              y: 0,
-              w: 1,
-              h: 1,
-            },
-          ],
-        },
-      ],
-    }),
-  )
-}
-
 test.describe('Users & Agents app panel', () => {
   test('desktop: internal entity manager renders and validates local-user form', async ({ page }) => {
     const consoleErrors: string[] = []
@@ -63,7 +9,6 @@ test.describe('Users & Agents app panel', () => {
     })
 
     await page.setViewportSize({ width: 1440, height: 900 })
-    await page.addInitScript(placeUsersAgentsOnFirstPage)
     await page.goto('/?scenario=normal')
 
     await page.getByTestId('desktop-app-users-agents').click()
@@ -75,7 +20,6 @@ test.describe('Users & Agents app panel', () => {
     await expect(win.getByLabel('Add Agent')).toBeVisible()
     await expect(win.getByText('BuckyOS Assistant')).toBeVisible()
     await expect(win.getByText('Carol')).toBeVisible()
-    await expect(win.getByText('Family Space')).toBeVisible()
     await expect(win.getByText('Collections', { exact: true })).toHaveCount(0)
 
     await win.getByLabel('Search or filter').click()
@@ -90,13 +34,20 @@ test.describe('Users & Agents app panel', () => {
 
     await win.getByPlaceholder('Search name, DID, role, tag, status...').fill('assistant')
     await win.getByText('BuckyOS Assistant').click()
-    await expect(win.getByText('Runtime & Work')).toBeVisible()
-    await expect(win.getByText('Running Tasks')).toBeVisible()
-    await expect(win.getByText('Queued Tasks')).toBeVisible()
-    await expect(win.getByText('Social Accounts')).toBeVisible()
+    const detail = win.getByTestId('agent-detail')
+    await expect(detail.getByTestId('agent-install-status')).toContainText('Running')
+    await expect(detail.getByTestId('agent-profile')).toContainText('assistant')
+    await expect(detail.getByTestId('agent-channels')).toContainText('@bucky_bot')
+    await expect(detail.getByRole('switch', { name: 'Allow this Agent to join group chats' })).not.toBeChecked()
+    await expect(detail.getByRole('switch', { name: 'Allow other users to use this Agent' })).toBeDisabled()
 
+    currentAction = 'open Add Agent'
     await win.getByLabel('Add Agent').click()
-    await expect(page.getByText('Agent creation is coming soon.')).toBeVisible()
+    const wizard = page.getByTestId('window-agent-setup')
+    await expect(wizard.getByText('Create Agent', { exact: true }).last()).toBeVisible()
+    await expect(wizard.getByTestId('agent-setup-name')).toHaveValue('')
+    await wizard.getByRole('button', { name: 'Close' }).first().click()
+    await win.click({ position: { x: 400, y: 20 } })
 
     currentAction = 'open Add User'
     await win.getByLabel('Add User').click()
@@ -119,69 +70,6 @@ test.describe('Users & Agents app panel', () => {
     await expect(win.getByRole('button', { name: 'Create User', exact: true })).toBeVisible()
     currentAction = 'close wizard'
     await win.getByLabel('Close new user wizard').click()
-
-    expect(consoleErrors).toEqual([])
-  })
-})
-
-test.describe('My Network app panel', () => {
-  test('desktop: relationship collections import and merge contacts', async ({ page }) => {
-    const consoleErrors: string[] = []
-    page.on('console', (message) => {
-      if (message.type() === 'error') consoleErrors.push(message.text())
-    })
-
-    await page.setViewportSize({ width: 1440, height: 900 })
-    await page.addInitScript(placeMyNetworkOnFirstPage)
-    await page.goto('/?scenario=normal')
-
-    await page.getByTestId('desktop-app-my-network').click()
-    const win = page.getByTestId('window-my-network')
-    await expect(win).toBeVisible()
-
-    await expect(win.getByRole('complementary').getByText('My Network')).toBeVisible()
-    const networkSidebar = win.getByRole('complementary')
-    await expect(networkSidebar.getByRole('button', { name: /Contacts/ })).toBeVisible()
-    await expect(networkSidebar.getByRole('button', { name: /Friends/ })).toBeVisible()
-    await expect(networkSidebar.getByRole('button', { name: /Joined Groups/ })).toBeVisible()
-
-    await expect(win.getByPlaceholder('Search Contacts…')).toBeVisible()
-    const graceTelegramRow = win.getByRole('button', { name: /Grace\.telegram/ }).first()
-    await expect(graceTelegramRow).toBeVisible()
-
-    await graceTelegramRow.click()
-    await expect(win.getByText('One-way relation')).toBeVisible()
-    await expect(win.getByText('Merge candidate')).toBeVisible()
-    await expect(win.getByText('Social Accounts')).toBeVisible()
-    await win.getByRole('button', { name: 'Comment Login Flow' }).click()
-    await expect(win.getByText('HomeStation Comment Authorization')).toBeVisible()
-    await expect(win.getByText('Session Token = None')).toBeVisible()
-
-    await win.getByRole('button', { name: 'Import', exact: true }).click()
-    await page.getByRole('button', { name: 'Start import' }).click()
-    await expect(page.getByText('Import complete. Two contacts were added to Contacts.')).toBeVisible()
-    await page.getByRole('button', { name: 'Done' }).click()
-    await expect(win.getByRole('button', { name: /Mina\.imported/ })).toBeVisible()
-
-    await graceTelegramRow.locator('input[type="checkbox"]').check()
-    await win.getByRole('button', { name: /Grace\.imported/ }).locator('input[type="checkbox"]').check()
-    await expect(win.getByText('2 selected')).toBeVisible()
-    await win.getByRole('button', { name: 'Merge', exact: true }).click()
-    const mergeDialog = page.getByRole('dialog', { name: 'Merge contacts' })
-    await expect(mergeDialog).toBeVisible()
-    await mergeDialog.getByRole('button', { name: 'Merge' }).click()
-    await expect(win.getByRole('button', { name: /Grace\.imported/ })).toHaveCount(0)
-
-    await win.getByRole('button', { name: 'Add Contact' }).click()
-    await expect(win.getByRole('heading', { name: 'Nora' })).toBeVisible()
-
-    await win.getByRole('button', { name: 'Add Collection' }).click()
-    const collectionDialog = page.getByRole('dialog', { name: 'Add Collection' })
-    await expect(collectionDialog).toBeVisible()
-    await collectionDialog.getByRole('button', { name: 'Import Group' }).click()
-    await collectionDialog.getByLabel('Group Name').fill('Imported Leads')
-    await collectionDialog.getByRole('button', { name: 'Create' }).click()
-    await expect(win.getByRole('button', { name: /Imported Leads/ })).toBeVisible()
 
     expect(consoleErrors).toEqual([])
   })
@@ -225,7 +113,6 @@ test.describe('Users & Agents mobile panel', () => {
     })
 
     await expect(page.getByText('Internal Entities', { exact: true })).toBeVisible()
-    await expect(page.getByText('Self-hosted Groups', { exact: true })).toBeVisible()
     await expect(page.getByText('Collections', { exact: true })).toHaveCount(0)
     await page.getByLabel('Search or filter').click()
     await page.getByPlaceholder('Search name, DID, role, tag, status...').fill('Carol')
@@ -272,7 +159,6 @@ test.describe('Users & Agents mobile panel', () => {
 
 test('Agent detail opens an explicit read-only owner view in a desktop window', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
-  await page.addInitScript(placeUsersAgentsOnFirstPage)
   await page.goto('/?scenario=normal')
   await page.getByTestId('desktop-app-users-agents').click()
   const users = page.getByTestId('window-users-agents')

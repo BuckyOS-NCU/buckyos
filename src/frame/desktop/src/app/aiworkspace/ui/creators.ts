@@ -4,6 +4,7 @@ import type { CapturedAnchor } from '../anchors/registry'
 import { randomId } from '../api/ids'
 import type { EntityEnvelope, Json, Operation, Reference } from '../api/types'
 import { orderKeyBetween, type AiwsCore } from '../api/wasm'
+import { aiwsT } from '../i18n'
 
 export function entityLabel(entity: EntityEnvelope): string {
   return entity.name ?? entity.title ?? entity.entity_id
@@ -43,12 +44,13 @@ export function appendKeys(core: AiwsCore, entities: EntityEnvelope[], parentId:
 }
 
 /** An annotation placed under `parentId` (a folder of the data tree, phase two §4.5), anchored by `anchor`. */
-export function annotationOp(core: AiwsCore, siblings: EntityEnvelope[], parentId: string, anchor: CapturedAnchor, body: string): Operation {
+export function annotationOp(core: AiwsCore, siblings: EntityEnvelope[], parentId: string, anchor: CapturedAnchor, body: string, authorName?: string): Operation {
   const last = siblings.length > 0 ? siblings[siblings.length - 1].order_key ?? null : null
   const key = orderKeyBetween(core, last, null)
   const payload: Record<string, Json> = { target: anchor.target as unknown as Json, kind: 'note', body }
   if (anchor.range) payload.range = anchor.range
   if (anchor.context) payload.context = anchor.context as unknown as Json
+  if (authorName) payload.author_name = authorName
   return { op: 'entity.create', entity_id: randomId('n'), type_id: 'buckyos.annotation', parent_id: parentId, order_key: key, payload }
 }
 
@@ -57,7 +59,7 @@ export function describeTarget(target: Reference): string {
   if (!selector || selector.kind === 'entity') return target.entity_id
   if (selector.kind === 'table_cell') return `${target.entity_id} / ${selector.record_id} / ${selector.field_id}`
   if (selector.kind === 'table_record') return `${target.entity_id} / ${selector.record_id}`
-  if (selector.kind === 'table_field') return `${target.entity_id} / 字段 ${selector.field_id}`
-  if (selector.kind === 'richtext_block') return `${target.entity_id} / 块 ${selector.block_id}`
+  if (selector.kind === 'table_field') return aiwsT('aiworkspace.data.target.field', { entity: target.entity_id, field: String(selector.field_id) })
+  if (selector.kind === 'richtext_block') return aiwsT('aiworkspace.data.target.block', { entity: target.entity_id, block: String(selector.block_id) })
   return `${target.entity_id} / ${selector.kind}`
 }

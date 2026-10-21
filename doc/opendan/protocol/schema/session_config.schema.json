@@ -222,6 +222,26 @@
             }
           ],
           "default": {}
+        },
+        "reply": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BehaviorReply"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BehaviorToolConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "type": "object"
@@ -249,6 +269,10 @@
               "type": "null"
             }
           ]
+        },
+        "todo": {
+          "description": "A hand-over to this behavior (`next_behavior`) executes the session's next serial Todo: the host admits it and hands its body over as the sub task (`create_sub_context` only).",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -309,6 +333,13 @@
     "BehaviorPromptConfig": {
       "additionalProperties": false,
       "properties": {
+        "goal_activation": {
+          "description": "Goal Sessions: template of the Goal header (variable `goal`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "anyOf": [
             {
@@ -354,6 +385,55 @@
       },
       "type": "object"
     },
+    "BehaviorReply": {
+      "additionalProperties": false,
+      "description": "`[reply]`: the reply contract of a behavior's context. The final reply (an assistant text without tool calls) is one JSON value matching `schema`: the provider enforces it natively where it can, the host checks it and asks for one correction (`OutputSpec::Json { max_repairs: Some(1) }`). Function call loop only.",
+      "properties": {
+        "asks_field": {
+          "description": "An array field of the reply that must list every question the context asked the user (`agent-session ask-user`), one entry each.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema": {
+          "description": "JSON Schema of the reply (an object schema)."
+        }
+      },
+      "required": [
+        "schema"
+      ],
+      "type": "object"
+    },
+    "BehaviorToolConfig": {
+      "additionalProperties": false,
+      "description": "`[tool]`: a sub context behavior offered to its callers as a named function. Calling it runs the behavior exactly like `call_behavior` does; the declaration only decides what the caller's model sees.",
+      "properties": {
+        "description": {
+          "default": "",
+          "description": "When to call it: the caller's routing guide.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Function name (letters, digits, `_`); default: the behavior name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parameters": {
+          "description": "JSON Schema of the arguments (an object); default: `{task: string}`."
+        },
+        "task": {
+          "description": "Template of the sub context's task (`{{args.<name>}}` only); default: the arguments as JSON (or `args.task` with the default parameters).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "Channels": {
       "properties": {
         "inputs": {
@@ -383,6 +463,29 @@
         }
       },
       "type": "object"
+    },
+    "CmdSkill": {
+      "description": "`prompt.frozen.cmd_skills[]`: a command manual of the session, frozen with its behaviors (`cmd_skills/<name>.md` without its front matter).",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "text"
+      ],
+      "type": "object"
+    },
+    "CompletionPolicy": {
+      "enum": [
+        "natural",
+        "explicit_report"
+      ],
+      "type": "string"
     },
     "ContextMode": {
       "description": "How a behavior is entered when a hand-over (`next_behavior`) or a `call_behavior` tool call names it. Decided by the target behavior, never by the session as a whole; there is no default mode.",
@@ -426,6 +529,14 @@
                 "string",
                 "null"
               ]
+            },
+            "scope": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/StopScope"
+                }
+              ],
+              "description": "`session` (default): the session finishes as stopped. `turn`: only the open Turn closes as stopped and the session goes on waiting. A Goal Session only ever stops its open Turn (it ends with its Goal)."
             }
           },
           "required": [
@@ -564,6 +675,33 @@
             "command"
           ],
           "type": "object"
+        },
+        {
+          "description": "Goal Sessions: change the Goal's current skills (applied by the driver to the Goal State it owns).",
+          "properties": {
+            "add": {
+              "items": {
+                "$ref": "#/definitions/GoalSkill"
+              },
+              "type": "array"
+            },
+            "command": {
+              "enum": [
+                "goal_skills"
+              ],
+              "type": "string"
+            },
+            "remove": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -658,6 +796,13 @@
           "description": "Catalog revision at the first freeze (audit).",
           "type": "string"
         },
+        "cmd_skills": {
+          "description": "The session's cmd_skills (`prompt.cmd_skills`, in that order), frozen once.",
+          "items": {
+            "$ref": "#/definitions/CmdSkill"
+          },
+          "type": "array"
+        },
         "frozen_at_ms": {
           "default": 0,
           "format": "uint64",
@@ -677,6 +822,91 @@
           "default": {}
         }
       },
+      "type": "object"
+    },
+    "GoalBinding": {
+      "description": "`session.goal` of a Goal Session: the Goal it works for. The definition is read from the Goal, never copied here.",
+      "properties": {
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "epoch",
+        "goal_id"
+      ],
+      "type": "object"
+    },
+    "GoalOrigin": {
+      "description": "`origin.goal` of a Work created by a Goal Session.",
+      "properties": {
+        "activation_seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "activation_seq",
+        "at_ms",
+        "epoch",
+        "goal_id",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "GoalSkill": {
+      "description": "A method / capability the Goal works with (architecture §10.2).",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref": {
+          "description": "Where it is read (path, object id, behavior name).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
       "type": "object"
     },
     "IdentityText": {
@@ -864,6 +1094,10 @@
     "MsgDelivery": {
       "description": "Delivery layer information; everything optional.",
       "properties": {
+        "context": {
+          "description": "An earlier message of the conversation, delivered as material for the input that follows it: it never forms an input batch alone, and it carries no request of its own.",
+          "type": "boolean"
+        },
         "conversation_name": {
           "description": "Display name of the conversation (group name).",
           "type": [
@@ -912,6 +1146,17 @@
             "string",
             "null"
           ]
+        },
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoalOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Created by an Activation of a Goal: the Goal and the revision the Work was given (kept when the Goal is revised later)."
         },
         "intent_ref": {
           "type": [
@@ -1071,6 +1316,13 @@
             "null"
           ]
         },
+        "cmd_skills": {
+          "description": "The cmd_skills of the session (`<agent_root>/cmd_skills/<name>.md`, at most [`super::behavior::MAX_CMD_SKILLS`]): chosen when the session is created (`agent.toml [session.<class>] default_cmd_skills`, `create-worksession --cmd-skill`), frozen with the behaviors (`frozen.cmd_skills`) and rendered as `## Commands`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "compact_ratio": {
           "description": "Compact after a run once the history uses more than this ratio of the budget (`maybe_compact`).",
           "format": "float",
@@ -1096,6 +1348,13 @@
             }
           ],
           "description": "Behaviors and identity frozen from the agent's catalog."
+        },
+        "goal_activation": {
+          "description": "Goal Sessions: the Goal header placed before the first batch of an Activation (variable `goal`).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "history_budget_tokens": {
           "description": "Context budget (tokens) available to the history section when the next llm_context is assembled. `None` → runner default.",
@@ -1277,13 +1536,24 @@
       "type": "object"
     },
     "SessionKind": {
-      "enum": [
-        "ui",
-        "work",
-        "self_improve",
-        "self_check"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "ui",
+            "work",
+            "self_improve",
+            "self_check"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The context of a Goal (`state/goals/<goal_id>`): one per `(goal, epoch)`, created by the host, never a sub session.",
+          "enum": [
+            "goal"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "SessionMsg": {
       "description": "`type = \"msg\"` payload: the message object as it is plus what a MsgObject does not carry by design.",
@@ -1303,6 +1573,21 @@
     "SessionPolicy": {
       "description": "`session.policy`: the session template resolved at creation (xAgent §4.7) and frozen with the session.",
       "properties": {
+        "ask_user_timeout_secs": {
+          "default": 10800,
+          "description": "A session without a user reading it (a Work) asks through a notification and waits at most this long for the answer.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "completion": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CompletionPolicy"
+            }
+          ],
+          "default": "natural"
+        },
         "load_hints": {
           "default": true,
           "type": "boolean"
@@ -1388,6 +1673,17 @@
             "type": "llm_declares_done"
           }
         },
+        "goal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoalBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Goal Sessions: the Goal and epoch."
+        },
         "idempotency_key": {
           "type": [
             "string",
@@ -1417,6 +1713,13 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "owner": {
+          "description": "The agent's owner (DID), when the host knows it: a UI session tells its peer apart from the owner by it.",
+          "type": [
+            "string",
+            "null"
           ]
         },
         "policy": {
@@ -1460,6 +1763,14 @@
         "session_id"
       ],
       "type": "object"
+    },
+    "StopScope": {
+      "description": "What a `stop` ends.",
+      "enum": [
+        "session",
+        "turn"
+      ],
+      "type": "string"
     },
     "Subscription": {
       "properties": {
@@ -1657,50 +1968,92 @@
             "finish_completed"
           ],
           "type": "string"
+        },
+        {
+          "description": "Nobody answers now: the Turn ends (needs input), the session goes on waiting for its next input (Goal Sessions).",
+          "enum": [
+            "end_turn"
+          ],
+          "type": "string"
         }
       ]
     },
-    "WorkspaceRef": {
-      "oneOf": [
-        {
-          "description": "Agent internal workspace `<agent_root>/workspace/<id>`.",
-          "properties": {
-            "id": {
-              "type": "string"
-            },
-            "kind": {
-              "enum": [
-                "agent"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "id",
-            "kind"
-          ],
-          "type": "object"
+    "WorkspaceAccess": {
+      "enum": [
+        "read_only",
+        "read_write"
+      ],
+      "type": "string"
+    },
+    "WorkspaceBinding": {
+      "properties": {
+        "access": {
+          "$ref": "#/definitions/WorkspaceAccess"
         },
-        {
-          "description": "Directory owned by a user / application.",
-          "properties": {
-            "kind": {
-              "enum": [
-                "external"
-              ],
-              "type": "string"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "path"
-          ],
-          "type": "object"
+        "location": {
+          "$ref": "#/definitions/WorkspaceLocation"
+        },
+        "location_revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtime_host": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
         }
-      ]
+      },
+      "required": [
+        "access",
+        "location",
+        "location_revision",
+        "revision",
+        "runtime_host",
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "WorkspaceLocation": {
+      "properties": {
+        "directory": {
+          "type": "string"
+        },
+        "runtime_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "directory",
+        "runtime_id"
+      ],
+      "type": "object"
+    },
+    "WorkspaceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WorkspaceAccess"
+            }
+          ],
+          "default": "read_write"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -1779,6 +2132,16 @@
       "anyOf": [
         {
           "$ref": "#/definitions/WorkspaceRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "workspace_binding": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WorkspaceBinding"
         },
         {
           "type": "null"

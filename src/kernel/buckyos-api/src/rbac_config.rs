@@ -86,6 +86,11 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 
  */
 pub const DEFAULT_RBAC_POLICY: &str = r#"
+p, agent_read_only, obj://config/users/{user}/settings,all,deny
+p, agent_read_only, obj://config/users/{user}/agents/{agent}/key,all,deny
+p, agent_read_only, obj://config/security/*,all,deny
+p, agent_read_write, obj://*, all,allow
+p, agent_read_only, obj://*, ^(read|list|query|subscribe)$,allow
 p, system:scheduler, obj://config/system/content_registry,all,allow
 p, kernel, obj://config/system/content_registry,write|create|delete,deny
 p, system, obj://config/system/content_registry,write|create|delete,deny
@@ -107,7 +112,6 @@ p, system, obj://*, all,allow
 
 p, frame, obj://config/boot/*, read,allow
 p, frame, obj://config/system/*,read,allow
-p, frame, obj://config/agents/{agent}/{key},read,allow
 p, frame, obj://config/services/{frame}/*,all,allow
 p, frame, obj://config/services/{service}/info,read,allow
 p, frame, obj://config/users*,read,allow
@@ -132,17 +136,15 @@ p, agent_runtime, obj://config/users/{user}/agents,read|list|query,allow
 p, agent_runtime, obj://config/users/{user}/agents/{agent}/spec,read,allow
 
 p, agent, obj://config/boot/*, read,allow
-p, agent, obj://config/agents/{agent}/*,read,allow
 p, agent, obj://config/users/{user}/agents/{agent}/settings,read|write,allow
 p, agent, obj://config/users/{user}/agents/{agent}/spec,read,allow
 p, agent, obj://config/users/{user}/agents/{agent}/info,read|write,allow
+p, agent, obj://config/users/{user}/agents/{agent}/profile,read|write,allow
 p, agent, obj://config/services/{service}/info,read,allow
 p, agent, obj://config/services/{agent}/instances/{node},write,allow
 
 p, admin,obj://config/boot/*, read,allow
 p, admin,obj://config/system/*,read,allow
-p, admin,obj://config/agents/{agent}/doc,read,allow
-p, admin,obj://config/agents/{agent}/settings,read|write,allow
 p, admin,obj://config/users/{admin}/*,read,allow
 p, admin,obj://config/users/{admin}/profile,read|write,allow
 p, admin,obj://config/users/{admin}/apps/{app}/{key},read|write,allow
@@ -156,7 +158,6 @@ p, admin,obj://config/services/*,read,allow
 p, admin,obj://task/{admin},read,allow
 
 p, users,obj://config/boot/*, read,allow
-p, users,obj://config/agents/{agent}/doc,read,allow
 # p, su_user,obj://config/users/{user}/*,all,allow
 p, users,obj://config/users/{users}/*,read,allow
 p, users,obj://config/users/{users}/profile,read|write,allow
@@ -181,6 +182,10 @@ p, admin,obj://msg-center/group_inbox/*,read,allow
 p, admin,obj://msg-center/request_box/*,read|write,allow
 p, admin,obj://msg-center/owners/*,read|write,allow
 p, admin,obj://msg-center/group,create,allow
+p, users,obj://msg-center/notify,read|write,allow
+p, admin,obj://msg-center/notify,read|write,allow
+p, app,obj://msg-center/notify,read|write,allow
+p, frame,obj://msg-center/notify,read|write,allow
 p, system:opendan,obj://msg-center/*,all,allow
 p, system:msg-center,obj://msg-center/*,all,allow
 p, agent_runtime,obj://msg-center/*,all,allow
@@ -205,6 +210,9 @@ g, system:slog-server, frame
 g, system:smb-service, frame
 g, system:nfs-server, frame
 g, system:aiworkspace, frame
+g, system:homestation, frame
+p, system:homestation, obj://msg-center/owners/*,read,allow
+p, system:homestation, obj://msg-center/contact_tags/homestation,write,allow
 
 "#;
 
@@ -266,6 +274,53 @@ pub async fn load_current_rbac_config(
     Ok(config)
 }
 
+struct RbacSyncState {
+    rounds: u64,
+    last_error: Option<String>,
+}
+
+static RBAC_SYNC: tokio::sync::Mutex<RbacSyncState> =
+    tokio::sync::Mutex::const_new(RbacSyncState {
+        rounds: 0,
+        last_error: None,
+    });
+static RBAC_SYNC_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Rounds run one at a time; with `join_finished_round` a caller that waited
+/// takes the finished round's outcome.
+pub(crate) async fn sync_rbac_enforcer<F, Fut>(load: F, join_finished_round: bool) -> Result<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<RbacConfig>>,
+{
+    use std::sync::atomic::Ordering;
+
+    let seen_rounds = RBAC_SYNC_ROUNDS.load(Ordering::Acquire);
+    let mut state = RBAC_SYNC.lock().await;
+    if join_finished_round && state.rounds != seen_rounds {
+        return match &state.last_error {
+            None => Ok(false),
+            Some(error) => Err(RPCErrors::ReasonError(error.clone())),
+        };
+    }
+
+    let outcome = match load().await {
+        Ok(config) => rbac::apply_enforcer_policy(&config.model, &config.policy)
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!("update rbac enforcer failed: {}", error))
+            }),
+        Err(error) => Err(error),
+    };
+    state.rounds += 1;
+    state.last_error = outcome.as_ref().err().map(|error| match error {
+        RPCErrors::ReasonError(reason) => reason.clone(),
+        other => other.to_string(),
+    });
+    RBAC_SYNC_ROUNDS.store(state.rounds, Ordering::Release);
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +333,30 @@ mod tests {
     // otherwise a parallel test can swap the policy out from under us.
     lazy_static! {
         static ref TEST_LOCK: Mutex<()> = Mutex::new(());
+    }
+
+    #[tokio::test]
+    async fn an_app_may_notify_its_user_but_not_read_the_mailbox() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, alice, users\ng, ood1, ood\ng, app:notes, app"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let notify = "obj://msg-center/notify";
+        assert!(rbac::enforce("alice", "app:notes", notify, "write", None).await);
+        assert!(rbac::enforce("alice", "app:notes", notify, "read", None).await);
+        assert!(rbac::enforce("alice", "system:control-panel", notify, "read", None).await);
+        assert!(rbac::enforce("ood1", "system:aiworkspace", notify, "write", None).await);
+        assert!(
+            !rbac::enforce(
+                "alice",
+                "app:notes",
+                "obj://msg-center/inbox/did:bns:alice",
+                "read",
+                None
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -411,6 +490,26 @@ p, app:session-ui,obj://msg-center/inbox/did:bns:alice/session-a,read|write,allo
     }
 
     #[tokio::test]
+    async fn homestation_reads_owner_contacts_only() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, ood1, ood"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let owner = crate::MailboxAddress::new(name_lib::DID::from_str("did:bns:alice").unwrap(), None)
+            .unwrap()
+            .owner_resource();
+        assert!(rbac::enforce("ood1", "system:homestation", &owner, "read", None).await);
+        assert!(!rbac::enforce("ood1", "system:homestation", &owner, "write", None).await);
+        assert!(!rbac::enforce("ood1", "system:aiworkspace", &owner, "read", None).await);
+        let own_tags = format!("{}homestation", crate::CONTACT_TAGS_RBAC_RESOURCE_PREFIX);
+        let other_tags = format!("{}aiworkspace", crate::CONTACT_TAGS_RBAC_RESOURCE_PREFIX);
+        assert!(rbac::enforce("ood1", "system:homestation", &own_tags, "write", None).await);
+        assert!(!rbac::enforce("ood1", "system:homestation", &other_tags, "write", None).await);
+        assert!(!rbac::enforce("ood1", "system:aiworkspace", &own_tags, "write", None).await);
+    }
+
+    #[tokio::test]
     async fn buckyos_info_is_read_only_for_admin_and_writable_by_scheduler() {
         let _guard = TEST_LOCK.lock().await;
         let config = build_current_rbac_config(Some("g, alice, admin\ng, ood1, ood"));
@@ -508,9 +607,7 @@ p, root, obj://config/*, read|write,allow
     //   的子路径, 超出了原本"单段 agent_id / app_id"的意图.
     //
     // 单段通配应该改用 `{xxx}` 占位符 (会被替换成 `[^/]+`), 例如:
-    //   obj://config/agents/{agent_id}/doc
-    //   obj://config/agents/{agent_id}/settings
-    //   obj://config/agents/{agent_id}/{key}
+    //   obj://config/users/{user}/apps/{app}/{key}
     //
     // 下面 `assert!(!...)` 断言的都是"修复后的正确语义", 因此 BUG 还在
     // 的时候每条断言都会 FAIL, 并把对应的 BUG 信息打印出来; 等 BUG
@@ -530,37 +627,7 @@ g, su_alice, su_admin
             .await
             .unwrap();
 
-        // ---- sanity: 单段 agent_id 下的访问应当通过 ----
-        assert!(
-            rbac::enforce(
-                "alice",
-                "system:buckycli",
-                "obj://config/agents/jarvis/doc",
-                "read",
-                None,
-            )
-            .await
-        );
-        assert!(
-            rbac::enforce(
-                "bob",
-                "system:buckycli",
-                "obj://config/agents/jarvis/doc",
-                "read",
-                None,
-            )
-            .await
-        );
-        assert!(
-            rbac::enforce(
-                "alice",
-                "system:buckycli",
-                "obj://config/agents/jarvis/settings",
-                "write",
-                None,
-            )
-            .await
-        );
+        // ---- sanity ----
         assert!(
             rbac::enforce(
                 "su_alice",
@@ -579,37 +646,6 @@ g, su_alice, su_admin
         // 每条 case: (userid, appid, res_path, action, bug 描述).
         // 期望: enforce 返回 false; 若返回 true 就说明该规则过度匹配.
         let over_match_cases: &[(&str, &str, &str, &str, &str)] = &[
-            (
-                "alice",
-                "system:buckycli",
-                "obj://config/agents/foo/bar/doc",
-                "read",
-                "BUG: admin 的 agents/*/doc 不应匹配多层路径 (foo/bar/doc)",
-            ),
-            (
-                "bob",
-                "system:buckycli",
-                "obj://config/agents/foo/bar/doc",
-                "read",
-                "BUG: users 的 agents/*/doc 不应匹配多层路径 (foo/bar/doc)",
-            ),
-            (
-                "alice",
-                "system:buckycli",
-                "obj://config/agents/foo/bar/settings",
-                "write",
-                "BUG: admin 的 agents/*/settings 不应匹配多层路径 (foo/bar/settings)",
-            ),
-            // frame 的 `obj://config/agents/*/*` 等效于 agents/.*/.*.
-            // user side 用 root (有全权), app side 用 repo-service
-            // (g, repo-service, frame), 把 BUG 隔离到 frame 这条规则.
-            (
-                "root",
-                "system:repo-service",
-                "obj://config/agents/a/b/c/d",
-                "read",
-                "BUG: frame 的 agents/*/* 不应匹配 4 层路径 (a/b/c/d)",
-            ),
             // admin 的 `obj://config/users/{admin}/apps/*/*` 同样会跨段:
             // 期望 apps 下面正好是 "{app_id}/{key}" 两段.
             (
@@ -908,6 +944,70 @@ g, did:bns:jarvis, agent
         );
     }
 
+    #[tokio::test]
+    async fn constructed_agent_app_only_reaches_its_own_agent_records() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let config = build_current_rbac_config(Some(
+            "g, bob, users\ng, app:xiaobai.example.com, app\ng, app:xiaobai.example.com, agent_runtime\ng, app:xiaobai.example.com, agent\ng, app:xiaohei.example.com, app\ng, app:xiaohei.example.com, agent_runtime\ng, app:xiaohei.example.com, agent",
+        ));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        let runtime = "app:xiaobai.example.com";
+        for (key, act) in [
+            ("settings", "read"),
+            ("settings", "write"),
+            ("profile", "read"),
+            ("profile", "write"),
+            ("info", "read"),
+            ("info", "write"),
+            ("spec", "read"),
+        ] {
+            assert!(
+                rbac::enforce(
+                    "bob",
+                    runtime,
+                    &format!("obj://config/users/bob/agents/xiaobai.example.com/{key}"),
+                    act,
+                    None,
+                )
+                .await,
+                "{key} {act}"
+            );
+        }
+        for (key, act) in [
+            ("settings", "read"),
+            ("settings", "write"),
+            ("profile", "read"),
+            ("profile", "write"),
+            ("info", "write"),
+        ] {
+            assert!(
+                !rbac::enforce(
+                    "bob",
+                    runtime,
+                    &format!("obj://config/users/bob/agents/xiaohei.example.com/{key}"),
+                    act,
+                    None,
+                )
+                .await,
+                "other agent {key} {act}"
+            );
+        }
+        assert!(
+            !rbac::enforce(
+                "bob",
+                runtime,
+                "obj://config/users/bob/agents/xiaobai.example.com/key",
+                "read",
+                None,
+            )
+            .await
+        );
+    }
+
     /// `obj://task/{user}` is the collection view TaskMgr consults to decide
     /// whether a principal may look past the creator's `app_id`. The bindings
     /// here mirror a real zone's policy tail (control-panel promoted to
@@ -1187,4 +1287,126 @@ g, app:gallery, app
         assert!(!rbac::enforce("ood1", "system:control-panel", registry, "write", None).await);
     }
 
+    #[tokio::test]
+    async fn rbac_sync_rebuilds_only_for_changed_policy() {
+        let _guard = TEST_LOCK.lock().await;
+        let base = build_current_rbac_config(Some("g, alice, users\ng, bob, users"));
+        rbac::create_enforcer(&base.model, &base.policy)
+            .await
+            .unwrap();
+        let builds = rbac::enforcer_build_count();
+        let bob_profile = "obj://config/users/bob/profile";
+
+        for _ in 0..20 {
+            let mut reread = base.clone();
+            reread.is_changed = true;
+            assert!(!sync_rbac_enforcer(|| async { Ok(reread) }, true)
+                .await
+                .unwrap());
+        }
+        assert_eq!(rbac::enforcer_build_count(), builds);
+        assert!(!rbac::enforce("alice", "system:control-panel", bob_profile, "read", None).await);
+
+        let granted = build_current_rbac_config(Some(&format!(
+            "{}\np, alice, {bob_profile}, read, allow",
+            base.policy_tail
+        )));
+        assert!(sync_rbac_enforcer(|| async { Ok(granted.clone()) }, true)
+            .await
+            .unwrap());
+        assert!(rbac::enforce("alice", "system:control-panel", bob_profile, "read", None).await);
+
+        assert!(sync_rbac_enforcer(|| async { Ok(base.clone()) }, true)
+            .await
+            .unwrap());
+        assert!(!rbac::enforce("alice", "system:control-panel", bob_profile, "read", None).await);
+
+        let deleted = build_current_rbac_config(None);
+        let alice_profile = "obj://config/users/alice/profile";
+        assert!(rbac::enforce("alice", "system:control-panel", alice_profile, "read", None).await);
+        assert!(sync_rbac_enforcer(|| async { Ok(deleted) }, true)
+            .await
+            .unwrap());
+        assert!(!rbac::enforce("alice", "system:control-panel", alice_profile, "read", None).await);
+        assert_eq!(rbac::enforcer_build_count(), builds + 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rbac_sync_never_installs_an_older_read_last() {
+        let _guard = TEST_LOCK.lock().await;
+        let old = build_current_rbac_config(Some("g, alice, users"));
+        let new = build_current_rbac_config(Some("g, alice, admin"));
+        rbac::create_enforcer(&old.model, &old.policy)
+            .await
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let slow_policy = old.clone();
+        let slow = tokio::spawn(sync_rbac_enforcer(
+            move || async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(slow_policy)
+            },
+            false,
+        ));
+        started_rx.await.unwrap();
+
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let forced_reads = reads.clone();
+        let forced = tokio::spawn(sync_rbac_enforcer(
+            move || async move {
+                forced_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(new)
+            },
+            false,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        release_tx.send(()).unwrap();
+        assert!(!slow.await.unwrap().unwrap());
+        assert!(forced.await.unwrap().unwrap());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            rbac::enforce("alice", "system:control-panel", "obj://config/system/x", "read", None)
+                .await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rbac_sync_callers_that_waited_share_the_finished_round() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, alice, users"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let failing = tokio::spawn(sync_rbac_enforcer(
+            move || async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Err::<RbacConfig, _>(RPCErrors::ReasonError("system-config timeout".into()))
+            },
+            true,
+        ));
+        started_rx.await.unwrap();
+        let waiter = tokio::spawn(sync_rbac_enforcer(
+            || async { panic!("a waiting caller reuses the finished round") },
+            true,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release_tx.send(()).unwrap();
+
+        let failed = failing.await.unwrap().unwrap_err().to_string();
+        assert!(failed.contains("system-config timeout"));
+        assert_eq!(waiter.await.unwrap().unwrap_err().to_string(), failed);
+
+        assert!(!sync_rbac_enforcer(|| async { Ok(config) }, true)
+            .await
+            .unwrap());
+    }
 }

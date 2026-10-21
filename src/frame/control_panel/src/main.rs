@@ -1,3 +1,4 @@
+mod agent_mgr;
 mod app_install_deployer;
 mod app_install_driver;
 mod app_install_engine;
@@ -9,8 +10,13 @@ mod app_mutation;
 mod app_package_namespace;
 mod app_servcie_mgr;
 mod app_staging;
+mod cluster_mgr;
 mod dashboard;
+mod desktop_folder;
+mod desktop_wallpaper;
 mod diagnostic_mgr;
+mod download_mgr;
+mod image_data_url;
 mod ndn_download;
 mod pikg;
 mod pre_install_reconciler;
@@ -105,6 +111,139 @@ struct RpcAuthPrincipal {
     owner_did: String,
     is_user_session: bool,
     is_control_panel_session: bool,
+    agent_permission_mode: Option<buckyos_api::AgentPermissionMode>,
+}
+
+impl RpcAuthPrincipal {
+    fn require_agent_permission(&self, method: &str) -> Result<(), RPCErrors> {
+        if self.agent_permission_mode == Some(buckyos_api::AgentPermissionMode::ReadOnly)
+            && !matches!(
+                method,
+                "ui.locale.get"
+                    | "ui.dashboard"
+                    | "user.list"
+                    | "user.get"
+                    | "user.profile.get"
+                    | "user.invite.get"
+                    | "agent.check_name"
+                    | "agent.list_templates"
+                    | "agent.create.status"
+                    | "agent.list"
+                    | "agent.get"
+                    | "agent.profile.get"
+                    | "system.overview"
+                    | "system.buckyos_info.get"
+                    | "system.dev_mode.get"
+                    | "system.status"
+                    | "system.metrics"
+                    | "network.overview"
+                    | "system.logs.list"
+                    | "system.logs.query"
+                    | "system.logs.tail"
+                    | "system.logs.download"
+                    | "diagnostic.export"
+                    | "system.update.check"
+                    | "apps.list"
+                    | "apps.details"
+                    | "apps.status"
+                    | "apps.availability.get"
+                    | "apps.availability.check"
+                    | "apps.staging.status"
+                    | "apps.install.status"
+                    | "apps.upgrade.check"
+                    | "zone.overview"
+                    | "zone.devices.list"
+                    | "zone.certificates.list"
+                    | "zone.presentation.get"
+                    | "gateway.overview"
+                    | "gateway.file.get"
+                    | "container.overview"
+                    | "desktop.session.list"
+                    | "desktop.state.get"
+                    | "desktop.wallpaper.get"
+            )
+        {
+            return Err(RPCErrors::NoPermission(format!(
+                "read-only Agent cannot call {method}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod agent_permission_tests {
+    use super::*;
+    use buckyos_api::AgentPermissionMode::{ReadOnly, ReadWrite};
+
+    fn principal(mode: Option<buckyos_api::AgentPermissionMode>) -> RpcAuthPrincipal {
+        RpcAuthPrincipal {
+            username: "alice".to_string(),
+            owner_user_id: "alice".to_string(),
+            authenticated_app_id: "helper.example.com@alice".to_string(),
+            user_type: UserType::Admin,
+            owner_did: "did:web:alice.example.com".to_string(),
+            is_user_session: false,
+            is_control_panel_session: false,
+            agent_permission_mode: mode,
+        }
+    }
+
+    #[test]
+    fn agent_permission_blocks_admin_rpc_and_desktop_writes() {
+        let read_only = principal(Some(ReadOnly));
+        for method in [
+            "agent.profile.set",
+            "agent.update",
+            "user.profile.set",
+            "user.create",
+            "apps.start",
+            "apps.submit",
+            "apps.uninstall",
+            "container.action",
+            "download.create",
+            "diagnostic.collect",
+            "ui.locale.set",
+            "desktop.session.create",
+            "desktop.session.rename",
+            "desktop.session.delete",
+            "desktop.state.set",
+            "desktop.state.delete",
+            "desktop.wallpaper.write",
+            "future.read",
+        ] {
+            assert!(
+                matches!(
+                    read_only.require_agent_permission(method),
+                    Err(RPCErrors::NoPermission(_))
+                ),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_permission_keeps_reads_and_unrestricted_principals() {
+        let read_only = principal(Some(ReadOnly));
+        for method in [
+            "agent.get",
+            "agent.create.status",
+            "apps.list",
+            "apps.status",
+            "system.logs.query",
+            "gateway.file.get",
+            "desktop.session.list",
+            "desktop.state.get",
+            "desktop.wallpaper.get",
+        ] {
+            assert!(read_only.require_agent_permission(method).is_ok(), "{method}");
+        }
+        for mode in [None, Some(ReadWrite)] {
+            let caller = principal(mode);
+            assert!(caller.require_agent_permission("apps.submit").is_ok());
+            assert!(caller.require_agent_permission("desktop.state.set").is_ok());
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -209,6 +348,7 @@ struct ControlPanelServer {
     log_downloads: Arc<Mutex<HashMap<String, LogDownloadEntry>>>,
     diagnostic_bundles: Arc<Mutex<HashMap<String, DiagnosticBundleEntry>>>,
     running_diagnostic_tasks: Arc<Mutex<HashSet<String>>>,
+    running_download_tasks: Arc<Mutex<HashSet<String>>>,
     metrics_snapshot: Arc<RwLock<SystemMetricsSnapshot>>,
     pending_sso_logins: Arc<Mutex<HashMap<u64, sys_auth_backend::PendingSsoLogin>>>,
     docker_overview_cache: Arc<Mutex<Option<DockerOverviewCacheEntry>>>,
@@ -220,6 +360,7 @@ struct ControlPanelServer {
     staging_store: Arc<app_staging::PikgStagingStore>,
     ndm_gateway: Option<Arc<NamedDataMgrZoneGateway>>,
     ndm_node_gateway: Option<Arc<NamedDataMgrNodeGateway>>,
+    agent_drives: Arc<std::sync::Mutex<HashMap<String, bool>>>,
 }
 
 impl ControlPanelServer {
@@ -244,6 +385,7 @@ impl ControlPanelServer {
             log_downloads: Arc::new(Mutex::new(HashMap::new())),
             diagnostic_bundles: Arc::new(Mutex::new(HashMap::new())),
             running_diagnostic_tasks: Arc::new(Mutex::new(HashSet::new())),
+            running_download_tasks: Arc::new(Mutex::new(HashSet::new())),
             metrics_snapshot,
             pending_sso_logins: Arc::new(Mutex::new(HashMap::new())),
             docker_overview_cache: Arc::new(Mutex::new(None)),
@@ -255,7 +397,20 @@ impl ControlPanelServer {
             staging_store,
             ndm_gateway: None,
             ndm_node_gateway: None,
+            agent_drives: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The storage behind the mounted disks, each counted once: container layers and repeated
+    /// mounts of one file system would otherwise multiply the capacity (name-lib `disk_space`).
+    pub(crate) fn distinct_disks(disks: &Disks) -> Vec<name_lib::DiskSpaceSample> {
+        name_lib::distinct_disk_samples(disks.list().iter().map(|disk| name_lib::DiskSpaceSample {
+            device: disk.name().to_string_lossy().into_owned(),
+            file_system: disk.file_system().to_string_lossy().into_owned(),
+            mount_point: disk.mount_point().to_string_lossy().into_owned(),
+            total: disk.total_space(),
+            available: disk.available_space(),
+        }))
     }
 
     fn sum_disks(disks: &Disks) -> (u64, u64, Vec<Value>) {
@@ -263,10 +418,9 @@ impl ControlPanelServer {
         let mut used_bytes: u64 = 0;
         let mut details: Vec<Value> = Vec::new();
 
-        for disk in disks.list().iter() {
-            let total = disk.total_space();
-            let available = disk.available_space();
-            let used = total.saturating_sub(available);
+        for disk in Self::distinct_disks(disks) {
+            let total = disk.total;
+            let used = disk.used();
             total_bytes = total_bytes.saturating_add(total);
             used_bytes = used_bytes.saturating_add(used);
             let usage_percent = if total > 0 {
@@ -276,12 +430,12 @@ impl ControlPanelServer {
             };
 
             details.push(json!({
-                "label": disk.name().to_string_lossy(),
+                "label": disk.device,
                 "totalGb": bytes_to_gb(total),
                 "usedGb": bytes_to_gb(used),
                 "usagePercent": usage_percent,
-                "fs": disk.file_system().to_string_lossy(),
-                "mount": disk.mount_point().to_string_lossy(),
+                "fs": disk.file_system,
+                "mount": disk.mount_point,
             }));
         }
 
@@ -451,6 +605,22 @@ impl ControlPanelServer {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// A text field patch: `None` keeps the stored value, `Some(None)` clears it (JSON null or a
+    /// blank string), `Some(Some(text))` sets the trimmed text.
+    fn param_text_patch(req: &RPCRequest, key: &str) -> Result<Option<Option<String>>, RPCErrors> {
+        match req.params.get(key) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(Value::String(value)) => {
+                let value = value.trim();
+                Ok(Some((!value.is_empty()).then(|| value.to_string())))
+            }
+            Some(_) => Err(RPCErrors::ParseRequestError(format!(
+                "{key} must be a string or null"
+            ))),
         }
     }
 
@@ -825,6 +995,7 @@ impl RPCHandler for ControlPanelServer {
 
         let principal = self.authenticate_rpc_request(&req).await?;
         if let Some(principal) = principal.as_ref() {
+            principal.require_agent_permission(&req.method)?;
             log::debug!(
                 "control-panel rpc auth: method={}, user={}, type={:?}",
                 req.method,
@@ -877,9 +1048,26 @@ impl RPCHandler for ControlPanelServer {
             "user.change_state" => self.handle_user_change_state(req, principal.as_ref()).await,
             "user.change_type" => self.handle_user_change_type(req, principal.as_ref()).await,
 
+            "agent.check_name" => self.handle_agent_check_name(req, principal.as_ref()).await,
+            "agent.list_templates" => {
+                self.handle_agent_list_templates(req, principal.as_ref())
+                    .await
+            }
+            "agent.create" => self.handle_agent_create(req, principal.as_ref()).await,
+            "agent.create.status" => {
+                self.handle_agent_create_status(req, principal.as_ref())
+                    .await
+            }
+            "agent.create.retry" => {
+                self.handle_agent_create_retry(req, principal.as_ref())
+                    .await
+            }
+            "agent.create.cancel" => {
+                self.handle_agent_create_cancel(req, principal.as_ref())
+                    .await
+            }
             "agent.list" => self.handle_agent_list(req, principal.as_ref()).await,
             "agent.get" => self.handle_agent_get(req, principal.as_ref()).await,
-            "agent.create" => self.handle_agent_create(req, principal.as_ref()).await,
             "agent.update" => self.handle_agent_update(req, principal.as_ref()).await,
             "agent.delete" => self.handle_agent_delete(req, principal.as_ref()).await,
             "agent.profile.get" => self.handle_agent_profile_get(req, principal.as_ref()).await,
@@ -925,6 +1113,7 @@ impl RPCHandler for ControlPanelServer {
                     .await
             }
             "diagnostic.export" => self.handle_diagnostic_export(req, principal.as_ref()).await,
+            "download.create" => self.handle_download_create(req, principal.as_ref()).await,
             "system.update.check" => self.handle_unimplemented(req, "Check updates").await,
             "system.update.apply" => self.handle_unimplemented(req, "Apply update").await,
 
@@ -996,6 +1185,13 @@ impl RPCHandler for ControlPanelServer {
 
             //ZoneMgr
             "zone.overview" => self.handle_zone_overview(req).await,
+            "zone.devices.list" => self.handle_zone_devices_list(req).await,
+            "zone.certificates.list" => self.handle_zone_certificates_list(req).await,
+            "zone.presentation.get" => self.handle_zone_presentation_get(req).await,
+            "zone.presentation.set" => {
+                self.handle_zone_presentation_set(req, principal.as_ref())
+                    .await
+            }
             "gateway.overview" => self.handle_gateway_overview(req).await,
             "gateway.file.get" => self.handle_gateway_file_get(req).await,
             "container.overview" => self.handle_container_overview(req).await,
@@ -1100,11 +1296,14 @@ pub async fn start_control_panel_service() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("register control-panel runtime failed: {}", err))?;
 
     let mut control_panel_server = ControlPanelServer::new();
+    // Agent 运行时 App 的本地 AppDoc 授权只在内存中，恢复安装任务前先重新注册。
+    agent_mgr::register_agent_runtime_authorities().await;
     // 启动安装任务恢复循环；正常路径由业务 RPC 直接执行，TaskManager
     // 启动扫描/低频 sweep 恢复重启前或异常遗漏的非终态安装事务。
     control_panel_server.install_runner.start();
     control_panel_server.app_installer.start_lifecycle_runner();
     control_panel_server.start_update_batch_runner();
+    control_panel_server.start_download_recovery();
 
     // 初始化 NDM Zone Gateway（best-effort，named store 不可用时跳过）
     let runtime = get_buckyos_api_runtime()
@@ -1183,6 +1382,7 @@ pub async fn start_control_panel_service() -> anyhow::Result<()> {
 
     let _ = runner.start();
     pre_install_reconciler::PreInstallReconciler::new(control_panel_server.clone()).start();
+    control_panel_server.start_agent_driver();
     info!(
         "control-panel service started at port {}",
         CONTROL_PANEL_SERVICE_PORT

@@ -1,7 +1,7 @@
 import type { z } from 'zod'
 import type { ComposerAttachmentInput } from '../conversation/input/attachmentDraft'
 import type { ConversationMessageReader } from '../conversation/history/types'
-import type { MessageObject, MsgMentions, MsgRelation } from '../protocol/msgobj'
+import type { MachineContent, MessageObject, MsgMentions, MsgRelation, VoiceNote } from '../protocol/msgobj'
 import type { createSessionSchema } from '../sessionModel'
 import type { createGroupSchema } from '../groupModel'
 import type { CreationPolicy, Entity, EntityDetail, GroupInfo, GroupInvitation, GroupInvitationView, GroupSessionInfo, GroupSessionParticipants, MessageHubContext, ReadReceipt, RuntimeState, Session, SessionAccess, SessionBinding, SessionPreferences } from '../types'
@@ -10,13 +10,25 @@ import type { CreationPolicy, Entity, EntityDetail, GroupInfo, GroupInvitation, 
  * What the composer hands to the store: text plus the raw browser files, and
  * for a relation message (edit / redact / reaction / reply) the MsgObject v2
  * `relates_to` and structured `mentions`, which travel in the message itself.
+ * `machine` becomes `content.machine` (an answer that picked an option).
+ * `voice` marks the only attachment as a voice note (`MsgObject.voice`).
  */
 export interface OutgoingPayload {
   content: string
   attachments: ComposerAttachmentInput[]
   relatesTo?: MsgRelation
   mentions?: MsgMentions
+  machine?: MachineContent
+  voice?: VoiceNote
+  localId?: string
+  submittedAt?: number
 }
+
+/** `ui_upload` of a pending outgoing bubble: waiting behind an earlier send, preparing the files, or uploading them. */
+export type OutgoingUpload =
+  | { phase: 'queued' }
+  | { phase: 'preparing' }
+  | { phase: 'uploading'; loaded: number; total: number }
 
 export interface ConnectionChoice {
   id: string
@@ -32,12 +44,8 @@ export type OwnerStatus =
 
 export type ManageAction = 'archive' | 'restore' | 'delete'
 
-/** Contact admission actions available for an entity in the current context. */
-export interface EntityAdmission {
-  accessLevel?: 'block' | 'stranger' | 'temporary' | 'friend'
-  temporaryExpiresAt?: number
-  canChange: boolean
-}
+/** Whether the background refresh of the owner's session list reaches msg-center: `connecting` after a failed refresh until one succeeds. */
+export type SyncStatus = 'online' | 'connecting'
 
 /**
  * Data layer consumed by every MessageHub component. Two implementations:
@@ -59,17 +67,23 @@ export interface MessageHubStore {
   defaultContext(): MessageHubContext
   canView(context: MessageHubContext): boolean
   ownerStatus(context: MessageHubContext): OwnerStatus
+  syncStatus(context: MessageHubContext): SyncStatus
   /** Ensure the owner's data is loaded (idempotent); `refresh` forces a reload. */
   ensureOwner(context: MessageHubContext, refresh?: boolean): Promise<void>
   /** Start / stop background synchronisation for a context (events + polling). */
   startSync(context: MessageHubContext, activeSessionId: string | null): () => void
   findEntity(context: MessageHubContext, id: string): Entity | undefined
+  /** The identity's own picture as the owner's contacts know it (the owner's own one included). */
+  avatarOf(context: MessageHubContext, did: string): string | undefined
   entities(context: MessageHubContext): Entity[]
   hasMoreEntities(context: MessageHubContext): boolean
   loadMoreEntities(context: MessageHubContext): Promise<void>
   entityDetail(context: MessageHubContext, id: string): EntityDetail | null
-  admission(context: MessageHubContext, entityId: string): EntityAdmission | null
-  setAdmission(context: MessageHubContext, entityId: string, action: 'accept' | 'block'): Promise<void>
+  /**
+   * Lists a DID the owner has no conversation with yet (a person found by search, a link from another
+   * app) as a person or Agent entity, so a conversation with it can open; it stays once a session exists.
+   */
+  addPeer(context: MessageHubContext, did: string, info?: { name?: string; type?: 'person' | 'agent' }): void
   sessions(context: MessageHubContext, entityId?: string, lifecycle?: Session['lifecycle']): Session[]
   defaultSession(context: MessageHubContext, entityId: string): Session | null
   ensureDefaultSession(context: MessageHubContext, entityId: string): Promise<Session | null>
@@ -95,9 +109,17 @@ export interface MessageHubStore {
   create(context: MessageHubContext, input: z.infer<typeof createSessionSchema>): Promise<Session>
   manage(context: MessageHubContext, sessionId: string, action: ManageAction): Promise<void>
   preferences(context: MessageHubContext, sessionId: string): SessionPreferences
+  /** Loads the owner's preferences (title, pinned, muted) of these sessions once; `preferences` reads them. */
+  loadPreferences(context: MessageHubContext, sessionIds: string[]): Promise<void>
   updatePreferences(context: MessageHubContext, sessionId: string, patch: Partial<SessionPreferences>): Promise<void>
   updateState(context: MessageHubContext, sessionId: string, scope: 'shared' | 'member', input: unknown): Promise<void>
+  /**
+   * The bubble of a payload with a `localId` shows at once, at `submittedAt`,
+   * and stays while its attachments upload.
+   */
   send(context: MessageHubContext, sessionId: string, payload: OutgoingPayload, confirmation: string | undefined): Promise<void>
+  /** Pending bubbles for the composer's submitted payloads that have not been sent yet; replaces the previous set. */
+  stageOutgoing(context: MessageHubContext, sessionId: string, queued: OutgoingPayload[]): void
   /** Post a failed outgoing message again as a new message (same text and attachment refs). */
   resend(context: MessageHubContext, sessionId: string, message: MessageObject, confirmation: string | undefined): Promise<void>
   /** Post a copy of `message` (displayed text and attachment refs) to another session of the owner. */
@@ -130,7 +152,7 @@ export interface MessageHubStore {
   transferGroupOwner(context: MessageHubContext, groupDid: string, memberDid: string): Promise<void>
   cancelGroupOwnerTransfer(context: MessageHubContext, groupDid: string): Promise<void>
   acceptGroupOwnerTransfer(context: MessageHubContext, groupDid: string, transferId: string): Promise<void>
-  /** Resolves to the link text (`formatInviteLink`). */
+  /** Resolves to the link's token; `formatInviteLink` makes the text to share. */
   createGroupInviteLink(context: MessageHubContext, groupDid: string, options: { expiresAt?: number; maxUses?: number; requireApproval?: boolean }): Promise<string>
   revokeGroupInviteLink(context: MessageHubContext, groupDid: string, token: string): Promise<void>
   /** `group.request_join`; resolves to the resulting member state (`active` or `pending_admin_approval`). */

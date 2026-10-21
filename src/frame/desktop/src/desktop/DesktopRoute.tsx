@@ -1,6 +1,7 @@
 import {
   Alert,
   Button,
+  Divider,
   Menu,
   MenuItem,
   useMediaQuery,
@@ -8,6 +9,9 @@ import {
 import { isTransferableRef } from 'buckyos/content'
 import { openContent } from '../app/content/open'
 import { openPreview } from '../app/preview/launch'
+import { agentGuide } from '../app/agent-setup/guide'
+import { agentSetupLaunchSchema, openAgentSetup } from '../app/agent-setup/launch'
+import { AGENT_GUIDE_APP_ID } from '../app/agent-setup/model'
 import clsx from 'clsx'
 import {
   memo,
@@ -27,7 +31,7 @@ import GridLayoutBase, {
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Pagination } from 'swiper/modules'
 import { Swiper, SwiperSlide } from 'swiper/react'
-import { globalSettingsStore } from '../app/settings/mock/store'
+import { globalSettingsStore } from '../app/settings/data/store'
 import { findDesktopAppById } from '../app/registry'
 import type { DesktopAppItem } from '../app/types'
 import {
@@ -42,9 +46,15 @@ import {
   resetDesktopViewportProgress,
   setDesktopViewportProgress,
 } from './viewportProgress'
+import { DesktopTaskbar } from './DesktopTaskbar'
+import { MobileTaskbar } from './MobileTaskbar'
 import { StatusBar } from './StatusBar'
-import { SystemSidebar } from './SystemSidebar'
+import { useCurrentUser } from './taskbarHooks'
 import { DesktopWidgetRenderer } from './widgets/WidgetRenderer'
+import { openDesktopFile, showFolderInFiles } from './desktopFolderActions'
+import { watchDfsPath } from '../app/filebrowser/data/nfsp/invalidation'
+import { classifyFileKind } from '../app/filebrowser/data/fileKinds'
+import { kindIcon } from '../app/filebrowser/fileDisplay'
 import { DesktopWindowLayer } from './windows/DesktopWindowLayer'
 import {
   getDesktopWindowWorkspaceBounds,
@@ -52,14 +62,22 @@ import {
 import { MobileNavProvider } from './windows/MobileNavContext'
 import { MobileWindowSheet } from './windows/MobileWindowSheet'
 import {
+  desktopAvatarRowHeight,
+  desktopWorkspaceInsets,
+  mobileStatusBarHeight,
   mobileStatusBarMode,
-  shellStatusBarHeight,
   type ConnectionState,
-  type StatusTip,
 } from './shell'
+import { useTray } from './tray/trayModel'
+import { useHasWallpaperPicture, useWallpaperSnapshot } from './wallpaper/store'
+import { AccountAppearanceSync } from './appearance/AccountAppearanceSync'
 import { useI18n } from '../i18n/provider'
+import { loadingTipKeys } from '../i18n/loading-tips'
+import { useAppText } from '../presentation/appText'
 import type {
   AppDefinition,
+  DesktopWallpaper,
+  FileIconItem,
   FormFactor,
   LayoutItem,
   LayoutState,
@@ -204,6 +222,9 @@ function nextSupportedLocale(locale: SupportedLocale) {
 // Dead-zone insets only apply on mobile; desktop windows and grid use the full viewport.
 const zeroDeadZone = { top: 0, bottom: 0, left: 0, right: 0 }
 
+// Launcher offset below the mobile home status bar.
+const mobileLauncherTopInset = 42
+
 // Overlap-tolerant compactor: react-grid-layout must NOT displace other
 // items while dragging (its null-compactType collision pass shoves items
 // downward, even past maxRows). The store resolves all displacement on
@@ -219,8 +240,8 @@ type WindowGeometryPatch = Partial<Pick<WindowRecord, 'x' | 'y' | 'width' | 'hei
 export function DesktopRoute() {
   const store = useDesktopUIStore()
   const snap = useDesktopUISnapshot()
-  const { resetBackground, setBackground } = useDesktopBackground()
   const { locale, setLocale, t } = useI18n()
+  const appText = useAppText()
   const { themeMode, setThemeMode } = useThemeMode()
   const isMobile = useMediaQuery('(max-width:768px)')
   const navigate = useNavigate()
@@ -230,6 +251,7 @@ export function DesktopRoute() {
     (searchParams.get('scenario') as MockScenario | null) ?? 'normal'
   const [scenario] = useState<MockScenario>(initialScenario)
   const [isLoggingOut, setIsLoggingOut] = useState(false)
+  const currentUser = useCurrentUser()
   const launchHandled = useRef(false)
   useEffect(() => {
     const value = searchParams.get('open')
@@ -240,6 +262,27 @@ export function DesktopRoute() {
     if (searchParams.get('intent') === 'preview') openPreview({ source })
     else void openContent({ source })
   }, [snap.status, searchParams])
+
+  // The Agent setup wizard comes back here after a sign-in (`?agent_setup=<source>[&agent_id=]`).
+  const agentSetupHandled = useRef(false)
+  useEffect(() => {
+    if (snap.status !== 'success' || agentSetupHandled.current || !searchParams.has('agent_setup')) return
+    agentSetupHandled.current = true
+    const launch = agentSetupLaunchSchema.safeParse({
+      source: searchParams.get('agent_setup'),
+      ...(searchParams.get('agent_id') ? { agent_id: searchParams.get('agent_id') } : {}),
+    })
+    const params = new URLSearchParams(searchParams)
+    params.delete('agent_setup')
+    params.delete('agent_id')
+    setSearchParams(params, { replace: true })
+    if (launch.success) openAgentSetup(launch.data)
+  }, [snap.status, searchParams, setSearchParams])
+
+  // The Jarvis guide follows the signed-in user's own Agent created from it.
+  useEffect(() => {
+    if (snap.status === 'success') agentGuide.start()
+  }, [snap.status])
 
 
   // Refs for drag suppression (view-only concern)
@@ -259,7 +302,7 @@ export function DesktopRoute() {
     globalSettingsStore.subscribe,
     globalSettingsStore.getSnapshot,
   )
-  const density = (settingsSnap.session.appearance.fontSize ?? 'medium') as GridDensity
+  const density = settingsSnap.desktopIconSize
   const gridSpec = useGridSpec(gridContainer, density, isMobile)
 
   // Sync grid spec into store
@@ -271,6 +314,29 @@ export function DesktopRoute() {
   useEffect(() => {
     void store.init(formFactor, scenario)
   }, [store, formFactor, scenario])
+
+  // The Desktop folder can change elsewhere (Files, another device): look again when the page comes back
+  // into view, now and then while it is shown, and right after Files changes it in this page.
+  const storeStatus = snap.status
+  useEffect(() => {
+    if (storeStatus !== 'success') return
+    const refresh = () => {
+      if (document.visibilityState === 'visible') void store.refreshDesktopFolder()
+    }
+    const folderPath = store.getDesktopFolderPath()
+    const stopWatching = folderPath
+      ? watchDfsPath(folderPath, () => void store.refreshDesktopFolder({ force: true }))
+      : undefined
+    const timer = window.setInterval(refresh, 30_000)
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    return () => {
+      stopWatching?.()
+      window.clearInterval(timer)
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+    }
+  }, [store, storeStatus])
 
   // Sync scenario to URL
   useEffect(() => {
@@ -331,10 +397,10 @@ export function DesktopRoute() {
   const { appearance } = snap.syncData
   const { runtimeContainer, windowAppearance } = appearance
   const {
-    windows,
     activityLog,
     snackbar,
     isSystemSidebarOpen,
+    isTaskbarPinned,
     selectedItemId,
     contextMenu,
   } = snap.runtime
@@ -345,23 +411,27 @@ export function DesktopRoute() {
 
   const resolvedDeadZone = isMobile ? store.getResolvedDeadZone() : zeroDeadZone
   const safeArea = useSafeAreaInsets()
-  const desktopWorkspaceTopInset =
-    safeArea.top + shellStatusBarHeight('desktop')
+  // Desktop: windows get the whole viewport unless the taskbar is pinned.
+  const desktopInsets = desktopWorkspaceInsets(!isMobile && isTaskbarPinned)
+  const desktopWorkspaceTopInset = safeArea.top + desktopInsets.top
+  const desktopWorkspaceLeftInset = desktopInsets.left
   const desktopViewportBounds = useMemo(
     () =>
       getDesktopWindowWorkspaceBounds({
         safeArea,
         topInset: desktopWorkspaceTopInset,
+        leftInset: desktopWorkspaceLeftInset,
         viewportSize,
       }),
-    [safeArea, desktopWorkspaceTopInset, viewportSize],
+    [safeArea, desktopWorkspaceTopInset, desktopWorkspaceLeftInset, viewportSize],
   )
   const workspaceInnerWidth = Math.max(
     workspaceSize.width -
       resolvedDeadZone.left -
       resolvedDeadZone.right -
       safeArea.left -
-      safeArea.right,
+      safeArea.right -
+      desktopWorkspaceLeftInset,
     320,
   )
 
@@ -385,6 +455,12 @@ export function DesktopRoute() {
       const app = findDesktopAppById(store.getSnapshot().apps, appId)
       if (!app) return
 
+      if (appId === AGENT_GUIDE_APP_ID) {
+        void agentGuide.open()
+        logActivity(t('activity.opened', 'Opened {{name}}', { name: appText(app).title }))
+        return
+      }
+
       if (isMobile && app.manifest.mobileRedirectPath) {
         navigate(app.manifest.mobileRedirectPath)
         return
@@ -393,7 +469,7 @@ export function DesktopRoute() {
       if (app.manifest.placement === 'new-container' || app.tier === 'external') {
         logActivity(
           t('activity.external', 'Requested new-container launch for {{name}}', {
-            name: t(app.labelKey),
+            name: appText(app).title,
           }),
         )
         store.setSnackbar(t('external.body'))
@@ -408,10 +484,10 @@ export function DesktopRoute() {
         viewportBounds: desktopViewportBounds,
       })
       logActivity(
-        t('activity.opened', 'Opened {{name}}', { name: t(app.labelKey) }),
+        t('activity.opened', 'Opened {{name}}', { name: appText(app).title }),
       )
     },
-    [store, isMobile, navigate, logActivity, t, desktopViewportBounds],
+    [store, isMobile, navigate, logActivity, t, appText, desktopViewportBounds],
   )
 
   const describeWindow = useCallback(
@@ -420,9 +496,9 @@ export function DesktopRoute() {
       const target = current.runtime.windows.find((w) => w.id === windowId)
       if (!target) return null
       const app = findDesktopAppById(current.apps, target.appId)
-      return t(app?.labelKey ?? target.titleKey)
+      return app ? appText(app).title : t(target.titleKey)
     },
-    [store, t],
+    [store, t, appText],
   )
 
   const handleCloseWindow = useCallback(
@@ -479,10 +555,13 @@ export function DesktopRoute() {
   )
 
   const restoreDefaults = useCallback(() => store.restoreDefaults(), [store])
-  const handleReturnDesktop = useCallback(() => store.returnToDesktop(), [store])
 
   const toggleSidebar = useCallback(() => store.toggleSystemSidebar(), [store])
   const closeSidebar = useCallback(() => store.closeSystemSidebar(), [store])
+  const toggleTaskbarPinned = useCallback(
+    () => store.setTaskbarPinned(!store.getSnapshot().runtime.isTaskbarPinned, viewportSize),
+    [store, viewportSize],
+  )
   const handleSelectSidebarApp = useCallback(
     (appId: string) => {
       handleOpenApp(appId)
@@ -490,6 +569,33 @@ export function DesktopRoute() {
     },
     [handleOpenApp, closeSidebar],
   )
+  const handleActivateTaskbarApp = useCallback(
+    (appId: string) => {
+      if (!store.activateTaskbarApp(appId)) handleOpenApp(appId)
+      closeSidebar()
+    },
+    [store, handleOpenApp, closeSidebar],
+  )
+  const handleCloseAppWindows = useCallback(
+    (appId: string) => {
+      for (const w of store.getSnapshot().runtime.windows) {
+        if (w.appId === appId) handleCloseWindow(w.id)
+      }
+    },
+    [store, handleCloseWindow],
+  )
+  const handleSetTaskbarAppPinned = useCallback(
+    (appId: string, pinned: boolean) => store.setTaskbarAppPinned(appId, pinned),
+    [store],
+  )
+  const handleMoveTaskbarApp = useCallback(
+    (appId: string, index: number) => store.moveTaskbarApp(appId, index),
+    [store],
+  )
+  const handleShowDesktop = useCallback(() => {
+    store.toggleShowDesktop()
+    closeSidebar()
+  }, [store, closeSidebar])
   const handleOpenDiagnostics = useCallback(
     () => handleSelectSidebarApp('diagnostics'),
     [handleSelectSidebarApp],
@@ -603,6 +709,10 @@ export function DesktopRoute() {
         if (!consumeOpenBlock(item.id)) handleOpenApp(item.appId)
         return
       }
+      if (item.type === 'file') {
+        if (!consumeOpenBlock(item.id)) openDesktopFile(item)
+        return
+      }
       store.setSelectedItemId(item.id)
     },
     // consumeOpenBlock only touches refs.
@@ -642,15 +752,16 @@ export function DesktopRoute() {
   const topMobileWindow = windowLayerModel.topWindow
   const activeMobileApp =
     formFactor === 'mobile' && topMobileWindow ? topMobileWindow.app : undefined
-  const shellBarHeight = shellStatusBarHeight(formFactor, activeMobileApp)
+  const mobileStatusBarRowHeight = mobileStatusBarHeight(activeMobileApp)
   const mobileSheetTopInset =
     activeMobileApp && mobileStatusBarMode(activeMobileApp) === 'standard'
-      ? safeArea.top + resolvedDeadZone.top + shellBarHeight
+      ? safeArea.top + resolvedDeadZone.top + mobileStatusBarRowHeight
       : 0
+  // On desktop the launcher grid starts below the floating avatar.
   const workspaceTopPadding =
-    formFactor === 'mobile' && topMobileWindow
-      ? safeArea.top + resolvedDeadZone.top
-      : desktopWorkspaceTopInset
+    formFactor === 'mobile'
+      ? safeArea.top + (topMobileWindow ? resolvedDeadZone.top : mobileLauncherTopInset)
+      : safeArea.top + desktopAvatarRowHeight
   const workspaceInnerHeight = Math.max(
     workspaceSize.height -
       workspaceTopPadding -
@@ -659,7 +770,6 @@ export function DesktopRoute() {
     360,
   )
   const shouldLockDesktopViewport = formFactor === 'desktop'
-  const systemSidebarModel = store.getSystemSidebarDataModel(activeMobileApp?.id)
   const topMobileWindowId = topMobileWindow?.id
   const handleMinimizeTopMobileWindow = useMemo(
     () =>
@@ -668,116 +778,19 @@ export function DesktopRoute() {
         : undefined,
     [isMobile, topMobileWindowId, minimizeWindow],
   )
+  const taskbarApps = store.getTaskbarApps()
+  const contextMenuItem = contextMenu
+    ? resolvedLayout?.pages.flatMap((page) => page.items).find((entry) => entry.id === contextMenu.itemId)
+    : undefined
+  const desktopFolderPath = status === 'success' ? store.getDesktopFolderPath() : ''
 
-  // Tray state depends on a few primitives derived from `windows`; derive
-  // them first so the memo is not invalidated by every geometry update.
-  const backupActive = windows.some(
-    (w) => w.appId === 'files' && w.state !== 'minimized',
-  )
-  const messageCount = Math.min(
-    windows.filter((w) => w.state !== 'minimized').length,
-    3,
-  )
-  const recentActivity = activityLog[0]
-  const trayState = useMemo(() => {
-    const statusTips: StatusTip[] = [
-      {
-        id: 'recent-shell-action',
-        tone: 'success' as const,
-        taskLabel: t('tips.task.shell'),
-        title: t('tips.card.recent.title'),
-        body: recentActivity ?? t('tips.card.recent.body'),
-        statusLabel: t('tips.status.completed'),
-        timeLabel: t('tips.time.justNow'),
-      },
-      {
-        id: 'mobile-touch-audit',
-        tone: 'error' as const,
-        taskLabel: t('tips.task.mobile'),
-        title: t('tips.card.touch.title'),
-        body: t('tips.card.touch.body'),
-        statusLabel: t('tips.status.failed'),
-        timeLabel: t('tips.time.twoMinutes'),
-      },
-      {
-        id: 'diagnostics-export',
-        tone: 'progress' as const,
-        taskLabel: t('tips.task.report'),
-        title: t('tips.card.report.title'),
-        body: t('tips.card.report.body'),
-        statusLabel: t('tips.status.running'),
-        timeLabel: t('tips.time.queue'),
-      },
-      {
-        id: 'runtime-cache-warmed',
-        tone: 'success' as const,
-        taskLabel: t('tips.task.runtime'),
-        title: t('tips.card.cache.title'),
-        body: t('tips.card.cache.body'),
-        statusLabel: t('tips.status.completed'),
-        timeLabel: '5m',
-      },
-      {
-        id: 'notes-sync-retry',
-        tone: 'error' as const,
-        taskLabel: t('tips.task.sync'),
-        title: t('tips.card.sync.title'),
-        body: t('tips.card.sync.body'),
-        statusLabel: t('tips.status.failed'),
-        timeLabel: '9m',
-      },
-      {
-        id: 'docs-index-refresh',
-        tone: 'progress' as const,
-        taskLabel: t('tips.task.index'),
-        title: t('tips.card.index.title'),
-        body: t('tips.card.index.body'),
-        statusLabel: t('tips.status.running'),
-        timeLabel: '12m',
-      },
-      {
-        id: 'launcher-metrics-pushed',
-        tone: 'success' as const,
-        taskLabel: t('tips.task.metrics'),
-        title: t('tips.card.metrics.title'),
-        body: t('tips.card.metrics.body'),
-        statusLabel: t('tips.status.completed'),
-        timeLabel: '18m',
-      },
-      {
-        id: 'widget-layout-reflow',
-        tone: 'progress' as const,
-        taskLabel: t('tips.task.layout'),
-        title: t('tips.card.layout.title'),
-        body: t('tips.card.layout.body'),
-        statusLabel: t('tips.status.running'),
-        timeLabel: '24m',
-      },
-    ]
+  // The status bar's message and notification trays read MessageHub,
+  // msg-center and TaskMgr only while the mobile shell is up.
+  const tray = useTray(isMobile && !isLoading && !hasError)
 
-    return {
-      backupActive,
-      messageCount,
-      notificationCount: Math.min(statusTips.length, 9),
-      tips: statusTips,
-    }
-  }, [backupActive, messageCount, recentActivity, t])
-
-  // Background
-  const backgroundWallpaper = useMemo(
-    () => appearance.wallpaper ?? { mode: 'infinite' as const },
-    [appearance.wallpaper],
-  )
+  // Background (drawn by DesktopBackgroundSync below)
+  const hasWallpaperPicture = useHasWallpaperPicture()
   const backgroundPageCount = resolvedLayout?.pages.length ?? 1
-
-  useEffect(() => {
-    setBackground({
-      wallpaper: backgroundWallpaper,
-      pageCount: backgroundPageCount,
-    })
-  }, [backgroundPageCount, backgroundWallpaper, setBackground])
-
-  useEffect(() => resetBackground, [resetBackground])
 
   // ---------------------------------------------------------------------------
   // Render
@@ -785,13 +798,18 @@ export function DesktopRoute() {
 
   return (
     <main
-      className="relative isolate bg-[color:var(--cp-bg)]"
+      // With a picture the desktop is see-through down to DesktopBackground; labels and page dots
+      // switch to light-on-dark (index.css) so they read on any image.
+      className={clsx('relative isolate', hasWallpaperPicture ? null : 'bg-[color:var(--cp-bg)]')}
+      data-wallpaper={hasWallpaperPicture ? 'image' : undefined}
       style={
         shouldLockDesktopViewport
           ? { height: '100dvh', overflow: 'hidden' }
           : { minHeight: '100dvh' }
       }
     >
+      <DesktopBackgroundSync fallback={appearance.wallpaper} pageCount={backgroundPageCount} />
+      {currentUser ? <AccountAppearanceSync key={currentUser.userId} userId={currentUser.userId} /> : null}
       <section
         className="relative z-10"
         style={
@@ -803,35 +821,66 @@ export function DesktopRoute() {
         <div ref={workspaceRef} className="relative h-dvh min-h-dvh">
           {!isLoading && !hasError && resolvedLayout ? (
             <MobileNavProvider>
-              <SystemSidebar
-                connectionState={connectionState}
-                deadZone={resolvedDeadZone}
-                isLoggingOut={isLoggingOut}
-                onClose={closeSidebar}
-                onLogout={handleLogout}
-                onOpenApp={handleSelectSidebarApp}
-                onReturnDesktop={handleReturnDesktop}
-                open={isSystemSidebarOpen}
-                runtimeContainer={runtimeContainer}
-                safeAreaTop={safeArea.top}
-                safeAreaBottom={safeArea.bottom}
-                uiModel={systemSidebarModel}
-              />
-              <StatusBar
-                activeApp={activeMobileApp}
-                connectionState={connectionState}
-                deadZone={resolvedDeadZone}
-                formFactor={formFactor}
-                safeAreaTop={safeArea.top}
-                onCycleLocale={handleCycleLocale}
-                onMinimizeWindow={handleMinimizeTopMobileWindow}
-                onOpenDiagnostics={handleOpenDiagnostics}
-                onOpenSettings={handleOpenSettings}
-                onOpenSidebar={toggleSidebar}
-                onToggleTheme={handleToggleTheme}
-                themeMode={themeMode}
-                trayState={trayState}
-              />
+              {isMobile ? (
+                <>
+                  <MobileTaskbar
+                    apps={apps}
+                    avatarRowHeight={mobileStatusBarRowHeight}
+                    connectionState={connectionState}
+                    deadZone={resolvedDeadZone}
+                    isLoggingOut={isLoggingOut}
+                    onClose={closeSidebar}
+                    onCloseAppWindows={handleCloseAppWindows}
+                    onLogout={handleLogout}
+                    onOpenApp={handleSelectSidebarApp}
+                    onSetAppPinned={handleSetTaskbarAppPinned}
+                    onShowDesktop={handleShowDesktop}
+                    open={isSystemSidebarOpen}
+                    runtimeContainer={runtimeContainer}
+                    safeArea={safeArea}
+                    taskbarApps={taskbarApps}
+                    user={currentUser}
+                  />
+                  <StatusBar
+                    activeApp={activeMobileApp}
+                    connectionState={connectionState}
+                    deadZone={resolvedDeadZone}
+                    safeAreaTop={safeArea.top}
+                    onCycleLocale={handleCycleLocale}
+                    onMinimizeWindow={handleMinimizeTopMobileWindow}
+                    onNavigate={navigate}
+                    onOpenDiagnostics={handleOpenDiagnostics}
+                    onOpenSettings={handleOpenSettings}
+                    onOpenSidebar={toggleSidebar}
+                    onToggleTheme={handleToggleTheme}
+                    themeMode={themeMode}
+                    tray={tray}
+                    user={currentUser}
+                  />
+                </>
+              ) : (
+                <DesktopTaskbar
+                  apps={apps}
+                  connectionState={connectionState}
+                  isLoggingOut={isLoggingOut}
+                  onActivateApp={handleActivateTaskbarApp}
+                  onClose={closeSidebar}
+                  onCloseAppWindows={handleCloseAppWindows}
+                  onLogout={handleLogout}
+                  onMoveApp={handleMoveTaskbarApp}
+                  onOpenApp={handleSelectSidebarApp}
+                  onSetAppPinned={handleSetTaskbarAppPinned}
+                  onShowDesktop={handleShowDesktop}
+                  onToggleOpen={toggleSidebar}
+                  onTogglePinned={toggleTaskbarPinned}
+                  open={isSystemSidebarOpen}
+                  pinned={isTaskbarPinned}
+                  runtimeContainer={runtimeContainer}
+                  safeArea={safeArea}
+                  taskbarApps={taskbarApps}
+                  user={currentUser}
+                />
+              )}
               <div
                 ref={setGridContainer}
                 className="relative overflow-hidden"
@@ -839,7 +888,7 @@ export function DesktopRoute() {
                 style={{
                   paddingTop: workspaceTopPadding,
                   paddingBottom: resolvedDeadZone.bottom + safeArea.bottom,
-                  paddingLeft: resolvedDeadZone.left + safeArea.left,
+                  paddingLeft: resolvedDeadZone.left + safeArea.left + desktopWorkspaceLeftInset,
                   paddingRight: resolvedDeadZone.right + safeArea.right,
                 }}
               >
@@ -875,6 +924,7 @@ export function DesktopRoute() {
                   onMinimize={minimizeWindow}
                   onSaveSettings={applySettings}
                   runtimeContainer={runtimeContainer}
+                  leftInset={desktopWorkspaceLeftInset}
                   safeArea={safeArea}
                   themeMode={themeMode}
                   topInset={desktopWorkspaceTopInset}
@@ -924,25 +974,35 @@ export function DesktopRoute() {
         }
       >
         <MenuItem
+          disabled={contextMenuItem?.type === 'widget'}
           onClick={() => {
-            const pageIndex =
-              contextMenu && resolvedLayout
-                ? getPageIndex(resolvedLayout, contextMenu.itemId)
-                : -1
-            const item =
-              pageIndex >= 0
-                ? resolvedLayout?.pages[pageIndex].items.find(
-                    (entry) => entry.id === contextMenu?.itemId,
-                  )
-                : null
-            if (item?.type === 'app') {
-              handleOpenApp(item.appId)
-            }
+            if (contextMenuItem?.type === 'app') handleOpenApp(contextMenuItem.appId)
+            if (contextMenuItem?.type === 'file') openDesktopFile(contextMenuItem)
             store.setContextMenu(null)
           }}
         >
           {t('common.open')}
         </MenuItem>
+        <MenuItem
+          disabled={!desktopFolderPath}
+          data-testid="desktop-menu-show-in-files"
+          onClick={() => {
+            store.setContextMenu(null)
+            showFolderInFiles(desktopFolderPath)
+          }}
+        >
+          {t('desktop.menu.showInFiles', 'Show in Files')}
+        </MenuItem>
+        <MenuItem
+          disabled={!contextMenuItem || contextMenuItem.type === 'file' || !desktopFolderPath}
+          data-testid="desktop-menu-remove"
+          onClick={() => {
+            if (contextMenuItem) void store.removeDesktopItem(contextMenuItem.id)
+          }}
+        >
+          {t('shell.removeFromDesktop', 'Remove from desktop')}
+        </MenuItem>
+        <Divider />
         <MenuItem
           disabled={
             !contextMenu ||
@@ -1083,7 +1143,8 @@ const DesktopPages = memo(function DesktopPages({
   useEffect(() => resetDesktopViewportProgress, [])
 
   if (pageCount === 0 || layout.pages.every((page) => page.items.length === 0)) {
-    return <EmptyState onRestore={onRestore} />
+    // As tall as the pages: the grid's row count is measured from this container.
+    return <EmptyState height={height} onRestore={onRestore} />
   }
 
   return (
@@ -1145,20 +1206,37 @@ const DesktopPages = memo(function DesktopPages({
 // Sub-components (unchanged)
 // ---------------------------------------------------------------------------
 
+/**
+ * Hands the wallpaper to the app-wide DesktopBackground: the picture chosen in Settings, else the payload's
+ * built-in one. Kept apart so a preview drag in Settings re-renders this, not the whole desktop.
+ */
+function DesktopBackgroundSync({ fallback, pageCount }: { fallback: DesktopWallpaper | undefined; pageCount: number }) {
+  const { resetBackground, setBackground } = useDesktopBackground()
+  const picture = useWallpaperSnapshot().wallpaper
+  const wallpaper = useMemo(() => picture ?? fallback ?? { mode: 'infinite' as const }, [picture, fallback])
+
+  useEffect(() => {
+    setBackground({ wallpaper, pageCount })
+  }, [pageCount, wallpaper, setBackground])
+
+  useEffect(() => resetBackground, [resetBackground])
+
+  return null
+}
+
 function LoadingState() {
   const { t } = useI18n()
+  // One tip per load, kept across re-renders and language switches.
+  const [tipKey] = useState(() => loadingTipKeys[Math.floor(Math.random() * loadingTipKeys.length)])
   return (
-    <div className="absolute inset-0 flex items-center justify-center bg-[color:var(--cp-surface)]/72 backdrop-blur-xl">
-      <div className="shell-panel max-w-lg px-7 py-8 text-center">
-        <div className="mx-auto mb-3 flex items-center justify-center">
-          <LoadingOrb size={48} label={t('states.loadingTitle')} />
-        </div>
-        <p className="shell-kicker">Prototype</p>
-        <p className="mt-2 font-display text-2xl font-semibold sm:text-[2rem]">
-          {t('states.loadingTitle')}
-        </p>
-        <p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-[color:var(--cp-muted)]">
-          {t('states.loadingBody')}
+    <div className="absolute inset-0 flex items-center justify-center bg-[color:var(--cp-surface)]/72 px-4 backdrop-blur-xl">
+      <div className="flex max-w-md flex-col items-center text-center">
+        <LoadingOrb size={48} label={t('states.loading')} />
+        <p className="mt-6 text-base font-medium text-[color:var(--cp-text)]">{t('states.loading')}</p>
+        <p className="mt-3 text-sm leading-6 text-[color:var(--cp-muted)]" data-testid="desktop-loading-tip">
+          <span className="font-medium text-[color:var(--cp-text)]">{t('states.tipLabel')}</span>
+          {' · '}
+          {t(tipKey)}
         </p>
       </div>
     </div>
@@ -1185,10 +1263,10 @@ function ErrorState({ onRetry }: { onRetry: () => void }) {
   )
 }
 
-function EmptyState({ onRestore }: { onRestore: () => void }) {
+function EmptyState({ height, onRestore }: { height: number; onRestore: () => void }) {
   const { t } = useI18n()
   return (
-    <div className="flex h-full items-center justify-center px-4">
+    <div className="flex items-center justify-center px-4" style={{ height }}>
       <div className="shell-panel max-w-lg border-dashed px-7 py-8 text-center">
         <p className="shell-kicker">Layout</p>
         <p className="mt-2 font-display text-2xl font-semibold">
@@ -1222,7 +1300,7 @@ function DesktopTile({
   onOpenContextMenu: (item: LayoutItem, event: ReactMouseEvent<HTMLDivElement>) => void
   onSaveNote: (itemId: string, content: string) => void
 }) {
-  const { t } = useI18n()
+  const appText = useAppText()
   const touchStartRef = useRef<{
     x: number
     y: number
@@ -1302,9 +1380,32 @@ function DesktopTile({
     )
   }
 
+  const tile = item.type === 'app' && app
+    ? {
+      title: appText(app).title,
+      testId: `desktop-app-${app.id}`,
+      icon: (
+        <span
+          className="relative flex shrink-0 items-center justify-center overflow-hidden rounded-[20px] shadow-[0_8px_20px_color-mix(in_srgb,var(--cp-shadow)_10%,transparent)]"
+          style={{
+            width: 'var(--icon-size)',
+            height: 'var(--icon-size)',
+            ...appIconSurfaceStyle(app.accent),
+          }}
+        >
+          <AppIcon iconKey={app.iconKey} iconUrl={app.iconUrl} fill className="text-white" />
+        </span>
+      ),
+    }
+    : item.type === 'file'
+      ? { title: item.id, testId: `desktop-file-${item.id}`, icon: <DesktopFileIcon item={item} /> }
+      : null
+
   return (
     <div
       data-testid={`desktop-item-${item.id}`}
+      data-item-type={item.type}
+      data-widget-type={item.type === 'widget' ? item.widgetType : undefined}
       className={clsx(
         'desktop-tile-shell group relative h-full border border-transparent transition-[transform,border-color,box-shadow,background-color] duration-200 ease-[var(--cp-ease-emphasis)]',
         item.type === 'widget' ? 'rounded-[22px]' : 'rounded-[28px]',
@@ -1318,15 +1419,15 @@ function DesktopTile({
       )}
       onContextMenu={(event) => onOpenContextMenu(item, event)}
     >
-      {item.type === 'app' && app ? (
+      {tile ? (
         <button
           type="button"
           onClick={isDesktop ? () => onOpen(item) : undefined}
           onPointerDown={handleAppPointerDown}
           onPointerUp={handleAppPointerUp}
           onPointerCancel={clearAppPointer}
-          data-testid={`desktop-app-${app.id}`}
-          title={t(app.labelKey)}
+          data-testid={tile.testId}
+          title={tile.title}
           className={clsx(
             'flex h-full w-full flex-col items-center rounded-[28px] bg-transparent text-center transition-[background-color,box-shadow] duration-200 ease-[var(--cp-ease-emphasis)] focus-visible:bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_10%,var(--cp-surface))]',
             isDesktop ? 'cursor-grab active:cursor-grabbing' : '',
@@ -1337,18 +1438,21 @@ function DesktopTile({
           // viewport (see the label's fontSize below).
           style={{ paddingTop: 'var(--icon-padding-top)', containerType: 'inline-size' }}
         >
+          {tile.icon}
+          {item.type === 'app' && app?.iconBadge ? (
+            <span
+              aria-hidden="true"
+              data-testid={`desktop-app-badge-${app.id}`}
+              className="pointer-events-none absolute z-20 size-3 rounded-full border-2 border-[color:var(--cp-surface)]"
+              style={{
+                top: 'calc(var(--icon-padding-top) - 3px)',
+                left: 'calc(50% + var(--icon-size) / 2 - 9px)',
+                background: app.iconBadge === 'error' ? 'var(--cp-danger)' : 'var(--cp-warning)',
+              }}
+            />
+          ) : null}
           <span
-            className="relative flex shrink-0 items-center justify-center overflow-hidden rounded-[20px] shadow-[0_8px_20px_color-mix(in_srgb,var(--cp-shadow)_10%,transparent)]"
-            style={{
-              width: 'var(--icon-size)',
-              height: 'var(--icon-size)',
-              ...appIconSurfaceStyle(app.accent),
-            }}
-          >
-            <AppIcon iconKey={app.iconKey} className="text-white" />
-          </span>
-          <span
-            className="max-w-full break-words overflow-hidden px-0.5 font-display font-semibold text-[color:var(--cp-text)]"
+            className="desktop-icon-label max-w-full break-words overflow-hidden px-0.5 font-display font-semibold text-[color:var(--cp-text)]"
             style={{
               paddingTop: 'var(--label-padding-top)',
               fontSize: isDesktop
@@ -1362,7 +1466,7 @@ function DesktopTile({
               WebkitBoxOrient: 'vertical',
             }}
           >
-            {t(app.labelKey)}
+            {tile.title}
           </span>
         </button>
       ) : null}
@@ -1371,5 +1475,18 @@ function DesktopTile({
         <DesktopWidgetRenderer item={item} onSaveNote={onSaveNote} />
       ) : null}
     </div>
+  )
+}
+
+/** A document or folder on the desktop: its kind's icon on a plain tile. */
+function DesktopFileIcon({ item }: { item: FileIconItem }) {
+  const kind = item.fileKind === 'folder' ? 'folder' : classifyFileKind(item.id)
+  return (
+    <span
+      className="relative flex shrink-0 items-center justify-center overflow-hidden rounded-[20px] border border-[color:color-mix(in_srgb,var(--cp-border)_80%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_92%,transparent)] shadow-[0_8px_20px_color-mix(in_srgb,var(--cp-shadow)_10%,transparent)]"
+      style={{ width: 'var(--icon-size)', height: 'var(--icon-size)' }}
+    >
+      {kindIcon(kind, 26)}
+    </span>
   )
 }

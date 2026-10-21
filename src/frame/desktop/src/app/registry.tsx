@@ -29,6 +29,7 @@ const SystestAppPanel = lazyPanel(
 const WebAppFramePanel = lazyPanel(() => import('./web-frame/WebAppFramePanel'), m => m.WebAppFramePanel)
 
 const appLoaders: Record<string, AppContentLoader> = {
+  'agent-setup': lazyPanel(() => import('./agent-setup/AgentSetupAppPanel'), (m) => m.AgentSetupAppPanel),
   aiworkspace: lazyPanel(() => import('./aiworkspace/AIWorkspaceAppPanel'), (m) => m.AIWorkspaceAppPanel),
   'ai-center': lazyPanel(() => import('./ai-center/AICenterAppPanel'), (m) => m.AICenterAppPanel),
   'app-service': lazyPanel(() => import('./app-service/AppServiceAppPanel'), (m) => m.AppServiceAppPanel),
@@ -41,6 +42,7 @@ const appLoaders: Record<string, AppContentLoader> = {
   codeassistant: lazyPanel(() => import('./codeassistant/CodeAssistantAppPanel'), (m) => m.CodeAssistantAppPanel),
   messagehub: lazyPanel(() => import('./messagehub/MessageHubAppPanel'), (m) => m.MessageHubAppPanel),
   'my-network': lazyPanel(() => import('./my-network/MyNetworkAppPanel'), (m) => m.MyNetworkAppPanel),
+  'my-content': lazyPanel(() => import('./my-content/MyContentAppPanel'), (m) => m.MyContentAppPanel),
   preview: lazyPanel(() => import('./preview/PreviewAppPanel'), (m) => m.PreviewAppPanel),
   homestation: lazyPanel(() => import('./homestation/HomeStationAppPanel'), (m) => m.HomeStationAppPanel),
   systest: SystestAppPanel,

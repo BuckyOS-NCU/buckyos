@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "revision": "official-provider-protocols-2026-09-25.1",
-  "checked_at": "2026-09-25",
+  "revision": "official-provider-protocols-2026-10-13.1",
+  "checked_at": "2026-10-13",
   "providers": [
     {
       "provider_driver": "typesafe",
@@ -112,8 +112,8 @@
         "vision.ocr": ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex"],
         "vision.caption": ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex"],
         "embedding.text": ["text-embedding-3-small", "text-embedding-3-large"],
-        "image.txt2img": ["gpt-image-2"],
-        "image.img2img": ["gpt-image-2"],
+        "image.txt2img": ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-image-2"],
+        "image.img2img": ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-image-2"],
         "image.inpaint": ["gpt-image-2"],
         "audio.tts": ["gpt-4o-mini-tts"],
         "audio.asr": ["gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"],
@@ -155,6 +155,8 @@
           "body_field_types": { "model": ["string"], "input": ["string", "array"] },
           "stream_protocol": "openai_responses",
           "success_fixture": { "id": "resp_mock_1", "object": "response", "status": "completed", "model": "mock-model", "output": [{ "type": "reasoning", "id": "rs_t15_4827", "summary": [{ "type": "summary_text", "text": "opaque reasoning" }], "encrypted_content": "opaque-t15-reasoning" }, { "type": "message", "id": "msg_t15_4827", "status": "completed", "role": "assistant", "content": [{ "type": "output_text", "text": "BUCKYOS-AICC-4827", "annotations": [] }] }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+          "inline_artifact_success_fixture": { "id": "resp_inline_artifact_mock_1", "object": "response", "status": "completed", "model": "mock-model", "output": [{ "type": "message", "id": "msg_inline_artifact_mock_1", "status": "completed", "role": "assistant", "content": [{ "type": "output_text", "text": "BUCKYOS-AICC-4827", "annotations": [] }] }, { "type": "image_generation_call", "id": "ig_inline_artifact_mock_1", "status": "completed", "result": "aW1hZ2U=", "output_format": "png" }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+          "inline_artifact_payload_paths": ["/output/1/result"],
           "official_sources": ["https://platform.openai.com/docs/api-reference/responses/create", "https://platform.openai.com/docs/guides/tools-image-generation", "https://platform.openai.com/docs/guides/error-codes/api-errors"],
           "evidence_summary": "Responses create uses POST /v1/responses with Bearer authentication and JSON model/input; response objects contain output and usage. Compatible GPT variants can generate or edit images through the built-in image_generation tool."
         },
@@ -348,11 +350,10 @@
       },
       "official_variant_sources": ["https://ai.google.dev/gemini-api/docs/thinking"],
       "official_variant_rules": [
-        { "model_ids": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"], "variants": { "reasoning-low": { "generation_config": { "thinking_level": "low" } }, "reasoning-medium": { "generation_config": { "thinking_level": "medium" } }, "reasoning-high": { "generation_config": { "thinking_level": "high" } } } },
+        { "model_ids": ["gemini-2.5-flash"], "variants": { "reasoning-low": { "generation_config": { "thinking_level": "low" } }, "reasoning-medium": { "generation_config": { "thinking_level": "medium" } }, "reasoning-high": { "generation_config": { "thinking_level": "high" } } } },
         { "model_ids": ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"], "variants": { "reasoning-minimal": { "generation_config": { "thinking_level": "minimal" } }, "reasoning-low": { "generation_config": { "thinking_level": "low" } }, "reasoning-medium": { "generation_config": { "thinking_level": "medium" } }, "reasoning-high": { "generation_config": { "thinking_level": "high" } } } },
         { "model_ids": ["gemini-3.8-flash"], "variants": { "reasoning-low": { "generation_config": { "thinking_level": "low" } }, "reasoning-medium": { "generation_config": { "thinking_level": "high" } }, "reasoning-high": { "generation_config": { "thinking_level": "high" } } } },
-        { "model_ids": ["gemini-3.7-flash", "gemini-3.1-pro-preview"], "variants": { "reasoning-low": { "generation_config": { "thinking_level": "low" } }, "reasoning-medium": { "generation_config": { "thinking_level": "medium" } }, "reasoning-high": { "generation_config": { "thinking_level": "high" } } } },
-        { "model_ids": ["gemini-3-pro-preview"], "variants": { "reasoning-low": { "generation_config": { "thinking_level": "low" } }, "reasoning-high": { "generation_config": { "thinking_level": "high" } } } }
+        { "model_ids": ["gemini-3.7-flash", "gemini-3.1-pro-preview"], "variants": { "reasoning-low": { "generation_config": { "thinking_level": "low" } }, "reasoning-medium": { "generation_config": { "thinking_level": "medium" } }, "reasoning-high": { "generation_config": { "thinking_level": "high" } } } }
       ],
       "test_model_ids": { "llm": "gemini-3.5-flash", "vision.ocr": "gemini-3.5-flash", "vision.caption": "gemini-3.5-flash", "vision.detect": "gemini-3.5-flash", "vision.segment": "gemini-3.5-flash", "audio.asr": "gemini-3.5-transcribe", "embedding.text": "gemini-embedding-2", "embedding.multimodal": "gemini-embedding-2", "image.txt2img": "gemini-3.1-flash-image", "image.img2img": "gemini-3.1-flash-image", "audio.tts": "gemini-3.1-flash-tts-preview", "audio.music": "lyria-3-clip-preview", "video.txt2video": "veo-3.1-generate-preview", "video.img2video": "veo-3.1-generate-preview", "video.video2video": "gemini-omni-1.1-flash", "video.extend": "gemini-omni-1.1-flash" },
       "contracts": [
@@ -375,6 +376,8 @@
           },
           "stream_protocol": "gemini_interactions",
           "success_fixture": { "id": "interaction_mock_1", "object": "interaction", "status": "completed", "model": "mock-model", "steps": [{ "type": "model_output", "content": [{ "type": "text", "text": "BUCKYOS-AICC-4827" }] }], "usage": { "total_input_tokens": 4, "total_output_tokens": 3, "total_tokens": 7 } },
+          "inline_artifact_success_fixture": { "id": "interaction_inline_artifact_mock_1", "object": "interaction", "status": "completed", "model": "mock-model", "steps": [{ "type": "model_output", "content": [{ "type": "text", "text": "BUCKYOS-AICC-4827" }, { "type": "image", "id": "gemini_inline_artifact_mock_1", "mime_type": "image/png", "data": "aW1hZ2U=" }] }], "usage": { "total_input_tokens": 4, "total_output_tokens": 3, "total_tokens": 7 } },
+          "inline_artifact_payload_paths": ["/steps/0/content/1/data"],
           "official_sources": ["https://ai.google.dev/api/interactions-api", "https://ai.google.dev/gemini-api/docs/function-calling", "https://ai.google.dev/gemini-api/docs/api-errors"],
           "evidence_summary": "Interactions create uses POST /v1beta/interactions with model/input and x-goog-api-key; function_result requires name, call_id and result and must match its preceding function_call."
         },
@@ -546,6 +549,7 @@
           "required_body_fields": ["image_url"],
           "allowed_body_fields": ["image_url", "scale", "tile", "face", "model", "output_format"],
           "body_field_types": { "image_url": ["string"] },
+          "body_field_formats": { "image_url": "http_url_or_data_uri" },
           "async_protocol": "fal_queue",
           "async_steps": [
             { "name": "poll", "http_method": "GET", "path": "/fal-ai/esrgan/requests/{request_id}/status" },
@@ -553,10 +557,10 @@
             { "name": "result", "http_method": "GET", "path": "/fal-ai/esrgan/requests/{request_id}/response" },
             { "name": "cancel", "http_method": "PUT", "path": "/fal-ai/esrgan/requests/{request_id}/cancel" }
           ],
-          "success_fixture": { "request_id": "fal_mock_1", "response_url": "http://mock/{endpoint}/requests/fal_mock_1/response", "status_url": "http://mock/{endpoint}/requests/fal_mock_1/status", "cancel_url": "http://mock/{endpoint}/requests/fal_mock_1/cancel", "queue_position": 0 },
-          "async_result_fixture": { "image": { "url": "http://mock/artifacts/result.png", "content_type": "image/png", "file_name": "result.png", "file_size": 1024, "width": 1024, "height": 1024 } },
+          "success_fixture": { "request_id": "fal_mock_1", "response_url": "http://mock/fal-ai/esrgan/requests/fal_mock_1/response", "status_url": "http://mock/fal-ai/esrgan/requests/fal_mock_1/status", "cancel_url": "http://mock/fal-ai/esrgan/requests/fal_mock_1/cancel", "queue_position": 0 },
+          "async_result_fixture": { "image": { "url": "http://mock-artifact/artifacts/result.png", "content_type": "image/png", "file_name": "result.png", "file_size": 1024, "width": 1024, "height": 1024 } },
           "official_sources": ["https://fal.ai/models/fal-ai/esrgan/api", "https://fal.ai/docs/documentation/model-apis/inference/queue"],
-          "evidence_summary": "ESRGAN queue submit requires image_url at /fal-ai/esrgan and returns an image result after queue completion."
+          "evidence_summary": "ESRGAN queue submit requires image_url at /fal-ai/esrgan; fal Files accepts hosted HTTP(S) URLs or Base64 data URIs. Queue lifecycle uses the app root, with canonical result retrieval at /requests/{request_id} and a returned response_url ending in /response."
         },
         {
           "id": "fal.imageutils-rembg.queue-v1",
@@ -571,17 +575,18 @@
           "required_body_fields": ["image_url"],
           "allowed_body_fields": ["image_url", "sync_mode", "crop_to_bbox"],
           "body_field_types": { "image_url": ["string"] },
+          "body_field_formats": { "image_url": "http_url_or_data_uri" },
           "async_protocol": "fal_queue",
           "async_steps": [
-            { "name": "poll", "http_method": "GET", "path": "/fal-ai/imageutils/rembg/requests/{request_id}/status" },
-            { "name": "result", "http_method": "GET", "path": "/fal-ai/imageutils/rembg/requests/{request_id}" },
-            { "name": "result", "http_method": "GET", "path": "/fal-ai/imageutils/rembg/requests/{request_id}/response" },
-            { "name": "cancel", "http_method": "PUT", "path": "/fal-ai/imageutils/rembg/requests/{request_id}/cancel" }
+            { "name": "poll", "http_method": "GET", "path": "/fal-ai/imageutils/requests/{request_id}/status" },
+            { "name": "result", "http_method": "GET", "path": "/fal-ai/imageutils/requests/{request_id}" },
+            { "name": "result", "http_method": "GET", "path": "/fal-ai/imageutils/requests/{request_id}/response" },
+            { "name": "cancel", "http_method": "PUT", "path": "/fal-ai/imageutils/requests/{request_id}/cancel" }
           ],
-          "success_fixture": { "request_id": "fal_mock_1", "response_url": "http://mock/{endpoint}/requests/fal_mock_1/response", "status_url": "http://mock/{endpoint}/requests/fal_mock_1/status", "cancel_url": "http://mock/{endpoint}/requests/fal_mock_1/cancel", "queue_position": 0 },
-          "async_result_fixture": { "image": { "url": "http://mock/artifacts/result.png", "content_type": "image/png", "file_name": "result.png", "file_size": 1024, "width": 512, "height": 512 } },
+          "success_fixture": { "request_id": "fal_mock_1", "response_url": "http://mock/fal-ai/imageutils/requests/fal_mock_1/response", "status_url": "http://mock/fal-ai/imageutils/requests/fal_mock_1/status", "cancel_url": "http://mock/fal-ai/imageutils/requests/fal_mock_1/cancel", "queue_position": 0 },
+          "async_result_fixture": { "image": { "url": "http://mock-artifact/artifacts/result.png", "content_type": "image/png", "file_name": "result.png", "file_size": 1024, "width": 512, "height": 512 } },
           "official_sources": ["https://fal.ai/docs/model-api-reference/image-generation-api/imageutils", "https://fal.ai/docs/documentation/model-apis/inference/queue"],
-          "evidence_summary": "Imageutils rembg queue submit requires image_url at /fal-ai/imageutils/rembg and returns an image result after queue completion."
+          "evidence_summary": "Imageutils rembg queue submit requires image_url at /fal-ai/imageutils/rembg; fal Files accepts hosted HTTP(S) URLs or Base64 data URIs. Queue lifecycle strips the /rembg subpath to the fal-ai/imageutils app root, while returned response_url uses the /response alias."
         },
         {
           "id": "fal.deepfilternet3.queue-v1",
@@ -596,6 +601,7 @@
           "required_body_fields": ["audio_url"],
           "allowed_body_fields": ["audio_url", "sync_mode", "audio_format", "bitrate"],
           "body_field_types": { "audio_url": ["string"] },
+          "body_field_formats": { "audio_url": "http_url_or_data_uri" },
           "async_protocol": "fal_queue",
           "async_steps": [
             { "name": "poll", "http_method": "GET", "path": "/fal-ai/deepfilternet3/requests/{request_id}/status" },
@@ -603,10 +609,10 @@
             { "name": "result", "http_method": "GET", "path": "/fal-ai/deepfilternet3/requests/{request_id}/response" },
             { "name": "cancel", "http_method": "PUT", "path": "/fal-ai/deepfilternet3/requests/{request_id}/cancel" }
           ],
-          "success_fixture": { "request_id": "fal_mock_1", "response_url": "http://mock/{endpoint}/requests/fal_mock_1/response", "status_url": "http://mock/{endpoint}/requests/fal_mock_1/status", "cancel_url": "http://mock/{endpoint}/requests/fal_mock_1/cancel", "queue_position": 0 },
-          "async_result_fixture": { "audio_file": { "url": "http://mock/artifacts/result.wav", "content_type": "audio/wav", "file_name": "result.wav", "file_size": 2048 }, "timings": { "preprocess": 0.01, "inference": 0.01, "postprocess": 0.01 } },
+          "success_fixture": { "request_id": "fal_mock_1", "response_url": "http://mock/fal-ai/deepfilternet3/requests/fal_mock_1/response", "status_url": "http://mock/fal-ai/deepfilternet3/requests/fal_mock_1/status", "cancel_url": "http://mock/fal-ai/deepfilternet3/requests/fal_mock_1/cancel", "queue_position": 0 },
+          "async_result_fixture": { "audio_file": { "url": "http://mock-artifact/artifacts/result.wav", "content_type": "audio/wav", "file_name": "result.wav", "file_size": 2048 }, "timings": { "preprocess": 0.01, "inference": 0.01, "postprocess": 0.01 } },
           "official_sources": ["https://fal.ai/models/fal-ai/deepfilternet3/api", "https://fal.ai/docs/documentation/model-apis/inference/queue"],
-          "evidence_summary": "DeepFilterNet 3 queue submit requires audio_url at /fal-ai/deepfilternet3 and returns audio_file plus timings after completion."
+          "evidence_summary": "DeepFilterNet 3 queue submit requires audio_url at /fal-ai/deepfilternet3; fal Files accepts hosted HTTP(S) URLs or Base64 data URIs. Queue lifecycle exposes canonical result retrieval and the returned /response alias."
         },
         {
           "id": "fal.video-upscaler.queue-v1",
@@ -621,6 +627,7 @@
           "required_body_fields": ["video_url"],
           "allowed_body_fields": ["video_url", "scale"],
           "body_field_types": { "video_url": ["string"] },
+          "body_field_formats": { "video_url": "http_url_or_data_uri" },
           "async_protocol": "fal_queue",
           "async_steps": [
             { "name": "poll", "http_method": "GET", "path": "/fal-ai/video-upscaler/requests/{request_id}/status" },
@@ -628,10 +635,10 @@
             { "name": "result", "http_method": "GET", "path": "/fal-ai/video-upscaler/requests/{request_id}/response" },
             { "name": "cancel", "http_method": "PUT", "path": "/fal-ai/video-upscaler/requests/{request_id}/cancel" }
           ],
-          "success_fixture": { "request_id": "fal_mock_1", "response_url": "http://mock/{endpoint}/requests/fal_mock_1/response", "status_url": "http://mock/{endpoint}/requests/fal_mock_1/status", "cancel_url": "http://mock/{endpoint}/requests/fal_mock_1/cancel", "queue_position": 0 },
-          "async_result_fixture": { "video": { "url": "http://mock/artifacts/result.mp4", "content_type": "video/mp4", "file_name": "result.mp4", "file_size": 4096 } },
+          "success_fixture": { "request_id": "fal_mock_1", "response_url": "http://mock/fal-ai/video-upscaler/requests/fal_mock_1/response", "status_url": "http://mock/fal-ai/video-upscaler/requests/fal_mock_1/status", "cancel_url": "http://mock/fal-ai/video-upscaler/requests/fal_mock_1/cancel", "queue_position": 0 },
+          "async_result_fixture": { "video": { "url": "http://mock-artifact/artifacts/result.mp4", "content_type": "video/mp4", "file_name": "result.mp4", "file_size": 4096 } },
           "official_sources": ["https://fal.ai/models/fal-ai/video-upscaler/api", "https://fal.ai/docs/documentation/model-apis/inference/queue"],
-          "evidence_summary": "Video Upscaler queue submit requires video_url at /fal-ai/video-upscaler, accepts scale, and returns a video result after completion."
+          "evidence_summary": "Video Upscaler queue submit requires video_url at /fal-ai/video-upscaler, accepts scale, and accepts hosted HTTP(S) URLs or Base64 data URIs through fal Files. Queue lifecycle exposes canonical result retrieval and the returned /response alias."
         }
       ]
     },
@@ -642,14 +649,22 @@
       "credential_type": "bearer",
       "official_first_party_model_ids": {
         "llm": [
+          "MiniMax-M3.1-Flash-Preview",
           "MiniMax-M3",
           "MiniMax-M2.7",
-          "MiniMax-M2.7-highspeed"
+          "MiniMax-M2.7-highspeed",
+          "MiniMax-M2.5",
+          "MiniMax-M2.5-highspeed",
+          "MiniMax-M2.1",
+          "MiniMax-M2.1-highspeed",
+          "MiniMax-M2"
         ],
         "vision.ocr": [
+          "MiniMax-M3.1-Flash-Preview",
           "MiniMax-M3"
         ],
         "vision.caption": [
+          "MiniMax-M3.1-Flash-Preview",
           "MiniMax-M3"
         ],
         "audio.tts": [
@@ -676,20 +691,28 @@
           "MiniMax-H3-Max"
         ],
         "audio.music": [
-          "music-2.0"
+          "music-3.0"
         ]
       },
+      "official_variant_sources": [
+        "https://platform.minimax.io/docs/guides/text-generation",
+        "https://platform.minimax.io/docs/api-reference/text-chat-anthropic"
+      ],
+      "official_variant_rules": [
+        { "model_ids": ["MiniMax-M3.1-Flash-Preview"], "variants": { "reasoning-low": { "thinking": { "type": "adaptive" }, "output_config": { "effort": "low" } }, "reasoning-medium": { "thinking": { "type": "adaptive" }, "output_config": { "effort": "medium" } }, "reasoning-high": { "thinking": { "type": "adaptive" }, "output_config": { "effort": "high" } }, "reasoning-xhigh": { "thinking": { "type": "adaptive" }, "output_config": { "effort": "xhigh" } }, "reasoning-max": { "thinking": { "type": "adaptive" }, "output_config": { "effort": "max" } } } },
+        { "model_ids": ["MiniMax-M3"], "variants": { "reasoning-none": { "thinking": { "type": "disabled" } } } }
+      ],
       "test_model_ids": {
-        "llm": "MiniMax-M3",
-        "vision.ocr": "MiniMax-M3",
-        "vision.caption": "MiniMax-M3",
+        "llm": "MiniMax-M3.1-Flash-Preview",
+        "vision.ocr": "MiniMax-M3.1-Flash-Preview",
+        "vision.caption": "MiniMax-M3.1-Flash-Preview",
         "audio.tts": "speech-2.8-hd",
         "audio.asr": "asr-1.0",
         "image.txt2img": "image-01",
         "image.img2img": "image-01",
         "video.txt2video": "MiniMax-H3",
         "video.img2video": "MiniMax-H3",
-        "audio.music": "music-2.0"
+        "audio.music": "music-3.0"
       },
       "contracts": [
         {
@@ -703,7 +726,7 @@
           "auth": { "kind": "header", "name": "x-api-key", "prefix": "" },
           "content_type": "application/json",
           "required_body_fields": ["model", "messages", "max_tokens"],
-          "allowed_body_fields": ["model", "messages", "max_tokens", "stream", "system", "temperature", "thinking", "tool_choice", "tools", "top_p"],
+          "allowed_body_fields": ["model", "messages", "max_tokens", "stream", "system", "temperature", "thinking", "tool_choice", "tools", "top_p", "output_config"],
           "body_field_types": { "model": ["string"], "messages": ["array"], "max_tokens": ["number"] },
           "stream_protocol": "claude_messages",
           "success_fixture": { "id": "msg_mock_1", "type": "message", "role": "assistant", "model": "mock-model", "content": [{ "type": "text", "text": "BUCKYOS-AICC-4827" }], "stop_reason": "end_turn", "usage": { "input_tokens": 4, "output_tokens": 3 }, "base_resp": { "status_code": 0, "status_msg": "success" } },
@@ -758,7 +781,7 @@
           "required_body_fields_by_api_type": { "image.img2img": ["subject_reference"] },
           "allowed_body_fields": ["model", "prompt", "aspect_ratio", "height", "width", "response_format", "n", "prompt_optimizer", "subject_reference"],
           "body_field_types": { "model": ["string"], "prompt": ["string"], "subject_reference": ["array"] },
-          "success_fixture": { "id": "minimax_mock_1", "data": { "image_urls": ["http://mock/artifacts/image.png"] }, "metadata": { "failed_count": "0", "success_count": "1" }, "base_resp": { "status_code": 0, "status_msg": "success" } },
+          "success_fixture": { "id": "minimax_mock_1", "data": { "image_urls": ["http://mock-artifact/artifacts/image.jpeg"] }, "metadata": { "failed_count": "0", "success_count": "1" }, "base_resp": { "status_code": 0, "status_msg": "success" } },
           "official_sources": ["https://platform.minimax.io/docs/api-reference/image-generation-t2i", "https://platform.minimax.io/docs/api-reference/image-generation-i2i"],
           "evidence_summary": "MiniMax image generation uses POST /v1/image_generation with model/prompt and returns data.image_urls."
         },
@@ -782,7 +805,7 @@
             { "name": "cancel", "http_method": "DELETE", "path": "/v2/video_generation/minimax_video_mock_1" }
           ],
           "success_fixture": { "task_id": "minimax_video_mock_1" },
-          "async_result_fixture": { "task": { "id": "minimax_video_mock_1", "model": "MiniMax-H3", "status": "succeeded", "content": { "url": "http://mock/artifacts/result.mp4" }, "resolution": "768P", "duration": 5, "ratio": "16:9", "usage": { "total_seconds": 5, "input_seconds": 0, "output_seconds": 5, "input_image_count": 0 }, "task_type": "generation", "modality": "video" } },
+          "async_result_fixture": { "task": { "id": "minimax_video_mock_1", "model": "MiniMax-H3", "status": "succeeded", "content": { "url": "http://mock-artifact/artifacts/result.mp4" }, "resolution": "768P", "duration": 5, "ratio": "16:9", "usage": { "total_seconds": 5, "input_seconds": 0, "output_seconds": 5, "input_image_count": 0 }, "task_type": "generation", "modality": "video" } },
           "official_sources": ["https://platform.minimax.io/docs/api-reference/video-generation-v2-create", "https://platform.minimax.io/docs/api-reference/video-generation-v2-query", "https://platform.minimax.io/docs/api-reference/video-generation-v2-delete"],
           "evidence_summary": "MiniMax H3 video generation submits V2 multimodal content, queries the task by path ID, and supports queued-task cancellation with DELETE."
         },
@@ -1400,7 +1423,7 @@
         "vision.ocr": ["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"],
         "vision.caption": ["kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"]
       },
-      "official_variant_sources": ["https://platform.kimi.com/docs/api/models-overview", "https://platform.kimi.com/docs/guide/kimi-k2-6-quickstart"],
+      "official_variant_sources": ["https://platform.kimi.com/docs/models", "https://platform.kimi.com/docs/guide/kimi-k2-7-code-quickstart", "https://platform.kimi.com/docs/guide/kimi-k2-6-quickstart"],
       "official_variant_rules": [{
         "model_ids": ["kimi-k3"],
         "variants": {
@@ -1433,7 +1456,7 @@
         "allowed_body_fields": ["model", "messages", "max_tokens", "max_completion_tokens", "response_format", "stop", "stream", "stream_options", "tools", "tool_choice", "thinking", "reasoning_effort", "prompt_cache_key", "temperature", "top_p", "n", "presence_penalty", "frequency_penalty"],
         "body_field_types": { "model": ["string"], "messages": ["array"], "stream": ["boolean"], "temperature": ["number"], "top_p": ["number"], "n": ["number"], "presence_penalty": ["number"], "frequency_penalty": ["number"] },
         "stream_protocol": "openai_chat",
-        "success_fixture": { "id": "cmpl_mock_1", "object": "chat.completion", "created": 1770000000, "model": "kimi-k3", "choices": [{ "index": 0, "message": { "role": "assistant", "content": "BUCKYOS-AICC-4827" }, "finish_reason": "stop" }], "usage": { "prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7, "cached_tokens": 0 } },
+        "success_fixture": { "id": "cmpl_mock_1", "object": "chat.completion", "created": 1770000000, "model": "kimi-k3", "choices": [{ "index": 0, "message": { "role": "assistant", "content": "BUCKYOS-AICC-4827", "reasoning_content": "The marker should be returned exactly." }, "finish_reason": "stop" }], "usage": { "prompt_tokens": 4, "completion_tokens": 10, "total_tokens": 14, "cached_tokens": 0 } },
         "official_sources": ["https://platform.kimi.com/docs/api/chat", "https://platform.kimi.com/docs/api/errors"],
         "evidence_summary": "Kimi Chat Completions uses POST /v1/chat/completions with Bearer authentication, JSON model/messages, OpenAI-style choices and data-only SSE terminated by [DONE]."
       }]
@@ -1457,12 +1480,12 @@
       },
       "official_variant_sources": ["https://docs.bigmodel.cn/cn/guide/capabilities/thinking", "https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3", "https://docs.bigmodel.cn/cn/guide/models/text/glm-5.2"],
       "official_variant_rules": [{
-        "model_ids": ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-4.6v", "glm-4.6v-flash", "glm-4.6v-flashx", "glm-4.5", "glm-4.5-x", "glm-4.5-air", "glm-4.5-airx", "glm-4.5-flash", "glm-4.5v"],
+        "model_ids": ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-4.6v", "glm-4.6v-flash", "glm-4.6v-flashx", "glm-4.5", "glm-4.5-x", "glm-4.5-air", "glm-4.5-airx", "glm-4.5v"],
         "variants": {
-          "reasoning-medium": { "thinking": { "type": "enabled" } }
+          "reasoning-thinking": { "thinking": { "type": "enabled" } }
         }
       }, {
-        "model_ids": ["glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5", "glm-4.6", "glm-4.6v", "glm-4.6v-flash", "glm-4.6v-flashx", "glm-4.5", "glm-4.5-x", "glm-4.5-flash"],
+        "model_ids": ["glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5", "glm-4.6", "glm-4.6v", "glm-4.6v-flash", "glm-4.6v-flashx", "glm-4.5", "glm-4.5-x"],
         "variants": {
           "reasoning-none": { "thinking": { "type": "disabled" } }
         }
@@ -1525,7 +1548,7 @@
         "required_body_fields": ["model", "prompt"],
         "allowed_body_fields": ["model", "prompt", "n", "quality", "size", "style", "response_format", "user"],
         "body_field_types": { "model": ["string"], "prompt": ["string"] },
-        "success_fixture": { "created": 1770000000, "data": [{ "url": "http://mock/artifacts/glm.png" }], "usage": { "input_tokens": 2, "output_tokens": 1, "total_tokens": 3 } },
+        "success_fixture": { "created": 1770000000, "data": [{ "url": "http://mock-artifact/artifacts/glm.png" }], "usage": { "input_tokens": 2, "output_tokens": 1, "total_tokens": 3 } },
         "official_sources": ["https://docs.z.ai/api-reference/image-generation/generate-image"],
         "evidence_summary": "GLM image generation uses the v4 images/generations endpoint with an OpenAI-compatible JSON envelope."
       }, {
@@ -1582,7 +1605,7 @@
           "task_status": "SUCCESS",
           "video_result": [
             {
-              "url": "http://mock/artifacts/result.mp4"
+              "url": "http://mock-artifact/artifacts/result.mp4"
             }
           ],
           "request_id": "glm_request_mock_1"
@@ -1632,16 +1655,16 @@
       }]
     },
     {
-      "provider_driver": "doubao",
-      "provider_profile_id": "doubao",
+      "provider_driver": "doubao-agent-plan",
+      "provider_profile_id": "doubao-agent-plan",
       "endpoint_path": "/api/plan/v3",
       "operation_endpoint_paths": { "ark.images.generate": "/api/plan/v3", "ark.contents.generate": "/api/plan/v3", "tts.unidirectional": "/api/v3/plan/tts" },
       "credential_type": "bearer",
       "instance_fields": { "region": "cn-beijing" },
       "official_first_party_model_ids": {
         "llm": ["doubao-seed-2.0-mini", "doubao-seed-2.0-lite", "doubao-seed-2.1-lite", "doubao-seed-2.1-turbo", "doubao-seed-2.1-pro", "doubao-seed-evolving", "deepseek-v4-flash", "glm-5.3-flash", "minimax-m3", "glm-5.3", "kimi-k2.7-code", "kimi-k2.8-preview", "deepseek-v4-pro", "kimi-k3", "deepseek-v4.1-flash"],
-        "vision.ocr": ["doubao-seed-2.0-mini", "doubao-seed-2.0-lite", "doubao-seed-2.1-lite", "doubao-seed-2.1-turbo", "doubao-seed-2.1-pro", "doubao-seed-evolving"],
-        "vision.caption": ["doubao-seed-2.0-mini", "doubao-seed-2.0-lite", "doubao-seed-2.1-lite", "doubao-seed-2.1-turbo", "doubao-seed-2.1-pro", "doubao-seed-evolving"],
+        "vision.ocr": ["doubao-seed-2.0-mini", "doubao-seed-2.0-lite", "doubao-seed-2.1-lite", "doubao-seed-2.1-turbo", "doubao-seed-2.1-pro", "doubao-seed-evolving", "deepseek-v4.1-flash", "glm-5.3-flash", "minimax-m3", "kimi-k2.7-code", "kimi-k2.8-preview", "kimi-k3"],
+        "vision.caption": ["doubao-seed-2.0-mini", "doubao-seed-2.0-lite", "doubao-seed-2.1-lite", "doubao-seed-2.1-turbo", "doubao-seed-2.1-pro", "doubao-seed-evolving", "deepseek-v4.1-flash", "glm-5.3-flash", "minimax-m3", "kimi-k2.7-code", "kimi-k2.8-preview", "kimi-k3"],
         "embedding.multimodal": ["doubao-embedding-vision"],
         "audio.tts": ["doubao-seed-tts-2.0"],
         "image.txt2img": ["doubao-seedream-5.0-lite", "doubao-seedream-5-0-pro"],
@@ -1680,6 +1703,14 @@
           "variants": { "reasoning-medium": { "thinking": { "type": "enabled" } } }
         },
         {
+          "model_ids": ["kimi-k2.8-preview"],
+          "variants": {
+            "reasoning-low": { "reasoning": { "effort": "low" } },
+            "reasoning-high": { "reasoning": { "effort": "high" } },
+            "reasoning-max": { "reasoning": { "effort": "max" } }
+          }
+        },
+        {
           "model_ids": ["kimi-k3"],
           "variants": {
             "reasoning-low": { "reasoning": { "effort": "low" } },
@@ -1690,7 +1721,7 @@
       ],
       "test_model_ids": { "llm": "doubao-seed-2.0-mini", "vision.ocr": "doubao-seed-2.0-mini", "vision.caption": "doubao-seed-2.0-mini", "embedding.multimodal": "doubao-embedding-vision", "audio.tts": "doubao-seed-tts-2.0", "image.txt2img": "doubao-seedream-5.0-lite", "image.img2img": "doubao-seedream-5.0-lite", "video.txt2video": "doubao-seedance-2.0", "video.img2video": "doubao-seedance-2.0", "video.video2video": "doubao-seedance-2.0", "video.extend": "doubao-seedance-2.0" },
       "contracts": [{
-        "id": "doubao.responses.plan-v3",
+        "id": "doubao-agent-plan.responses.plan-v3",
         "protocol_adapter_id": "doubao-responses",
         "api_version": "plan-v3",
         "api_types": ["llm", "vision.ocr", "vision.caption"],
@@ -1707,7 +1738,7 @@
         "official_sources": ["https://docs.volcengine.com/docs/ark/agent-plan-enterprise-voice-model?lang=zh", "https://www.volcengine.com/docs/82379/1958524?lang=zh"],
         "evidence_summary": "Agent Plan OpenAI-compatible inference uses the dedicated /api/plan/v3 base URL and Responses JSON/SSE wire."
       }, {
-        "id": "doubao.embedding-multimodal.plan-v3",
+        "id": "doubao-agent-plan.embedding-multimodal.plan-v3",
         "protocol_adapter_id": "doubao-responses",
         "api_version": "plan-v3",
         "api_types": ["embedding.multimodal"],
@@ -1723,7 +1754,7 @@
         "official_sources": ["https://www.volcengine.com/docs/82379/1526459"],
         "evidence_summary": "Ark multimodal embedding uses POST /embeddings/multimodal with typed text/image input items."
       }, {
-        "id": "doubao.images.plan-v3",
+        "id": "doubao-agent-plan.images.plan-v3",
         "protocol_adapter_id": "doubao-responses",
         "api_version": "plan-v3",
         "api_types": ["image.txt2img", "image.img2img"],
@@ -1735,11 +1766,11 @@
         "required_body_fields": ["model", "prompt", "response_format"],
         "allowed_body_fields": ["model", "prompt", "image", "response_format", "size", "seed", "sequential_image_generation", "sequential_image_generation_options"],
         "body_field_types": { "model": ["string"], "prompt": ["string"], "image": ["array"], "response_format": ["string"], "size": ["string"], "seed": ["number"] },
-        "success_fixture": { "created": 1770000000, "data": [{ "url": "http://mock/artifacts/doubao.jpeg" }], "usage": { "generated_images": 1 } },
+        "success_fixture": { "created": 1770000000, "data": [{ "url": "http://mock-artifact/artifacts/doubao.jpeg?X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Credential=t15&X-Tos-Signature=t15-signature" }], "usage": { "generated_images": 1 } },
         "official_sources": ["https://docs.volcengine.com/docs/ark/agent-plan-enterprise-visual-models?lang=zh"],
         "evidence_summary": "Agent Plan Seedream image generation uses POST /api/plan/v3/images/generations for text-to-image and image-to-image."
       }, {
-        "id": "doubao.video-tasks.plan-v3",
+        "id": "doubao-agent-plan.video-tasks.plan-v3",
         "protocol_adapter_id": "doubao-responses",
         "api_version": "plan-v3",
         "api_types": ["video.txt2video", "video.img2video", "video.video2video", "video.extend"],
@@ -1771,7 +1802,7 @@
           "id": "doubao_video_mock_1",
           "status": "succeeded",
           "content": {
-            "video_url": "http://mock/artifacts/doubao.mp4"
+            "video_url": "http://mock-artifact/artifacts/doubao.mp4?X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Credential=t15&X-Tos-Signature=t15-signature"
           },
           "usage": {
             "completion_tokens": 100,
@@ -1782,7 +1813,7 @@
         "official_sources": ["https://docs.volcengine.com/docs/ark/agent-plan-enterprise-visual-models?lang=zh"],
         "evidence_summary": "Agent Plan Seedance video generation uses /api/plan/v3 asynchronous content generation tasks with GET status/result and DELETE cancellation."
       }, {
-        "id": "doubao.tts.plan-v3",
+        "id": "doubao-agent-plan.tts.plan-v3",
         "protocol_adapter_id": "doubao-responses",
         "error_fixture_key": "doubao-tts",
         "api_version": "plan-v3",
@@ -1818,6 +1849,408 @@
       }]
     },
     {
+      "provider_driver": "doubao-speech",
+      "provider_profile_id": "doubao-speech",
+      "endpoint_path": "/api/v3",
+      "operation_endpoint_paths": {
+        "tts.unidirectional": "/api/v3/tts",
+        "asr.recognize.submit": "/api/v3/auc/bigmodel",
+        "asr.recognize.flash": "/api/v3/auc/bigmodel"
+      },
+      "credential_type": "bearer",
+      "official_first_party_model_ids": {
+        "audio.tts": [
+          "doubao-seed-tts-2.0"
+        ],
+        "audio.asr": [
+          "doubao-seed-asr-2.0",
+          "doubao-seed-asr-2.0-fast"
+        ]
+      },
+      "wire_distinct_model_ids": {
+        "audio.tts": [
+          "doubao-seed-tts-2.0"
+        ],
+        "audio.asr": [
+          "doubao-seed-asr-2.0",
+          "doubao-seed-asr-2.0-fast"
+        ]
+      },
+      "test_model_ids": {
+        "audio.tts": "doubao-seed-tts-2.0",
+        "audio.asr": "doubao-seed-asr-2.0"
+      },
+      "contracts": [
+        {
+          "id": "doubao-speech.tts.v3",
+          "protocol_adapter_id": "doubao-responses",
+          "error_fixture_key": "doubao-speech",
+          "api_version": "v3",
+          "api_types": [
+            "audio.tts"
+          ],
+          "test_model_ids": {
+            "audio.tts": "doubao-seed-tts-2.0"
+          },
+          "operation": "tts.unidirectional",
+          "http_method": "POST",
+          "path": "/api/v3/tts/unidirectional",
+          "auth": {
+            "kind": "header",
+            "name": "x-api-key",
+            "prefix": ""
+          },
+          "required_headers": {
+            "x-api-resource-id": "seed-tts-2.0",
+            "x-control-require-usage-tokens-return": "*"
+          },
+          "content_type": "application/json",
+          "required_body_fields": [
+            "req_params"
+          ],
+          "allowed_body_fields": [
+            "req_params"
+          ],
+          "body_field_types": {
+            "req_params": [
+              "object"
+            ]
+          },
+          "required_body_values": {
+            "/req_params/speaker": "zh_female_vv_uranus_bigtts"
+          },
+          "json_string_body_values": {
+            "/req_params/additions": {
+              "context_texts": ["Speak calmly"],
+              "explicit_language": "en"
+            }
+          },
+          "forbidden_body_paths": [
+            "/req_params/context_texts"
+          ],
+          "canonical_request_overrides": {
+            "voice": {
+              "language": "en-US",
+              "instructions": "Speak calmly"
+            }
+          },
+          "success_content_type": "text/plain",
+          "success_chunk_fixtures": [
+            {
+              "code": 0,
+              "message": "",
+              "data": "SUQz"
+            },
+            {
+              "code": 0,
+              "message": "",
+              "data": "BA==",
+              "usage": {
+                "text_words": 5
+              }
+            },
+            {
+              "code": 20000000,
+              "message": "OK",
+              "data": null
+            }
+          ],
+          "official_sources": [
+            "https://www.volcengine.com/docs/6561/1598757?lang=zh",
+            "https://www.volcengine.com/docs/6257/2607681?lang=zh"
+          ],
+          "evidence_summary": "Doubao Voice unidirectional TTS posts req_params to /api/v3/tts/unidirectional with X-Api-Key, X-Api-Resource-Id and the usage tokens control header, and streams newline-delimited JSON frames terminated by code 20000000."
+        },
+        {
+          "id": "doubao-speech.asr.flash.v3",
+          "protocol_adapter_id": "doubao-responses",
+          "error_fixture_key": "doubao-asr",
+          "api_version": "v3",
+          "api_types": [
+            "audio.asr"
+          ],
+          "test_model_ids": {
+            "audio.asr": "doubao-seed-asr-2.0-fast"
+          },
+          "operation": "asr.recognize.flash",
+          "http_method": "POST",
+          "path": "/api/v3/auc/bigmodel/recognize/flash",
+          "auth": {
+            "kind": "header",
+            "name": "x-api-key",
+            "prefix": ""
+          },
+          "required_headers": {
+            "x-api-resource-id": "volc.bigasr.auc_turbo"
+          },
+          "content_type": "application/json",
+          "required_body_fields": [
+            "user",
+            "audio",
+            "request"
+          ],
+          "allowed_body_fields": [
+            "user",
+            "audio",
+            "request"
+          ],
+          "body_field_types": {
+            "user": [
+              "object"
+            ],
+            "audio": [
+              "object"
+            ],
+            "request": [
+              "object"
+            ]
+          },
+          "required_body_values": {
+            "/request/enable_speaker_info": true,
+            "/request/show_utterances": true
+          },
+          "success_fixture": {
+            "result": {
+              "text": "The quick brown fox jumps over the lazy dog.",
+              "utterances": [
+                {
+                  "text": "The quick brown fox jumps over the lazy dog.",
+                  "start_time": 0,
+                  "end_time": 2140
+                }
+              ]
+            },
+            "audio_info": {
+              "duration": 2140
+            }
+          },
+          "official_sources": [
+            "https://www.volcengine.com/docs/6561/1354869?lang=zh"
+          ],
+          "evidence_summary": "Doubao Voice ASR flash posts user/audio/request to the AUC bigmodel recognize/flash path with resource id volc.bigasr.auc_turbo; success is signalled by X-Api-Status-Code 20000000 and the transcript is in result.text with optional result.utterances."
+        },
+        {
+          "id": "doubao-speech.asr.task.v3",
+          "protocol_adapter_id": "doubao-responses",
+          "error_fixture_key": "doubao-asr",
+          "api_version": "v3",
+          "api_types": [
+            "audio.asr"
+          ],
+          "test_model_ids": {
+            "audio.asr": "doubao-seed-asr-2.0"
+          },
+          "operation": "asr.recognize.submit",
+          "http_method": "POST",
+          "path": "/api/v3/auc/bigmodel/submit",
+          "auth": {
+            "kind": "header",
+            "name": "x-api-key",
+            "prefix": ""
+          },
+          "required_headers": {
+            "x-api-resource-id": "volc.seedasr.auc"
+          },
+          "content_type": "application/json",
+          "required_body_fields": [
+            "user",
+            "audio",
+            "request"
+          ],
+          "allowed_body_fields": [
+            "user",
+            "audio",
+            "request"
+          ],
+          "body_field_types": {
+            "user": [
+              "object"
+            ],
+            "audio": [
+              "object"
+            ],
+            "request": [
+              "object"
+            ]
+          },
+          "required_body_values": {
+            "/request/enable_speaker_info": true,
+            "/request/show_utterances": true
+          },
+          "required_body_paths": [
+            "/audio/url"
+          ],
+          "forbidden_body_paths": [
+            "/audio/data"
+          ],
+          "async_protocol": "doubao_asr",
+          "async_steps": [
+            {
+              "name": "poll",
+              "http_method": "POST",
+              "path": "/api/v3/auc/bigmodel/query"
+            },
+            {
+              "name": "result",
+              "http_method": "POST",
+              "path": "/api/v3/auc/bigmodel/query"
+            }
+          ],
+          "success_fixture": {
+            "result": {
+              "text": "The quick brown fox jumps over the lazy dog.",
+              "utterances": [
+                {
+                  "text": "The quick brown fox jumps over the lazy dog.",
+                  "start_time": 0,
+                  "end_time": 2140
+                }
+              ]
+            },
+            "audio_info": {
+              "duration": 2140
+            }
+          },
+          "official_sources": [
+            "https://www.volcengine.com/docs/6561/1354868?lang=zh"
+          ],
+          "evidence_summary": "Doubao Voice ASR standard submits one absolute audio URL to the AUC bigmodel submit path with resource id volc.seedasr.auc, then polls the query path with the returned X-Api-Request-Id until X-Api-Status-Code reports 20000000 and the transcript arrives in result.text."
+        }
+      ]
+    },
+    {
+      "provider_driver": "doubao",
+      "provider_profile_id": "doubao",
+      "endpoint_path": "/api/v3",
+      "operation_endpoint_paths": {"ark.images.generate": "/api/v3", "ark.embeddings.multimodal": "/api/v3", "ark.contents.generate": "/api/v3"},
+      "credential_type": "bearer",
+      "instance_fields": {"region": "cn-beijing"},
+      "official_first_party_model_ids": {
+        "llm": ["doubao-seed-2-0-lite-260428", "doubao-seed-2-1-turbo-260628", "doubao-seed-translation-250915"],
+        "vision.ocr": ["doubao-seed-2-0-lite-260428", "doubao-seed-2-1-turbo-260628"],
+        "vision.caption": ["doubao-seed-2-0-lite-260428", "doubao-seed-2-1-turbo-260628"],
+        "embedding.multimodal": ["doubao-embedding-vision-251215"],
+        "image.txt2img": ["doubao-seedream-5-0-pro-260628"],
+        "image.img2img": ["doubao-seedream-5-0-pro-260628"],
+        "video.txt2video": ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-mini-260615", "doubao-seedance-2-5-260628"],
+        "video.img2video": ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-mini-260615", "doubao-seedance-2-5-260628"],
+        "video.video2video": ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-mini-260615", "doubao-seedance-2-5-260628"],
+        "video.extend": ["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128", "doubao-seedance-2-0-mini-260615", "doubao-seedance-2-5-260628"]
+      },
+      "official_variant_sources": ["https://docs.volcengine.com/docs/ark/deep-thinking?lang=zh", "https://www.volcengine.com/docs/82379/1554682"],
+      "official_variant_rules": [{
+        "model_ids": ["doubao-seed-2-0-lite-260428", "doubao-seed-2-1-turbo-260628"],
+        "variants": {"reasoning-none": {"reasoning": {"effort": "minimal"}}}
+      }],
+      "test_model_ids": {
+        "llm": "doubao-seed-2-0-lite-260428",
+        "vision.ocr": "doubao-seed-2-0-lite-260428",
+        "vision.caption": "doubao-seed-2-0-lite-260428",
+        "embedding.multimodal": "doubao-embedding-vision-251215",
+        "image.txt2img": "doubao-seedream-5-0-pro-260628",
+        "image.img2img": "doubao-seedream-5-0-pro-260628",
+        "video.txt2video": "doubao-seedance-2-0-260128",
+        "video.img2video": "doubao-seedance-2-0-260128",
+        "video.video2video": "doubao-seedance-2-0-260128",
+        "video.extend": "doubao-seedance-2-0-260128"
+      },
+      "contracts": [{
+        "id": "doubao.responses.v3",
+        "protocol_adapter_id": "doubao-responses",
+        "error_fixture_key": "doubao",
+        "api_version": "v3",
+        "api_types": ["llm", "vision.ocr", "vision.caption"],
+        "operation": "responses.create",
+        "http_method": "POST",
+        "path": "/api/v3/responses",
+        "auth": {"kind": "header", "name": "authorization", "prefix": "Bearer "},
+        "content_type": "application/json",
+        "required_body_fields": ["model", "input"],
+        "allowed_body_fields": ["model", "input", "instructions", "max_output_tokens", "previous_response_id", "reasoning", "store", "stream", "temperature", "text", "thinking", "tool_choice", "tools", "top_p"],
+        "body_field_types": {"model": ["string"], "input": ["string", "array"], "stream": ["boolean"], "reasoning": ["object"], "thinking": ["object"]},
+        "stream_protocol": "openai_responses",
+        "success_fixture": {"created_at": 1780000000, "id": "resp_doubao_standard_mock_1", "model": "doubao-seed-2-0-lite-260428", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "BUCKYOS-AICC-4827", "annotations": []}], "status": "completed", "id": "msg_mock_1"}], "status": "completed", "store": false, "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7}},
+        "official_sources": ["https://www.volcengine.com/docs/82379/1585128", "https://docs.volcengine.com/docs/82379/1362931?lang=zh"],
+        "evidence_summary": "Standard ModelArk Responses uses the /api/v3 base URL with OpenAI-compatible JSON and SSE semantics."
+      }, {
+        "id": "doubao.translation.responses.v3",
+        "protocol_adapter_id": "doubao-responses",
+        "error_fixture_key": "doubao",
+        "api_version": "v3",
+        "api_types": ["llm"],
+        "test_model_ids": {"llm": "doubao-seed-translation-250915"},
+        "operation": "responses.create",
+        "http_method": "POST",
+        "path": "/api/v3/responses",
+        "auth": {"kind": "header", "name": "authorization", "prefix": "Bearer "},
+        "content_type": "application/json",
+        "required_body_fields": ["model", "input"],
+        "allowed_body_fields": ["model", "input", "instructions", "max_output_tokens", "previous_response_id", "reasoning", "store", "stream", "temperature", "text", "thinking", "tool_choice", "tools", "top_p"],
+        "body_field_types": {"model": ["string"], "input": ["array"], "stream": ["boolean"], "reasoning": ["object"], "thinking": ["object"]},
+        "success_fixture": {"created_at": 1780000000, "id": "resp_doubao_translation_mock_1", "model": "doubao-seed-translation-250915", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "BUCKYOS-AICC-4827", "annotations": []}], "status": "completed", "id": "msg_translation_mock_1"}], "status": "completed", "store": false, "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7}},
+        "official_sources": ["https://www.volcengine.com/docs/82379/1820188", "https://www.volcengine.com/docs/82379/1585128"],
+        "evidence_summary": "Doubao Seed Translation uses Responses only and requires translation_options.target_language as a supported language code in the user input_text content block."
+      }, {
+        "id": "doubao.video-tasks.v3",
+        "protocol_adapter_id": "doubao-responses",
+        "error_fixture_key": "doubao",
+        "api_version": "v3",
+        "api_types": ["video.txt2video", "video.img2video", "video.video2video", "video.extend"],
+        "operation": "ark.contents.generate",
+        "http_method": "POST",
+        "path": "/api/v3/contents/generations/tasks",
+        "auth": {"kind": "header", "name": "authorization", "prefix": "Bearer "},
+        "content_type": "application/json",
+        "required_body_fields": ["model", "content"],
+        "allowed_body_fields": ["model", "content", "duration", "ratio", "resolution", "seed", "generate_audio", "omni_reference_task_type"],
+        "body_field_types": {"model": ["string"], "content": ["array"], "duration": ["integer"], "ratio": ["string"], "resolution": ["string"], "seed": ["number"], "generate_audio": ["boolean"], "omni_reference_task_type": ["string"]},
+        "async_protocol": "doubao_video",
+        "async_steps": [
+          {"name": "poll", "http_method": "GET", "path": "/api/v3/contents/generations/tasks/doubao_video_v3_mock_1"},
+          {"name": "result", "http_method": "GET", "path": "/api/v3/contents/generations/tasks/doubao_video_v3_mock_1"},
+          {"name": "cancel", "http_method": "DELETE", "path": "/api/v3/contents/generations/tasks/doubao_video_v3_mock_1"}
+        ],
+        "success_fixture": {"id": "doubao_video_v3_mock_1", "status": "queued"},
+        "async_result_fixture": {"id": "doubao_video_v3_mock_1", "status": "succeeded", "content": {"video_url": "http://mock-artifact/artifacts/doubao-v3.mp4?X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Credential=t15&X-Tos-Signature=t15-signature"}},
+        "official_sources": ["https://docs.volcengine.com/docs/ark/get-video-generation-task-api?lang=zh", "https://docs.volcengine.com/docs/ark/seedance-2-0?lang=zh", "https://docs.volcengine.com/docs/82379/2607688?lang=zh"],
+        "evidence_summary": "Standard Seedance uses /api/v3 asynchronous content-generation tasks and returns the result URL as content.video_url; Seedance 2.5 uses omni_reference_task_type for edit and extend validation."
+      }, {
+        "id": "doubao.embedding-multimodal.v3",
+        "protocol_adapter_id": "doubao-responses",
+        "error_fixture_key": "doubao",
+        "api_version": "v3",
+        "api_types": ["embedding.multimodal"],
+        "operation": "ark.embeddings.multimodal",
+        "http_method": "POST",
+        "path": "/api/v3/embeddings/multimodal",
+        "auth": {"kind": "header", "name": "authorization", "prefix": "Bearer "},
+        "content_type": "application/json",
+        "required_body_fields": ["model", "input"],
+        "allowed_body_fields": ["model", "input", "encoding_format", "dimensions"],
+        "body_field_types": {"model": ["string"], "input": ["array"], "encoding_format": ["string"], "dimensions": ["number"]},
+        "success_fixture": {"object": "list", "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}], "model": "doubao-embedding-vision-251215", "usage": {"prompt_tokens": 2, "total_tokens": 2}},
+        "official_sources": ["https://www.volcengine.com/docs/82379/1526459"],
+        "evidence_summary": "Standard Ark multimodal embedding uses POST /api/v3/embeddings/multimodal with typed text/image input items."
+      }, {
+        "id": "doubao.images.v3",
+        "protocol_adapter_id": "doubao-responses",
+        "error_fixture_key": "doubao",
+        "api_version": "v3",
+        "api_types": ["image.txt2img", "image.img2img"],
+        "operation": "ark.images.generate",
+        "http_method": "POST",
+        "path": "/api/v3/images/generations",
+        "auth": {"kind": "header", "name": "authorization", "prefix": "Bearer "},
+        "content_type": "application/json",
+        "required_body_fields": ["model", "prompt", "response_format"],
+        "allowed_body_fields": ["model", "prompt", "image", "response_format", "size", "seed", "sequential_image_generation", "sequential_image_generation_options"],
+        "body_field_types": {"model": ["string"], "prompt": ["string"], "image": ["array"], "response_format": ["string"], "size": ["string"], "seed": ["number"]},
+        "success_fixture": {"created": 1780000000, "data": [{"url": "http://mock-artifact/artifacts/doubao-standard.jpeg?X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Credential=t15&X-Tos-Signature=t15-signature"}], "usage": {"generated_images": 1}},
+        "official_sources": ["https://docs.volcengine.com/docs/82379/1541523?lang=zh"],
+        "evidence_summary": "Standard Seedream image generation uses POST /api/v3/images/generations for text-to-image and image-to-image."
+      }]
+    },
+    {
       "provider_driver": "qwen",
       "provider_profile_id": "qwen",
       "endpoint_path": "/compatible-mode/v1",
@@ -1833,15 +2266,17 @@
         "vision.ocr": [
           "qwen3.8-max",
           "qwen3.8-flash",
+          "qwen3.7-plus",
           "qwen3.8-omni-flash"
         ],
         "vision.caption": [
           "qwen3.8-max",
           "qwen3.8-flash",
+          "qwen3.7-plus",
           "qwen3.8-omni-flash"
         ],
         "image.txt2img": [
-          "wan2.1-t2i-turbo"
+          "wanx2.1-t2i-turbo"
         ],
         "image.img2img": [
           "qwen-image-edit"
@@ -1850,24 +2285,117 @@
           "wan2.6-t2v"
         ]
       },
-      "official_variant_sources": ["https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-responses"],
+      "official_aggregated_model_ids": {
+        "llm": [
+          "deepseek-v4-flash-0731",
+          "deepseek-v4-flash",
+          "deepseek-v4-pro-0813",
+          "deepseek-v4-pro",
+          "deepseek-v4.1-flash",
+          "vanchin/deepseek-v4-pro-0813",
+          "vanchin/deepseek-v4-pro",
+          "vanchin/deepseek-v4.1-flash",
+          "glm-4.7",
+          "glm-5",
+          "glm-5.1",
+          "glm-5.2",
+          "glm-5.3",
+          "ZHIPU/GLM-5",
+          "ZHIPU/GLM-5.1",
+          "ZHIPU/GLM-5.2",
+          "ZHIPU/GLM-5.3",
+          "ZHIPU/GLM-5.3-Flash",
+          "kimi-k2.6",
+          "kimi-k2.7-code",
+          "kimi-k3",
+          "kimi/kimi-k2.6",
+          "kimi/kimi-k2.7-code",
+          "kimi/kimi-k2.7-code-highspeed",
+          "kimi/kimi-k2.8-preview",
+          "kimi/kimi-k3",
+          "MiniMax-M2.1",
+          "MiniMax-M2.5",
+          "MiniMax/MiniMax-M2.1",
+          "MiniMax/MiniMax-M2.5",
+          "MiniMax/MiniMax-M2.7",
+          "MiniMax/MiniMax-M3"
+        ],
+        "vision.ocr": ["deepseek-v4.1-flash", "vanchin/deepseek-v4.1-flash", "ZHIPU/GLM-5.3-Flash", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3", "kimi/kimi-k2.6", "kimi/kimi-k2.7-code", "kimi/kimi-k2.7-code-highspeed", "kimi/kimi-k2.8-preview", "kimi/kimi-k3", "MiniMax/MiniMax-M3"],
+        "vision.caption": ["deepseek-v4.1-flash", "vanchin/deepseek-v4.1-flash", "ZHIPU/GLM-5.3-Flash", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3", "kimi/kimi-k2.6", "kimi/kimi-k2.7-code", "kimi/kimi-k2.7-code-highspeed", "kimi/kimi-k2.8-preview", "kimi/kimi-k3", "MiniMax/MiniMax-M3"]
+      },
+      "official_variant_sources": ["https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-responses", "https://help.aliyun.com/zh/model-studio/deepseek-api-by-vanchin", "https://help.aliyun.com/zh/model-studio/glm-zhipu", "https://help.aliyun.com/zh/model-studio/kimi-api-by-moonshot-ai", "https://help.aliyun.com/zh/model-studio/minimax-api-by-minimax"],
       "official_variant_rules": [{
-        "model_ids": ["qwen3.8-max", "qwen3.8-flash", "qwen3.7-plus", "qwen3.8-omni-flash"],
+        "model_ids": ["qwen3.8-max", "qwen3.8-flash", "qwen3.8-omni-flash"],
         "variants": {
           "reasoning-none": { "reasoning": { "effort": "none" } },
-          "reasoning-mini": { "reasoning": { "effort": "minimal" } },
           "reasoning-low": { "reasoning": { "effort": "low" } },
           "reasoning-medium": { "reasoning": { "effort": "medium" } },
-          "reasoning-high": { "reasoning": { "effort": "high" } },
-          "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } },
-          "reasoning-max": { "reasoning": { "effort": "max" } }
+          "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } }
+        }
+      }, {
+        "model_ids": ["qwen3.7-plus"],
+        "variants": {
+          "reasoning-none": { "reasoning": { "effort": "none" } },
+          "reasoning-thinking": { "reasoning": { "effort": "xhigh" } }
+        }
+      }, {
+        "model_ids": ["deepseek-v4-flash-0731", "deepseek-v4-flash", "deepseek-v4-pro-0813", "deepseek-v4-pro", "deepseek-v4.1-flash", "vanchin/deepseek-v4-pro-0813", "vanchin/deepseek-v4-pro", "vanchin/deepseek-v4.1-flash"],
+        "variants": {
+          "reasoning-none": { "enable_thinking": false },
+          "reasoning-low": { "enable_thinking": true, "reasoning_effort": "low" },
+          "reasoning-high": { "enable_thinking": true, "reasoning_effort": "high" },
+          "reasoning-max": { "enable_thinking": true, "reasoning_effort": "max" }
+        }
+      }, {
+        "model_ids": ["glm-5", "glm-5.1", "ZHIPU/GLM-5", "ZHIPU/GLM-5.1"],
+        "variants": {
+          "reasoning-none": { "enable_thinking": false },
+          "reasoning-thinking": { "enable_thinking": true }
+        }
+      }, {
+        "model_ids": ["glm-5.2", "ZHIPU/GLM-5.2"],
+        "variants": {
+          "reasoning-none": { "enable_thinking": false },
+          "reasoning-thinking": { "enable_thinking": true },
+          "reasoning-high": { "enable_thinking": true, "reasoning_effort": "high" },
+          "reasoning-max": { "enable_thinking": true, "reasoning_effort": "max" }
+        }
+      }, {
+        "model_ids": ["glm-5.3", "ZHIPU/GLM-5.3", "ZHIPU/GLM-5.3-Flash"],
+        "variants": {
+          "reasoning-low": { "enable_thinking": true, "reasoning_effort": "low" },
+          "reasoning-high": { "enable_thinking": true, "reasoning_effort": "high" },
+          "reasoning-max": { "enable_thinking": true, "reasoning_effort": "max" }
+        }
+      }, {
+        "model_ids": ["kimi-k2.6", "kimi/kimi-k2.6"],
+        "variants": {
+          "reasoning-none": { "enable_thinking": false },
+          "reasoning-medium": { "enable_thinking": true }
+        }
+      }, {
+        "model_ids": ["kimi-k2.7-code", "kimi/kimi-k2.7-code", "kimi/kimi-k2.7-code-highspeed"],
+        "variants": {
+          "reasoning-medium": { "enable_thinking": true, "preserve_thinking": true }
+        }
+      }, {
+        "model_ids": ["kimi-k3", "kimi/kimi-k2.8-preview", "kimi/kimi-k3"],
+        "variants": {
+          "reasoning-low": { "reasoning_effort": "low" },
+          "reasoning-high": { "reasoning_effort": "high" },
+          "reasoning-max": { "reasoning_effort": "max" }
+        }
+      }, {
+        "model_ids": ["MiniMax/MiniMax-M3"],
+        "variants": {
+          "reasoning-none": { "thinking": { "type": "disabled" } }
         }
       }],
       "test_model_ids": {
         "llm": "qwen3.8-max",
         "vision.ocr": "qwen3.8-max",
         "vision.caption": "qwen3.8-max",
-        "image.txt2img": "wan2.1-t2i-turbo",
+        "image.txt2img": "wanx2.1-t2i-turbo",
         "image.img2img": "qwen-image-edit",
         "video.txt2video": "wan2.6-t2v"
       },
@@ -1887,9 +2415,30 @@
         "body_field_types": { "model": ["string"], "input": ["string", "array"], "stream": ["boolean"], "reasoning": ["object"] },
         "stream_protocol": "openai_responses",
         "success_fixture": { "id": "resp_qwen_mock_1", "object": "response", "created_at": 1770000000, "status": "completed", "model": "qwen3.8-max", "output": [{ "type": "message", "id": "msg_mock_1", "status": "completed", "role": "assistant", "content": [{ "type": "output_text", "text": "BUCKYOS-AICC-4827", "annotations": [] }] }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+        "inline_artifact_success_fixture": { "id": "resp_qwen_inline_artifact_mock_1", "object": "response", "created_at": 1770000000, "status": "completed", "model": "qwen3.8-max", "output": [{ "type": "message", "id": "msg_qwen_inline_artifact_mock_1", "status": "completed", "role": "assistant", "content": [{ "type": "output_text", "text": "BUCKYOS-AICC-4827", "annotations": [] }] }, { "type": "image_generation_call", "id": "ig_qwen_inline_artifact_mock_1", "status": "completed", "result": "aW1hZ2U=", "output_format": "png" }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+        "inline_artifact_payload_paths": ["/output/1/result"],
         "official_sources": ["https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-responses", "https://www.alibabacloud.com/help/en/model-studio/error-code"],
-        "evidence_summary": "Qwen workspace-compatible Responses uses POST /compatible-mode/v1/responses with Bearer authentication and JSON model/input, returning OpenAI-style response output."
+        "evidence_summary": "Qwen workspace-compatible Responses uses POST /compatible-mode/v1/responses with Bearer authentication and JSON model/input, returning OpenAI-style response output. The inline artifact fixture is an adapter regression fixture for the delegated OpenAI Responses output shape, not a declaration that every Qwen model supports image generation."
       },
+        {
+          "id": "qwen.chat-completions.compatible-v1",
+          "protocol_adapter_id": "qwen-responses",
+          "api_version": "compatible-v1",
+          "api_types": ["llm", "vision.ocr", "vision.caption"],
+          "test_model_ids": {"llm": "deepseek-v4-flash", "vision.ocr": "kimi/kimi-k2.6", "vision.caption": "kimi/kimi-k2.6"},
+          "operation": "chat.completions.create",
+          "http_method": "POST",
+          "path": "/compatible-mode/v1/chat/completions",
+          "auth": {"kind": "header", "name": "authorization", "prefix": "Bearer "},
+          "content_type": "application/json",
+          "required_body_fields": ["model", "messages"],
+          "allowed_body_fields": ["model", "messages", "max_completion_tokens", "max_tokens", "response_format", "stop", "stream", "stream_options", "tools", "tool_choice", "enable_thinking", "preserve_thinking", "thinking", "tool_stream", "thinking_budget", "reasoning_effort", "temperature", "top_p", "seed", "presence_penalty", "frequency_penalty", "n", "logprobs", "top_logprobs"],
+          "body_field_types": {"model": ["string"], "messages": ["array"], "max_completion_tokens": ["integer"], "max_tokens": ["integer"], "stream": ["boolean"], "enable_thinking": ["boolean"], "preserve_thinking": ["boolean"], "thinking": ["object"], "tool_stream": ["boolean"], "temperature": ["number"], "top_p": ["number"], "seed": ["integer"]},
+          "stream_protocol": "openai_chat",
+          "success_fixture": {"id": "chatcmpl_qwen_aggregated_mock_1", "object": "chat.completion", "created": 1770000000, "model": "deepseek-v4-flash", "choices": [{"index": 0, "message": {"role": "assistant", "content": "BUCKYOS-AICC-4827"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}},
+          "official_sources": ["https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-chat-completions", "https://www.alibabacloud.com/help/en/model-studio/models", "https://www.alibabacloud.com/help/en/model-studio/error-code"],
+          "evidence_summary": "Alibaba Cloud Model Studio exposes DeepSeek, Kimi, GLM, and MiniMax through POST /compatible-mode/v1/chat/completions with Bearer authentication and OpenAI-compatible chat responses."
+        },
         {
           "id": "qwen.dashscope.image_synthesis.v1",
           "protocol_adapter_id": "qwen-responses",
@@ -1960,7 +2509,7 @@
               "task_status": "SUCCEEDED",
               "results": [
                 {
-                  "url": "http://mock/artifacts/result.png"
+                  "url": "http://mock-artifact/artifacts/result.png"
                 },
                 {
                   "code": "DataInspectionFailed",
@@ -2022,7 +2571,7 @@
                     "role": "assistant",
                     "content": [
                       {
-                        "image": "http://mock/artifacts/result.png"
+                        "image": "http://mock-artifact/artifacts/result.png"
                       }
                     ]
                   }
@@ -2102,7 +2651,7 @@
             "output": {
               "task_id": "qwen_task_mock_1",
               "task_status": "SUCCEEDED",
-              "video_url": "http://mock/artifacts/result.mp4"
+              "video_url": "http://mock-artifact/artifacts/result.mp4"
             },
             "usage": {
               "video_count": 1,
@@ -2160,6 +2709,7 @@
     }
   ],
   "error_evidence": {
+    "doubao-speech": {"applicable_api_versions": ["v3"], "official_sources": ["https://www.volcengine.com/docs/6561/1354869?lang=zh", "https://www.volcengine.com/docs/6561/1257584?lang=zh"], "evidence_summary": "Doubao Voice reports authentication, request, throttling and service errors through HTTP status plus header.code/header.message for TTS and X-Api-Status-Code/X-Api-Message for AUC speech recognition."},
     "typesafe": {"applicable_api_versions": ["v1"], "official_sources": ["https://docs.typesafe.ai/api"], "evidence_summary": "HTTP 401 invalid key, 422 validation, 429 rate limit and 529 overload; errors are opaque JSON."},
     "openai": { "applicable_api_versions": ["v1"], "official_sources": ["https://platform.openai.com/docs/guides/error-codes/api-errors"], "evidence_summary": "OpenAI documents HTTP authentication, permission, request, not-found, rate-limit and server error categories with an error envelope." },
     "claude": { "applicable_api_versions": ["2023-06-01"], "official_sources": ["https://platform.claude.com/docs/en/api/errors"], "evidence_summary": "Anthropic documents status-specific error.type values and the top-level error/request_id envelope." },
@@ -2170,12 +2720,28 @@
     "kimi": { "applicable_api_versions": ["v1"], "official_sources": ["https://platform.kimi.com/docs/api/errors"], "evidence_summary": "Kimi documents error.type/message envelopes for invalid requests, authentication, permissions, missing resources, rate limits, quota and server failures." },
     "glm": { "applicable_api_versions": ["v4"], "official_sources": ["https://docs.bigmodel.cn/cn/api/api-code", "https://docs.bigmodel.cn/cn/api/rate-limit"], "evidence_summary": "GLM documents an error code/message envelope with HTTP status plus business codes including 1000 authentication, 1210 invalid parameter, 1302 rate limit and 1305 overload." },
     "deepseek": { "applicable_api_versions": ["v1"], "official_sources": ["https://api-docs.deepseek.com/quick_start/error_codes/"], "evidence_summary": "DeepSeek documents 400 invalid format, 401 authentication, 402 balance, 422 invalid parameters, 429 rate limit and 5xx service failures." },
-    "doubao": { "applicable_api_versions": ["plan-v3"], "official_sources": ["https://www.volcengine.com/docs/82379/1330312?lang=zh"], "evidence_summary": "Volcano Ark documents OpenAI-compatible error envelopes and HTTP-aligned request, authentication, throttling and server failure codes." },
-    "doubao-tts": { "applicable_api_versions": ["plan-v3"], "official_sources": ["https://docs.volcengine.com/docs/ark/agent-plan-enterprise-voice-model?lang=zh"], "evidence_summary": "Agent Plan TTS reports authentication, request, throttling and service errors through HTTP status and code/message fields." },
+    "doubao-agent-plan": { "applicable_api_versions": ["plan-v3"], "official_sources": ["https://www.volcengine.com/docs/82379/1330312?lang=zh"], "evidence_summary": "Volcano Ark documents OpenAI-compatible error envelopes and HTTP-aligned request, authentication, throttling and server failure codes." },
+    "doubao": { "applicable_api_versions": ["v3"], "official_sources": ["https://www.volcengine.com/docs/82379/1330312?lang=zh"], "evidence_summary": "Standard ModelArk documents OpenAI-compatible error envelopes and HTTP-aligned request, authentication, throttling and server failure codes." },
+    "doubao-tts": { "applicable_api_versions": ["v3", "plan-v3"], "official_sources": ["https://www.volcengine.com/docs/6561/2528925?lang=zh", "https://docs.volcengine.com/docs/ark/agent-plan-enterprise-voice-model?lang=zh"], "evidence_summary": "Standard and Agent Plan TTS report authentication, request, throttling and service errors through HTTP status and header.code/header.message fields." },
     "qwen": { "applicable_api_versions": ["compatible-v1"], "official_sources": ["https://www.alibabacloud.com/help/en/model-studio/error-code"], "evidence_summary": "Alibaba Model Studio documents OpenAI-compatible error codes including invalid_request_error, invalid_api_key, access_denied, Throttling and InternalError." },
     "sn-ai-provider": { "applicable_api_versions": ["v1"], "official_sources": ["https://github.com/buckyos/sn-business/blob/f765081d5ae038b9eeec14cb38e6af12750db31a/src/modules/sn_aicc/src/http/error.rs"], "evidence_summary": "SN source at f765081 defines HTTP errors as code/message and the 429 insufficient-balance special case as an OpenAI-shaped nested error." }
   },
   "error_fixtures": {
+    "doubao-asr": [
+      { "scenario": "empty_audio", "status": 200, "body": {}, "headers": { "x-api-status-code": "45000002", "x-api-message": "empty audio" } },
+      { "scenario": "invalid_audio_format", "status": 200, "body": {}, "headers": { "x-api-status-code": "45000151", "x-api-message": "invalid audio format" } },
+      { "scenario": "server_busy", "status": 200, "body": {}, "headers": { "x-api-status-code": "55000031", "x-api-message": "server busy" } },
+      { "scenario": "invalid_request", "status": 400, "body": { "header": { "reqid": "mock-doubao-speech-invalid", "code": 40000000, "message": "invalid request" } }, "headers": { "x-api-status-code": "40000000", "x-api-message": "invalid request" } },
+      { "scenario": "authentication", "status": 401, "body": { "header": { "reqid": "mock-doubao-speech-auth", "code": 45000010, "message": "Invalid X-Api-Key" } }, "headers": { "x-api-status-code": "45000010", "x-api-message": "Invalid X-Api-Key" } },
+      { "scenario": "rate_limit", "status": 429, "body": { "header": { "reqid": "mock-doubao-speech-rate-limit", "code": 42900000, "message": "rate limit reached" } }, "headers": { "x-api-status-code": "42900000", "x-api-message": "rate limit reached" } },
+      { "scenario": "server_error", "status": 500, "body": { "header": { "reqid": "mock-doubao-speech-server", "code": 50000000, "message": "internal service error" } }, "headers": { "x-api-status-code": "50000000", "x-api-message": "internal service error" } }
+    ],
+    "doubao-speech": [
+      { "scenario": "invalid_request", "status": 400, "body": { "header": { "reqid": "mock-doubao-speech-invalid", "code": 40000000, "message": "invalid request" } }, "headers": { "x-api-status-code": "40000000", "x-api-message": "invalid request" } },
+      { "scenario": "authentication", "status": 401, "body": { "header": { "reqid": "mock-doubao-speech-auth", "code": 45000010, "message": "Invalid X-Api-Key" } }, "headers": { "x-api-status-code": "45000010", "x-api-message": "Invalid X-Api-Key" } },
+      { "scenario": "rate_limit", "status": 429, "body": { "header": { "reqid": "mock-doubao-speech-rate-limit", "code": 42900000, "message": "rate limit reached" } }, "headers": { "x-api-status-code": "42900000", "x-api-message": "rate limit reached" } },
+      { "scenario": "server_error", "status": 500, "body": { "header": { "reqid": "mock-doubao-speech-server", "code": 50000000, "message": "internal service error" } }, "headers": { "x-api-status-code": "50000000", "x-api-message": "internal service error" } }
+    ],
     "typesafe": [{"scenario": "auth", "status": 401, "body": {"detail": "Invalid API key"}}, {"scenario": "rate_limit", "status": 429, "body": {"detail": "Rate limit exceeded"}, "headers": {"retry-after": "1"}}, {"scenario": "server_error", "status": 529, "body": {"detail": "Overloaded"}}],
     "openai": [
       { "scenario": "invalid_request", "status": 400, "body": { "error": { "message": "Invalid request", "type": "invalid_request_error", "param": null, "code": null } } },
@@ -2246,6 +2812,13 @@
       { "scenario": "rate_limit", "status": 429, "body": { "error": { "message": "Rate limit reached", "type": "rate_limit_error", "code": "rate_limit_exceeded" } } },
       { "scenario": "overloaded", "status": 503, "body": { "error": { "message": "Server overloaded", "type": "server_error", "code": "server_overloaded" } } }
     ],
+    "doubao-agent-plan": [
+      { "scenario": "invalid_request", "status": 400, "body": { "error": { "code": "InvalidParameter", "message": "The request parameter is invalid", "param": "input", "type": "BadRequest" } } },
+      { "scenario": "authentication", "status": 401, "body": { "error": { "code": "AuthenticationError", "message": "Invalid API key", "param": "", "type": "Unauthorized" } } },
+      { "scenario": "rate_limit", "status": 429, "body": { "error": { "code": "RequestBurstTooFast", "message": "System protection triggered by request burst", "param": "", "type": "TooManyRequests" } } },
+      { "scenario": "overloaded", "status": 429, "body": { "error": { "code": "ServerOverloaded", "message": "The service is currently unable to handle additional requests", "param": "", "type": "TooManyRequests" } } },
+      { "scenario": "server_error", "status": 500, "body": { "error": { "code": "InternalServiceError", "message": "Internal service error", "param": "", "type": "InternalServerError" } } }
+    ],
     "doubao": [
       { "scenario": "invalid_request", "status": 400, "body": { "error": { "code": "InvalidParameter", "message": "The request parameter is invalid", "param": "input", "type": "BadRequest" } } },
       { "scenario": "authentication", "status": 401, "body": { "error": { "code": "AuthenticationError", "message": "Invalid API key", "param": "", "type": "Unauthorized" } } },
@@ -2254,10 +2827,10 @@
       { "scenario": "server_error", "status": 500, "body": { "error": { "code": "InternalServiceError", "message": "Internal service error", "param": "", "type": "InternalServerError" } } }
     ],
     "doubao-tts": [
-      { "scenario": "invalid_request", "status": 400, "body": { "code": 40000000, "message": "invalid request" } },
-      { "scenario": "authentication", "status": 401, "body": { "code": 40100000, "message": "invalid api key" } },
-      { "scenario": "rate_limit", "status": 429, "body": { "code": 42900000, "message": "rate limit reached" } },
-      { "scenario": "server_error", "status": 500, "body": { "code": 50000000, "message": "internal service error" } }
+      { "scenario": "invalid_request", "status": 400, "body": { "header": { "reqid": "mock-doubao-tts-invalid", "code": 40000000, "message": "invalid request" } } },
+      { "scenario": "authentication", "status": 401, "body": { "header": { "reqid": "mock-doubao-tts-auth", "code": 45000010, "message": "Invalid X-Api-Key" } } },
+      { "scenario": "rate_limit", "status": 429, "body": { "header": { "reqid": "mock-doubao-tts-rate-limit", "code": 42900000, "message": "rate limit reached" } } },
+      { "scenario": "server_error", "status": 500, "body": { "header": { "reqid": "mock-doubao-tts-server", "code": 50000000, "message": "internal service error" } } }
     ],
     "qwen": [
       { "scenario": "invalid_request", "status": 400, "body": { "error": { "code": "invalid_request_error", "message": "You must provide a model parameter", "type": "invalid_request_error" } } },

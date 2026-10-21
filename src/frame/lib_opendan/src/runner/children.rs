@@ -102,8 +102,37 @@ fn cut(mut text: String) -> String {
     text
 }
 
-fn summary_of(e: &RegistryEntry, attention: Option<&str>) -> String {
+/// The Todo attempt a sub session executes, as the parent's list binds it.
+struct TodoOf {
+    todo_id: String,
+    attempt: u32,
+    summary: Option<String>,
+}
+
+/// `brief`: one line only — a UI parent shows the end in its background
+/// context and reads the report on demand (`agent-session read-session`).
+fn summary_of(
+    e: &RegistryEntry,
+    attention: Option<&str>,
+    todo: Option<&TodoOf>,
+    brief: bool,
+) -> String {
     let st = &e.status;
+    // An exploration's end is told through its Todo: a line, and where the
+    // report is; the report itself is read on demand.
+    if let (Some(t), Some(ATTENTION_FINISHED)) = (todo, attention) {
+        return cut(format!(
+            "sub session {} of todo {} (attempt {}) finished ({}): {}\nRead the report with `agent-session todo show {} --report`, then review it.",
+            e.session_id,
+            t.todo_id,
+            t.attempt,
+            st.outcome
+                .map(|o| format!("{o:?}").to_lowercase())
+                .unwrap_or_else(|| "no outcome".into()),
+            t.summary.clone().unwrap_or_else(|| st.one_line_status.clone()),
+            t.todo_id
+        ));
+    }
     let mut text = match attention {
         Some(ATTENTION_FINISHED) => format!(
             "sub session {} finished ({})",
@@ -124,6 +153,13 @@ fn summary_of(e: &RegistryEntry, attention: Option<&str>) -> String {
     if !st.one_line_status.is_empty() {
         text.push_str(&format!(": {}", st.one_line_status));
     }
+    if brief {
+        let mut line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.chars().count() > 300 {
+            line = format!("{}…", line.chars().take(299).collect::<String>());
+        }
+        return line;
+    }
     if attention == Some(ATTENTION_FINISHED) && !st.report_brief.is_empty() {
         text.push_str(&format!("\nreport: {}", st.report_brief));
     }
@@ -132,7 +168,11 @@ fn summary_of(e: &RegistryEntry, attention: Option<&str>) -> String {
 
 /// Sub sessions the session still has to hear from before it may finish:
 /// reporting children that are not finished, or whose end was not delivered.
+/// A Goal Session never waits for its Work (a later Activation takes it in).
 pub(super) async fn unsettled_children(sh: &Shared) -> Result<Vec<String>> {
+    if super::goal::is_goal(&sh.session.lock().await.config) {
+        return Ok(Vec::new());
+    }
     let me = sh.dir.sid().to_string();
     let children = sh.agent().sessions().children_of(&[me]).await?;
     let s = sh.session.lock().await;
@@ -144,6 +184,40 @@ pub(super) async fn unsettled_children(sh: &Shared) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The sub sessions a session hears from: its own children; for a Goal
+/// Session every Work of its Goal not taken in yet, whichever epoch created
+/// it (a new epoch takes over the Work of the one before).
+async fn watched_children(sh: &Shared) -> Result<Vec<RegistryEntry>> {
+    let me = sh.dir.sid().to_string();
+    let mut children = sh.agent().sessions().children_of(&[me.clone()]).await?;
+    let goal = {
+        let s = sh.session.lock().await;
+        s.state
+            .goal
+            .as_ref()
+            .map(|g| (g.goal_id.clone(), g.state.absorbed.clone()))
+    };
+    let Some((goal_id, absorbed)) = goal else {
+        return Ok(children);
+    };
+    for e in sh
+        .agent()
+        .sessions()
+        .query(&RegistryQuery {
+            goal_id: Some(goal_id),
+            ..Default::default()
+        })
+        .await?
+    {
+        if e.kind != SessionKind::Goal && !children.iter().any(|c| c.session_id == e.session_id) {
+            children.push(e);
+        }
+    }
+    children.retain(|e| !absorbed.contains(&e.session_id));
+    children.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(children)
+}
+
 /// One look at the session's sub sessions. Progress is saved as
 /// semi-subscription state (and committed here); what needs the parent's
 /// attention is returned as input candidates. `pending_tasks`: task ids the
@@ -152,16 +226,20 @@ pub(super) async fn poll_children(
     sh: &Arc<Shared>,
     pending_tasks: &[String],
 ) -> Result<Vec<FetchedInput>> {
-    let me = sh.dir.sid().to_string();
-    let children = sh.agent().sessions().children_of(&[me]).await?;
+    let children = watched_children(sh).await?;
     if children.is_empty() {
         return Ok(Vec::new());
     }
     let mut inputs = Vec::new();
+    let todos: Vec<(String, TodoOf)> = super::todos::bound_children(sh)
+        .into_iter()
+        .map(|(sid, todo_id, attempt, summary)| (sid, TodoOf { todo_id, attempt, summary }))
+        .collect();
     let mut s = sh.session.lock().await;
     if s.state.is_finished() {
         return Ok(inputs);
     }
+    let brief = s.config.session.kind == SessionKind::Ui;
     let mut changed = false;
     for e in &children {
         let Some(report) = reports(e) else {
@@ -180,7 +258,12 @@ pub(super) async fn poll_children(
                     source: EventSource::new("session", sid),
                     event: a.to_string(),
                     seq: Some(e.status.rev),
-                    summary: summary_of(e, Some(a)),
+                    summary: summary_of(
+                        e,
+                        Some(a),
+                        todos.iter().find(|(c, _)| c == sid).map(|(_, t)| t),
+                        brief,
+                    ),
                     data_ref: None,
                     terminal: a == ATTENTION_FINISHED,
                 };
@@ -221,7 +304,7 @@ pub(super) async fn poll_children(
                     source: EventSource::new("session", sid),
                     event: "progress".to_string(),
                     seq: Some(e.status.rev),
-                    summary: summary_of(e, None),
+                    summary: summary_of(e, None, None, false),
                     data_ref: None,
                     terminal: false,
                 };
@@ -367,6 +450,10 @@ impl RunningTaskResolver for SessionTaskResolver {
     fn can_resolve(&self, task_id: &str) -> bool {
         task_id.starts_with(SESSION_TASK_PREFIX)
             || self.inner.as_ref().is_some_and(|i| i.can_resolve(task_id))
+    }
+
+    fn result_seen(&self, task_id: &str) -> bool {
+        self.inner.as_ref().is_some_and(|i| i.result_seen(task_id))
     }
 
     fn watch(&self, task_id: &str) {

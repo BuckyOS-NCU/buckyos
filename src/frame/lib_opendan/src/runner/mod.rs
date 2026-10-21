@@ -4,10 +4,13 @@
 //! protocol piece used here is xllm's run directory (§8.7).
 
 pub mod assembler;
+pub mod background;
+mod ask;
 mod children;
 mod drive;
 pub mod input_view;
 mod flush;
+mod goal;
 pub mod history;
 mod hook;
 mod inputs;
@@ -15,10 +18,12 @@ mod live;
 mod outbound;
 mod outcome;
 mod receipts;
+mod reports;
 mod reconcile;
 mod rounds;
 mod shared;
 mod tools;
+mod todos;
 mod turn_task;
 
 use std::path::PathBuf;
@@ -42,13 +47,15 @@ pub use assembler::{
 pub use children::{SessionTaskResolver, SESSION_TASK_PREFIX};
 pub use drive::drive;
 pub use outbound::{
-    compose_text, has_pending_outbound, OutboundSink, SendResult, TurnReply, AGENT_TASK_META,
+    compose_reply, has_pending_outbound, OutboundSink, SendResult, TurnReply, AGENT_TASK_META,
 };
+pub use reports::ObjectStore;
 pub use turn_task::{
     has_pending_turn_tasks, TurnTaskEnd, TurnTaskOpen, TurnTaskSink, TurnTaskStatus,
 };
 pub use history::{LlmSummarizer, Summarizer};
 pub use tools::classify_effect;
+pub(crate) use inputs::side_effects_from_worklog as side_effects_of;
 
 /// When `drive` returns (a property of this call, not a session end
 /// condition).
@@ -234,10 +241,18 @@ pub struct RunnerDeps {
     pub notifier: Arc<dyn Notifier>,
     /// Where replies leave the process (`None`: no outbox is kept).
     pub outbound: Option<Arc<dyn OutboundSink>>,
+    /// Where report artifacts become objects (`None`: they stay files).
+    pub objects: Option<Arc<dyn ObjectStore>>,
     /// The host's task service (`None`: Turns get no task).
     pub turn_tasks: Option<Arc<dyn TurnTaskSink>>,
+    /// The host's notification service (`None`: a Work cannot ask its
+    /// user).
+    pub notify: Option<Arc<dyn crate::notify::NotifyHost>>,
     /// Executable wrapped as `agent-session` in `.runtime/bin`.
     pub session_cli: Option<PathBuf>,
+    /// Further commands of the host in `.runtime/bin`
+    /// (`llm_understand_media` …).
+    pub session_helpers: Vec<crate::runtime::bin_overlay::SessionHelper>,
     /// Tools that only exist in this runner process (`requirement.app_tools`).
     pub app_tools: Vec<String>,
     pub options: RunnerOptions,
@@ -264,8 +279,11 @@ impl RunnerDeps {
             summarizer: None,
             notifier: Arc::new(NoopNotifier),
             outbound: None,
+            objects: None,
             turn_tasks: None,
+            notify: None,
             session_cli: None,
+            session_helpers: Vec::new(),
             app_tools: Vec::new(),
             options: RunnerOptions::default(),
             stop: StopSignal::default(),

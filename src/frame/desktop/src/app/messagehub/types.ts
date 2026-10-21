@@ -46,6 +46,12 @@ export interface Entity {
   sessionCount?: number
   /** Visible REQUEST_BOX records across the entity's sessions. */
   requestCount?: number
+  /**
+   * The system notify sender (the Zone DID) holding the user's notification
+   * sessions `sysnotify:todo|agent|app`: shown as "System notifications", no
+   * session can be created and nothing can be sent.
+   */
+  systemNotify?: boolean
 }
 
 export interface MessagePreview {
@@ -114,7 +120,7 @@ export interface EntityDetail extends Entity {
   note?: string
   createdAt?: number
   /** Contact admission level of the current owner towards this entity. */
-  accessLevel?: 'block' | 'stranger' | 'temporary' | 'friend'
+  accessLevel?: 'block' | 'stranger' | 'temporary' | 'allow'
   isVerified?: boolean
   contactSource?: string
 }

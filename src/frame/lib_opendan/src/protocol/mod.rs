@@ -9,22 +9,28 @@
 pub mod agent_state;
 pub mod behavior;
 pub mod config;
+pub mod goal;
 pub mod input;
 pub mod misc;
+pub mod report;
 pub mod runtime;
 pub mod state;
 pub mod summary;
 pub mod worklog;
+pub mod workspace;
 
 pub use agent_state::*;
 pub use behavior::*;
 pub use config::*;
+pub use goal::*;
 pub use input::*;
 pub use misc::*;
+pub use report::*;
 pub use runtime::*;
 pub use state::*;
 pub use summary::*;
 pub use worklog::*;
+pub use workspace::*;
 
 /// Directory holding the session state inside a session directory.
 pub const STATE_DIR: &str = ".opendan_agent_session";
@@ -54,6 +60,8 @@ pub fn json_schemas() -> Vec<(&'static str, serde_json::Value)> {
         ("behavior_entry", s::<config::BehaviorEntry>()),
         ("behavior_config", s::<behavior::BehaviorConfig>()),
         ("session_state", s::<state::SessionState>()),
+        ("todo_list", s::<agent_tool::todo_tools::TodoList>()),
+        ("report_submission", s::<report::ReportSubmission>()),
         ("session_summary", s::<summary::SessionSummary>()),
         ("worklog_entry", s::<worklog::WorklogEntry>()),
         ("lock_info", s::<misc::LockInfo>()),
@@ -71,6 +79,18 @@ pub fn json_schemas() -> Vec<(&'static str, serde_json::Value)> {
         ("control_command", s::<input::ControlCommand>()),
         ("input_receipt", s::<input::InputReceipt>()),
         ("host_meta", s::<input::HostMeta>()),
+        ("workspace_metadata", s::<workspace::WorkspaceMetadata>()),
+        ("workspace_record", s::<workspace::WorkspaceRecord>()),
         ("runtime_descriptor", s::<runtime::RuntimeDescriptor>()),
+        ("runtime_record", s::<runtime::RuntimeRecord>()),
+        ("user_input_request", s::<input::UserInputRequest>()),
+        ("user_input_answer", s::<input::UserInputAnswer>()),
+        ("ask_notify", s::<input::AskNotify>()),
+        ("goal", s::<goal::GoalDefinition>()),
+        ("goal_change", s::<goal::GoalChange>()),
+        ("goal_state", s::<goal::GoalState>()),
+        ("goal_activation", s::<goal::GoalActivation>()),
+        ("goal_schedule", s::<goal::GoalSchedule>()),
+        ("goal_result", s::<goal::GoalResult>()),
     ]
 }

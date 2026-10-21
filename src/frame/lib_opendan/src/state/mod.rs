@@ -10,10 +10,13 @@ mod behaviors;
 mod cognition;
 mod connect;
 mod fs_client;
+pub mod goals;
 pub mod krpc;
 mod locks;
-mod perception;
+pub mod perception;
 mod registry;
+mod runtimes;
+mod workspaces;
 
 use std::path::Path;
 
@@ -29,17 +32,21 @@ pub use activity::{
 };
 pub use artifacts::{nearest_valid_base, DecideResult};
 pub use behaviors::{
-    freeze_behavior, freeze_config, parse_behavior, BehaviorCatalog, FsBehaviorCatalog,
-    MemBehaviorCatalog,
+    check_cmd_skill_names, freeze_behavior, freeze_config, parse_behavior, BehaviorCatalog,
+    FsBehaviorCatalog, MemBehaviorCatalog, CMD_SKILLS_DIR, ROLE_SUPPLEMENT_FILE,
 };
 pub use cognition::{ConsolidationBatch, Hint, NotebookNote, RecallQuery};
 pub use connect::{
     connect, register_in_process, unregister_in_process, ConnectOptions, ForwardingStateClient,
-    StateLocator, WithBehaviors, ENV_AGENT_ROOT, ENV_AGENT_STATE_URL,
+    StateLocator, WithBehaviors, WithNotify, ENV_AGENT_ROOT, ENV_AGENT_STATE_URL,
 };
 pub use fs_client::{AgentLayout, FsAgentStateClient};
+pub use goals::{
+    ActivationQuery, CallerKind, GoalCaller, GoalCreate, GoalReopen, GoalRestart, GoalRevise,
+    GoalStatusChange, GoalStore,
+};
 pub use krpc::{KrpcAgentStateClient, KrpcTransport, StateTransport};
-pub use perception::{run_digest, Backlog, BacklogItem};
+pub use perception::{run_digest, Backlog, BacklogItem, PERCEPTION_LOCK_TIMEOUT};
 
 /// Session registry (session mgr, §6.2). The only entry point to discover
 /// every session of an agent, wherever its directory lives.
@@ -152,6 +159,42 @@ pub trait LockManager: Send + Sync {
     fn is_held(&self, resource: &str) -> Result<bool>;
 }
 
+#[async_trait]
+pub trait WorkspaceManager: Send + Sync {
+    async fn create(&self, request: &WorkspaceCreate, who: &str) -> Result<WorkspaceRecord>;
+    async fn import(&self, request: &WorkspaceImport, who: &str) -> Result<WorkspaceRecord>;
+    async fn discover(&self, request: &WorkspaceDiscover, who: &str) -> Result<WorkspaceRecord>;
+    async fn lookup(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+    async fn query(&self, query: &WorkspaceQuery) -> Result<Vec<WorkspaceRecord>>;
+    async fn check(&self, workspace_id: &str) -> Result<WorkspaceRecord>;
+    async fn update(&self, workspace_id: &str, request: &WorkspaceUpdate, who: &str) -> Result<WorkspaceRecord>;
+    async fn archive(&self, workspace_id: &str, expected_revision: u64, who: &str) -> Result<WorkspaceRecord> {
+        self.update(workspace_id, &WorkspaceUpdate { expected_revision, lifecycle: Some(WorkspaceLifecycle::Archived), private_notes: None }, who).await
+    }
+    async fn unregister(&self, workspace_id: &str, expected_revision: u64, who: &str) -> Result<()>;
+    async fn runtime_impact(&self, runtime_id: &str) -> Result<Vec<WorkspaceRecord>>;
+    async fn set_runtime_available(&self, runtime_id: &str, available: bool, who: &str) -> Result<Vec<WorkspaceRecord>>;
+}
+
+/// Runtimes of the agent (`state/runtimes/`): what its sessions and
+/// workspaces may run in. Writes are signed with the caller.
+#[async_trait]
+pub trait RuntimeRegistry: Send + Sync {
+    async fn list(&self) -> Result<Vec<RuntimeRecord>>;
+    /// `local` is read as `container`.
+    async fn lookup(&self, runtime_id: &str) -> Result<Option<RuntimeRecord>>;
+    /// A runtime an owner adds (idempotent for the same registration).
+    async fn register(&self, request: &RuntimeRegister, who: &str) -> Result<RuntimeRecord>;
+    async fn update(&self, runtime_id: &str, request: &RuntimeUpdate, who: &str) -> Result<RuntimeRecord>;
+    /// Whether this host can use it now (writes the observation).
+    async fn check(&self, runtime_id: &str) -> Result<RuntimeRecord>;
+    /// Built-in runtimes are refused.
+    async fn unregister(&self, runtime_id: &str, expected_revision: u64, who: &str) -> Result<()>;
+    /// Host: the built-in runtimes, created when missing; what an owner
+    /// changed of them is kept.
+    async fn ensure_builtin(&self, builtin: &[RuntimeRegister], who: &str) -> Result<Vec<RuntimeRecord>>;
+}
+
 /// The SDK boundary to Agent State (not a protocol; the protocol is the file
 /// layout and the locks behind it).
 pub trait AgentStateClient: Send + Sync {
@@ -165,8 +208,16 @@ pub trait AgentStateClient: Send + Sync {
     fn perception(&self) -> &dyn Perception;
     fn cognition(&self) -> &dyn Cognition;
     fn artifacts(&self) -> &dyn Artifacts;
+    fn workspaces(&self) -> &dyn WorkspaceManager;
+    fn runtimes(&self) -> &dyn RuntimeRegistry;
     fn locks(&self) -> &dyn LockManager;
     /// The agent's behaviors and identity text (frozen into a session when
     /// it is constructed).
     fn behaviors(&self) -> &dyn BehaviorCatalog;
+    /// The agent's Goals (`state/goals/`).
+    fn goals(&self) -> &dyn GoalStore;
+    /// The host's notification service (`None`: not available here).
+    fn notifies(&self) -> Option<&dyn crate::notify::NotifyHost> {
+        None
+    }
 }

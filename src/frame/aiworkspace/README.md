@@ -18,9 +18,12 @@ server/    aiworkspace        process entry, kRPC dispatch, upload/download rout
                               wish/: run orchestration, xllm adapter and host tools, Deno program runner, llm.map
 aiws/      aiws v2 package    program host (aiws.js, run.js), API doc for the model, prompts, renderer catalog (deno test)
 wasm/      aiworkspace-wasm   wasm-bindgen facade of core for the browser replica (`wasm/build.sh` writes it into the Desktop app)
+import-drawio/                draw.io import/export and the canvas geometry shared with the Desktop (TypeScript, no
+                              dependencies, runs in the browser and Deno; see its README; `deno test -A`)
 schemas/   richtext.basic.v1.json (single source for the Rust validator and the ProseMirror schema)
 fixtures/  project-workspace/commits.json (the shared sample as a commit sequence), presentation/commits.json (the third
-           phase M0 fixture: a five-step mixed path and a guide), vectors/
+           phase M0 fixture: a five-step mixed path and a guide), vectors/, drawio/ (draw.io files and their expected
+           import plans)
 ```
 
 ## Run
@@ -62,7 +65,9 @@ holding the presentation paths and Viewports (below). They exist from
 Annotation, `buckyos.wish`, `buckyos.block-def`); `surfaces` takes `surface` containers; `surface` / `group`
 take Cells and groups only. A Surface names its content folder (`content_folder_id`); the folder may point back
 (`surface_id`). A Surface may carry `icon`: the id of a client-side preset icon (`[a-z][a-z0-9-]{0,31}`, Surfaces
-only; the client owns the preset list), a shared, undoable key projected into the outline like `title`. `placement` is `{ x, y, w, h, rotation? }` relative to the parent (`rotation`: degrees clockwise about the centre,
+only; the client owns the preset list), a shared, undoable key projected into the outline like `title`. A Surface may also
+carry `config`, its page settings (`background`, `page_size`; an object of at most 64 KiB the client checks, read with
+`doc.read`, not projected; draw.io 导入 TODO §2.5). `placement` is `{ x, y, w, h, rotation? }` relative to the parent (`rotation`: degrees clockwise about the centre,
 `[0, 360)`, absent = 0); stacking order is `order_key`. A Cell or a group may carry `locked: true`: a shared flag
 the client honours (no moves, resizing or deletion from the canvas) and the core only checks for being boolean.
 `FORMAT_VERSION` is 0.3 since these two keys (older kernels would refuse them on replay or import); stores and
@@ -205,7 +210,8 @@ AICC, iterations, `max_output_tokens` (every stage sends it; Claude requires one
 `llm.map` item limit, `deno`). The service exchanges its startup assertion at verify-hub before it listens:
 AICC accepts only verify-hub sessions. Standalone:
 `--wish-config <json>` with `{ provider: { type: "openai", base_url, api_key_env }, analyze_model, … }`.
-Deno: `deno` setting → `AIWS_DENO` → `$BUCKYOS_ROOT/libexec/buckyos-tool/runtime/deno` → `PATH`.
+Deno: `deno` setting → `AIWS_DENO` → `$BUCKYOS_ROOT/libexec/buckyos-tool/runtime/deno` → `PATH`
+(`deno.exe` on Windows). The Windows program subprocess retains `SystemRoot` after clearing its environment.
 
 ## Storage
 
@@ -228,11 +234,17 @@ kRPC: `POST /kapi/aiworkspace` with `{ "method", "params", "sys": [seq, session_
 or the three-state commit result (`status: accepted | conflict | rejected`). The kRPC `error`
 string is used only for an invalid token, an unknown method or an unparsable request.
 
+**Guests.** A public link's visitor has no session: `sys[1]` (or the bearer of the upload / asset / export
+routes) carries a guest token instead, `gt_` + 26 base32 chars the browser made up and keeps. The caller is
+then `guest:<26 chars>` (derived from the token's SHA-256, never the token itself), reaches only the grants
+of subject `public`, and cannot own anything: `ws.list` is empty, `ws.create` / `ws.fork` / `ws.import` /
+`ws.list_subjects` are denied. `ws.get_info` returns `principal` so a guest learns who it is.
+
 | Method | Params (besides `workspace_id`) |
 | --- | --- |
 | `ws.create` | `title`, `workspace_id?` |
 | `ws.list`, `ws.get_info`, `ws.delete`, `ws.fork` | |
-| `ws.grant` / `ws.revoke` / `ws.list_grants` | `subject`, `scope_entity_id?`, `capabilities[]`; `list_grants` returns every row and the `owner` to a manager, only the caller's own rows otherwise (`complete: false`, no owner) |
+| `ws.grant` / `ws.revoke` / `ws.list_grants` | `subject`, `scope_entity_id?`, `capabilities[]`; `list_grants` returns every row and the `owner` to a manager, only the rows that apply to the caller otherwise (`complete: false`, no owner). Subjects: a principal, `*` (any authenticated principal) or `public` (everyone, a public link; never `manage`) |
 | `ws.list_subjects` | principals a grant can name (static identities / zone users) |
 | `ws.get_user_state` / `ws.set_user_state` | `entries: { key: value \| null }` — user work state per subject and Workspace in `local.sqlite`; never a Commit |
 | `ws.begin_import` → PUT → `ws.import` | `upload_id`, `semantics: "restore" \| "new"`, `replace?` |

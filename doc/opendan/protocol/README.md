@@ -1,7 +1,9 @@
 # Agent Session 协议（反写 Spec）
 
-- 版本：5（session_input 为 /3，session_config 为 /5，session_state 为 /5，binding 为 /3，xllm RunRecord.version = 5；summary 与机械渲染保持 /2，快照 snapshot_version = 4）。版本 5（2026-10-03，xagent）把 session_config 升到 /5：`session.policy`（Session 模板）、`origin.report / created_by_call`（Sub Session）、`prompt.frozen`（behavior 冻结）、`prompt.initial_inputs`（无输入队列的首批输入）；登记表 `status` 增加 `waiting_for / turn_open`；内部输入源 `_bootstrap`、`_child` 与 `session:<sid>` task；tmux runtime 的 id 等于 session_id。同一版本内的增量（2026-10-03，OpenDAN Loader，均为可缺省字段）：`state.outbox`（出站消息的待发列表；2026-10-04 增加 `purpose` 与占位 / 最终 edit）、`state.turn_tasks` 与 `origin.parent_task`（Turn ↔ task 绑定，2026-10-04）、`channels.outbound`（回复坐标，原为未定型的占位）、登记表 `route_key`、正式的 ui kind。版本 4（2026-10-03）引入 Session Input Bus 协议 3：总线记录收敛为 `msg / event / control`，消息体直接用 MsgObject，输入模板 `on_init / on_input / on_context_switch` 与半订阅快照，`pending_events` / `reply` / `watched_tasks`，挂起调用在上下文之外等待 task；旧版本的 Session 在显式迁移前只读。版本 3 引入共享 Runtime 的有效配置与实际目标绑定，不改变 worklog 形状。版本 2 引入逻辑 Turn（`turn_seq` / `open_turn` / `turns_completed`）、新的 worklog 条目与拆分的 flush 游标，并把工具预算改名为 `max_tool_iterations`；Round / Step / Turn 的定义见 [LLM Context readme](../../llm_context/readme.md)
-- 日期：2026-09-29；2026-10-01 按 Round / Step / Turn 术语统一更新
+- 版本：7（session_input /3、session_config /7、session_state /6、binding /4、run.json version 6、snapshot_version 5；summary /2、mechanical/3）。2026-10-10 增加显式 report 提交、`session.policy.completion`、`state.latest_report / final_report`、`report_delivery` 和持久报告 journal；XML 结束只用 report.end，取消 END / 隐式 done。旧目录不迁移。版本 5 的 Session 模板、冻结配置、输入总线、Turn/task 与出站协议继续保留。Round / Step / Turn 见 [LLM Context readme](../../llm_context/readme.md)。
+- 2026-10-11（同一主版本内的加法，不升版本）：Goal 与 Goal Session——AgentRoot `state/goals/<goal_id>/`（`opendan.goal/1`、`goal_state/1`、`goal_activation/1`、`goal_schedule/1`）、登记表与查询的 `goal_id`、`session.kind = goal` 与 `session.goal`、`origin.goal`、`policy.wait_user_msg = end_turn`、`prompt.goal_activation` 模板槽、`state.goal` 与 `state.turn_stop_requested`、`waiting_for.kind = event` 的实际使用、receipt part `goal_activation` 与 `parts[].brief` / worklog `user_message.brief`、`control(stop).scope` 与 `control(goal_skills)`、`system:goal` 运行机会事件。见 Agent State Protocol §9。
+- 2026-10-11（同一主版本内的加法，不升版本）：意图分析——behavior `[tool]` 与 `BehaviorEntry.tool`（`tool_whitelist` 的 `behavior:<name>`）、fork 目标的 `[budget]`；挂起 task `userinput:<call_id>`（`ask-user`）与它的结果 `user_input_answer`、`waiting_for = {kind: input, refs: ["userinput:…"]}`、`outbox[].purpose = question` 与 `agent_ask` meta、输入 receipt `extra.user_input`；run.json `host.extra.asks`；AgentRoot `state/runtimes/<runtime_id>.json`（`runtime_record`）与 kRPC `runtimes.*`；Workspace 位置 `runtime_id` 的 `local` 改称 `container`（旧值照读）。见 Session Input Protocol §9、Agent State Protocol §10。
+- 日期：2026-10-11
 - 来源：由 Rust 参考实现 `src/frame/lib_opendan`（crate `libopendan`）反写（[实现计划](<../Agent Session SDK 实现计划.md>) L6 / V6）。字段以 `src/protocol/` 的类型为准，本目录的 JSON Schema 由这些类型导出。
 - 读者：实现其它语言 runner（buckyos-websdk 的 ts-runner 等）的开发者，以及审查协议的人。
 
@@ -16,6 +18,8 @@
 | AgentRoot 上 Agent State 的文件布局与单写者规则 | `AgentStateClient` 的接口形态（文件版 / kRPC 版） |
 | xllm 的 run 目录（`runs/<run_id>/`）及其中宿主相关字段 | 执行跟踪的平台实现（本实现用 Linux `/proc`） |
 
+Workspace 改造新增稳定 ID、Agent State 登记和不可变执行快照；旧 Session 配置不迁移，详见 [Agent Workspace Protocol](<Agent Workspace Protocol.md>)。
+
 ## 2. 文档
 
 | 文档 | 内容 |
@@ -24,12 +28,14 @@
 | [Lease Protocol](<Lease Protocol.md>) | 推进权与各类锁、锁文件内容、接管前的执行核对 |
 | [Session Input Protocol](<Session Input Protocol.md>) | Agent 输入：总线记录（`opendan.session_input/3`）、MsgObject 消息与 AgentEvent、校验与拒绝、路由、消费进度、半订阅状态、Input 链路与内建渲染、receipt 与提交、bridge、长任务等待、Sub Session 的创建 / 汇报 / 等待 |
 | [Session Control Protocol](<Session Control Protocol.md>) | Session 控制：stop / decide / subscribe / unsubscribe / activity / perceive；驱动者自己的停止请求 |
-| [Agent State Protocol](<Agent State Protocol.md>) | AgentRoot 布局、登记表、活动视图、感知、认知边界、产物列表与 decide、behavior 目录与 Session 模板 |
+| [Agent State Protocol](<Agent State Protocol.md>) | AgentRoot 布局、登记表、活动视图、感知、认知边界、产物列表与 decide、behavior 目录（含 `[tool]`）与 Session 模板、Goals（定义 / 修订 / Goal State / Activation 记录 / epoch / 计划进度、写者与权限）、Runtime 登记 |
+| [Agent Workspace Protocol](<Agent Workspace Protocol.md>) | 稳定身份、Known Workspaces、位置修订、固定绑定、本地写锁及交接、CLI、旧目录导入与能力边界 |
 
 ## 3. 机器可读材料
 
 - `schema/*.schema.json`：由 `libopendan::protocol::json_schemas()` 导出，覆盖全部持久结构（`cargo run -p libopendan --bin xagent -- schema <dir>` 可重新导出）。
 - `fixtures/<NN>_<scenario>/`：由 `cargo run -p libopendan --example fixtures -- doc/opendan/protocol/fixtures` 生成的黄金目录。每个场景包含 `agent_root/`、`app/<sid>/`、`kmsg/`（开发用文件队列，语义同 kmsg）和 `expected.json`。文件里的绝对路径已替换为 `${FIXTURE_ROOT}`，使用前替换为拷贝后的场景目录。
+- 为支持 Windows checkout，场景内相对路径超过 160 个 UTF-16 单元的文件保存在 `_files/<编号>`；可选的 `_paths.json` 记录「短路径 → 原始相对路径」，统一用 `/` 分隔。消费方复制场景后先按映射还原文件，再替换占位符；文件内容、协议 ID 和哈希保持原样。Rust 生成器和 fixture 测试自动处理此映射。
 - `expected.json` 的 `sessions[]` 记录解析结果（state 摘要、live_run、run.json 的门槛与在途、worklog 边界），`next` 记录符合协议的 runner 下一步必须做什么。Rust 参考实现用 `tests/fixtures.rs` 在每个场景上验证 `next`；其它语言应跑同一组断言。
 
 | 场景 | 要点 |
@@ -43,11 +49,13 @@
 | 07_receipt_ahead_of_state | 续用 run 的快照领先 state 一批：按 receipt 补交，不重复注入 |
 | 08_finished_with_decide | 应用 decide(accept) 移动产物 head，拒绝迟到的 msg 并记 worklog |
 | 09_semi_subscription | 半订阅按登记表 rev 拉取变化并入 `pending_events`，在下一次受控输入之前作为半订阅快照消息注入，不额外推理 |
-| 10_active_overlap | 两个活动 session 同一 workspace：渲染对方 activity 并标出交集 |
+| 10_active_overlap | 同一 Workspace：activity 能看到重叠，旧执行未核实时新写入者返回 Busy |
 | 11_worklog_with_summary | 反向读 worklog 在 summary 起点停止 |
 | 12_fork_child_live | fork 子 context 的 run 在跑、调用方的 run 作为 `caller` 帧挂起在 process_stack；两个 run 同属仍打开的 Turn 1 |
 | 13_unsupported_snapshot_version | 快照版本不支持：RecoveryBlocked，保留现场 |
-| 14_input_bus | 没有 session 状态：手工投递的总线记录（`records/`）及各自的处理、每种拒绝原因的记录（`rejected/`）、同一批输入的逐字节渲染（`rendering/`：`input_text.xml`、内建模板、半订阅快照、六个示例模板的 `.tpl` / `.out`、模板变量 `vars.json`、`input.media = reference / inline` 的 user 消息） |
+| 15_report_pending_commit | 最终报告与配对快照已持久但 Session 尚未关闭；恢复不推理，稳定产物与最终消息只交付一次 |
+| 16_goal_session | Goal 与它 epoch 1 的 Goal Session（两次 Activation 之间：`waiting_for = event`）、一个已结束的 Goal 派生 Work；Activation 1 吸收了定时运行机会与 Work 的结束，关闭 Turn 的提交已落盘但 Goal State 与 Activation 记录尚未写回：下一次推进只写回一次，不推理 |
+| 14_input_bus | 没有 session 状态：手工投递的总线记录（`records/`）及各自的处理、每种拒绝原因的记录（`rejected/`）、同一批输入的逐字节渲染（`rendering/`：`input_text.xml`、内建模板、半订阅快照、六个示例模板的 `.tpl` / `.out`、模板变量 `vars.json`、`input.media = reference / inline` 的 user 消息，以及 UI Session 的 chat 格式：一对一、事件批次、群聊三份 `chat_*.txt`） |
 
 其余 §11 场景（选择性消费、订阅丢失重建、ack 不回退、持有者退出后接管、非驱动者被拒、binding 准备中断后修复、discard 与 accept 并发、历史段确定性、跨 Agent/App/owner 的 sid）由 `src/frame/lib_opendan/tests/` 的用例覆盖。
 
@@ -56,5 +64,5 @@
 - 各 JSON 文件带 `schema` 字段（`opendan.<name>/<major>`）。读者遇到不认识的主版本必须拒绝（恢复时返回 RecoveryBlocked），不得猜测。当前实现加载 session 时要求 `state.json` / `session_config.json` 的 schema 精确等于当前版本；更旧的主版本以 RecoveryBlocked 拒绝推进，投递返回 `session_readonly`：旧 Session 在显式迁移前只读（可查看、导出，不能 append 或 drive）。
 - 同一主版本内只做**加法**：新增字段都有默认值；读者必须容忍未知字段，写者必须保留自己不理解的宿主元数据（如快照的 `state.host`）。
 - 主版本升级是 breaking change（beta 2.2）：不提供 serde 别名、不双读双写、不迁移旧目录；版本 1 的 session 与 run 只能保留现场，不能被版本 2 的 runner 推进。
-- 快照：`LLMContextState.snapshot_version` 当前为 3（v3 把工具预算字段改为 `tool_iterations_left` / `tool_batch.batch_error`）。`LLMContext::resume` 只接受当前版本，更旧或更新的快照都拒绝恢复（RecoveryBlocked）。
-- xllm run 记录：`RunRecord.version` 当前为 3（有效 runtime 与 runtime_descriptor）；不等于当前版本时 xllm 拒绝接手，libopendan 返回 RecoveryBlocked。
+- 快照：`LLMContextState.snapshot_version` 当前为 5（显式 report_end、报告产物与 JSON result）。`LLMContext::resume` 只接受当前版本，更旧或更新的快照都拒绝恢复（RecoveryBlocked）。
+- xllm run 记录：`RunRecord.version` 当前为 6（显式报告协议与接手规则）；不等于当前版本时 xllm 拒绝接手，libopendan 返回 RecoveryBlocked。

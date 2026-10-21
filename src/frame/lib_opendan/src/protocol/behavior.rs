@@ -63,6 +63,9 @@ pub struct BehaviorPromptConfig {
     pub on_context_switch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semi_subscription_snapshot: Option<String>,
+    /// Goal Sessions: template of the Goal header (variable `goal`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_activation: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -112,6 +115,291 @@ pub struct BehaviorEntryConfig {
     pub mode: Option<ContextMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit: Option<InheritMode>,
+    /// A hand-over to this behavior (`next_behavior`) executes the session's
+    /// next serial Todo: the host admits it and hands its body over as the
+    /// sub task (`create_sub_context` only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub todo: bool,
+}
+
+/// `[tool]`: a sub context behavior offered to its callers as a named
+/// function. Calling it runs the behavior exactly like `call_behavior`
+/// does; the declaration only decides what the caller's model sees.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorToolConfig {
+    /// Function name (letters, digits, `_`); default: the behavior name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// When to call it: the caller's routing guide.
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema of the arguments (an object); default: `{task: string}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+    /// Template of the sub context's task (`{{args.<name>}}` only); default:
+    /// the arguments as JSON (or `args.task` with the default parameters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+/// Prefix of a `tool_whitelist` entry naming a behavior's `[tool]`.
+pub const BEHAVIOR_TOOL_PREFIX: &str = "behavior:";
+
+/// `[reply]`: the reply contract of a behavior's context. The final reply
+/// (an assistant text without tool calls) is one JSON value matching
+/// `schema`: the provider enforces it natively where it can, the host
+/// checks it and asks for one correction (`OutputSpec::Json { max_repairs:
+/// Some(1) }`). Function call loop only.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorReply {
+    /// JSON Schema of the reply (an object schema).
+    pub schema: Value,
+    /// An array field of the reply that must list every question the
+    /// context asked the user (`agent-session ask-user`), one entry each.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asks_field: Option<String>,
+}
+
+impl BehaviorReply {
+    pub fn validate(&self, behavior: &str) -> std::result::Result<(), String> {
+        if self.schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(format!(
+                "behavior `{behavior}`: [reply] schema must be a JSON Schema of type object"
+            ));
+        }
+        if let Some(f) = &self.asks_field {
+            let declared = self
+                .schema
+                .pointer(&format!("/properties/{f}/type"))
+                .and_then(Value::as_str);
+            if declared != Some("array") {
+                return Err(format!(
+                    "behavior `{behavior}`: [reply] asks_field `{f}` must be an array property of the schema"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A session takes at most this many cmd_skills (`prompt.cmd_skills`).
+pub const MAX_CMD_SKILLS: usize = 8;
+
+/// `prompt.frozen.cmd_skills[]`: a command manual of the session, frozen
+/// with its behaviors (`cmd_skills/<name>.md` without its front matter).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CmdSkill {
+    pub name: String,
+    pub text: String,
+}
+
+/// Kind of an installed skill: a command manual (`cmd_skills/`) or a
+/// method a Goal uses (`goal_skills/`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillKind {
+    #[default]
+    Cmd,
+    Goal,
+}
+
+impl SkillKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkillKind::Cmd => "cmd",
+            SkillKind::Goal => "goal",
+        }
+    }
+
+    /// Directory of the AgentRoot holding skills of this kind.
+    pub fn dir(self) -> &'static str {
+        match self {
+            SkillKind::Cmd => "cmd_skills",
+            SkillKind::Goal => "goal_skills",
+        }
+    }
+}
+
+/// A skill as `skill list` shows it: the front matter of its manual and
+/// where it came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkillMeta {
+    pub kind: SkillKind,
+    pub name: String,
+    /// What the skill is for (front matter `description`).
+    #[serde(default)]
+    pub description: String,
+    /// What it needs before it works (front matter `requires`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requires: String,
+    /// `package` (the agent package) | `installed` (`skills.install`).
+    #[serde(default)]
+    pub origin: String,
+    /// An installed skill: the package it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<SkillInstallRecord>,
+    /// Commands it brings (`tools/<name>/bin`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+}
+
+/// Where an installed skill came from (`.meta/skills.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkillInstallRecord {
+    /// The PIKG package (`pkg_name`).
+    pub package: String,
+    #[serde(default)]
+    pub version: String,
+    /// Digest of the installed content (`sha256:` over its files).
+    #[serde(default)]
+    pub digest: String,
+    /// Digest of the `.pikg` file it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pikg_digest: Option<String>,
+    #[serde(default)]
+    pub installed_at_ms: u64,
+    #[serde(default)]
+    pub installed_by: String,
+}
+
+/// Split a skill manual into its front matter (`---` lines around
+/// `key: value` lines) and its body. A manual without front matter is all
+/// body.
+pub fn split_front_matter(text: &str) -> (BTreeMap<String, String>, &str) {
+    let mut fields = BTreeMap::new();
+    let trimmed = text.trim_start_matches('\u{feff}');
+    let Some(rest) = trimmed.strip_prefix("---\n").or_else(|| trimmed.strip_prefix("---\r\n")) else {
+        return (fields, text.trim());
+    };
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        offset += line.len();
+        let l = line.trim();
+        if l == "---" {
+            return (fields, rest[offset..].trim());
+        }
+        if let Some((k, v)) = l.split_once(':') {
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"')
+                .and_then(|x| x.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+                .unwrap_or(v);
+            fields.insert(k.trim().to_string(), v.to_string());
+        }
+    }
+    // No closing line: not front matter.
+    (BTreeMap::new(), text.trim())
+}
+
+/// The metadata of the manual `text` of skill `name`.
+pub fn skill_meta(kind: SkillKind, name: &str, text: &str) -> SkillMeta {
+    let (fields, _) = split_front_matter(text);
+    SkillMeta {
+        kind,
+        name: name.to_string(),
+        description: fields.get("description").cloned().unwrap_or_default(),
+        requires: fields.get("requires").cloned().unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+fn valid_function_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && name.len() <= 64
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `{{ args.<name> }}` placeholders of a task template, in order; an error
+/// for any other template syntax.
+fn task_placeholders(template: &str) -> std::result::Result<Vec<(usize, usize, String)>, String> {
+    if template.contains("{%") {
+        return Err("a task template only takes {{args.<name>}} placeholders".into());
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(start) = template[at..].find("{{").map(|i| at + i) {
+        let end = template[start..]
+            .find("}}")
+            .map(|i| start + i + 2)
+            .ok_or_else(|| "unclosed {{ in the task template".to_string())?;
+        let inner = template[start + 2..end - 2].trim();
+        let key = inner
+            .strip_prefix("args.")
+            .filter(|k| valid_function_name(k))
+            .ok_or_else(|| format!("task template placeholder `{{{{{inner}}}}}`: only args.<name> is available"))?;
+        out.push((start, end, key.to_string()));
+        at = end;
+    }
+    Ok(out)
+}
+
+impl BehaviorToolConfig {
+    pub fn function_name(&self, behavior: &str) -> String {
+        self.name.clone().unwrap_or_else(|| behavior.to_string())
+    }
+
+    pub fn args_schema(&self) -> Value {
+        self.parameters.clone().unwrap_or_else(|| {
+            json!({
+                "type": "object",
+                "properties": { "task": { "type": "string", "description": "what the sub context must do and return" } },
+                "required": ["task"]
+            })
+        })
+    }
+
+    pub fn validate(&self, behavior: &str) -> std::result::Result<(), String> {
+        let name = self.function_name(behavior);
+        if !valid_function_name(&name) {
+            return Err(format!(
+                "behavior `{behavior}`: [tool] name `{name}` must be letters, digits and `_` (at most 64)"
+            ));
+        }
+        if self.description.trim().is_empty() {
+            return Err(format!("behavior `{behavior}`: [tool] needs a description"));
+        }
+        let schema = self.args_schema();
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(format!(
+                "behavior `{behavior}`: [tool] parameters must be a JSON Schema of type object"
+            ));
+        }
+        if let Some(t) = &self.task {
+            task_placeholders(t).map_err(|e| format!("behavior `{behavior}`: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// The sub context's task for a call with `args`.
+    pub fn render_task(&self, args: &Value) -> String {
+        let text = |v: &Value| match v {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            v => v.to_string(),
+        };
+        let Some(template) = &self.task else {
+            return match (&self.parameters, args.get("task")) {
+                (None, Some(t)) => text(t),
+                _ => args.to_string(),
+            };
+        };
+        let Ok(holes) = task_placeholders(template) else {
+            return args.to_string();
+        };
+        let mut out = String::with_capacity(template.len());
+        let mut at = 0;
+        for (start, end, key) in holes {
+            out.push_str(&template[at..start]);
+            out.push_str(&args.get(&key).map(text).unwrap_or_default());
+            at = end;
+        }
+        out.push_str(&template[at..]);
+        out.trim().to_string()
+    }
 }
 
 /// One behavior of the agent, includes expanded.
@@ -132,6 +420,10 @@ pub struct BehaviorConfig {
     pub model: BehaviorModel,
     #[serde(default)]
     pub entry: BehaviorEntryConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<BehaviorToolConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<BehaviorReply>,
     /// Host hooks (`on_context_limit_reached` …): carried, not interpreted.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hooks: BTreeMap<String, Value>,
@@ -204,6 +496,18 @@ impl BehaviorConfig {
                 ))
             }
         };
+        let mut llm_context = self.overlay_llm_context(base_llm_context);
+        if mode == ContextMode::Fork {
+            // A fork keeps the caller's configuration; its `[budget]` limits
+            // the branch's run and is applied by the runner, not here.
+            if let Some(o) = llm_context.as_object_mut() {
+                o.remove("max_tool_iterations");
+                o.remove("max_tokens");
+                if o.is_empty() {
+                    llm_context = Value::Null;
+                }
+            }
+        }
         let entry = BehaviorEntry {
             mode,
             prompt: BehaviorPrompt {
@@ -212,13 +516,17 @@ impl BehaviorConfig {
                 on_input: self.prompt.on_input.clone(),
                 on_context_switch: self.prompt.on_context_switch.clone(),
                 semi_subscription_snapshot: self.prompt.semi_subscription_snapshot.clone(),
+                goal_activation: self.prompt.goal_activation.clone(),
             },
             input: self.input,
-            llm_context: self.overlay_llm_context(base_llm_context),
+            llm_context,
             inherit: self.entry.inherit.unwrap_or(match mode {
                 ContextMode::SwitchContext if initial => InheritMode::RecentDialogue,
                 _ => InheritMode::None,
             }),
+            tool: self.tool.clone(),
+            todo: self.entry.todo,
+            reply: self.reply.clone(),
         };
         entry.validate(name)?;
         Ok(entry)
@@ -253,6 +561,10 @@ pub struct FrozenPrompt {
     pub identity: IdentityText,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub behaviors: BTreeMap<String, BehaviorConfig>,
+    /// The session's cmd_skills (`prompt.cmd_skills`, in that order),
+    /// frozen once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmd_skills: Vec<CmdSkill>,
 }
 
 impl SessionConfig {

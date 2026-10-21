@@ -42,6 +42,10 @@ pub fn error_to_wire(e: &OpenDanError) -> String {
             v["pending"] = json!(pending);
         }
         OpenDanError::QueueMissing { session_id } => v["session_id"] = json!(session_id),
+        OpenDanError::Busy { resource, holder } => {
+            v["resource"] = json!(resource);
+            v["holder"] = json!(holder);
+        }
         _ => {}
     }
     v.to_string()
@@ -66,6 +70,10 @@ pub fn error_from_wire(text: &str) -> OpenDanError {
     match v["kind"].as_str().unwrap_or_default() {
         "invalid_argument" => OpenDanError::InvalidArgument(detail("invalid argument: ")),
         "not_found" => OpenDanError::NotFound(detail("not found: ")),
+        "busy" => OpenDanError::Busy {
+            resource: v["resource"].as_str().unwrap_or_default().to_string(),
+            holder: v.get("holder").cloned().filter(|h| !h.is_null()),
+        },
         "input_full" => OpenDanError::InputFull {
             session_id: v["session_id"].as_str().unwrap_or_default().to_string(),
             pending: v["pending"].as_u64().unwrap_or(MAX_PENDING_INPUTS as u64) as usize,
@@ -78,6 +86,12 @@ pub fn error_from_wire(text: &str) -> OpenDanError {
         ),
         "session_id_conflict" => OpenDanError::SessionIdConflict(detail("session id conflict: ")),
         "artifact" => OpenDanError::Artifact(detail("artifact error: ")),
+        "goal_conflict" => OpenDanError::GoalConflict(detail("goal conflict: ")),
+        "goal_budget_exhausted" => {
+            OpenDanError::GoalBudgetExhausted(detail("goal budget exhausted: "))
+        }
+        "forbidden" => OpenDanError::Forbidden(detail("forbidden: ")),
+        "notify_conflict" => OpenDanError::NotifyConflict(detail("notify conflict: ")),
         "channel" => OpenDanError::Channel(detail("input channel error: ")),
         _ => OpenDanError::Other(message),
     }
@@ -101,7 +115,46 @@ pub fn is_write(method: &str) -> bool {
             | "sessions.verify"
             | "cognition.notebook_append"
             | "artifacts.decide"
+            | "workspaces.create"
+            | "workspaces.import"
+            | "workspaces.discover"
+            | "workspaces.check"
+            | "workspaces.update"
+            | "workspaces.archive"
+            | "workspaces.unregister"
+            | "workspaces.set_runtime_available"
+            | "runtimes.register"
+            | "runtimes.update"
+            | "runtimes.check"
+            | "runtimes.unregister"
+            | "goals.create"
+            | "goals.revise"
+            | "goals.set_status"
+            | "goals.reopen"
+            | "goals.restart"
+            | "notify.send"
+            | "notify.cancel"
+            | "notify.answer"
+            | "skills.install"
+            | "skills.remove"
     )
+}
+
+/// Goal writes of a driver or the host: never served (they need the
+/// AgentRoot and, for the Goal State, the session lease).
+pub const GOAL_DRIVER_ONLY: &[&str] = &[
+    "goals.write_state",
+    "goals.append_activations",
+    "goals.prepare_epoch",
+    "goals.end_epoch",
+    "goals.write_schedule",
+];
+
+fn goal_caller(who: &str, params: &Value) -> Result<GoalCaller> {
+    Ok(GoalCaller {
+        principal: who.to_string(),
+        session: arg::<Option<String>>(params, "session")?,
+    })
 }
 
 /// Dispatch one Agent State call of `who` onto `agent`. `None`: not an
@@ -212,6 +265,71 @@ pub async fn serve_call(
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
             }
         }
+        "workspaces.create" => match arg::<WorkspaceCreate>(params, "request") {
+            Ok(request) => agent.workspaces().create(&request, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.import" => match arg::<WorkspaceImport>(params, "request") {
+            Ok(request) => agent.workspaces().import(&request, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.discover" => match arg::<WorkspaceDiscover>(params, "request") {
+            Ok(request) => agent.workspaces().discover(&request, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.lookup" => match arg::<String>(params, "workspace_id") {
+            Ok(id) => agent.workspaces().lookup(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.query" | "workspaces.list" => match arg::<Option<WorkspaceQuery>>(params, "query") {
+            Ok(query) => agent.workspaces().query(&query.unwrap_or_default()).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.check" => match arg::<String>(params, "workspace_id") {
+            Ok(id) => agent.workspaces().check(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.update" => match (arg::<String>(params, "workspace_id"), arg::<WorkspaceUpdate>(params, "request")) {
+            (Ok(id), Ok(request)) => agent.workspaces().update(&id, &request, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "workspaces.archive" => match (arg::<String>(params, "workspace_id"), arg::<u64>(params, "expected_revision")) {
+            (Ok(id), Ok(revision)) => agent.workspaces().archive(&id, revision, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "workspaces.unregister" => match (arg::<String>(params, "workspace_id"), arg::<u64>(params, "expected_revision")) {
+            (Ok(id), Ok(revision)) => agent.workspaces().unregister(&id, revision, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "workspaces.runtime_impact" => match arg::<String>(params, "runtime_id") {
+            Ok(id) => agent.workspaces().runtime_impact(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "runtimes.list" => agent.runtimes().list().await.and_then(out),
+        "runtimes.lookup" => match arg::<String>(params, "runtime_id") {
+            Ok(id) => agent.runtimes().lookup(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "runtimes.register" => match arg::<RuntimeRegister>(params, "request") {
+            Ok(request) => agent.runtimes().register(&request, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "runtimes.update" => match (arg::<String>(params, "runtime_id"), arg::<RuntimeUpdate>(params, "request")) {
+            (Ok(id), Ok(request)) => agent.runtimes().update(&id, &request, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "runtimes.check" => match arg::<String>(params, "runtime_id") {
+            Ok(id) => agent.runtimes().check(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "runtimes.unregister" => match (arg::<String>(params, "runtime_id"), arg::<u64>(params, "expected_revision")) {
+            (Ok(id), Ok(revision)) => agent.runtimes().unregister(&id, revision, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "workspaces.set_runtime_available" => match (arg::<String>(params, "runtime_id"), arg::<bool>(params, "available")) {
+            (Ok(id), Ok(available)) => agent.workspaces().set_runtime_available(&id, available, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
         "behaviors.identity" => agent.behaviors().identity().await.and_then(out),
         "behaviors.get" => match arg::<String>(params, "name") {
             Ok(n) => agent.behaviors().get(&n).await.and_then(out),
@@ -219,8 +337,136 @@ pub async fn serve_call(
         },
         "behaviors.list" => agent.behaviors().list().await.and_then(out),
         "behaviors.revision" => agent.behaviors().revision().await.and_then(out),
+        "behaviors.cmd_skill" => match arg::<String>(params, "name") {
+            Ok(n) => agent.behaviors().cmd_skill(&n).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "skills.list" => match arg::<Option<SkillKind>>(params, "kind") {
+            Ok(kind) => agent.behaviors().skills(kind).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "skills.install" => match (
+            arg::<crate::skills::SkillPackage>(params, "package"),
+            arg::<Option<bool>>(params, "replace"),
+        ) {
+            (Ok(pkg), Ok(replace)) => agent
+                .behaviors()
+                .install_skills(&pkg, replace.unwrap_or(false), who)
+                .await
+                .and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "skills.remove" => match (arg::<SkillKind>(params, "kind"), arg::<String>(params, "name")) {
+            (Ok(kind), Ok(name)) => agent.behaviors().remove_skill(kind, &name, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.list" => agent.goals().list().await.and_then(out),
+        "goals.get" => match arg::<String>(params, "goal_id") {
+            Ok(id) => agent.goals().get(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "goals.revision" => match (arg::<String>(params, "goal_id"), arg::<u64>(params, "revision")) {
+            (Ok(id), Ok(rev)) => agent.goals().revision(&id, rev).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.changes" => match (arg::<String>(params, "goal_id"), arg::<Option<usize>>(params, "limit")) {
+            (Ok(id), Ok(limit)) => agent.goals().changes(&id, limit.unwrap_or(0)).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.create" => match (arg::<GoalCreate>(params, "request"), goal_caller(who, params)) {
+            (Ok(req), Ok(c)) => agent.goals().create(&req, &c).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.revise" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalRevise>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().revise(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.set_status" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalStatusChange>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().set_status(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.reopen" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalReopen>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().reopen(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.restart" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalRestart>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().restart(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.state" => match arg::<String>(params, "goal_id") {
+            Ok(id) => agent.goals().state(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "goals.epoch_state" => match (arg::<String>(params, "goal_id"), arg::<u64>(params, "epoch")) {
+            (Ok(id), Ok(epoch)) => agent.goals().epoch_state(&id, epoch).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.activations" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<Option<ActivationQuery>>(params, "query"),
+        ) {
+            (Ok(id), Ok(q)) => agent.goals().activations(&id, &q.unwrap_or_default()).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.schedule" => match arg::<String>(params, "goal_id") {
+            Ok(id) => agent.goals().schedule(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        m if GOAL_DRIVER_ONLY.contains(&m) => Err(driver_only(m)),
+        m if m.starts_with("notify.") => serve_notify(agent, m, params).await,
         _ => return None,
     })
+}
+
+/// `notify.*` onto the host's notification service. The source of a
+/// notification is completed here, from the session it names.
+async fn serve_notify(agent: &dyn AgentStateClient, method: &str, params: &Value) -> Result<Value> {
+    let Some(notify) = agent.notifies() else {
+        return Err(crate::notify::unavailable());
+    };
+    match method {
+        "notify.send" => {
+            let mut req: crate::notify::NotifySendReq = arg(params, "request")?;
+            let mut source = req.source.take().unwrap_or_default();
+            crate::notify::complete_notify_source(agent, &mut source).await;
+            req.source = Some(source);
+            notify.send(req).await.and_then(out)
+        }
+        "notify.state" => notify.state(&arg::<String>(params, "notify_id")?).await.and_then(out),
+        "notify.list" => notify
+            .list(arg::<Option<crate::notify::NotifyListReq>>(params, "request")?.unwrap_or_default())
+            .await
+            .and_then(out),
+        "notify.cancel" => notify
+            .cancel(&arg::<String>(params, "notify_id")?, &arg::<String>(params, "reason")?)
+            .await
+            .and_then(out),
+        "notify.answer" => notify
+            .answer(
+                &arg::<String>(params, "notify_id")?,
+                arg(params, "answer")?,
+                arg(params, "via")?,
+            )
+            .await
+            .and_then(out),
+        other => Err(OpenDanError::InvalidArgument(format!("unknown method {other}"))),
+    }
 }
 
 /// accept / discard on behalf of `who`: the serving side takes the
@@ -477,6 +723,23 @@ impl BehaviorCatalog for KrpcAgentStateClient {
     async fn revision(&self) -> Result<String> {
         self.call("behaviors.revision", json!({})).await
     }
+    async fn cmd_skill(&self, name: &str) -> Result<Option<String>> {
+        self.call("behaviors.cmd_skill", json!({ "name": name })).await
+    }
+    async fn skills(&self, kind: Option<SkillKind>) -> Result<Vec<SkillMeta>> {
+        self.call("skills.list", json!({ "kind": kind })).await
+    }
+    async fn install_skills(
+        &self,
+        pkg: &crate::skills::SkillPackage,
+        replace: bool,
+        _who: &str,
+    ) -> Result<crate::skills::InstallReport> {
+        self.call("skills.install", json!({ "package": pkg, "replace": replace })).await
+    }
+    async fn remove_skill(&self, kind: SkillKind, name: &str, _who: &str) -> Result<SkillMeta> {
+        self.call("skills.remove", json!({ "kind": kind, "name": name })).await
+    }
 }
 
 impl AgentStateClient for KrpcAgentStateClient {
@@ -504,10 +767,201 @@ impl AgentStateClient for KrpcAgentStateClient {
     fn artifacts(&self) -> &dyn Artifacts {
         self
     }
+    fn workspaces(&self) -> &dyn WorkspaceManager {
+        self
+    }
+    fn runtimes(&self) -> &dyn RuntimeRegistry {
+        self
+    }
     fn locks(&self) -> &dyn LockManager {
         self
     }
     fn behaviors(&self) -> &dyn BehaviorCatalog {
         self
+    }
+    fn goals(&self) -> &dyn GoalStore {
+        self
+    }
+    fn notifies(&self) -> Option<&dyn crate::notify::NotifyHost> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl crate::notify::NotifyHost for KrpcAgentStateClient {
+    async fn send(&self, req: crate::notify::NotifySendReq) -> Result<crate::notify::NotifyView> {
+        self.call("notify.send", json!({ "request": req })).await
+    }
+    async fn state(&self, notify_id: &str) -> Result<crate::notify::NotifyView> {
+        self.call("notify.state", json!({ "notify_id": notify_id })).await
+    }
+    async fn list(&self, req: crate::notify::NotifyListReq) -> Result<Vec<crate::notify::NotifyView>> {
+        self.call("notify.list", json!({ "request": req })).await
+    }
+    async fn cancel(&self, notify_id: &str, reason: &str) -> Result<crate::notify::NotifyView> {
+        self.call("notify.cancel", json!({ "notify_id": notify_id, "reason": reason }))
+            .await
+    }
+    async fn answer(
+        &self,
+        notify_id: &str,
+        answer: crate::notify::NotifyAnswer,
+        via: Option<crate::notify::NotifyVia>,
+    ) -> Result<crate::notify::NotifyView> {
+        self.call(
+            "notify.answer",
+            json!({ "notify_id": notify_id, "answer": answer, "via": via }),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl GoalStore for KrpcAgentStateClient {
+    async fn list(&self) -> Result<Vec<GoalDefinition>> {
+        self.call("goals.list", json!({})).await
+    }
+    async fn get(&self, goal_id: &str) -> Result<Option<GoalDefinition>> {
+        self.call("goals.get", json!({ "goal_id": goal_id })).await
+    }
+    async fn revision(&self, goal_id: &str, revision: u64) -> Result<Option<GoalDefinition>> {
+        self.call("goals.revision", json!({ "goal_id": goal_id, "revision": revision })).await
+    }
+    async fn changes(&self, goal_id: &str, limit: usize) -> Result<Vec<GoalChange>> {
+        self.call("goals.changes", json!({ "goal_id": goal_id, "limit": limit })).await
+    }
+    async fn create(&self, req: &GoalCreate, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call("goals.create", json!({ "request": req, "session": caller.session })).await
+    }
+    async fn revise(&self, goal_id: &str, req: &GoalRevise, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call(
+            "goals.revise",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn set_status(
+        &self,
+        goal_id: &str,
+        req: &GoalStatusChange,
+        caller: &GoalCaller,
+    ) -> Result<GoalDefinition> {
+        self.call(
+            "goals.set_status",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn reopen(&self, goal_id: &str, req: &GoalReopen, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call(
+            "goals.reopen",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn restart(&self, goal_id: &str, req: &GoalRestart, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call(
+            "goals.restart",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn state(&self, goal_id: &str) -> Result<Option<GoalState>> {
+        self.call("goals.state", json!({ "goal_id": goal_id })).await
+    }
+    async fn epoch_state(&self, goal_id: &str, epoch: u64) -> Result<Option<GoalState>> {
+        self.call("goals.epoch_state", json!({ "goal_id": goal_id, "epoch": epoch })).await
+    }
+    async fn activations(&self, goal_id: &str, q: &ActivationQuery) -> Result<Vec<GoalActivation>> {
+        self.call("goals.activations", json!({ "goal_id": goal_id, "query": q })).await
+    }
+    async fn schedule(&self, goal_id: &str) -> Result<Option<GoalSchedule>> {
+        self.call("goals.schedule", json!({ "goal_id": goal_id })).await
+    }
+    async fn write_state(&self, _lease: &Lease, _state: &GoalState) -> Result<()> {
+        Err(driver_only("goals.write_state"))
+    }
+    async fn append_activations(&self, _lease: &Lease, _records: &[GoalActivation]) -> Result<()> {
+        Err(driver_only("goals.append_activations"))
+    }
+    async fn prepare_epoch(&self, _goal_id: &str, _epoch: u64) -> Result<GoalState> {
+        Err(driver_only("goals.prepare_epoch"))
+    }
+    async fn end_epoch(
+        &self,
+        _goal_id: &str,
+        _epoch: u64,
+        _end: EpochEnd,
+        _reason: Option<String>,
+    ) -> Result<GoalDefinition> {
+        Err(driver_only("goals.end_epoch"))
+    }
+    async fn write_schedule(&self, _schedule: &GoalSchedule) -> Result<()> {
+        Err(driver_only("goals.write_schedule"))
+    }
+}
+
+#[async_trait]
+impl RuntimeRegistry for KrpcAgentStateClient {
+    async fn list(&self) -> Result<Vec<RuntimeRecord>> {
+        self.call("runtimes.list", json!({})).await
+    }
+    async fn lookup(&self, runtime_id: &str) -> Result<Option<RuntimeRecord>> {
+        self.call("runtimes.lookup", json!({ "runtime_id": runtime_id })).await
+    }
+    async fn register(&self, request: &RuntimeRegister, _who: &str) -> Result<RuntimeRecord> {
+        self.call("runtimes.register", json!({ "request": request })).await
+    }
+    async fn update(&self, runtime_id: &str, request: &RuntimeUpdate, _who: &str) -> Result<RuntimeRecord> {
+        self.call("runtimes.update", json!({ "runtime_id": runtime_id, "request": request })).await
+    }
+    async fn check(&self, runtime_id: &str) -> Result<RuntimeRecord> {
+        self.call("runtimes.check", json!({ "runtime_id": runtime_id })).await
+    }
+    async fn unregister(&self, runtime_id: &str, expected_revision: u64, _who: &str) -> Result<()> {
+        self.call(
+            "runtimes.unregister",
+            json!({ "runtime_id": runtime_id, "expected_revision": expected_revision }),
+        )
+        .await
+    }
+    async fn ensure_builtin(&self, _builtin: &[RuntimeRegister], _who: &str) -> Result<Vec<RuntimeRecord>> {
+        Err(OpenDanError::Forbidden(
+            "built-in runtimes are registered by the host on the AgentRoot".into(),
+        ))
+    }
+}
+
+#[async_trait]
+impl WorkspaceManager for KrpcAgentStateClient {
+    async fn create(&self, request: &WorkspaceCreate, _who: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.create", json!({"request": request})).await
+    }
+    async fn import(&self, request: &WorkspaceImport, _who: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.import", json!({"request": request})).await
+    }
+    async fn discover(&self, request: &WorkspaceDiscover, _who: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.discover", json!({"request": request})).await
+    }
+    async fn lookup(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>> {
+        self.call("workspaces.lookup", json!({"workspace_id": workspace_id})).await
+    }
+    async fn query(&self, query: &WorkspaceQuery) -> Result<Vec<WorkspaceRecord>> {
+        self.call("workspaces.query", json!({"query": query})).await
+    }
+    async fn check(&self, workspace_id: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.check", json!({"workspace_id": workspace_id})).await
+    }
+    async fn update(&self, workspace_id: &str, request: &WorkspaceUpdate, _who: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.update", json!({"workspace_id": workspace_id, "request": request})).await
+    }
+    async fn unregister(&self, workspace_id: &str, expected_revision: u64, _who: &str) -> Result<()> {
+        self.call("workspaces.unregister", json!({"workspace_id": workspace_id, "expected_revision": expected_revision})).await
+    }
+    async fn runtime_impact(&self, runtime_id: &str) -> Result<Vec<WorkspaceRecord>> {
+        self.call("workspaces.runtime_impact", json!({"runtime_id": runtime_id})).await
+    }
+    async fn set_runtime_available(&self, runtime_id: &str, available: bool, _who: &str) -> Result<Vec<WorkspaceRecord>> {
+        self.call("workspaces.set_runtime_available", json!({"runtime_id": runtime_id, "available": available})).await
     }
 }

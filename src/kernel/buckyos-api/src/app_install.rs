@@ -35,6 +35,28 @@ pub const PIKG_STAGING_HANDLE_PREFIX: &str = "pikg-stage-";
 #[serde(deny_unknown_fields)]
 pub struct SystemInstallSettings {
     pub pre_install_apps: HashMap<String, PreInstallAppConfig>,
+    #[serde(default)]
+    pub agent_templates: HashMap<String, AgentTemplateConfig>,
+}
+
+/// `system/install_settings.agent_templates` 中的系统内置 Agent 模板。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTemplateConfig {
+    pub schema_version: u32,
+    pub pikg_path: String,
+}
+
+impl AgentTemplateConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != PRE_INSTALL_APP_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported agent template schema version {}",
+                self.schema_version
+            ));
+        }
+        validate_preinstall_pikg_path(&self.pikg_path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,6 +65,18 @@ pub struct PreInstallAppConfig {
     pub schema_version: u32,
     pub pikg_path: String,
     pub install_plan: PreInstallPlanSeed,
+    /// Present when a new account's Desktop folder starts with a shortcut to this App (Control Panel
+    /// writes `{name}.lnk`). Apps are otherwise only listed under All apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_shortcut: Option<PreInstallDesktopShortcut>,
+}
+
+/// The default desktop shortcut of a pre-installed App.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreInstallDesktopShortcut {
+    /// The shortcut's file name without `.lnk`.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1167,7 +1201,12 @@ impl InstallTransactionState {
         let mut value = serde_json::to_value(self).unwrap_or_else(|_| json!({}));
         if let Some(map) = value.as_object_mut() {
             for key in Self::STATE_KEYS {
-                map.entry(key.to_string()).or_insert(Value::Null);
+                let cleared = if key == "completed_stages" {
+                    json!([])
+                } else {
+                    Value::Null
+                };
+                map.entry(key.to_string()).or_insert(cleared);
             }
         }
         value
@@ -1907,6 +1946,19 @@ mod tests {
     }
 
     #[test]
+    fn full_patch_of_a_state_invalidated_to_resolve_round_trips() {
+        let mut state = InstallTransactionState::default();
+        state.mark_stage_completed(InstallStage::Resolve);
+        state.invalidate_from(InstallStage::Resolve);
+        assert!(state.completed_stages.is_empty());
+        let patch = state.to_full_patch();
+        assert_eq!(patch["completed_stages"], json!([]));
+        assert_eq!(patch["resolution"], Value::Null);
+        let back: InstallTransactionState = serde_json::from_value(patch).unwrap();
+        assert_eq!(back, state);
+    }
+
+    #[test]
     fn preinstall_config_accepts_seed_and_rejects_legacy_or_unknown_fields() {
         let value = json!({
             "pre_install_apps": {
@@ -1924,6 +1976,23 @@ mod tests {
             .unwrap()
             .validate()
             .unwrap();
+        assert_eq!(settings.pre_install_apps["demo.example.web.did"].desktop_shortcut, None);
+
+        let with_shortcut: SystemInstallSettings = serde_json::from_value(json!({
+            "pre_install_apps": {
+                "demo.example.web.did": {
+                    "schema_version": 1,
+                    "pikg_path": "data/cache/demo.example.web.did-1.0.0.pikg",
+                    "install_plan": {},
+                    "desktop_shortcut": {"name": "Demo"}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            with_shortcut.pre_install_apps["demo.example.web.did"].desktop_shortcut,
+            Some(PreInstallDesktopShortcut { name: "Demo".to_string() })
+        );
 
         for invalid in [
             json!({

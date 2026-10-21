@@ -132,6 +132,8 @@ async fn create_init_list_by_template(
         .await?
         .add_aiworkspace()
         .await?
+        .add_homestation()
+        .await?
         .add_workflow()
         .await?
         .add_control_panel()
@@ -141,8 +143,6 @@ async fn create_init_list_by_template(
     builder
         //.add_smb_service().await?
         .add_default_apps(&start_config)
-        .await?
-        .add_default_agents(&start_config)
         .await?
         .add_gateway_settings(&start_config)?;
     for ood_name in ood_names.iter() {
@@ -383,7 +383,8 @@ mod test {
     use buckyos_api::test_config;
     use jsonwebtoken::{jwk::Jwk, DecodingKey};
     use name_client::{
-        NameClient, NameClientConfig, NameInfo, NsProvider, RecordType, GLOBAL_NAME_CLIENT,
+        Carrier, DidDocType, NameClient, NameClientConfig, ResolveOpts, Revision, Source,
+        SourceAnswer, SourceRef, SourceTier, GLOBAL_NAME_CLIENT,
     };
     use name_lib::{
         DeviceDocument, DeviceInfo, EncodedDocument, NSError, OODDescriptionString,
@@ -566,6 +567,8 @@ mod test {
         assert!(init_map.contains_key("services/nfs-server/settings"));
         assert!(init_map.contains_key("services/aiworkspace/spec"));
         assert!(init_map.contains_key("services/aiworkspace/settings"));
+        assert!(init_map.contains_key("services/homestation/spec"));
+        assert!(init_map.contains_key("services/homestation/settings"));
         //assert!(init_map.contains_key("services/smb-service/spec"));
         assert!(init_map.contains_key(&format!("users/{}/profile", TEST_USERNAME)));
         let install_settings: buckyos_api::SystemInstallSettings = serde_json::from_str(
@@ -574,16 +577,24 @@ mod test {
                 .expect("install settings should be preserved"),
         )
         .expect("install settings should use the pre-install seed schema");
-        assert_eq!(install_settings.pre_install_apps.len(), 3);
-        assert!(install_settings
-            .pre_install_apps
-            .contains_key("jarvis.buckyos.bns.did"));
+        assert_eq!(install_settings.pre_install_apps.len(), 2);
         assert!(install_settings
             .pre_install_apps
             .contains_key("buckyos-systest.buckyos.bns.did"));
         assert!(install_settings
             .pre_install_apps
             .contains_key("text-editor.buckyos.bns.did"));
+        assert_eq!(install_settings.agent_templates.len(), 1);
+        let jarvis_template = install_settings
+            .agent_templates
+            .get("jarvis.buckyos.bns.did")
+            .expect("Jarvis should be a bundled agent template");
+        jarvis_template
+            .validate()
+            .expect("bundled Jarvis template should be valid");
+        assert!(!init_map
+            .keys()
+            .any(|key| key.starts_with("users/") && key.contains("/agents/")));
         let registry: AppRegistry = serde_json::from_str(
             init_map
                 .get(APP_REGISTRY_KEY)
@@ -810,9 +821,9 @@ mod test {
             .into_iter()
             .map(|(did, doc)| (did.to_raw_host_name(), doc))
             .collect();
-        client
-            .add_provider(Box::new(StaticProvider::new(docs)), None)
-            .await;
+        let provider = Arc::new(StaticProvider::new(docs));
+        client.set_method_authority("bns", provider.clone());
+        client.set_method_authority("web", provider);
         let _ = GLOBAL_NAME_CLIENT.set(client);
     }
 
@@ -889,31 +900,24 @@ mod test {
     }
 
     #[async_trait]
-    impl NsProvider for StaticProvider {
-        fn get_id(&self) -> String {
+    impl Source for StaticProvider {
+        fn id(&self) -> String {
             "static-provider".to_string()
         }
 
-        async fn query(
-            &self,
-            name: &str,
-            _record_type: Option<RecordType>,
-            _from_ip: Option<IpAddr>,
-        ) -> name_lib::NSResult<NameInfo> {
-            Err(NSError::NotFound(name.to_string()))
-        }
-
-        async fn query_did(
+        async fn get_document(
             &self,
             did: &DID,
-            _doc_type: Option<name_client::DidDocType>,
-            _from_ip: Option<IpAddr>,
-        ) -> name_lib::NSResult<EncodedDocument> {
-            let host = did.to_host_name();
-            self.docs
-                .get(&host)
-                .cloned()
-                .ok_or_else(|| NSError::NotFound(host))
+            _doc_type: &DidDocType,
+            _revision: &Revision,
+            _opts: &ResolveOpts,
+        ) -> SourceAnswer {
+            let sref = SourceRef::provider(self.id(), SourceTier::Authority);
+            let host = did.to_raw_host_name();
+            match self.docs.get(&host) {
+                Some(doc) => SourceAnswer::new(sref).with_body(doc.clone(), Carrier::Body),
+                None => SourceAnswer::no_answer(sref, host),
+            }
         }
     }
 }

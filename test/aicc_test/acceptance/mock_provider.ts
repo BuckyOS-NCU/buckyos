@@ -144,6 +144,59 @@ function usage(): { input_tokens: number; output_tokens: number; total_tokens: n
   return { input_tokens: 10, output_tokens: 5, total_tokens: 15 };
 }
 
+export function minimaxDiscoveryModelIds(): string[] {
+  return [
+    "MiniMax-M3.1-Flash-Preview",
+    "MiniMax-M3",
+    "MiniMax-M2.7",
+    "MiniMax-M2.7-highspeed",
+    "MiniMax-M2.5",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.1",
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2",
+    "image-01",
+    "MiniMax-H3",
+    "MiniMax-H3-Max",
+  ];
+}
+
+export function minimaxVideoFixture(
+  method: string | undefined,
+  path: string,
+  artifactBaseUrl: string,
+): Json | undefined {
+  if (method === "POST" && path === "/v2/video_generation") {
+    return { task_id: "minimax-video-mock", base_resp: { status_code: 0 } };
+  }
+  if (method === "GET" && /^\/v2\/query\/video_generation\/[^/]+$/.test(path)) {
+    return {
+      task: {
+        id: path.split("/").at(-1)!,
+        model: "MiniMax-H3",
+        status: "succeeded",
+        content: { url: `${artifactBaseUrl}/__mock/fixtures/video.mp4` },
+        resolution: "768P",
+        duration: 5,
+        ratio: "16:9",
+        usage: {
+          total_seconds: 5,
+          input_seconds: 0,
+          output_seconds: 5,
+          input_image_count: 0,
+        },
+        task_type: "generation",
+        modality: "video",
+      },
+      base_resp: { status_code: 0 },
+    };
+  }
+  if (method === "DELETE" && /^\/v2\/video_generation\/[^/]+$/.test(path)) {
+    return { status: "cancelled", base_resp: { status_code: 0 } };
+  }
+  return undefined;
+}
+
 function deterministicText(body: Json | null, scenario: Scenario = "success"): string {
   if (JSON.stringify(body).includes("Rerank the documents")) {
     if (scenario === "rerank_missing_score") {
@@ -483,7 +536,7 @@ async function providerResponse(
     if (request.headers["anthropic-version"] || request.headers["x-api-key"]) {
       const minimax = !request.headers["anthropic-version"];
       const modelIds = minimax
-        ? ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.5"]
+        ? minimaxDiscoveryModelIds()
         : ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5-20251001"];
       json(response, 200, {
         data: modelIds.map((id) => ({
@@ -652,6 +705,18 @@ async function providerResponse(
     });
     return;
   }
+  if (path === "/v1/image_generation" && request.method === "POST") {
+    json(response, 200, {
+      data: {
+        image_urls: [
+          `http://${request.headers.host ?? "127.0.0.1:18080"}/__mock/fixtures/image.png`,
+        ],
+      },
+      metadata: { failed_count: "0", success_count: "1" },
+      base_resp: { status_code: 0, status_msg: "success" },
+    });
+    return;
+  }
   if (path === "/v1/audio/transcriptions") {
     json(response, 200, {
       text: "今天的测试编号是四八二七",
@@ -665,6 +730,15 @@ async function providerResponse(
   }
   if (path === "/v1/messages") {
     json(response, 200, claudeResponse(body, includeUsage));
+    return;
+  }
+  const minimaxVideo = minimaxVideoFixture(
+    request.method,
+    path,
+    `http://${request.headers.host ?? "127.0.0.1:18080"}`,
+  );
+  if (minimaxVideo) {
+    json(response, 200, minimaxVideo);
     return;
   }
   if (/:(?:generateContent|streamGenerateContent)$/.test(path)) {
@@ -773,6 +847,46 @@ async function providerResponse(
     text(response, 200, "mock-video", "video/mp4");
     return;
   }
+  if (path === "/v2/video_generation" && request.method === "POST") {
+    const taskId = `minimax_video_mock_${state.calls}`;
+    state.operations.set(`/v2/query/video_generation/${taskId}`, { polls: 0, scenario });
+    json(response, 200, { task_id: taskId });
+    return;
+  }
+  if (/^\/v2\/query\/video_generation\/[^/]+$/.test(path) && request.method === "GET") {
+    const operation = state.operations.get(path) ?? { polls: 0, scenario };
+    operation.polls += 1;
+    state.operations.set(path, operation);
+    const taskId = path.split("/").at(-1)!;
+    if (operation.scenario === "async_pending") {
+      json(response, 200, { task: { id: taskId, status: "processing" } });
+      return;
+    }
+    if (operation.scenario === "async_failed" && operation.polls >= 2) {
+      json(response, 200, {
+        task: {
+          id: taskId,
+          status: "failed",
+          error: { code: 1004, message: "deterministic async Provider failure" },
+        },
+      });
+      return;
+    }
+    json(response, 200, operation.polls < 2
+      ? { task: { id: taskId, status: "processing" } }
+      : {
+        task: {
+          id: taskId,
+          status: "succeeded",
+          content: {
+            url: `http://${request.headers.host ?? "127.0.0.1:18080"}/__mock/fixtures/video.mp4`,
+          },
+          duration: 5,
+          usage: { total_seconds: 5, input_seconds: 0, output_seconds: 5, input_image_count: 0 },
+        },
+      });
+    return;
+  }
   if (/^\/queue\/requests\/[^/]+\/status$/.test(path)) {
     const operation = state.operations.get(path) ?? { polls: 0, scenario };
     operation.polls += 1;
@@ -788,9 +902,6 @@ async function providerResponse(
   json(response, 404, { error: { type: "unknown_endpoint", message: path } });
 }
 
-const args = process.argv.slice(2);
-const port = parsePort(args);
-const host = parseHost(args);
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
@@ -830,12 +941,17 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(port, host, () => {
-  const address = server.address();
-  const actualPort = typeof address === "object" && address ? address.port : port;
-  process.stdout.write(`${JSON.stringify({ ready: true, host, port: actualPort })}\n`);
-});
+if (import.meta.main) {
+  const args = process.argv.slice(2);
+  const port = parsePort(args);
+  const host = parseHost(args);
+  server.listen(port, host, () => {
+    const address = server.address();
+    const actualPort = typeof address === "object" && address ? address.port : port;
+    process.stdout.write(`${JSON.stringify({ ready: true, host, port: actualPort })}\n`);
+  });
 
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => server.close(() => process.exit(0)));
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => server.close(() => process.exit(0)));
+  }
 }

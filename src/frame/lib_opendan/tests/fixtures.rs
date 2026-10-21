@@ -25,7 +25,9 @@ fn fixtures_dir() -> PathBuf {
 fn load(name: &str) -> (tempfile::TempDir, Env, Value) {
     let tmp = tempfile::tempdir().unwrap();
     let dst = tmp.path().join(name);
-    copy_dir(&fixtures_dir().join(name), &dst, libopendan::now_ms());
+    let started_at_ms = libopendan::now_ms();
+    copy_dir(&fixtures_dir().join(name), &dst);
+    fixture_paths::expand(&dst);
     if name == "10_active_overlap" {
         std::fs::create_dir_all(dst.join("ws")).unwrap();
     }
@@ -55,7 +57,7 @@ fn load(name: &str) -> (tempfile::TempDir, Env, Value) {
             ("${FIXTURE_HOSTNAME}", &hostname),
         ],
     );
-    localize(&dst, &root, &os);
+    localize(&dst, &root, &os, started_at_ms);
     let expected: Value =
         serde_json::from_slice(&std::fs::read(dst.join("expected.json")).unwrap()).unwrap();
     let env = Env {
@@ -68,7 +70,7 @@ fn load(name: &str) -> (tempfile::TempDir, Env, Value) {
     (tmp, env, expected)
 }
 
-fn localize(dir: &Path, root: &str, os: &str) {
+fn localize(dir: &Path, root: &str, os: &str, started_at_ms: u64) {
     fn value(v: &mut Value, root: &str, os: &str, canonical: bool) {
         match v {
             Value::Object(map) => {
@@ -99,32 +101,27 @@ fn localize(dir: &Path, root: &str, os: &str) {
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
         let path = entry.path();
         if path.is_dir() {
-            localize(&path, root, os);
+            localize(&path, root, os, started_at_ms);
         } else if path.extension().is_some_and(|ext| ext == "json") {
             let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             value(&mut v, root, os, false);
+            if dir.file_name().is_some_and(|name| name == "snapshots") {
+                v["state"]["started_at_ms"] = started_at_ms.into();
+            }
             std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
         }
     }
 }
 
-fn copy_dir(src: &Path, dst: &Path, started_at_ms: u64) {
+fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for e in std::fs::read_dir(src).unwrap().flatten() {
         let p = e.path();
         let t = dst.join(e.file_name());
         if p.is_dir() {
-            copy_dir(&p, &t, started_at_ms);
+            copy_dir(&p, &t);
         } else {
             std::fs::copy(&p, &t).unwrap();
-            if src.file_name().is_some_and(|n| n == "snapshots")
-                && p.extension().is_some_and(|n| n == "json")
-            {
-                let mut snapshot: Value =
-                    serde_json::from_slice(&std::fs::read(&t).unwrap()).unwrap();
-                snapshot["state"]["started_at_ms"] = started_at_ms.into();
-                std::fs::write(&t, serde_json::to_vec(&snapshot).unwrap()).unwrap();
-            }
             #[cfg(unix)]
             {
                 let mode = std::fs::metadata(&p).unwrap().permissions();
@@ -132,6 +129,60 @@ fn copy_dir(src: &Path, dst: &Path, started_at_ms: u64) {
             }
         }
     }
+}
+
+#[test]
+fn fixture_paths_fit_windows_checkout() {
+    let root = fixtures_dir();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let relative = path.strip_prefix(&root).unwrap();
+            let scenario_relative: PathBuf = relative.components().skip(1).collect();
+            assert!(
+                scenario_relative.to_str().unwrap().encode_utf16().count() <= 160,
+                "{}",
+                path.display()
+            );
+            let repository_relative = format!("doc/opendan/protocol/fixtures/{}", relative.display());
+            assert!(
+                repository_relative.encode_utf16().count() <= 210,
+                "{repository_relative}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compact_snapshot_is_localized_after_expansion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dst = tmp.path().join("dst");
+    let relative = format!(
+        "app/{}/.opendan_agent_session/runs/run/snapshots/0001.json",
+        "s".repeat(120)
+    );
+    let snapshot = src.join(&relative);
+    std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+    std::fs::write(
+        &snapshot,
+        serde_json::to_vec(&json!({ "state": { "started_at_ms": 1, "os": "linux" } })).unwrap(),
+    )
+    .unwrap();
+    fixture_paths::compact(&src);
+    assert!(!snapshot.exists());
+    copy_dir(&src, &dst);
+    fixture_paths::expand(&dst);
+    localize(&dst, dst.to_str().unwrap(), "fixture-os", 42);
+    let snapshot: Value =
+        serde_json::from_slice(&std::fs::read(dst.join(relative)).unwrap()).unwrap();
+    assert_eq!(snapshot["state"]["started_at_ms"], 42);
+    assert_eq!(snapshot["state"]["os"], "fixture-os");
 }
 
 /// Runner deps on the runtime the fixtures were bound to.
@@ -170,9 +221,9 @@ fn script(name: &'static str) -> Arc<ScriptedLlm> {
             }
             "fork" => {
                 if all.contains("research result") {
-                    text("<response><report><![CDATA[final]]></report></response>")
+                    text("<response><report end=\"true\"><![CDATA[final]]></report></response>")
                 } else {
-                    text("<response><report><![CDATA[research result]]></report></response>")
+                    text("<response><report end=\"true\"><![CDATA[research result]]></report></response>")
                 }
             }
             _ => text("answer"),
@@ -336,16 +387,16 @@ async fn f09_semi_subscription() {
 async fn f10_active_overlap() {
     let (_t, env, _) = load("10_active_overlap");
     let b = session(&env, "work-fixture-active-b");
-    let llm = ScriptedLlm::new(|req, _| {
-        let u = last_user_text(req);
-        assert!(
-            u.contains("work-fixture-active-a") && u.contains("same_target"),
-            "{u}"
-        );
-        text("avoid")
-    });
-    let result = drive(&b, &fdeps(&env, llm), StopWhen::Finished).await;
-    assert!(result.is_finished(), "{result:?}");
+    let agent = env.agent();
+    let me = agent.sessions().lookup(b.sid()).await.unwrap().unwrap();
+    let active = agent.activity().active(Some(&me), 10).await.unwrap();
+    let other = active.iter().find(|s| s.session_id == "work-fixture-active-a").unwrap();
+    assert_eq!(serde_json::to_value(other.relation).unwrap(), json!("same_target"));
+    assert!(other.overlap.contains(&"ws:snake/src/".to_string()));
+    let llm = ScriptedLlm::new(|_, _| panic!("unsettled writer must block inference"));
+    let result = drive(&b, &fdeps(&env, llm.clone()), StopWhen::Finished).await;
+    assert!(matches!(result, DriveResult::Busy { .. }), "{result:?}");
+    assert_eq!(llm.count(), 0);
 }
 
 #[tokio::test]
@@ -391,6 +442,99 @@ async fn f13_unsupported_snapshot_version() {
         DriveResult::RecoveryBlocked(_)
     ));
     assert_eq!(llm.count(), 0);
+}
+
+#[tokio::test]
+async fn f15_report_pending_commit() {
+    let (_t, env, expected) = load("15_report_pending_commit");
+    let sd = session(&env, "work-fixture-report");
+    let before = sd.state().unwrap();
+    assert!(!before.is_finished());
+    let run_id = before.live_run.as_ref().unwrap().run_id.clone();
+    let record = sd.runs().record(&run_id).unwrap();
+    assert!(!record.status.is_terminal());
+    let submitted: ReportSubmission = serde_json::from_value(
+        record.host.as_ref().unwrap().extra["reports"][0].clone(),
+    ).unwrap();
+    assert!(submitted.is_end);
+    assert_eq!(submitted.report, expected["next"]["final_report"]);
+    let llm = ScriptedLlm::new(|_, _| panic!("accepted final report recovery must not infer"));
+    let deps = fdeps(&env, llm.clone());
+    let result = drive(&sd, &deps, StopWhen::Finished).await;
+    assert!(result.is_finished(), "{result:?}");
+    assert_eq!(llm.count(), expected["next"]["llm_calls"].as_u64().unwrap() as usize);
+    let state = sd.state().unwrap();
+    assert_eq!(state.outcome, Some(Outcome::Succeeded));
+    assert_eq!(state.acceptance, Acceptance::Pending);
+    assert_eq!(state.last_run.as_deref(), Some(run_id.as_str()));
+    assert_eq!(state.final_report.as_ref(), Some(&submitted));
+    assert_eq!(submitted.result.as_ref(), Some(&expected["next"]["result"]));
+    assert_eq!(submitted.artifacts.len(), 1);
+    let artifact = &submitted.artifacts[0];
+    assert_eq!(artifact.path, expected["next"]["artifact"]["path"]);
+    assert_eq!(std::fs::read_to_string(sd.path().join(&artifact.reference)).unwrap(),
+        expected["next"]["artifact"]["content"]);
+    let entries = read_worklog(&sd);
+    let deliveries: Vec<_> = entries.iter().filter_map(|e| match &e.body {
+        WorklogBody::ReportDelivery { submission, assistant, .. } => Some((submission, assistant)),
+        _ => None,
+    }).collect();
+    assert_eq!(deliveries.len(), expected["next"]["report_deliveries"].as_u64().unwrap() as usize);
+    assert_eq!(deliveries[0].0, &submitted);
+    assert_eq!(deliveries[0].1, &submitted.delivery_text());
+    assert_eq!(entries.iter().filter(|e| matches!(&e.body,
+        WorklogBody::ActionResult { call_id, status, .. } if call_id == "report-final" && status == "ok"
+    )).count(), 1);
+    assert_eq!(sd.statistics().unwrap().rounds, expected["next"]["rounds_after"].as_u64().unwrap());
+    assert!(drive(&sd, &deps, StopWhen::Idle).await.is_finished());
+    assert_eq!(read_worklog(&sd), entries);
+}
+
+/// A Goal Session whose Activation close is committed but not written back:
+/// the next drive publishes the Goal State and appends the record, once,
+/// without inferring.
+#[tokio::test]
+async fn f16_goal_session() {
+    let (_t, env, expected) = load("16_goal_session");
+    let goal_id = expected["sessions"][0]["goal"]["goal_id"].as_str().unwrap().to_string();
+    let sid = expected["sessions"][0]["session_id"].as_str().unwrap().to_string();
+    let sd = session(&env, &sid);
+    let agent = env.agent();
+    let before = sd.state().unwrap();
+    assert!(before.goal.as_ref().unwrap().needs_flush());
+    assert!(agent
+        .goals()
+        .activations(&goal_id, &Default::default())
+        .await
+        .unwrap()
+        .is_empty());
+    let llm = ScriptedLlm::new(|_, _| panic!("a committed activation is not inferred again"));
+    let deps = fdeps(&env, llm.clone());
+    let r = drive(&sd, &deps, StopWhen::Idle).await;
+    assert!(matches!(r, DriveResult::Idle { .. }), "{r:?}");
+    assert_eq!(llm.count(), expected["next"]["llm_calls"].as_u64().unwrap() as usize);
+    let acts = agent.goals().activations(&goal_id, &Default::default()).await.unwrap();
+    assert_eq!(acts.len(), 1);
+    let a = &acts[0];
+    let want = &expected["next"]["activation"];
+    assert_eq!(json!([a.epoch, a.seq]), json!([want["epoch"], want["seq"]]));
+    assert_eq!(json!(a.outcome), want["outcome"]);
+    assert_eq!(json!(a.decision), want["decision"]);
+    assert_eq!(json!(a.works_absorbed), want["works_absorbed"]);
+    let kinds: Vec<Value> = a.reasons.iter().map(|r| json!(r.kind)).collect();
+    assert_eq!(json!(kinds), want["reasons"]);
+    let st = agent.goals().state(&goal_id).await.unwrap().unwrap();
+    assert_eq!(st.rev, expected["next"]["goal_state_rev"].as_u64().unwrap());
+    assert_eq!(json!(st.absorbed), expected["next"]["goal_state"]["absorbed"]);
+    assert_eq!(json!(st.distance.unwrap().text), expected["next"]["goal_state"]["distance"]);
+    assert_eq!(st.usage.activations, expected["next"]["goal_state"]["activations"].as_u64().unwrap());
+    let after = sd.state().unwrap();
+    assert!(!after.goal.as_ref().unwrap().needs_flush());
+    assert_eq!(after.run_state, RunState::Waiting);
+    assert_eq!(after.waiting_for.map(|w| w.kind), Some(WaitingKind::Event));
+    // Again: nothing more to write.
+    drive(&sd, &deps, StopWhen::Idle).await;
+    assert_eq!(agent.goals().activations(&goal_id, &Default::default()).await.unwrap().len(), 1);
 }
 
 /// The input bus fixture: every stored record is handled as `expected.json`
@@ -506,4 +650,14 @@ async fn f14_input_bus() {
         .collect();
     assert_eq!(kinds, vec!["text", "image", "document"]);
     assert_eq!(json_of("rendering/ai_message_reference.json")["content"].as_array().unwrap().len(), 1);
+    // The chat format of UI sessions, byte for byte.
+    for c in expected["rendering"]["chat"]["batches"].as_array().unwrap() {
+        let files: Vec<&str> = c["batch"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect();
+        let text = input_fixture::chat_text(&records, &files, c["group"].as_bool().unwrap());
+        assert_eq!(text, read(c["output"].as_str().unwrap()), "{}", c["output"]);
+    }
+    let one = read("rendering/chat_one_to_one.txt");
+    assert!(one.starts_with("<<background_context>>\n- current_time 2026-10-02T08:00:01+08:00 (Asia/Shanghai)\n"), "{one}");
+    assert!(one.ends_with("<</background_context>>\n查询构建进度"), "{one}");
+    assert!(read("rendering/chat_group.txt").contains("<<inputs>>\n<msg "));
 }

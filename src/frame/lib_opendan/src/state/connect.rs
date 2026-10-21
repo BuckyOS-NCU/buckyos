@@ -276,6 +276,23 @@ impl BehaviorCatalog for ForwardingStateClient {
     async fn revision(&self) -> Result<String> {
         self.inner.behaviors().revision().await
     }
+    async fn cmd_skill(&self, name: &str) -> Result<Option<String>> {
+        self.inner.behaviors().cmd_skill(name).await
+    }
+    async fn skills(&self, kind: Option<SkillKind>) -> Result<Vec<SkillMeta>> {
+        self.inner.behaviors().skills(kind).await
+    }
+    async fn install_skills(
+        &self,
+        pkg: &crate::skills::SkillPackage,
+        replace: bool,
+        who: &str,
+    ) -> Result<crate::skills::InstallReport> {
+        self.inner.behaviors().install_skills(pkg, replace, who).await
+    }
+    async fn remove_skill(&self, kind: SkillKind, name: &str, who: &str) -> Result<SkillMeta> {
+        self.inner.behaviors().remove_skill(kind, name, who).await
+    }
 }
 
 impl AgentStateClient for ForwardingStateClient {
@@ -307,11 +324,23 @@ impl AgentStateClient for ForwardingStateClient {
     fn artifacts(&self) -> &dyn Artifacts {
         self
     }
+    fn workspaces(&self) -> &dyn WorkspaceManager {
+        self.inner.workspaces()
+    }
+    fn runtimes(&self) -> &dyn RuntimeRegistry {
+        self.inner.runtimes()
+    }
     fn locks(&self) -> &dyn LockManager {
         self
     }
     fn behaviors(&self) -> &dyn BehaviorCatalog {
         self
+    }
+    fn goals(&self) -> &dyn GoalStore {
+        self.inner.goals()
+    }
+    fn notifies(&self) -> Option<&dyn crate::notify::NotifyHost> {
+        self.inner.notifies()
     }
 }
 
@@ -353,10 +382,80 @@ impl AgentStateClient for WithBehaviors {
     fn artifacts(&self) -> &dyn Artifacts {
         self.inner.artifacts()
     }
+    fn workspaces(&self) -> &dyn WorkspaceManager {
+        self.inner.workspaces()
+    }
+    fn runtimes(&self) -> &dyn RuntimeRegistry {
+        self.inner.runtimes()
+    }
     fn locks(&self) -> &dyn LockManager {
         self.inner.locks()
     }
     fn behaviors(&self) -> &dyn BehaviorCatalog {
         self.behaviors.as_ref()
+    }
+    fn goals(&self) -> &dyn GoalStore {
+        self.inner.goals()
+    }
+    fn notifies(&self) -> Option<&dyn crate::notify::NotifyHost> {
+        self.inner.notifies()
+    }
+}
+
+/// An agent state whose notification service is supplied by the host
+/// process (msg-center in a zone); the other facades stay with `inner`.
+pub struct WithNotify {
+    inner: Arc<dyn AgentStateClient>,
+    notify: Arc<dyn crate::notify::NotifyHost>,
+}
+
+impl WithNotify {
+    pub fn new(inner: Arc<dyn AgentStateClient>, notify: Arc<dyn crate::notify::NotifyHost>) -> Self {
+        Self { inner, notify }
+    }
+}
+
+impl AgentStateClient for WithNotify {
+    fn agent_did(&self) -> &str {
+        self.inner.agent_did()
+    }
+    fn agent_id(&self) -> &str {
+        self.inner.agent_id()
+    }
+    fn agent_root(&self) -> Option<&Path> {
+        self.inner.agent_root()
+    }
+    fn sessions(&self) -> &dyn SessionRegistry {
+        self.inner.sessions()
+    }
+    fn activity(&self) -> &dyn ActivityView {
+        self.inner.activity()
+    }
+    fn perception(&self) -> &dyn Perception {
+        self.inner.perception()
+    }
+    fn cognition(&self) -> &dyn Cognition {
+        self.inner.cognition()
+    }
+    fn artifacts(&self) -> &dyn Artifacts {
+        self.inner.artifacts()
+    }
+    fn workspaces(&self) -> &dyn WorkspaceManager {
+        self.inner.workspaces()
+    }
+    fn runtimes(&self) -> &dyn RuntimeRegistry {
+        self.inner.runtimes()
+    }
+    fn locks(&self) -> &dyn LockManager {
+        self.inner.locks()
+    }
+    fn behaviors(&self) -> &dyn BehaviorCatalog {
+        self.inner.behaviors()
+    }
+    fn goals(&self) -> &dyn GoalStore {
+        self.inner.goals()
+    }
+    fn notifies(&self) -> Option<&dyn crate::notify::NotifyHost> {
+        Some(self.notify.as_ref())
     }
 }

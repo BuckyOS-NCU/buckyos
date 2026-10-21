@@ -1,4 +1,4 @@
-export type SessionKind = 'ui' | 'work' | 'self_improve' | 'self_check'
+export type SessionKind = 'ui' | 'work' | 'self_improve' | 'self_check' | 'goal'
 export type RunState = 'created' | 'ready' | 'running' | 'waiting' | 'finished'
 export type Outcome = 'succeeded' | 'failed' | 'stopped'
 export type Acceptance = 'n/a' | 'pending' | 'accepted' | 'discarded'
@@ -180,6 +180,7 @@ export interface Binding {
   workdir: string
   bound_at_ms: number
   bound_by: string
+  workspace?: WorkspaceBinding | null
 }
 
 // Tagged by `kind`: idle, finished, outcomes_handled, turn_closed, turn_open,
@@ -205,6 +206,7 @@ export interface SessionConfigSummary {
   session: unknown
   runtime: unknown
   workspace: unknown
+  workspace_binding?: WorkspaceBinding | null
   subscriptions: unknown
   channels: unknown
   behavior: string
@@ -262,7 +264,62 @@ export interface PerceptionRecord {
   refs?: unknown
 }
 
-export type WorkspaceRef = { kind: 'agent'; id: string } | { kind: 'external'; path: string }
+export interface WorkspaceRef {
+  workspace_id: string
+  access?: 'read_write' | 'read_only'
+}
+
+export interface WorkspaceLocation {
+  runtime_id: string
+  directory: string
+}
+
+export interface WorkspaceBinding extends WorkspaceRef {
+  runtime_host: string
+  revision: number
+  location_revision: number
+  location: WorkspaceLocation
+}
+
+/** A runtime the agent's sessions and workspaces may use (`state/runtimes/`). */
+export interface KnownRuntime {
+  version: number
+  runtime_id: string
+  kind: 'container' | 'host_native' | 'remote_ssh'
+  name: string
+  description: string
+  runtime_host: string
+  exec: unknown
+  roots: string[]
+  capabilities: unknown
+  availability: 'available' | 'runtime_unavailable' | 'permission_denied'
+  builtin: boolean
+  revision: number
+  registered_by: string
+  registered_at_ms: number
+  updated_at_ms: number
+  checked_at_ms: number | null
+  last_error: string | null
+}
+
+export interface KnownWorkspace {
+  version: number
+  runtime_host: string
+  workspace_id: string
+  name: string
+  description: string
+  location: WorkspaceLocation
+  usage: 'private' | 'collaborative'
+  lifecycle: 'active' | 'archived'
+  availability: 'available' | 'missing' | 'runtime_unavailable' | 'permission_denied' | 'invalid_metadata' | 'conflict'
+  revision: number
+  location_revision: number
+  updated_at_ms: number
+  checked_at_ms: number | null
+  source_session: string | null
+  conflict: { code: string; message: string; candidate: WorkspaceLocation; at_ms: number } | null
+  last_error: string | null
+}
 
 export interface ArtifactHead {
   aid: string
@@ -331,8 +388,9 @@ export interface LoaderStatus {
   errors: { at_ms: number; source: string; message: string }[]
 }
 
-// `owner_did` / `desktop_url` are null outside a zone. `editable` is false
-// when the service is too old to keep a profile.
+// The agent's profile record in the zone; without a nickname `display_name`
+// is the agent's user name. `owner_did` / `desktop_url` are null outside a
+// zone. `editable` is false when the service is too old to keep a profile.
 export interface AgentProfile {
   agent_did: string
   agent_id: string
@@ -341,7 +399,6 @@ export interface AgentProfile {
   bio: string
   owner_did: string | null
   desktop_url: string | null
-  updated_at_ms: number
   editable: boolean
 }
 

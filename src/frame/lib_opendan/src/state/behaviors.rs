@@ -3,7 +3,8 @@
 //!
 //! File layout: `<agent_root>/behaviors/<name>.toml` (`__INCLUDE(path)__`
 //! expanded relative to the including file), `role.md`, `self.md`,
-//! `i18n/<lang>.md`.
+//! `i18n/<lang>.md`, and the owner's supplement to the role
+//! (`.meta/role_supplement.md`, written by the host).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,9 +25,46 @@ pub trait BehaviorCatalog: Send + Sync {
     async fn list(&self) -> Result<Vec<BehaviorMeta>>;
     /// Version of the catalog as a whole (audit of a freeze).
     async fn revision(&self) -> Result<String>;
+    /// The manual of a cmd_skill (`cmd_skills/<name>.md`, front matter
+    /// included). `None`: the agent has no such cmd_skill.
+    async fn cmd_skill(&self, name: &str) -> Result<Option<String>> {
+        let _ = name;
+        Ok(None)
+    }
+    /// The agent's skills of `kind` (`None`: both), by name.
+    async fn skills(&self, kind: Option<SkillKind>) -> Result<Vec<SkillMeta>> {
+        let _ = kind;
+        Ok(Vec::new())
+    }
+    /// Install the skills of a skill package (`skills.install`).
+    async fn install_skills(
+        &self,
+        pkg: &crate::skills::SkillPackage,
+        replace: bool,
+        who: &str,
+    ) -> Result<crate::skills::InstallReport> {
+        let _ = (pkg, replace, who);
+        Err(OpenDanError::InvalidArgument(
+            "this agent state does not install skills".into(),
+        ))
+    }
+    /// Remove an installed skill (`skills.remove`).
+    async fn remove_skill(&self, kind: SkillKind, name: &str, who: &str) -> Result<SkillMeta> {
+        let _ = (kind, name, who);
+        Err(OpenDanError::InvalidArgument(
+            "this agent state does not remove skills".into(),
+        ))
+    }
 }
 
 const MAX_INCLUDE_DEPTH: usize = 8;
+
+/// What the owner adds to the package's role, appended to it.
+pub const ROLE_SUPPLEMENT_FILE: &str = ".meta/role_supplement.md";
+
+/// `<agent_root>/cmd_skills/<name>.md`: command manuals a session takes
+/// when it is created (`prompt.cmd_skills`).
+pub const CMD_SKILLS_DIR: &str = "cmd_skills";
 
 fn expand_includes(text: &str, base: &Path, depth: usize) -> Result<String> {
     const OPEN: &str = "__INCLUDE(";
@@ -74,6 +112,17 @@ pub fn parse_behavior(name: &str, path: &Path) -> Result<BehaviorConfig> {
         if let Some(text) = t {
             *text = expand_includes(text, base, 0)?;
         }
+    }
+    // `[reply] schema` may be written as JSON text (`schema = '''{…}'''`).
+    if let Some(reply) = cfg.reply.as_mut() {
+        if let serde_json::Value::String(text) = &reply.schema {
+            reply.schema = serde_json::from_str(text).map_err(|e| {
+                OpenDanError::InvalidArgument(format!("{}: [reply] schema: {e}", path.display()))
+            })?;
+        }
+        reply
+            .validate(name)
+            .map_err(|e| OpenDanError::InvalidArgument(format!("{}: {e}", path.display())))?;
     }
     if cfg.meta.name.is_empty() {
         cfg.meta.name = name.to_string();
@@ -141,8 +190,16 @@ impl BehaviorCatalog for FsBehaviorCatalog {
                 }
             }
         }
+        let role = [
+            read_trimmed(&self.root.join("role.md")),
+            read_trimmed(&self.root.join(ROLE_SUPPLEMENT_FILE)),
+        ]
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
         Ok(IdentityText {
-            role: read_trimmed(&self.root.join("role.md")),
+            role,
             self_text: read_trimmed(&self.root.join("self.md")),
             i18n,
         })
@@ -169,10 +226,51 @@ impl BehaviorCatalog for FsBehaviorCatalog {
         Ok(out)
     }
 
+    async fn cmd_skill(&self, name: &str) -> Result<Option<String>> {
+        crate::ids::validate_session_id(name)
+            .map_err(|_| OpenDanError::InvalidArgument(format!("bad cmd_skill name `{name}`")))?;
+        let path = self.root.join(CMD_SKILLS_DIR).join(format!("{name}.md"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(read_trimmed(&path)))
+    }
+
+    async fn skills(&self, kind: Option<SkillKind>) -> Result<Vec<SkillMeta>> {
+        crate::skills::list(&self.root, kind)
+    }
+
+    async fn install_skills(
+        &self,
+        pkg: &crate::skills::SkillPackage,
+        replace: bool,
+        who: &str,
+    ) -> Result<crate::skills::InstallReport> {
+        let r = crate::skills::install(&self.root, pkg, replace, who)?;
+        log::info!(
+            "skills: {} {} ({}) installed by {who}: {}",
+            r.package,
+            r.version,
+            r.digest,
+            r.skills.iter().map(|s| format!("{}:{}", s.kind.as_str(), s.name)).collect::<Vec<_>>().join(", ")
+        );
+        Ok(r)
+    }
+
+    async fn remove_skill(&self, kind: SkillKind, name: &str, who: &str) -> Result<SkillMeta> {
+        let m = crate::skills::remove(&self.root, kind, name)?;
+        log::info!("skills: {}:{name} removed by {who}", kind.as_str());
+        Ok(m)
+    }
+
     async fn revision(&self) -> Result<String> {
         let mut h = Sha256::new();
-        let mut files: Vec<PathBuf> = vec![self.root.join("role.md"), self.root.join("self.md")];
-        for d in [self.dir(), self.root.join("i18n")] {
+        let mut files: Vec<PathBuf> = vec![
+            self.root.join("role.md"),
+            self.root.join(ROLE_SUPPLEMENT_FILE),
+            self.root.join("self.md"),
+        ];
+        for d in [self.dir(), self.root.join("i18n"), self.root.join(CMD_SKILLS_DIR)] {
             if let Ok(rd) = std::fs::read_dir(d) {
                 files.extend(rd.flatten().map(|e| e.path()));
             }
@@ -198,6 +296,7 @@ impl BehaviorCatalog for FsBehaviorCatalog {
 pub struct MemBehaviorCatalog {
     identity: Mutex<IdentityText>,
     behaviors: Mutex<BTreeMap<String, BehaviorConfig>>,
+    cmd_skills: Mutex<BTreeMap<String, String>>,
     rev: Mutex<u64>,
 }
 
@@ -215,6 +314,14 @@ impl MemBehaviorCatalog {
             .lock()
             .expect("behaviors")
             .insert(name.to_string(), cfg);
+        *self.rev.lock().expect("rev") += 1;
+    }
+
+    pub fn put_cmd_skill(&self, name: &str, text: &str) {
+        self.cmd_skills
+            .lock()
+            .expect("cmd skills")
+            .insert(name.to_string(), text.to_string());
         *self.rev.lock().expect("rev") += 1;
     }
 }
@@ -241,6 +348,26 @@ impl BehaviorCatalog for MemBehaviorCatalog {
 
     async fn revision(&self) -> Result<String> {
         Ok(format!("mem:{}", self.rev.lock().expect("rev")))
+    }
+
+    async fn cmd_skill(&self, name: &str) -> Result<Option<String>> {
+        Ok(self.cmd_skills.lock().expect("cmd skills").get(name).cloned())
+    }
+
+    async fn skills(&self, kind: Option<SkillKind>) -> Result<Vec<SkillMeta>> {
+        if kind == Some(SkillKind::Goal) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .cmd_skills
+            .lock()
+            .expect("cmd skills")
+            .iter()
+            .map(|(n, t)| SkillMeta {
+                origin: "package".into(),
+                ..skill_meta(SkillKind::Cmd, n, t)
+            })
+            .collect())
     }
 }
 
@@ -272,7 +399,30 @@ pub async fn freeze_config(
         frozen_by: who.to_string(),
         identity: catalog.identity().await?,
         behaviors: BTreeMap::new(),
+        cmd_skills: Vec::new(),
     };
+    // The session's command manuals are frozen with its behaviors: a
+    // cmd_skill the agent does not have is a configuration error.
+    check_cmd_skill_names(&cfg.prompt.cmd_skills)?;
+    for name in &cfg.prompt.cmd_skills {
+        let Some(text) = catalog.cmd_skill(name).await? else {
+            let known: Vec<String> = catalog
+                .skills(Some(SkillKind::Cmd))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            return Err(OpenDanError::InvalidArgument(format!(
+                "the agent has no cmd_skill `{name}` (installed: {}; see `agent-session skill list`)",
+                if known.is_empty() { "none".to_string() } else { known.join(", ") }
+            )));
+        };
+        frozen.cmd_skills.push(CmdSkill {
+            name: name.clone(),
+            text: split_front_matter(&text).1.to_string(),
+        });
+    }
     let mut next = cfg.clone();
     let mut queue: Vec<String> = cfg.prompt.behavior.iter().cloned().collect();
     while let Some(name) = queue.pop() {
@@ -290,6 +440,28 @@ pub async fn freeze_config(
     next.prompt.frozen = Some(frozen);
     next.behaviors().map_err(OpenDanError::InvalidArgument)?;
     *cfg = next;
+    Ok(())
+}
+
+/// The cmd_skill names a session may take: at most [`MAX_CMD_SKILLS`], each
+/// once, each a valid name.
+pub fn check_cmd_skill_names(names: &[String]) -> Result<()> {
+    if names.len() > MAX_CMD_SKILLS {
+        return Err(OpenDanError::InvalidArgument(format!(
+            "a session takes at most {MAX_CMD_SKILLS} cmd_skills (got {}): choose the ones the task needs",
+            names.len()
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for n in names {
+        crate::ids::validate_session_id(n)
+            .map_err(|_| OpenDanError::InvalidArgument(format!("bad cmd_skill name `{n}`")))?;
+        if !seen.insert(n.as_str()) {
+            return Err(OpenDanError::InvalidArgument(format!(
+                "cmd_skill `{n}` is named twice"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -320,4 +492,32 @@ pub async fn freeze_behavior(
     }
     *cfg = next;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_role_supplement_follows_the_role() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".meta")).unwrap();
+        std::fs::write(dir.path().join("role.md"), "You are Jarvis.\n").unwrap();
+        std::fs::write(dir.path().join("self.md"), "I keep notes.").unwrap();
+        let catalog = FsBehaviorCatalog::new(dir.path());
+        let plain = catalog.identity().await.unwrap();
+        assert_eq!(plain.role, "You are Jarvis.");
+        let before = catalog.revision().await.unwrap();
+
+        std::fs::write(dir.path().join(ROLE_SUPPLEMENT_FILE), "Answer in Japanese.\n").unwrap();
+        let with = catalog.identity().await.unwrap();
+        assert_eq!(with.role, "You are Jarvis.\n\nAnswer in Japanese.");
+        assert_eq!(with.self_text, "I keep notes.");
+        let after = catalog.revision().await.unwrap();
+        assert_ne!(before, after, "the supplement is part of the catalog revision");
+
+        std::fs::remove_file(dir.path().join(ROLE_SUPPLEMENT_FILE)).unwrap();
+        assert_eq!(catalog.identity().await.unwrap(), plain);
+        assert_eq!(catalog.revision().await.unwrap(), before);
+    }
 }

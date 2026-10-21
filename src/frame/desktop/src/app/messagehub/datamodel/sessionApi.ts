@@ -1,11 +1,12 @@
 import { buckyos } from 'buckyos'
 import { fetchUserDetail } from '../../../api/user_mgr'
-import type { DID, MsgObject } from '../protocol/msgobj'
+import type { DID, MsgObject, NotifyCategory, NotifyKind, NotifyStatus } from '../protocol/msgobj'
+import type { NotifyView } from '../notify/model'
 
 /**
  * Thin client for the msg-center RPC surface used by MessageHub. Wire shapes
  * mirror the Rust structs in src/kernel/buckyos-api/src/msg_center_client.rs
- * (`msg.*`, `ui_session.*`, `contact.*`, `group.*`).
+ * (`msg.*`, `ui_session.*`, `contact.*`, `group.*`) and msg_notify.rs (`notify.*`).
  */
 
 const MSG_CENTER_SERVICE = 'msg-center'
@@ -184,7 +185,7 @@ export interface AccountBinding {
   meta?: Record<string, string>
 }
 
-export type AccessGroupLevel = 'block' | 'stranger' | 'temporary' | 'friend'
+export type AccessGroupLevel = 'block' | 'stranger' | 'temporary' | 'allow'
 
 export interface Contact {
   did: DID
@@ -196,7 +197,7 @@ export interface Contact {
   bindings?: AccountBinding[]
   access_level: AccessGroupLevel
   temp_grants?: Array<{ context_id: string; granted_at: number; expires_at: number }>
-  groups?: string[]
+  friend_state?: 'none' | 'outgoing_pending' | 'incoming_pending' | 'friend'
   tags?: string[]
   created_at: number
   updated_at: number
@@ -312,8 +313,6 @@ export const updateUiSessionState = (sessionId: string, key: string, value: unkn
 
 export const listContacts = (contactMgrOwner?: DID) => call<Contact[] | null>('contact.list_contacts', contactMgrOwner ? { query: {}, contact_mgr_owner: contactMgrOwner } : { query: {} }).then(list => list ?? [])
 export const getContact = (did: DID, contactMgrOwner?: DID) => call<Contact | null>('contact.get_contact', contactMgrOwner ? { did, contact_mgr_owner: contactMgrOwner } : { did })
-export const updateContact = (did: DID, patch: Record<string, unknown>, contactMgrOwner?: DID) => call<Contact>('contact.update_contact', contactMgrOwner ? { did, patch, contact_mgr_owner: contactMgrOwner } : { did, patch })
-export const blockContact = (did: DID, contactMgrOwner?: DID, reason?: string) => call<unknown>('contact.block_contact', { did, ...(reason ? { reason } : {}), ...(contactMgrOwner ? { contact_mgr_owner: contactMgrOwner } : {}) })
 
 /* ── Self-host Group v2 (msg_center/doc/group-v2-backend.md) ── */
 
@@ -458,5 +457,30 @@ export const updateGroupMemberState = (groupDid: DID, sessionId: string | undefi
 /** The host's reason code (`capability-denied`, `invitation-mismatch`, …) carried in an RPC error. */
 export function groupErrorReason(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
+  // msg-center refuses to add an Agent whose `allow_group` is off (NoPermission … agent_group_disabled).
+  if (message.includes('agent_group_disabled')) return 'agent-group-disabled'
   return message.match(/[a-z0-9]+(?:-[a-z0-9]+)+/)?.[0] ?? 'unknown'
 }
+
+/* ── System Notify (`msg_notify.rs`) ── */
+
+/** `NotifyListReq`; only the caller's own notifications are listed. */
+export interface NotifyListRequest {
+  status?: NotifyStatus[]
+  kind?: NotifyKind
+  category?: NotifyCategory
+  agent_did?: DID
+  app_id?: string
+  session_id?: string
+  goal_id?: string
+  since_ms?: number
+  cursor?: string
+  limit?: number
+}
+
+export const getNotify = (notifyId: string) => call<NotifyView>('notify.get', { notify_id: notifyId })
+export const listNotify = (request: NotifyListRequest) => call<{ items?: NotifyView[]; next_cursor?: string } | null>('notify.list', request as unknown as Record<string, unknown>).then(result => ({ items: result?.items ?? [], next_cursor: result?.next_cursor }))
+/** Marks a `notice` read (every record of it). */
+export const ackNotify = (notifyId: string) => call<NotifyView>('notify.ack', { notify_id: notifyId })
+/** Dismisses a `notice` (archives every record of it). */
+export const dismissNotify = (notifyId: string) => call<NotifyView>('notify.dismiss', { notify_id: notifyId })

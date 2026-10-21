@@ -8,6 +8,8 @@ import type {
   Decision,
   Hint,
   IdentityText,
+  KnownRuntime,
+  KnownWorkspace,
   LoaderStatus,
   PerceptionCursor,
   PerceptionRecord,
@@ -16,6 +18,7 @@ import type {
   SessionDetail,
   UiBinding,
   UsageByModel,
+  WorkspaceLocation,
 } from './types'
 
 export interface PerceptionView {
@@ -28,8 +31,16 @@ export interface BehaviorCatalog {
   behaviors: BehaviorMeta[]
 }
 
+/** Whether the page still has the zone login its calls need. */
+export interface LoginState {
+  /** `true` once the zone turns this page away: only a new sign-in helps. */
+  lost(): boolean
+  subscribe(notify: () => void): () => void
+}
+
 export interface OpenDanDataModel {
   readonly source: 'mock' | 'krpc'
+  readonly login: LoginState
 
   loaderStatus(): Promise<LoaderStatus>
 
@@ -38,6 +49,10 @@ export interface OpenDanDataModel {
   /** `null`: the service does not record usage by model. */
   usageModels(): Promise<UsageByModel | null>
   uiBindings(): Promise<UiBinding[]>
+  workspaces(): Promise<KnownWorkspace[]>
+  runtimes(): Promise<KnownRuntime[]>
+  checkWorkspace(workspaceId: string): Promise<KnownWorkspace>
+  relocateWorkspace(workspace: KnownWorkspace, location: WorkspaceLocation): Promise<KnownWorkspace>
 
   sessions(): Promise<RegistryEntry[]>
   activeSessions(): Promise<ActiveSession[]>

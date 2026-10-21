@@ -9,16 +9,17 @@
 
 use crate::msg_center::MessageCenter;
 use crate::owner_session_db::{DeleteWatermark, VisibleSessionIndexEntry};
+use crate::zone_agent::{find_zone_agent_spec, load_agent_settings, AgentLocationHints};
 use async_trait::async_trait;
 use buckyos_api::{
-    get_buckyos_api_runtime, validate_verify_hub_token_claims, MailboxAddress, MailboxKind,
-    MailboxRecord, MsgCenterCreateSessionReq, OwnerSessionState, SessionLifecycle,
+    get_buckyos_api_runtime, validate_verify_hub_token_claims, AgentSpec, MailboxAddress,
+    MailboxKind, MailboxRecord, MsgCenterCreateSessionReq, OwnerSessionState, SessionLifecycle,
     SessionListLifecycleFilter, SessionListOrder, SessionMessagePage, SessionSummary,
     SessionSummaryPage, TokenPrincipalKind, TokenUse, UiSessionStateEntry, UserPrivateProfile,
 };
 use kRPC::{RPCContext, RPCErrors, RPCSessionToken};
 use log::warn;
-use name_lib::{AgentDocument, DID};
+use name_lib::DID;
 use ndn_lib::MsgObjKind;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -51,13 +52,43 @@ pub trait SessionTokenVerifier: Send + Sync {
 
     async fn verify(&self, token: &str) -> std::result::Result<RPCSessionToken, RPCErrors>;
     async fn resolve_user_did(&self, user_id: &str) -> std::result::Result<DID, RPCErrors>;
-    async fn is_zone_agent(&self, did: &DID) -> std::result::Result<bool, RPCErrors>;
-    /// Owner of a zone-hosted agent (`AgentDocument.owner`); `None` when
-    /// `did` is not a live agent of this zone.
-    async fn agent_owner(&self, did: &DID) -> std::result::Result<Option<DID>, RPCErrors>;
+    /// `None` when `did` is not an Agent of this zone with an installed spec.
+    async fn zone_agent(&self, did: &DID) -> std::result::Result<Option<ZoneAgentInfo>, RPCErrors>;
+
+    async fn is_zone_agent(&self, did: &DID) -> std::result::Result<bool, RPCErrors> {
+        Ok(self.zone_agent(did).await?.is_some())
+    }
+
+    /// Owner of a zone-hosted agent (`AgentDocument.owner`).
+    async fn agent_owner(&self, did: &DID) -> std::result::Result<Option<DID>, RPCErrors> {
+        Ok(self.zone_agent(did).await?.map(|agent| agent.owner))
+    }
 }
 
-pub struct RuntimeSessionTokenVerifier;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZoneAgentInfo {
+    pub owner: DID,
+    pub allow_group: bool,
+}
+
+#[derive(Default)]
+pub struct RuntimeSessionTokenVerifier {
+    agent_locations: AgentLocationHints,
+}
+
+impl RuntimeSessionTokenVerifier {
+    async fn zone_agent_spec(
+        &self,
+        did: &DID,
+    ) -> std::result::Result<Option<(String, AgentSpec)>, RPCErrors> {
+        let client = get_buckyos_api_runtime()?
+            .get_system_config_client()
+            .await?;
+        find_zone_agent_spec(client.as_ref(), did, Some(&self.agent_locations))
+            .await
+            .map_err(|error| permission_denied(error.to_string()))
+    }
+}
 
 #[async_trait]
 impl SessionTokenVerifier for RuntimeSessionTokenVerifier {
@@ -80,40 +111,160 @@ impl SessionTokenVerifier for RuntimeSessionTokenVerifier {
         Ok(profile.did)
     }
 
-    async fn is_zone_agent(&self, did: &DID) -> std::result::Result<bool, RPCErrors> {
-        Ok(self.agent_owner(did).await?.is_some())
-    }
-
-    async fn agent_owner(&self, did: &DID) -> std::result::Result<Option<DID>, RPCErrors> {
+    async fn zone_agent(&self, did: &DID) -> std::result::Result<Option<ZoneAgentInfo>, RPCErrors> {
+        let Some((owner_user_id, spec)) = self.zone_agent_spec(did).await? else {
+            return Ok(None);
+        };
         let client = get_buckyos_api_runtime()?
             .get_system_config_client()
             .await?;
-        for agent_id in client
-            .list("agents")
+        let settings = load_agent_settings(client.as_ref(), &owner_user_id, &spec.agent_id)
             .await
-            .map_err(|error| permission_denied(error.to_string()))?
-        {
-            let value = client
-                .get(&format!("agents/{}/doc", agent_id))
-                .await
-                .map_err(|error| permission_denied(error.to_string()))?;
-            let doc: AgentDocument = serde_json::from_str(&value.value)
-                .map_err(|error| permission_denied(format!("invalid agent document: {}", error)))?;
-            if &doc.id == did {
-                let settings = client
-                    .get(&format!("agents/{}/settings", agent_id))
-                    .await
-                    .map_err(|error| permission_denied(error.to_string()))?;
-                let settings: Value = serde_json::from_str(&settings.value).map_err(|error| {
-                    permission_denied(format!("invalid agent settings: {}", error))
-                })?;
-                return Ok(
-                    (settings.get("state").and_then(Value::as_str) != Some("deleted"))
-                        .then(|| doc.owner.clone()),
-                );
-            }
+            .map_err(|error| permission_denied(error.to_string()))?;
+        Ok(Some(ZoneAgentInfo {
+            owner: spec.agent_doc.owner,
+            allow_group: settings.allow_group,
+        }))
+    }
+
+    async fn is_zone_agent(&self, did: &DID) -> std::result::Result<bool, RPCErrors> {
+        Ok(self.zone_agent_spec(did).await?.is_some())
+    }
+
+    async fn agent_owner(&self, did: &DID) -> std::result::Result<Option<DID>, RPCErrors> {
+        Ok(self
+            .zone_agent_spec(did)
+            .await?
+            .map(|(_, spec)| spec.agent_doc.owner))
+    }
+}
+
+tokio::task_local! {
+    static REQUEST_IDENTITY: RequestIdentityMemo;
+}
+
+#[derive(Default)]
+struct RequestIdentityMemo(std::sync::Mutex<RequestIdentityFacts>);
+
+#[derive(Default)]
+struct RequestIdentityFacts {
+    verified_tokens: HashMap<String, RPCSessionToken>,
+    user_dids: HashMap<String, DID>,
+    zone_agents: HashMap<DID, Option<ZoneAgentInfo>>,
+    agent_owners: HashMap<DID, Option<DID>>,
+}
+
+/// Only successful answers are kept, and only for this request.
+pub(crate) async fn serve_with_request_identity<F: std::future::Future>(request: F) -> F::Output {
+    REQUEST_IDENTITY
+        .scope(RequestIdentityMemo::default(), request)
+        .await
+}
+
+fn recall<T>(read: impl FnOnce(&RequestIdentityFacts) -> Option<T>) -> Option<T> {
+    REQUEST_IDENTITY
+        .try_with(|memo| {
+            read(
+                &memo
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        })
+        .ok()
+        .flatten()
+}
+
+fn remember(write: impl FnOnce(&mut RequestIdentityFacts)) {
+    let _ = REQUEST_IDENTITY.try_with(|memo| {
+        write(
+            &mut memo
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    });
+}
+
+struct RequestScopedVerifier(Arc<dyn SessionTokenVerifier>);
+
+#[async_trait]
+impl SessionTokenVerifier for RequestScopedVerifier {
+    async fn authorize(
+        &self,
+        token: &str,
+        resource: &str,
+        action: &str,
+    ) -> std::result::Result<(), RPCErrors> {
+        self.0.authorize(token, resource, action).await
+    }
+
+    async fn verify(&self, token: &str) -> std::result::Result<RPCSessionToken, RPCErrors> {
+        if let Some(verified) = recall(|facts| facts.verified_tokens.get(token).cloned()) {
+            return Ok(verified);
         }
-        Ok(None)
+        let verified = self.0.verify(token).await?;
+        remember(|facts| {
+            facts
+                .verified_tokens
+                .insert(token.to_string(), verified.clone());
+        });
+        Ok(verified)
+    }
+
+    async fn resolve_user_did(&self, user_id: &str) -> std::result::Result<DID, RPCErrors> {
+        if let Some(did) = recall(|facts| facts.user_dids.get(user_id).cloned()) {
+            return Ok(did);
+        }
+        let did = self.0.resolve_user_did(user_id).await?;
+        remember(|facts| {
+            facts.user_dids.insert(user_id.to_string(), did.clone());
+        });
+        Ok(did)
+    }
+
+    async fn zone_agent(&self, did: &DID) -> std::result::Result<Option<ZoneAgentInfo>, RPCErrors> {
+        if let Some(agent) = recall(|facts| facts.zone_agents.get(did).cloned()) {
+            return Ok(agent);
+        }
+        let agent = self.0.zone_agent(did).await?;
+        remember(|facts| {
+            facts.zone_agents.insert(did.clone(), agent.clone());
+        });
+        Ok(agent)
+    }
+
+    async fn is_zone_agent(&self, did: &DID) -> std::result::Result<bool, RPCErrors> {
+        let known = recall(|facts| {
+            facts
+                .agent_owners
+                .get(did)
+                .map(Option::is_some)
+                .or_else(|| facts.zone_agents.get(did).map(Option::is_some))
+        });
+        match known {
+            Some(known) => Ok(known),
+            None => self.0.is_zone_agent(did).await,
+        }
+    }
+
+    async fn agent_owner(&self, did: &DID) -> std::result::Result<Option<DID>, RPCErrors> {
+        let known = recall(|facts| {
+            facts.agent_owners.get(did).cloned().or_else(|| {
+                facts
+                    .zone_agents
+                    .get(did)
+                    .map(|agent| agent.as_ref().map(|agent| agent.owner.clone()))
+            })
+        });
+        if let Some(owner) = known {
+            return Ok(owner);
+        }
+        let owner = self.0.agent_owner(did).await?;
+        remember(|facts| {
+            facts.agent_owners.insert(did.clone(), owner.clone());
+        });
+        Ok(owner)
     }
 }
 
@@ -123,7 +274,7 @@ pub struct TokenVerifierSlot(RwLock<Arc<dyn SessionTokenVerifier>>);
 
 impl TokenVerifierSlot {
     pub fn new(verifier: Arc<dyn SessionTokenVerifier>) -> Self {
-        Self(RwLock::new(verifier))
+        Self(RwLock::new(Arc::new(RequestScopedVerifier(verifier))))
     }
 
     pub(crate) fn get(&self) -> Arc<dyn SessionTokenVerifier> {
@@ -132,7 +283,7 @@ impl TokenVerifierSlot {
 
     #[allow(dead_code)]
     fn set(&self, verifier: Arc<dyn SessionTokenVerifier>) {
-        *self.0.write().unwrap() = verifier;
+        *self.0.write().unwrap() = Arc::new(RequestScopedVerifier(verifier));
     }
 }
 
@@ -144,7 +295,7 @@ impl std::fmt::Debug for TokenVerifierSlot {
 
 impl Default for TokenVerifierSlot {
     fn default() -> Self {
-        Self::new(Arc::new(RuntimeSessionTokenVerifier))
+        Self::new(Arc::new(RuntimeSessionTokenVerifier::default()))
     }
 }
 
@@ -154,6 +305,19 @@ pub struct CallerIdentity {
     pub user_id: String,
     pub principal_kind: TokenPrincipalKind,
     pub user_did: Option<DID>,
+    /// RBAC app subject of the token (`system:<service>` / `app:<app>`).
+    pub authorization_key: String,
+}
+
+/// A call made inside this process: no session token and no peer address.
+pub(crate) fn is_in_process_call(ctx: &RPCContext) -> bool {
+    ctx.from_ip.is_none()
+        && ctx
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .is_none()
 }
 
 fn permission_denied(reason: impl Into<String>) -> RPCErrors {
@@ -163,7 +327,7 @@ fn permission_denied(reason: impl Into<String>) -> RPCErrors {
 fn is_activity_kind(kind: MsgObjKind) -> bool {
     matches!(
         kind,
-        MsgObjKind::Chat | MsgObjKind::GroupMsg | MsgObjKind::Deliver
+        MsgObjKind::Chat | MsgObjKind::GroupMsg | MsgObjKind::Deliver | MsgObjKind::Notify
     )
 }
 
@@ -216,17 +380,16 @@ impl MessageCenter {
         &self,
         ctx: &RPCContext,
     ) -> std::result::Result<Option<CallerIdentity>, RPCErrors> {
+        if is_in_process_call(ctx) {
+            return Ok(None);
+        }
         let Some(token) = ctx
             .token
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
         else {
-            return if ctx.from_ip.is_some() {
-                Err(permission_denied("session token required"))
-            } else {
-                Ok(None)
-            };
+            return Err(permission_denied("session token required"));
         };
         let verified = self
             .token_verifier
@@ -259,19 +422,27 @@ impl MessageCenter {
         };
         Ok(Some(CallerIdentity {
             user_id,
+            authorization_key: claims.target.authorization_key(),
             principal_kind: claims.principal_kind,
             user_did,
         }))
     }
 
     /// A zone user may observe a mailbox owner other than themselves only when
-    /// the owner is a zone-hosted non-user identity (an agent such as
-    /// `did:web:jarvis.<zone>`). Other users' mailboxes are never readable.
-    async fn user_may_observe(&self, owner: &DID) -> std::result::Result<bool, RPCErrors> {
+    /// the owner is a zone-hosted Agent of that user. Other users' mailboxes
+    /// and their Agents' mailboxes are never readable.
+    async fn user_may_observe(
+        &self,
+        viewer: Option<&DID>,
+        owner: &DID,
+    ) -> std::result::Result<bool, RPCErrors> {
+        let Some(viewer) = viewer else {
+            return Ok(false);
+        };
         if !self.is_local_recipient(owner) {
             return Ok(false);
         }
-        self.token_verifier.get().is_zone_agent(owner).await
+        Ok(self.token_verifier.get().agent_owner(owner).await?.as_ref() == Some(viewer))
     }
 
     /// Read access of the caller to `owner`'s mailbox / sessions.
@@ -285,7 +456,9 @@ impl MessageCenter {
             Some(caller) => match caller.principal_kind {
                 TokenPrincipalKind::User => {
                     if caller.user_did.as_ref() == Some(owner)
-                        || self.user_may_observe(owner).await?
+                        || self
+                            .user_may_observe(caller.user_did.as_ref(), owner)
+                            .await?
                     {
                         Ok(())
                     } else {

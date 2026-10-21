@@ -1,6 +1,8 @@
-//! Start-up and shutdown of the Loader: AgentRoot sync → `agent.toml` →
-//! Agent State (file implementation, registered for the process) → HTTP
-//! (kRPC + WebUI) → Supervisor → modules.
+//! Start-up and shutdown of the Loader: AgentRoot identity → AgentRoot sync
+//! (unless the template is pinned) → the instance role (its name and the
+//! owner's supplement) →
+//! `agent.toml` → Agent State (file implementation, registered for the
+//! process) → HTTP (kRPC + WebUI) → Supervisor → modules → runtime info.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -8,20 +10,34 @@ use std::time::Duration;
 
 use agent_tool::xllm::XllmDeps;
 use anyhow::{anyhow, Context, Result};
-use buckyos_api::KEventClient;
+use buckyos_api::{agent_short_name, AgentId, AgentRuntimeInfo, AgentSettings, KEventClient};
 use buckyos_http_server::{DirHandlerOptions, Runner};
 use libopendan::bridge::{EventBridge, KEventBridge, TimerBridge};
 use libopendan::channel::{KmsgChannels, Waker};
+use libopendan::host::goals::{GoalHost, GoalHostOptions};
 use libopendan::host::{HostDeps, Supervisor};
-use libopendan::runner::{BehaviorAssembler, OutboundSink, RunnerOptions};
-use libopendan::state::{register_in_process, unregister_in_process, AgentStateClient, FsAgentStateClient};
+use libopendan::protocol::builtin_runtimes;
+use libopendan::runner::{BehaviorAssembler, ObjectStore, OutboundSink, RunnerOptions};
+use libopendan::state::{
+    register_in_process, unregister_in_process, AgentStateClient, FsAgentStateClient, WithNotify,
+};
+use name_lib::DID;
+use ndn_lib::ObjId;
 
 use crate::config::AgentConfig;
 use crate::home::Home;
-use crate::rootfs;
+use crate::records::{self, AgentRecords};
+use crate::rootfs::{self, RootIdentity};
 use crate::service::{Access, LoaderInfo, ModuleStatus, StateService, SERVICE_PATH};
 use crate::tasks::{owner_of, CancelBridge, TaskService, TurnTasks};
 use crate::ui::{MailService, MsgCenterSink, OutboundTexts, UiModule};
+
+/// The AgentSpec this process hosts the agent of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpecRef {
+    pub agent_doc_object_id: ObjId,
+    pub generation: u64,
+}
 
 /// Everything the Loader takes from its surroundings.
 pub struct LoaderEnv {
@@ -31,8 +47,23 @@ pub struct LoaderEnv {
     pub agent_did: String,
     /// Name of the agent in kevent / kmsg names (default: from the DID).
     pub agent_id: Option<String>,
+    /// The agent's owner (`AgentSpec.agent_doc.owner`): the only sender
+    /// whose messages reach a session. `None`: messages reach none.
+    pub owner_did: Option<DID>,
+    /// `None` outside a zone: no AgentDocument the AgentRoot is bound to
+    /// and no runtime info to write.
+    pub spec: Option<SpecRef>,
+    /// Read once at start-up; `allow_group` is read again while running.
+    pub settings: AgentSettings,
+    /// `settings`, `profile` and `info` outside the AgentRoot.
+    pub records: Arc<dyn AgentRecords>,
     pub agent_root: PathBuf,
     pub package_root: Option<PathBuf>,
+    /// The template's `agent_skills` sub package (`cmd_skills/`,
+    /// `goal_skills/`, `tools/`), synced like the package itself.
+    pub skills_package_root: Option<PathBuf>,
+    /// Version of the package at `package_root` (the agent's template).
+    pub package_version: Option<String>,
     pub channels: Arc<KmsgChannels>,
     pub waker: Arc<dyn Waker>,
     pub kevent: Option<Arc<KEventClient>>,
@@ -40,12 +71,21 @@ pub struct LoaderEnv {
     pub mail: Option<Arc<dyn MailService>>,
     /// `None`: no TaskMgr (development host); Turns get no task.
     pub tasks: Option<Arc<dyn TaskService>>,
+    /// `None`: no NamedStore (development host); report artifacts stay
+    /// files and replies attach no local file.
+    pub objects: Option<Arc<dyn ObjectStore>>,
+    /// The owner's notification service (msg-center; files with `--dev`).
+    /// `None`: a Work cannot ask, `agent-session notify` is not available.
+    pub notify: Option<Arc<dyn libopendan::notify::NotifyHost>>,
     pub access: Access,
     pub port: u16,
     pub web_dir: Option<PathBuf>,
     pub xllm: XllmDeps,
     /// The `xagent` executable, wrapped as `agent-session` in every session.
     pub session_cli: Option<PathBuf>,
+    /// Further commands every session gets (`llm_understand_media` →
+    /// `agent_tool llm_understand_media`).
+    pub session_helpers: Vec<libopendan::runtime::bin_overlay::SessionHelper>,
     pub options: RunnerOptions,
 }
 
@@ -58,25 +98,118 @@ pub struct Loader {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Where workspaces are best placed in the agent's own environment: the
+/// AgentRoot's `workspaces/`, and the owner's home when the AgentRoot lives
+/// under it (`<home>/.local/share/<app>/agents/<agent>`).
+fn container_roots(agent_root: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = vec![agent_root.join("workspaces")];
+    let home = agent_root
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == ".local"))
+        .and_then(|local| local.parent());
+    if let Some(home) = home.filter(|h| h.is_dir()) {
+        roots.push(home.to_path_buf());
+    }
+    roots
+}
+
+fn container_note() -> &'static str {
+    if std::path::Path::new("/.dockerenv").exists() {
+        "It is the agent's container: paths here are not the owner's host paths."
+    } else {
+        "The agent currently runs as a process on its host (development), so this is the host's own environment."
+    }
+}
+
 impl Loader {
     pub async fn start(env: LoaderEnv) -> Result<Self> {
-        rootfs::ensure_layout(&env.agent_root)?;
-        match &env.package_root {
+        rootfs::claim(
+            &env.agent_root,
+            &RootIdentity {
+                agent_did: env.agent_did.clone(),
+                agent_doc_object_id: env.spec.as_ref().map(|s| s.agent_doc_object_id.clone()),
+            },
+        )?;
+        let pinned = !env.settings.template_auto_update && rootfs::initialized(&env.agent_root);
+        let synced = match &env.package_root {
+            Some(pkg) if pinned => {
+                log::info!(
+                    "loader: the template of {} is pinned; AgentRoot {} is not synced from {}",
+                    env.agent_did,
+                    env.agent_root.display(),
+                    pkg.display()
+                );
+                false
+            }
             Some(pkg) => {
                 let r = rootfs::sync_from_package(pkg, &env.agent_root)
                     .with_context(|| format!("sync AgentRoot from {}", pkg.display()))?;
                 log::info!(
-                    "loader: AgentRoot {} synced from {}: copied={} updated={} unchanged={} kept_local={}",
+                    "loader: AgentRoot {} synced from {} ({}): copied={} updated={} unchanged={} kept_local={}",
                     env.agent_root.display(),
                     pkg.display(),
+                    env.package_version.as_deref().unwrap_or("unknown version"),
                     r.copied,
                     r.updated,
                     r.unchanged,
                     r.preserved
                 );
+                true
             }
-            None => log::warn!("loader: no agent package directory; AgentRoot is used as it is"),
+            None => {
+                log::warn!("loader: no agent package directory; AgentRoot is used as it is");
+                false
+            }
+        };
+        if let Some(skills) = env.skills_package_root.as_ref().filter(|_| !pinned) {
+            let r = rootfs::sync_from_package(skills, &env.agent_root)
+                .with_context(|| format!("sync AgentRoot from the skills package {}", skills.display()))?;
+            log::info!(
+                "loader: skills of the template synced from {}: copied={} updated={} unchanged={} kept={}",
+                skills.display(),
+                r.copied,
+                r.updated,
+                r.unchanged,
+                r.preserved
+            );
         }
+        let display_name = match records::profile(env.records.as_ref()).await {
+            Ok(profile) => DID::from_str(&env.agent_did)
+                .ok()
+                .and_then(|did| AgentId::from_agent_did(&did).ok())
+                .map(|id| (profile.resolved_display_name(&id), agent_short_name(&id))),
+            Err(e) => {
+                log::warn!("loader: profile of {} not readable: {e}", env.agent_did);
+                None
+            }
+        };
+        // Who the agent is and whose: its name, account and DID, and its
+        // owner's account and DID (the review of the UI prompt).
+        let owner_line = env.owner_did.as_ref().map(|owner| {
+            let owner = owner.to_string();
+            format!(
+                "Your owner is `{}` (DID `{owner}`).",
+                libopendan::runner::assembler::did_account(&owner)
+            )
+        });
+        let instance_role = display_name
+            .map(|(name, account)| {
+                let mut line = format!(
+                    "Your name is {name} (account `{account}`, DID `{}`).",
+                    env.agent_did
+                );
+                if let Some(o) = &owner_line {
+                    line.push(' ');
+                    line.push_str(o);
+                }
+                line
+            })
+            .into_iter()
+            .chain(Some(env.settings.role_supplement.trim().to_string()))
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        rootfs::write_role_supplement(&env.agent_root, &instance_role)?;
         let config = AgentConfig::load(&env.agent_root)?;
 
         let mut fs = FsAgentStateClient::open(
@@ -89,8 +222,26 @@ impl Loader {
         if let Some(id) = &env.agent_id {
             fs = fs.with_agent_id(id);
         }
-        let agent: Arc<dyn AgentStateClient> = Arc::new(fs);
+        let agent: Arc<dyn AgentStateClient> = match &env.notify {
+            Some(notify) => Arc::new(WithNotify::new(Arc::new(fs), notify.clone())),
+            None => Arc::new(fs),
+        };
         register_in_process(agent.clone());
+        // The runtimes every agent has, before anything can choose one.
+        match agent
+            .runtimes()
+            .ensure_builtin(&builtin_runtimes(container_roots(&env.agent_root), container_note()), &env.who)
+            .await
+        {
+            Ok(r) => log::info!(
+                "loader: runtimes {}",
+                r.iter()
+                    .map(|r| format!("{}={:?}", r.runtime_id, r.availability))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(e) => log::warn!("loader: built-in runtimes not registered: {e}"),
+        }
 
         let info = Arc::new(LoaderInfo {
             agent_did: env.agent_did.clone(),
@@ -125,6 +276,7 @@ impl Loader {
             Arc::new(MsgCenterSink {
                 mail,
                 texts: OutboundTexts::load(&env.agent_root, &config.language),
+                owner: env.owner_did.clone(),
             }) as Arc<dyn OutboundSink>
         });
         if env.session_cli.is_none() {
@@ -137,6 +289,13 @@ impl Loader {
         // Commands run by a session's shell reach the Agent State as the
         // same identity.
         std::env::set_var("LIBOPENDAN_WHO", &env.who);
+        // ... and know how many sub sessions this host drives at once (a
+        // Todo dispatch beyond it is refused, not queued).
+        let max_child_concurrency = 4;
+        std::env::set_var(
+            libopendan::todos::ENV_MAX_CHILDREN,
+            max_child_concurrency.to_string(),
+        );
         let host = HostDeps {
             who: env.who.clone(),
             agent: agent.clone(),
@@ -145,11 +304,14 @@ impl Loader {
             xllm: env.xllm.clone(),
             assembler: Arc::new(BehaviorAssembler::default()),
             session_cli: env.session_cli.clone(),
+            session_helpers: env.session_helpers.clone(),
             app_tools: Vec::new(),
             options,
-            max_child_concurrency: 4,
+            max_child_concurrency,
             bridges,
             outbound,
+            objects: env.objects.clone(),
+            notify: env.notify.clone(),
             turn_tasks: env.tasks.clone().map(|tasks| {
                 Arc::new(TurnTasks {
                     tasks,
@@ -168,6 +330,14 @@ impl Loader {
                     supervisor.with_class_idle(&rule.session_class, Duration::from_secs(secs));
             }
         }
+        // Goals: their Goal Sessions follow the Goal list, scheduled run
+        // opportunities come from the local schedule (phase 1).
+        if config.loader.goals.enabled {
+            supervisor = supervisor.with_goals(GoalHost::new(GoalHostOptions::new(
+                env.agent_root.join("sessions"),
+                config.llm_context.clone(),
+            )));
+        }
 
         let mut tasks = Vec::new();
         let ui = match (&env.mail, config.loader.ui.is_empty()) {
@@ -179,12 +349,19 @@ impl Loader {
                 module("ui", true, false, Some("msg-center is not available to this host"));
                 None
             }
+            (Some(_), false) if env.owner_did.is_none() => {
+                module("ui", true, false, Some("the agent has no owner"));
+                None
+            }
             (Some(mail), false) => {
                 module("ui", true, true, None);
                 Some(UiModule::new(
                     config.clone(),
                     agent.clone(),
                     &env.who,
+                    env.owner_did.clone().expect("checked"),
+                    env.settings.allow_group,
+                    env.records.clone(),
                     mail.clone(),
                     env.channels.clone(),
                     supervisor.clone(),
@@ -192,6 +369,12 @@ impl Loader {
                 ))
             }
         };
+        module(
+            "goals",
+            config.loader.goals.enabled,
+            config.loader.goals.enabled,
+            config.loader.goals.enabled.then_some("schedule backend: local"),
+        );
         for (name, switch) in [
             ("self_check", &config.loader.self_check),
             ("self_improve", &config.loader.self_improve),
@@ -213,7 +396,14 @@ impl Loader {
                     info: info.clone(),
                     ui: ui.clone(),
                     access: env.access.clone(),
-                    home: Home::new(&env.agent_root),
+                    home: Home::new(
+                        env.records.clone(),
+                        env.owner_did.as_ref().map(|d| d.to_string()),
+                        match &env.access {
+                            Access::Zone { zone_host, .. } => zone_host.as_ref().map(|h| format!("https://{h}")),
+                            Access::Open { .. } => None,
+                        },
+                    ),
                 });
                 runner
                     .add_http_server(SERVICE_PATH.to_string(), service.clone())
@@ -265,6 +455,19 @@ impl Loader {
         // Recovery does not wait for something to touch a session: the
         // first registry scan hosts everything left unfinished.
         tasks.push(tokio::spawn(supervisor.clone().run()));
+        match &env.notify {
+            Some(notify) => {
+                module("notify", true, true, None);
+                tasks.push(tokio::spawn(crate::notify::watch_answers(
+                    notify.clone(),
+                    env.kevent.clone(),
+                    supervisor.clone(),
+                    env.agent_did.clone(),
+                    env.options.poll_interval.saturating_mul(6),
+                )));
+            }
+            None => module("notify", false, false, Some("no notification service")),
+        }
         if let Some(ui) = &ui {
             tasks.push(tokio::spawn(
                 ui.clone().run(
@@ -272,6 +475,11 @@ impl Loader {
                     env.options.poll_interval.min(Duration::from_secs(5)),
                 ),
             ));
+        }
+        if let Some(shell_tasks) = env.xllm.shell_tasks.clone() {
+            // The `shell` tasks a previous process left open are taken
+            // back (or failed) before anything asks for them.
+            tasks.push(tokio::spawn(async move { shell_tasks.recover().await }));
         }
         match &env.tasks {
             Some(service) => {
@@ -287,6 +495,29 @@ impl Loader {
                 ));
             }
             None => module("task_mgr", false, false, Some("TaskMgr is not available to this host")),
+        }
+        if let Some(spec) = &env.spec {
+            let template_version = if synced {
+                env.package_version.clone()
+            } else {
+                match records::info(env.records.as_ref()).await {
+                    Ok(previous) => previous.and_then(|i| i.template_version),
+                    Err(e) => {
+                        log::warn!("loader: the previous runtime info is not readable ({e}); its template version is lost");
+                        None
+                    }
+                }
+            };
+            tasks.push(tokio::spawn(report_loaded(
+                env.records.clone(),
+                AgentRuntimeInfo {
+                    agent_doc_object_id: spec.agent_doc_object_id.clone(),
+                    generation: spec.generation,
+                    loaded_at: buckyos_kit::buckyos_get_unix_timestamp(),
+                    template_version,
+                },
+                info.clone(),
+            )));
         }
         log::info!(
             "loader: agent {} hosted by {} (root {})",
@@ -316,5 +547,29 @@ impl Loader {
         }
         self.supervisor.shutdown().await;
         unregister_in_process(self.agent.agent_did());
+    }
+}
+
+/// The runtime info tells the zone the agent is loaded (and from which
+/// template version); it is written until it is accepted.
+async fn report_loaded(records: Arc<dyn AgentRecords>, info: AgentRuntimeInfo, status: Arc<LoaderInfo>) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match records::set_info(records.as_ref(), &info).await {
+            Ok(()) => {
+                log::info!(
+                    "loader: runtime info written (generation {}, template {})",
+                    info.generation,
+                    info.template_version.as_deref().unwrap_or("unknown")
+                );
+                return;
+            }
+            Err(e) => {
+                log::warn!("loader: runtime info not written: {e}");
+                status.error("info", e);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
     }
 }

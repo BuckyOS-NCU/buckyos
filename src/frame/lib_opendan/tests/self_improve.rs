@@ -96,7 +96,7 @@ async fn failed_self_improve_does_not_advance_the_cursor() {
     .unwrap()
     .unwrap();
     // Stopped instead of succeeded.
-    libopendan::post_input(agent.as_ref(), si.sid(), &PostedInput::control(APP, "s", ControlCommand::Stop { reason: None }))
+    libopendan::post_input(agent.as_ref(), si.sid(), &PostedInput::control(APP, "s", ControlCommand::stop(None)))
         .await
         .unwrap();
     let r = drive(&si, &env.deps(ScriptedLlm::new(|_, _| text("never"))), StopWhen::Finished).await;
@@ -125,6 +125,7 @@ async fn perception_append_is_idempotent_and_monotonic() {
         summary: format!("r{seq}"),
         payload: serde_json::Value::Null,
         refs: serde_json::Value::Null,
+        ..Default::default()
     };
     let p = agent.perception();
     assert_eq!(p.append(&lease, sd.sid(), vec![rec(1), rec(2)]).await.unwrap(), 2);
