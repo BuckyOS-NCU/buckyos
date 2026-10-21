@@ -10,10 +10,14 @@ BuckyOS Compose 将 `/run` 挂为 tmpfs，避免普通容器重启时残留 cont
 
 Jarvis 容器的 OpenDAN 程序和 WebUI 来自内层 AIOS 镜像；更新外层 BuckyOS 镜像不会自动同步它们。诊断时分别核对内外层实际程序版本及容器内 `bin/opendan/web/index.html`，不要以外层 WebUI 文件存在推断 Jarvis 容器也有网页产物。
 
-此主机通过运行卷内 `etc/devenv.json` 的 `aios` 使用 `buckyos-aios-local` Worker 镜像。`docker/build-aios-runtime.sh` 在内部 Docker 中构建它，可通过 `BUCKYOS_OPENDAN_BINARY` 使用已编译的 OpenDAN；随后需要重建应用容器。node-daemon 对本地已有的 Worker 标签不会自动 pull。
+此主机通过运行卷内 `etc/devenv.json` 的 `aios` 使用 `buckyos-aios-local` Worker 镜像。`docker/build-aios-runtime.sh` 在内部 Docker 中构建它，可通过 `BUCKYOS_OPENDAN_BINARY` 使用已编译的 OpenDAN。node-daemon 从不拉取 paios 镜像；开发安装需在内部 Docker 中预先准备 Worker 和 `paios/exttool:latest-amd64`，镜像 ID 变化后会重建应用容器。
+
+Docker 覆盖更新必须保留 `bin/applist.json`，同时同步程序、SDK/CLI、`etc/scheduler/` 模板和 `data/cache/` 内置 PIKG。新模板不会重写已初始化 Zone 的 system-config；例如 Jarvis 从预装 App 改为 Agent 模板时，需同步 `system/install_settings.agent_templates` 登记。
 
 Agent Loader 实际读取 `data/home/<owner>/.local/share/<app_id>/agents/<agent_id>/agent.toml`。旧 `[dispatch.rule]` 不会启用新 Loader 的消息入口，需要 `[[loader.ui]]`；迁移时保留本地配置并按已有文件同步策略更新模板，不能只更新容器程序。
 
 AICC 的 DeepSeek discovery 将 `deepseek-flash` 归一为 `deepseek-v4.1-flash`；Provider variants 必须覆盖归一后的模型身份，否则实例健康、模型已发现仍会报 `missing_channel_mapping`，导致 `llm.chat` 无候选。本机映射补充位于运行卷 `etc/aicc/driver_metadata/local/providers/deepseek.provider.json`，通过 `service.reload_settings` 生效；本地 metadata 覆盖内置定义，system-config metadata 的优先级更高。
+
+AICC 的 `services/aicc/settings.providers[].credentials` 使用 `inline_secret`、`secret_ref` 或 `runtime_ref` 变体。旧的 `{ "locked": "..." }` 会导致服务解析失败；静态 API 密钥应保留值并改为 `{ "inline_secret": "..." }`，变更前保存受保护的配置备份。
 
 可迁移部署入口为仓库内 `docker/REPRODUCE.md`；原 `/root/neko/nginx/` 的域名网关、HTTP 跳转和可选 TUN 回程配置已收录到 `docker/domain/`。外部依赖跟随 main/latest，源码部署不保证复现已有镜像摘要；精确迁移仍需镜像和持久卷。

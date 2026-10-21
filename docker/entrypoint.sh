@@ -5,8 +5,14 @@ if [ ! -f "$BUCKYOS_ROOT/.docker-initialized" ]; then
     cp -a /usr/local/share/buckyos/rootfs/. "$BUCKYOS_ROOT/"
     touch "$BUCKYOS_ROOT/.docker-initialized"
 else
-    cp -a /usr/local/share/buckyos/rootfs/bin/. "$BUCKYOS_ROOT/bin/"
+    for module in /usr/local/share/buckyos/rootfs/bin/*; do
+        if [ "${module##*/}" != "applist.json" ]; then
+            cp -a "$module" "$BUCKYOS_ROOT/bin/"
+        fi
+    done
     cp -a /usr/local/share/buckyos/rootfs/libexec/. "$BUCKYOS_ROOT/libexec/"
+    cp -a /usr/local/share/buckyos/rootfs/etc/scheduler/. "$BUCKYOS_ROOT/etc/scheduler/"
+    cp -a /usr/local/share/buckyos/rootfs/data/cache/. "$BUCKYOS_ROOT/data/cache/"
     cp /usr/local/share/buckyos/rootfs/etc/boot_gateway.yaml "$BUCKYOS_ROOT/etc/boot_gateway.yaml"
 fi
 

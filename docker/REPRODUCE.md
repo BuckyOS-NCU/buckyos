@@ -44,6 +44,8 @@ docker compose --env-file docker/deployment.local.env logs --tail 100 buckyos
 外层构建已生成当前源码的 OpenDAN、WebUI、xagent、agent_tool 和 SDK。将它们装入内层 Worker，避免使用远端旧 Worker 中的程序：
 
 ```bash
+docker exec buckyos docker pull paios/aios:latest-amd64
+docker exec buckyos docker pull paios/exttool:latest-amd64
 bash docker/build-aios-runtime.sh
 docker exec -i buckyos python3 - <<'PY'
 import json
@@ -57,7 +59,7 @@ t.replace(p)
 PY
 ```
 
-随后从桌面安装/启动 Jarvis；已有实例需通过 App Service 面板重建应用容器，让它使用 `buckyos-aios-local:latest-amd64`。单独重启外层容器不会更新 Worker。`BUCKYOS_OPENDAN_BINARY` 只供使用外部已编译产物，纯净机器流程无需指定本机备份路径。
+随后通过桌面 Jarvis 入口或 Users and Agents 向导，基于内置 Jarvis 模板创建自己的 Agent。已有实例由新版 node-daemon 在发现 Worker 镜像 ID 变化后重建，让它使用 `buckyos-aios-local:latest-amd64`。单独重启外层容器不会更新 Worker。`BUCKYOS_OPENDAN_BINARY` 只供使用外部已编译产物，纯净机器流程无需指定本机备份路径。
 
 当前源码已有 `[[loader.ui]]` Agent 模板。旧数据卷的 `[dispatch.rule]` 配置不能直接当作新 Loader 配置；既有实例的本地修改也可能阻止模板同步。应先备份，再核对 AgentRoot 的 `agent.toml`，不能据此流程宣称完成旧数据迁移。
 

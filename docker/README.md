@@ -66,13 +66,20 @@ docker compose stop
 docker compose up -d --no-build
 ```
 
-服务日志位于容器内 `/opt/buckyos/logs`。上述停止和重启命令保留持久卷。首次启动时镜像内容会复制到运行卷；后续创建容器时同步镜像中的程序、Web 页面、SDK/CLI 和 boot gateway 配置，用户身份、设置和数据保留在运行卷中。
+服务日志位于容器内 `/opt/buckyos/logs`。上述停止和重启命令保留持久卷。首次启动时镜像内容会复制到运行卷；后续创建容器时同步镜像中的程序、Web 页面、SDK/CLI、scheduler 模板、内置 PIKG 包和 boot gateway 配置，保留 `bin/applist.json`、用户身份、设置和数据。
 
 容器的 `/run` 使用 tmpfs，普通重启时清除 Docker/containerd 的运行 PID 和 socket；应用镜像及数据仍保存在 `buckyos_docker-data` 卷中。
 
 设置页的 Build Version 来自 system-config 的 `system/buckyos_info`。scheduler 启动时按实际程序版本更新该记录，保留首次安装时间；同一构建重启不改变更新时间。
 
-Jarvis 在内部 Docker 的 AIOS Worker 镜像中运行。更新外层 BuckyOS 镜像不会自动更新它；node-daemon 仅在本地缺少 Worker 镜像时拉取，已有的 `latest-amd64` 标签不会自动刷新。
+Agent 在内部 Docker 的 AIOS Worker 镜像中运行。更新外层 BuckyOS 镜像不会自动更新它。node-daemon 不拉取 Worker 或 ExtTool 镜像，开发安装必须预先在内部 Docker 中准备镜像：
+
+```bash
+docker exec buckyos docker pull paios/aios:latest-amd64
+docker exec buckyos docker pull paios/exttool:latest-amd64
+```
+
+已有本地 Worker 构建完成后保存在内部 Docker 的 `buckyos-aios-local:latest-amd64` 标签。新版 node-daemon 会在发现镜像 ID 变化后重建应用容器。
 
 本机 `/opt/buckyos/etc/devenv.json` 的 `aios` 已设为 `buckyos-aios-local`。`docker/build-aios-runtime.sh` 在内部 Docker 中构建该镜像，复用当前运行环境的 OpenDAN、xagent、agent_tool、WebUI 和 SDK，使用仓库内的入口脚本及 Agent 工具。需要替换 OpenDAN 程序时可指定已编译产物。纯净机器从完整源码构建外层镜像后，重建命令是：
 
