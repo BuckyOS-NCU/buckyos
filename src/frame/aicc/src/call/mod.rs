@@ -1,6 +1,6 @@
 use crate::canonical::{
-    resolve_canonical_field, resolve_missing_canonical_field, CanonicalFieldConverter,
-    CanonicalFieldMapping, CanonicalMatchQuality,
+    resolve_canonical_field, resolve_missing_canonical_field, CanonicalFieldMapping,
+    CanonicalMatchQuality,
 };
 use crate::catalog::{CatalogSnapshot, Pricing, ResolvedProviderRule};
 use crate::error::{CallLoweringError, CatalogResolveError, ModelRegistryError};
@@ -12,6 +12,7 @@ use crate::protocol::{
 };
 use crate::resource::ResourceAccessContext;
 use crate::routing::{RouteDecision, SelectedRoute};
+use crate::video::{VideoGenerationContract, VideoMaterialFacts, VIDEO_PLAN_PARAMETER};
 use buckyos_api::{
     AiccCall, AiccErrorCode, AiccExecutionMode, ApiType, CanonicalFieldRequirement, Money,
     ResourceRef,
@@ -49,6 +50,10 @@ pub(crate) struct ProviderCallTarget {
     pub limits: CodecLimits,
     pub pricing: Option<ResolvedPricing>,
     pub match_dimensions: MatchContext,
+    /// The selected inventory model's video contract (`video.generate` only).
+    pub video_contract: Option<VideoGenerationContract>,
+    /// Facts measured for the request's conditions before the final route.
+    pub video_facts: VideoMaterialFacts,
 }
 
 impl fmt::Debug for ProviderCallTarget {
@@ -104,8 +109,11 @@ pub(crate) struct ResolvedProviderCall {
     pub credential_header_name: Option<String>,
     pub resource_requirements: Vec<ResourceRequirement>,
     pub resource_access_context: Option<ResourceAccessContext>,
+    pub resource_leases: Vec<crate::resource::ResourceLease>,
     pub pricing: ResolvedPricing,
     pub reported_cost_currency: Option<String>,
+    /// Model metadata output cap: the quota budget when the call sets none.
+    pub model_max_output_tokens: Option<u64>,
     pub revisions: LoweringRevisions,
 }
 
@@ -199,6 +207,7 @@ impl CallLoweringError {
     pub(crate) fn code(&self) -> AiccErrorCode {
         match self {
             Self::UnsupportedExecutionMode { .. } => AiccErrorCode::UnsupportedExecutionMode,
+            Self::Video(error) => error.code,
             _ => AiccErrorCode::InvalidRequest,
         }
     }
@@ -256,6 +265,7 @@ impl fmt::Display for CallLoweringError {
                 "adapter `{adapter_id}` operation `{operation}` does not support `{execution_mode}` execution for `{api_type}`"
             ),
             Self::InvalidRule(v) => write!(f, "invalid request rule: {v}"),
+            Self::Video(v) => f.write_str(&v.message),
         }
     }
 }
@@ -290,6 +300,8 @@ impl<'a> CallResolver<'a> {
     ) -> Result<ResolvedProviderCall, CallLoweringError> {
         let api_type = call_api_type(canonical_request)?;
         let requested_execution_mode = call_execution_mode(canonical_request)?;
+        let video_contract = target.video_contract.clone();
+        let video_facts = target.video_facts.clone();
         let method = canonical_request.method().to_owned();
         let exact_model = call_exact_model(canonical_request)?;
         validate_route(&decision.selected, exact_model, api_type)?;
@@ -461,10 +473,12 @@ impl<'a> CallResolver<'a> {
             "provider_model_id".into(),
             Value::String(decision.selected.provider_model_id.clone()),
         );
-        if api_type == ApiType::Llm
-            && binding
-                .supported_features
-                .contains(buckyos_api::features::WEB_SEARCH)
+        // Any binding that declares `web_search` can act on it. Gemini grounds
+        // image generation through the same `google_search` tool, so gating the
+        // injection on `llm` silently dropped the caller's request.
+        if binding
+            .supported_features
+            .contains(buckyos_api::features::WEB_SEARCH)
         {
             let enabled = decision
                 .selected
@@ -477,6 +491,22 @@ impl<'a> CallResolver<'a> {
                     .iter()
                     .any(|feature| feature == buckyos_api::features::WEB_SEARCH);
             resolved_parameters.insert(buckyos_api::features::WEB_SEARCH.into(), json!(enabled));
+        }
+        let mut video_dimensions = BTreeMap::new();
+        if let AiccCall::VideoGenerate(request) = &rewritten_request {
+            let contract = video_contract.as_ref().ok_or_else(|| {
+                CallLoweringError::UnsupportedOperation(
+                    "the selected model declares no video generation contract".into(),
+                )
+            })?;
+            let plan = crate::video::plan_video(contract, request, &video_facts)
+                .map_err(CallLoweringError::Video)?;
+            video_dimensions = plan.pricing_dimensions();
+            resolved_parameters.insert(
+                VIDEO_PLAN_PARAMETER.into(),
+                serde_json::to_value(&plan)
+                    .map_err(|error| CallLoweringError::InvalidRule(error.to_string()))?,
+            );
         }
         let input = CodecInput {
             canonical_request: rewritten_request,
@@ -524,9 +554,19 @@ impl<'a> CallResolver<'a> {
                     })
             })
             .transpose()?;
-        let pricing_context = request_match_context(api_name, &operation, &normalized);
+        let mut pricing_context = request_match_context(api_name, &operation, &normalized);
+        pricing_context.extend(video_dimensions);
+        let mut target_pricing = target.pricing;
+        if let Some(target) = target_pricing.as_mut() {
+            if target.matched_amount.is_none() {
+                target.matched_amount = target
+                    .pricing
+                    .as_ref()
+                    .and_then(|pricing| matched_rule_amount(pricing, &pricing_context));
+            }
+        }
         let mut pricing = resolve_pricing(
-            target.pricing,
+            target_pricing,
             provider_rule
                 .as_ref()
                 .and_then(|rule| rule.action.pricing.clone()),
@@ -587,7 +627,9 @@ impl<'a> CallResolver<'a> {
             credential_header_name,
             resource_requirements: resources,
             resource_access_context: None,
+            resource_leases: Vec::new(),
             pricing,
+            model_max_output_tokens,
             reported_cost_currency: target
                 .provider_rules_id
                 .as_deref()
@@ -751,10 +793,7 @@ fn validate_route(
 }
 
 fn call_api_type(call: &AiccCall) -> Result<ApiType, CallLoweringError> {
-    if matches!(
-        call,
-        AiccCall::RouteResolve(_) | AiccCall::HelperLlmChat(_) | AiccCall::HelperTextToImage(_)
-    ) {
+    if is_routing_only(call) {
         return Err(CallLoweringError::UnsupportedCanonicalCall(
             call.method().into(),
         ));
@@ -793,11 +832,18 @@ fn internal_execution_mode(
     }
 }
 
-fn serialize_call(call: &AiccCall) -> Result<Value, CallLoweringError> {
-    if matches!(
+fn is_routing_only(call: &AiccCall) -> bool {
+    matches!(
         call,
-        AiccCall::RouteResolve(_) | AiccCall::HelperLlmChat(_) | AiccCall::HelperTextToImage(_)
-    ) {
+        AiccCall::RouteResolve(_)
+            | AiccCall::HelperLlmChat(_)
+            | AiccCall::HelperTextToImage(_)
+            | AiccCall::HelperVideoGenerate(_)
+    )
+}
+
+fn serialize_call(call: &AiccCall) -> Result<Value, CallLoweringError> {
+    if is_routing_only(call) {
         return Err(CallLoweringError::UnsupportedCanonicalCall(
             call.method().into(),
         ));
@@ -873,20 +919,16 @@ fn canonical_option_keys(call: &AiccCall) -> Result<&'static [&'static str], Cal
             "output",
         ],
         AiccCall::AudioEnhance(_) => &["strength", "return_stems"],
-        AiccCall::VideoTextToVideo(_) => &[
-            "duration_seconds",
-            "aspect_ratio",
-            "resolution",
-            "generate_audio",
-            "seed",
-            "output",
-        ],
-        AiccCall::VideoImageToVideo(_) => &["duration_seconds", "aspect_ratio", "resolution"],
-        AiccCall::VideoToVideo(_) => &["preserve_motion", "time_range"],
+        // The video plan maps these requests field by field, so provider
+        // rules never see (or rewrite) their content.
+        AiccCall::VideoGenerate(_) | AiccCall::VideoEdit(_) => &[],
         AiccCall::VideoExtend(_) => &["continuation_handle", "duration_seconds", "resolution"],
         AiccCall::VideoUpscale(_) => &["denoise", "sharpen", "output"],
         AiccCall::ComputerUse(_) => &[],
-        AiccCall::RouteResolve(_) | AiccCall::HelperLlmChat(_) | AiccCall::HelperTextToImage(_) => {
+        AiccCall::RouteResolve(_)
+        | AiccCall::HelperLlmChat(_)
+        | AiccCall::HelperTextToImage(_)
+        | AiccCall::HelperVideoGenerate(_) => {
             return Err(CallLoweringError::UnsupportedCanonicalCall(
                 call.method().into(),
             ));
@@ -914,9 +956,8 @@ fn api_type_name(api_type: ApiType) -> &'static str {
         ApiType::AudioSpeechRecognition => "audio.asr",
         ApiType::AudioMusic => "audio.music",
         ApiType::AudioEnhance => "audio.enhance",
-        ApiType::VideoTextToVideo => "video.txt2video",
-        ApiType::VideoImageToVideo => "video.img2video",
-        ApiType::VideoToVideo => "video.video2video",
+        ApiType::VideoGenerate => "video.generate",
+        ApiType::VideoEdit => "video.edit",
         ApiType::VideoExtend => "video.extend",
         ApiType::VideoUpscale => "video.upscale",
         ApiType::AgentComputerUse => "agent.computer_use",
@@ -947,12 +988,10 @@ fn apply_canonical_mappings(
     mappings: &BTreeMap<String, CanonicalFieldMapping>,
 ) -> Result<BTreeMap<String, Value>, CallLoweringError> {
     let mut provider_options = BTreeMap::new();
-    let original_canonical = canonical.clone();
     for (pointer, mapping) in mappings {
         let (resolved, strict) = match canonical.pointer(pointer).cloned() {
             Some(value) => {
-                let requirement =
-                    inferred_canonical_requirement(pointer, value, &original_canonical, mapping);
+                let requirement = inferred_canonical_requirement(value);
                 let strict = requirement.strict;
                 (resolve_canonical_field(Some(mapping), &requirement), strict)
             }
@@ -1012,22 +1051,7 @@ fn set_pointer(
     Ok(())
 }
 
-fn inferred_canonical_requirement(
-    pointer: &str,
-    value: Value,
-    canonical: &Value,
-    mapping: &CanonicalFieldMapping,
-) -> CanonicalFieldRequirement {
-    if pointer == "/resolution"
-        && mapping.converter == CanonicalFieldConverter::OpenaiVideoResolutionV1
-    {
-        if let Some(aspect_ratio) = canonical.pointer("/aspect_ratio").cloned() {
-            return CanonicalFieldRequirement::new(json!({
-                "resolution": value,
-                "aspect_ratio": aspect_ratio
-            }));
-        }
-    }
+fn inferred_canonical_requirement(value: Value) -> CanonicalFieldRequirement {
     CanonicalFieldRequirement::new(value)
 }
 
@@ -1290,6 +1314,20 @@ fn collect_resource_requirements(value: &Value) -> Vec<ResourceRequirement> {
     output
 }
 
+/// The first price rule of an inventory (discovery) price that matches the
+/// request; provider-rule prices are matched by the catalog itself.
+fn matched_rule_amount(pricing: &Pricing, context: &MatchContext) -> Option<f64> {
+    pricing.rules.iter().find_map(|rule| {
+        crate::matching::CompiledMatchRule::compile(
+            rule.when.clone(),
+            &crate::matching::PRICING_RULE_MATCH_SCHEMA,
+        )
+        .ok()?
+        .matches(context)
+        .then_some(rule.amount)
+    })
+}
+
 fn resolve_pricing(
     target: Option<ResolvedPricing>,
     provider_pricing: Option<Pricing>,
@@ -1333,8 +1371,8 @@ mod tests {
     use crate::provider::claude_messages_adapter;
     use crate::routing::{RouteModelKind, RoutingTrace, ScoreBreakdown, UserFacingRouteSummary};
     use buckyos_api::{
-        AiMessage, AiOutputOptions, AiRole, EmbeddingTextRequest, LlmChatInvokeRequest,
-        VideoTextToVideoRequest,
+        AiMessage, AiRole, EmbeddingTextRequest, LlmChatInvokeRequest, VideoGenerateRequest,
+        VideoOutputSpec,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -1521,6 +1559,89 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn vendor_models_that_reject_sampling_parameters_declare_remove_rules() {
+        // Claude 5.5 rejects `temperature`, `top_p` and `top_k` with a 400
+        // ("`temperature` is deprecated for this model"). Only the provider rules can express
+        // that: the values have to be removed from the normalized options so the lowering step
+        // drops them from the canonical request. Every channel that exposes the model has to
+        // declare it, so both the direct and the aggregate profile are asserted here.
+        let catalog = metadata_snapshot();
+        let context = MatchContext::from([
+            ("api_type".into(), Value::String("llm".into())),
+            ("operation".into(), Value::String("messages.create".into())),
+        ]);
+        for (profile, model) in [
+            ("claude", "claude-sonnet-5-5"),
+            ("claude", "claude-haiku-5-5"),
+            ("claude", "claude-opus-5-5"),
+            ("openrouter", "anthropic/claude-sonnet-5.5"),
+            ("openrouter", "anthropic/claude-haiku-5.5"),
+            ("openrouter", "anthropic/claude-opus-5.5"),
+        ] {
+            let rule = catalog
+                .resolve_provider_rule(profile, model, &context)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{profile}/{model} must resolve a provider rule"));
+            let removed = rule
+                .matching_request_rules(&context)
+                .iter()
+                .flat_map(|rule| rule.remove.iter().map(String::as_str))
+                .collect::<Vec<_>>();
+            for pointer in ["/temperature", "/top_p", "/top_k"] {
+                assert!(
+                    removed.contains(&pointer),
+                    "{profile}/{model} must remove {pointer}, got {removed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn models_without_the_constraint_keep_their_sampling_parameters() {
+        let catalog = metadata_snapshot();
+        let context = MatchContext::from([
+            ("api_type".into(), Value::String("llm".into())),
+            ("operation".into(), Value::String("messages.create".into())),
+        ]);
+        for (profile, model) in [
+            ("claude", "claude-opus-4-6"),
+            ("openrouter", "anthropic/claude-opus-4.6"),
+        ] {
+            let rule = catalog
+                .resolve_provider_rule(profile, model, &context)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{profile}/{model} must resolve a provider rule"));
+            let removed = rule
+                .matching_request_rules(&context)
+                .iter()
+                .flat_map(|rule| rule.remove.iter())
+                .collect::<Vec<_>>();
+            assert!(
+                !removed
+                    .iter()
+                    .any(|pointer| pointer.starts_with("/temperature")
+                        || pointer.starts_with("/top_p")
+                        || pointer.starts_with("/top_k")),
+                "{profile}/{model} must keep sampling parameters, got {removed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_normalized_keys_are_dropped_from_the_canonical_request() {
+        // A remove rule edits the normalized options only. The lowering step has to carry that
+        // deletion over to the canonical request, otherwise the typed request keeps the value
+        // and the codec sends a parameter the provider refuses.
+        let canonical = json!({"temperature": 0.4, "top_p": 0.9, "max_output_tokens": 64});
+        let normalized = json!({"max_output_tokens": 64});
+        let rewritten =
+            rewrite_canonical_options(&canonical, &normalized, &["temperature", "top_p"]).unwrap();
+        assert!(rewritten.get("temperature").is_none());
+        assert!(rewritten.get("top_p").is_none());
+        assert_eq!(rewritten["max_output_tokens"], json!(64));
+    }
+
     fn api_type_from_mapping_key(key: &str) -> ApiType {
         match key {
             "chat.completions.create" => ApiType::Llm,
@@ -1601,7 +1722,7 @@ mod tests {
         route.selected.origin_model_id = "sora-2-pro".into();
         route.selected.operation = "videos.create".into();
         route.selected.enabled_capabilities = Vec::new();
-        route.trace.api_type = "video.txt2video".into();
+        route.trace.api_type = "video.generate".into();
         route.trace.requested_model = "sora-2-pro@openai-main".into();
         route.trace.selected_exact_model = "sora-2-pro@openai-main".into();
         route.trace.selected_provider_instance_name = "openai-main".into();
@@ -1624,6 +1745,8 @@ mod tests {
             },
             pricing: None,
             match_dimensions: MatchContext::new(),
+            video_contract: None,
+            video_facts: VideoMaterialFacts::new(),
         }
     }
 
@@ -1739,47 +1862,254 @@ mod tests {
     }
 
     #[test]
-    fn openai_video_rules_normalize_size_seconds_and_fps() {
+    fn video_lowering_plans_exact_sora_size_and_rejects_unsupported_fps() {
         let catalog = metadata_snapshot();
         let codecs = codecs();
         let resolver = CallResolver::new(&catalog, &codecs);
-        let mut request = VideoTextToVideoRequest::new(
+        let mut request = VideoGenerateRequest::new(
             "sora-2-pro@openai-main",
-            "stick figure exercise".to_string(),
+            Some("stick figure exercise".to_string()),
         );
-        request.duration_seconds = Some(1.0);
-        request.aspect_ratio = Some("16:9".to_string());
-        request.resolution = Some("720p".to_string());
-        request.output = Some(AiOutputOptions {
-            fps: Some(24),
+        request.output = Some(VideoOutputSpec {
+            duration_seconds: Some(8.0),
+            aspect_ratio: Some("16:9".to_string()),
             ..Default::default()
         });
-        let call = AiccCall::VideoTextToVideo(request);
-
+        let mut video_target = target("credential-secret");
+        video_target.video_contract = Some(crate::video::test_support::model_contract(
+            "openai",
+            "sora-2-pro",
+        ));
         let lowered = resolver
-            .lower(&video_decision(), &call, target("credential-secret"))
+            .lower(
+                &video_decision(),
+                &AiccCall::VideoGenerate(request.clone()),
+                video_target.clone(),
+            )
             .unwrap();
-
         assert_eq!(lowered.operation, "videos.create");
         assert_eq!(lowered.execution_mode, ExecutionMode::NativeTask);
+        let plan =
+            crate::video::VideoPlan::from_parameters(&lowered.input.resolved_parameters).unwrap();
+        assert_eq!(plan.duration_seconds, Some(8.0));
         assert_eq!(
-            lowered.input.resolved_parameters.get("seconds"),
-            Some(&json!("4"))
+            plan.size,
+            Some(buckyos_api::VideoExactSize {
+                width: 1280,
+                height: 720
+            })
         );
-        assert_eq!(
-            lowered.input.resolved_parameters.get("size"),
-            Some(&json!("1280x720"))
+        assert!(lowered.input.resolved_parameters.get("seconds").is_none());
+
+        // The old converter rounded 1s up to 4s and dropped fps; both are now refused.
+        request.output = Some(VideoOutputSpec {
+            duration_seconds: Some(1.0),
+            ..Default::default()
+        });
+        let error = resolver
+            .lower(
+                &video_decision(),
+                &AiccCall::VideoGenerate(request.clone()),
+                video_target.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, CallLoweringError::Video(error) if error.code == AiccErrorCode::UnsupportedOperation)
         );
-        let AiccCall::VideoTextToVideo(rewritten) = &lowered.input.canonical_request else {
-            panic!("expected video text-to-video request")
+        request.output = Some(VideoOutputSpec {
+            fps: Some(24.0),
+            ..Default::default()
+        });
+        assert!(resolver
+            .lower(
+                &video_decision(),
+                &AiccCall::VideoGenerate(request.clone()),
+                video_target,
+            )
+            .is_err());
+        assert!(resolver
+            .lower(
+                &video_decision(),
+                &AiccCall::VideoGenerate(request),
+                target("credential-secret"),
+            )
+            .is_err());
+    }
+
+    fn openrouter_video_call(model: &str, origin: &str) -> (RouteDecision, ProviderCallTarget) {
+        let exact = format!("{model}@openrouter-main");
+        let mut route = decision(&exact);
+        route.selected.model_uid = format!("minimax:{origin}:openrouter-responses");
+        route.selected.provider_instance_name = "openrouter-main".into();
+        route.selected.provider_profile_id = "openrouter".into();
+        route.selected.protocol_adapter_id = "openrouter-responses".into();
+        route.selected.model_driver_id = "minimax".into();
+        route.selected.origin_model_id = origin.into();
+        route.selected.provider_model_id = model.into();
+        route.selected.operation = "videos.create".into();
+        route.selected.enabled_capabilities = Vec::new();
+        route.trace.api_type = "video.generate".into();
+        route.trace.selected_provider_instance_name = "openrouter-main".into();
+        let mut target = target("sk-or");
+        target.provider_rules_id = Some("openrouter".into());
+        target.base_url = "https://openrouter.ai/api/v1".into();
+        target.video_contract = Some(crate::video::test_support::openrouter_contract(model));
+        (route, target)
+    }
+
+    /// OpenRouter's `pricing_skus` as discovery turns them into a price.
+    fn openrouter_video_pricing(
+        base: f64,
+        resolutions: &[(&str, f64)],
+        reference_image: Option<f64>,
+    ) -> ResolvedPricing {
+        let rule = |resolution: &str, amount: f64| {
+            serde_json::from_value::<crate::catalog::PricingRule>(json!({
+                "when": {"/video/resolution": resolution},
+                "amount": amount,
+                "unit": "video_second"
+            }))
+            .unwrap()
         };
-        assert_eq!(rewritten.duration_seconds, Some(4.0));
-        assert_eq!(rewritten.aspect_ratio.as_deref(), None);
-        assert_eq!(rewritten.resolution.as_deref(), Some("720p"));
-        assert_eq!(
-            rewritten.output.as_ref().and_then(|output| output.fps),
-            None
+        let mut pricing = serde_json::from_value::<Pricing>(json!({
+            "currency": "USD",
+            "unit": "video_second",
+            "amount": base
+        }))
+        .unwrap();
+        pricing.rules = resolutions
+            .iter()
+            .map(|(resolution, amount)| rule(resolution, *amount))
+            .collect();
+        pricing.addons = reference_image
+            .map(|amount| crate::catalog::PricingAddon {
+                unit: crate::catalog::PricingUnit::ReferenceImage,
+                amount,
+            })
+            .into_iter()
+            .collect();
+        ResolvedPricing {
+            source: PricingSource::Discovery,
+            pricing: Some(pricing),
+            matched_amount: None,
+            estimated_cost: None,
+        }
+    }
+
+    #[test]
+    fn openrouter_h3_lowering_plans_the_channel_contract_and_prices_by_resolution() {
+        let catalog = metadata_snapshot();
+        let codecs = all_codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+
+        // H3-Max at 480p: the per-resolution SKU wins over the base price.
+        let (route, mut target) = openrouter_video_call("minimax/hailuo-3-max", "MiniMax-H3-Max");
+        target.pricing = Some(openrouter_video_pricing(
+            0.08,
+            &[("480p", 0.05), ("768p", 0.08)],
+            None,
+        ));
+        let mut request = VideoGenerateRequest::new(
+            "minimax/hailuo-3-max@openrouter-main",
+            Some("a paper boat drifting down a gutter".to_string()),
         );
+        request.output = Some(VideoOutputSpec {
+            duration_seconds: Some(5.0),
+            size: Some(buckyos_api::VideoSize::short_edge(480)),
+            ..Default::default()
+        });
+        let lowered = resolver
+            .lower(
+                &route,
+                &AiccCall::VideoGenerate(request.clone()),
+                target.clone(),
+            )
+            .unwrap();
+        assert_eq!(lowered.operation, "videos.create");
+        assert_eq!(lowered.execution_mode, ExecutionMode::NativeTask);
+        let plan =
+            crate::video::VideoPlan::from_parameters(&lowered.input.resolved_parameters).unwrap();
+        assert_eq!(plan.resolution.as_deref(), Some("480p"));
+        assert_eq!(plan.duration_seconds, Some(5.0));
+        assert_eq!(lowered.pricing.matched_amount, Some(0.05));
+        let pinned = crate::execution::PinnedPricingSnapshot::from_pricing(
+            lowered.pricing.pricing.as_ref().unwrap(),
+            lowered.pricing.matched_amount,
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+        .unwrap();
+        let usage = buckyos_api::AiUsage {
+            video_seconds: Some(5.0),
+            reference_images: Some(0),
+            ..Default::default()
+        };
+        assert!((pinned.completion_cost(&usage).unwrap().amount - 0.25).abs() < 1e-9);
+
+        // H3-Max cannot generate sound and has no 1080p tier.
+        request.output = Some(VideoOutputSpec {
+            audio: Some(buckyos_api::VideoAudioMode::Generate),
+            ..Default::default()
+        });
+        assert!(resolver
+            .lower(
+                &route,
+                &AiccCall::VideoGenerate(request.clone()),
+                target.clone()
+            )
+            .is_err());
+        request.output = Some(VideoOutputSpec {
+            size: Some(buckyos_api::VideoSize::short_edge(1080)),
+            ..Default::default()
+        });
+        assert!(resolver
+            .lower(&route, &AiccCall::VideoGenerate(request), target)
+            .is_err());
+
+        // H3 at 2K with one reference image: 0.13/s for 6s plus 0.04 per image.
+        let (route, mut target) = openrouter_video_call("minimax/hailuo-3", "MiniMax-H3");
+        target.pricing = Some(openrouter_video_pricing(0.13, &[], Some(0.04)));
+        let mut request = VideoGenerateRequest::new(
+            "minimax/hailuo-3@openrouter-main",
+            Some("the cat from @{cat} jumps onto the sofa".to_string()),
+        );
+        request.conditions = vec![buckyos_api::VideoCondition::ReferenceImage {
+            id: "cat".into(),
+            resource: ResourceRef::url("https://example.test/cat.png".to_string(), None),
+        }];
+        request.output = Some(VideoOutputSpec {
+            duration_seconds: Some(6.0),
+            ..Default::default()
+        });
+        let mut target_with_facts = target.clone();
+        target_with_facts.video_facts = VideoMaterialFacts::from([(
+            "cat".to_string(),
+            crate::video::test_support::image_facts(1024, 1024),
+        )]);
+        let lowered = resolver
+            .lower(&route, &AiccCall::VideoGenerate(request), target_with_facts)
+            .unwrap();
+        let plan =
+            crate::video::VideoPlan::from_parameters(&lowered.input.resolved_parameters).unwrap();
+        assert_eq!(plan.resolution.as_deref(), Some("2K"));
+        assert_eq!(
+            plan.submitted_prompt.as_deref(),
+            Some("the cat from reference image 1 jumps onto the sofa")
+        );
+        assert_eq!(lowered.pricing.matched_amount, None);
+        let pinned = crate::execution::PinnedPricingSnapshot::from_pricing(
+            lowered.pricing.pricing.as_ref().unwrap(),
+            lowered.pricing.matched_amount,
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+        .unwrap();
+        let usage = buckyos_api::AiUsage {
+            video_seconds: Some(6.0),
+            reference_images: Some(1),
+            ..Default::default()
+        };
+        assert!((pinned.completion_cost(&usage).unwrap().amount - 0.82).abs() < 1e-9);
     }
 
     #[test]
@@ -2210,6 +2540,69 @@ mod tests {
         }
     }
 
+    /// Gemini grounds image generation through the same `google_search` tool it
+    /// uses for chat, but lowering only injected the resolved parameter for
+    /// `llm`, so `enabled_capabilities = ["web_search"]` never reached the codec.
+    #[test]
+    fn image_generation_lowering_honours_the_web_search_capability() {
+        let catalog = metadata_snapshot();
+        let codecs = all_codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        for (enabled, expected_tools) in [(true, 1), (false, 0)] {
+            let exact = "gemini-3.1-flash-image@primary".to_string();
+            let mut route = decision(&exact);
+            route.trace.requested_model = "images.generate".into();
+            route.trace.requested_model_type = RouteModelKind::Logical;
+            route.trace.resolved_logical_path = None;
+            route.selected.provider_instance_name = "primary".into();
+            route.selected.provider_profile_id = "gemini".into();
+            route.selected.protocol_adapter_id = "gemini-interactions".into();
+            route.selected.model_driver_id = "gemini".into();
+            route.selected.origin_model_id = "gemini-3.1-flash-image".into();
+            route.selected.provider_model_id = "gemini-3.1-flash-image".into();
+            route.selected.operation = "interactions.create".into();
+            route.selected.enabled_capabilities = if enabled {
+                vec!["web_search".into()]
+            } else {
+                Vec::new()
+            };
+            route.selected.disabled_capabilities = Vec::new();
+            let request = buckyos_api::TextToImageInvokeRequest::new(exact, "上海外滩今天的日出");
+            let mut target = target("test-secret");
+            target.provider_rules_id = Some("gemini".into());
+            target.credential =
+                crate::protocol::gemini_api_key("secret://gemini", "test-secret").unwrap();
+            let lowered = resolver
+                .lower(&route, &AiccCall::ImagesGenerate(request), target)
+                .unwrap();
+            let wire = codecs
+                .encode(
+                    "gemini-interactions",
+                    "interactions.create",
+                    ApiType::ImageTextToImage,
+                    &lowered.input,
+                    &lowered.context,
+                )
+                .unwrap();
+            let crate::protocol::HttpBody::Json(body) = wire.body else {
+                panic!("expected JSON")
+            };
+            let google = body
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter(|tool| {
+                            tool.get("type").and_then(Value::as_str) == Some("google_search")
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            assert_eq!(google, expected_tools, "web_search={enabled}");
+        }
+    }
+
     #[test]
     fn every_builtin_provider_operation_has_a_golden_lowering_binding() {
         let codecs = all_codecs();
@@ -2282,7 +2675,7 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         assert_eq!(golden, documented);
-        assert_eq!(golden.len(), 119);
+        assert_eq!(golden.len(), 113);
         assert!(golden.contains(&"typesafe|typesafe-systemone|decision|systemone.evaluate".into()));
         assert!(golden.contains(&"openai|openai-responses|llm|responses.create".into()));
         assert!(
@@ -2311,7 +2704,7 @@ mod tests {
         assert!(golden
             .contains(&"openrouter|openrouter-responses|embedding.text|embeddings.create".into()));
         assert!(golden
-            .contains(&"minimax|minimax-messages|video.txt2video|video_generation.create".into()));
+            .contains(&"minimax|minimax-messages|video.generate|video_generation.create".into()));
         assert!(golden.contains(&"qwen|qwen-responses|llm|responses.create".into()));
         assert!(golden.contains(&"qwen|qwen-responses|llm|chat.completions.create".into()));
         assert!(golden.contains(&"sn|sn-openai|llm|responses.create".into()));

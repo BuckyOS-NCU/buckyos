@@ -1,6 +1,7 @@
 pub mod files;
+pub mod executor;
+pub mod node;
 pub mod ssh;
-pub mod tmux;
 
 use crate::exec_tracking::{unresolved_reason, InflightAction};
 use crate::llm_bash::{
@@ -37,28 +38,26 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmux: Option<TmuxConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_ssh: Option<SshConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_node: Option<RemoteNodeConfig>,
+    /// The environment baseline its registrar declares; carried into
+    /// `RuntimeInfo.baseline` for prompts, never probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<RuntimeBaseline>,
 }
 
+pub use buckyos_api::RuntimeBaseline;
+
+/// Target of a `remote_node` runtime: the Node Executor of `node_did`, logged
+/// in under `profile_id`. Endpoint and credentials come from the host.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct TmuxConfig {
-    pub session: Option<String>,
+pub struct RemoteNodeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub socket: Option<String>,
+    pub node_did: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<TmuxMode>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TmuxMode {
-    Create,
-    Attach,
-    #[default]
-    CreateOrAttach,
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -84,8 +83,8 @@ impl RuntimeConfig {
             reason,
         };
         match self.kind() {
-            "native" | "tmux" | "remote_ssh" => {}
-            "container" | "container_host" | "remote_node" | "http_proxy_runtime" => {
+            "native" | "remote_ssh" | "remote_node" => {}
+            "container" | "container_host" | "http_proxy_runtime" => {
                 return Err(XllmError::Capability(format!(
                     "runtime `{}` is planned but not implemented",
                     self.kind()
@@ -93,12 +92,14 @@ impl RuntimeConfig {
             }
             kind => return Err(bad(format!("unknown runtime kind `{kind}`"))),
         }
-        if self.tmux.is_some() && self.kind() != "tmux" && self.kind.is_some() {
-            return Err(bad("tmux connection block requires kind: tmux".into()));
-        }
         if self.remote_ssh.is_some() && self.kind() != "remote_ssh" && self.kind.is_some() {
             return Err(bad(
                 "remote_ssh connection block requires kind: remote_ssh".into()
+            ));
+        }
+        if self.remote_node.is_some() && self.kind() != "remote_node" && self.kind.is_some() {
+            return Err(bad(
+                "remote_node connection block requires kind: remote_node".into()
             ));
         }
         for (k, v) in &self.env {
@@ -110,27 +111,12 @@ impl RuntimeConfig {
             return Err(bad("id cannot be empty".into()));
         }
         if complete {
-            if self.tmux.is_some() && self.kind() != "tmux"
-                || self.remote_ssh.is_some() && self.kind() != "remote_ssh"
+            if self.remote_ssh.is_some() && self.kind() != "remote_ssh"
+                || self.remote_node.is_some() && self.kind() != "remote_node"
             {
                 return Err(bad("connection block does not match runtime kind".into()));
             }
             match self.kind() {
-                "tmux" => {
-                    let name = self
-                        .tmux
-                        .as_ref()
-                        .and_then(|t| t.session.as_deref())
-                        .unwrap_or("");
-                    if name.is_empty()
-                        || name.starts_with('-')
-                        || name.chars().any(|c| c.is_control() || c == ':' || c == '.')
-                    {
-                        return Err(bad(
-                            "tmux.session is required and must be a valid session name".into(),
-                        ));
-                    }
-                }
                 "remote_ssh" => {
                     let s = self
                         .remote_ssh
@@ -156,21 +142,38 @@ impl RuntimeConfig {
                         ));
                     }
                 }
+                "remote_node" => {
+                    let n = self
+                        .remote_node
+                        .as_ref()
+                        .ok_or_else(|| bad("remote_node.node_did is required".into()))?;
+                    let did = n.node_did.as_deref().unwrap_or("");
+                    let profile = n.profile_id.as_deref().unwrap_or("");
+                    if !did.starts_with("did:") || did.chars().any(|c| c.is_whitespace()) {
+                        return Err(bad("remote_node.node_did must be a device DID".into()));
+                    }
+                    if !buckyos_api::is_valid_profile_id(profile) {
+                        return Err(bad("remote_node.profile_id is required".into()));
+                    }
+                    let cwd = self.workdir.as_deref().unwrap_or("");
+                    if !buckyos_api::is_absolute_node_path(cwd) {
+                        return Err(bad(
+                            "remote_node requires an explicit absolute workdir on the node".into(),
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
         Ok(())
     }
+    /// Whether the workdir names a path on another machine.
+    pub fn is_remote(&self) -> bool {
+        matches!(self.kind(), "remote_ssh" | "remote_node")
+    }
     pub fn resolve_paths(&mut self, source: &Path) {
-        if self.kind.is_some() && self.kind() != "remote_ssh" {
+        if self.kind.is_some() && !self.is_remote() {
             if let Some(p) = &mut self.workdir {
-                *p = crate::xllm::resolve_config_path(p, source)
-                    .display()
-                    .to_string();
-            }
-        }
-        if let Some(t) = &mut self.tmux {
-            if let Some(p) = &mut t.socket {
                 *p = crate::xllm::resolve_config_path(p, source)
                     .display()
                     .to_string();
@@ -197,17 +200,17 @@ impl RuntimeConfig {
         if other.workdir.is_some() {
             self.workdir = other.workdir.clone();
         }
+        if other.baseline.is_some() {
+            self.baseline = other.baseline;
+        }
         self.env.extend(other.env.clone());
-        if let Some(t) = &other.tmux {
-            let b = self.tmux.get_or_insert_with(Default::default);
-            if t.session.is_some() {
-                b.session = t.session.clone();
+        if let Some(n) = &other.remote_node {
+            let b = self.remote_node.get_or_insert_with(Default::default);
+            if n.node_did.is_some() {
+                b.node_did = n.node_did.clone();
             }
-            if t.socket.is_some() {
-                b.socket = t.socket.clone();
-            }
-            if t.mode.is_some() {
-                b.mode = t.mode;
+            if n.profile_id.is_some() {
+                b.profile_id = n.profile_id.clone();
             }
         }
         if let Some(s) = &other.remote_ssh {
@@ -270,9 +273,37 @@ pub struct RuntimeInfo {
     pub current_time: String,
     pub timezone: String,
     pub target: Value,
+    /// `linux`, `macos` or `windows` (whatever `os` the probe reported).
+    #[serde(default)]
+    pub platform: String,
+    /// The shell's program name (`bash`, `sh`, `pwsh`, `powershell`, …): the
+    /// syntax commands are written in.
+    #[serde(default)]
+    pub shell_kind: String,
+    /// The declared baseline (`standard` / `extended`), empty when undeclared.
+    #[serde(default)]
+    pub baseline: String,
 }
 
 impl RuntimeInfo {
+    /// Fill the fields derived from the probe and the configuration.
+    pub fn with_declared(mut self, baseline: Option<RuntimeBaseline>) -> Self {
+        self.platform = match self.os.to_ascii_lowercase().as_str() {
+            "darwin" | "macos" => "macos".into(),
+            os => os.into(),
+        };
+        self.shell_kind = self
+            .shell
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(".exe")
+            .trim_end_matches(".EXE")
+            .to_ascii_lowercase();
+        self.baseline = baseline.map(|b| b.as_str().to_string()).unwrap_or_default();
+        self
+    }
+
     pub fn template_values(&self) -> BTreeMap<String, String> {
         let v = serde_json::to_value(self).expect("runtime info");
         v.as_object()
@@ -355,7 +386,6 @@ struct OpenedRuntime {
     info: RuntimeInfo,
     files: Arc<dyn FileBackend>,
     ssh: Option<Arc<ssh::SshTransport>>,
-    tmux: Option<Arc<tmux::TmuxTarget>>,
     base_path: String,
 }
 
@@ -365,7 +395,6 @@ pub struct Runtime {
     opened: tokio::sync::OnceCell<OpenedRuntime>,
 }
 pub type NativeRuntime = Runtime;
-pub type TmuxRuntime = Runtime;
 
 /// What a finished `shell` command's execution directory says.
 pub(crate) struct ExecDirFacts {
@@ -441,10 +470,6 @@ pub(crate) fn interrupted_shell_text(
         }
     }
     match kind {
-        "tmux" => format!(
-            "shell ({kind}): the previous executor exited while `{command}` was running in tmux session `{target}` ({started}). No exit was recorded, so the command may still be running there; its output and `exit` file are in {location}. Check (tmux, the files, `ps`) before repeating it.{}",
-            facts.map(tails).unwrap_or_default()
-        ),
         "remote_ssh" => match facts {
             Some(f) if f.exists => format!(
                 "shell ({kind}): the previous executor exited while `{command}` was running on `{target}` ({started}). No exit was recorded, so the command may still be running there; its output and `exit` file are in {location}. Check before repeating it.{}",
@@ -497,12 +522,6 @@ impl Runtime {
             opened: tokio::sync::OnceCell::new(),
         }
     }
-    pub fn available() -> bool {
-        std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
     async fn initialize(&self, fallback: &Path) -> Result<&OpenedRuntime> {
         self.opened
             .get_or_try_init(|| async {
@@ -514,7 +533,7 @@ impl Runtime {
                     .workdir
                     .clone()
                     .unwrap_or_else(|| fallback.display().to_string());
-                let (info, target, files, ssh, tmux, base_path) = if kind == "remote_ssh" {
+                let (info, target, files, ssh, base_path) = if kind == "remote_ssh" {
                     let transport = Arc::new(
                         ssh::SshTransport::connect(config.remote_ssh.as_ref().unwrap()).await?,
                     );
@@ -529,7 +548,6 @@ impl Runtime {
                         target,
                         transport.clone() as Arc<dyn FileBackend>,
                         Some(transport),
-                        None,
                         base_path,
                     )
                 } else {
@@ -541,29 +559,13 @@ impl Runtime {
                             "runtime workdir must be a directory".into(),
                         ));
                     }
-                    let tmux = if kind == "tmux" {
-                        let t = Arc::new(
-                            tmux::TmuxTarget::open(config.tmux.as_ref().unwrap(), &cwd).await?,
-                        );
-                        Some(t)
-                    } else {
-                        None
-                    };
-                    let probe = if let Some(t) = &tmux {
-                        t.probe(&cwd, &config.env).await?
-                    } else {
-                        ssh::local_probe(&cwd, &config.env).await?
-                    };
-                    let mut target = json!({ "host": native_host_id(), "uid": probe.identity.uid });
-                    if let Some(t) = &tmux {
-                        target["tmux"] = t.identity();
-                    }
+                    let probe = ssh::local_probe(&cwd, &config.env).await?;
+                    let target = json!({ "host": native_host_id(), "uid": probe.identity.uid });
                     (
                         probe.info,
                         target,
                         Arc::new(LocalFileBackend) as Arc<dyn FileBackend>,
                         None,
-                        tmux,
                         probe.path,
                     )
                 };
@@ -573,15 +575,12 @@ impl Runtime {
                         &blake3::hash(target.to_string().as_bytes()).to_hex()[..24]
                     )
                 });
-                let mut info = info;
+                let mut info = info.with_declared(config.baseline);
                 info.id = id.clone();
                 info.kind = kind.clone();
                 info.target = target.clone();
                 config.id = Some(id.clone());
                 config.workdir = Some(info.cwd.clone());
-                if let Some(t) = &mut config.tmux {
-                    t.mode = Some(TmuxMode::Attach);
-                }
                 let descriptor = RuntimeDescriptor {
                     runtime_id: id,
                     kind,
@@ -607,7 +606,6 @@ impl Runtime {
                     info,
                     files,
                     ssh,
-                    tmux,
                     base_path,
                 })
             })
@@ -633,9 +631,6 @@ impl AgentRuntime for Runtime {
         let state = self.initialize(&std::env::current_dir()?).await?;
         let probe = if let Some(ssh) = &state.ssh {
             ssh.probe(&state.info.cwd, &state.config.env).await?
-        } else if let Some(tmux) = &state.tmux {
-            tmux.probe(Path::new(&state.info.cwd), &state.config.env)
-                .await?
         } else {
             ssh::local_probe(Path::new(&state.info.cwd), &state.config.env).await?
         };
@@ -691,8 +686,6 @@ impl AgentRuntime for Runtime {
                 ));
             }
             Arc::new(ssh::SshBashRunner::new(ssh.clone(), env, ctx.run.clone()))
-        } else if let Some(tmux) = &s.tmux {
-            Arc::new(tmux::TmuxBashRunner::new(tmux.clone(), env, ctx.run.clone()))
         } else {
             Arc::new(
                 LocalProcessBashRunner::new()
@@ -742,18 +735,12 @@ impl AgentRuntime for Runtime {
             let facts = ssh.read_exec_dir(&dir).await;
             return interrupted_shell_text(&kind, &target, action, facts.as_ref(), &dir);
         }
-        let target = self
-            .config()
-            .tmux
-            .as_ref()
-            .and_then(|t| t.session.clone())
-            .unwrap_or_default();
         match exec_dir_for(run.run_dir.as_deref(), Some(&action.call_id)) {
             Some(dir) => {
                 let facts = read_exec_dir(&dir);
-                interrupted_shell_text(&kind, &target, action, Some(&facts), &dir.display().to_string())
+                interrupted_shell_text(&kind, "", action, Some(&facts), &dir.display().to_string())
             }
-            None => interrupted_shell_text(&kind, &target, action, None, "(no execution directory)"),
+            None => interrupted_shell_text(&kind, "", action, None, "(no execution directory)"),
         }
     }
 }
@@ -762,7 +749,26 @@ pub struct RuntimeRegistry;
 impl RuntimeRegistry {
     pub fn from_config(config: &RuntimeConfig) -> Result<Arc<dyn AgentRuntime>> {
         config.validate(true)?;
+        if config.kind() == node::REMOTE_NODE_KIND {
+            return Err(XllmError::Capability(
+                "runtime `remote_node` needs a host that provides a Node Executor connector".into(),
+            ));
+        }
         Ok(Arc::new(Runtime::from_config(config.clone())))
+    }
+
+    /// Like `from_config`, with the host-provided Node Executor connector.
+    pub fn from_config_with(config: &RuntimeConfig, deps: &XllmDeps) -> Result<Arc<dyn AgentRuntime>> {
+        if config.kind() == node::REMOTE_NODE_KIND {
+            config.validate(true)?;
+            let connector = deps.node_executor.clone().ok_or_else(|| {
+                XllmError::Capability(
+                    "runtime `remote_node` needs a host that provides a Node Executor connector".into(),
+                )
+            })?;
+            return Ok(Arc::new(node::RemoteNodeRuntime::new(config.clone(), connector)));
+        }
+        Self::from_config(config)
     }
 }
 
@@ -775,7 +781,7 @@ pub async fn open_runtime(
     config.validate(true)?;
     let runtime = match &deps.runtime {
         Some(r) => r.clone(),
-        None => RuntimeRegistry::from_config(config)?,
+        None => RuntimeRegistry::from_config_with(config, deps)?,
     };
     if deps.runtime.is_some() {
         let provided = runtime.config();

@@ -18,6 +18,22 @@ def _load_build_script():
 
 
 class BuckyosBuildEntrypointTests(unittest.TestCase):
+    def test_standalone_daemon_build_does_not_require_sdk_or_web_tools(self) -> None:
+        module = _load_build_script()
+        with (
+            patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_sdk_tool_distribution") as sdk,
+            patch.object(module.subprocess, "run", return_value=module.subprocess.CompletedProcess([], 0)) as run,
+        ):
+            for target in ("x86_64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+                with self.subTest(target=target):
+                    self.assertEqual(module.main(["--agent-daemon", f"--target={target}"]), 0)
+                    sdk.assert_not_called()
+                    self.assertEqual(run.call_args.args[0], ["/runtime/buckyos-build", f"--target={target}", "--select", "buckyos_agent_daemon"])
+            run.reset_mock()
+            self.assertEqual(module.main(["--agent-daemon", "-s", "scheduler"]), 2)
+            run.assert_not_called()
+
     def test_main_delegates_arguments_to_devkit_build(self) -> None:
         module = _load_build_script()
         completed = module.subprocess.CompletedProcess([], 23)
@@ -25,9 +41,11 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
         with (
             patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
             patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
+            patch.object(module, "_prepare_agent_tools", return_value=0) as agent_tools,
             patch.object(module.subprocess, "run", return_value=completed) as run,
         ):
             result = module.main(["--skip-web", "-s", "scheduler"])
+        agent_tools.assert_called_once_with()
 
         self.assertEqual(result, 23)
         run.assert_called_once_with(
@@ -36,6 +54,41 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
                 "/runtime/buckyos-build", str(SCRIPT_PATH.resolve().parent / "rootfs" / "libexec" / "buckyos-tool" / "cli" / "launcher.mjs"),
             ])},
         )
+
+    def test_successful_build_assembles_the_macos_runtime_bundle(self) -> None:
+        module = _load_build_script()
+        with (
+            patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
+            patch.object(module, "_prepare_agent_tools", return_value=0),
+            patch.object(module.subprocess, "run", return_value=module.subprocess.CompletedProcess([], 0)) as run,
+        ):
+            self.assertEqual(module.main(["-s", "node_daemon"]), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0], ["/runtime/buckyos-build", "-s", "node_daemon"])
+        self.assertEqual(run.call_args_list[1].args[0], [
+            module.sys.executable,
+            str(SCRIPT_PATH.resolve().parent / "tools" / "macos_runtime_bundle.py"),
+            "assemble",
+        ])
+
+    def test_agent_tools_are_copied_with_the_host_sdk_import(self) -> None:
+        module = _load_build_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "src"
+            (source / "commands").mkdir(parents=True)
+            (source / "aicc-tool.ts").write_text("// entry\n", encoding="utf-8")
+            (source / "commands" / "gen_image.ts").write_text("// cmd\n", encoding="utf-8")
+            (source / "deno.json").write_text('{"imports": {"buckyos": "../../rootfs/x.mjs"}}', encoding="utf-8")
+            target = Path(temporary) / "rootfs" / "libexec" / "buckyos-agent"
+            target.mkdir(parents=True)
+            (target / "stale.ts").write_text("old", encoding="utf-8")
+            self.assertEqual(module._prepare_agent_tools(source, target), 0)
+            config = module.json.loads((target / "deno.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["imports"]["buckyos"], "../buckyos-tool/dist/node.mjs")
+            self.assertTrue((target / "commands" / "gen_image.ts").is_file())
+            self.assertFalse((target / "stale.ts").exists())
+            self.assertEqual(module._prepare_agent_tools(Path(temporary) / "missing", target), 2)
 
     def test_main_prepares_sdk_tool_distribution_before_build(self) -> None:
         module = _load_build_script()
@@ -67,6 +120,7 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
                 "/inputs/deno",
                 "--sbom",
                 "/inputs/sbom.json",
+                *(["--windows"] if module.os.name == "nt" else []),
             ],
             env=env,
         )

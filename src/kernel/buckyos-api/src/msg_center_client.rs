@@ -1,7 +1,7 @@
-use crate::rdb_mgr::{RdbBackend, RdbInstanceConfig, RdbPartition};
-use crate::{get_buckyos_api_runtime, AppDoc, AppType, SelectorType};
 use crate::msg_contact::*;
 use crate::msg_notify::*;
+use crate::rdb_mgr::{RdbBackend, RdbInstanceConfig, RdbPartition};
+use crate::{get_buckyos_api_runtime, AppDoc, AppType, SelectorType};
 use ::kRPC::*;
 use async_trait::async_trait;
 use name_lib::DID;
@@ -596,6 +596,12 @@ impl MailboxAddress {
             "obj://msg-center/owners/{}",
             Self::encode_resource_address(&self.owner.to_string())
         )
+    }
+
+    /// The owner's address book: Limited accounts reach this, not the rest of
+    /// the owner scope.
+    pub fn contacts_resource(&self) -> String {
+        format!("{}/contacts", self.owner_resource())
     }
 
     fn encode_resource_address(value: &str) -> String {
@@ -1259,6 +1265,11 @@ pub struct Contact {
     pub friend_state: FriendState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Source groups (`type:<user type>` / `group:<id>`) that project this Zone
+    /// user into the owner's address book. Non-empty means the entry is read
+    /// only: the owner can add a note or block it, not edit or remove it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_from: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -3599,8 +3610,12 @@ impl MsgCenterClient {
         &self,
         req: ContactSendFriendRequestReq,
     ) -> std::result::Result<FriendRequestResult, RPCErrors> {
-        self.contact_ext_call(METHOD_CONTACT_SEND_FRIEND_REQUEST, &req, "FriendRequestResult")
-            .await
+        self.contact_ext_call(
+            METHOD_CONTACT_SEND_FRIEND_REQUEST,
+            &req,
+            "FriendRequestResult",
+        )
+        .await
     }
 
     pub async fn contact_respond_friend_request(
@@ -3639,8 +3654,25 @@ impl MsgCenterClient {
         &self,
         req: ContactListFriendRequestsReq,
     ) -> std::result::Result<FriendRequestPage, RPCErrors> {
-        self.contact_ext_call(METHOD_CONTACT_LIST_FRIEND_REQUESTS, &req, "FriendRequestPage")
-            .await
+        self.contact_ext_call(
+            METHOD_CONTACT_LIST_FRIEND_REQUESTS,
+            &req,
+            "FriendRequestPage",
+        )
+        .await
+    }
+
+    /// Service-only (needs `read` on [`CONTACT_MEMBERSHIP_RBAC_RESOURCE`]).
+    pub async fn contact_check_membership(
+        &self,
+        req: ContactCheckMembershipReq,
+    ) -> std::result::Result<ContactCheckMembershipResult, RPCErrors> {
+        self.contact_ext_call(
+            METHOD_CONTACT_CHECK_MEMBERSHIP,
+            &req,
+            "ContactCheckMembershipResult",
+        )
+        .await
     }
 
     async fn notify_call<Req: Serialize, Resp: DeserializeOwned>(
@@ -3670,14 +3702,16 @@ impl MsgCenterClient {
         &self,
         req: NotifySendReq,
     ) -> std::result::Result<NotifyView, RPCErrors> {
-        self.notify_call(METHOD_NOTIFY_SEND, &req, "NotifyView").await
+        self.notify_call(METHOD_NOTIFY_SEND, &req, "NotifyView")
+            .await
     }
 
     pub async fn notify_get(&self, notify_id: &str) -> std::result::Result<NotifyView, RPCErrors> {
         let req = NotifyGetReq {
             notify_id: notify_id.to_string(),
         };
-        self.notify_call(METHOD_NOTIFY_GET, &req, "NotifyView").await
+        self.notify_call(METHOD_NOTIFY_GET, &req, "NotifyView")
+            .await
     }
 
     pub async fn notify_list(
@@ -3698,7 +3732,8 @@ impl MsgCenterClient {
             notify_id: notify_id.to_string(),
             on_behalf,
         };
-        self.notify_call(METHOD_NOTIFY_ACK, &req, "NotifyView").await
+        self.notify_call(METHOD_NOTIFY_ACK, &req, "NotifyView")
+            .await
     }
 
     pub async fn notify_dismiss(
@@ -4762,9 +4797,16 @@ impl<T: MsgCenterHandler> RPCHandler for MsgCenterServerHandler<T> {
                     .await?;
                 RPCResult::Success(result)
             }
-            METHOD_NOTIFY_SEND | METHOD_NOTIFY_GET | METHOD_NOTIFY_LIST | METHOD_NOTIFY_ACK
-            | METHOD_NOTIFY_DISMISS | METHOD_NOTIFY_CANCEL => {
-                let result = self.0.handle_notify(req.method.as_str(), req.params, ctx).await?;
+            METHOD_NOTIFY_SEND
+            | METHOD_NOTIFY_GET
+            | METHOD_NOTIFY_LIST
+            | METHOD_NOTIFY_ACK
+            | METHOD_NOTIFY_DISMISS
+            | METHOD_NOTIFY_CANCEL => {
+                let result = self
+                    .0
+                    .handle_notify(req.method.as_str(), req.params, ctx)
+                    .await?;
                 RPCResult::Success(result)
             }
             _ => return Err(RPCErrors::UnknownMethod(req.method.clone())),

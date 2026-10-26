@@ -26,6 +26,7 @@ export const SOURCES_SIDE_TABS: SideTab[] = ['collab', 'edits']
 
 export type DialogRequest =
   | { kind: 'new'; tab: 'canvas' | 'workspace' | 'template' }
+  | { kind: 'share' }
   | { kind: 'export' }
   | { kind: 'import' }
   | { kind: 'help' }
@@ -88,8 +89,9 @@ export interface ShellApi {
   phone: boolean
   /** The Mock processing panel and other developer tools are shown (dev server or dev override). */
   devTools: boolean
-  /** Who this window acts as; a dev-override identity has no login session to end; a guest came through a public link. */
-  identity: { principal: string | null; dev: boolean; guest: boolean }
+  /** Who this window acts as; a dev-override identity has no login session to end; a guest came through a public link;
+   * a restricted session (Limited account, External DID) owns no workspace (hybrid SSO, from the current identity). */
+  identity: { principal: string | null; dev: boolean; guest: boolean; restricted: boolean }
   /** Log out through the Desktop's sign-in flow (after the workspace's leave check). */
   logout: () => void
   /** A guest signs in (the Desktop login, coming back to this address). */

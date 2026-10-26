@@ -7,6 +7,7 @@ pub mod assembler;
 pub mod background;
 mod ask;
 mod children;
+mod consolidation;
 mod drive;
 pub mod input_view;
 mod flush;
@@ -15,12 +16,15 @@ pub mod history;
 mod hook;
 mod inputs;
 mod live;
+mod live_tasks;
+mod observe;
 mod outbound;
 mod outcome;
 mod receipts;
 mod reports;
 mod reconcile;
 mod rounds;
+mod share;
 mod shared;
 mod tools;
 mod todos;
@@ -46,6 +50,8 @@ pub use assembler::{
 };
 pub use children::{SessionTaskResolver, SESSION_TASK_PREFIX};
 pub use drive::drive;
+pub use live_tasks::answer_session_task;
+pub use outcome::AI_QUOTA_ERROR_KIND;
 pub use outbound::{
     compose_reply, has_pending_outbound, OutboundSink, SendResult, TurnReply, AGENT_TASK_META,
 };
@@ -54,6 +60,7 @@ pub use turn_task::{
     has_pending_turn_tasks, TurnTaskEnd, TurnTaskOpen, TurnTaskSink, TurnTaskStatus,
 };
 pub use history::{LlmSummarizer, Summarizer};
+pub use consolidation::{GoalCaps, TOOL_BEGIN as TOOL_MEMORY_CONSOLIDATION_BEGIN, TOOL_COMMIT as TOOL_MEMORY_CONSOLIDATION_COMMIT};
 pub use tools::classify_effect;
 pub(crate) use inputs::side_effects_from_worklog as side_effects_of;
 
@@ -248,6 +255,9 @@ pub struct RunnerDeps {
     /// The host's notification service (`None`: a Work cannot ask its
     /// user).
     pub notify: Option<Arc<dyn crate::notify::NotifyHost>>,
+    /// Where a finished user task is shared as the agent's own post
+    /// (`None`: nothing is shared).
+    pub share: Option<Arc<dyn crate::share::ShareHost>>,
     /// Executable wrapped as `agent-session` in `.runtime/bin`.
     pub session_cli: Option<PathBuf>,
     /// Further commands of the host in `.runtime/bin`
@@ -282,6 +292,7 @@ impl RunnerDeps {
             objects: None,
             turn_tasks: None,
             notify: None,
+            share: None,
             session_cli: None,
             session_helpers: Vec::new(),
             app_tools: Vec::new(),

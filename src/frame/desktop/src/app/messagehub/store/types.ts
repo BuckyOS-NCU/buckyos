@@ -14,6 +14,7 @@ import type { CreationPolicy, Entity, EntityDetail, GroupInfo, GroupInvitation, 
  * `voice` marks the only attachment as a voice note (`MsgObject.voice`).
  */
 export interface OutgoingPayload {
+  signal?: AbortSignal
   content: string
   attachments: ComposerAttachmentInput[]
   relatesTo?: MsgRelation
@@ -99,6 +100,7 @@ export interface MessageHubStore {
   locateMessage(context: MessageHubContext, sessionId: string, messageId: string): Promise<boolean>
   /** Mark displayed inbound records read, together with the edits folded into them (no-op for observers). */
   markRead(context: MessageHubContext, sessionId: string, recordIds: string[]): Promise<void>
+  markAllRead(context: MessageHubContext): Promise<void>
   access(context: MessageHubContext, session: Session, confirmed: boolean): SessionAccess
   draft(context: MessageHubContext, sessionId: string): string
   attachments(context: MessageHubContext, sessionId: string): ComposerAttachmentInput[]

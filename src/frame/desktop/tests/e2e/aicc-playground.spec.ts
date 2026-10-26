@@ -21,10 +21,21 @@ function sample(api: ApiType): JsonObject {
   const params: JsonObject = { ...defaultRequest(api), exact_model: `${api}@test-provider`, ...Object.fromEntries(PLAYGROUND_APIS[api].fields.filter((field) => field.required).map((field) => [field.key, fillField(field)])) }
   if (api === 'embedding.multimodal') params.items = [{ id: 'item-1', text: 'hello' }]
   if (api === 'rerank') params.documents = [{ id: 'doc-1', text: 'hello' }]
+  if (api === 'video.generate') params.prompt = 'sample'
   return params
 }
 
 async function serviceFixture(page: Page, mode = 'success') {
+  await page.route('**/src/app/ai-center/api/resourceImport.ts*', route => route.fulfill({ contentType: 'application/javascript', body: `
+    export async function importPlaygroundResource(file, signal, progress) {
+      progress?.(50);
+      if (globalThis.deferResourceImport) await new Promise((resolve, reject) => {
+        globalThis.resumeFileRead = resolve;
+        signal.addEventListener('abort', () => reject(new Error('Import cancelled')), { once: true });
+      });
+      return 'cyfile:' + 'a'.repeat(64);
+    }
+  ` }));
   await page.route('**/src/api/aicc_playground.ts*', (route) => route.fulfill({ contentType: 'application/javascript', body: `
     import { mockPlaygroundResponse } from '/src/app/ai-center/mock/playground.ts';
     let polls = 0;
@@ -101,6 +112,30 @@ test('canonical API coverage, task request wrappers, identifier cleanup and reso
   const result = taskResponse({ task_id: 'id', phase: 'Terminal', outcome: 'Succeeded', result: { result: { output: { value: { text: 'done' }, usage: { total_tokens: 8 }, cost: { amount: 0.1, currency: 'USD' } } } } }, { status: 'running', route_trace: { final_model: 'm@p' } })
   expect(result).toMatchObject({ status: 'succeeded', text: 'done', usage: { total_tokens: 8 }, cost: { amount: 0.1 }, route_trace: { final_model: 'm@p' } })
   expect(taskResponse({ phase: 'Terminal', outcome: 'Canceled' }, {}).status).toBe('cancelled')
+})
+
+test('video.generate conditions follow the server rules and results show each video with its metadata', async ({ page }) => {
+  const keyframe = { type: 'keyframe', id: 'first', position: 'start', resource }
+  const base = { ...sample('video.generate'), prompt: '@{first} comes alive', conditions: [keyframe] }
+  expect(validateRequest('video.generate', base)).toEqual([])
+  expect(validateRequest('video.generate', { ...base, prompt: '', conditions: [] })).toContainEqual({ path: 'prompt', code: 'required' })
+  expect(validateRequest('video.generate', { ...base, prompt: '@{ghost} walks' })).toContainEqual({ path: 'prompt', code: 'invalid' })
+  expect(validateRequest('video.generate', { ...base, prompt: 'mail a@@{b}' })).toEqual([])
+  expect(validateRequest('video.generate', { ...base, conditions: [keyframe, { ...keyframe, id: 'FIRST', position: 'end' }] })).toContainEqual({ path: 'conditions[1].id', code: 'invalid' })
+  expect(validateRequest('video.generate', { ...base, conditions: [keyframe, { ...keyframe, id: 'again' }] })).toContainEqual({ path: 'conditions[1].position', code: 'invalid' })
+  expect(validateRequest('video.generate', { ...base, conditions: [{ type: 'reference_audio', id: 'voice', resource, time_range: { start_seconds: 3, end_seconds: 1 } }] })).toContainEqual({ path: 'conditions[0].time_range', code: 'range' })
+  expect(validateRequest('video.generate', { ...base, output: { size: { short_edge: 720, width: 1280 } } })).toContainEqual({ path: 'output.size', code: 'invalid' })
+
+  await serviceFixture(page)
+  await openPlayground(page)
+  await page.getByRole('checkbox', { name: 'Advanced mode / import request JSON' }).check()
+  await page.getByRole('textbox', { name: 'Request JSON to import' }).fill(JSON.stringify({ method: 'video.generate', params: { ...base, output: { duration_seconds: 6, audio: 'none' } } }))
+  await page.getByRole('button', { name: 'Extract parameters', exact: true }).click()
+  await page.getByRole('button', { name: 'Run request', exact: true }).click()
+  const result = page.getByRole('region', { name: 'Call result' })
+  await expect(result).toContainText('Succeeded')
+  await expect(result).toContainText('videos.0.resource')
+  await expect(result.locator('details').filter({ hasText: 'Videos and their metadata' })).toContainText('"deviations"')
 })
 
 test('all API forms import and submit canonical parameters without losing extensions', async ({ page }) => {
@@ -196,11 +231,11 @@ test('URL, data URL and file input, plus invalid import leaves the form intact',
   await expect(page.getByRole('region', { name: 'Call result' })).toContainText('Succeeded')
   await page.getByRole('combobox', { name: 'image Input mode', exact: true }).selectOption('file')
   await page.getByLabel('image Choose file', { exact: true }).setInputFiles({ name: 'image.png', mimeType: 'image/png', buffer: Buffer.from('image bytes') })
-  await expect(page.getByText('Reading file…')).toBeHidden()
+  await expect(page.getByText('Importing file…', { exact: false })).toBeHidden()
   await page.getByRole('button', { name: 'Run request', exact: true }).click()
   await expect(page.getByRole('region', { name: 'Call result' })).toContainText('Succeeded')
   const submitted = await page.evaluate(() => (globalThis as unknown as { playgroundLastRequest: { params: JsonObject } }).playgroundLastRequest.params)
-  expect(submitted.image).toEqual({ kind: 'base64', mime: 'image/png', data_base64: Buffer.from('image bytes').toString('base64') })
+  expect(submitted.image).toEqual({ kind: 'named_object', obj_id: 'cyfile:' + 'a'.repeat(64) })
   expect(submitted.mask).toEqual({ kind: 'base64', mime: 'image/png', data_base64: 'aGk=' })
   await page.getByRole('checkbox', { name: 'Advanced mode / import request JSON' }).check()
   await page.getByRole('textbox', { name: 'Request JSON to import' }).fill('{bad')
@@ -284,24 +319,18 @@ test('Task Center retains original AICC input alongside a terminal result', asyn
 test('file completion preserves recent edits and cannot overwrite another API form', async ({ page }) => {
   await serviceFixture(page)
   await openPlayground(page)
-  await page.evaluate(() => {
-    const original = FileReader.prototype.readAsDataURL
-    FileReader.prototype.readAsDataURL = function (blob) {
-      const resumeFileRead = original.bind(this, blob)
-      ;(globalThis as unknown as { resumeFileRead: () => void }).resumeFileRead = resumeFileRead
-    }
-  })
+  await page.evaluate(() => { (globalThis as unknown as { deferResourceImport: boolean }).deferResourceImport = true })
   await page.getByRole('combobox', { name: 'API Type', exact: true }).selectOption('image.inpaint')
   await page.getByRole('combobox', { name: 'image Input mode', exact: true }).selectOption('file')
   const file = { name: 'image.png', mimeType: 'image/png', buffer: Buffer.from('image') }
   await page.getByLabel('image Choose file', { exact: true }).setInputFiles(file)
-  await expect(page.getByText('Reading file…')).toBeVisible()
+  await expect(page.getByText('Importing file…', { exact: false })).toBeVisible()
   await page.getByRole('textbox', { name: 'prompt', exact: true }).fill('Latest prompt')
   await page.evaluate(() => (globalThis as unknown as { resumeFileRead: () => void }).resumeFileRead())
-  await expect(page.getByText('Reading file…')).toBeHidden()
+  await expect(page.getByText('Importing file…', { exact: false })).toBeHidden()
   await expect(page.getByRole('textbox', { name: 'prompt', exact: true })).toHaveValue('Latest prompt')
   await page.getByLabel('image Choose file', { exact: true }).setInputFiles({ ...file, name: 'next.png' })
-  await expect(page.getByText('Reading file…')).toBeVisible()
+  await expect(page.getByText('Importing file…', { exact: false })).toBeVisible()
   await page.getByRole('combobox', { name: 'API Type', exact: true }).selectOption('audio.tts')
   await page.getByRole('textbox', { name: 'text', exact: true }).fill('Keep this text')
   await page.evaluate(() => (globalThis as unknown as { resumeFileRead: () => void }).resumeFileRead())

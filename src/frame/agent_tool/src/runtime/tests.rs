@@ -93,10 +93,14 @@ async fn open(
 
 #[test]
 fn config_merge_resolves_source_paths_and_resets_kind() {
-    let a=crate::xllm::parse_llm_context_file(Path::new("/one/.llm_context"),"runtime:\n  kind: tmux\n  workdir: work\n  env: {ONE: a}\n  tmux: {session: test, socket: sock}\n").unwrap();
+    let a = crate::xllm::parse_llm_context_file(
+        Path::new("/one/.llm_context"),
+        "runtime:\n  kind: remote_ssh\n  workdir: /srv/work\n  env: {ONE: a}\n  remote_ssh: {host: build, identity_file: key}\n",
+    )
+    .unwrap();
     let b = crate::xllm::parse_llm_context_file(
         Path::new("/two/.llm_context"),
-        "runtime:\n  env: {TWO: b}\n  tmux: {mode: attach}\n",
+        "runtime:\n  env: {TWO: b}\n  remote_ssh: {user: dev}\n",
     )
     .unwrap();
     let merged = crate::xllm::merge_config_layers(&[
@@ -110,34 +114,76 @@ fn config_merge_resolves_source_paths_and_resets_kind() {
         },
     ])
     .unwrap();
-    assert_eq!(merged.runtime.workdir.as_deref().map(Path::new), Some(Path::new("/one/work")));
+    assert_eq!(merged.runtime.workdir.as_deref(), Some("/srv/work"));
+    let ssh = merged.runtime.remote_ssh.as_ref().unwrap();
     assert_eq!(
-        merged.runtime.tmux.as_ref().unwrap().socket.as_deref().map(Path::new),
-        Some(Path::new("/one/sock"))
+        ssh.identity_file.as_deref().map(Path::new),
+        Some(Path::new("/one/key"))
     );
+    assert_eq!((ssh.host.as_deref(), ssh.user.as_deref()), (Some("build"), Some("dev")));
     assert_eq!(merged.runtime.env.len(), 2);
+    let local = crate::xllm::parse_llm_context_file(
+        Path::new("/one/.llm_context"),
+        "runtime: {kind: native, workdir: work}",
+    )
+    .unwrap();
+    assert_eq!(
+        local.runtime.unwrap().workdir.as_deref().map(Path::new),
+        Some(Path::new("/one/work"))
+    );
     let mut r = merged.runtime;
     r.merge_over(&RuntimeConfig {
         kind: Some("native".into()),
         ..Default::default()
     });
-    assert!(r.tmux.is_none() && r.env.is_empty() && r.workdir.is_none());
+    assert!(r.remote_ssh.is_none() && r.env.is_empty() && r.workdir.is_none());
     for raw in [
         "runtime: {kind: bad}",
+        "runtime: {kind: tmux}",
         "runtime: {kind: native, limits: {}}",
-        "runtime: {kind: native, tmux: {session: x}}",
+        "runtime: {kind: native, remote_ssh: {host: x}}",
     ] {
         assert!(matches!(
             crate::xllm::parse_llm_context_file(Path::new(".llm_context"), raw),
             Err(XllmError::Config { .. })
         ));
     }
-    for kind in [
-        "container",
-        "container_host",
-        "remote_node",
-        "http_proxy_runtime",
-    ] {
+    let node = RuntimeConfig {
+        kind: Some("remote_node".into()),
+        workdir: Some("/home/devtest/ws".into()),
+        remote_node: Some(RemoteNodeConfig {
+            node_did: Some("did:web:ood1.test.buckyos.io".into()),
+            profile_id: Some("dev".into()),
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        RuntimeRegistry::from_config(&node),
+        Err(XllmError::Capability(_))
+    ));
+    assert!(matches!(
+        RuntimeRegistry::from_config_with(&node, &XllmDeps::default()),
+        Err(XllmError::Capability(_))
+    ));
+    let mut no_profile = node.clone();
+    no_profile.remote_node.as_mut().unwrap().profile_id = None;
+    assert!(matches!(
+        RuntimeRegistry::from_config(&no_profile),
+        Err(XllmError::Config { .. })
+    ));
+    for (workdir, ok) in [(r"C:\Users\devtest\ws", true), ("ws", false), (r"C:ws", false)] {
+        let mut windows_node = node.clone();
+        windows_node.workdir = Some(workdir.into());
+        let result = RuntimeRegistry::from_config(&windows_node);
+        assert_eq!(!matches!(result, Err(XllmError::Config { .. })), ok, "{workdir}");
+    }
+    let parsed = crate::xllm::parse_llm_context_file(
+        Path::new(".llm_context"),
+        "runtime: {kind: remote_node, workdir: /home/devtest/ws, remote_node: {node_did: did:web:ood1.test.buckyos.io, profile_id: dev}}",
+    )
+    .unwrap();
+    assert_eq!(parsed.runtime.unwrap(), node);
+    for kind in ["container", "container_host", "http_proxy_runtime"] {
         assert!(matches!(
             RuntimeRegistry::from_config(&RuntimeConfig {
                 kind: Some(kind.into()),
@@ -290,345 +336,6 @@ async fn native_default_explicit_env_files_and_prompt_share_executor() {
         ));
         assert!(!outside.path().join("new").exists());
     }
-}
-
-#[tokio::test]
-async fn tmux_modes_dedicated_pane_and_serial_execution() {
-    if !Runtime::available() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("socket").display().to_string();
-    let cfg = RuntimeConfig {
-        kind: Some("tmux".into()),
-        tmux: Some(TmuxConfig {
-            session: Some("runtime-test".into()),
-            socket: Some(socket.clone()),
-            mode: Some(TmuxMode::Attach),
-        }),
-        ..Default::default()
-    };
-    let r = RuntimeRegistry::from_config(&cfg).unwrap();
-    let ctx = RuntimeOpenCtx::new(dir.path(), "test", LoopModel::FunctionCall);
-    assert!(r
-        .open(&ctx, &ToolsConfig::default(), &XllmDeps::default())
-        .await
-        .is_err());
-    let mut cfg = cfg;
-    cfg.tmux.as_mut().unwrap().mode = Some(TmuxMode::Create);
-    let (rt, m, slot) = open(
-        cfg.clone(),
-        dir.path(),
-        crate::xllm::FilesystemPolicy::Workspace,
-    )
-    .await;
-    let original = CommandOutput::pane(&socket, "runtime-test:0.0");
-    let o = m
-        .exec(
-            request(m.workdir(), "echo tmux; printf same > file"),
-            &context(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(o.stdout, "tmux\n");
-    assert_eq!(o.engine, "tmux");
-    let obs = m
-        .call_tool_t(call("read_file", json!({"path":"file"})))
-        .await
-        .unwrap();
-    assert!(format!("{obs:?}").contains("same"));
-    assert_eq!(original, CommandOutput::pane(&socket, "runtime-test:0.0"));
-    let bad = RuntimeRegistry::from_config(&cfg).unwrap();
-    assert!(bad
-        .open(&ctx, &ToolsConfig::default(), &XllmDeps::default())
-        .await
-        .is_err());
-    cfg.tmux.as_mut().unwrap().mode = Some(TmuxMode::CreateOrAttach);
-    let (second, _, _) = open(cfg, dir.path(), crate::xllm::FilesystemPolicy::Workspace).await;
-    assert_eq!(rt.descriptor(), second.descriptor());
-    // A command the executor stops waiting for keeps running in tmux; a
-    // timeout kills its window.
-    let mut long = request(m.workdir(), "sleep 30; echo late");
-    long.timeout_ms = 500;
-    long.call_id = Some("long".into());
-    let out = m.exec(long, &context()).await.unwrap();
-    assert!(out.timed_out);
-    let binding = slot.lock().unwrap().clone().unwrap();
-    let text = rt
-        .describe_interrupted(&binding, &inflight("long", "sleep 30; echo late"))
-        .await;
-    assert!(text.contains("tmux session `runtime-test`"), "{text}");
-    let _ = std::process::Command::new("tmux")
-        .args(["-S", &socket, "kill-server"])
-        .status();
-}
-
-#[tokio::test]
-async fn tmux_run_cancellation_keeps_the_command_running() {
-    if !Runtime::available() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("socket").display().to_string();
-    struct Cleanup(String);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
-                .args(["-S", &self.0, "kill-server"])
-                .output();
-        }
-    }
-    let _cleanup = Cleanup(socket.clone());
-    let (_, manager, slot) = open(
-        RuntimeConfig {
-            kind: Some("tmux".into()),
-            tmux: Some(TmuxConfig {
-                session: Some("run-cancellation".into()),
-                socket: Some(socket),
-                mode: Some(TmuxMode::Create),
-            }),
-            ..Default::default()
-        },
-        dir.path(),
-        crate::xllm::FilesystemPolicy::Workspace,
-    )
-    .await;
-    let binding = slot.lock().unwrap().clone().unwrap();
-    for cause in ["interrupt", "finish", "deadline"] {
-        let handle = llm_context::LLMContextInterruptHandle::standalone();
-        let call_ctx = ToolCallCtx {
-            abort: handle.token(),
-            deadline_ms: (cause == "deadline").then(|| crate::now_ms() + 500),
-            allow_deferred: false,
-        };
-        let mut call = call(
-            TOOL_SHELL,
-            json!({"command": format!("echo started > {cause}.started; sleep 2; echo finished")}),
-        );
-        call.call_id = cause.into();
-        let manager = manager.clone();
-        let running = tokio::spawn(async move { manager.call_tool(call, call_ctx).await });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !dir.path().join(format!("{cause}.started")).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("tmux command started");
-        match cause {
-            "interrupt" => {
-                handle.interrupt("test");
-            }
-            "finish" => {
-                handle.finish("test");
-            }
-            _ => {}
-        }
-        let observation = tokio::time::timeout(Duration::from_secs(1), running)
-            .await
-            .expect("run cancellation is prompt")
-            .unwrap()
-            .unwrap();
-        let llm_context::observation::Observation::Cancelled {
-            reason,
-            effect_unknown,
-            ..
-        } = observation
-        else {
-            panic!("expected cancelled, got {observation:?}");
-        };
-        assert!(!effect_unknown);
-        assert!(reason.contains("still running"), "{reason}");
-        assert!(
-            reason.contains("tmux session `run-cancellation`"),
-            "{reason}"
-        );
-        let exec = crate::llm_bash::exec_dir_for(binding.run_dir.as_deref(), Some(cause)).unwrap();
-        assert!(reason.contains(&exec.display().to_string()), "{reason}");
-        assert!(!exec.join("exit").exists());
-        tokio::time::timeout(Duration::from_secs(4), async {
-            while crate::llm_bash::read_exit_file(&exec).is_none() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("detached command completes");
-        assert_eq!(crate::llm_bash::read_exit_file(&exec), Some(0));
-        assert!(std::fs::read_to_string(exec.join("stdout"))
-            .unwrap()
-            .contains("finished"));
-    }
-}
-
-struct CommandOutput;
-impl CommandOutput {
-    fn tmux(socket: &str, args: &[&str]) -> String {
-        let output = std::process::Command::new("tmux")
-            .args(["-S", socket])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        String::from_utf8(output.stdout).unwrap()
-    }
-
-    fn pane(socket: &str, pane: &str) -> Vec<u8> {
-        std::process::Command::new("tmux")
-            .args(["-S", socket, "capture-pane", "-p", "-t", pane])
-            .output()
-            .unwrap()
-            .stdout
-    }
-}
-
-#[tokio::test]
-async fn tmux_duplicate_window_names_cancel_only_the_requested_run() {
-    if !Runtime::available() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("socket").display().to_string();
-    let target = Arc::new(
-        tmux::TmuxTarget::open(
-            &TmuxConfig {
-                session: Some("duplicates".into()),
-                socket: Some(socket.clone()),
-                mode: Some(TmuxMode::Create),
-            },
-            dir.path(),
-        )
-        .await
-        .unwrap(),
-    );
-    let mut handles = Vec::new();
-    for run_id in ["first", "second"] {
-        let slot = new_run_binding_slot();
-        *slot.lock().unwrap() = Some(RunBinding {
-            run_id: run_id.into(),
-            run_dir: Some(dir.path().join(run_id)),
-        });
-        let runner = tmux::TmuxBashRunner::new(target.clone(), BTreeMap::new(), slot);
-        let mut req = request(dir.path().to_str().unwrap(), "sleep 30");
-        req.call_id = Some("duplicate".into());
-        handles.push(runner.start(&context(), req).await.unwrap());
-    }
-    let windows = || {
-        CommandOutput::tmux(
-            &socket,
-            &[
-                "list-windows",
-                "-t",
-                "=duplicates",
-                "-F",
-                "#{window_id} #{window_name}",
-            ],
-        )
-        .lines()
-        .filter(|line| line.ends_with(" llm-duplicate"))
-        .map(str::to_string)
-        .collect::<Vec<_>>()
-    };
-    let original = windows();
-    assert_eq!(original.len(), 2);
-    assert!(handles[0]
-        .locator()
-        .contains(original[0].split_once(' ').unwrap().0));
-    assert!(handles[1]
-        .locator()
-        .contains(original[1].split_once(' ').unwrap().0));
-    assert!(handles[0].kill().await.unwrap().timed_out);
-    assert_eq!(windows(), vec![original[1].clone()]);
-    assert!(handles[1]
-        .wait(Duration::from_millis(50))
-        .await
-        .unwrap()
-        .is_none());
-    assert!(handles[1].kill().await.unwrap().timed_out);
-    assert!(windows().is_empty());
-    CommandOutput::tmux(&socket, &["kill-server"]);
-}
-
-#[tokio::test]
-async fn tmux_info_and_shell_use_the_session_environment() {
-    if !Runtime::available() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("socket").display().to_string();
-    let tmux_cfg = TmuxConfig {
-        session: Some("environment".into()),
-        socket: Some(socket.clone()),
-        mode: Some(TmuxMode::Create),
-    };
-    tmux::TmuxTarget::open(&tmux_cfg, dir.path()).await.unwrap();
-    let path = format!(
-        "{}:{}",
-        dir.path().join("session-bin").display(),
-        std::env::var("PATH").unwrap()
-    );
-    let bash_env = dir.path().join("bash-env");
-    std::fs::write(
-        &bash_env,
-        format!("export PATH={}\nunset BASH_ENV\n", shell_quote(&path)),
-    )
-    .unwrap();
-    CommandOutput::tmux(
-        &socket,
-        &[
-            "set-environment",
-            "-t",
-            "=environment",
-            "BASH_ENV",
-            bash_env.to_str().unwrap(),
-        ],
-    );
-    CommandOutput::tmux(
-        &socket,
-        &["set-environment", "-t", "=environment", "TZ", "HST10"],
-    );
-    let config = RuntimeConfig {
-        kind: Some("tmux".into()),
-        tmux: Some(TmuxConfig {
-            mode: Some(TmuxMode::Attach),
-            ..tmux_cfg
-        }),
-        ..Default::default()
-    };
-    let (rt, manager, _) = open(
-        config.clone(),
-        dir.path(),
-        crate::xllm::FilesystemPolicy::Workspace,
-    )
-    .await;
-    assert_eq!(manager.runtime_info().unwrap().timezone, "HST-1000");
-    let out = manager
-        .exec(
-            request(manager.workdir(), "date +%Z%z; printf '%s' \"$PATH\""),
-            &context(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(out.stdout, format!("HST-1000\n{path}"));
-    CommandOutput::tmux(
-        &socket,
-        &["set-environment", "-t", "=environment", "TZ", "JST-9"],
-    );
-    assert_eq!(rt.info().await.unwrap().timezone, "JST+0900");
-    let mut override_config = config;
-    override_config.env.insert("TZ".into(), "UTC0".into());
-    let (rt, manager, _) = open(
-        override_config,
-        dir.path(),
-        crate::xllm::FilesystemPolicy::Workspace,
-    )
-    .await;
-    assert_eq!(rt.info().await.unwrap().timezone, "UTC+0000");
-    let out = manager
-        .exec(request(manager.workdir(), "date +%Z%z"), &context())
-        .await
-        .unwrap();
-    assert_eq!(out.stdout, "UTC+0000\n");
-    CommandOutput::tmux(&socket, &["kill-server"]);
 }
 
 fn ssh_config() -> RuntimeConfig {
@@ -887,4 +594,95 @@ async fn ssh_saved_target_rejects_alias_redirect_with_same_id() {
         .await
         .unwrap();
     assert_eq!(out.stdout, "pinned");
+}
+
+#[tokio::test]
+async fn native_runtime_files_stream_guard_and_commit() {
+    use files::{LocalFileBackend, PathType, RuntimeFiles, WholeWriteMode, WriteChunk};
+    use buckyos_api::{executor_content_hash, ExecutorErrorCode};
+    let dir = tempfile::tempdir().unwrap();
+    let files = LocalFileBackend;
+    let p = |name: &str| dir.path().join(name).to_string_lossy().to_string();
+    let chunk = |mode, expected_size, expected_hash, data| WriteChunk { mode, expected_size, expected_hash, data };
+
+    let first = files.write_chunk(&p("sub/a.part"), chunk(WholeWriteMode::CreateNew, None, None, b"hello ")).await.unwrap();
+    assert!(first.created);
+    assert_eq!(first.hash.as_deref(), Some(executor_content_hash(b"hello ").as_str()));
+    let second = files.write_chunk(&p("sub/a.part"), chunk(WholeWriteMode::Append, Some(6), None, b"world")).await.unwrap();
+    assert_eq!((second.size, second.hash.is_none(), second.created), (11, true, false));
+    let stale = files.write_chunk(&p("sub/a.part"), chunk(WholeWriteMode::Append, Some(6), None, b"world")).await;
+    assert_eq!(stale.unwrap_err().code, ExecutorErrorCode::Conflict);
+    let prefix = executor_content_hash(b"hello world");
+    let hashed = files
+        .write_chunk(&p("sub/a.part"), chunk(WholeWriteMode::Append, None, Some(&prefix), b"!"))
+        .await
+        .unwrap();
+    assert_eq!(hashed.hash.as_deref(), Some(executor_content_hash(b"hello world!").as_str()));
+    let missing = files.write_chunk(&p("none"), chunk(WholeWriteMode::Append, Some(0), None, b"x")).await;
+    assert_eq!(missing.unwrap_err().code, ExecutorErrorCode::Conflict);
+    assert!(!dir.path().join("none").exists());
+
+    let stat = files.stat(&p("sub/a.part"), true).await.unwrap();
+    assert_eq!((stat.path_type, stat.size), (PathType::File, 12));
+    assert_eq!(stat.hash.as_deref(), Some(executor_content_hash(b"hello world!").as_str()));
+    assert_eq!(files.stat(&p("sub"), true).await.unwrap().path_type, PathType::Directory);
+    assert_eq!(files.stat(&p("nothing"), false).await.unwrap().path_type, PathType::Missing);
+    let range = files.read_range(&p("sub/a.part"), 6, 100).await.unwrap();
+    assert_eq!((range.data.as_slice(), range.file_size), (&b"world!"[..], 12));
+    let too_big = files.read_range(&p("sub/a.part"), 0, files.limits().max_chunk_bytes + 1).await;
+    assert_eq!(too_big.unwrap_err().code, ExecutorErrorCode::InvalidArgument);
+
+    files.rename(&p("sub/a.part"), &p("sub/a"), false).await.unwrap();
+    assert_eq!(std::fs::read(dir.path().join("sub/a")).unwrap(), b"hello world!");
+    files.write_chunk(&p("b"), chunk(WholeWriteMode::Replace, None, None, b"b")).await.unwrap();
+    assert_eq!(files.rename(&p("b"), &p("sub/a"), false).await.unwrap_err().code, ExecutorErrorCode::Conflict);
+    files.rename(&p("b"), &p("sub/a"), true).await.unwrap();
+    assert_eq!(std::fs::read(dir.path().join("sub/a")).unwrap(), b"b");
+    assert_eq!(files.rename(&p("b"), &p("c"), false).await.unwrap_err().code, ExecutorErrorCode::NotFound);
+    assert_eq!(files.rename(&p("sub"), &p("d"), false).await.unwrap_err().code, ExecutorErrorCode::InvalidArgument);
+    assert!(files.remove(&p("sub/a")).await.unwrap());
+    assert!(!files.remove(&p("sub/a")).await.unwrap());
+    assert_eq!(files.remove(&p("sub")).await.unwrap_err().code, ExecutorErrorCode::InvalidArgument);
+    assert_eq!(files.stat("relative", false).await.unwrap_err().code, ExecutorErrorCode::InvalidArgument);
+}
+
+#[tokio::test]
+async fn runtime_info_carries_platform_shell_kind_and_declared_baseline() {
+    let probe = |os: &str, shell: &str| RuntimeInfo {
+        os: os.into(),
+        shell: shell.into(),
+        ..Default::default()
+    };
+    let mac = probe("darwin", "/bin/zsh").with_declared(None);
+    assert_eq!((mac.platform.as_str(), mac.shell_kind.as_str(), mac.baseline.as_str()), ("macos", "zsh", ""));
+    let win = probe("windows", r"C:\Program Files\PowerShell\7\pwsh.exe").with_declared(Some(RuntimeBaseline::Extended));
+    assert_eq!((win.platform.as_str(), win.shell_kind.as_str(), win.baseline.as_str()), ("windows", "pwsh", "extended"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config: RuntimeConfig = serde_json::from_value(json!({"baseline": "standard"})).unwrap();
+    config.workdir = Some(dir.path().display().to_string());
+    assert!(serde_json::from_value::<RuntimeConfig>(json!({"baseline": "full"})).is_err());
+    let mut merged = RuntimeConfig::default();
+    merged.merge_over(&config);
+    assert_eq!(merged.baseline, Some(RuntimeBaseline::Standard));
+    let rt = RuntimeRegistry::from_config(&config).unwrap();
+    let info = rt.info().await.unwrap();
+    assert_eq!(info.baseline, "standard");
+    assert_eq!(info.platform, std::env::consts::OS);
+    assert_eq!(info.template_values()["baseline"], "standard");
+    let hosted = crate::xllm::XllmTask::prepare_hosted(
+        dir.path(),
+        &json!({"runtime": rt.config(), "tools": {"enabled": true}}),
+        &dir.path().join("session_config.json").display().to_string(),
+        "SHELL_KIND={{runtime.shell_kind}}",
+        &crate::xllm::XllmDeps::default().with_runtime(rt.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(hosted.prompt.system_prompt.contains(&format!("SHELL_KIND={}", info.shell_kind)));
+    let contexts = |info: &RuntimeInfo| {
+        crate::xllm::build_contexts_system_text(&crate::xllm::TemplateEnv::for_new_run(info), &BTreeMap::new()).unwrap()
+    };
+    assert!(contexts(&info).contains("Environment baseline: standard"));
+    assert!(!contexts(&RuntimeInfo { os: "linux".into(), ..Default::default() }).contains("Environment baseline"));
 }

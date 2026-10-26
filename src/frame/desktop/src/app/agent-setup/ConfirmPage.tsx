@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useI18n } from '../../i18n/provider'
 import type { CurrentAccount } from '../../api/account'
-import type { AgentTemplate, UserTunnelBinding } from '../../api/user_mgr'
+import type { AgentRuntimeOffer, AgentTemplate, UserTunnelBinding } from '../../api/user_mgr'
 import { draftDisplayName, type AgentSetupDraft } from './model'
 import { AgentAvatar, Section, StatusPill, SummaryRows } from './ui'
 
@@ -15,6 +15,8 @@ export function ConfirmPage({
   template,
   telegram,
   avatarFallback,
+  host,
+  onHost,
 }: {
   draft: AgentSetupDraft
   bio: string
@@ -23,9 +25,14 @@ export function ConfirmPage({
   template: AgentTemplate | null
   telegram: UserTunnelBinding | null
   avatarFallback?: string
+  host: AgentRuntimeOffer | null
+  onHost: boolean
 }) {
   const { t } = useI18n()
   const [roleOpen, setRoleOpen] = useState(false)
+  const hostRow = onHost && host
+    ? t('agentSetup.confirm.hostDesktop', undefined, { name: host.name || host.node_id || 'host', computer: t(`agentSetup.confirm.computer.${host.computer_max}`) })
+    : t('agentSetup.confirm.hostContainer')
   const yes = t('agentSetup.yes')
   const no = t('agentSetup.no')
   const role = draft.roleSupplement.trim()
@@ -84,13 +91,23 @@ export function ConfirmPage({
         />
       </Section>
 
-      <Section title={t('agentSetup.confirm.runtime')}>
+      <Section title={t('agentSetup.social.title')} testId="agent-setup-confirm-social">
+        <SummaryRows
+          rows={[
+            [t('agentSetup.social.homestation'), draft.homestation ? yes : no],
+            [t('agentSetup.social.autoShare'), draft.homestation && draft.autoShareResults ? yes : no],
+          ]}
+        />
+      </Section>
+
+      <Section title={t('agentSetup.confirm.runtime')} testId="agent-setup-confirm-runtime">
         <SummaryRows
           rows={[
             [t('agentSetup.loader.label'), 'OpenDAN'],
             [t('agentSetup.template.label'), template ? `${template.show_name || template.name} · ${t(template.source === 'installed' ? 'agentSetup.template.sourceInstalled' : 'agentSetup.template.sourceBundled')}` : '-'],
             [t('agentSetup.confirm.version'), template?.version ?? '-'],
             [t('agentSetup.template.autoUpdate'), draft.templateAutoUpdate ? yes : no],
+            [t('agentSetup.confirm.host'), hostRow],
           ]}
         />
       </Section>

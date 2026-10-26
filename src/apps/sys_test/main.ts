@@ -20,16 +20,9 @@
  */
 import { serveDir } from "jsr:@std/http/file-server";
 import { runXllmIdentitySelftest } from "./xllm_selftest.ts";
+import { handleSupportRoute, type SupportContext } from "./support_group.ts";
 
 type NodeSdkModule = typeof import("@sys-test/websdk-node-types");
-type NdmModule = NodeSdkModule["ndm"];
-type QueryObjectByIdResponse = Awaited<
-  ReturnType<NdmModule["queryObjectById"]>
->;
-type QueryChunkStateResponse = Awaited<
-  ReturnType<NdmModule["queryChunkState"]>
->;
-
 type AppInstanceIdentity = {
   appId: string;
   ownerUserId: string;
@@ -54,16 +47,6 @@ type GroupId =
   | "service_clients"
   | "sdk_utilities"
   | "ndm_proxy";
-
-type ContentAvailabilityState =
-  | {
-    kind: "chunk";
-    state: QueryChunkStateResponse | { state: "error"; error: string };
-  }
-  | {
-    kind: "object";
-    state: QueryObjectByIdResponse | { state: "error"; error: string };
-  };
 
 type BootstrapState =
   | { kind: "ready"; identity: AppInstanceIdentity; sdk: NodeSdkModule }
@@ -655,11 +638,11 @@ function buildGroupRunners(
         return { definitions: definitions.length };
       }),
       await runSelftestCase("AiccClient.queryQuota", async () => {
-        const { quota } = await sdk.buckyos.getAiccClient().queryQuota({});
-        if (typeof quota.state !== "string" || quota.state.length === 0) {
-          throw new Error("quota.query returned an invalid state");
+        const quota = await sdk.buckyos.getAiccClient().queryQuota({});
+        if (typeof quota.user_id !== "string" || !Array.isArray(quota.rules)) {
+          throw new Error("quota.query returned no user or rule list");
         }
-        return { quota };
+        return { user_id: quota.user_id, rules: quota.rules.length };
       }),
       await runSelftestCase(
         "MsgCenterClient rejects an ungranted owner inbox read",
@@ -758,21 +741,51 @@ function buildGroupRunners(
   const ndmProxyGroup = async (): Promise<SelftestCaseResult[]> => {
     return [
       await runSelftestCase(
-        "ndm_proxy queries a missing object through the node gateway",
+        "ndm_proxy writes, registers and reads back its own object",
+        async () => {
+          const data = new TextEncoder().encode(`systest ndm_proxy ${Date.now()}`);
+          const chunkId = sdk.ndn.ChunkId.fromMix256Result(
+            data.length,
+            sdk.ndn.sha256Bytes(data),
+          ).toString();
+          await sdk.ndm_proxy.putChunk(chunkId, data);
+          const [objId, objData] = new sdk.ndn.FileObject(
+            "systest-ndm-proxy.txt",
+            data.length,
+            chunkId,
+          ).genObjId();
+          await sdk.ndm_proxy.putObject({ obj_id: objId.toString(), obj_data: objData });
+          const result = await sdk.ndm_proxy.queryObjectById({ obj_id: objId.toString() });
+          if (result.state !== "object") {
+            throw new Error(`expected the registered object, got ${result.state}`);
+          }
+          return { objId: objId.toString(), state: result.state };
+        },
+      ),
+      await runSelftestCase(
+        "ndm_proxy denies reading an object this app does not hold",
         async () => {
           const objId = new sdk.ndn.ObjId(
             sdk.ndn.OBJ_TYPE_FILE,
             crypto.getRandomValues(new Uint8Array(32)),
           ).toString();
-          const result = await sdk.ndm_proxy.queryObjectById({ obj_id: objId });
-          if (result.state !== "not_exist") {
-            throw new Error(`expected a missing object, got ${result.state}`);
+          try {
+            await sdk.ndm_proxy.queryObjectById({ obj_id: objId });
+          } catch (error) {
+            if (
+              error instanceof sdk.ndm_proxy.NdmProxyApiError &&
+              error.status === 403 &&
+              error.errorCode === "permission_denied"
+            ) {
+              return { access: "denied", status: error.status };
+            }
+            throw error;
           }
-          return { objId, state: result.state };
+          throw new Error("app read an object it never uploaded or registered");
         },
       ),
       await runSelftestCase(
-        "ndm_proxy rejects restricted outboxCount on the app gateway",
+        "ndm_proxy rejects restricted outboxCount for apps",
         async () => {
           try {
             await sdk.ndm_proxy.outboxCount();
@@ -780,9 +793,7 @@ function buildGroupRunners(
             if (
               error instanceof sdk.ndm_proxy.NdmProxyApiError &&
               error.status === 403 &&
-              error.message.includes(
-                "restricted operation 'outbox_count' is disabled on this gateway",
-              )
+              error.errorCode === "permission_denied"
             ) {
               return { access: "denied", status: error.status };
             }
@@ -820,6 +831,21 @@ const staticRoot = await resolveStaticRoot();
 let groupRunners = bootstrapState.kind === "ready"
   ? buildGroupRunners(bootstrapState)
   : null;
+
+// The customer-service example (support_group.ts) needs the App service session
+// and the owner identity; both come from the bootstrap state.
+function supportContext(): SupportContext | null {
+  if (bootstrapState.kind !== "ready") return null;
+  const { sdk, identity } = bootstrapState;
+  return {
+    ownerUserId: identity.ownerUserId,
+    appInstanceId: `${identity.appId}@${identity.ownerUserId}`,
+    zoneHost: sdk.buckyos.getZoneHostName() ?? "",
+    serviceClient: (service) => sdk.buckyos.getServiceRpcClient(service),
+    clientWithToken: (service, token) =>
+      new sdk.buckyos.kRPCClient(sdk.buckyos.getZoneServiceURL(service), token),
+  };
+}
 
 let bootstrapRetryAttempt = 0;
 
@@ -921,42 +947,6 @@ function summarizeHeaders(req: Request): Record<string, string> {
   return out;
 }
 
-function isChunkListContentId(contentId: string): boolean {
-  return contentId.startsWith("clist:") || contentId.startsWith("chunklist:");
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) &&
-    value.every((item) => typeof item === "string" && item.length > 0);
-}
-
-function extractChunkIdsFromChunkListObjectData(
-  objData: string,
-): string[] | null {
-  try {
-    const parsed = JSON.parse(objData) as unknown;
-    return isStringArray(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-async function queryContentAvailabilityState(
-  ndm: NdmModule,
-  contentId: string,
-): Promise<ContentAvailabilityState> {
-  if (
-    contentId.startsWith("chunk:") || contentId.startsWith("mix256:") ||
-    contentId.startsWith("sha256:")
-  ) {
-    const state = await ndm.queryChunkState({ chunk_id: contentId });
-    return { kind: "chunk", state };
-  }
-
-  const state = await ndm.queryObjectById({ obj_id: contentId });
-  return { kind: "object", state };
-}
-
 let requestSeq = 0;
 
 Deno.serve({
@@ -979,9 +969,9 @@ Deno.serve({
     console.log(`  POST ${sdkRoutePrefix}/selftest/service_clients`);
     console.log(`  POST ${sdkRoutePrefix}/selftest/sdk_utilities`);
     console.log(`  POST ${sdkRoutePrefix}/selftest/ndm_proxy`);
-    console.log(
-      `  POST ${sdkRoutePrefix}/ndm_query             (query FileObjId status)`,
-    );
+    console.log(`  GET  /support/panel                           (customer-service example panel)`);
+    console.log(`  GET  ${sdkRoutePrefix}/support/summary`);
+    console.log(`  POST ${sdkRoutePrefix}/support/customer_link`);
     console.log(
       `  GET  *                                       (static dist/)`,
     );
@@ -1020,6 +1010,9 @@ Deno.serve({
   };
 
   try {
+    const support = await handleSupportRoute(req, url, sdkRoutePrefix, supportContext());
+    if (support) return tap(url.pathname, support);
+
     if (req.method === "GET" && url.pathname === `${sdkRoutePrefix}/healthz`) {
       return tap(
         "healthz",
@@ -1047,7 +1040,7 @@ Deno.serve({
           appId: identity.appId,
           appInstanceId: sdk.buckyos.getAppInstanceId(),
           ownerUserId: identity.ownerUserId,
-          zoneHost: sdk.buckyos.getZoneHostName(),
+          zoneHost: sdk.buckyos.getZoneHostName() ?? "",
           hostGateway: getEnv("BUCKYOS_HOST_GATEWAY"),
           expectedTokenEnvKey: "BUCKYOS_APP_TOKEN",
           serviceUrls: {
@@ -1072,309 +1065,6 @@ Deno.serve({
           ),
         }),
       );
-    }
-
-    // NDM query endpoint: receives FileObjId + FileObject + chunkList + qcid from the
-    // frontend after upload, then uses ndm store APIs to:
-    //   1. putObject — store chunklist/FileObject metadata so NDM knows about it
-    //   2. queryObjectById — query the object state
-    //   3. isObjectStored/queryChunkState — query content + qcid state
-    // The qcid is stored alongside the FileObject so that future uploads
-    // of the same file content can be resolved instantly (instant upload).
-    if (
-      req.method === "POST" && url.pathname === `${sdkRoutePrefix}/ndm_query`
-    ) {
-      if (bootstrapState.kind !== "ready") {
-        return tap("ndm_query[unavail]", appServiceUnavailableResponse());
-      }
-      try {
-        const body = await readJsonBody(req);
-        const fileObjId = body.fileObjId as string | undefined;
-        const fileObject = body.fileObject as
-          | Record<string, unknown>
-          | undefined;
-        const qcid = body.qcid as string | undefined;
-        const chunkList = body.chunkList;
-        const preUploadState = body.preUploadState as
-          | Record<string, unknown>
-          | undefined;
-
-        if (typeof fileObjId !== "string" || !fileObjId) {
-          return tap(
-            "ndm_query[bad-req]",
-            jsonResponse({ ok: false, error: "fileObjId is required" }, 400),
-          );
-        }
-
-        console.log(
-          `[sys_test] ndm_query: fileObjId=${fileObjId}, qcid=${qcid ?? "N/A"}`,
-        );
-
-        const { ndm } = bootstrapState.sdk;
-        const contentId = typeof fileObject?.content === "string" &&
-            fileObject.content.length > 0
-          ? fileObject.content
-          : null;
-        const isChunkListContent = contentId
-          ? isChunkListContentId(contentId)
-          : false;
-
-        let putChunkListResult: { ok: boolean; error?: string } | null = null;
-        if (contentId && isChunkListContent) {
-          if (!isStringArray(chunkList)) {
-            putChunkListResult = {
-              ok: false,
-              error:
-                "chunkList is required when fileObject.content is a chunklist id",
-            };
-            console.warn(
-              `[sys_test] ndm_query: missing chunkList for ${contentId}`,
-            );
-          } else {
-            try {
-              await ndm.putObject({
-                obj_id: contentId,
-                obj_data: JSON.stringify(chunkList),
-              });
-              console.log(
-                `[sys_test] ndm_query: putObject OK for chunklist ${contentId}`,
-              );
-              putChunkListResult = { ok: true };
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              console.warn(
-                `[sys_test] ndm_query: put chunklist failed: ${msg}`,
-              );
-              putChunkListResult = { ok: false, error: msg };
-            }
-          }
-        }
-
-        let putObjectResult: { ok: boolean; error?: string } = { ok: true };
-        if (fileObject) {
-          const objDataToStore = qcid
-            ? { ...fileObject, _qcid: qcid }
-            : fileObject;
-          try {
-            await ndm.putObject({
-              obj_id: fileObjId,
-              obj_data: JSON.stringify(objDataToStore),
-            });
-            console.log(`[sys_test] ndm_query: putObject OK for ${fileObjId}`);
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.warn(`[sys_test] ndm_query: putObject failed: ${msg}`);
-            putObjectResult = { ok: false, error: msg };
-          }
-        }
-
-        let objectState: QueryObjectByIdResponse | {
-          state: "error";
-          error: string;
-        };
-        try {
-          objectState = await ndm.queryObjectById({ obj_id: fileObjId });
-          console.log(
-            `[sys_test] ndm_query: queryObjectById state=${objectState.state}`,
-          );
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          console.warn(`[sys_test] ndm_query: queryObjectById failed: ${msg}`);
-          objectState = { state: "error", error: msg };
-        }
-
-        let contentState:
-          | { contentId: string; state: ContentAvailabilityState }
-          | null = null;
-        if (contentId) {
-          try {
-            const availabilityState = await queryContentAvailabilityState(
-              ndm,
-              contentId,
-            );
-            console.log(
-              `[sys_test] ndm_query: content availability for ${contentId} queried`,
-            );
-            contentState = { contentId, state: availabilityState };
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.warn(
-              `[sys_test] ndm_query: content availability query failed for ${contentId}: ${msg}`,
-            );
-            contentState = {
-              contentId,
-              state: { kind: "object", state: { state: "error", error: msg } },
-            };
-          }
-        }
-
-        let contentStoredState:
-          | {
-            contentId: string;
-            state: { stored: boolean } | { state: "error"; error: string };
-          }
-          | null = null;
-        if (contentId) {
-          try {
-            const storedState = await ndm.isObjectStored({ obj_id: contentId });
-            console.log(
-              `[sys_test] ndm_query: isObjectStored(${contentId}) = ${storedState.stored}`,
-            );
-            contentStoredState = { contentId, state: storedState };
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.warn(
-              `[sys_test] ndm_query: isObjectStored(${contentId}) failed: ${msg}`,
-            );
-            contentStoredState = {
-              contentId,
-              state: { state: "error", error: msg },
-            };
-          }
-        }
-
-        let contentChunkStates: Array<{
-          chunkId: string;
-          state: QueryChunkStateResponse | { state: "error"; error: string };
-        }> = [];
-        if (contentId && isChunkListContent) {
-          const chunkIds = isStringArray(chunkList)
-            ? chunkList
-            : contentState?.state.kind === "object" &&
-                contentState.state.state.state === "object"
-            ? extractChunkIdsFromChunkListObjectData(
-              contentState.state.state.obj_data,
-            ) ?? []
-            : [];
-
-          for (const chunkId of chunkIds) {
-            try {
-              const chunkState = await ndm.queryChunkState({
-                chunk_id: chunkId,
-              });
-              console.log(
-                `[sys_test] ndm_query: queryChunkState(${chunkId}) = ${chunkState.state}`,
-              );
-              contentChunkStates.push({ chunkId, state: chunkState });
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              console.warn(
-                `[sys_test] ndm_query: queryChunkState(${chunkId}) failed: ${msg}`,
-              );
-              contentChunkStates.push({
-                chunkId,
-                state: { state: "error", error: msg },
-              });
-            }
-          }
-        }
-
-        let addSameAsResult:
-          | { ok: boolean; skipped?: boolean; error?: string }
-          | null = null;
-        if (qcid && contentId && isChunkListContent) {
-          const fileSize = typeof fileObject?.size === "number" &&
-              Number.isFinite(fileObject.size)
-            ? fileObject.size
-            : null;
-          const contentFullyStored = contentStoredState?.state &&
-            "stored" in contentStoredState.state &&
-            contentStoredState.state.stored === true;
-
-          if (fileSize === null) {
-            addSameAsResult = {
-              ok: false,
-              error:
-                "fileObject.size is required when adding qcid same_as mapping",
-            };
-          } else if (!contentFullyStored) {
-            addSameAsResult = {
-              ok: false,
-              error:
-                `skip addChunkBySameAs because content ${contentId} is not fully stored yet`,
-            };
-            console.warn(
-              `[sys_test] ndm_query: skip addChunkBySameAs for ${qcid} because ${contentId} is not fully stored`,
-            );
-          } else {
-            try {
-              await ndm.addChunkBySameAs({
-                big_chunk_id: qcid,
-                chunk_list_id: contentId,
-                big_chunk_size: fileSize,
-              });
-              console.log(
-                `[sys_test] ndm_query: addChunkBySameAs OK for ${qcid} -> ${contentId}`,
-              );
-              addSameAsResult = { ok: true };
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              console.warn(
-                `[sys_test] ndm_query: addChunkBySameAs failed: ${msg}`,
-              );
-              addSameAsResult = { ok: false, error: msg };
-            }
-          }
-        } else if (qcid) {
-          addSameAsResult = { ok: true, skipped: true };
-        }
-
-        let qcidState:
-          | {
-            chunkId: string;
-            state: QueryChunkStateResponse | { state: "error"; error: string };
-          }
-          | null = null;
-        if (qcid) {
-          try {
-            const chunkState = await ndm.queryChunkState({
-              chunk_id: qcid,
-            });
-            console.log(
-              `[sys_test] ndm_query: queryChunkState(${qcid}) = ${chunkState.state}`,
-            );
-            qcidState = { chunkId: qcid, state: chunkState };
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.warn(
-              `[sys_test] ndm_query: queryChunkState(${qcid}) failed: ${msg}`,
-            );
-            qcidState = {
-              chunkId: qcid,
-              state: { state: "error", error: msg },
-            };
-          }
-        }
-
-        return tap(
-          "ndm_query",
-          jsonResponse({
-            ok: true,
-            fileObjId,
-            qcid: qcid ?? null,
-            preUploadState: preUploadState ?? null,
-            putChunkList: putChunkListResult,
-            putObject: putObjectResult,
-            addSameAs: addSameAsResult,
-            objectState,
-            contentState,
-            contentStoredState,
-            contentChunkStates,
-            qcidState,
-          }),
-        );
-      } catch (error) {
-        return tap(
-          "ndm_query[error]",
-          jsonResponse(
-            {
-              ok: false,
-              error: error instanceof Error ? error.message : String(error),
-            },
-            500,
-          ),
-        );
-      }
     }
 
     // Per-group selftest endpoint, e.g.

@@ -72,7 +72,7 @@ const DRIVE_POLL: Duration = Duration::from_secs(2);
 const DRIVE_SWEEP: Duration = Duration::from_secs(30);
 const MAX_DRIVE_STEPS: usize = 64;
 
-fn reason(code: &str, message: impl Display) -> RPCErrors {
+pub(crate) fn reason(code: &str, message: impl Display) -> RPCErrors {
     RPCErrors::ReasonError(format!("{code}: {message}"))
 }
 
@@ -151,7 +151,7 @@ async fn get_json<T: DeserializeOwned>(
     }
 }
 
-async fn get_value<T: DeserializeOwned>(kv: &dyn AgentKv, key: &str) -> Option<T> {
+pub(crate) async fn get_value<T: DeserializeOwned>(kv: &dyn AgentKv, key: &str) -> Option<T> {
     match kv.get(key).await {
         Ok(Some((raw, _))) => serde_json::from_str(&raw).ok(),
         _ => None,
@@ -219,7 +219,7 @@ async fn commit_record(
 // names
 // ---------------------------------------------------------------------------
 
-fn is_dns_label(value: &str) -> bool {
+pub(crate) fn is_dns_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
         && !value.starts_with('-')
@@ -946,6 +946,8 @@ pub(crate) struct AgentCreateRequest {
     pub name: String,
     pub profile: AgentProfile,
     pub permission_mode: AgentPermissionMode,
+    pub runtimes: Option<Value>,
+    pub default_runtime_id: Option<Value>,
     pub role_supplement: String,
     pub allow_group: bool,
     pub allow_other_users: bool,
@@ -953,6 +955,8 @@ pub(crate) struct AgentCreateRequest {
     pub template_auto_update: bool,
     pub desktop_entry: Option<String>,
     pub bot_token: Option<String>,
+    pub homestation: bool,
+    pub auto_share_results: bool,
 }
 
 impl AgentCreateRequest {
@@ -1000,6 +1004,8 @@ impl AgentCreateRequest {
                     )
                 })?,
             },
+            runtimes: params.get("runtimes").cloned(),
+            default_runtime_id: params.get("default_runtime_id").cloned(),
             role_supplement: params
                 .get("role_supplement")
                 .and_then(Value::as_str)
@@ -1012,11 +1018,13 @@ impl AgentCreateRequest {
             template_auto_update: flag("template_auto_update", true)?,
             desktop_entry: optional_text(params.get("desktop_entry")),
             bot_token,
+            homestation: flag("homestation", true)?,
+            auto_share_results: flag("auto_share_results", true)?,
         })
     }
 
     pub(crate) fn fingerprint(&self) -> String {
-        let material = json!({
+        let mut material = json!({
             "name": self.name,
             "profile": self.profile,
             "permission_mode": self.permission_mode,
@@ -1027,10 +1035,45 @@ impl AgentCreateRequest {
             "template_auto_update": self.template_auto_update,
             "desktop_entry": self.desktop_entry,
             "bot_token": self.bot_token,
+            "homestation": self.homestation,
+            "auto_share_results": self.auto_share_results,
         });
+        if let Some(runtimes) = &self.runtimes {
+            material["runtimes"] = runtimes.clone();
+        }
+        if let Some(default_runtime_id) = &self.default_runtime_id {
+            material["default_runtime_id"] = default_runtime_id.clone();
+        }
         build_named_object_by_json("agentreq", &material)
             .0
             .to_string()
+    }
+
+    async fn settings_with_runtimes(
+        &self,
+        kv: &dyn AgentKv,
+        owner: &str,
+    ) -> Result<AgentSettings, RPCErrors> {
+        let mut settings = self.settings();
+        crate::agent_runtimes::apply_create_defaults(kv, owner, &mut settings).await;
+        crate::agent_runtimes::apply_update(
+            kv,
+            owner,
+            &mut settings,
+            self.runtimes.as_ref(),
+            self.default_runtime_id.as_ref(),
+        )
+        .await?;
+        // An Agent that runs in its container needs somewhere to run it.
+        if settings.effective_default_runtime() == buckyos_api::CONTAINER_RUNTIME_ID
+            && !crate::agent_runtimes::container_available(kv).await
+        {
+            return Err(reason(
+                "container_unavailable",
+                "no node of this zone runs containers: the Agent has to run on the host",
+            ));
+        }
+        Ok(settings)
     }
 
     fn settings(&self) -> AgentSettings {
@@ -1039,6 +1082,8 @@ impl AgentCreateRequest {
             role_supplement: self.role_supplement.clone(),
             template_auto_update: self.template_auto_update,
             desktop_entry: self.desktop_entry.clone(),
+            homestation: self.homestation,
+            auto_share_results: self.auto_share_results,
             msg_tunnels: self
                 .bot_token
                 .iter()
@@ -1843,7 +1888,9 @@ fn internal_principal(owner: &str) -> RpcAuthPrincipal {
         owner_did: String::new(),
         is_user_session: false,
         is_control_panel_session: true,
+        principal_kind: buckyos_api::TokenPrincipalKind::System,
         agent_permission_mode: None,
+        session: crate::PrincipalSession::default(),
     }
 }
 
@@ -2031,7 +2078,7 @@ pub(crate) async fn register_agent_runtime_authorities() {
 // ---------------------------------------------------------------------------
 
 fn settings_view(settings: &AgentSettings) -> Value {
-    json!({
+    let mut view = json!({
         "enabled": settings.enabled,
         "auto_start": settings.auto_start,
         "allow_other_users": settings.allow_other_users,
@@ -2039,11 +2086,17 @@ fn settings_view(settings: &AgentSettings) -> Value {
         "role_supplement": settings.role_supplement,
         "template_auto_update": settings.template_auto_update,
         "desktop_entry": settings.desktop_entry,
+        "homestation": settings.homestation,
+        "auto_share_results": settings.auto_share_results,
         "msg_tunnels": settings.msg_tunnels.iter().map(|tunnel| json!({
             "platform": tunnel.platform,
             "bot_account_id": tunnel.bot_account_id,
         })).collect::<Vec<_>>(),
-    })
+    });
+    view.as_object_mut()
+        .unwrap()
+        .extend(crate::agent_runtimes::settings_view(settings));
+    view
 }
 
 fn runtime_view(spec: &AppServiceSpec) -> Value {
@@ -2090,16 +2143,15 @@ impl ControlPanelServer {
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<&RpcAuthPrincipal, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
-        match principal.user_type {
-            UserType::Root | UserType::Admin | UserType::User => Ok(principal),
-            UserType::Limited | UserType::Guest => {
-                Err(reason("limited_user", "limited users cannot create Agents"))
-            }
+        if principal.user_type.can_create_agent() {
+            Ok(principal)
+        } else {
+            Err(reason("limited_user", "limited users cannot create Agents"))
         }
     }
 
     fn principal_admin(principal: &RpcAuthPrincipal) -> bool {
-        matches!(principal.user_type, UserType::Admin | UserType::Root)
+        principal.user_type.is_privileged()
     }
 
     fn param_agent_id(req: &RPCRequest) -> Result<AgentId, RPCErrors> {
@@ -2788,11 +2840,12 @@ impl ControlPanelServer {
             template.built_from(),
             buckyos_get_unix_timestamp(),
         );
+        let settings = request.settings_with_runtimes(&kv, &owner).await?;
         let actions = reservation_actions(
             &owner,
             &record,
             &private_key,
-            &request.settings(),
+            &settings,
             &request.profile,
         )?;
         if let Err(error) = kv.exec_tx(actions, None).await {
@@ -2942,23 +2995,88 @@ impl ControlPanelServer {
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
         let agent_id = Self::param_agent_id(&req)?;
-        let allow_group = Self::param_bool(&req, "allow_group").ok_or_else(|| {
-            RPCErrors::ParseRequestError("allow_group must be a boolean".to_string())
-        })?;
+        let flag = |key: &str| -> Result<Option<bool>, RPCErrors> {
+            match req.params.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(_) => Self::param_bool(&req, key).map(Some).ok_or_else(|| {
+                    RPCErrors::ParseRequestError(format!("{key} must be a boolean"))
+                }),
+            }
+        };
+        let allow_group = flag("allow_group")?;
+        let homestation = flag("homestation")?;
+        let auto_share_results = flag("auto_share_results")?;
+        let runtimes = req.params.get("runtimes");
+        let default_runtime_id = req.params.get("default_runtime_id");
+        if allow_group.is_none()
+            && homestation.is_none()
+            && auto_share_results.is_none()
+            && runtimes.is_none()
+            && default_runtime_id.is_none()
+        {
+            return Err(RPCErrors::ParseRequestError(
+                "agent.update changes allow_group, homestation, auto_share_results, runtimes or default_runtime_id".to_string(),
+            ));
+        }
         let kv = ZoneKv::connect().await?;
         let (owner, record, _) = Self::locate_agent(&kv, principal, &agent_id, false).await?;
         let key = agent_settings_key(&owner, &agent_id);
         let mut settings = get_value::<AgentSettings>(&kv, &key)
             .await
             .unwrap_or_default();
-        settings.allow_group = allow_group;
+        if let Some(allow_group) = allow_group {
+            settings.allow_group = allow_group;
+        }
+        if let Some(homestation) = homestation {
+            settings.homestation = homestation;
+        }
+        if let Some(auto_share_results) = auto_share_results {
+            settings.auto_share_results = auto_share_results;
+        }
+        crate::agent_runtimes::apply_update(&kv, &owner, &mut settings, runtimes, default_runtime_id).await?;
         kv.exec_tx(
             HashMap::from([(key, KVAction::Update(to_json(&settings)?))]),
             None,
         )
         .await?;
+        if runtimes.is_some() {
+            if let Err(error) = refresh_rbac_by_scheduler("agent runtime settings changed").await {
+                warn!("scheduler refresh after runtime change of {agent_id} failed: {error}");
+            }
+        }
         Ok(RPCResponse::new(
             RPCResult::Success(self.agent_entry(&kv, &owner, &record).await?),
+            req.seq,
+        ))
+    }
+
+    // ── agent.runtime_directory ──────────────────────────────────────────
+
+    /// The nodes the caller's Agents may run on, and one Agent's choice.
+    pub(crate) async fn handle_agent_runtime_directory(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let kv = ZoneKv::connect().await?;
+        let (owner, settings) = match req.params.get("agent_id").filter(|v| !v.is_null()) {
+            Some(_) => {
+                let agent_id = Self::param_agent_id(&req)?;
+                let (owner, _, _) = Self::locate_agent(&kv, principal, &agent_id, false).await?;
+                let settings = get_value::<AgentSettings>(&kv, &agent_settings_key(&owner, &agent_id)).await;
+                (owner, settings)
+            }
+            None => (principal.owner_user_id.clone(), None),
+        };
+        let offers = crate::agent_runtimes::runtime_directory(&kv, &owner).await?;
+        let container_available = crate::agent_runtimes::container_available(&kv).await;
+        Ok(RPCResponse::new(
+            RPCResult::Success(crate::agent_runtimes::directory_view(
+                &offers,
+                settings.as_ref(),
+                container_available,
+            )),
             req.seq,
         ))
     }
@@ -3727,6 +3845,7 @@ mod tests {
         assert_eq!(request.permission_mode, AgentPermissionMode::ReadWrite);
         let settings = request.settings();
         assert!(settings.allow_group);
+        assert!(settings.homestation && settings.auto_share_results);
         assert_eq!(settings.desktop_entry.as_deref(), Some("jarvis_guide"));
         assert_eq!(settings.msg_tunnels[0].bot_token, "123:abc_DEF-9");
         assert_eq!(settings.msg_tunnels[0].bot_account_id, None);
@@ -3740,6 +3859,11 @@ mod tests {
             request.fingerprint(),
             AgentCreateRequest::parse(&changed).unwrap().fingerprint()
         );
+        let mut no_share = params.clone();
+        no_share["auto_share_results"] = json!(false);
+        let no_share = AgentCreateRequest::parse(&no_share).unwrap();
+        assert!(!no_share.settings().auto_share_results);
+        assert_ne!(request.fingerprint(), no_share.fingerprint());
         let mut bad_token = params.clone();
         bad_token["msg_tunnel"]["bot_token"] = json!("not a token");
         assert!(AgentCreateRequest::parse(&bad_token).is_err());
@@ -3793,6 +3917,225 @@ mod tests {
             params["permission_mode"] = invalid;
             assert!(AgentCreateRequest::parse(&params).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn create_runtime_selection_respects_owner_and_node_policy() {
+        use buckyos_api::{
+            AgentRuntimeTarget, ComputerAccess, ExecutorSettings, NodeSettings, OwnerAgentsPolicy,
+            ZONE_OWNER_USER_ID_KEY,
+        };
+        use name_lib::{DeviceDocument, DeviceInfo};
+
+        let kv = MemoryKv::default();
+        kv.put(ZONE_OWNER_USER_ID_KEY, &OWNER);
+        // The owner's desktop (on Linux the container is the default, below).
+        let mut device = DeviceInfo::from_device_doc(&DeviceDocument::new(
+            "ood1",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        ));
+        device.os = "windows".into();
+        kv.put("devices/ood1/info", &device);
+        let mut node = NodeSettings {
+            executor: Some(ExecutorSettings {
+                enabled: true,
+                owner_agents: Some(OwnerAgentsPolicy {
+                    enabled: true,
+                    workdir_roots: vec!["/home/devtest/workspace".into()],
+                    env: BTreeMap::new(),
+                    ops: Vec::new(),
+                    computer: ComputerAccess::Observe,
+                    run_as: Some(buckyos_api::ExecutorRunAs {
+                        uid: 1000,
+                        gid: 1000,
+                    }),
+                }),
+                ..Default::default()
+            }),
+        };
+        let mut params = json!({
+            "idempotency_key": "runtime-choice",
+            "name": "runtime-agent",
+            "template_id": "bundled:jarvis.buckyos.bns.did",
+        });
+        let default_request = AgentCreateRequest::parse(&params).unwrap();
+        let settings = default_request
+            .settings_with_runtimes(&kv, OWNER)
+            .await
+            .unwrap();
+        assert!(!settings.runtime_enabled("host"));
+
+        kv.put("nodes/ood1/settings", &node);
+        let settings = default_request
+            .settings_with_runtimes(&kv, OWNER)
+            .await
+            .unwrap();
+        assert!(settings.runtime_enabled("host"));
+        assert_eq!(settings.effective_default_runtime(), "host");
+        assert_eq!(settings.runtimes["host"].computer, ComputerAccess::Observe);
+        assert_eq!(
+            settings.runtimes["host"].target,
+            AgentRuntimeTarget::Node {
+                node_id: "ood1".into(),
+                node_did: device.device_doc.id.to_string(),
+            }
+        );
+        let settings = default_request
+            .settings_with_runtimes(&kv, "other-user")
+            .await
+            .unwrap();
+        assert!(!settings.runtime_enabled("host"));
+
+        params["default_runtime_id"] = Value::Null;
+        let container_default = AgentCreateRequest::parse(&params).unwrap();
+        assert_ne!(
+            default_request.fingerprint(),
+            container_default.fingerprint()
+        );
+        assert_eq!(
+            container_default
+                .settings_with_runtimes(&kv, OWNER)
+                .await
+                .unwrap()
+                .effective_default_runtime(),
+            "container",
+        );
+        params["runtimes"] = json!({"host": null});
+        params["default_runtime_id"] = json!("container");
+        let disabled = AgentCreateRequest::parse(&params).unwrap();
+        assert_ne!(container_default.fingerprint(), disabled.fingerprint());
+        let settings = disabled.settings_with_runtimes(&kv, OWNER).await.unwrap();
+        assert!(!settings.runtime_enabled("host"));
+        assert_eq!(settings.effective_default_runtime(), "container");
+        kv.put("nodes/ood1/settings", &NodeSettings::default());
+        assert!(!disabled
+            .settings_with_runtimes(&kv, OWNER)
+            .await
+            .unwrap()
+            .runtime_enabled("host"));
+        kv.put("nodes/ood1/settings", &node);
+
+        params["runtimes"] = json!({"host": {"enabled": true, "computer": "none"}});
+        params["default_runtime_id"] = json!("host");
+        let enabled = AgentCreateRequest::parse(&params).unwrap();
+        assert_ne!(disabled.fingerprint(), enabled.fingerprint());
+        let settings = enabled.settings_with_runtimes(&kv, OWNER).await.unwrap();
+        assert!(settings.runtime_enabled("host"));
+        assert_eq!(settings.runtimes["host"].computer, ComputerAccess::None);
+        assert!(enabled
+            .settings_with_runtimes(&kv, "other-user")
+            .await
+            .is_err());
+
+        params["runtimes"]["host"]["computer"] = json!("control");
+        assert!(AgentCreateRequest::parse(&params)
+            .unwrap()
+            .settings_with_runtimes(&kv, OWNER)
+            .await
+            .is_err());
+        for invalid in [
+            json!(false),
+            json!({"enabled": "false"}),
+            json!({"computer": "invalid"}),
+        ] {
+            params["runtimes"]["host"] = invalid;
+            assert!(AgentCreateRequest::parse(&params)
+                .unwrap()
+                .settings_with_runtimes(&kv, OWNER)
+                .await
+                .is_err());
+        }
+
+        node.executor.as_mut().unwrap().enabled = false;
+        kv.put("nodes/ood1/settings", &node);
+        let directory = crate::agent_runtimes::runtime_directory(&kv, OWNER)
+            .await
+            .unwrap();
+        assert!(directory[0].closed);
+        assert!(!default_request
+            .settings_with_runtimes(&kv, OWNER)
+            .await
+            .unwrap()
+            .runtime_enabled("host"));
+        assert!(enabled.settings_with_runtimes(&kv, OWNER).await.is_err());
+
+        node.executor.as_mut().unwrap().enabled = true;
+        node.executor
+            .as_mut()
+            .unwrap()
+            .owner_agents
+            .as_mut()
+            .unwrap()
+            .enabled = false;
+        kv.put("nodes/ood1/settings", &node);
+        assert!(!default_request
+            .settings_with_runtimes(&kv, OWNER)
+            .await
+            .unwrap()
+            .runtime_enabled("host"));
+        assert!(enabled.settings_with_runtimes(&kv, OWNER).await.is_err());
+    }
+
+    /// On a Linux node the owner's new Agent stays in its container (its
+    /// Agent Service would otherwise run as the node's service user); the
+    /// owner may still choose the host explicitly. Without any container
+    /// node the host is the only place and a container default is refused.
+    #[tokio::test]
+    async fn linux_hosts_default_to_the_container_and_the_owner_chooses() {
+        use buckyos_api::{ComputerAccess, ExecutorSettings, NodeSettings, OwnerAgentsPolicy, ZONE_OWNER_USER_ID_KEY};
+        use name_lib::{DeviceDocument, DeviceInfo};
+        let kv = MemoryKv::default();
+        kv.put(ZONE_OWNER_USER_ID_KEY, &OWNER);
+        let mut device = DeviceInfo::from_device_doc(&DeviceDocument::new(
+            "ood1",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        ));
+        device.os = "linux".into();
+        kv.put("devices/ood1/info", &device);
+        kv.put("nodes/ood1/settings", &NodeSettings {
+            executor: Some(ExecutorSettings {
+                enabled: true,
+                owner_agents: Some(OwnerAgentsPolicy {
+                    enabled: true,
+                    workdir_roots: vec!["/opt/buckyos/data/home/devtest/host-runtime".into()],
+                    env: BTreeMap::new(),
+                    ops: Vec::new(),
+                    computer: ComputerAccess::None,
+                    run_as: None,
+                }),
+                ..Default::default()
+            }),
+        });
+        let params = json!({"idempotency_key": "linux", "name": "linux-agent", "template_id": "bundled:jarvis.buckyos.bns.did"});
+        let default_request = AgentCreateRequest::parse(&params).unwrap();
+        let settings = default_request.settings_with_runtimes(&kv, OWNER).await.unwrap();
+        assert_eq!(settings.effective_default_runtime(), "container");
+        assert!(!settings.runtime_enabled("host"));
+        let offers = crate::agent_runtimes::runtime_directory(&kv, OWNER).await.unwrap();
+        let view = crate::agent_runtimes::directory_view(&offers, Some(&settings), true);
+        assert_eq!((view["container_available"].as_bool(), view["host_by_default"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(view["runtimes"][0]["os"], "linux");
+        assert_eq!(view["agent_service"]["mode"], "container");
+
+        let mut explicit = params.clone();
+        explicit["runtimes"] = json!({"host": {"enabled": true, "computer": "none"}});
+        explicit["default_runtime_id"] = json!("host");
+        let host = AgentCreateRequest::parse(&explicit).unwrap().settings_with_runtimes(&kv, OWNER).await.unwrap();
+        assert_eq!(host.effective_default_runtime(), "host", "the owner may choose the host");
+        let view = crate::agent_runtimes::directory_view(&offers, Some(&host), true);
+        assert_eq!(view["agent_service"], json!({"mode": "native", "node_id": "ood1"}));
+
+        // No node runs containers: the host is the default, a container
+        // default is refused.
+        device.device_doc.support_container = false;
+        kv.put("devices/ood1/info", &device);
+        let settings = default_request.settings_with_runtimes(&kv, OWNER).await.unwrap();
+        assert_eq!(settings.effective_default_runtime(), "host");
+        let mut container = params.clone();
+        container["runtimes"] = json!({"host": null});
+        container["default_runtime_id"] = json!("container");
+        let refused = AgentCreateRequest::parse(&container).unwrap().settings_with_runtimes(&kv, OWNER).await.unwrap_err();
+        assert!(refused.to_string().contains("container_unavailable"), "{refused}");
     }
 
     #[tokio::test]

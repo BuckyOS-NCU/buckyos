@@ -4,7 +4,9 @@
 
 本协议落实 [OpenDAN Agent Workspace 设计](<../OpenDAN Agent Workspace 设计.md>) 的首轮本地实现。Workspace 是独立于 Session 的长期目录；稳定身份不由目录路径决定。Agent State 保存 Known Workspaces，Session 保存创建时解析的位置快照。
 
-位置的 `runtime_id` 引用 Agent State 的 Runtime 登记（[Agent State Protocol](<Agent State Protocol.md>) §10）。本 runner 只能直接使用 `container`：Agent 进程自己所在环境的文件系统，native 和 tmux 执行实例都映射到它；旧记录里的 `local` 是它的旧名，照常读取、与 `container` 视为同一 Runtime（目录重叠检查、按 Runtime 查询都按同一个算）。`container` 登记为不可用（或 owner 用 `set-runtime` 关掉）时其上的 Workspace 不可用。`host` 等其它已登记 Runtime 在执行器落地前不能放 Workspace，创建 / 导入明确失败并说明原因。登记及 Session 快照用 `runtime_host` 固定本地宿主身份；通过 kRPC 返回的另一宿主上的同名路径不能被当成本机目录执行。它不是 tmux Session ID。尚未接入远程 Workspace helper、宿主机执行器、跨主机锁或文件同步。
+位置的 `runtime_id` 引用 Agent State 的 Runtime 登记（[Agent State Protocol](<Agent State Protocol.md>) §10）。**分层**（2026-10-23，集成 TODO §3.4）：登记、身份、URL、revision、独占租约和重定位规则全部在 Agent State 的控制侧文件；runtime 侧只是目标目录。`container`（旧记录的 `local`，视为同一 Runtime）上这些目录操作是本地文件操作；`host` 等 `available` 的节点 runtime 上收敛为执行器的 `describe(workdir)`（存在性与规范化）、`stat`、`read`/`write`（`.opendan-workspace.json`）和 `mkdir`，不为远端引入 list/rename/remove。`directory` 的绝对性按目标 OS 判定（`buckyos_api::is_absolute_node_path`，Windows 路径不交给 Linux Runner canonicalize），目录重叠按目标 OS 的路径规则比较。远端 `create` 没有列目录操作，只以“没有身份元信息”判定可创建；远端 discover/import 首期只接受显式目录。runtime 未启用或不可用时其上的 Workspace 不可用，创建 / 导入明确失败并说明原因。登记及 Session 快照用 `runtime_host` 固定控制侧宿主身份。尚未接入跨主机锁或文件同步。
+
+Workspace 的产品语义是 **runtime + directory + url**：`url` 是可选的项目关联（http/https 链接，不含用户名密码，≤2048），用于跨 Agent 交接和识别同一项目；它不是目录、凭据、授权或唯一键，填了也不克隆。
 
 ## 2. 数据分类与存储
 
@@ -20,7 +22,7 @@
 
 ## 3. 目录元信息
 
-目录根下 `.opendan-workspace.json` 是版本 1 JSON；字段见 `schema/workspace_metadata.schema.json`：`version`、`workspace_id`、`name`、`description`、`created_at_ms`、`operation_id`。不写入 Runtime 地址、凭据、私有 Notes 或 Session 锁。
+目录根下 `.opendan-workspace.json` 是版本 2 JSON；字段见 `schema/workspace_metadata.schema.json`：`version`、`workspace_id`、`name`、`description`、`url`（可选）、`created_at_ms`、`operation_id`。不写入 Runtime 地址、凭据、私有 Notes 或 Session 锁。`url` 随元信息被 discover/import 读取、随 `update {url}` 改写（`""` 清空），所以跨 Agent 导入同一目录看到同一项目 URL。
 
 元信息携带稳定 ID 和共享描述；Agent State 登记才是本 Agent 已确认位置的来源。Runtime/目录只取本次受支持访问环境和规范化路径，不从不可信元信息取得授权。损坏内容、未知版本、符号链接元信息均失败，不当成“文件缺失”覆盖初始化。
 
@@ -28,7 +30,7 @@
 
 ## 4. 登记与修订
 
-`WorkspaceRecord` 使用必填 `version: 1`，未知登记版本拒绝读取。记录包括稳定 ID、共享名称/描述缓存、`location {runtime_id,directory}`、`usage`（`private` / `collaborative`）、`lifecycle`（`active` / `archived`）、独立的 `availability`、`revision`、`location_revision`、来源/登记者/时间、可选策略引用、私有 Notes、冲突和错误观察。
+`WorkspaceRecord` 使用必填 `version: 2`（含 `url`），未知登记版本拒绝读取。记录包括稳定 ID、共享名称/描述缓存、`location {runtime_id,directory}`、`usage`（`private` / `collaborative`）、`lifecycle`（`active` / `archived`）、独立的 `availability`、`revision`、`location_revision`、来源/登记者/时间、可选策略引用、私有 Notes、冲突和错误观察。
 
 可用性取值为 `available`、`missing`、`runtime_unavailable`、`permission_denied`、`invalid_metadata`、`conflict`。它是最近检查结果，不是下次执行的保证。`revision` 用于条件更新；只有位置改变才增加 `location_revision`，描述/观察刷新不使正常运行的绑定失效。每次 `check`（即使可用性未变）和 Runtime 状态刷新都会增加 `revision`；条件更新须使用最新修订。
 
@@ -36,9 +38,9 @@
 
 ## 5. Session 绑定与执行
 
-`session_config` 升为 `/7`，`binding` 升为 `/4`。`workspace` 为 `{workspace_id, access}`，不再接受 `kind:agent/external` 和路径引用；`workspace_binding` 持久保存稳定 ID、登记/位置修订、Runtime/目录、`runtime_host` 和访问模式。
+`session_config` 升为 `/7`，`binding` 升为 `/4`（2026-10-25 起 `/5`，见下）。`workspace` 为 `{workspace_id, access}`，不再接受 `kind:agent/external` 和路径引用；`workspace_binding` 持久保存稳定 ID、登记/位置修订、Runtime/目录、`runtime_host` 和访问模式。
 
-创建时解析并核验；无 Workspace 的任务使用自身 SessionDir。另行给出的 Runtime workdir 必须与所选目录一致，不能覆盖 Workspace 决策。已有 Session 的配置和 binding 均不得改为另一个 Workspace、目录或访问模式；子 Session 的继承也不能扩大访问能力。
+创建时解析并核验。**2026-10-25 起（primary-runtime TODO，`binding` 为 `/5`）Workspace 不决定 Session 的执行位置**：session-runtime 由显式选择 / 继承 / Agent 默认决定，默认 cwd 永远是 session-runtime 上的 Session 工作目录；Workspace 只贡献自己的 runtime 与目录（写在 binding 的 `workspace` 快照、提示词的 runtime 状态与本机 runtime 的 `OPENDAN_WORKSPACE_ID / _RUNTIME / _DIR` 里）。两者同 runtime 时命令可直接 `cd` 进 Workspace 目录；不同 runtime 时经 `agent-session copy --from workspace:<path> --to session:<path>`（及反向）复制文件，不要求共享磁盘。另行给出的 Runtime workdir 必须是 Session 工作目录。已有 Session 的配置和 binding 均不得改为另一个 Workspace、目录或访问模式；子 Session 的继承也不能扩大访问能力，只读 Workspace 也不接受复制写入。
 
 启动、恢复和工具调用前核验登记、位置修订、目录元信息和执行环境。绑定 Workspace 的 run 不允许独立 `xllm --resume` 绕过校验和写锁，必须由 `xagent run` 驱动。原绑定不可访问或失效时，Session 终态失败并保留原 binding 和执行证据；不重建目录、不改绑、不因访问恢复而重启失败 Session。后续工作须创建新 Session。
 
@@ -50,8 +52,10 @@
 
 ```bash
 xagent workspace list
-xagent workspace create --runtime container --directory /projects/demo --name Demo --description "长期项目" --key create-demo-1
+xagent workspace create --runtime container --directory /projects/demo --name Demo --description "长期项目" --url https://github.com/org/demo --key create-demo-1
+xagent workspace create --runtime host --directory 'C:\Users\owner\demo' --name Demo --key create-demo-host-1   # 节点 runtime：目录在节点上创建
 xagent workspace import --runtime container --directory /projects/existing --name Existing --key import-existing-1
+xagent workspace set-url <workspace_id> --url https://github.com/org/existing --expected-revision <revision>
 xagent workspace get <workspace_id>
 xagent workspace check <workspace_id>
 xagent workspace discover --runtime container --directory /projects/moved --expected-revision <revision>

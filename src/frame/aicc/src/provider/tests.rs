@@ -8,7 +8,7 @@ use crate::protocol::{
     OperationBinding, OperationCodec, OperationDescriptor, ProtocolError, ProtocolExecution,
     ProtocolResultValue,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
@@ -365,7 +365,9 @@ fn discovery(model_id: &str) -> ProviderDiscoverySnapshot {
                 tiers: None,
 
                 time_windows: Vec::new(),
+                addons: Vec::new(),
             }),
+            video: None,
         }],
     }
 }
@@ -583,6 +585,7 @@ fn codecs() -> Arc<CodecRegistry> {
             ]),
             execution_modes: BTreeSet::from([ExecutionMode::Immediate]),
             default_max_output_tokens: None,
+            default_priority: 0,
         }],
         supports_cancel: false,
         supports_webhook: false,
@@ -722,6 +725,13 @@ fn web_search_inventory_requires_model_adapter_and_discovery_support() {
             let mut discovered = discovery(model);
             discovered.models[0].supported_features = None;
             discovered.models[0].remote_methods = None;
+            if provider == "openrouter" {
+                discovered.models[0].remote_methods =
+                    Some(BTreeSet::from(["responses.create".to_owned()]));
+            } else if provider == "gemini" {
+                discovered.models[0].remote_methods =
+                    Some(BTreeSet::from(["interactions.create".to_owned()]));
+            }
             if discovery_disables {
                 discovered.models[0]
                     .unsupported_features
@@ -974,6 +984,7 @@ async fn draft_validation_classifies_connection_auth_discovery_and_adapter_failu
         .await
         .unwrap_err();
     assert_eq!(error.stage, ProviderDraftValidationStage::Connection);
+    assert!(error.message.contains("workspace"));
 
     let invalid_auth = draft(ProviderAuthConfig::ApiKey {
         credential_ref: "missing-secret".into(),
@@ -990,6 +1001,7 @@ async fn draft_validation_classifies_connection_auth_discovery_and_adapter_failu
         .unwrap_err();
     assert_eq!(error.stage, ProviderDraftValidationStage::Authentication);
     assert_eq!(error.kind, ProviderRefreshFailure::Credential);
+    assert!(error.message.contains("credential reference was not resolved"));
 
     let mut invalid_adapter = draft(ProviderAuthConfig::ApiKey {
         credential_ref: "system-config://secrets/aicc/openai".into(),
@@ -1006,9 +1018,14 @@ async fn draft_validation_classifies_connection_auth_discovery_and_adapter_failu
         .await
         .unwrap_err();
     assert_eq!(error.stage, ProviderDraftValidationStage::Protocol);
+    assert!(error.message.contains("missing-adapter"));
+    assert!(error.message.contains("requires adapter"));
 
     let failed_discovery = ScriptedDiscovery::new(
-        [Err("invalid discovery response".into())],
+        [Err(
+            "invalid discovery response; Authorization: Bearer draft-secret sk-provider-secret-1234"
+                .into(),
+        )],
         discovery("gpt-test"),
     );
     let valid = draft(ProviderAuthConfig::ApiKey {
@@ -1021,6 +1038,10 @@ async fn draft_validation_classifies_connection_auth_discovery_and_adapter_failu
         .unwrap_err();
     assert_eq!(error.stage, ProviderDraftValidationStage::Discovery);
     assert_eq!(error.kind, ProviderRefreshFailure::Discovery);
+    assert!(error.message.contains("invalid discovery response"));
+    assert!(error.message.contains("Bearer [REDACTED]"));
+    assert!(!format!("{error:?}").contains("draft-secret"));
+    assert!(!format!("{error:?}").contains("sk-provider-secret-1234"));
 
     let error = manager
         .validate_draft(
@@ -1647,6 +1668,7 @@ fn backoff_is_bounded_and_fingerprint_is_order_independent() {
             availability: ModelAvailability::Unknown,
             deprecated: false,
             pricing: None,
+            video: None,
         },
     ];
     let mut second = first.clone();
@@ -1654,5 +1676,81 @@ fn backoff_is_bounded_and_fingerprint_is_order_independent() {
     assert_eq!(
         model_list_fingerprint(&first),
         model_list_fingerprint(&second)
+    );
+}
+
+/// A custom Gemini channel declares `provider_rules_id: None`, so the inventory
+/// has no `operations` override to pick between the adapter's overlapping
+/// bindings. The descriptor priority decides instead of failing the whole
+/// inventory with `multiple default operations`.
+#[test]
+fn custom_channel_defaults_each_api_type_to_its_preferred_operation() {
+    let (adapter, _) = crate::protocol::gemini_interactions_adapter();
+    for (api_type, name, expected) in [
+        (ApiType::Llm, "llm", "interactions.background"),
+        (ApiType::VisionOcr, "vision.ocr", "interactions.background"),
+        (
+            ApiType::AudioSpeechRecognition,
+            "audio.asr",
+            "interactions.background",
+        ),
+        (
+            ApiType::VideoGenerate,
+            "video.generate",
+            "models.predictLongRunning",
+        ),
+        (
+            ApiType::VideoExtend,
+            "video.extend",
+            "models.predictLongRunning",
+        ),
+        (ApiType::VideoEdit, "video.edit", "interactions.create"),
+        (
+            ApiType::ImageTextToImage,
+            "image.txt2img",
+            "interactions.create",
+        ),
+        (
+            ApiType::ImageImageToImage,
+            "image.img2img",
+            "interactions.create",
+        ),
+        (
+            ApiType::AudioTextToSpeech,
+            "audio.tts",
+            "interactions.create",
+        ),
+        (
+            ApiType::EmbeddingText,
+            "embedding.text",
+            "models.embedContent",
+        ),
+    ] {
+        assert_eq!(
+            resolve_operation(&adapter, &BTreeMap::new(), None, api_type, name).unwrap(),
+            Some(expected.to_string()),
+            "{name}"
+        );
+    }
+    // Discovery narrows the candidates before the priority applies, so an
+    // instance that only exposes the synchronous interactions endpoint still
+    // resolves `llm` onto it.
+    let discovered = BTreeSet::from(["interactions.create".to_string()]);
+    assert_eq!(
+        resolve_operation(
+            &adapter,
+            &BTreeMap::new(),
+            Some(&discovered),
+            ApiType::Llm,
+            "llm"
+        )
+        .unwrap(),
+        Some("interactions.create".to_string())
+    );
+    // An explicit override always wins.
+    let overrides = BTreeMap::from([("llm".to_string(), "models.embedContent".to_string())]);
+    assert_eq!(
+        resolve_operation(&adapter, &overrides, None, ApiType::Llm, "llm").unwrap(),
+        Some("models.embedContent".to_string())
     );
 }

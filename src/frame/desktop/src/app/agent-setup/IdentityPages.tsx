@@ -2,15 +2,17 @@
 
 import { useState } from 'react'
 import { Alert, Button, CircularProgress, Switch, TextField } from '@mui/material'
-import { CheckCircle2, ChevronDown, ChevronRight, ShieldCheck, Users } from 'lucide-react'
+import { CheckCircle2, ChevronDown, ChevronRight, Home, ShieldCheck, Users } from 'lucide-react'
 import { useI18n } from '../../i18n/provider'
 import type { CurrentAccount } from '../../api/account'
 import { AvatarPicker } from './AvatarPicker'
-import type { NameCheckState } from './hooks'
-import { draftDisplayName, type AgentSetupDraft, type ClassifiedAgentError } from './model'
+import type { NameCheckState, RuntimeDirectoryState } from './hooks'
+import type { AgentRuntimeOffer } from '../../api/user_mgr'
+import { canChooseRuntime, draftDisplayName, runsOnHost, type AgentSetupDraft, type ClassifiedAgentError } from './model'
 import { OptionCard, Section, StatusPill } from './ui'
 import { ObjectAvatar } from '../../presentation/ObjectIcon'
 import type { ObjectPresentation } from '../../presentation/model'
+import { parseUserType } from '../../api/user_type'
 
 const NICKNAME_MAX = 64
 const BIO_MAX = 500
@@ -205,9 +207,9 @@ export function AccountPage({
 }
 
 function userTypeLabelKey(userType: string) {
-  const normalized = userType.toLowerCase()
-  if (normalized === 'root') return 'agentSetup.userType.root'
-  if (normalized === 'admin') return 'agentSetup.userType.admin'
+  const type = parseUserType(userType)
+  if (type === 'root') return 'agentSetup.userType.root'
+  if (type === 'admin') return 'agentSetup.userType.admin'
   return 'agentSetup.userType.user'
 }
 
@@ -216,13 +218,21 @@ export function PermissionsPage({
   update,
   account,
   owner,
+  host,
+  runtimeDirectory,
+  onReloadRuntimes,
 }: {
   draft: AgentSetupDraft
   update: (patch: Partial<AgentSetupDraft>) => void
   account: CurrentAccount
   owner: ObjectPresentation
+  host: AgentRuntimeOffer | null
+  runtimeDirectory: RuntimeDirectoryState
+  onReloadRuntimes: () => void
 }) {
   const { t } = useI18n()
+  const directory = runtimeDirectory.status === 'ready' ? runtimeDirectory.directory : null
+  const onHost = runsOnHost(draft, host, directory)
   return (
     <div className="space-y-4">
       <Section title={t('agentSetup.owner.title')} description={t('agentSetup.owner.description')}>
@@ -261,6 +271,43 @@ export function PermissionsPage({
             <ShieldCheck size={16} className="mt-0.5 shrink-0 text-[color:var(--cp-accent)]" />
             <p>{t('agentSetup.permission.agentRoot')}</p>
           </div>
+          <div className="border-t pt-3" style={{ borderColor: 'var(--cp-border)' }} data-testid="agent-setup-host-runtime">
+            <div className="text-sm font-medium text-[color:var(--cp-text)]">{t('agentSetup.host.choice')}</div>
+            <p className="mt-1 text-[12px] leading-5 text-[color:var(--cp-muted)]">{t('agentSetup.host.hint')}</p>
+            {directory && host && canChooseRuntime(host, directory) ? (
+              <div className="mt-2 space-y-3" role="radiogroup" aria-label={t('agentSetup.host.choice')}>
+                <OptionCard
+                  testId="agent-setup-runtime-host"
+                  selected={onHost}
+                  onSelect={() => update({ hostRuntimeEnabled: true })}
+                  title={t('agentSetup.host.onHost', undefined, { name: host.name || host.node_id || 'host' })}
+                  description={t('agentSetup.host.onHostHint')}
+                />
+                <OptionCard
+                  testId="agent-setup-runtime-container"
+                  selected={!onHost}
+                  onSelect={() => update({ hostRuntimeEnabled: false })}
+                  title={t('agentSetup.host.inContainer')}
+                  description={t('agentSetup.host.inContainerHint')}
+                />
+              </div>
+            ) : null}
+            {runtimeDirectory.status === 'loading' ? (
+              <p className="mt-2 text-[12px] text-[color:var(--cp-muted)]">{t('agentSetup.host.loading')}</p>
+            ) : runtimeDirectory.status === 'error' ? (
+              <Alert severity="error" className="mt-2" action={<Button size="small" onClick={onReloadRuntimes}>{t('agentSetup.host.retry')}</Button>}>
+                {t('agentSetup.host.failed')}
+              </Alert>
+            ) : !host || host.closed ? (
+              <p className="mt-2 text-[12px] text-[color:var(--cp-muted)]">{t(host?.closed ? 'agentSetup.host.closed' : 'agentSetup.host.unavailable')}</p>
+            ) : onHost ? (
+              <div className="mt-2 space-y-1 text-[12px] leading-5 text-[color:var(--cp-muted)]">
+                {directory?.container_available === false ? <p>{t('agentSetup.host.noContainer')}</p> : null}
+                <p>{t('agentSetup.host.node', undefined, { name: host.name || host.node_id || 'host', computer: t(`agentSetup.confirm.computer.${host.computer_max}`) })}</p>
+                {host.workdir_roots?.length ? <p className="break-all">{t('agentSetup.host.roots', undefined, { roots: host.workdir_roots.join(', ') })}</p> : null}
+              </div>
+            ) : null}
+          </div>
         </div>
       </Section>
 
@@ -289,6 +336,37 @@ export function PermissionsPage({
               checked={draft.allowGroup}
               onChange={(event) => update({ allowGroup: event.target.checked })}
               slotProps={{ input: { 'aria-label': t('agentSetup.access.group') } }}
+            />
+          </div>
+        </div>
+      </Section>
+
+      <Section title={t('agentSetup.social.title')}>
+        <div className="space-y-4">
+          <div className="flex items-start justify-between gap-3" data-testid="agent-setup-homestation">
+            <div className="flex min-w-0 items-start gap-3">
+              <Home size={18} className="mt-0.5 shrink-0 text-[color:var(--cp-muted)]" />
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-[color:var(--cp-text)]">{t('agentSetup.social.homestation')}</div>
+                <p className="mt-0.5 text-[12px] leading-5 text-[color:var(--cp-muted)]">{t('agentSetup.social.homestationHint')}</p>
+              </div>
+            </div>
+            <Switch
+              checked={draft.homestation}
+              onChange={(event) => update({ homestation: event.target.checked })}
+              slotProps={{ input: { 'aria-label': t('agentSetup.social.homestation') } }}
+            />
+          </div>
+          <div className="flex items-start justify-between gap-3" data-testid="agent-setup-auto-share">
+            <div className="min-w-0 pl-[30px]">
+              <div className="text-sm font-medium text-[color:var(--cp-text)]">{t('agentSetup.social.autoShare')}</div>
+              <p className="mt-0.5 text-[12px] leading-5 text-[color:var(--cp-muted)]">{t('agentSetup.social.autoShareHint')}</p>
+            </div>
+            <Switch
+              checked={draft.homestation && draft.autoShareResults}
+              disabled={!draft.homestation}
+              onChange={(event) => update({ autoShareResults: event.target.checked })}
+              slotProps={{ input: { 'aria-label': t('agentSetup.social.autoShare') } }}
             />
           </div>
         </div>

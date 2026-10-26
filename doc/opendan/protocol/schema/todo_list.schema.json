@@ -88,6 +88,20 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "baseline": {
+          "description": "The declared baseline of that runtime (`standard | extended`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "behavior": {
+          "description": "The behavior its sub session started with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "caller": {
           "anyOf": [
             {
@@ -100,7 +114,7 @@
           "description": "Serial: the caller's hand-over the attempt was admitted for."
         },
         "child_sid": {
-          "description": "Explore: the sub session.",
+          "description": "Explore, or a serial Todo on another runtime / workspace: the sub session.",
           "type": [
             "string",
             "null"
@@ -157,6 +171,13 @@
             "null"
           ]
         },
+        "runtime_id": {
+          "description": "Where the attempt executes, as resolved at its start (the Todo keeps the intent; a retry resolves again).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "started_at_ms": {
           "format": "uint64",
           "minimum": 0.0,
@@ -172,6 +193,12 @@
         },
         "summary": {
           "description": "One line about the result.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
           "type": [
             "string",
             "null"
@@ -234,6 +261,13 @@
             "null"
           ]
         },
+        "behavior": {
+          "description": "The behavior a sub session executing the Todo starts with (`None`: the mode's default); set when it is first dispatched, so a retry runs the same way.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "cancel_reason": {
           "type": [
             "string",
@@ -283,6 +317,13 @@
           },
           "type": "array"
         },
+        "runtime_id": {
+          "description": "Where the Todo must execute: a session-runtime id (`None`: the session's own), and `inherit | none | <workspace id>` (`None`: a serial Todo inherits the session's workspace, an exploration takes none). The two are chosen independently: a workspace on another runtime than the work's is reached by copying files.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "scope": {
           "type": [
             "string",
@@ -315,6 +356,12 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "workspace": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

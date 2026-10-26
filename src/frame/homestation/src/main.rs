@@ -3,7 +3,7 @@ use buckyos_api::{
     ZonePresentationConfig, ZonePresentationFields, HOMESTATION_SERVICE_NAME, HOMESTATION_SERVICE_PORT, ZONE_PRESENTATION_KEY,
 };
 use clap::{Arg, ArgAction, Command};
-use homestation::auth::RuntimeAuth;
+use homestation::auth::{RuntimeAccounts, RuntimeAuth};
 use homestation::contacts::{CachedContacts, MsgCenterContacts};
 use homestation::db::Db;
 use homestation::directory::NameDirectory;
@@ -127,7 +127,7 @@ async fn service_main() {
     let owner = zone_doc.owner.to_string();
     let device_did = runtime.device_config.as_ref().map(|d| d.id.to_string()).unwrap_or_default();
     let signer = Signer::new(runtime.device_private_key.clone().expect("device key loaded"), format!("{device_did}#main_key"));
-    let ndm = match runtime.get_named_store().await {
+    let ndm = match runtime.get_local_named_store().await {
         Ok(n) => n,
         Err(e) => {
             log::error!("named store unavailable: {e}");
@@ -166,6 +166,7 @@ async fn service_main() {
             cfg.user = user.user.clone();
             // The collector role (§14) is the zone owner's.
             cfg.collector = collector && user.did == owner;
+            cfg.agent = user.agent.clone();
             let contacts = CachedContacts::new(Box::new(MsgCenterContacts { owner: user.did.clone() }), Duration::from_secs(30));
             Ok(Station::new(cfg, db, signer.clone(), directory.clone(), contacts, chunks.clone(), model.clone()))
         })
@@ -183,7 +184,7 @@ async fn service_main() {
             std::process::exit(1);
         }
     };
-    let host = Host::new(host_cfg, directory, Arc::new(RuntimeAuth::default()), users, zone_feed, builder);
+    let host = Host::new(host_cfg, directory, Arc::new(RuntimeAuth::new(Box::new(RuntimeAccounts), users.clone())), users, zone_feed, builder);
     {
         let host = host.clone();
         tokio::spawn(async move {
@@ -201,13 +202,15 @@ async fn service_main() {
         Err(e) => log::error!("opening user HomeStations: {e}"),
     }
     tokio::spawn(watch_contact_changes(host.clone()));
-    if let Err(e) = serve(AppState { host }, &format!("127.0.0.1:{HOMESTATION_SERVICE_PORT}")).await {
+    tokio::spawn(host.clone().refresh_loop(USERS_REFRESH));
+    if let Err(e) = serve(AppState { host }, &format!("0.0.0.0:{HOMESTATION_SERVICE_PORT}")).await {
         log::error!("serve failed: {e}");
         std::process::exit(1);
     }
 }
 
 const ZONE_BRAND_REFRESH: Duration = Duration::from_secs(60);
+const USERS_REFRESH: Duration = Duration::from_secs(60);
 
 /// Message Center announces contact changes per owner; a burst is coalesced
 /// and each affected HomeStation re-reads its relations once.

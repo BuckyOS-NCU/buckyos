@@ -33,6 +33,7 @@ use kRPC::{RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use libopendan::host::Supervisor;
 use libopendan::protocol::*;
 use libopendan::state::krpc::{error_to_wire, is_write, serve_call};
+use libopendan::session_context::{is_session_method, is_session_token, SessionService};
 use libopendan::state::AgentStateClient;
 use libopendan::{OpenDanError, SessionDir};
 use serde::Serialize;
@@ -42,6 +43,7 @@ use crate::home::Home;
 use crate::ui::UiModule;
 
 pub const SERVICE_PATH: &str = "/kapi/opendan";
+pub const WEB_API_PATH: &str = "/api/opendan";
 
 /// Who may call the service.
 #[derive(Debug, Clone)]
@@ -109,6 +111,9 @@ pub struct StateService {
     pub ui: Option<Arc<UiModule>>,
     pub access: Access,
     pub home: Home,
+    /// Session processes on other runtimes: their session tokens and
+    /// methods (`libopendan::session_context`).
+    pub sessions: Option<Arc<SessionService>>,
 }
 
 fn param<T: serde::de::DeserializeOwned>(params: &Value, name: &str) -> Result<T, OpenDanError> {
@@ -340,6 +345,17 @@ impl StateService {
             "usage.models" => self.home.usage_models(self.agent.as_ref()).await,
             "ui.bindings" => self.home.ui_bindings(self.agent.as_ref()).await,
             "home.workspaces" => self.home.workspaces(self.agent.as_ref()).await,
+            "runtimes.settings" => self.home.runtime_settings().await,
+            "runtimes.settings_set" => {
+                let settings = self.home.set_runtime_settings(params).await?;
+                // The projection follows the settings at once (the watcher
+                // would catch up later).
+                if let Some(root) = crate::home::agent_root_of(self.agent.as_ref()) {
+                    crate::loader::project_runtimes(self.agent.as_ref(), &root, &settings, who).await;
+                    tokio::spawn(crate::loader::check_runtimes(self.agent.clone()));
+                }
+                self.home.runtime_settings().await
+            }
             "goals.activate" => {
                 let id: String = param(params, "goal_id")?;
                 let reason = param::<Option<String>>(params, "reason")?
@@ -359,19 +375,26 @@ impl StateService {
                 let (index, key) = self.supervisor.goal_feedback(&id, &text, &from).await?;
                 Ok(json!({ "index": index, "key": key }))
             }
-            "loader.status" => Ok(json!({
+            "loader.status" => {
+                let authentication = match buckyos_api::get_buckyos_api_runtime() {
+                    Ok(runtime) => Some(runtime.get_authentication_status().await),
+                    Err(_) => None,
+                };
+                Ok(json!({
                 "agent_did": self.info.agent_did,
                 "agent_id": self.info.agent_id,
                 "who": self.info.who,
                 "agent_root": self.info.agent_root,
                 "started_at_ms": self.info.started_at_ms,
                 "now_ms": libopendan::now_ms(),
+                "authentication": authentication,
                 "modules": *self.info.modules.lock().expect("modules"),
                 "hosted": self.supervisor.status(),
                 "ui": self.ui.as_ref().map(|u| u.status()),
                 "goals": self.supervisor.goals().map(|g| g.status()),
                 "errors": *self.info.errors.lock().expect("errors"),
-            })),
+                }))
+            }
             other => Err(OpenDanError::InvalidArgument(format!("unknown method `{other}`"))),
         }
     }
@@ -444,6 +467,7 @@ fn is_read(method: &str) -> bool {
             | "usage.models"
             | "ui.bindings"
             | "home.workspaces"
+            | "runtimes.settings"
             | "loader.status"
     )
 }
@@ -456,14 +480,42 @@ fn is_operation(method: &str) -> bool {
             | "session.decide"
             | "session.post"
             | "agent.profile_set"
+            | "runtimes.settings_set"
             | "goals.activate"
             | "goals.post"
     )
 }
 
+impl StateService {
+    /// A call with a session token: only that session's own methods.
+    async fn session_call(&self, req: &RPCRequest, token: &str) -> Result<RPCResponse, RPCErrors> {
+        // Refusals in the facade's wire form: a Session process tells them
+        // apart from transport failures by kind.
+        let forbidden = |m: String| RPCErrors::ReasonError(error_to_wire(&OpenDanError::Forbidden(m)));
+        let sessions = self
+            .sessions
+            .as_ref()
+            .ok_or_else(|| forbidden("this host issues no session tokens".to_string()))?;
+        let claims = sessions
+            .authenticate(self.agent.agent_id(), token)
+            .map_err(|e| forbidden(e.to_string()))?;
+        if !is_session_method(&req.method) {
+            return Err(forbidden(format!("a session token cannot call {}", req.method)));
+        }
+        log::info!("service: {} by session {}", req.method, claims.session_id);
+        match sessions.call(self.agent.as_ref(), &claims, &req.method, &req.params).await {
+            Ok(v) => Ok(RPCResponse::new(RPCResult::Success(v), req.seq)),
+            Err(e) => Err(RPCErrors::ReasonError(error_to_wire(&e))),
+        }
+    }
+}
+
 #[async_trait]
 impl RPCHandler for StateService {
     async fn handle_rpc_call(&self, req: RPCRequest, ip_from: IpAddr) -> Result<RPCResponse, RPCErrors> {
+        if let Some(token) = req.token.as_deref().filter(|t| is_session_token(t)) {
+            return self.session_call(&req, token).await;
+        }
         let who = self.caller(&req, ip_from).await?;
         if is_write(&req.method) || is_operation(&req.method) {
             log::info!("service: {} by {who}", req.method);

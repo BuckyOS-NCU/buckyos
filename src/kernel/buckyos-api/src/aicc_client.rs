@@ -2,7 +2,10 @@ use crate::aicc_usage_log::{
     QueryRouteTraceRequest, QueryRouteTraceResponse, QueryUsageRequest, QueryUsageResponse,
 };
 use crate::{
-    AppDoc, AppType, DecisionAnswer, DecisionQuestion, DecisionRequirements, SelectorType,
+    quota_methods, video_error, AiccListView, AiccOnBehalfOf, AppDoc, AppType, DecisionAnswer,
+    DecisionQuestion, DecisionRequirements, GeneratedVideo, QuotaQueryRequest, QuotaQueryResponse,
+    SelectorType, VideoGenerateHelperRequest, VideoGenerateRequest, VideoGenerationRequirement,
+    VideoOutputSpec, AICC_ON_BEHALF_OF_PARAM,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -23,6 +26,7 @@ pub mod ai_methods {
     pub const IMAGES_GENERATE: &str = "images.generate";
     pub const HELPER_LLM_CHAT: &str = "helper.llm_chat";
     pub const HELPER_TEXT_TO_IMAGE: &str = "helper.text_to_image";
+    pub const HELPER_VIDEO_GENERATE: &str = "helper.video_generate";
 
     pub const EMBEDDING_TEXT: &str = "embedding.text";
     pub const EMBEDDING_MULTIMODAL: &str = "embedding.multimodal";
@@ -40,9 +44,8 @@ pub mod ai_methods {
     pub const AUDIO_ASR: &str = "audio.asr";
     pub const AUDIO_MUSIC: &str = "audio.music";
     pub const AUDIO_ENHANCE: &str = "audio.enhance";
-    pub const VIDEO_TXT2VIDEO: &str = "video.txt2video";
-    pub const VIDEO_IMG2VIDEO: &str = "video.img2video";
-    pub const VIDEO_VIDEO2VIDEO: &str = "video.video2video";
+    pub const VIDEO_GENERATE: &str = "video.generate";
+    pub const VIDEO_EDIT: &str = "video.edit";
     pub const VIDEO_EXTEND: &str = "video.extend";
     pub const VIDEO_UPSCALE: &str = "video.upscale";
     pub const AGENT_COMPUTER_USE: &str = "agent.computer_use";
@@ -90,9 +93,8 @@ pub mod ai_methods {
                 | AUDIO_ASR
                 | AUDIO_MUSIC
                 | AUDIO_ENHANCE
-                | VIDEO_TXT2VIDEO
-                | VIDEO_IMG2VIDEO
-                | VIDEO_VIDEO2VIDEO
+                | VIDEO_GENERATE
+                | VIDEO_EDIT
                 | VIDEO_EXTEND
                 | VIDEO_UPSCALE
                 | AGENT_COMPUTER_USE
@@ -102,7 +104,7 @@ pub mod ai_methods {
     pub fn is_aicc_core_method(method: &str) -> bool {
         matches!(
             method,
-            ROUTE_RESOLVE | HELPER_LLM_CHAT | HELPER_TEXT_TO_IMAGE
+            ROUTE_RESOLVE | HELPER_LLM_CHAT | HELPER_TEXT_TO_IMAGE | HELPER_VIDEO_GENERATE
         ) || is_ai_method(method)
     }
 
@@ -129,7 +131,7 @@ pub mod ai_methods {
                 | MODELS_LIST
                 | DRIVER_METADATA_UPDATE_GET
                 | DRIVER_METADATA_UPDATE_SET
-        )
+        ) || crate::quota_methods::is_quota_method(method)
     }
 }
 
@@ -273,8 +275,9 @@ mod canonical_contract_tests {
             "voice": {"style": "provider_specific_style"}
         }))
         .is_err());
-        assert!(VideoImageToVideoRequest::from_json(json!({
+        assert!(VideoGenerateRequest::from_json(json!({
             "exact_model": "m@p",
+            "prompt": "fox",
             "image": {"kind": "named_object", "obj_id": "chunk:123456"}
         }))
         .is_err());
@@ -725,25 +728,23 @@ mod canonical_contract_tests {
     }
 
     #[test]
-    fn quota_and_policy_money_are_currency_explicit_and_strict() {
-        let money = Money::new(12.5, "USD");
-        let quota = QuotaView {
-            state: QuotaState::Normal,
-            remaining_request_units: Some(1_000),
-            remaining_cost: Some(money.clone()),
-            reset_at: Some("2026-04-26T00:00:00Z".to_string()),
+    fn quota_refusals_travel_as_detailed_errors_with_their_code() {
+        let mut error = AiccError::new(AiccErrorCode::QuotaExhausted, "token quota is exhausted");
+        error.details = Some(json!({"required_tokens": 10}));
+        let wire = error.to_krpc_error();
+        let RPCErrors::Detailed(detail) = &wire else {
+            panic!("quota refusals are detailed errors");
         };
-        let value = serde_json::to_value(&quota).unwrap();
-        assert_eq!(
-            value["remaining_cost"],
-            json!({
-                "amount": 12.5,
-                "currency": "USD"
-            })
-        );
-        assert!(value.get("remaining_cost_usd").is_none());
-        assert_eq!(serde_json::from_value::<QuotaView>(value).unwrap(), quota);
+        assert_eq!(detail.code, "quota_exhausted");
+        assert_eq!(AiccError::from_krpc_error(&wire), Some(error));
+        let other = AiccError::new(AiccErrorCode::ProviderError, "upstream failed");
+        assert!(matches!(other.to_krpc_error(), RPCErrors::ReasonError(_)));
+        assert_eq!(AiccError::from_krpc_error(&other.to_krpc_error()), Some(other));
+    }
 
+    #[test]
+    fn policy_money_is_currency_explicit_and_strict() {
+        let money = Money::new(12.5, "USD");
         let policy = AiccPolicyConfig {
             max_estimated_cost: Some(LockedValue::locked(money.clone())),
             ..Default::default()
@@ -775,11 +776,6 @@ mod canonical_contract_tests {
             "amount": 1.0,
             "currency": "USD",
             "unit": "dollar"
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<QuotaView>(json!({
-            "state": "normal",
-            "remaining_cost_usd": 12.5
         }))
         .is_err());
     }
@@ -1174,12 +1170,10 @@ pub enum ApiType {
     AudioMusic,
     #[serde(rename = "audio.enhance")]
     AudioEnhance,
-    #[serde(rename = "video.txt2video")]
-    VideoTextToVideo,
-    #[serde(rename = "video.img2video")]
-    VideoImageToVideo,
-    #[serde(rename = "video.video2video")]
-    VideoToVideo,
+    #[serde(rename = "video.generate")]
+    VideoGenerate,
+    #[serde(rename = "video.edit")]
+    VideoEdit,
     #[serde(rename = "video.extend")]
     VideoExtend,
     #[serde(rename = "video.upscale")]
@@ -1207,11 +1201,9 @@ impl ApiType {
             | Self::AudioSpeechRecognition
             | Self::AudioMusic
             | Self::AudioEnhance => Capability::Audio,
-            Self::VideoTextToVideo
-            | Self::VideoImageToVideo
-            | Self::VideoToVideo
-            | Self::VideoExtend
-            | Self::VideoUpscale => Capability::Video,
+            Self::VideoGenerate | Self::VideoEdit | Self::VideoExtend | Self::VideoUpscale => {
+                Capability::Video
+            }
             Self::AgentComputerUse => Capability::Agent,
         }
     }
@@ -1236,9 +1228,8 @@ impl ApiType {
             Self::AudioSpeechRecognition => ai_methods::AUDIO_ASR,
             Self::AudioMusic => ai_methods::AUDIO_MUSIC,
             Self::AudioEnhance => ai_methods::AUDIO_ENHANCE,
-            Self::VideoTextToVideo => ai_methods::VIDEO_TXT2VIDEO,
-            Self::VideoImageToVideo => ai_methods::VIDEO_IMG2VIDEO,
-            Self::VideoToVideo => ai_methods::VIDEO_VIDEO2VIDEO,
+            Self::VideoGenerate => ai_methods::VIDEO_GENERATE,
+            Self::VideoEdit => ai_methods::VIDEO_EDIT,
             Self::VideoExtend => ai_methods::VIDEO_EXTEND,
             Self::VideoUpscale => ai_methods::VIDEO_UPSCALE,
             Self::AgentComputerUse => ai_methods::AGENT_COMPUTER_USE,
@@ -1404,9 +1395,32 @@ pub enum AiccErrorCode {
     SettingsRevisionConflict,
     Cancelled,
     InternalError,
+    /// An enabled token quota rule has nothing left (§7.4).
+    QuotaExhausted,
+    /// Every rule has tokens left, but fewer than this call reserves.
+    QuotaBudgetExceeded,
+    /// A configured rule could not be read or reserved; never treated as unlimited.
+    QuotaUnavailable,
+    /// The Provider / Model is outside the caller's visibility, or no
+    /// permitted candidate is left; hidden identities are not disclosed.
+    ResourceNotPermitted,
+    /// The AICC user of a delegated run cannot be determined.
+    AttributionUnavailable,
 }
 
 impl AiccErrorCode {
+    /// Token quota and resource policy refusals (AI Center Quota PRD §7.4).
+    pub fn is_policy_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::QuotaExhausted
+                | Self::QuotaBudgetExceeded
+                | Self::QuotaUnavailable
+                | Self::ResourceNotPermitted
+                | Self::AttributionUnavailable
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
@@ -1428,6 +1442,11 @@ impl AiccErrorCode {
             Self::SettingsRevisionConflict => "settings_revision_conflict",
             Self::Cancelled => "cancelled",
             Self::InternalError => "internal_error",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::QuotaBudgetExceeded => "quota_budget_exceeded",
+            Self::QuotaUnavailable => "quota_unavailable",
+            Self::ResourceNotPermitted => "resource_not_permitted",
+            Self::AttributionUnavailable => "attribution_unavailable",
         }
     }
 }
@@ -1480,6 +1499,15 @@ impl AiccError {
     }
 
     pub fn to_krpc_error(&self) -> RPCErrors {
+        if self.code.is_policy_refusal() {
+            // The wire carries the code and the whole error as data, so every
+            // client branches on `code` (PRD §7.4) instead of parsing text.
+            return RPCErrors::Detailed(RPCErrorDetail {
+                code: self.code.as_str().to_string(),
+                message: self.message.clone(),
+                data: serde_json::to_value(self).ok(),
+            });
+        }
         let body = serde_json::to_string(self).unwrap_or_else(|_| {
             format!(
                 "{{\"code\":\"internal_error\",\"message\":{:?}}}",
@@ -1491,7 +1519,9 @@ impl AiccError {
             | AiccErrorCode::InvalidMethod
             | AiccErrorCode::SchemaValidationFailed
             | AiccErrorCode::InvalidModelName => RPCErrors::ParseRequestError(body),
-            AiccErrorCode::PolicyDenied => RPCErrors::NoPermission(body),
+            AiccErrorCode::PolicyDenied
+            | AiccErrorCode::ResourceNotPermitted
+            | AiccErrorCode::AttributionUnavailable => RPCErrors::NoPermission(body),
             _ => RPCErrors::ReasonError(body),
         }
     }
@@ -1507,6 +1537,12 @@ impl AiccError {
     }
 
     pub fn from_krpc_error(error: &RPCErrors) -> Option<Self> {
+        if let RPCErrors::Detailed(detail) = error {
+            return detail
+                .data
+                .clone()
+                .and_then(|data| serde_json::from_value(data).ok());
+        }
         let body = match error {
             RPCErrors::ParseRequestError(body)
             | RPCErrors::ReasonError(body)
@@ -1545,6 +1581,8 @@ pub struct ModelRequirement {
     pub min_context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub canonical_fields: BTreeMap<String, CanonicalFieldRequirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoGenerationRequirement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2685,6 +2723,9 @@ pub struct AiUsage {
     pub audio_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video_seconds: Option<f64>,
+    /// Reference images a video request submitted, for per-image prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_images: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_units: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2711,6 +2752,7 @@ impl AiUsage {
             image_units: None,
             audio_seconds: None,
             video_seconds: None,
+            reference_images: None,
             request_units: Some(request_units),
             characters: None,
             cost: None,
@@ -3101,7 +3143,7 @@ pub struct LlmChatHelperRequest {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct HelperModelRequirement {
     #[serde(default, skip_serializing_if = "is_false")]
@@ -3120,6 +3162,8 @@ pub struct HelperModelRequirement {
     pub min_context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub canonical_fields: BTreeMap<String, CanonicalFieldRequirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoGenerationRequirement>,
 }
 
 impl From<HelperModelRequirement> for ModelRequirement {
@@ -3134,6 +3178,7 @@ impl From<HelperModelRequirement> for ModelRequirement {
             image_generation: value.image_generation,
             min_context_tokens: value.min_context_tokens,
             canonical_fields: value.canonical_fields,
+            video: value.video,
         }
     }
 }
@@ -3987,31 +4032,6 @@ typed_response!(AudioEnhanceResponse {
     stems: Vec<ResourceRef>
 });
 
-typed_request!(
-    VideoTextToVideoRequest,
-    required { prompt: String },
-    optional {
-        duration_seconds: f64,
-        aspect_ratio: String,
-        resolution: String,
-        generate_audio: bool,
-        seed: u64,
-        output: AiOutputOptions
-    }
-);
-typed_request!(
-    VideoImageToVideoRequest,
-    required {
-        image: ResourceRef,
-        prompt: String
-    },
-    optional {
-        duration_seconds: f64,
-        aspect_ratio: String,
-        resolution: String
-    }
-);
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TimeRange {
@@ -4020,16 +4040,33 @@ pub struct TimeRange {
 }
 
 typed_request!(
-    VideoToVideoRequest,
+    VideoEditRequest,
     required {
         video: ResourceRef,
         prompt: String
     },
-    optional {
-        preserve_motion: bool,
-        time_range: TimeRange
-    }
+    optional { output: VideoOutputSpec }
+    validate validate
 );
+
+impl VideoEditRequest {
+    pub fn validate(&self) -> std::result::Result<(), AiccError> {
+        if self.prompt.trim().is_empty() {
+            return Err(video_error(
+                AiccErrorCode::InvalidRequest,
+                "video edit requires a non-blank prompt",
+                "/prompt",
+                None,
+                None,
+                None,
+            ));
+        }
+        if let Some(output) = &self.output {
+            output.validate("/output")?;
+        }
+        Ok(())
+    }
+}
 typed_request!(
     VideoExtendRequest,
     required {
@@ -4054,11 +4091,10 @@ typed_request!(
         output: AiOutputOptions
     }
 );
-typed_response!(VideoTextToVideoResponse { video: Option<ResourceRef> });
-typed_response!(VideoImageToVideoResponse { video: Option<ResourceRef> });
-typed_response!(VideoToVideoResponse { video: Option<ResourceRef> });
-typed_response!(VideoExtendResponse { video: Option<ResourceRef> });
-typed_response!(VideoUpscaleResponse { video: Option<ResourceRef> });
+typed_response!(VideoGenerateResponse { videos: Vec<GeneratedVideo> });
+typed_response!(VideoEditResponse { videos: Vec<GeneratedVideo> });
+typed_response!(VideoExtendResponse { videos: Vec<GeneratedVideo> });
+typed_response!(VideoUpscaleResponse { videos: Vec<GeneratedVideo> });
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -4260,13 +4296,16 @@ pub struct RoutingUpdateResponse {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ListModelsRequest {}
+pub struct ListModelsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<AiccListView>,
+}
 
 impl_request_json!(ListModelsRequest);
 
 impl ListModelsRequest {
     pub fn new() -> Self {
-        Self {}
+        Self { view: None }
     }
 }
 
@@ -4723,23 +4762,6 @@ impl_request_json!(QueryUsageRequest);
 
 impl_request_json!(QueryRouteTraceRequest);
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct QuotaQueryRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability: Option<Capability>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub method: Option<String>,
-}
-
-impl_request_json!(QuotaQueryRequest);
-
-impl QuotaQueryRequest {
-    pub fn new(capability: Option<Capability>, method: Option<String>) -> Self {
-        Self { capability, method }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaState {
@@ -4749,35 +4771,20 @@ pub enum QuotaState {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct QuotaView {
-    pub state: QuotaState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remaining_request_units: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remaining_cost: Option<Money>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reset_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct QuotaQueryResponse {
-    pub quota: QuotaView,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderListRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<AiccListView>,
 }
 
 impl_request_json!(ProviderListRequest);
 
 impl ProviderListRequest {
     pub fn new(method: Option<String>) -> Self {
-        Self { method }
+        Self { method, view: None }
     }
 }
 
@@ -5047,6 +5054,7 @@ define_aicc_calls! {
     ImagesGenerate(TextToImageInvokeRequest) => ai_methods::IMAGES_GENERATE, Some(ApiType::ImageTextToImage), exact;
     HelperLlmChat(LlmChatHelperRequest) => ai_methods::HELPER_LLM_CHAT, Some(ApiType::Llm), none;
     HelperTextToImage(TextToImageHelperRequest) => ai_methods::HELPER_TEXT_TO_IMAGE, Some(ApiType::ImageTextToImage), none;
+    HelperVideoGenerate(VideoGenerateHelperRequest) => ai_methods::HELPER_VIDEO_GENERATE, Some(ApiType::VideoGenerate), none;
     EmbeddingText(EmbeddingTextRequest) => ai_methods::EMBEDDING_TEXT, Some(ApiType::EmbeddingText), exact;
     EmbeddingMultimodal(EmbeddingMultimodalRequest) => ai_methods::EMBEDDING_MULTIMODAL, Some(ApiType::EmbeddingMultimodal), exact;
     DecisionEvaluate(DecisionEvaluateRequest) => ai_methods::DECISION_EVALUATE, Some(ApiType::Decision), exact;
@@ -5063,9 +5071,8 @@ define_aicc_calls! {
     AudioSpeechRecognition(AudioSpeechRecognitionRequest) => ai_methods::AUDIO_ASR, Some(ApiType::AudioSpeechRecognition), exact;
     AudioMusic(AudioMusicRequest) => ai_methods::AUDIO_MUSIC, Some(ApiType::AudioMusic), exact;
     AudioEnhance(AudioEnhanceRequest) => ai_methods::AUDIO_ENHANCE, Some(ApiType::AudioEnhance), exact;
-    VideoTextToVideo(VideoTextToVideoRequest) => ai_methods::VIDEO_TXT2VIDEO, Some(ApiType::VideoTextToVideo), exact;
-    VideoImageToVideo(VideoImageToVideoRequest) => ai_methods::VIDEO_IMG2VIDEO, Some(ApiType::VideoImageToVideo), exact;
-    VideoToVideo(VideoToVideoRequest) => ai_methods::VIDEO_VIDEO2VIDEO, Some(ApiType::VideoToVideo), exact;
+    VideoGenerate(VideoGenerateRequest) => ai_methods::VIDEO_GENERATE, Some(ApiType::VideoGenerate), exact;
+    VideoEdit(VideoEditRequest) => ai_methods::VIDEO_EDIT, Some(ApiType::VideoEdit), exact;
     VideoExtend(VideoExtendRequest) => ai_methods::VIDEO_EXTEND, Some(ApiType::VideoExtend), exact;
     VideoUpscale(VideoUpscaleRequest) => ai_methods::VIDEO_UPSCALE, Some(ApiType::VideoUpscale), exact;
     ComputerUse(ComputerUseRequest) => ai_methods::AGENT_COMPUTER_USE, Some(ApiType::AgentComputerUse), exact;
@@ -5215,9 +5222,33 @@ impl CancelResponse {
     }
 }
 
+/// kRPC transport of [`AiccClient`]; a delegated client adds the
+/// `on_behalf_of` parameter to every call.
+pub struct AiccKrpcClient {
+    client: Box<kRPC>,
+    on_behalf_of: Option<Value>,
+}
+
+impl AiccKrpcClient {
+    pub async fn call(
+        &self,
+        method: &str,
+        mut params: Value,
+    ) -> std::result::Result<Value, RPCErrors> {
+        if let (Some(on_behalf_of), Value::Object(map)) = (&self.on_behalf_of, &mut params) {
+            map.insert(AICC_ON_BEHALF_OF_PARAM.to_string(), on_behalf_of.clone());
+        }
+        self.client.call(method, params).await
+    }
+
+    pub async fn set_context(&self, context: RPCContext) {
+        self.client.set_context(context).await;
+    }
+}
+
 pub enum AiccClient {
     InProcess(Box<dyn AiccHandler>),
-    KRPC(Box<kRPC>),
+    KRPC(Box<AiccKrpcClient>),
 }
 
 macro_rules! client_typed_method {
@@ -5298,7 +5329,56 @@ impl AiccClient {
     }
 
     pub fn new_krpc(krpc_client: Box<kRPC>) -> Self {
-        Self::KRPC(krpc_client)
+        Self::KRPC(Box::new(AiccKrpcClient {
+            client: krpc_client,
+            on_behalf_of: None,
+        }))
+    }
+
+    /// Calls made through this client are charged to `on_behalf_of.user_id`.
+    /// AICC accepts it only from a system service granted
+    /// [`AICC_ON_BEHALF_OF_RESOURCE`]; the business App is that service.
+    pub fn with_on_behalf_of(self, on_behalf_of: &AiccOnBehalfOf) -> Self {
+        match self {
+            Self::KRPC(mut client) => {
+                client.on_behalf_of = serde_json::to_value(on_behalf_of).ok();
+                Self::KRPC(client)
+            }
+            in_process => in_process,
+        }
+    }
+
+    /// One `quota.*` / `visibility.*` method (see [`quota_methods`]).
+    pub async fn quota_call<Req, Resp>(
+        &self,
+        method: &str,
+        request: &Req,
+    ) -> std::result::Result<Resp, RPCErrors>
+    where
+        Req: Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let params = serde_json::to_value(request).map_err(|error| {
+            RPCErrors::ReasonError(format!("Failed to serialize {method} request: {error}"))
+        })?;
+        let result = match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_quota_rpc(method, params, RPCContext::default())
+                    .await?
+            }
+            Self::KRPC(client) => client.call(method, params).await?,
+        };
+        serde_json::from_value(result).map_err(|error| {
+            RPCErrors::ParserResponseError(format!("Failed to parse {method} response: {error}"))
+        })
+    }
+
+    pub async fn query_quota(
+        &self,
+        request: QuotaQueryRequest,
+    ) -> std::result::Result<QuotaQueryResponse, RPCErrors> {
+        self.quota_call(quota_methods::QUERY, &request).await
     }
 
     pub async fn set_context(&self, context: RPCContext) {
@@ -5326,6 +5406,9 @@ impl AiccClient {
             }
             AiccCall::HelperTextToImage(request) => {
                 serde_json::to_value(self.helper_text_to_image(request).await?)
+            }
+            AiccCall::HelperVideoGenerate(request) => {
+                serde_json::to_value(self.helper_video_generate(request).await?)
             }
             AiccCall::EmbeddingText(request) => {
                 serde_json::to_value(self.embedding_text(request).await?)
@@ -5369,15 +5452,10 @@ impl AiccClient {
             AiccCall::AudioEnhance(request) => {
                 serde_json::to_value(self.audio_enhance(request).await?)
             }
-            AiccCall::VideoTextToVideo(request) => {
-                serde_json::to_value(self.video_text_to_video(request).await?)
+            AiccCall::VideoGenerate(request) => {
+                serde_json::to_value(self.video_generate(request).await?)
             }
-            AiccCall::VideoImageToVideo(request) => {
-                serde_json::to_value(self.video_image_to_video(request).await?)
-            }
-            AiccCall::VideoToVideo(request) => {
-                serde_json::to_value(self.video_to_video(request).await?)
-            }
+            AiccCall::VideoEdit(request) => serde_json::to_value(self.video_edit(request).await?),
             AiccCall::VideoExtend(request) => {
                 serde_json::to_value(self.video_extend(request).await?)
             }
@@ -5683,26 +5761,68 @@ impl AiccClient {
         AudioEnhanceRequest,
         AudioEnhanceResponse
     );
+    pub async fn video_generate(
+        &self,
+        request: VideoGenerateRequest,
+    ) -> std::result::Result<VideoGenerateResponse, RPCErrors> {
+        request.validate().map_err(|error| error.to_krpc_error())?;
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_video_generate(request, RPCContext::default())
+                    .await
+            }
+            Self::KRPC(client) => {
+                let params = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize VideoGenerateRequest: {error}"
+                    ))
+                })?;
+                let result = client.call(ai_methods::VIDEO_GENERATE, params).await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse video.generate response: {error}"
+                    ))
+                })
+            }
+        }
+    }
+
+    pub async fn helper_video_generate(
+        &self,
+        request: VideoGenerateHelperRequest,
+    ) -> std::result::Result<VideoGenerateResponse, RPCErrors> {
+        request.validate().map_err(|error| error.to_krpc_error())?;
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_helper_video_generate(request, RPCContext::default())
+                    .await
+            }
+            Self::KRPC(client) => {
+                let params = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize VideoGenerateHelperRequest: {error}"
+                    ))
+                })?;
+                let result = client
+                    .call(ai_methods::HELPER_VIDEO_GENERATE, params)
+                    .await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse helper.video_generate response: {error}"
+                    ))
+                })
+            }
+        }
+    }
+
     client_inference_method!(
-        video_text_to_video,
-        handle_video_text_to_video,
-        ai_methods::VIDEO_TXT2VIDEO,
-        VideoTextToVideoRequest,
-        VideoTextToVideoResponse
-    );
-    client_inference_method!(
-        video_image_to_video,
-        handle_video_image_to_video,
-        ai_methods::VIDEO_IMG2VIDEO,
-        VideoImageToVideoRequest,
-        VideoImageToVideoResponse
-    );
-    client_inference_method!(
-        video_to_video,
-        handle_video_to_video,
-        ai_methods::VIDEO_VIDEO2VIDEO,
-        VideoToVideoRequest,
-        VideoToVideoResponse
+        video_edit,
+        handle_video_edit,
+        ai_methods::VIDEO_EDIT,
+        VideoEditRequest,
+        VideoEditResponse
     );
     client_inference_method!(
         video_extend,
@@ -5759,13 +5879,6 @@ impl AiccClient {
         ai_methods::EVENTS_LIST,
         EventsListRequest,
         EventsListResponse
-    );
-    client_typed_method!(
-        query_quota,
-        handle_query_quota,
-        ai_methods::QUOTA_QUERY,
-        QuotaQueryRequest,
-        QuotaQueryResponse
     );
     client_typed_method!(
         query_usage,
@@ -6157,34 +6270,32 @@ pub trait AiccHandler: Send + Sync {
         ))
     }
 
-    async fn handle_video_text_to_video(
+    async fn handle_video_generate(
         &self,
-        _request: VideoTextToVideoRequest,
+        _request: VideoGenerateRequest,
         _ctx: RPCContext,
-    ) -> std::result::Result<VideoTextToVideoResponse, RPCErrors> {
+    ) -> std::result::Result<VideoGenerateResponse, RPCErrors> {
         Err(RPCErrors::UnknownMethod(
-            ai_methods::VIDEO_TXT2VIDEO.to_string(),
+            ai_methods::VIDEO_GENERATE.to_string(),
         ))
     }
 
-    async fn handle_video_image_to_video(
+    async fn handle_helper_video_generate(
         &self,
-        _request: VideoImageToVideoRequest,
+        _request: VideoGenerateHelperRequest,
         _ctx: RPCContext,
-    ) -> std::result::Result<VideoImageToVideoResponse, RPCErrors> {
+    ) -> std::result::Result<VideoGenerateResponse, RPCErrors> {
         Err(RPCErrors::UnknownMethod(
-            ai_methods::VIDEO_IMG2VIDEO.to_string(),
+            ai_methods::HELPER_VIDEO_GENERATE.to_string(),
         ))
     }
 
-    async fn handle_video_to_video(
+    async fn handle_video_edit(
         &self,
-        _request: VideoToVideoRequest,
+        _request: VideoEditRequest,
         _ctx: RPCContext,
-    ) -> std::result::Result<VideoToVideoResponse, RPCErrors> {
-        Err(RPCErrors::UnknownMethod(
-            ai_methods::VIDEO_VIDEO2VIDEO.to_string(),
-        ))
+    ) -> std::result::Result<VideoEditResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(ai_methods::VIDEO_EDIT.to_string()))
     }
 
     async fn handle_video_extend(
@@ -6267,14 +6378,15 @@ pub trait AiccHandler: Send + Sync {
         ))
     }
 
-    async fn handle_query_quota(
+    /// Every `quota.*` and `visibility.*` method; the typed requests and
+    /// responses are in `aicc_quota`.
+    async fn handle_quota_rpc(
         &self,
-        _request: QuotaQueryRequest,
+        method: &str,
+        _params: Value,
         _ctx: RPCContext,
-    ) -> std::result::Result<QuotaQueryResponse, RPCErrors> {
-        Err(RPCErrors::UnknownMethod(
-            ai_methods::QUOTA_QUERY.to_string(),
-        ))
+    ) -> std::result::Result<Value, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(method.to_string()))
     }
 
     async fn handle_query_usage(
@@ -6428,6 +6540,52 @@ impl<T: AiccHandler> AiccServerHandler<T> {
 #[async_trait]
 impl<T: AiccHandler> RPCHandler for AiccServerHandler<T> {
     async fn handle_rpc_call(
+        &self,
+        mut req: RPCRequest,
+        ip_from: IpAddr,
+    ) -> std::result::Result<RPCResponse, RPCErrors> {
+        let on_behalf_of = take_on_behalf_of(&mut req.params)?;
+        AICC_REQUEST_ON_BEHALF_OF
+            .scope(on_behalf_of, self.dispatch(req, ip_from))
+            .await
+    }
+}
+
+tokio::task_local! {
+    static AICC_REQUEST_ON_BEHALF_OF: Option<AiccOnBehalfOf>;
+}
+
+/// The `on_behalf_of` parameter of the AICC request being served; AICC
+/// decides whether the caller may send it.
+pub fn current_aicc_on_behalf_of() -> Option<AiccOnBehalfOf> {
+    AICC_REQUEST_ON_BEHALF_OF
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
+/// Run `future` as a request carrying `on_behalf_of` (in-process callers, tests).
+pub async fn with_aicc_on_behalf_of<F: std::future::Future>(
+    on_behalf_of: Option<AiccOnBehalfOf>,
+    future: F,
+) -> F::Output {
+    AICC_REQUEST_ON_BEHALF_OF.scope(on_behalf_of, future).await
+}
+
+fn take_on_behalf_of(params: &mut Value) -> std::result::Result<Option<AiccOnBehalfOf>, RPCErrors> {
+    let Some(value) = params
+        .as_object_mut()
+        .and_then(|params| params.remove(AICC_ON_BEHALF_OF_PARAM))
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| RPCErrors::ParseRequestError(format!("invalid on_behalf_of: {error}")))
+}
+
+impl<T: AiccHandler> AiccServerHandler<T> {
+    async fn dispatch(
         &self,
         req: RPCRequest,
         ip_from: IpAddr,
@@ -6585,25 +6743,22 @@ impl<T: AiccHandler> RPCHandler for AiccServerHandler<T> {
                     .handle_audio_enhance(AudioEnhanceRequest::from_json(req.params)?, ctx)
                     .await?
             )),
-            ai_methods::VIDEO_TXT2VIDEO => RPCResult::Success(json!(
+            ai_methods::VIDEO_GENERATE => RPCResult::Success(json!(
                 self.0
-                    .handle_video_text_to_video(
-                        VideoTextToVideoRequest::from_json(req.params)?,
+                    .handle_video_generate(VideoGenerateRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::HELPER_VIDEO_GENERATE => RPCResult::Success(json!(
+                self.0
+                    .handle_helper_video_generate(
+                        VideoGenerateHelperRequest::from_json(req.params)?,
                         ctx
                     )
                     .await?
             )),
-            ai_methods::VIDEO_IMG2VIDEO => RPCResult::Success(json!(
+            ai_methods::VIDEO_EDIT => RPCResult::Success(json!(
                 self.0
-                    .handle_video_image_to_video(
-                        VideoImageToVideoRequest::from_json(req.params)?,
-                        ctx
-                    )
-                    .await?
-            )),
-            ai_methods::VIDEO_VIDEO2VIDEO => RPCResult::Success(json!(
-                self.0
-                    .handle_video_to_video(VideoToVideoRequest::from_json(req.params)?, ctx)
+                    .handle_video_edit(VideoEditRequest::from_json(req.params)?, ctx)
                     .await?
             )),
             ai_methods::VIDEO_EXTEND => RPCResult::Success(json!(
@@ -6649,11 +6804,9 @@ impl<T: AiccHandler> RPCHandler for AiccServerHandler<T> {
                     .handle_list_events(EventsListRequest::from_json(req.params)?, ctx)
                     .await?
             )),
-            ai_methods::QUOTA_QUERY => RPCResult::Success(json!(
-                self.0
-                    .handle_query_quota(QuotaQueryRequest::from_json(req.params)?, ctx)
-                    .await?
-            )),
+            method if quota_methods::is_quota_method(method) => {
+                RPCResult::Success(self.0.handle_quota_rpc(method, req.params, ctx).await?)
+            }
             ai_methods::USAGE_QUERY => RPCResult::Success(json!(
                 self.0
                     .handle_query_usage(QueryUsageRequest::from_json(req.params)?, ctx)

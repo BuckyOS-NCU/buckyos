@@ -4,6 +4,8 @@
 
 状态：首版已实施。native、tmux、remote_ssh 已共享配置、构造、工具入口、环境信息与恢复检查；xAgent §5、SDK、PRD、模板文档及协议 schema/fixtures 已回写。policy/grant/approval 和其它执行体仍为后续规划。
 
+2026-10-25：按用户裁决，tmux runtime 已在全平台移除（`TmuxConfig` / `TmuxRuntime`、Session 绑定 tmux 的逻辑及相关测试均已删除，`kind: tmux` 为配置错误），当前 kind 为 `native` / `remote_ssh` / `remote_node`；长任务、取消与断连恢复复用 Node Executor 的操作记录、查询和取消。下文涉及 tmux 的已完成项仅作历史记录，不代表当前实现或后续方向。
+
 ## 1. 目标与边界
 
 把 Agent Runtime 从 libopendan 的 Session 层下移到 llm_context 层（`llm_context` crate + `agent_tool` / xllm 这一层），首版完成三个需求：
@@ -44,7 +46,7 @@ Runtime 长期包含**执行体与 policy** 两部分：执行体回答“在哪
 | kind | 执行位置与机制 | 实际用途 | 本期范围 |
 |---|---|---|---|
 | `native` | Runner 当前所在 OS / 容器内直接启动进程，使用当前用户权限；文件工具访问同一文件系统 | 本地开发、默认执行；Runner 在容器里时命令也在该容器里 | 实现，默认值 |
-| `tmux` | Runner 所在环境的指定 tmux session 内执行命令；文件工具使用与 native 相同的文件系统 | 保留可观察的终端会话，人工 attach 调试，创建或继承既有 session | 迁移已有实现并补齐指定 session 配置 |
+| `tmux` | Runner 所在环境的指定 tmux session 内执行命令；文件工具使用与 native 相同的文件系统 | 保留可观察的终端会话，人工 attach 调试，创建或继承既有 session | 首版已实施；2026-10-25 全平台移除 |
 | `remote_ssh` | 经 SSH 到指定机器 / SSH alias 执行命令与文件操作 | 使用开发机、服务器或另一台设备上的环境 | 细化并实现；首版远端目标为 Linux + bash |
 | `container` | 从 Runner 所在机器通过容器引擎进入本机一个指定的已有容器，例如 `docker exec` | 使用已有容器的工具链、依赖与文件系统；不负责创建新容器 | 规划，暂不实现 |
 | `container_host` | Runner / llm_context 在容器内，命令与文件操作在容器外的宿主机执行 | OpenDAN 在容器内运行时使用宿主环境；尤其包括 Windows 桌面上的宿主命令 | 规划；后续定义宿主连接机制与路径语义 |
@@ -69,7 +71,7 @@ BuckyOS Node 的命令执行接口不能直接假定具有完整文件工具能�
     env: { LANG: en_US.UTF-8 }
   ```
 
-  指定 tmux session：
+  指定 tmux session（2026-10-25 已移除，仅作历史记录）：
 
   ```yaml
   runtime:
@@ -177,7 +179,7 @@ policy 参考 Docker 的环境与资源配置，也参考 NVIDIA OpenShell 对�
 | 工具与授权 | 工具可见性、Do 前检查、ActionGuard / DenyList、临时 grant 与审批如何组合 |
 | 策略生效与审计 | 哪些项在启动时固定、哪些可动态更新；如何记录有效 revision、强制机制、拒绝原因与撤权结果 |
 
-不同执行体的强制能力不同：native / tmux 上的工具路径检查不能等同于容器隔离；SSH / HTTP 的策略必须由目标侧执行或提供可验证的能力，不能仅凭配置宣称已限制远端。后续设计有效 policy 与能力不足时报错的规则，再决定配置字段与 guard 接口。
+不同执行体的强制能力不同：native 上的工具路径检查不能等同于容器隔离；SSH / HTTP 的策略必须由目标侧执行或提供可验证的能力，不能仅凭配置宣称已限制远端。后续设计有效 policy 与能力不足时报错的规则，再决定配置字段与 guard 接口。
 
 `ToolSpec.effect` 统一与 libopendan `classify_effect` 迁移可在该阶段推进；本期继续使用现有分类记录 inflight。grant 与人工审批仍在 xAgent 阶段衔接，见 xAgent.md §5.4。
 
@@ -187,7 +189,7 @@ policy 参考 Docker 的环境与资源配置，也参考 NVIDIA OpenShell 对�
 
 | OpenShell 的处理方式与依据 | 对 AgentRuntime 的启发 |
 |---|---|
-| Compute driver 负责部署、通信通道与外围网络边界；可信 supervisor 在 workload 边界外作出 policy 决策；隔离 backend 提供共同的执行接口。[Architecture](https://docs.nvidia.com/openshell/about/architecture)、[Isolation Backends](https://docs.nvidia.com/openshell/extensibility/isolation-backends) | 执行体、policy 决策、强制机制分别建模；native / tmux / SSH / Node 的接入差异不应变成各自一套授权语义。 |
+| Compute driver 负责部署、通信通道与外围网络边界；可信 supervisor 在 workload 边界外作出 policy 决策；隔离 backend 提供共同的执行接口。[Architecture](https://docs.nvidia.com/openshell/about/architecture)、[Isolation Backends](https://docs.nvidia.com/openshell/extensibility/isolation-backends) | 执行体、policy 决策、强制机制分别建模；native / SSH / Node 的接入差异不应变成各自一套授权语义。 |
 | Linux workload 使用 Landlock 限制文件访问、降权与 seccomp 等进程机制，并由受控通道与代理处理出站连接。[Architecture](https://docs.nvidia.com/openshell/about/architecture) | ActionGuard 管工具调用授权；执行体约束覆盖命令及其子进程的实际 I/O。允许 `exec` 之后，文件和网络限制仍须生效；仅检查 `write_file` 参数覆盖不了 shell 中的写入。 |
 | 网络规则组合目标、端口、调用程序与可选请求检查；REST 可限制 method / path，MCP 可限制 method / tool，但当前 MCP 规则不匹配工具参数。请求规则有独立的 audit / enforce 模式。[Network Rules](https://docs.nvidia.com/openshell/dev/how-it-works/policies/network-rules) | 网络 policy 可细化到“允许这个程序调用这个 API”；业务资源、工具参数与 BuckyOS 权限仍需上层授权。观察到违规与真正阻断必须区分，不能把 audit 当成隔离。 |
 | Agent 环境中的凭据值使用占位符，由代理在允许的 HTTP 请求中解析；网络放行与凭据绑定是两次独立授权。[Providers](https://docs.nvidia.com/openshell/how-it-works/providers/overview) | 凭据应成为独立维度；能访问某服务不意味着可向其发送任意 token。后续评估目标绑定的凭据代理 / 服务授权，避免默认把宿主 token 放进任意 bash 的环境。 |
@@ -198,7 +200,7 @@ policy 参考 Docker 的环境与资源配置，也参考 NVIDIA OpenShell 对�
 ### 7.3 后续落地顺序与边界
 
 1. **先区分两种 policy 职责。** 工具授权处理调用、参数、业务资源、BuckyOS RBAC 与审批；执行体约束处理文件、进程、网络与凭据。二者协作，进程内 ActionGuard 不能独自保证任意 shell 程序的 I/O 范围。
-2. **定义要求、能力与生效结果。** 后续 policy 应明确所需强制能力；backend 无法提供时拒绝对应的受约束执行，不能静默降级。现有 tmux pane 与普通 SSH 连接不能仅靠配置获得完整隔离；SSH 的命令与 SFTP 文件通道也需纳入同一授权边界，不能只约束远端 bash。
+2. **定义要求、能力与生效结果。** 后续 policy 应明确所需强制能力；backend 无法提供时拒绝对应的受约束执行，不能静默降级。普通 SSH 连接不能仅靠配置获得完整隔离；SSH 的命令与 SFTP 文件通道也需纳入同一授权边界，不能只约束远端 bash。
 3. **明确组合与更新语义。** 记录声明策略、provider / grant 等贡献与目标实际采用的有效策略。最大授权边界与 Session / grant 的组合需单独定义，不能套用 runtime 连接字段的覆盖规则；OpenShell 的 global policy 是替换语义，本项目不直接照搬为权限上限。[Sandbox Policies](https://docs.nvidia.com/openshell/dev/how-it-works/policies/overview) 然后设计 revision / 生效确认 / 撤权 / 审计，区分启动固定项和动态项。
 4. **再评估实现复用。** OpenShell 可作为后续受约束执行 backend 的候选，也可仅借鉴 policy 与边界契约。其当前 workload 隔离依赖 Linux 机制；Windows 平台支持经 WSL 2，不能据此推断它已支持本项目的 Windows `container_host` 宿主命令隔离。[Support Matrix](https://docs.nvidia.com/openshell/about/support-matrix) 是否接入、接哪一层，待该阶段验证；本期仍按 native / tmux / remote_ssh 推进。
 
@@ -248,4 +250,60 @@ Session 接管额外保存并核验 runtime、PATH、环境和 bin manifest/help
 - `cargo check --workspace` 与 `uv run buckyos-build.py --skip-web` 通过。整仓 `cargo test --workspace -- --test-threads=1` 在链接阶段因现有磁盘空间不足（ENOSPC）未完成；已清理本轮生成的增量缓存/链接产物，相关模块测试重新通过。
 - schema 和 fixtures 由 Rust 参考实现重新生成；fixture 路径替换同步重算 worklog 字节边界，测试专用主机身份占位符不改变生产恢复核验。
 
-首版限制：SSH 目标需 Linux/bash/SFTP；libopendan 未部署远端 Session helper，选择 SSH 时明确能力错误，独立 xllm 可用。native/tmux 的 workspace 路径检查不构成 OS 隔离。SSH 不提供跨 Runner 的远端工作目录锁。policy、grant、approval 与其它类型按 §7/§8 后续评估；不提前冻结 daemon/HTTP 协议。2026-10-02 起恢复不做进程核验（长命令 TODO §3.2），native / tmux / SSH 都不再依赖 /proc 与 setsid；tmux 因此可在 macOS 上使用。
+首版限制：SSH 目标需 Linux/bash/SFTP；libopendan 未部署远端 Session helper，选择 SSH 时明确能力错误，独立 xllm 可用。native/tmux 的 workspace 路径检查不构成 OS 隔离。SSH 不提供跨 Runner 的远端工作目录锁。policy、grant、approval 与其它类型按 §7/§8 后续评估；不提前冻结 daemon/HTTP 协议。2026-10-02 起恢复不做进程核验（长命令 TODO §3.2），native / tmux / SSH 都不再依赖 /proc 与 setsid。tmux 已于 2026-10-25 全平台移除。
+
+## 11. Session Runtime 先行项（2026-10-25 实施）
+
+来源：[Session Runtime 与 Workspace 解耦 TODO](opendan-primary-runtime-tools-todo.md) §7 T0（S1：agent-runtime 属于 llm_context 层，libopendan 只做角色解析与编排）。四项均已实施，未提交。
+
+| 项 | 落点 | 结果 |
+| --- | --- | --- |
+| 流式读 / 分块写原语 | `agent_tool/src/runtime/files.rs` 新 trait `RuntimeFiles`：`limits / stat(hash) / read_range / write_chunk(mode, expected_size, expected_hash) / rename / remove`；实现为 `LocalFileBackend`（native）与 `node.rs::RemoteNodeTarget`（remote_node） | 控制侧按 runtime 操作文件；路径为该 runtime 的绝对路径字符串；错误沿用 `buckyos_api::ExecutorError` 的错误码，调用方按枚举判断 |
+| Executor 加 `Rename` / `Remove` | `buckyos-api` 的 `ExecutorOp` / `ExecutorOpKind` / `ExecutorOpSpec` / `ExecutorClientMessage::{Rename, Remove}`（`ExecutorRenameRequest`，`Remove` 复用 `ExecutorPathRequest`）；`node_executor` 的 stream 分派、ops 校验与路径锁（rename 锁两端）、store 预算、worker（Unix `renameat`/`linkat`/`unlinkat` 于已校验目录 fd，Windows `MoveFileExW`）、host caps | 进 RBAC action（`executor.rename` / `executor.remove`，mutating，ReadOnly 拒绝）、账本去重与摘要；只作用于普通文件 |
+| `write` 分块追加 | `ExecutorWriteRequest.expected_size`；worker 的 `append` 改为 `O_APPEND` 原地追加 | 见下方“与原设计的差异” |
+| `stat` 大小与摘要 | `ExecutorStatRequest { …, hash }`（`stat` 不再与 `mkdir` 共用请求类型）；结果带 `size`，`hash: true` 时带整文件摘要 | 复制末尾的整文件核验 |
+| 去 `ControlSide` | 删除 `runtime::ControlSide`、`RuntimeOpenCtx.control`、`XllmDeps.runtime_control`、`node::leading_program` 与 `NodeBashRunner` 的首词分流；`RemoteNodeRuntime::open` 对任何非空 `path_prefix` 报 Capability | `NodeBashRunner` 不认识命令名，所有命令都发往节点 |
+| RuntimeInfo 只读字段 | `RuntimeConfig.baseline: Option<RuntimeBaseline{standard, extended}>`（登记者声明）；`RuntimeInfo.{platform, shell_kind, baseline}`（`with_declared` 归一：`darwin`→`macos`，shell 程序名去 `.exe`）；xllm 运行环境段在 baseline 非空时加 `Environment baseline: …` | 供提示词与 T3/T6 的平台/基线匹配使用，Runtime 层不探测基线 |
+
+与原设计（primary TODO §4 / §6.2）的差异，实施时定下：
+
+- **顺序保护用 `expected_size`，不用 `expected_hash`。** 旧 `append` 读入整文件再原子替换，结果受 `max_file_bytes`（默认 1 MiB）限制；用 `expected_hash` 保护每一块还要每块重读已有内容，传输总量是 O(n²)。现在 `append` 原地追加，整文件可超过 `max_file_bytes`（只限单次上传）；`expected_size` 每块只需一次 stat；`expected_hash` 仍可用（会读一遍已有内容，并返回追加后的整文件摘要）；完整性由末尾 `stat(hash=true)` 一次核验。缺失文件不满足任何 `expected_*`，避免中间块落到空文件上。
+- **原语放在新 trait `RuntimeFiles`，`FileBackend` 不变。** `FileBackend` 是工具调用侧接口（`&Path`、remote_node 每个工具调用只对应一个远端操作的 locator）；runtime 间复制由 libopendan 在控制侧编排、跨两个 runtime 发多次操作，适合 `RemoteNodeTarget` 这种每操作自带 locator 的控制侧目标。primary TODO T0 写的“`FileBackend` 加最小方法”由此改为 `RuntimeFiles` 的 `rename` / `remove`。
+- **`remove` 对已不存在的文件成功并报 `changed=false`**（取消、重试清理临时文件时不必区分）；`rename` 的 `to` 父目录须已存在（临时文件与目标同目录）。
+- `RemoteNodeTarget::write_new` 改为按 `ExecutorErrorCode::Conflict` 判断已存在，去掉原来对错误文本的匹配。
+
+已知限制（留给 T3 / T4）：
+
+- 去掉 `ControlSide` 后，`remote_node` Session 的 `agent-session`、`llm_understand_media`、cmd_skill 命令只在节点上已安装时可用；libopendan 对节点 Session 不再给控制侧 PATH 层（`open_session_env`），binding 探测只对本机 Session 设 `path_prefix`。helper 安装与经 kRPC 访问控制面是 T1–T3。
+- 经 Executor 中转的复制会在节点账本留下读内容与上传块，受 `max_store_bytes`（默认 2 GiB）与保留期（7 天）约束；T4 需决定单次传输上限或提交后释放。
+- Windows worker 代码只在 Linux 上用 stub crate 对 `x86_64-pc-windows-msvc` 做了类型检查，未在 Windows 上运行；macOS 未编译。
+
+验证（`buckyos/src/` 下）：
+
+- `cargo test -p node_executor -- --test-threads=1`（root）：新增 `transfer_primitives_append_past_max_file_bytes_then_commit_by_rename`（1.4 MiB 分块追加、重复块与缺失文件 Conflict、`expected_hash` 追加、stat 摘要、rename 冲突/替换/NotFound/越界/符号链接/目录、remove 幂等与越界）、`runtime_files_copy_both_ways_between_native_and_remote_node`（2 MiB+ 与空文件在 native 与节点间双向复制、中文与空格路径、两个实现的冲突与上限错误码）；`read_only_agents_cannot_mutate…` 增加 rename/remove 拒绝；`platform` 的 host caps 期望含新 op。
+- `cargo test -p agent_tool --lib`：新增 `native_runtime_files_stream_guard_and_commit`、`runtime_info_carries_platform_shell_kind_and_declared_baseline`。
+- 2026-10-25 结果（root，`--test-threads=1`）：node_executor 全部 test target 通过（executor 13、remote_node_runtime 3、platform 3、computer 9）；agent_tool `--lib` 274 通过 / 5 忽略（SSH 真实传输用例）；buckyos-api 294 通过；scheduler `executor_auth` 4 通过；buckyos_agent_daemon 通过；libopendan 全部 test target 通过（1 项故障注入 child 入口默认忽略）；opendan 通过（1 忽略）；agent_tool_cli_dev 36 通过；`cargo check --workspace --all-targets` 通过。`xagent schema` 重新导出与 `doc/opendan/protocol/schema` 逐文件一致（RuntimeConfig 不在导出的 schema 里），fixtures 无需重生成。
+- 未执行：`uv run buckyos-build.py`、真实 Zone DV、Windows / macOS 实机、websdk 构建（只改了 `ExecutorOperation` 联合类型）。
+
+### 11.1 T1–T7 实施时的补充改动（2026-10-25）
+
+primary-runtime TODO T1–T7 实施时对本层与执行器的小改动（记录见 [primary-runtime TODO §10](opendan-primary-runtime-tools-todo.md#10-t1t7-实施记录2026-10-25未提交)）：
+
+- `RuntimeBaseline` 移到 buckyos-api（control-panel 的 `AgentRuntimeSettings.baseline` 也用它），`agent_tool::runtime::RuntimeBaseline` 改为重导出；新增 `meets()`。
+- `agent_tool::todo_tools`：`TodoAttempt.baseline` / `AttemptTarget.baseline`（派出的 attempt 所在 runtime 声明的基线），PLAN 视图属性 `baseline="…"`；`TodoRecord.runtime_id / workspace` 的注释改为“两者独立”。
+- node_executor：exec 的环境多 `EXECUTOR_CALL_ID / EXECUTOR_RUN_ID`（执行器自己的操作身份，buckyos-api 常量 `ENV_EXECUTOR_CALL_ID / ENV_EXECUTOR_RUN_ID`）；`ExecutorOptions.path_prefix`（宿主目录排在每条命令 PATH 最前），`ExecutorOptions` 去掉 `Copy`。
+- 发现：节点 runtime 只执行带调用 ID、有持久 run 目录的命令——libopendan 绑定时的 `requirement.tools` 探测此前在节点上不能成功；改由 libopendan `run_probe` 补调用 ID 与 run 目录，本层不变。
+
+### 11.2 plan_simple 实施时的补充改动（2026-10-25）
+
+[plan_simple TODO](opendan-plan-simple-todo.md) 实施时对本层的小改动（记录见该文 §10）：
+
+- `agent_tool::todo_tools`：`TodoRecord.behavior` / `NewTodo.behavior` / `TodoAttempt.behavior` / `AttemptTarget.behavior`（子 Session 的入口 behavior，首次派发写入、重试沿用）；`TodoList::admit_serial`（串行 Todo 作为独立子 Session 派发前的准入：pending、无其它串行在执行、无未 Review 结果、`after` 已接受；由 libopendan 在列表锁内调用）；`TodoRecord::view_line`（视图中单个 `<todo …>` 元素，`render_view` 与工具结果后的背景共用）；`task_text` 的依赖行对子 Session 报告附 `read-session` 提示与 artifacts。
+- `llm_context` 本身未改：函数结果后的观察用既有 `CheckpointHook::before_inference` → `Injection`（function call 追加到 accumulated、批次未配对或挂起时不注入），`intent` 由 libopendan 的 `SessionToolManager` 加到 schema 并校验、剥离（不改 `AiToolCall` 与 xllm 工具契约）。
+
+### 11.3 原生 Agent Service DV 时的补充改动（2026-10-25）
+
+[原生 Agent Service TODO](opendan-native-agent-service-todo.md) 的 DV 暴露的本层缺陷（记录见该文 §6）：
+
+- `agent_tool::runtime::node::RemoteNodeClient::submit`：节点执行槽满时答 `Busy`（设计 §“并发槽满”：不记录任何东西），客户端原来直接把它当失败返回。Jarvis 在 owner 节点上原生启动后，两个 UI Session 与一个 Goal Session 同时 bind（每次 bind 写几份文件），节点默认 `max_concurrency = 2` → 总有一份写拿到 `Busy` → 三个 bind 每 5 s 同步重试、永远失败。现在 `submit` 对 `ExecutorErrorCode::Busy` 用同一 locator 退避重提（100 ms 起、最多 2 s 一次、共 60 s，`BUSY_RETRY_*`），重复提交由节点按 op_id 去重。测试：`node_executor/tests/remote_node_runtime.rs::an_operation_waits_for_a_free_execution_slot`（单槽节点上一条 `sleep 2` 占槽，随后的 write_file 等到槽位成功；去掉重试即复现 `remote_node Busy: no free execution slot`）。
+- 仍待定：60 s 窗口内槽位一直被长命令占着（默认 2 槽、一个 Agent 两条长命令即占满）时照样失败；节点默认并发是否该放大、是否按 profile 分槽，属于 Node Executor 的配置决定，未改。

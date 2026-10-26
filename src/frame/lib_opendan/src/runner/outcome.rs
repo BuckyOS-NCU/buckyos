@@ -166,6 +166,10 @@ impl StructuredReply {
     }
 }
 
+/// `error.kind` of a Turn the AI service refused under the AI quota or
+/// resource policy of the Agent's owner.
+pub const AI_QUOTA_ERROR_KIND: &str = "ai_quota";
+
 fn is_retryable_error(e: &LLMComputeError) -> bool {
     match e {
         LLMComputeError::Timeout | LLMComputeError::Cancelled => true,
@@ -637,11 +641,24 @@ pub(super) async fn handle_context_outcome(
             next.usage = Some(usage);
             next.kind = FinishKind::Error;
             let retry = is_retryable_error(&error);
-            next.error = Some(json!({
-                "kind": format!("{:?}", error.source()).to_lowercase(),
-                "message": error.to_string(),
-                "recoverable": retry,
-            }));
+            next.error = Some(match &error {
+                // AI Center Quota PRD §9.6: the session learns only that the
+                // Agent is limited; the rules and balances stay with its owner.
+                LLMComputeError::Provider {
+                    failure: ProviderFailure::Refused(refusal),
+                    ..
+                } => json!({
+                    "kind": AI_QUOTA_ERROR_KIND,
+                    "refusal": refusal,
+                    "message": "the AI service refused the call under the quota or resource policy of the Agent's owner",
+                    "recoverable": false,
+                }),
+                _ => json!({
+                    "kind": format!("{:?}", error.source()).to_lowercase(),
+                    "message": error.to_string(),
+                    "recoverable": retry,
+                }),
+            });
             if retry {
                 // Retryable: the run is kept and the Turn stays open.
                 status = RunStatus::Paused;
@@ -1156,7 +1173,11 @@ async fn commit_run_end(
         }
     }
     let digest_seq = s.state.perception_seq + 1;
-    s.state.perception_seq = digest_seq + u64::from(next.finished);
+    // The consolidation Goal's session leaves no material: no seq is
+    // reserved for it either (nothing for `catch_up` to backfill).
+    if super::consolidation::caps(sh).records_perception {
+        s.state.perception_seq = digest_seq + u64::from(next.finished);
+    }
     s.commit_state(&sh.lease)?; // commit point
     crate::fault::point("finish_run:after_commit");
     Ok(RunEnded {
@@ -1274,35 +1295,18 @@ async fn after_run_end(
             ..Default::default()
         });
     }
-    if let Err(e) = sh.agent().perception().append(&sh.lease, &sid, recs).await {
-        log::warn!("perception of {sid}: {e}");
+    // The consolidation Goal writes no material of its own (anti echo).
+    if super::consolidation::caps(sh).records_perception {
+        if let Err(e) = sh.agent().perception().append(&sh.lease, &sid, recs).await {
+            log::warn!("perception of {sid}: {e}");
+        }
     }
-    let consolidate = next.finished
-        && next.outcome == Some(Outcome::Succeeded)
-        && s.config.session.kind == SessionKind::SelfImprove;
-    let window = perception_window(&s.config);
     let status = s.status(sh.lease.epoch());
     drop(s);
     report(sh, status).await;
+    super::share::after_finish(sh, run, next, super::share::Finished { config: cfg, turns });
     super::outbound::flush_outbox(sh).await;
     super::turn_task::flush_turn_tasks(sh).await;
-    if consolidate {
-        let kind_lease = sh.kind_lease.lock().expect("kind lease").clone();
-        if let (Some(w), Some(l)) = (window, kind_lease) {
-            let base = sh.agent().perception().cursor().await?;
-            let upto = w.advanced(&base);
-            let batch = crate::state::ConsolidationBatch {
-                session_id: sid.clone(),
-                summary: next.answer.clone().unwrap_or_default().chars().take(500).collect(),
-                memory_ops: 0,
-                notebook_ops: 0,
-            };
-            sh.agent()
-                .cognition()
-                .commit_consolidation(&l, &batch, &upto)
-                .await?;
-        }
-    }
     Ok(())
 }
 
@@ -1429,23 +1433,3 @@ fn register_outputs(
     })
 }
 
-/// `extensions.opendan.perception_window` of a self-improve session.
-pub fn perception_window(cfg: &SessionConfig) -> Option<crate::state::Backlog> {
-    cfg.extensions
-        .get("opendan")
-        .and_then(|o| o.get("perception_window"))
-        .and_then(|w| serde_json::from_value(w.clone()).ok())
-}
-
-pub(super) async fn perception_window_records(
-    sh: &Shared,
-    cfg: &SessionConfig,
-) -> Result<Vec<PerceptionRecord>> {
-    let mut out = Vec::new();
-    if let Some(w) = perception_window(cfg) {
-        for item in &w.items {
-            out.extend(sh.agent().perception().read(item).await?);
-        }
-    }
-    Ok(out)
-}

@@ -29,7 +29,7 @@ const OFFICIAL_PROTOCOL_SOURCE_HOSTS: Record<string, Set<string>> = {
   "google-gemini": new Set(["ai.google.dev"]),
   fal: new Set(["fal.ai"]),
   minimax: new Set(["platform.minimax.io"]),
-  openrouter: new Set(["openrouter.ai"]),
+  openrouter: new Set(["openrouter.ai", "ai.google.dev", "platform.minimax.io"]),
   kimi: new Set(["platform.kimi.com"]),
   glm: new Set(["docs.z.ai", "docs.bigmodel.cn"]),
   deepseek: new Set(["api-docs.deepseek.com"]),
@@ -56,6 +56,9 @@ export type ProviderProtocolContract = {
   api_version: string;
   api_types: string[];
   test_model_ids?: Record<string, string>;
+  conformance_test_model_ids?: Record<string, string[]>;
+  native_history_matrix?: boolean;
+  provider_switch_matrix?: boolean;
   variant_api_types?: string[];
   operation: string;
   http_method: string;
@@ -65,6 +68,8 @@ export type ProviderProtocolContract = {
   content_type: string;
   required_body_fields: string[];
   required_body_fields_by_api_type?: Record<string, string[]>;
+  /** video.generate condition scenarios the official contract documents, beyond text only. */
+  video_generate_scenarios?: VideoScenario[];
   allowed_body_fields: string[];
   body_field_types: Record<
     string,
@@ -72,9 +77,11 @@ export type ProviderProtocolContract = {
   >;
   body_field_formats?: Record<string, "http_url" | "http_url_or_data_uri">;
   required_body_values?: Record<string, unknown>;
+  required_body_values_by_model?: Record<string, Record<string, unknown>>;
   json_string_body_values?: Record<string, Record<string, unknown>>;
   required_body_paths?: string[];
   forbidden_body_paths?: string[];
+  forbidden_body_paths_by_model?: Record<string, string[]>;
   canonical_request_overrides?: Record<string, unknown>;
   generation_config?: {
     allowed_fields: string[];
@@ -95,10 +102,12 @@ export type ProviderProtocolContract = {
     | "gemini_interactions";
   async_protocol?:
     | "fal_queue"
+    | "gemini_interactions"
     | "minimax_video"
     | "minimax_video_v2"
     | "google_lro"
     | "openai_video"
+    | "openrouter_video"
     | "glm_video"
     | "doubao_video"
     | "qwen_media"
@@ -114,6 +123,12 @@ export type ProviderProtocolContract = {
   inline_artifact_success_fixture?: Record<string, unknown>;
   inline_artifact_payload_paths?: string[];
   success_chunk_fixtures?: Array<Record<string, unknown>>;
+  success_chunk_string_expansions?: Array<{
+    chunk_index: number;
+    path: Array<string | number>;
+    value: string;
+    repeat: number;
+  }>;
   async_result_fixture?: Record<string, unknown>;
   success_fixture_base64?: string;
   provider_artifact_identity?: {
@@ -419,6 +434,43 @@ export function validateProviderProtocolCatalog(
           throw new Error(`${id} has no ${driver}.test_model_ids.${apiType}`);
         }
       }
+      if (contract.conformance_test_model_ids !== undefined) {
+        const conformanceModels = object(
+          contract.conformance_test_model_ids,
+          `${id}.conformance_test_model_ids`,
+        );
+        for (const [apiType, rawModelIds] of Object.entries(conformanceModels)) {
+          if (!(contract.api_types as string[]).includes(apiType)) {
+            throw new Error(
+              `${id}.conformance_test_model_ids.${apiType} is not declared by the contract`,
+            );
+          }
+          const modelIds = stringArray(
+            rawModelIds,
+            `${id}.conformance_test_model_ids.${apiType}`,
+          );
+          const officialPool = [
+            ...((provider.official_first_party_model_ids as
+              | Record<string, string[]>
+              | undefined)?.[apiType] ?? []),
+            ...((provider.official_aggregated_model_ids as
+              | Record<string, string[]>
+              | undefined)?.[apiType] ?? []),
+          ];
+          for (const modelId of modelIds) {
+            if (!officialPool.includes(modelId)) {
+              throw new Error(
+                `${id}.conformance_test_model_ids.${apiType} contains ${modelId} outside its official model pool`,
+              );
+            }
+          }
+        }
+      }
+      for (const field of ["native_history_matrix", "provider_switch_matrix"] as const) {
+        if (contract[field] !== undefined && typeof contract[field] !== "boolean") {
+          throw new Error(`${id}.${field} must be a boolean`);
+        }
+      }
       if (contract.variant_api_types !== undefined) {
         stringArray(contract.variant_api_types, `${id}.variant_api_types`);
       }
@@ -442,6 +494,26 @@ export function validateProviderProtocolCatalog(
         for (const pointer of Object.keys(requiredBodyValues)) {
           if (!pointer.startsWith("/")) {
             throw new Error(`${id}.required_body_values keys must be JSON pointers`);
+          }
+        }
+      }
+      if (contract.required_body_values_by_model !== undefined) {
+        const byModel = object(
+          contract.required_body_values_by_model,
+          `${id}.required_body_values_by_model`,
+        );
+        for (const [modelId, rawValues] of Object.entries(byModel)) {
+          nonEmptyString(modelId, `${id}.required_body_values_by_model key`);
+          const values = object(
+            rawValues,
+            `${id}.required_body_values_by_model.${modelId}`,
+          );
+          for (const pointer of Object.keys(values)) {
+            if (!pointer.startsWith("/")) {
+              throw new Error(
+                `${id}.required_body_values_by_model.${modelId} keys must be JSON pointers`,
+              );
+            }
           }
         }
       }
@@ -470,6 +542,47 @@ export function validateProviderProtocolCatalog(
           throw new Error(`${id}.${field} entries must be JSON pointers`);
         }
       }
+      if (contract.forbidden_body_paths_by_model !== undefined) {
+        const byModel = object(
+          contract.forbidden_body_paths_by_model,
+          `${id}.forbidden_body_paths_by_model`,
+        );
+        for (const [modelId, rawPointers] of Object.entries(byModel)) {
+          nonEmptyString(modelId, `${id}.forbidden_body_paths_by_model key`);
+          const pointers = stringArray(
+            rawPointers,
+            `${id}.forbidden_body_paths_by_model.${modelId}`,
+          );
+          if (pointers.some((pointer) => !pointer.startsWith("/"))) {
+            throw new Error(
+              `${id}.forbidden_body_paths_by_model.${modelId} entries must be JSON pointers`,
+            );
+          }
+        }
+        const knownModels = new Set([
+          ...Object.values(
+            (provider.official_first_party_model_ids ?? {}) as Record<
+              string,
+              string[]
+            >,
+          ).flat(),
+          ...Object.values(
+            (provider.official_aggregated_model_ids ?? {}) as Record<
+              string,
+              string[]
+            >,
+          ).flat(),
+          ...Object.values(testModelIds as Record<string, string>),
+          ...Object.values(contractTestModelIds as Record<string, string>),
+        ]);
+        for (const modelId of Object.keys(byModel)) {
+          if (!knownModels.has(modelId)) {
+            throw new Error(
+              `${id}.forbidden_body_paths_by_model.${modelId} is not a documented model of ${provider.provider_driver}`,
+            );
+          }
+        }
+      }
       for (const required of contract.required_body_fields as string[]) {
         if (!allowed.has(required)) {
           throw new Error(`${id} required field ${required} is not allowed`);
@@ -478,6 +591,20 @@ export function validateProviderProtocolCatalog(
           throw new Error(
             `${id} required field ${required} has no type schema`,
           );
+        }
+      }
+      if (contract.video_generate_scenarios !== undefined) {
+        const scenarios = stringArray(
+          contract.video_generate_scenarios,
+          `${id}.video_generate_scenarios`,
+        );
+        if (!(contract.api_types as string[]).includes("video.generate")) {
+          throw new Error(`${id}.video_generate_scenarios requires video.generate`);
+        }
+        for (const scenario of scenarios) {
+          if (!VIDEO_SCENARIOS.includes(scenario as VideoScenario)) {
+            throw new Error(`${id}.video_generate_scenarios has unknown scenario ${scenario}`);
+          }
         }
       }
       if (contract.required_body_fields_by_api_type !== undefined) {
@@ -929,6 +1056,7 @@ export function validateProviderRequest(
   contract: ProviderProtocolContract,
   request: CapturedProviderRequest,
   apiType = contract.api_types[0],
+  videoScenario?: VideoScenario,
 ): string[] {
   const errors: string[] = [];
   if (request.method.toUpperCase() !== contract.http_method.toUpperCase()) {
@@ -993,6 +1121,15 @@ export function validateProviderRequest(
       errors.push(`body ${pointer} must equal ${JSON.stringify(expected)}`);
     }
   }
+  const modelValues = typeof body.model === "string"
+    ? contract.required_body_values_by_model?.[body.model] ?? {}
+    : {};
+  for (const [pointer, expected] of Object.entries(modelValues)) {
+    const actual = pointerValue(pointer);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      errors.push(`body ${pointer} must equal ${JSON.stringify(expected)}`);
+    }
+  }
   for (const [pointer, expected] of Object.entries(contract.json_string_body_values ?? {})) {
     const actual = pointerValue(pointer);
     if (typeof actual !== "string") {
@@ -1014,7 +1151,13 @@ export function validateProviderRequest(
       errors.push(`body ${pointer} is required`);
     }
   }
-  for (const pointer of contract.forbidden_body_paths ?? []) {
+  const forbiddenPointers = [
+    ...(contract.forbidden_body_paths ?? []),
+    ...(typeof body.model === "string"
+      ? contract.forbidden_body_paths_by_model?.[body.model] ?? []
+      : []),
+  ];
+  for (const pointer of forbiddenPointers) {
     if (pointerValue(pointer) !== undefined) {
       errors.push(`body ${pointer} is forbidden`);
     }
@@ -1120,7 +1263,7 @@ export function validateProviderRequest(
       } else errors.push("invalid System One question type");
     }
   }
-  validateNestedProviderBody(contract, body, errors, requiredFields, apiType);
+  validateNestedProviderBody(contract, body, errors, requiredFields, apiType, videoScenario);
   return errors;
 }
 
@@ -1136,6 +1279,7 @@ function validateNestedProviderBody(
   errors: string[],
   requiredFields = contract.required_body_fields,
   apiType?: string,
+  videoScenario?: VideoScenario,
 ): void {
   for (const field of requiredFields) {
     if (typeof body[field] === "string" && !(body[field] as string).trim()) {
@@ -1244,20 +1388,14 @@ function validateNestedProviderBody(
     ) {
       errors.push("MiniMax V2 video content requires a non-empty text block");
     }
-    if (apiType === "video.img2video") {
-      const firstFrame = blocks.find((block) =>
-        block.type === "image_url" && block.role === "first_frame"
-      );
-      const imageUrl = recordValue(firstFrame?.image_url);
-      if (typeof imageUrl?.url !== "string" || !imageUrl.url.trim()) {
-        errors.push(
-          "MiniMax image-to-video content requires a first_frame image_url block",
-        );
-      }
-    }
+  }
+  if (apiType === "video.generate") {
+    errors.push(...videoScenarioErrors(contract, body, videoScenario));
   }
   if (
-    contract.operation === "interactions.create" && Array.isArray(body.input) &&
+    ["interactions.create", "interactions.background"].includes(
+      contract.operation,
+    ) && Array.isArray(body.input) &&
     (body.input.length === 0 ||
       body.input.some((item) => typeof item !== "string" && !recordValue(item)))
   ) {
@@ -1277,13 +1415,37 @@ function validateNestedProviderBody(
     Array.isArray(body.messages)
   ) {
     validateOpenAiChatMessages(body.messages, errors);
+    if (
+      contract.id === "openrouter.chat-completions.v1" &&
+      apiType !== undefined &&
+      ["vision.ocr", "vision.caption"].includes(apiType)
+    ) {
+      const hasTextOnlyInstruction = body.messages.some((rawMessage) => {
+        const message = recordValue(rawMessage);
+        return Array.isArray(message?.content) && message.content.some((rawPart) => {
+          const part = recordValue(rawPart);
+          return part?.type === "text" &&
+            typeof part.text === "string" &&
+            part.text.includes("Return text only and do not generate an image.");
+        });
+      });
+      if (!hasTextOnlyInstruction) {
+        errors.push(
+          "OpenRouter image-model vision requests require an explicit text-only instruction",
+        );
+      }
+    }
   }
   if (
     contract.operation === "messages.create" && Array.isArray(body.messages)
   ) {
     validateClaudeMessages(contract, body, errors);
   }
-  if (contract.operation === "interactions.create") {
+  if (
+    ["interactions.create", "interactions.background"].includes(
+      contract.operation,
+    )
+  ) {
     if (Array.isArray(body.input)) {
       validateGeminiInteractionInput(body.input, errors);
     }
@@ -1569,6 +1731,16 @@ function validateClaudeMessages(
     blocks.forEach((value, blockIndex) => {
       const block = recordValue(value);
       if (!block) return;
+      const source = recordValue(block.source);
+      const mediaType = source?.media_type;
+      if (block.type === "document" && typeof mediaType === "string" &&
+          !["application/pdf", "text/plain"].includes(mediaType)) {
+        errors.push(`body field messages[${index}].content[${blockIndex}] document media_type is invalid for Claude Messages`);
+      }
+      if (block.type === "image" && typeof mediaType === "string" &&
+          !["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mediaType)) {
+        errors.push(`body field messages[${index}].content[${blockIndex}] image media_type is invalid for Claude Messages`);
+      }
       if (block.type === "tool_use") {
         if (
           role !== "assistant" || typeof block.id !== "string" ||
@@ -1607,6 +1779,42 @@ function validateClaudeMessages(
     errors.push(
       "body field output_config.format must contain type=json_schema and an object schema",
     );
+  }
+  if (format?.type === "json_schema" && recordValue(format.schema)) {
+    const unsupported = new Set([
+      "minimum", "maximum", "multipleOf", "minLength", "maxLength",
+      "maxItems", "uniqueItems", "contains", "minContains", "maxContains",
+    ]);
+    const schemaMaps = new Set([
+      "properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
+    ]);
+    const schemaValues = new Set([
+      "items", "additionalProperties", "propertyNames", "not", "if", "then", "else",
+      "unevaluatedProperties", "unevaluatedItems",
+    ]);
+    const schemaArrays = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
+    const visit = (value: unknown, path: string): void => {
+      const record = recordValue(value);
+      if (!record) return;
+      for (const [key, child] of Object.entries(record)) {
+        if (unsupported.has(key) || key === "minItems" && child !== 0 && child !== 1) {
+          errors.push(`${path}.${key} is not supported by Claude structured outputs`);
+        }
+        if (schemaMaps.has(key)) {
+          const children = recordValue(child);
+          if (children) {
+            for (const [name, schema] of Object.entries(children)) {
+              visit(schema, `${path}.${key}.${name}`);
+            }
+          }
+        } else if (schemaValues.has(key)) {
+          visit(child, `${path}.${key}`);
+        } else if (schemaArrays.has(key) && Array.isArray(child)) {
+          child.forEach((schema, index) => visit(schema, `${path}.${key}[${index}]`));
+        }
+      }
+    };
+    visit(format.schema, "body field output_config.format.schema");
   }
   const thinking = recordValue(body.thinking);
   const allowedThinkingTypes = contract.thinking?.allowed_types;
@@ -1853,6 +2061,14 @@ export function validateProviderSuccessFixture(
       });
       break;
     }
+    case "interactions.background":
+      if (typeof fixture.id !== "string" || !fixture.id) {
+        errors.push("id is required");
+      }
+      if (!["queued", "in_progress"].includes(String(fixture.status))) {
+        errors.push("status must be queued or in_progress");
+      }
+      break;
     case "queue.submit":
       if (typeof fixture.request_id !== "string" || !fixture.request_id) {
         errors.push("request_id is required");
@@ -1936,6 +2152,77 @@ function providerErrorRetriable(fixture: ProtocolErrorFixture): boolean {
       .includes(fixture.scenario);
 }
 
+export const VIDEO_SCENARIOS = ["keyframe", "keyframes", "reference-images"] as const;
+export type VideoScenario = typeof VIDEO_SCENARIOS[number];
+
+/** The video.generate condition scenario a case id (or mock selection seed) names. */
+export function videoScenarioOf(key: string): VideoScenario | undefined {
+  const match = /\.video-(keyframes|keyframe|reference-images)$/.exec(key);
+  return match ? match[1] as VideoScenario : undefined;
+}
+
+/**
+ * What each official contract requires on the wire for a condition scenario:
+ * the start/end frames and reference images reach the provider in the
+ * documented field and role, and nothing image-shaped is sent for text only.
+ */
+function videoScenarioErrors(
+  contract: ProviderProtocolContract,
+  body: Record<string, unknown>,
+  scenario: VideoScenario | undefined,
+): string[] {
+  const urlOf = (value: unknown) => {
+    const url = recordValue(recordValue(value)?.image_url)?.url;
+    return typeof url === "string" && url.trim() ? url : undefined;
+  };
+  const expected = {
+    first: scenario === "keyframe" || scenario === "keyframes",
+    last: scenario === "keyframes",
+    references: scenario === "reference-images" ? 2 : 0,
+  };
+  let found: { first: boolean; last: boolean; references: number } | undefined;
+  if (contract.async_protocol === "minimax_video_v2" || contract.async_protocol === "doubao_video") {
+    const blocks = (Array.isArray(body.content) ? body.content : [])
+      .map(recordValue).filter(Boolean) as Array<Record<string, unknown>>;
+    const role = (name: string) => blocks.filter((block) => block.type === "image_url" && block.role === name && urlOf(block));
+    found = { first: role("first_frame").length === 1, last: role("last_frame").length === 1, references: role("reference_image").length };
+  } else if (contract.async_protocol === "openrouter_video") {
+    const frames = (Array.isArray(body.frame_images) ? body.frame_images : [])
+      .map(recordValue).filter(Boolean) as Array<Record<string, unknown>>;
+    const references = (Array.isArray(body.input_references) ? body.input_references : [])
+      .map(recordValue).filter(Boolean) as Array<Record<string, unknown>>;
+    found = {
+      first: frames.some((frame) => frame.frame_type === "first_frame" && urlOf(frame)),
+      last: frames.some((frame) => frame.frame_type === "last_frame" && urlOf(frame)),
+      references: references.filter((reference) => reference.type === "image_url" && urlOf(reference)).length,
+    };
+  } else if (contract.async_protocol === "google_lro") {
+    const instance = recordValue(Array.isArray(body.instances) ? body.instances[0] : undefined) ?? {};
+    found = {
+      first: recordValue(instance.image) !== undefined,
+      last: recordValue(instance.lastFrame) !== undefined,
+      references: Array.isArray(instance.referenceImages) ? instance.referenceImages.length : 0,
+    };
+  } else if (contract.async_protocol === "openai_video") {
+    found = { first: body.input_reference !== undefined, last: false, references: 0 };
+  } else if (contract.async_protocol === "glm_video") {
+    const images = Array.isArray(body.image_url) ? body.image_url : body.image_url === undefined ? [] : [body.image_url];
+    found = { first: images.length >= 1, last: images.length === 2, references: 0 };
+  }
+  if (!found) return [];
+  const errors: string[] = [];
+  if (found.first !== expected.first) {
+    errors.push(`video.generate ${scenario ?? "text"} scenario ${expected.first ? "requires" : "must not send"} a start keyframe`);
+  }
+  if (found.last !== expected.last) {
+    errors.push(`video.generate ${scenario ?? "text"} scenario ${expected.last ? "requires" : "must not send"} an end keyframe`);
+  }
+  if (found.references !== expected.references) {
+    errors.push(`video.generate ${scenario ?? "text"} scenario requires ${expected.references} reference images; found ${found.references}`);
+  }
+  return errors;
+}
+
 const TASK_RESULT_ARTIFACT_API_TYPES = new Set([
   "image.txt2img",
   "image.img2img",
@@ -1945,9 +2232,8 @@ const TASK_RESULT_ARTIFACT_API_TYPES = new Set([
   "audio.tts",
   "audio.music",
   "audio.enhance",
-  "video.txt2video",
-  "video.img2video",
-  "video.video2video",
+  "video.generate",
+  "video.edit",
   "video.extend",
   "video.upscale",
 ]);
@@ -1977,6 +2263,12 @@ export function buildT15Manifest(
             provider.provider_driver,
             contract.protocol_adapter_id,
             apiType,
+            ...(contract.native_history_matrix === false
+              ? ["native_history_matrix_disabled"]
+              : []),
+            ...(contract.provider_switch_matrix === false
+              ? ["provider_switch_matrix_disabled"]
+              : []),
           ],
           input_entry: "zone_gateway",
           user: "acceptance-user-a",
@@ -2020,6 +2312,20 @@ export function buildT15Manifest(
           ),
           mock_scenario: "success",
         } as AcceptanceCase);
+        for (
+          const modelId of contract.conformance_test_model_ids?.[apiType] ?? []
+        ) {
+          if (modelId === contractModel) continue;
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.model.${modelId}.success`,
+            ),
+            tags: [...common.tags!, "model_api_conformance"],
+            model_selector: { kind: "exact", value: modelId },
+            mock_scenario: "success",
+          } as AcceptanceCase);
+        }
         if (TASK_RESULT_ARTIFACT_API_TYPES.has(apiType)) {
           cases.push({
             ...common,
@@ -2032,6 +2338,20 @@ export function buildT15Manifest(
               `${contract.id}.request.task-result-artifact`,
             response_fixture: `${contract.id}.success`,
           } as AcceptanceCase);
+        }
+        if (apiType === "video.generate") {
+          for (const scenario of contract.video_generate_scenarios ?? []) {
+            cases.push({
+              ...common,
+              case_id: caseId(
+                `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.video-${scenario}`,
+              ),
+              tags: [...common.tags!, "video_scenario", scenario],
+              mock_scenario: "success",
+              expected_wire_fixture: `${contract.id}.request.video-${scenario}`,
+              response_fixture: `${contract.id}.success`,
+            } as AcceptanceCase);
+          }
         }
         if (apiType === "llm" && contract.inline_artifact_success_fixture) {
           cases.push({
@@ -2167,6 +2487,7 @@ export function buildT15Manifest(
           } as AcceptanceCase);
           const terminalFailureScenarios =
               contract.async_protocol === "google_lro" ||
+              contract.async_protocol === "gemini_interactions" ||
               contract.async_protocol === "minimax_video" ||
               contract.async_protocol === "minimax_video_v2" ||
               contract.async_protocol === "glm_video" ||
@@ -2298,6 +2619,7 @@ export function buildT15Manifest(
     testCase.api_type === "llm" &&
     testCase.mock_scenario === "success" &&
     !testCase.tags.includes("cloud_update") &&
+    !testCase.tags.includes("model_api_conformance") &&
     !testCase.tags.includes("history") &&
     !testCase.tags.includes("tool_history")
   );
@@ -2319,7 +2641,10 @@ export function buildT15Manifest(
       expected_wire_fixture:
         `${base.protocol_contract_id}.request.tool-history`,
     });
-    if (["openai", "openrouter"].includes(base.provider_driver ?? "")) {
+    if (
+      ["openai", "openrouter"].includes(base.provider_driver ?? "") &&
+      !base.tags.includes("native_history_matrix_disabled")
+    ) {
       cases.push({
         ...base,
         case_id: caseId(
@@ -2342,8 +2667,11 @@ export function buildT15Manifest(
       });
     }
   }
-  for (const source of historyBases) {
-    for (const target of historyBases) {
+  const providerSwitchBases = historyBases.filter((testCase) =>
+    !testCase.tags.includes("provider_switch_matrix_disabled")
+  );
+  for (const source of providerSwitchBases) {
+    for (const target of providerSwitchBases) {
       if (source.provider_driver === target.provider_driver) continue;
       cases.push({
         ...target,
@@ -2377,6 +2705,8 @@ export function buildT15Manifest(
       !testCase.tags.includes("structured_output") &&
       !testCase.tags.includes("task_result_artifact") &&
       !testCase.tags.includes("generated_artifact_id") &&
+      !testCase.tags.includes("video_scenario") &&
+      !testCase.tags.includes("model_api_conformance") &&
       !testCase.tags.includes("custom_provider")
     ).map((testCase) => ({
       ...testCase,
@@ -2388,6 +2718,60 @@ export function buildT15Manifest(
       expected_provider_instance: `t15-custom-${testCase.provider_driver}`,
     })),
   );
+  // Vendor models that reject explicit sampling parameters must have those
+  // parameters stripped by Provider Rules before the request reaches the wire.
+  // Each provider keeps a control case on a model without the constraint, so the
+  // assertion cannot pass just because the harness never sends the values.
+  const samplingConstraints: Array<{
+    provider_driver: string;
+    contract_id: string;
+    stripped_model: string;
+    forwarded_model: string;
+  }> = [
+    {
+      provider_driver: "claude",
+      contract_id: "anthropic.messages.2023-06-01",
+      stripped_model: "claude-sonnet-5-5",
+      forwarded_model: "claude-sonnet-5",
+    },
+    {
+      provider_driver: "openrouter",
+      contract_id: "openrouter.responses.v1",
+      stripped_model: "anthropic/claude-sonnet-5.5",
+      forwarded_model: "anthropic/claude-sonnet-5",
+    },
+  ];
+  for (const constraint of samplingConstraints) {
+    const samplingBase = cases.find((testCase) =>
+      testCase.provider_driver === constraint.provider_driver &&
+      testCase.protocol_contract_id === constraint.contract_id &&
+      testCase.api_type === "llm" &&
+      testCase.mock_scenario === "success" &&
+      !testCase.tags.includes("model_api_conformance")
+    );
+    if (!samplingBase) {
+      throw new Error(
+        `${constraint.contract_id} LLM contract is required for the sampling constraint cases`,
+      );
+    }
+    const samplingVariants: Array<[string, string, string]> = [
+      ["sampling-omitted", constraint.stripped_model, "sampling_omitted"],
+      ["sampling-forwarded", constraint.forwarded_model, "sampling_forwarded"],
+    ];
+    for (const [suffix, modelId, tag] of samplingVariants) {
+      cases.push({
+        ...samplingBase,
+        case_id: caseId(
+          `t1.5.${constraint.provider_driver}.${constraint.contract_id}.llm.${suffix}`,
+        ),
+        priority: "P0",
+        tags: [...samplingBase.tags, tag],
+        model_selector: { kind: "exact", value: modelId },
+        mock_scenario: "success",
+        expected_wire_fixture: `${constraint.contract_id}.request.${suffix}`,
+      } as AcceptanceCase);
+    }
+  }
   for (const variant of variants) {
     const contract = protocolContract(
       catalog,

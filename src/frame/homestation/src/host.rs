@@ -6,7 +6,7 @@
 use crate::audience::Reader;
 use crate::auth::Caller;
 use crate::directory::Directory;
-use crate::error::{bad, HsError, HsResult};
+use crate::error::{bad, denied, HsError, HsResult};
 use crate::protocol::{normalize_obj_id, valid_user_segment, EntryNamespace, HomeRef, ZONE_FEED};
 use crate::publish::{get_entry, get_head, EntryKind};
 use crate::stream::{ChangesPage, DisplayPage};
@@ -46,6 +46,11 @@ impl HostConfig {
         }
     }
 }
+
+/// What a restricted session (Limited, External; contract §3.2 `homestation`) may call on
+/// its own station besides `portal.*`: reading and commenting. Publishing and managing a
+/// home stay closed.
+pub const RESTRICTED_STATION_METHODS: &[&str] = &["comments.list", "interact.comment"];
 
 /// Builds the station of one user (database under `users/<user>/`, contacts of that user).
 pub type StationBuilder = Box<dyn Fn(&ZoneUser) -> HsResult<Arc<Station>> + Send + Sync>;
@@ -140,6 +145,10 @@ impl Station {
     }
 }
 
+pub fn user_kind(user: &ZoneUser) -> &'static str {
+    if user.is_agent() { "agent" } else { "person" }
+}
+
 pub struct Host {
     pub cfg: HostConfig,
     pub directory: Arc<dyn Directory>,
@@ -148,6 +157,8 @@ pub struct Host {
     pub zone_feed: ZoneFeed,
     builder: StationBuilder,
     stations: std::sync::Mutex<HashMap<String, Arc<Station>>>,
+    /// The DIDs served at the last refresh (sorted).
+    known_dids: std::sync::Mutex<Vec<String>>,
     brand: std::sync::RwLock<ZoneBrand>,
     me: Weak<Host>,
 }
@@ -168,7 +179,7 @@ impl Host {
         zone_feed: ZoneFeed,
         builder: StationBuilder,
     ) -> Arc<Self> {
-        Arc::new_cyclic(|me| Self { cfg, directory, auth, users, zone_feed, builder, stations: Default::default(), brand: Default::default(), me: me.clone() })
+        Arc::new_cyclic(|me| Self { cfg, directory, auth, users, zone_feed, builder, stations: Default::default(), known_dids: Default::default(), brand: Default::default(), me: me.clone() })
     }
 
     pub fn set_zone_brand(&self, brand: ZoneBrand) {
@@ -213,15 +224,9 @@ impl Host {
         }
     }
 
-    /// The caller's own station: session DID first, the session subject (username) otherwise.
+    /// The caller's own station: the one of the session DID.
     pub async fn station_for_caller(&self, caller: &Caller) -> HsResult<Option<Arc<Station>>> {
-        if let Some(did) = &caller.did {
-            return self.station_for_did(did).await;
-        }
-        match self.users.by_user(&caller.principal).await {
-            Some(user) => self.station(&user.user).await,
-            None => Ok(None),
-        }
+        self.station_for_did(&caller.did).await
     }
 
     /// Open (or return) the station of a known user.
@@ -246,7 +251,56 @@ impl Host {
         for user in &users {
             self.open(user)?;
         }
+        let mut dids: Vec<String> = users.iter().map(|u| u.did.clone()).collect();
+        dids.sort();
+        *self.known_dids.lock().unwrap() = dids;
         Ok(users.len())
+    }
+
+    /// Open the stations of users added since the last look (a new Agent, a new account), stop
+    /// serving the homes of users who left (their databases stay on disk) and, when the set of
+    /// users changed, let every station re-derive its zone relations (§4.3).
+    pub async fn refresh_users(&self) -> HsResult<bool> {
+        let users = self.users.list().await;
+        let mut dids: Vec<String> = users.iter().map(|u| u.did.clone()).collect();
+        dids.sort();
+        let changed = {
+            let mut known = self.known_dids.lock().unwrap();
+            let changed = *known != dids;
+            *known = dids;
+            changed
+        };
+        for user in &users {
+            self.open(user)?;
+        }
+        if changed {
+            let mut stations = self.stations.lock().unwrap();
+            stations.retain(|user, station| {
+                let kept = users.iter().any(|u| &u.user == user && u.did == station.cfg.owner);
+                if !kept {
+                    log::info!("closed HomeStation of {user} ({}): no longer a user of the zone", station.cfg.owner);
+                }
+                kept
+            });
+        }
+        if changed {
+            for station in self.opened() {
+                if let Err(e) = station.sync_zone_relations().await {
+                    log::warn!("zone relation sync of {}: {e}", station.cfg.user);
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Periodic [`Self::refresh_users`].
+    pub async fn refresh_loop(self: Arc<Self>, every: std::time::Duration) {
+        loop {
+            tokio::time::sleep(every).await;
+            if let Err(e) = self.refresh_users().await {
+                log::warn!("user refresh failed: {e}");
+            }
+        }
     }
 
     pub fn opened(&self) -> Vec<Arc<Station>> {
@@ -291,7 +345,7 @@ impl Host {
     pub async fn locate(&self, did: &str) -> Option<Value> {
         let user = self.users.by_did(did).await?;
         let home = self.home(&user.user);
-        Some(json!({ "did": user.did, "user": user.user, "stream": home.stream(), "inbox": home.inbox() }))
+        Some(json!({ "did": user.did, "user": user.user, "kind": user_kind(&user), "stream": home.stream(), "inbox": home.inbox() }))
     }
 
     /// Display read of the zone feed: listed entries the viewer may see, newest `iat` first.
@@ -386,12 +440,7 @@ impl Host {
 
     async fn viewer_of(&self, caller: Option<&Caller>) -> (Viewer, Option<ZoneUser>) {
         let Some(caller) = caller else { return (Viewer::Anonymous, None) };
-        let user = match &caller.did {
-            Some(did) => self.users.by_did(did).await,
-            None => self.users.by_user(&caller.principal).await,
-        };
-        let viewer = caller.did.clone().or_else(|| user.as_ref().map(|u| u.did.clone())).map(Viewer::Did).unwrap_or(Viewer::Anonymous);
-        (viewer, user)
+        (Viewer::Did(caller.did.clone()), self.users.by_did(&caller.did).await)
     }
 
     /// kRPC entry: `portal.*` for anyone (session optional), everything else on the caller's
@@ -401,6 +450,9 @@ impl Host {
             return self.portal_rpc(caller, portal, params).await;
         }
         let caller = caller.ok_or_else(|| HsError::Forbidden("unauthorized: session token required".into()))?;
+        if caller.restricted && !RESTRICTED_STATION_METHODS.contains(&method) {
+            return Err(denied(buckyos_api::DenyReason::SessionKindNotAllowed, method));
+        }
         let station = self
             .station_for_caller(caller)
             .await?

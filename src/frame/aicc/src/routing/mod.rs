@@ -87,6 +87,8 @@ pub(crate) struct RoutingRequest {
     pub request_units: u64,
     pub estimated_input_tokens: Option<u64>,
     pub estimated_output_tokens: Option<u64>,
+    /// Measured clip lengths of a video request's references.
+    pub video_clips: crate::video::ClipSummary,
     pub caller: CallerIdentity,
 }
 
@@ -113,6 +115,7 @@ impl RoutingRequest {
             request_units: 1,
             estimated_input_tokens: None,
             estimated_output_tokens: None,
+            video_clips: Default::default(),
             caller,
         }
     }
@@ -178,6 +181,29 @@ pub(crate) struct RoutingTrace {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled_capabilities: Vec<Feature>,
     pub user_summary: UserFacingRouteSummary,
+}
+
+impl RoutingTrace {
+    /// Drop every exact model the viewer may not see (PRD §3.4: traces must
+    /// not disclose hidden candidates). Logical paths are kept.
+    pub(crate) fn retain_models(&mut self, allowed: &dyn Fn(&str) -> bool) {
+        let keep = |name: &str| !name.contains('@') || allowed(name);
+        self.filtered_candidates
+            .retain(|candidate| keep(&candidate.exact_model));
+        self.ranked_candidates
+            .retain(|candidate| keep(&candidate.exact_model));
+        self.fallback_chain
+            .retain(|step| keep(&step.from) && keep(&step.to));
+        self.logical_item_sources
+            .retain(|source| keep(&source.exact_model));
+        self.logical_admission
+            .retain(|admission| keep(&admission.exact_model));
+        for expansion in &mut self.logical_expansion {
+            expansion.items.retain(|item| keep(&item.target));
+        }
+        self.candidate_count_before_filter =
+            self.candidate_count_after_filter + self.filtered_candidates.len();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -922,6 +948,28 @@ fn hard_filter_model(
                 "canonical_field_unsatisfied",
                 format!("model cannot satisfy canonical field {pointer}"),
             ));
+        }
+    }
+    if request.api_type == ApiType::VideoGenerate {
+        match crate::video::VideoGenerationContract::from_capabilities(&model.capabilities) {
+            None => reasons.push(filter_reason(
+                "video_contract_missing",
+                "model declares no video generation contract",
+            )),
+            Some(contract) => {
+                if let Some(requirement) = &request.requirements.video {
+                    for unmet in crate::video::unmet_requirements(
+                        &contract,
+                        requirement,
+                        &request.video_clips,
+                    ) {
+                        reasons.push(filter_reason(
+                            "video_requirement_unsatisfied",
+                            format!("{}: {}", unmet.field, unmet.reason),
+                        ));
+                    }
+                }
+            }
         }
     }
     reasons

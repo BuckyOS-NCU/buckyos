@@ -45,6 +45,9 @@ pub struct StandaloneUser {
     pub collector: bool,
     #[serde(default)]
     pub zone_feed_writer: Option<bool>,
+    /// A zone Agent: `{ agent_id, owner_did }`.
+    #[serde(default)]
+    pub agent: Option<crate::users::ZoneAgentRef>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -101,6 +104,8 @@ pub struct StandaloneConfig {
 
 pub struct Standalone {
     pub host: Arc<Host>,
+    /// The zone's users as the host reads them (tests add and remove Agents here).
+    pub users: Arc<StaticUsers>,
     /// The owner's station.
     pub station: Arc<Station>,
     pub state: AppState,
@@ -124,6 +129,15 @@ impl crate::contacts::Contacts for SharedContacts {
     }
 }
 
+struct SharedUsers(Arc<StaticUsers>);
+
+#[async_trait::async_trait]
+impl crate::users::UserSource for SharedUsers {
+    async fn load(&self) -> Result<Vec<ZoneUser>, String> {
+        self.0.load().await
+    }
+}
+
 struct UserSetup {
     contacts: Arc<StaticContacts>,
     settings: Option<UserSettings>,
@@ -131,6 +145,18 @@ struct UserSetup {
 }
 
 pub fn build(cfg: StandaloneConfig, data_dir: &Path, config_dir: Option<&Path>, model: Option<Arc<dyn ModelClient>>) -> HsResult<Standalone> {
+    let chunks: Arc<dyn ChunkStore> = Arc::new(FsChunkStore { dir: data_dir.join("chunks") });
+    build_with_store(cfg, data_dir, config_dir, model, chunks)
+}
+
+/// As [`build`], with file contents in `chunks` (a named store in retention tests).
+pub fn build_with_store(
+    cfg: StandaloneConfig,
+    data_dir: &Path,
+    config_dir: Option<&Path>,
+    model: Option<Arc<dyn ModelClient>>,
+    chunks: Arc<dyn ChunkStore>,
+) -> HsResult<Standalone> {
     std::fs::create_dir_all(data_dir).map_err(|e| HsError::Internal(format!("data dir: {e}")))?;
     let pem = match (&cfg.private_key_pem, &cfg.private_key_file) {
         (Some(pem), _) => pem.clone(),
@@ -151,6 +177,7 @@ pub fn build(cfg: StandaloneConfig, data_dir: &Path, config_dir: Option<&Path>, 
         did: cfg.owner.clone(),
         name: cfg.owner_name.clone().unwrap_or_else(|| "Owner".into()),
         zone_feed_writer: true,
+        agent: None,
     }];
     let owner_contacts = Arc::new(StaticContacts(Mutex::new(cfg.contacts.clone())));
     let mut setups: HashMap<String, UserSetup> = HashMap::new();
@@ -163,7 +190,8 @@ pub fn build(cfg: StandaloneConfig, data_dir: &Path, config_dir: Option<&Path>, 
             user: u.user.clone(),
             did: u.did.clone(),
             name: u.name.clone().unwrap_or_else(|| u.user.clone()),
-            zone_feed_writer: u.zone_feed_writer.unwrap_or(true),
+            zone_feed_writer: u.zone_feed_writer.unwrap_or(u.agent.is_none()),
+            agent: u.agent.clone(),
         });
         setups.insert(u.user.clone(), UserSetup { contacts: Arc::new(StaticContacts(Mutex::new(u.contacts.clone()))), settings: u.settings.clone(), collector: u.collector });
     }
@@ -201,7 +229,6 @@ pub fn build(cfg: StandaloneConfig, data_dir: &Path, config_dir: Option<&Path>, 
         template.comment_sync_interval = Duration::from_secs(v);
     }
 
-    let chunks: Arc<dyn ChunkStore> = Arc::new(FsChunkStore { dir: data_dir.join("chunks") });
     let users_dir = data_dir.join("users");
     let setups = Arc::new(setups);
     let builder = {
@@ -226,6 +253,7 @@ pub fn build(cfg: StandaloneConfig, data_dir: &Path, config_dir: Option<&Path>, 
             station_cfg.owner_name = user.name.clone();
             station_cfg.user = user.user.clone();
             station_cfg.collector = setup.is_some_and(|s| s.collector);
+            station_cfg.agent = user.agent.clone();
             Ok(Station::new(station_cfg, db, signer.clone(), directory.clone(), cached, chunks.clone(), model.clone()))
         })
     };
@@ -235,7 +263,8 @@ pub fn build(cfg: StandaloneConfig, data_dir: &Path, config_dir: Option<&Path>, 
     host_cfg.default_feed = cfg.default_feed.clone();
     host_cfg.zone_feed_writers = cfg.zone_feed_writers.clone();
     host_cfg.start_workers = cfg.workers.unwrap_or(true);
-    let registry = Arc::new(UserRegistry::new(Box::new(StaticUsers(Mutex::new(zone_users.clone()))), Duration::from_secs(3600)));
+    let static_users = Arc::new(StaticUsers(Mutex::new(zone_users.clone())));
+    let registry = Arc::new(UserRegistry::new(Box::new(SharedUsers(static_users.clone())), Duration::from_millis(0)));
     let auth = Arc::new(StaticTokens { tokens: cfg.tokens.clone() });
     let zone_feed = ZoneFeed::open(&data_dir.join("zone.db"))?;
     let host = Host::new(host_cfg, directory, auth, registry, zone_feed, builder);
@@ -250,6 +279,7 @@ pub fn build(cfg: StandaloneConfig, data_dir: &Path, config_dir: Option<&Path>, 
     Ok(Standalone {
         state: AppState { host: host.clone() },
         host,
+        users: static_users,
         station: station.expect("owner station"),
         contacts: owner_contacts,
         user_contacts,

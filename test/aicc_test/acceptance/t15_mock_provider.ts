@@ -10,9 +10,12 @@ import {
   type ProviderProtocolContract,
   validateProviderAuxiliaryRequest,
   validateProviderRequest,
+  videoScenarioOf,
 } from "./provider_protocol_contracts.ts";
 
 const openrouterDecisionCatalog = JSON.parse(readFileSync(new URL("./fixtures/openrouter-jev-models.json", import.meta.url), "utf8")) as {data: Array<Record<string, unknown>>};
+// The official `/videos/models` entries of the OpenRouter video models in the catalog.
+const openrouterVideoCatalog = JSON.parse(readFileSync(new URL("./fixtures/openrouter-video-models.json", import.meta.url), "utf8")) as {data: Array<Record<string, unknown>>};
 
 type Selection = { provider_driver: string; contract_id: string; api_type?: string; scenario: string; selection_seed?: string };
 type DiscoveryContract = {
@@ -334,10 +337,10 @@ function discoveryFixture(
             ...(provider.official_first_party_model_ids?.["image.img2img"]?.includes(id)
               ? ["ImageToImage"]
               : []),
-            ...(provider.official_first_party_model_ids?.["video.txt2video"]?.includes(id)
+            ...(provider.official_first_party_model_ids?.["video.generate"]?.includes(id)
               ? ["MultimodalToVideo"]
               : []),
-            ...(provider.official_first_party_model_ids?.["video.video2video"]?.includes(id)
+            ...(provider.official_first_party_model_ids?.["video.edit"]?.includes(id)
               ? ["VideoEditing"]
               : []),
             ...(provider.official_first_party_model_ids?.["video.extend"]?.includes(id)
@@ -357,18 +360,46 @@ function discoveryFixture(
         : {}),
       ...(provider.provider_driver === "openrouter"
         ? {
-          ...(openrouterDecisionCatalog.data.find(model => model.id === id) ?? {canonical_slug: id}),
+          ...(openrouterDecisionCatalog.data.find(model => model.id === id) ?? {
+            canonical_slug: openrouterVideoCatalog.data.find((model) => model.id === id)?.canonical_slug ?? id,
+          }),
           supported_parameters: id.startsWith("cohere/rerank-") ? ["top_n"] : [],
           architecture: {
-            input_modalities: ["text"],
-            output_modalities: id === "typesafe/jev-1.13" ? ["decisions"] : id.startsWith("cohere/rerank-")
+            input_modalities: openrouterVideoCatalog.data.some((model) => model.id === id)
+              ? ["text", "image"]
+              : provider.official_first_party_model_ids?.["audio.asr"]?.includes(id)
+              ? ["audio"]
+              : provider.official_first_party_model_ids?.["audio.music"]?.includes(id) ||
+                  provider.official_first_party_model_ids?.["image.img2img"]?.includes(id) ||
+                  provider.official_first_party_model_ids?.["vision.ocr"]?.includes(id) ||
+                  provider.official_first_party_model_ids?.["vision.caption"]?.includes(id)
+              ? ["text", "image"]
+              : ["text"],
+            output_modalities: id === "typesafe/jev-1.13" ? ["decisions"] : openrouterVideoCatalog.data.some((model) => model.id === id)
+              ? ["video"]
+              : id.startsWith("cohere/rerank-")
               ? ["rerank"]
-              : id.includes("embedding")
+              : provider.official_first_party_model_ids?.["embedding.text"]?.includes(id)
               ? ["embeddings"]
+              : provider.official_first_party_model_ids?.["audio.tts"]?.includes(id)
+              ? ["speech"]
+              : provider.official_first_party_model_ids?.["audio.asr"]?.includes(id)
+              ? ["transcription"]
+              : provider.official_first_party_model_ids?.["audio.music"]?.includes(id)
+              ? ["text", "audio"]
+              : provider.official_first_party_model_ids?.["video.generate"]?.includes(id)
+              ? ["video"]
+              : provider.official_first_party_model_ids?.["image.txt2img"]?.includes(id) ||
+                  provider.official_first_party_model_ids?.["image.img2img"]?.includes(id)
+              ? ["image"]
               : ["text"],
           },
-          pricing: id === "typesafe/jev-1.13" ? {prompt:"0.000000042",completion:"0"} : null,
-          expiration_date: null,
+          pricing: id === "typesafe/jev-1.13"
+            ? { prompt: "0.000000042", completion: "0" }
+            : id === "z-ai/glm-5.2"
+            ? { prompt: "0.000000037", completion: "0.000007" }
+            : null,
+          expiration_date: id === "z-ai/glm-4.7" ? "2026-12-31" : null,
         }
         : {}),
     })),
@@ -635,6 +666,30 @@ export function createT15MockHandler(
         );
       }
       if (
+        discoveryProvider?.provider_driver === "openrouter" &&
+        url.pathname === "/api/v1/videos/models" && request.method === "GET"
+      ) {
+        const authValue = request.headers.authorization;
+        const value = Array.isArray(authValue) ? authValue[0] : authValue;
+        const errors = value?.startsWith("Bearer ") && value.length > 7
+          ? []
+          : ["missing or invalid header authentication authorization"];
+        requests.push({
+          received_at: new Date().toISOString(),
+          selection: selection!,
+          method: request.method,
+          pathname: url.pathname,
+          query: Object.fromEntries(url.searchParams),
+          headers: safeHeaders(request.headers),
+          body: null,
+          validation_errors: errors,
+        });
+        if (errors.length > 0) {
+          return json(response, 401, { error: { code: 401, message: "invalid discovery credential" } });
+        }
+        return json(response, 200, { data: openrouterVideoCatalog.data });
+      }
+      if (
         selectedProvider && request.method === "GET" &&
         url.pathname.endsWith("/models")
       ) {
@@ -677,6 +732,86 @@ export function createT15MockHandler(
         });
         return validation.errors;
       };
+
+      if (contract.async_protocol === "gemini_interactions") {
+        const interactionPath =
+          "/v1beta/interactions/interaction_background_mock_1";
+        if (url.pathname === interactionPath && request.method === "GET") {
+          const prior = requests.filter((captured) =>
+            captured.selection.contract_id === selection!.contract_id &&
+            captured.pathname === url.pathname && captured.method === "GET"
+          );
+          const step = prior.length === 0 ? "poll" : "result";
+          const errors = captureAuxiliary(step);
+          if (errors.length > 0) {
+            return json(response, 400, {
+              type: "t15_mock_contract_violation",
+              errors,
+            });
+          }
+          if (selection.scenario === "async_failed") {
+            return json(response, 200, {
+              id: "interaction_background_mock_1",
+              status: "failed",
+              error: { code: "provider_error", message: "mock decode failed" },
+            });
+          }
+          if (
+            selection.scenario === "async_poll_timeout" ||
+            selection.scenario === "async_cancel"
+          ) {
+            return json(response, 200, {
+              id: "interaction_background_mock_1",
+              status: "in_progress",
+            });
+          }
+          const result = structuredClone(
+            contract.async_result_fixture ?? {},
+          ) as Record<string, unknown>;
+          const structuredText: Record<string, string> = {
+            "vision.ocr": JSON.stringify({
+              text: "BUCKYOS-AICC-4827",
+              pages: [{ page_index: 0, width: 1, height: 1, blocks: [] }],
+            }),
+            "vision.detect": JSON.stringify({
+              boxes: [{ box_2d: [100, 200, 800, 900], label: "marker" }],
+            }),
+            "vision.segment": JSON.stringify({
+              boxes: [{
+                box_2d: [100, 200, 800, 900],
+                mask: [[200, 100], [900, 100], [900, 800]],
+                label: "marker",
+              }],
+            }),
+          };
+          const text = selection.api_type
+            ? structuredText[selection.api_type]
+            : undefined;
+          if (text) {
+            result.steps = [{
+              type: "model_output",
+              content: [{ type: "text", text }],
+            }];
+          }
+          return json(response, 200, result);
+        }
+        if (
+          url.pathname === `${interactionPath}/cancel` &&
+          request.method === "POST"
+        ) {
+          const errors = captureAuxiliary("cancel");
+          if (errors.length > 0) {
+            return json(response, 400, {
+              type: "t15_mock_contract_violation",
+              errors,
+            });
+          }
+          return json(response, 200, {
+            id: "interaction_background_mock_1",
+            status: "cancelled",
+          });
+        }
+      }
 
       if (contract.async_protocol === "fal_queue") {
         if (
@@ -1091,6 +1226,48 @@ export function createT15MockHandler(
         response.end(Buffer.from("mock-video"));
         return;
       }
+      const openrouterJob = contract.async_protocol === "openrouter_video" &&
+          request.method === "GET"
+        ? /^\/api\/v1\/videos\/(gen-vid-[^/]+)(\/content)?$/.exec(url.pathname)
+        : null;
+      if (openrouterJob) {
+        const errors = captureAuxiliary();
+        if (errors.length > 0) {
+          return json(response, 400, {
+            type: "t15_mock_contract_violation",
+            errors,
+          });
+        }
+        const [, jobId, content] = openrouterJob;
+        if (content) {
+          if (selection.scenario === "async_artifact_unavailable") {
+            return json(response, 410, {
+              error: { code: 410, message: "Video output is no longer available" },
+            });
+          }
+          response.writeHead(200, { "content-type": "video/mp4" });
+          response.end(Buffer.from("mock-video"));
+          return;
+        }
+        const status = selection.scenario === "async_failed"
+          ? "failed"
+          : selection.scenario === "async_poll_timeout"
+          ? "in_progress"
+          : "completed";
+        return json(response, 200, {
+          id: jobId,
+          generation_id: jobId,
+          polling_url: `/api/v1/videos/${jobId}`,
+          status,
+          ...(status === "failed" ? { error: "Mock upstream generation failed" } : {}),
+          ...(status === "completed"
+            ? {
+              unsigned_urls: [`http://${request.headers.host}/api/v1/videos/${jobId}/content?index=0`],
+              usage: { cost: 0.65, is_byok: false },
+            }
+            : {}),
+        });
+      }
       if (url.pathname === "/v1/files/retrieve" && request.method === "GET") {
         if (contract.async_protocol === "minimax_video") {
           const errors = captureAuxiliary();
@@ -1169,6 +1346,7 @@ export function createT15MockHandler(
             contract,
             captured,
             selection.api_type ?? contract.api_types[0],
+            videoScenarioOf(selection.selection_seed ?? ""),
           );
           requests.push({
             received_at: new Date().toISOString(),
@@ -1286,12 +1464,83 @@ export function createT15MockHandler(
         contract,
         captured,
         selection.api_type ?? contract.api_types[0],
+        videoScenarioOf(selection.selection_seed ?? ""),
       );
       if (
         selection.provider_driver === "qwen" &&
         selection.contract_id === "qwen.responses.compatible-v1"
       ) {
         validationErrors.push(...qwenResponsesVideoErrors(parsedBody));
+      }
+      if (
+        selection.provider_driver === "google-gemini" &&
+        ["vision.detect", "vision.segment"].includes(selection.api_type ?? "") &&
+        typeof parsedBody === "object" && parsedBody !== null
+      ) {
+        const body = parsedBody as Record<string, unknown>;
+        const format = body.response_format as Record<string, unknown> | undefined;
+        const schema = format?.schema as Record<string, unknown> | undefined;
+        const properties = schema?.properties as Record<string, unknown> | undefined;
+        const boxes = properties?.boxes as Record<string, unknown> | undefined;
+        const item = boxes?.items as Record<string, unknown> | undefined;
+        const itemProperties = item?.properties as Record<string, unknown> | undefined;
+        const required = Array.isArray(item?.required) ? item.required : [];
+        const expectedFields = selection.api_type === "vision.detect"
+          ? ["box_2d", "label"]
+          : ["box_2d", "mask", "label"];
+        if (
+          format?.type !== "text" || format?.mime_type !== "application/json" ||
+          schema?.type !== "object" || boxes?.type !== "array" ||
+          !expectedFields.every((field) =>
+            field in (itemProperties ?? {}) && required.includes(field)
+          ) ||
+          (selection.api_type === "vision.detect" &&
+            ("mask" in (itemProperties ?? {}) || required.includes("mask")))
+        ) {
+          validationErrors.push(
+            selection.api_type === "vision.detect"
+              ? "Gemini detection requests require boxes with box_2d and label only"
+              : "Gemini segmentation requests require boxes with box_2d, mask, and label",
+          );
+        }
+      }
+      if (
+        selection.provider_driver === "google-gemini" &&
+        selection.contract_id === "gemini.batch-embed-contents.v1beta" &&
+        typeof parsedBody === "object" && parsedBody !== null
+      ) {
+        const requests = (parsedBody as Record<string, unknown>).requests;
+        if (
+          !Array.isArray(requests) || requests.length === 0 ||
+          requests.some((entry) => {
+            if (typeof entry !== "object" || entry === null) return true;
+            const request = entry as Record<string, unknown>;
+            const content = request.content as Record<string, unknown> | undefined;
+            return typeof request.model !== "string" ||
+              !request.model.startsWith("models/") ||
+              !Array.isArray(content?.parts);
+          })
+        ) {
+          validationErrors.push(
+            "Gemini batch embeddings require model-qualified EmbedContentRequest entries",
+          );
+        }
+      }
+      if (
+        selection.provider_driver === "google-gemini" &&
+        (selection.api_type ?? "").startsWith("video.") &&
+        typeof parsedBody === "object" && parsedBody !== null
+      ) {
+        const body = parsedBody as Record<string, unknown>;
+        const format = body.response_format as Record<string, unknown> | undefined;
+        if (
+          format?.duration !== undefined &&
+          (typeof format.duration !== "string" || !/^\d+(?:\.\d+)?s$/.test(format.duration))
+        ) {
+          validationErrors.push(
+            "Gemini video response_format.duration must use the official seconds string",
+          );
+        }
       }
       if (
         ["doubao", "doubao-agent-plan"].includes(selection.provider_driver) &&
@@ -1385,14 +1634,26 @@ export function createT15MockHandler(
         return;
       }
       if (contract.success_chunk_fixtures?.length) {
+        const contentType = contract.success_content_type ?? "text/plain";
         response.writeHead(200, {
-          "content-type": contract.success_content_type ?? "text/plain",
+          "content-type": contentType,
         });
-        response.end(
-          contract.success_chunk_fixtures.map((fixture) =>
-            JSON.stringify(fixture)
-          ).join("\n") + "\n",
-        );
+        const fixtures = structuredClone(contract.success_chunk_fixtures);
+        for (const expansion of contract.success_chunk_string_expansions ?? []) {
+          let target: unknown = fixtures[expansion.chunk_index];
+          for (const segment of expansion.path.slice(0, -1)) {
+            target = (target as Record<string | number, unknown>)[segment];
+          }
+          const leaf = expansion.path.at(-1);
+          if (leaf !== undefined) {
+            (target as Record<string | number, unknown>)[leaf] =
+              expansion.value.repeat(expansion.repeat);
+          }
+        }
+        const chunks = fixtures.map((fixture) => JSON.stringify(fixture));
+        response.end(contentType === "text/event-stream"
+          ? chunks.map((chunk) => `data: ${chunk}\n\n`).join("") + "data: [DONE]\n\n"
+          : chunks.join("\n") + "\n");
         return;
       }
       const rawFixture = structuredClone(
@@ -1401,8 +1662,10 @@ export function createT15MockHandler(
           : contract.success_fixture ?? {},
       ) as Record<string, unknown>;
       if (
-        selection.provider_driver === "openai" &&
-        contract.id === "openai.responses.v1" &&
+        ((selection.provider_driver === "openai" &&
+          contract.id === "openai.responses.v1") ||
+          (selection.provider_driver === "openrouter" &&
+            contract.id === "openrouter.responses.v1")) &&
         ["image.txt2img", "image.img2img"].includes(selection.api_type ?? "")
       ) {
         rawFixture.output = [{
@@ -1424,24 +1687,16 @@ export function createT15MockHandler(
             pages: [{ page_index: 0, width: 1, height: 1, blocks: [] }],
           }),
           "vision.detect": JSON.stringify({
-            detections: [{
+            boxes: [{
+              box_2d: [100, 200, 800, 900],
               label: "marker",
-              score: 1,
-              bbox: {
-                format: "xywh",
-                unit: "relative",
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-              },
             }],
           }),
           "vision.segment": JSON.stringify({
-            masks: [{
-              id: "mask-1",
-              score: 1,
-              mask: { format: "polygon", points: [[0, 0], [1, 0], [1, 1]] },
+            boxes: [{
+              box_2d: [100, 200, 800, 900],
+              mask: [[200, 100], [900, 100], [900, 800]],
+              label: "marker",
             }],
           }),
         };

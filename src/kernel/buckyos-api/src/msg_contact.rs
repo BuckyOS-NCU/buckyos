@@ -8,8 +8,9 @@
 //! at every moment.
 //!
 //! Tags group contacts. A tag is a system tag ([`CONTACT_TAG_ZONE_USER`],
-//! [`CONTACT_TAG_ZONE_AGENT`]), an app tag (`<app>.<name>`, written only by
-//! that app) or a user tag (anything else).
+//! [`CONTACT_TAG_ZONE_AGENT`], or a user group reference `type:<user type>` /
+//! `group:<id>` naming the source group of a projected Zone user), an app tag
+//! (`<app>.<name>`, written only by that app) or a user tag (anything else).
 
 use name_lib::DID;
 use serde::{Deserialize, Serialize};
@@ -46,8 +47,12 @@ pub const METHOD_CONTACT_RESPOND_FRIEND_REQUEST: &str = "contact.respond_friend_
 pub const METHOD_CONTACT_CANCEL_FRIEND_REQUEST: &str = "contact.cancel_friend_request";
 pub const METHOD_CONTACT_REMOVE_FRIEND: &str = "contact.remove_friend";
 pub const METHOD_CONTACT_LIST_FRIEND_REQUESTS: &str = "contact.list_friend_requests";
+/// Service-only: is a DID in one of an owner's contact groups (T-5).
+pub const METHOD_CONTACT_CHECK_MEMBERSHIP: &str = "contact.check_membership";
+/// RBAC resource a service needs (`read`) for [`METHOD_CONTACT_CHECK_MEMBERSHIP`].
+pub const CONTACT_MEMBERSHIP_RBAC_RESOURCE: &str = "obj://msg-center/contact_membership";
 
-pub const CONTACT_EXT_METHODS: [&str; 9] = [
+pub const CONTACT_EXT_METHODS: [&str; 10] = [
     METHOD_CONTACT_LOOKUP,
     METHOD_CONTACT_UPDATE_TAGS,
     METHOD_CONTACT_REMOVE_CONTACT,
@@ -57,6 +62,7 @@ pub const CONTACT_EXT_METHODS: [&str; 9] = [
     METHOD_CONTACT_CANCEL_FRIEND_REQUEST,
     METHOD_CONTACT_REMOVE_FRIEND,
     METHOD_CONTACT_LIST_FRIEND_REQUESTS,
+    METHOD_CONTACT_CHECK_MEMBERSHIP,
 ];
 
 /// The friendship between the owner and a contact, as the owner's side knows it.
@@ -118,7 +124,11 @@ pub const WELL_KNOWN_CONTACT_TAGS: [WellKnownContactTag; 3] = [
 /// `zone_user` / `zone_agent` are system tags; `<app>.<name>` with a
 /// lowercase ASCII `app` is an app tag; anything else is a user tag.
 pub fn contact_tag_kind(tag: &str) -> ContactTagKind {
-    if tag == CONTACT_TAG_ZONE_USER || tag == CONTACT_TAG_ZONE_AGENT {
+    if tag == CONTACT_TAG_ZONE_USER
+        || tag == CONTACT_TAG_ZONE_AGENT
+        || tag.starts_with(crate::USER_GROUP_REF_PREFIX)
+        || tag.starts_with(crate::USER_TYPE_GROUP_REF_PREFIX)
+    {
         return ContactTagKind::System;
     }
     if contact_tag_app(tag).is_some() {
@@ -131,8 +141,9 @@ pub fn contact_tag_kind(tag: &str) -> ContactTagKind {
 pub fn contact_tag_app(tag: &str) -> Option<&str> {
     let (app, rest) = tag.split_once('.')?;
     let ident = |s: &str, extra: char| {
-        s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == extra)
+        s.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == extra
+        })
     };
     let valid = !app.is_empty()
         && !rest.is_empty()
@@ -291,6 +302,20 @@ pub struct ContactUpdateTagsReq {
     pub remove: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_mgr_owner: Option<DID>,
+}
+
+/// Exact match on the authenticated `did` (no alias / merge resolution);
+/// projected Zone users count with their source group tags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactCheckMembershipReq {
+    pub owner: DID,
+    pub did: DID,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactCheckMembershipResult {
+    pub member: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,7 +538,10 @@ pub fn contact_changed_event_id(owner: &DID) -> String {
 }
 
 /// The machine data of a friend message, if `content` carries one.
-pub fn friend_message_data(machine_intent: Option<&str>, data: &Value) -> Option<FriendMessageData> {
+pub fn friend_message_data(
+    machine_intent: Option<&str>,
+    data: &Value,
+) -> Option<FriendMessageData> {
     if machine_intent != Some(FRIEND_INTENT) {
         return None;
     }
@@ -532,7 +560,10 @@ mod tests {
             contact_tag_kind(CONTACT_TAG_HOMESTATION_FOLLOWING),
             ContactTagKind::App
         );
-        assert_eq!(contact_tag_app("homestation.following"), Some("homestation"));
+        assert_eq!(
+            contact_tag_app("homestation.following"),
+            Some("homestation")
+        );
         for user in ["家人", "Team A", "a.", ".x", "Work.Friends", "v1.2 notes"] {
             assert_eq!(contact_tag_kind(user), ContactTagKind::User, "{user}");
         }

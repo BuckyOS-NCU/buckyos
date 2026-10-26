@@ -44,9 +44,7 @@ use super::live::{
     try_fill, InputBatch,
 };
 use super::goal::Gate;
-use super::outcome::{
-    finish_run, handle_context_outcome, perception_window_records, FinishKind, Next,
-};
+use super::outcome::{finish_run, handle_context_outcome, FinishKind, Next};
 use super::receipts::internal_task_key;
 use super::reconcile::{reconcile_runs, Reconciled};
 use super::shared::{commit_and_report, report, ClosedTurn, LiveCtx, Opened, Shared, WaitingRun};
@@ -142,20 +140,8 @@ async fn drive_locked(
             }
         }
     }
-    match crate::runtime::session_runtime(
-        sd,
-        &session.config,
-        &deps.runtime,
-        deps.agent.agent_root(),
-    ) {
+    match crate::runtime::session_runtime(sd, &session.config, &deps.runtime) {
         Ok(r) => deps.runtime = r,
-        Err(error @ OpenDanError::WorkspaceBindingInvalid(_)) => {
-            return fail_workspace(&mut session, &lease, deps.agent.as_ref(), &error).await;
-        }
-        Err(error) if session.config.workspace_binding.is_some() => {
-            let error = OpenDanError::WorkspaceBindingInvalid(error.to_string());
-            return fail_workspace(&mut session, &lease, deps.agent.as_ref(), &error).await;
-        }
         Err(e) => return DriveResult::BindFailed { error: e.to_json() },
     }
     // A finished session that takes no more input gave its queue back.
@@ -190,6 +176,8 @@ async fn drive_locked(
         agent_root: deps.agent.agent_root().map(|p| p.to_path_buf()),
         dir: sd.clone(),
         kind_lease: Mutex::new(None),
+        goal_caps: Mutex::new(None),
+        memory: Mutex::new(None),
         workspace_lease: Mutex::new(None),
         workspace_failure: Mutex::new(None),
         tasks: Mutex::new(None),
@@ -200,6 +188,7 @@ async fn drive_locked(
         external_stop_applied: AtomicBool::new(false),
         behavior_functions: Default::default(),
     });
+    super::live_tasks::register(sd.sid(), &sh);
     let r = Box::pin(drive_inner(&sh, until)).await;
     let failure = sh
         .workspace_failure
@@ -231,6 +220,10 @@ async fn drive_locked(
         Err(OpenDanError::Busy { holder, .. }) => DriveResult::Busy { holder },
         Err(OpenDanError::RunBusy { run_id }) => DriveResult::RunBusy { run_id },
         Err(OpenDanError::LeaseLost(_)) => DriveResult::LeaseLost,
+        Err(e @ OpenDanError::Bind(_)) => {
+            record_error(&sh, &e).await;
+            DriveResult::BindFailed { error: binding_error(&e).await }
+        }
         Err(e) => {
             record_error(&sh, &e).await;
             DriveResult::Error {
@@ -239,6 +232,18 @@ async fn drive_locked(
             }
         }
     }
+}
+
+async fn binding_error(error: &OpenDanError) -> Value {
+    let mut detail = error.to_json();
+    if matches!(error, OpenDanError::Bind(_)) {
+        if let Ok(runtime) = buckyos_api::get_buckyos_api_runtime() {
+            if runtime.get_authentication_status().await.state == buckyos_api::RuntimeAuthState::RetryPending {
+                detail["recoverable"] = Value::Bool(true);
+            }
+        }
+    }
+    detail
 }
 
 async fn fail_workspace(
@@ -612,6 +617,9 @@ async fn catch_up(sh: &Arc<Shared>) -> Result<()> {
     };
     if reported < status.rev {
         report(sh, status).await;
+    }
+    if !super::consolidation::caps(sh).records_perception {
+        return Ok(());
     }
     let last = sh.agent().perception().last_seq(&sid).await?;
     if last < perception_seq {
@@ -1336,13 +1344,16 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
         .config
         .behaviors()
         .map_err(OpenDanError::InvalidArgument)?;
-    // Kind leases: one consolidation at a time for the whole agent.
-    let kind = sh.session.lock().await.config.session.kind;
-    let _kind_lease = if kind == SessionKind::SelfImprove {
+    // The consolidation lease: one consolidation at a time for the whole
+    // agent, held by the drive of the Goal Session whose Goal has the
+    // `memory_consolidation` capability (released with the drive, so it is
+    // never held while the session waits).
+    let caps = super::consolidation::load_caps(sh).await?;
+    let _kind_lease = if caps.consolidation {
         match sh
             .agent()
             .locks()
-            .acquire("self_improve", sh.deps.holder())?
+            .acquire(crate::memory::CONSOLIDATION_LEASE, sh.deps.holder())?
         {
             Acquire::Acquired(l) => Some(Arc::new(l)),
             Acquire::Busy(info) => {
@@ -1370,7 +1381,7 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
             &sh.lease,
             sh.deps.runtime.as_ref(),
             &cfg,
-            sh.agent_root.as_deref(),
+            sh.agent(),
             &sh.deps.app_tools,
             &plan,
             &sh.deps.runner_id,
@@ -1379,13 +1390,11 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
         let binding = match bound {
             Ok(b) => b,
             Err(e @ (OpenDanError::Bind(_) | OpenDanError::RuntimeMismatch { .. })) => {
-                if cfg.workspace_binding.is_some() {
-                    return Err(OpenDanError::WorkspaceBindingInvalid(e.to_string()));
-                }
+                let error = binding_error(&e).await;
                 let mut s = sh.session.lock().await;
-                s.state.last_error = Some(e.to_json());
+                s.state.last_error = Some(error.clone());
                 commit_and_report(sh, &mut s).await?;
-                return Ok(DriveResult::BindFailed { error: e.to_json() });
+                return Ok(DriveResult::BindFailed { error });
             }
             Err(e) => return Err(e),
         };
@@ -1399,6 +1408,7 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
                 input_queue: s.config.channels.kmsg().map(|(_, q, _)| q.to_string()),
                 trace_id: s.sid().to_string(),
                 cmd_skills: crate::runtime::frozen_cmd_skills(&s.config),
+                workspace: s.config.workspace_binding.clone(),
                 extra_env: s
                     .config
                     .runtime
@@ -1445,6 +1455,13 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
     // publish yet is published first.
     Box::pin(super::goal::load(sh)).await?;
     Box::pin(super::goal::flush(sh)).await;
+    // The consolidation Goal's mechanical work: unfinished receipts, the
+    // sweep and the cleanup, before any input and without a model.
+    if caps.consolidation {
+        if let Err(e) = Box::pin(super::consolidation::maintain(sh)).await {
+            log::warn!("memory maintenance of {}: {e}", sh.dir.sid());
+        }
+    }
     // Replies committed and not handed over yet (a crash after the commit,
     // a sink that was not reachable).
     super::outbound::flush_outbox(sh).await;
@@ -1739,16 +1756,17 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
                 input: InputView::new(hook, now_ms, items),
                 hints,
                 active,
-                runtime_status: serde_json::to_value(sh.deps.runtime.info().await?)
-                    .unwrap_or_default(),
-                now_ms,
-                perceptions: if !state.bootstrap_done
-                    && cfg.session.kind == SessionKind::SelfImprove
-                {
-                    perception_window_records(sh, &cfg).await?
-                } else {
-                    Vec::new()
+                runtime_status: {
+                    let mut status = serde_json::to_value(sh.deps.runtime.info().await?)
+                        .unwrap_or_default();
+                    if let (Some(o), Some(w)) =
+                        (status.as_object_mut(), crate::runtime::workspace_view(&cfg))
+                    {
+                        o.insert("workspace".into(), w);
+                    }
+                    status
                 },
+                now_ms,
                 todos: None,
                 current_todo: super::todos::current(sh),
                 background: Vec::new(),

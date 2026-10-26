@@ -26,7 +26,7 @@ AUTH_REJECTION_TOKENS = {
     "missing_owner": "eyJhbGciOiJFZERTQSIsImtpZCI6InZlcmlmeS1odWIifQ.eyJpc3MiOiJ2ZXJpZnktaHViIiwiYXBwaWQiOiJmaWxlYnJvd3NlciIsInN1YiI6ImRlYnVnLXVzZXIiLCJleHAiOjIwNTg4Mzg5MzksInByaW5jaXBhbF9raW5kIjoidXNlciIsInRva2VuX3VzZSI6InNlc3Npb24iLCJ0YXJnZXRfa2luZCI6ImFwcCIsImFwcF9pbnN0YW5jZV9pZCI6ImZpbGVicm93c2VyQGFsaWNlIn0.TNLxnk9X4A9LqXek_uVhBJmi6PR92P-KH88PKwL8M-RLtPlgcvBAS55NcrNi2XpMXoCgba7Vnvha8UFM0kcPBg",
 }
 ROUTE_REJECTION_CASES = ("mixed_fields", "missing_owner", "mismatched_instance")
-SSO_SERVICE_PATHS = ("/sso_refresh", "/sso_logout")
+SSO_SERVICE_PATHS = ("/sso_refresh", "/sso_logout", "/sso/did_callback")
 
 
 def resolve_buckyos_root() -> Path:
@@ -118,6 +118,9 @@ def build_typical_node_gateway_info(*, remote_app: bool) -> dict:
             },
             "kevent": {
                 "selector": build_selector(("ood1", 10165, 10)),
+            },
+            "nfs-server": {
+                "selector": build_selector(("ood1", 4110, 10)),
             },
         },
         "node_route_map": {
@@ -274,8 +277,9 @@ def run_sso_service_route_case(binary: Path, config: Path, path: str) -> bool:
         "id": "server:node_gateway:main",
         "output": ["REQ", "RESP"],
     }
+    case_name = f"req_{path.removeprefix('/').replace('/', '_')}"
     with tempfile.TemporaryDirectory(prefix="boot-gateway-sso-req-") as request_dir:
-        req_file = Path(request_dir) / f"req_{path.removeprefix('/')}.json"
+        req_file = Path(request_dir) / f"{case_name}.json"
         req_file.write_text(json.dumps(request), encoding="utf-8")
         result = run_debug(
             binary, config, build_typical_node_gateway_info(remote_app=False), req_file
@@ -284,9 +288,9 @@ def run_sso_service_route_case(binary: Path, config: Path, path: str) -> bool:
         {"return", "exit"}, expected_substring="tcp:///127.0.0.1:10262"
     )(result)
     if not passed:
-        print(f"  FAIL req_{path.removeprefix('/')}_no_cookie: {message}")
+        print(f"  FAIL {case_name}_no_cookie: {message}")
         return False
-    print(f"  PASS req_{path.removeprefix('/')}_no_cookie")
+    print(f"  PASS {case_name}_no_cookie")
     return True
 
 
@@ -349,6 +353,8 @@ def request_header_equals(name, expected_value):
 
 
 def assertions_for_case(case_name: str):
+    if case_name in {"req_service_not_ready_root", "req_service_not_ready_app"}:
+        return [control_matches({"return"}, exact_value="error 503 service_not_ready:aiworkspace")]
     if case_name == "req_agent_worklog_by_kapi_ok":
         return [control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:10032")]
     if case_name == "req_app_public_no_cookie_ok":
@@ -406,7 +412,7 @@ def assertions_for_case(case_name: str):
             request_header_equals("X-Forwarded-Proto", "https"),
         ]
     if case_name == "req_ndm_ok":
-        return [control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:10262")]
+        return [control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:4110")]
     if case_name == "req_service_system_config_identifiers_ok":
         return [control_matches({"return", "exit"}, expected_substring="tcp:///127.0.0.1:3200")]
     if case_name == "req_service_system_config_well_known_ok":

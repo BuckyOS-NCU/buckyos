@@ -3,8 +3,7 @@ use buckyos_api::{
     contact_tag_kind, AccessDecision, AccessGroupLevel, AccountBinding, Contact,
     ContactChangedEvent, ContactPatch, ContactQuery, ContactSource, ContactTagKind, FriendState,
     GrantTemporaryAccessResult, ImportContactEntry, ImportReport, RdbBackend,
-    SetGroupSubscribersResult, TemporaryGrant, TemporaryGrantOutcome, CONTACT_TAG_ZONE_AGENT,
-    CONTACT_TAG_ZONE_USER,
+    SetGroupSubscribersResult, TemporaryGrant, TemporaryGrantOutcome, CONTACT_TAG_ZONE_USER,
 };
 use kRPC::RPCErrors;
 use log::info;
@@ -56,11 +55,72 @@ pub struct ZoneUserContactSeed {
     pub tags: Vec<String>,
 }
 
+/// A Zone user an owner sees through the contact projection rules
+/// (product/users_and_agents/UserType.md): read only, rebuilt on every zone
+/// sync and never written into the owner's own store.
+#[derive(Debug, Clone)]
+pub struct ProjectedContact {
+    pub seed: ZoneUserContactSeed,
+    /// Source group references (`type:<user type>`, `group:<id>`).
+    pub sources: Vec<String>,
+}
+
+/// What each owner's address book adds on top of its own store.
+#[derive(Debug, Clone, Default)]
+pub struct ContactProjection {
+    /// Owner DID -> projected DID -> entry.
+    pub by_owner: HashMap<String, HashMap<DID, ProjectedContact>>,
+    /// Owners that may not change their own address book; they see only the
+    /// projection.
+    pub read_only_owners: HashSet<String>,
+    pub built_at_ms: u64,
+}
+
+impl ContactProjection {
+    fn owner(&self, owner_key: &str) -> Option<&HashMap<DID, ProjectedContact>> {
+        self.by_owner.get(owner_key)
+    }
+
+    fn entry(&self, owner_key: &str, did: &DID) -> Option<&ProjectedContact> {
+        self.owner(owner_key)?.get(did)
+    }
+
+    /// The projected DID bound to a platform account in `owner_key`'s view.
+    fn binding_owner(&self, owner_key: &str, platform: &str, account_id: &str) -> Option<DID> {
+        let key = ContactMgr::binding_key(platform, account_id);
+        self.owner(owner_key)?
+            .values()
+            .find(|entry| {
+                entry
+                    .seed
+                    .bindings
+                    .iter()
+                    .any(|b| ContactMgr::binding_key(&b.platform, &b.account_id) == key)
+            })
+            .map(|entry| entry.seed.did.clone())
+    }
+
+    fn fingerprint(entry: &ProjectedContact) -> String {
+        let mut bindings: Vec<String> = entry
+            .seed
+            .bindings
+            .iter()
+            .map(|b| format!("{}|{}|{}", b.platform, b.account_id, b.display_id))
+            .collect();
+        bindings.sort();
+        format!(
+            "{}|{:?}|{:?}|{:?}|{:?}",
+            entry.seed.name, entry.seed.avatar, entry.seed.note, entry.sources, bindings
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ContactMgr {
     stores: Arc<RwLock<HashMap<String, ContactStore>>>,
     did_seq: Arc<AtomicU64>,
     msg_box_db: MsgBoxDbMgr,
+    projection: Arc<std::sync::RwLock<Arc<ContactProjection>>>,
 }
 
 impl ContactMgr {
@@ -73,12 +133,152 @@ impl ContactMgr {
             stores: Arc::new(RwLock::new(HashMap::new())),
             did_seq: Arc::new(AtomicU64::new(1)),
             msg_box_db,
+            projection: Arc::new(std::sync::RwLock::new(Arc::new(ContactProjection::default()))),
         };
 
         let next_seq = mgr.load_next_did_seq().await?;
         mgr.did_seq.store(next_seq, Ordering::SeqCst);
 
         Ok(mgr)
+    }
+
+    /// Replace the projection and tell viewers which projected entries came,
+    /// changed or went.
+    pub fn set_projection(&self, projection: ContactProjection) {
+        let previous = std::mem::replace(
+            &mut *self.projection.write().unwrap(),
+            Arc::new(projection),
+        );
+        let current = self.projection();
+        let owners: HashSet<&String> = previous
+            .by_owner
+            .keys()
+            .chain(current.by_owner.keys())
+            .collect();
+        for owner_key in owners {
+            let Ok(owner) = DID::from_str(owner_key) else {
+                continue;
+            };
+            let empty = HashMap::new();
+            let before = previous.owner(owner_key).unwrap_or(&empty);
+            let after = current.owner(owner_key).unwrap_or(&empty);
+            let removed: Vec<DID> = before
+                .keys()
+                .filter(|did| !after.contains_key(*did))
+                .cloned()
+                .collect();
+            let upserted: Vec<DID> = after
+                .iter()
+                .filter(|(did, entry)| {
+                    before.get(*did).map(ContactProjection::fingerprint)
+                        != Some(ContactProjection::fingerprint(entry))
+                })
+                .map(|(did, _)| did.clone())
+                .collect();
+            if !removed.is_empty() {
+                Self::publish_changed(Some(&owner), "remove", removed);
+            }
+            if !upserted.is_empty() {
+                Self::publish_changed(Some(&owner), "upsert", upserted);
+            }
+        }
+    }
+
+    pub fn projection(&self) -> Arc<ContactProjection> {
+        self.projection.read().unwrap().clone()
+    }
+
+    /// Is `did` in `owner`'s address book through the projection?
+    pub fn is_projected(&self, owner: Option<&DID>, did: &DID) -> bool {
+        self.projection()
+            .entry(&Self::owner_key(owner), did)
+            .is_some()
+    }
+
+    /// Whether `owner` may change its own address book (unknown owners may).
+    pub fn owner_can_edit(&self, owner: &DID) -> bool {
+        !self
+            .projection()
+            .read_only_owners
+            .contains(&owner.to_string())
+    }
+
+    /// The owner's view of one contact: its own record, completed by the
+    /// projection. Name, avatar and bindings come from the Zone; the owner's
+    /// note, tags and block stay.
+    fn view_of(
+        raw: Option<&Contact>,
+        projected: Option<&ProjectedContact>,
+        built_at_ms: u64,
+    ) -> Option<Contact> {
+        let Some(projected) = projected else {
+            return raw.cloned();
+        };
+        let seed = &projected.seed;
+        let mut contact = raw.cloned().unwrap_or_else(|| {
+            Self::blank_contact_with_source(seed.did.clone(), built_at_ms, ContactSource::Shared)
+        });
+        let name = seed.name.trim();
+        contact.name = if name.is_empty() {
+            seed.did.to_string()
+        } else {
+            name.to_string()
+        };
+        contact.avatar = seed
+            .avatar
+            .as_deref()
+            .map(str::trim)
+            .filter(|avatar| !avatar.is_empty())
+            .map(str::to_string);
+        contact.source = ContactSource::Shared;
+        contact.is_verified = true;
+        contact.friend_state = FriendState::Friend;
+        if contact.access_level != AccessGroupLevel::Block {
+            contact.access_level = AccessGroupLevel::Allow;
+            contact.temp_grants.clear();
+        }
+        if contact.note.is_none() {
+            contact.note = seed
+                .note
+                .as_deref()
+                .map(str::trim)
+                .filter(|note| !note.is_empty())
+                .map(str::to_string);
+        }
+        let mut system_tags = vec![CONTACT_TAG_ZONE_USER.to_string()];
+        system_tags.extend(projected.sources.iter().cloned());
+        contact.tags = Self::merge_string_lists(&contact.tags, system_tags);
+        for binding in seed.bindings.iter().cloned() {
+            Self::upsert_binding(&mut contact, binding);
+        }
+        contact.projected_from = projected.sources.clone();
+        Some(contact)
+    }
+
+    fn view_in_store(&self, store: &ContactStore, owner_key: &str, did: &DID) -> Option<Contact> {
+        let projection = self.projection();
+        Self::view_of(
+            store.contacts.get(did),
+            projection.entry(owner_key, did),
+            projection.built_at_ms,
+        )
+    }
+
+    /// An own record as the owner sees it (completed when projected).
+    fn with_projection(&self, owner_key: &str, contact: Contact) -> Contact {
+        let projection = self.projection();
+        match projection.entry(owner_key, &contact.did) {
+            Some(entry) => Self::view_of(Some(&contact), Some(entry), projection.built_at_ms)
+                .unwrap_or(contact),
+            None => contact,
+        }
+    }
+
+    fn reject_projected(&self, owner_key: &str, did: &DID) -> std::result::Result<(), RPCErrors> {
+        if self.projection().entry(owner_key, did).is_some() {
+            return Err(RPCErrors::NoPermission("projected-contact-read-only".into()));
+        }
+        Ok(())
     }
 
     fn pool(&self) -> &AnyPool {
@@ -173,6 +373,15 @@ impl ContactMgr {
             };
 
             self.save_owner_store(&owner_key, &snapshot).await?;
+            return Ok(did);
+        }
+
+        // A projected Zone user's account resolves to that user, ahead of any
+        // shadow contact of the owner's own store.
+        if let Some(did) = self
+            .projection()
+            .binding_owner(&owner_key, &platform, &account_id)
+        {
             return Ok(did);
         }
 
@@ -275,7 +484,7 @@ impl ContactMgr {
         let store = stores.get(&owner_key).ok_or_else(|| {
             RPCErrors::ReasonError("contact store missing after load".to_string())
         })?;
-        let contact = store.contacts.get(&did).ok_or_else(|| {
+        let contact = self.view_in_store(store, &owner_key, &did).ok_or_else(|| {
             RPCErrors::ReasonError(format!("contact not found for did {}", did.to_string()))
         })?;
 
@@ -344,12 +553,14 @@ impl ContactMgr {
         let store = stores.get(&owner_key).ok_or_else(|| {
             RPCErrors::ReasonError("contact store missing after load".to_string())
         })?;
-        let contact = store.contacts.get(&contact_did).ok_or_else(|| {
-            RPCErrors::ReasonError(format!(
-                "contact not found for did {}",
-                contact_did.to_string()
-            ))
-        })?;
+        let contact = self
+            .view_in_store(store, &owner_key, &contact_did)
+            .ok_or_else(|| {
+                RPCErrors::ReasonError(format!(
+                    "contact not found for did {}",
+                    contact_did.to_string()
+                ))
+            })?;
 
         let mut matches: Vec<&AccountBinding> = contact
             .bindings
@@ -425,6 +636,12 @@ impl ContactMgr {
     ) -> std::result::Result<Option<DID>, RPCErrors> {
         let owner_key = Self::owner_key(owner);
         self.ensure_store_loaded(&owner_key).await?;
+        if let Some(did) = self
+            .projection()
+            .binding_owner(&owner_key, platform, account_id)
+        {
+            return Ok(Some(did));
+        }
         let stores = self.stores.read().await;
         let store = stores.get(&owner_key).ok_or_else(|| {
             RPCErrors::ReasonError("contact store missing after load".to_string())
@@ -504,7 +721,7 @@ impl ContactMgr {
             RPCErrors::ReasonError("contact store missing after load".to_string())
         })?;
         let did = Self::canonical_did_in_store(store, did);
-        let Some(contact) = store.contacts.get(&did) else {
+        let Some(contact) = self.view_in_store(store, &owner_key, &did) else {
             return Ok(AccessDecision {
                 level: AccessGroupLevel::Stranger,
                 allow_delivery: false,
@@ -572,6 +789,13 @@ impl ContactMgr {
     ) -> std::result::Result<AccessDecision, RPCErrors> {
         let owner_key = Self::owner_key(owner.as_ref());
         self.ensure_store_loaded(&owner_key).await?;
+        if self.is_projected(owner.as_ref(), &did) {
+            // Projected Zone users are delivered like friends unless blocked;
+            // nothing of the owner's own record needs cleaning up.
+            return self
+                .peek_access_permission(&did, context_id.as_deref(), owner.as_ref())
+                .await;
+        }
 
         let (decision, snapshot) = {
             let mut stores = self.stores.write().await;
@@ -1051,6 +1275,8 @@ impl ContactMgr {
             let store = stores.get_mut(&owner_key).ok_or_else(|| {
                 RPCErrors::ReasonError("contact store missing after load".to_string())
             })?;
+            self.reject_projected(&owner_key, &target_did)?;
+            self.reject_projected(&owner_key, &source_did)?;
             let now_ms = Self::now_ms();
             let result = Self::merge_contacts_in_store(store, &target_did, &source_did, now_ms)?;
             store.binding_index = Self::rebuild_binding_index(&store.contacts);
@@ -1079,11 +1305,23 @@ impl ContactMgr {
             })?;
             let now_ms = Self::now_ms();
             let did = Self::canonical_did_in_store(store, &did);
+            // A projected Zone user keeps the Zone's name and picture; the
+            // owner may only add a note or decide admission, which lands in
+            // the owner's own record.
+            let projected = self.projection().entry(&owner_key, &did).is_some();
+            if projected
+                && (patch.name.is_some()
+                    || patch.avatar.is_some()
+                    || patch.source.is_some()
+                    || patch.is_verified.is_some())
+            {
+                return Err(RPCErrors::NoPermission("projected-contact-read-only".into()));
+            }
             // Setting an access level is an admission decision about a DID,
             // which may never have been stored (a native sender that only
             // reached the request box), so it creates the record like
             // `block_contact` does. Other edits still require a contact.
-            let contact = if patch.access_level.is_some() {
+            let contact = if patch.access_level.is_some() || projected {
                 Self::ensure_contact_exists(store, did, now_ms, ContactSource::ManualCreate)
             } else {
                 store.contacts.get_mut(&did).ok_or_else(|| {
@@ -1140,7 +1378,7 @@ impl ContactMgr {
 
         self.save_owner_store(&owner_key, &snapshot).await?;
         Self::publish_changed(owner.as_ref(), "upsert", vec![result.did.clone()]);
-        Ok(result)
+        Ok(self.with_projection(&owner_key, result))
     }
 
     pub async fn get_contact(
@@ -1154,7 +1392,7 @@ impl ContactMgr {
         let store = stores.get(&owner_key).ok_or_else(|| {
             RPCErrors::ReasonError("contact store missing after load".to_string())
         })?;
-        Ok(store.contacts.get(&did).cloned())
+        Ok(self.view_in_store(store, &owner_key, &did))
     }
 
     pub async fn list_contacts(
@@ -1169,7 +1407,33 @@ impl ContactMgr {
             RPCErrors::ReasonError("contact store missing after load".to_string())
         })?;
 
-        let mut contacts: Vec<Contact> = store.contacts.values().cloned().collect();
+        let projection = self.projection();
+        let projected = projection.owner(&owner_key);
+        let mut contacts: Vec<Contact> = store
+            .contacts
+            .values()
+            .filter_map(|contact| {
+                Self::view_of(
+                    Some(contact),
+                    projected.and_then(|entries| entries.get(&contact.did)),
+                    projection.built_at_ms,
+                )
+            })
+            .collect();
+        if let Some(projected) = projected {
+            contacts.extend(
+                projected
+                    .iter()
+                    .filter(|(did, _)| !store.contacts.contains_key(*did))
+                    .filter_map(|(_, entry)| {
+                        Self::view_of(None, Some(entry), projection.built_at_ms)
+                    }),
+            );
+        }
+        // An owner that may not change its address book sees the projection only.
+        if projection.read_only_owners.contains(&owner_key) {
+            contacts.retain(|contact| !contact.projected_from.is_empty());
+        }
         if let Some(source) = query.source {
             contacts.retain(|contact| contact.source == source);
         }
@@ -1225,7 +1489,9 @@ impl ContactMgr {
                 contact.tags = Self::merge_string_lists(&contact.tags, add.clone());
             })
             .await?;
-        contact.ok_or_else(|| RPCErrors::ReasonError("contact missing after update".into()))
+        contact
+            .map(|contact| self.with_projection(&Self::owner_key(owner.as_ref()), contact))
+            .ok_or_else(|| RPCErrors::ReasonError("contact missing after update".into()))
     }
 
     /// Delete a contact record and its aliases; history is untouched.
@@ -1243,6 +1509,7 @@ impl ContactMgr {
                 RPCErrors::ReasonError("contact store missing after load".to_string())
             })?;
             let did = Self::canonical_did_in_store(store, &did);
+            self.reject_projected(&owner_key, &did)?;
             let contact = store
                 .contacts
                 .get(&did)
@@ -1280,7 +1547,9 @@ impl ContactMgr {
                 }
             })
             .await?;
-        contact.ok_or_else(|| RPCErrors::NoPermission("not-found".into()))
+        contact
+            .map(|contact| self.with_projection(&Self::owner_key(owner.as_ref()), contact))
+            .ok_or_else(|| RPCErrors::NoPermission("not-found".into()))
     }
 
     /// Zone users and Agents are related to the owner by the system.
@@ -1577,13 +1846,18 @@ impl ContactMgr {
                 RPCErrors::ReasonError(format!("failed to decode contacts.payload: {}", error))
             })?;
             let did = Self::parse_did(&did_str, "contacts.did")?;
-            let mut value: Value = serde_json::from_str(&payload).map_err(|error| {
+            let value: Value = serde_json::from_str(&payload).map_err(|error| {
                 RPCErrors::ReasonError(format!(
                     "failed to parse contact payload for {}: {}",
                     did_str, error
                 ))
             })?;
-            Self::migrate_contact_payload(&mut value);
+            if value.get("groups").is_some() {
+                return Err(RPCErrors::ReasonError(format!(
+                    "unsupported contact payload for {}: `groups` is not part of the current Contact format",
+                    did_str
+                )));
+            }
             let contact: Contact = serde_json::from_value(value).map_err(|error| {
                 RPCErrors::ReasonError(format!(
                     "failed to parse contact payload for {}: {}",
@@ -1641,51 +1915,6 @@ impl ContactMgr {
             group_subscribers,
             alias_index,
         })
-    }
-
-    /// Stored contacts written before `friend_state` existed: `groups` merge
-    /// into `tags`, the `friend` access level becomes `allow`, and Zone users
-    /// and Agents (the only friendships that existed) become friends.
-    fn migrate_contact_payload(value: &mut Value) {
-        let Some(object) = value.as_object_mut() else {
-            return;
-        };
-        let mut tags: Vec<String> = object
-            .get("tags")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        if let Some(groups) = object.remove("groups") {
-            let groups = serde_json::from_value::<Vec<String>>(groups).unwrap_or_default();
-            // Zone users carried the Zone's own user groups here; those are
-            // not the owner's groupings.
-            let system = groups
-                .iter()
-                .chain(tags.iter())
-                .any(|t| t == CONTACT_TAG_ZONE_USER || t == CONTACT_TAG_ZONE_AGENT);
-            if system {
-                tags.extend(
-                    groups
-                        .into_iter()
-                        .filter(|g| g == CONTACT_TAG_ZONE_USER || g == CONTACT_TAG_ZONE_AGENT),
-                );
-                if tags.iter().any(|t| t == CONTACT_TAG_ZONE_AGENT) {
-                    tags.retain(|t| t != "agent");
-                }
-            } else {
-                tags.extend(groups);
-            }
-            object.insert("tags".into(), serde_json::json!(Self::dedupe_strings(tags.clone())));
-        }
-        if object.get("access_level").and_then(Value::as_str) == Some("friend") {
-            object.insert("access_level".into(), Value::String("allow".into()));
-            if !object.contains_key("friend_state")
-                && tags
-                    .iter()
-                    .any(|t| t == CONTACT_TAG_ZONE_USER || t == CONTACT_TAG_ZONE_AGENT)
-            {
-                object.insert("friend_state".into(), Value::String("friend".into()));
-            }
-        }
     }
 
     async fn load_alias_index(
@@ -2189,6 +2418,7 @@ impl ContactMgr {
             temp_grants: Vec::new(),
             friend_state: FriendState::None,
             tags: Vec::new(),
+            projected_from: Vec::new(),
             created_at: now_ms,
             updated_at: now_ms,
         }
@@ -2241,6 +2471,7 @@ impl ContactMgr {
             temp_grants: Vec::new(),
             friend_state: FriendState::None,
             tags: Vec::new(),
+            projected_from: Vec::new(),
             created_at: now_ms,
             updated_at: now_ms,
         }
@@ -2267,6 +2498,7 @@ impl ContactMgr {
                 temp_grants: Vec::new(),
                 friend_state: FriendState::None,
                 tags: Vec::new(),
+                projected_from: Vec::new(),
                 created_at: now_ms,
                 updated_at: now_ms,
             })
@@ -2720,32 +2952,65 @@ mod tests {
         (mgr, temp_dir)
     }
 
+    async fn stored_contact_payloads(mgr: &ContactMgr, owner: &DID) -> Vec<String> {
+        sqlx::query("SELECT payload FROM contacts WHERE owner_key = ? ORDER BY did")
+            .bind(owner.to_string())
+            .fetch_all(mgr.pool())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get::<String, _>("payload").unwrap())
+            .collect()
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn stored_contacts_from_before_friend_state_are_migrated() {
-        let (mgr, _tmp) = new_test_mgr().await;
+    async fn stored_contacts_in_old_format_are_rejected_and_kept() {
         let owner = DID::new("bns", "alice");
-        for (did, payload) in [
-            ("did:bns:bob", json!({"did":"did:bns:bob","name":"Bob","source":"shared","is_verified":true,
-                "access_level":"friend","groups":["zone_user","users"],"tags":["zone_user"],"created_at":1,"updated_at":1})),
-            ("did:bns:eve", json!({"did":"did:bns:eve","name":"Eve","source":"manual_create","is_verified":true,
-                "access_level":"friend","groups":["hiking"],"created_at":1,"updated_at":1})),
+        for payload in [
+            json!({"did":"did:bns:bob","name":"Bob","source":"shared","is_verified":true,
+                "access_level":"allow","groups":["zone_user","users"],"tags":["zone_user"],"created_at":1,"updated_at":1}),
+            json!({"did":"did:bns:bob","name":"Bob","source":"manual_create","is_verified":true,
+                "access_level":"friend","created_at":1,"updated_at":1}),
         ] {
+            let (mgr, _tmp) = new_test_mgr().await;
             sqlx::query("INSERT INTO contacts (owner_key, did, payload) VALUES (?, ?, ?)")
                 .bind(owner.to_string())
-                .bind(did)
+                .bind("did:bns:bob")
                 .bind(payload.to_string())
                 .execute(mgr.pool())
                 .await
                 .unwrap();
+
+            assert!(mgr
+                .get_contact(DID::new("bns", "bob"), Some(owner.clone()))
+                .await
+                .is_err());
+            assert!(mgr
+                .check_access_permission(DID::new("bns", "bob"), None, Some(owner.clone()))
+                .await
+                .is_err());
+            assert_eq!(
+                stored_contact_payloads(&mgr, &owner).await,
+                vec![payload.to_string()]
+            );
         }
-        let bob = mgr
-            .get_contact(DID::new("bns", "bob"), Some(owner.clone()))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stored_current_contact_with_defaults_loads() {
+        let (mgr, _tmp) = new_test_mgr().await;
+        let owner = DID::new("bns", "alice");
+        sqlx::query("INSERT INTO contacts (owner_key, did, payload) VALUES (?, ?, ?)")
+            .bind(owner.to_string())
+            .bind("did:bns:eve")
+            .bind(
+                json!({"did":"did:bns:eve","name":"Eve","source":"manual_create","is_verified":true,
+                    "access_level":"allow","created_at":1,"updated_at":1})
+                .to_string(),
+            )
+            .execute(mgr.pool())
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(bob.access_level, AccessGroupLevel::Allow);
-        assert_eq!(bob.friend_state, FriendState::Friend);
-        assert_eq!(bob.tags, vec!["zone_user".to_string()]);
         let eve = mgr
             .get_contact(DID::new("bns", "eve"), Some(owner))
             .await
@@ -2753,7 +3018,7 @@ mod tests {
             .unwrap();
         assert_eq!(eve.access_level, AccessGroupLevel::Allow);
         assert_eq!(eve.friend_state, FriendState::None);
-        assert_eq!(eve.tags, vec!["hiking".to_string()]);
+        assert!(eve.tags.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -838,9 +838,8 @@ function semanticRubric(cell: { api_type: string; method: string }): string[] {
   if (apiType === "audio.asr") return ["The transcript faithfully represents the supplied speech audio."];
   if (apiType === "audio.music") return ["The output is a short, calm ambient instrumental passage with no vocals, speech, or dance beat."];
   if (apiType === "audio.enhance") return ["The output preserves the source audio while reducing noise or improving clarity."];
-  if (apiType === "video.txt2video") return ["The video shows a paper plane moving across a desk."];
-  if (apiType === "video.img2video") return ["The video preserves the supplied image content and adds subtle motion with a slow camera push."];
-  if (apiType === "video.video2video") return ["The output is a coherent transformation of the supplied video."];
+  if (apiType === "video.generate") return ["The video shows a paper plane moving across a desk, or brings the supplied first frame to life with subtle motion."];
+  if (apiType === "video.edit") return ["The output is a coherent edit of the supplied video."];
   if (apiType === "video.extend") return ["The output coherently extends the supplied video rather than replacing it with unrelated content."];
   if (apiType === "video.upscale") return ["The output preserves the supplied video content at improved resolution or visual quality."];
   if (apiType === "agent.computer_use") return ["The result reports the title visible in the supplied test environment and does not invent an action result."];
@@ -976,18 +975,24 @@ async function main(): Promise<void> {
     normalizeInventories(await session.aicc.call("models.list", {}))
       .map((inventory) => inventory.provider_instance_name),
   );
-  const execute = () => executeAcceptance({
-    options,
-    session,
-    runStartedAt,
-    runId,
-    outputDir,
-    baseline,
-    officialCatalogs,
-    uploadedFixtureIds,
-    configuredFixtures,
-  });
-  options.providerTokens = selectProviderTokens(options.providerTokens, options.providers);
+  const resolvedProviderInstances: Record<string, string> = {};
+  const execute = () =>
+    executeAcceptance({
+      options,
+      session,
+      runStartedAt,
+      runId,
+      outputDir,
+      baseline,
+      officialCatalogs,
+      uploadedFixtureIds,
+      configuredFixtures,
+      resolvedProviderInstances,
+    });
+  options.providerTokens = selectProviderTokens(
+    options.providerTokens,
+    options.providers,
+  );
   const tokenDrivers = providerTokenDrivers(options.providerTokens);
   let outcome: { report: AcceptanceReport; effectiveBaseline: Record<string, unknown> };
   let cleanupFailure: SettingsCleanupError<typeof outcome> | undefined;
@@ -1005,6 +1010,7 @@ async function main(): Promise<void> {
             options.providerTokens,
             options.providerInstances,
             options.providerInstanceOverrides,
+            resolvedProviderInstances,
           ),
         execute,
         refreshClients: async () => {
@@ -1051,7 +1057,15 @@ async function main(): Promise<void> {
     }
   }
   if (options.applyProviderCredentials && tokenDrivers.length > 0) {
-    const extraRuntimeInstances = normalizeInventories(await session.aicc.call("models.list", {}))
+    const postExecutionSession = options.username && options.password
+      ? await loginGateway({
+        gatewayUrl: options.gatewayUrl,
+        username: options.username,
+        password: options.password,
+        appId: options.appId,
+      })
+      : session;
+    const extraRuntimeInstances = normalizeInventories(await postExecutionSession.aicc.call("models.list", {}))
       .map((inventory) => inventory.provider_instance_name)
       .filter((name) => !initialRuntimeInstances.has(name));
     if (extraRuntimeInstances.length > 0) {
@@ -1106,7 +1120,10 @@ async function executeAcceptance(input: {
   officialCatalogs: ProviderInventory[];
   uploadedFixtureIds: string[];
   configuredFixtures: FixtureRefs;
-}): Promise<{ report: AcceptanceReport; effectiveBaseline: Record<string, unknown> }> {
+  resolvedProviderInstances: Record<string, string>;
+}): Promise<
+  { report: AcceptanceReport; effectiveBaseline: Record<string, unknown> }
+> {
   const {
     options,
     session,
@@ -1117,6 +1134,7 @@ async function executeAcceptance(input: {
     officialCatalogs,
     uploadedFixtureIds,
     configuredFixtures,
+    resolvedProviderInstances,
   } = input;
   const { ndm_proxy } = await import("buckyos");
   const ndm = ndm_proxy.createNdmProxyClient({
@@ -1138,19 +1156,56 @@ async function executeAcceptance(input: {
     ? options.providers
     : baseline.providers.map((provider) => provider.provider_driver);
   const credentialDrivers = providerTokenDrivers(options.providerTokens);
-  const discoveryInventories = options.applyProviderCredentials && credentialDrivers.length > 0
-    ? await waitForProviderInventories({
+  // A credential override resolves the target instance inside the patched settings (either the
+  // single existing instance or a created `<driver>-main`). `applyProviderTokens` reports those
+  // names back so a run that leaves `[instances.<driver>].name` empty keeps working; the inventory
+  // of the resolved instance is awaited before it is selected. Providers without a temporary
+  // credential still refresh from their own inventory, so mixed runs stay complete.
+  if (options.applyProviderCredentials && credentialDrivers.length > 0) {
+    await waitForProviderInventories({
       aicc: session.aicc,
       expectedDrivers: credentialDrivers,
-      expectedInstances: options.providerInstances,
+      expectedInstances: resolvedProviderInstances,
       timeoutMs: options.timeoutMs,
-    })
-    : normalizeInventories(await session.aicc.call("models.list", {}));
-  const selectedBeforeRefresh = selectSingleProviderInstances({
-    inventories: discoveryInventories,
-    drivers: selectedDrivers,
-    configured: options.providerInstances,
-  });
+    });
+  }
+  const selectedBeforeRefresh = await (async () => {
+    if (!(options.applyProviderCredentials && credentialDrivers.length > 0)) {
+      return selectSingleProviderInstances({
+        inventories: normalizeInventories(
+          await session.aicc.call("models.list", {}),
+        ),
+        drivers: selectedDrivers,
+        configured: options.providerInstances,
+      });
+    }
+    const credentialTargets = credentialDrivers.map((driver) => {
+      const instance = resolvedProviderInstances[driver] ??
+        options.providerInstances[driver];
+      if (!instance) {
+        throw new Error(`missing configured Provider instance for ${driver}`);
+      }
+      return {
+        provider_driver: driver,
+        provider_instance_name: instance,
+        models: [],
+      };
+    });
+    const remainingDrivers = selectedDrivers.filter((driver) =>
+      !credentialDrivers.includes(driver)
+    );
+    if (remainingDrivers.length === 0) return credentialTargets;
+    return [
+      ...credentialTargets,
+      ...selectSingleProviderInstances({
+        inventories: normalizeInventories(
+          await session.aicc.call("models.list", {}),
+        ),
+        drivers: remainingDrivers,
+        configured: options.providerInstances,
+      }),
+    ];
+  })();
   const refreshed = await refreshProviderInventoriesUntilSuccess({
     aicc: session.aicc,
     selectedInventories: selectedBeforeRefresh,
@@ -1478,7 +1533,7 @@ async function executeAcceptance(input: {
     const continuationPrerequisites = new Map<string, Promise<ResourceRef>>();
     const continuationResource = (cell: typeof executableCells[number]): Promise<ResourceRef> => {
       const sourceApiType = cell.generated_artifact_source_api_type ??
-        (cell.api_type === "video.extend" ? "video.txt2video" : undefined);
+        (cell.api_type === "video.extend" ? "video.generate" : undefined);
       if (!sourceApiType) throw new Error(`${cell.case_id} has no generated artifact source api_type`);
       const key = `${cell.exact_model}:${sourceApiType}`;
       const existing = continuationPrerequisites.get(key);
@@ -1507,6 +1562,8 @@ async function executeAcceptance(input: {
               : sourceApiType.startsWith("video.") ? ["video"]
               : cell.output_kinds,
             generated_artifact_source_api_type: undefined,
+            // The cell's defaults belong to its own api_type, not to the source call.
+            request_defaults: undefined,
           };
           const prerequisiteRequest = buildExactRequest({
             cell: prerequisiteCell,
@@ -1514,7 +1571,7 @@ async function executeAcceptance(input: {
             fixtures: options.fixtures,
           });
           const payload = prerequisiteRequest.payload as Record<string, unknown>;
-          if (sourceApiType === "video.txt2video") {
+          if (sourceApiType === "video.generate") {
             payload.input_json = {
               ...(payload.input_json as Record<string, unknown>),
               prompt: "A paper plane moving across a desk, continuous steady motion",

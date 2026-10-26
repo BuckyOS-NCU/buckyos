@@ -1,7 +1,8 @@
 use crate::error::{StorageError, StorageResult};
 use crate::execution::{
     ExecutionOutput, ExecutionRecord, ExecutionState, ExecutionStore, IdempotencyClaim,
-    PinnedProviderTask, UsageCompletion, UsageCompletionPort,
+    IdempotencyScope, PinnedProviderTask, RecoverableExecutions, RetiredExecution,
+    UsageCompletion, UsageCompletionPort,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -20,42 +21,18 @@ use sqlx::{Any, AnyPool, Executor, QueryBuilder, Row};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Once;
 
+mod quota;
+pub(crate) use quota::{AdmitOutcome, AttemptAdmission, QuotaWriteError, SettleOutcome};
+
 const SERVICE_NAME: &str = "aicc";
-const STORAGE_SCHEMA_VERSION: i64 = 2;
+const STORAGE_SCHEMA_VERSION: i64 = 3;
 const INVENTORY_SCHEMA_VERSION: i64 = 1;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1_000;
 static INSTALL_DRIVERS: Once = Once::new();
 
-const SCHEMA_META: &str = "CREATE TABLE IF NOT EXISTS aicc_schema_meta (schema_key TEXT PRIMARY KEY, schema_version BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL)";
-/// Versioned steps that can only be expressed as row rewrites.
-///
-/// The table set itself is deliberately *not* versioned: `SCHEMA` is re-applied
-/// on every open (see `migrate`), so a table that has been added or renamed is
-/// created for both new and already-provisioned databases without a migration.
-/// A table that a newer `SCHEMA` no longer declares is left behind unused rather
-/// than dropped — it holds nothing a Provider round trip cannot rebuild, and
-/// leaving it costs nothing.
-const MIGRATIONS: &[(i64, &str)] = &[(2, ROUTE_TRACE_FILTER_COLUMNS)];
-
-const ROUTE_TRACE_FILTER_COLUMNS: &str = r#"
-ALTER TABLE aicc_route_trace_event ADD COLUMN fallback_applied INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE aicc_route_trace_event ADD COLUMN warning_count BIGINT NOT NULL DEFAULT 0;
-UPDATE aicc_route_trace_event SET fallback_applied=1
- WHERE route_trace_json LIKE '%"fallback_applied":true%';
-UPDATE aicc_route_trace_event SET warning_count=1
- WHERE route_trace_json LIKE '%"warnings":[%'
-   AND route_trace_json NOT LIKE '%"warnings":[]%';
-CREATE INDEX idx_aicc_route_trace_event_fallback_time ON aicc_route_trace_event(tenant_id, fallback_applied, created_at_ms);
-CREATE INDEX idx_aicc_route_trace_event_warning_time ON aicc_route_trace_event(tenant_id, warning_count, created_at_ms);
-"#;
-
-/// The current table set, applied in full on every open.
-///
-/// Every statement is additive and idempotent (`CREATE ... IF NOT EXISTS`), so
-/// applying it to an existing database creates only what is missing. That is
-/// what carries a renamed table to an already-provisioned database without a
-/// versioned migration, and why no statement here drops anything.
+/// The complete current table set, applied together with `quota::QUOTA_SCHEMA`
+/// only when the database holds no AICC table yet.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS aicc_schema_meta (
  schema_key TEXT PRIMARY KEY, schema_version BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL);
@@ -74,7 +51,7 @@ CREATE TABLE IF NOT EXISTS aicc_usage_event (
  provider_model TEXT NOT NULL, input_tokens BIGINT, output_tokens BIGINT, total_tokens BIGINT,
  request_units BIGINT, usage_json TEXT NOT NULL, finance_snapshot_json TEXT,
  finance_amount REAL, finance_currency TEXT, finance_valid INTEGER NOT NULL DEFAULT 0,
- created_at_ms BIGINT NOT NULL);
+ created_at_ms BIGINT NOT NULL, operator_id TEXT, attribution_json TEXT);
 CREATE INDEX IF NOT EXISTS idx_aicc_usage_event_time ON aicc_usage_event(created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_aicc_usage_event_tenant_time ON aicc_usage_event(tenant_id, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_aicc_usage_event_trace_time ON aicc_usage_event(trace_id, created_at_ms);
@@ -96,10 +73,13 @@ CREATE TABLE IF NOT EXISTS aicc_route_trace_event (
  trace_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, caller_app_id TEXT, task_id TEXT NOT NULL,
  request_id TEXT, route_id TEXT, provider_trace_id TEXT, request_model TEXT NOT NULL,
  selected_exact_model TEXT, provider_instance_name TEXT, api_type TEXT NOT NULL,
- scheduler_profile TEXT, outcome TEXT, route_trace_json TEXT NOT NULL, created_at_ms BIGINT NOT NULL);
+ scheduler_profile TEXT, outcome TEXT, route_trace_json TEXT NOT NULL, created_at_ms BIGINT NOT NULL,
+ fallback_applied INTEGER NOT NULL DEFAULT 0, warning_count BIGINT NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_aicc_route_trace_event_time ON aicc_route_trace_event(created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_aicc_route_trace_event_tenant_time ON aicc_route_trace_event(tenant_id, created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_aicc_route_trace_event_task_time ON aicc_route_trace_event(task_id, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_aicc_route_trace_event_fallback_time ON aicc_route_trace_event(tenant_id, fallback_applied, created_at_ms);
+CREATE INDEX IF NOT EXISTS idx_aicc_route_trace_event_warning_time ON aicc_route_trace_event(tenant_id, warning_count, created_at_ms);
 CREATE TABLE IF NOT EXISTS aicc_session_route_history (
  tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, caller_app_id TEXT NOT NULL,
  session_id TEXT NOT NULL, selected_exact_model TEXT NOT NULL, updated_at_ms BIGINT NOT NULL,
@@ -296,6 +276,8 @@ pub(crate) struct ProviderCompletion {
     pub provider_model: String,
     pub usage: Option<AiUsage>,
     pub finance_snapshot: Option<Value>,
+    pub operator_id: Option<String>,
+    pub attribution: Option<buckyos_api::AiccAttribution>,
     pub created_at_ms: i64,
 }
 
@@ -376,72 +358,66 @@ impl AiccStorage {
             .connect(connection)
             .await?;
         let storage = Self { pool, backend };
-        storage.migrate().await?;
+        storage.init_schema().await?;
         Ok(storage)
     }
 
-    async fn migrate(&self) -> StorageResult<()> {
-        self.pool.execute(SCHEMA_META).await?;
-        let version: Option<i64> = sqlx::query_scalar(
-            "SELECT schema_version FROM aicc_schema_meta WHERE schema_key='aicc'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        let mut version = version.unwrap_or(0);
-        if version > STORAGE_SCHEMA_VERSION {
-            return Err(StorageError::InvalidRecord(format!(
-                "unsupported AICC storage schema version {version}; latest supported is {STORAGE_SCHEMA_VERSION}"
-            )));
-        }
-        // Apply the table set before the versioned steps. It is entirely
-        // idempotent, so this is what keeps an already-provisioned database
-        // current when a table is added or renamed: the missing table is created
-        // here and the one it replaced stays behind. It runs first so the
-        // versioned steps still see every table they expect.
-        self.apply_script(SCHEMA).await?;
-        for (target, schema) in MIGRATIONS {
-            if *target <= version {
-                continue;
+    /// Creates the full current schema in an empty database; an existing one
+    /// must already record `STORAGE_SCHEMA_VERSION`.
+    async fn init_schema(&self) -> StorageResult<()> {
+        let tables_sql = match self.backend {
+            RdbBackend::Sqlite => {
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'aicc\\_%' ESCAPE '\\'"
             }
+            RdbBackend::Postgres => {
+                "SELECT table_name::text FROM information_schema.tables
+                 WHERE table_schema=current_schema() AND table_name LIKE 'aicc\\_%' ESCAPE '\\'"
+            }
+        };
+        let tables: Vec<String> = sqlx::query_scalar(tables_sql).fetch_all(&self.pool).await?;
+        if tables.is_empty() {
             let mut transaction = self.pool.begin().await?;
-            for statement in schema
-                .split(';')
+            for statement in [SCHEMA, quota::QUOTA_SCHEMA]
+                .into_iter()
+                .flat_map(|script| script.split(';'))
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
                 transaction.execute(statement).await?;
             }
-            let update = self.sql(
-                "INSERT INTO aicc_schema_meta (schema_key,schema_version,updated_at_ms)
-                 VALUES ('aicc',?,0) ON CONFLICT(schema_key) DO UPDATE SET schema_version=excluded.schema_version,updated_at_ms=excluded.updated_at_ms",
+            let insert = self.sql(
+                "INSERT INTO aicc_schema_meta (schema_key,schema_version,updated_at_ms) VALUES ('aicc',?,0)",
             );
-            sqlx::query(&update)
-                .bind(*target)
+            sqlx::query(&insert)
+                .bind(STORAGE_SCHEMA_VERSION)
                 .execute(&mut *transaction)
                 .await?;
             transaction.commit().await?;
-            version = *target;
+        } else {
+            let version: Option<i64> = if tables.iter().any(|name| name == "aicc_schema_meta") {
+                sqlx::query_scalar(
+                    "SELECT schema_version FROM aicc_schema_meta WHERE schema_key='aicc'",
+                )
+                .fetch_optional(&self.pool)
+                .await?
+            } else {
+                None
+            };
+            match version {
+                Some(STORAGE_SCHEMA_VERSION) => {}
+                Some(version) => {
+                    return Err(StorageError::UnsupportedSchema(format!(
+                        "schema version {version}; this build reads {STORAGE_SCHEMA_VERSION}"
+                    )))
+                }
+                None => {
+                    return Err(StorageError::UnsupportedSchema(format!(
+                        "tables {tables:?} exist without a schema version"
+                    )))
+                }
+            }
         }
-        if version != STORAGE_SCHEMA_VERSION {
-            return Err(StorageError::InvalidRecord(format!(
-                "incomplete AICC storage migration at version {version}"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Runs a semicolon-separated DDL script inside a single transaction.
-    async fn apply_script(&self, script: &str) -> StorageResult<()> {
-        let mut transaction = self.pool.begin().await?;
-        for statement in script
-            .split(';')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            transaction.execute(statement).await?;
-        }
-        transaction.commit().await?;
-        Ok(())
+        self.seed_default_visibility().await
     }
 
     pub(crate) async fn open_from_service_spec() -> StorageResult<Self> {
@@ -978,6 +954,8 @@ impl AiccStorage {
             request_units: usage.request_units,
             usage_json: usage,
             finance_snapshot_json: completion.finance_snapshot,
+            operator_id: completion.operator_id,
+            attribution: completion.attribution,
             created_at_ms: completion.created_at_ms,
         };
         self.write_usage(&event).await
@@ -1013,8 +991,9 @@ impl AiccStorage {
         let sql = self.sql("INSERT INTO aicc_usage_event
           (event_id,tenant_id,user_id,caller_app_id,task_id,trace_id,idempotency_key,method,capability,
            request_model,provider_instance_name,provider_model,input_tokens,output_tokens,total_tokens,
-           request_units,usage_json,finance_snapshot_json,finance_amount,finance_currency,finance_valid,created_at_ms)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING");
+           request_units,usage_json,finance_snapshot_json,finance_amount,finance_currency,finance_valid,
+           operator_id,attribution_json,created_at_ms)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING");
         let result = sqlx::query(&sql)
             .bind(&e.event_id)
             .bind(&e.tenant_id)
@@ -1042,6 +1021,8 @@ impl AiccStorage {
             .bind(finance.as_ref().map(|(amount, _)| *amount))
             .bind(finance.as_ref().map(|(_, currency)| currency.as_str()))
             .bind(i64::from(finance.is_some()))
+            .bind(&e.operator_id)
+            .bind(e.attribution.as_ref().map(serde_json::to_string).transpose()?)
             .bind(e.created_at_ms)
             .execute(&self.pool)
             .await?;
@@ -1154,14 +1135,81 @@ impl AiccStorage {
             == 1)
     }
 
-    async fn recoverable_executions(&self) -> StorageResult<Vec<ExecutionRecord>> {
+    async fn recoverable_executions(&self) -> StorageResult<RecoverableExecutions> {
         let rows = sqlx::query(
-            "SELECT state,record_json FROM aicc_execution_record
+            "SELECT task_id,state,record_json FROM aicc_execution_record
              WHERE state IN ('submitted','queued','running') ORDER BY created_at_ms,task_id",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(execution_from_row).collect()
+        let mut recoverable = RecoverableExecutions::default();
+        for row in rows {
+            let task_id: String = row.try_get("task_id")?;
+            let record_json: String = row.try_get("record_json")?;
+            match serde_json::from_str::<ExecutionRecord>(&record_json) {
+                Ok(record) => recoverable.records.push(record),
+                Err(error) => {
+                    log::warn!(
+                        "AICC task recovery: retiring unreadable execution {task_id}: {error}"
+                    );
+                    recoverable
+                        .retired
+                        .push(self.retire_execution(task_id, &record_json).await?);
+                }
+            }
+        }
+        Ok(recoverable)
+    }
+
+    /// Stores an unreadable execution as failed. The record keeps what this
+    /// build can still read; its provider binding and staged output, which
+    /// name removed methods or API types, are dropped.
+    async fn retire_execution(
+        &self,
+        task_id: String,
+        record_json: &str,
+    ) -> StorageResult<RetiredExecution> {
+        let error = AiccError::new(
+            AiccErrorCode::UnsupportedOperation,
+            "the task was started with a request this AICC version no longer supports",
+        );
+        let mut value = serde_json::from_str::<Value>(record_json).unwrap_or(Value::Null);
+        let quota_attempt_id = value
+            .pointer("/binding/quota_attempt_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let retired = match value.as_object_mut() {
+            Some(object) => {
+                object.remove("binding");
+                object.remove("output");
+                object.insert("state".into(), serde_json::to_value(ExecutionState::Failed)?);
+                object.insert("error".into(), serde_json::to_value(&error)?);
+                serde_json::from_value::<ExecutionRecord>(value).ok()
+            }
+            None => None,
+        };
+        match retired {
+            Some(record) => {
+                let sql = self.sql(
+                    "UPDATE aicc_execution_record SET state='failed',record_json=? WHERE task_id=?",
+                );
+                sqlx::query(&sql)
+                    .bind(serde_json::to_string(&record)?)
+                    .bind(&task_id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+            None => {
+                let sql =
+                    self.sql("UPDATE aicc_execution_record SET state='failed' WHERE task_id=?");
+                sqlx::query(&sql).bind(&task_id).execute(&self.pool).await?;
+            }
+        }
+        Ok(RetiredExecution {
+            task_id,
+            error,
+            quota_attempt_id,
+        })
     }
 
     pub(crate) async fn query_usage(
@@ -1585,8 +1633,14 @@ impl ExecutionStore for AiccStorage {
         .map_err(storage_error)
     }
 
-    async fn recoverable(&self) -> Result<Vec<ExecutionRecord>, AiccError> {
+    async fn recoverable(&self) -> Result<RecoverableExecutions, AiccError> {
         self.recoverable_executions().await.map_err(storage_error)
+    }
+
+    async fn find(&self, scope: &IdempotencyScope) -> Result<Option<ExecutionRecord>, AiccError> {
+        self.execution_by_scope(&scope.tenant_id, &scope.method, &scope.key)
+            .await
+            .map_err(storage_error)
     }
 }
 
@@ -1617,6 +1671,8 @@ impl UsageCompletionPort for AiccStorage {
                         "usage finance snapshot could not be serialized",
                     )
                 })?,
+            operator_id: completion.operator_id,
+            attribution: completion.attribution,
             created_at_ms: completion.completed_at_ms,
         })
         .await
@@ -1718,6 +1774,11 @@ fn usage_from_row(row: AnyRow) -> StorageResult<AiccUsageEvent> {
         request_units: opt_from_i64(row.try_get("request_units")?)?,
         usage_json: serde_json::from_str(&usage)?,
         finance_snapshot_json: finance.map(|v| serde_json::from_str(&v)).transpose()?,
+        operator_id: row.try_get("operator_id")?,
+        attribution: row
+            .try_get::<Option<String>, _>("attribution_json")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
         created_at_ms: row.try_get("created_at_ms")?,
     })
 }
@@ -2278,80 +2339,101 @@ mod tests {
         assert_eq!(version, STORAGE_SCHEMA_VERSION);
     }
 
-    #[tokio::test]
-    async fn storage_rejects_a_future_schema_version_before_business_migrations() {
-        let storage = db().await;
-        sqlx::query("UPDATE aicc_schema_meta SET schema_version=99 WHERE schema_key='aicc'")
-            .execute(&storage.pool)
+    async fn route_trace_ids(storage: &AiccStorage) -> Vec<String> {
+        sqlx::query_scalar("SELECT trace_id FROM aicc_route_trace_event ORDER BY trace_id")
+            .fetch_all(&storage.pool)
             .await
-            .unwrap();
-        let error = storage.migrate().await.unwrap_err();
-        assert!(error.to_string().contains("latest supported"));
+            .unwrap()
     }
 
-    #[tokio::test]
-    async fn existing_database_gains_the_merged_table_and_keeps_the_obsolete_one() {
-        let storage = db().await;
-        // Simulate a database provisioned by an older build: an obsolete
-        // single-key table is present, the recorded version is already current,
-        // and the merged table does not exist. No versioned step can run here,
-        // so the merged table can only appear because the table set is applied
-        // on every open.
-        sqlx::query("UPDATE aicc_schema_meta SET schema_version=2 WHERE schema_key='aicc'")
-            .execute(&storage.pool)
-            .await
-            .unwrap();
-        sqlx::query("DROP TABLE aicc_provider_artifact")
-            .execute(&storage.pool)
-            .await
-            .unwrap();
+    async fn insert_route_trace(storage: &AiccStorage, trace_id: &str) {
         sqlx::query(
-            "CREATE TABLE aicc_provider_artifact_id (
-             content_digest TEXT NOT NULL, provider_instance_name TEXT NOT NULL,
-             origin_provider TEXT NOT NULL, artifact_id TEXT NOT NULL,
-             expires_at_ms BIGINT, created_at_ms BIGINT NOT NULL,
-             PRIMARY KEY (content_digest, provider_instance_name, origin_provider))",
+            "INSERT INTO aicc_route_trace_event
+             (trace_id,tenant_id,task_id,request_model,api_type,route_trace_json,created_at_ms)
+             VALUES (?,'tenant-a','task-a','model-a','llm.chat','{}',1)",
         )
+        .bind(trace_id)
         .execute(&storage.pool)
         .await
         .unwrap();
-        storage.migrate().await.unwrap();
-        let tables: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type='table'
-               AND name LIKE 'aicc_provider_artifact%' ORDER BY name",
+    }
+
+    #[tokio::test]
+    async fn storage_rejects_other_schema_versions_without_touching_rows() {
+        let storage = db().await;
+        insert_route_trace(&storage, "trace-kept").await;
+        for version in [STORAGE_SCHEMA_VERSION - 1, STORAGE_SCHEMA_VERSION + 1] {
+            sqlx::query("UPDATE aicc_schema_meta SET schema_version=? WHERE schema_key='aicc'")
+                .bind(version)
+                .execute(&storage.pool)
+                .await
+                .unwrap();
+            let error = storage.init_schema().await.unwrap_err();
+            assert!(
+                matches!(error, StorageError::UnsupportedSchema(_)),
+                "{error}"
+            );
+            assert_eq!(
+                route_trace_ids(&storage).await,
+                vec!["trace-kept".to_string()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_rejects_non_empty_database_without_schema_version() {
+        let storage = db().await;
+        insert_route_trace(&storage, "trace-kept").await;
+        sqlx::query("DELETE FROM aicc_schema_meta")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        let error = storage.init_schema().await.unwrap_err();
+        assert!(
+            matches!(error, StorageError::UnsupportedSchema(_)),
+            "{error}"
+        );
+
+        sqlx::query("DROP TABLE aicc_schema_meta")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        let error = storage.init_schema().await.unwrap_err();
+        assert!(
+            matches!(error, StorageError::UnsupportedSchema(_)),
+            "{error}"
+        );
+        assert_eq!(
+            route_trace_ids(&storage).await,
+            vec!["trace-kept".to_string()]
+        );
+        let meta: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='aicc_schema_meta'",
         )
-        .fetch_all(&storage.pool)
+        .fetch_optional(&storage.pool)
         .await
         .unwrap();
-        // The merged table is created; the obsolete one is left untouched.
-        assert_eq!(
-            tables,
-            vec![
-                "aicc_provider_artifact".to_string(),
-                "aicc_provider_artifact_id".to_string()
-            ]
+        assert_eq!(meta, None);
+    }
+
+    #[tokio::test]
+    async fn storage_reopens_current_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("aicc.db").to_str().unwrap()
         );
-        // The merged table is usable straight after it is created.
-        let key = ProviderArtifactKey::ObjectId(format!("cyfile:{}", "ab".repeat(32)));
-        storage
-            .remember_provider_artifact(&ProviderArtifactRecord {
-                key: key.clone(),
-                provider_instance_name: "aggregator-primary".into(),
-                origin_provider: "gemini".into(),
-                tenant_id: "tenant-a".into(),
-                artifact_id: "files/abc123".into(),
-                expires_at_ms: None,
-                created_at_ms: 10,
-            })
+        let storage = AiccStorage::open(&connection, RdbBackend::Sqlite)
+            .await
+            .unwrap();
+        insert_route_trace(&storage, "trace-kept").await;
+        storage.pool.close().await;
+        let storage = AiccStorage::open(&connection, RdbBackend::Sqlite)
             .await
             .unwrap();
         assert_eq!(
-            storage
-                .provider_artifact(&key, "aggregator-primary", "gemini", "tenant-a", 10)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("files/abc123")
+            route_trace_ids(&storage).await,
+            vec!["trace-kept".to_string()]
         );
     }
 
@@ -2878,6 +2960,8 @@ mod tests {
                 ..AiUsage::default()
             }),
             finance_snapshot: Some(json!({"amount": 0.25, "currency": "USD"})),
+            operator_id: None,
+            attribution: None,
             created_at_ms: at,
         }
     }
@@ -2909,6 +2993,8 @@ mod tests {
             request_units,
             usage_json: usage,
             finance_snapshot_json: finance,
+            operator_id: None,
+            attribution: None,
             created_at_ms: 10_000,
         }
     }
@@ -2925,6 +3011,7 @@ mod tests {
             trace_id: Some(format!("trace-{task_id}")),
             user_id: "user-a".into(),
             caller_app_id: Some("app-a".into()),
+            attribution: None,
             request_model: "llm.chat".into(),
             body_fingerprint: format!("fingerprint-{task_id}"),
             task_id: task_id.into(),
@@ -2943,6 +3030,7 @@ mod tests {
         let fingerprint = sha256_hex(reference.as_bytes())[..16].to_string();
         PinnedProviderTask {
             reported_cost_currency: None,
+            quota_attempt_id: None,
             runtime_generation: 7,
             origin_provider: "openai".into(),
             exact_model: "gpt-5:reasoning@openai-primary".into(),
@@ -2968,6 +3056,7 @@ mod tests {
                     ("result_path".into(), json!("/tasks/{task_id}/result")),
                     ("cancel_path".into(), json!("/tasks/{task_id}/cancel")),
                 ]),
+                input_leases: Vec::new(),
                 resource_access_context: crate::resource::ResourceAccessContext::new(
                     "tenant-a",
                     "alice",
@@ -2976,6 +3065,8 @@ mod tests {
                 .unwrap(),
                 output_video_seconds: None,
                 request_timeout_ms: 30_000,
+                max_poll_duration_ms: 30 * 60 * 1_000,
+                active_poll_elapsed_ms: 0,
                 max_request_bytes: 1_048_576,
                 max_response_bytes: 8_388_608,
             }),
@@ -3092,7 +3183,7 @@ mod tests {
         let encoded_binding = serde_json::to_string(restored_binding).unwrap();
         assert!(encoded_binding.contains("system-config://secrets/aicc/openai-primary/api-key"));
         assert!(!encoded_binding.contains("plaintext-secret"));
-        assert_eq!(db.recoverable().await.unwrap(), vec![restored]);
+        assert_eq!(db.recoverable().await.unwrap().records, vec![restored]);
         assert!(db.try_cancel(&running.task_id).await.unwrap());
         assert!(!db
             .try_complete(&running.task_id, execution_output())
@@ -3135,7 +3226,45 @@ mod tests {
             db.try_cancel(&raced.task_id)
         );
         assert_ne!(complete.unwrap(), cancel.unwrap());
-        assert!(db.recoverable().await.unwrap().is_empty());
+        assert!(db.recoverable().await.unwrap().records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_execution_of_a_removed_api_type_is_retired_without_blocking_recovery() {
+        let db = db().await;
+        let current = execution_record("task-current", "key-current");
+        db.claim(current.clone()).await.unwrap();
+        let old = execution_record("task-old-video", "key-old-video");
+        db.claim(old.clone()).await.unwrap();
+        let mut binding = serde_json::to_value(provider_binding()).unwrap();
+        binding["api_type"] = json!("video.txt2video");
+        binding["quota_attempt_id"] = json!("attempt-old");
+        let mut old_json = serde_json::to_value(&old).unwrap();
+        old_json["state"] = json!("running");
+        old_json["binding"] = binding;
+        sqlx::query("UPDATE aicc_execution_record SET state='running',record_json=? WHERE task_id=?")
+            .bind(old_json.to_string())
+            .bind(&old.task_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let recoverable = db.recoverable().await.unwrap();
+        assert_eq!(recoverable.records, vec![current]);
+        assert_eq!(recoverable.retired.len(), 1);
+        assert_eq!(recoverable.retired[0].task_id, old.task_id);
+        assert_eq!(
+            recoverable.retired[0].quota_attempt_id.as_deref(),
+            Some("attempt-old")
+        );
+        let retired = db.get_task(&old.task_id).await.unwrap().unwrap();
+        assert_eq!(retired.state, ExecutionState::Failed);
+        assert!(retired.binding.is_none());
+        assert_eq!(
+            retired.error.unwrap().code,
+            AiccErrorCode::UnsupportedOperation
+        );
+        assert!(db.recoverable().await.unwrap().retired.is_empty());
     }
 
     #[tokio::test]
@@ -3165,6 +3294,8 @@ mod tests {
                 amount: 0.25,
                 currency: "EUR".into(),
             }),
+            operator_id: None,
+            attribution: None,
             completed_at_ms: 10_000,
         };
         db.write_once(completion.clone()).await.unwrap();
@@ -3231,6 +3362,7 @@ mod tests {
             output_mode: UsageQueryOutputMode::SummaryAndEvents,
             limit: Some(1),
             cursor: None,
+            zone_wide: false,
         };
         let first = db.query_usage(&request, 20_000).await.unwrap();
         assert_eq!(first.total.total_requests, 3);
@@ -3376,6 +3508,7 @@ mod tests {
             output_mode: UsageQueryOutputMode::Events,
             limit: None,
             cursor: None,
+            zone_wide: false,
         };
         let response = db.query_usage(&request, 12_000).await.unwrap();
         assert_eq!(response.total.total_requests, 1);
@@ -3427,6 +3560,7 @@ mod tests {
                         output_mode: UsageQueryOutputMode::Events,
                         limit: None,
                         cursor: None,
+                        zone_wide: false,
                     },
                     20_000,
                 )

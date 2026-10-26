@@ -8,7 +8,7 @@
 |---|---|
 | `main.rs` | 参数、zone 形态与 `--dev` 形态的环境装配（等待绑定的 AgentSpec，读 settings）、退出信号 |
 | `loader.rs` | 启动顺序：AgentRoot 身份 → AgentRoot 同步（模板固定时跳过）→ 角色补充 → `agent.toml` → Agent State（文件实现，进程内登记）→ HTTP → Supervisor → 模块 → 写 `info`；退出时结束托管并等待 |
-| `config.rs` | `agent.toml` 里 Loader 的部分：`[loader]`、`[[loader.ui]]`、`[loader.self_check]`、`[loader.self_improve]`、`[loader.goals]`、`[llm_context]`；配置错误在启动时报出并退出（含 `[session.goal]` 的预算格式） |
+| `config.rs` | `agent.toml` 里 Loader 的部分：`[loader]`、`[[loader.ui]]`、`[loader.self_check]`、`[loader.goals]`、`[llm_context]`；配置错误在启动时报出并退出（含 `[session.goal]` 的预算格式与 `[session.goal.maintenance]`） |
 | `rootfs.rs` | AgentRoot 目录布局、身份（`.meta/identity.json`，不一致时归档）、从 Agent 包同步素材（保留本地修改）、角色补充文件 |
 | `records.rs` | AgentRoot 之外的 Agent 记录：system-config 的 `settings` / `profile` / `info`；`--dev` 用内存或本地目录 |
 | `ui.rs` | UI Session + Message Tunnel：inbox 发现、绑定、入站桥（只放行 Owner，群聊规则与群上下文）、出站 sink |
@@ -38,7 +38,7 @@ OpenDAN kRPC 对只读 Agent 的 App token 同样检查该授权：保留已有 
 - **只放行 Owner**：消息的发送者是 `record.ingress.extra.principal_did`（msg-center 解析出的本人，例如 Telegram 账号背后的 Owner），没有时是 `record.from`。不是 Owner 的记录只标记已读：不建 Session、不调用 LLM、不回复。`/stop` 等命令也只有 Owner 能发。
 - **群聊**：`allow_group = false` 时群消息只标记已读。`allow_group = true` 时只有 Owner 发出、且 `mentions.dids` 含 Agent DID 的群消息触发；触发时先把同一 mailbox 最近 20 条已读消息（不含 Agent 自己的）作为上下文（`delivery.context = true`，保留各自的发言者）按时间顺序投进 Session 队列，再投触发消息。上下文消息不单独组成输入批次、不构成请求，渲染时带 `context="true"`；Session 已经看过的按 ObjId 去重。Agent 包需要 `[[loader.ui]] on = "msg.group"` 规则。
 
-Goals（`[loader.goals] enabled`，缺省开启，没有 Goal 时没有开销）：Supervisor 带 `libopendan::host::goals::GoalHost`。每次巡检按 Goal 列表补建当前 epoch 的 Goal Session（`<agent_root>/sessions/`，`[llm_context]` 为基础配置，class `goal`）、投递 epoch 开始事件（`created` 需 `schedule.start_on_create`）、按本地计划（`every_secs`，`LocalScheduleBackend`）在准入（Goal active、距上次 Activation 不少于 `min_interval_secs`、周期上限未到）后投递定时运行机会，并处理 epoch 迁移（reopen / restart：旧 Session 由其状态闸门结束、Goal State 存档、新 Session 建立）与结束（archive / achieved）。Goal 本身与 Goal Session 的语义见 [Agent State Protocol](../../../doc/opendan/protocol/Agent%20State%20Protocol.md) §9。一次 Activation 是 Goal Session 的一个 Turn，因此也是一个 TaskMgr task；TaskMgr 取消它（`CancelBridge` 投递 `stop{scope: turn}`）只结束这次 Activation。
+Goals（`[loader.goals] enabled`，缺省开启，没有 Goal 时没有开销）：Supervisor 带 `libopendan::host::goals::GoalHost`。每次巡检按 Goal 列表补建当前 epoch 的 Goal Session（`<agent_root>/sessions/`，`[llm_context]` 为基础配置，class `goal`）、投递 epoch 开始事件（`created` 需 `schedule.start_on_create`）、按本地计划（`every_secs`，`LocalScheduleBackend`）在准入（Goal active、距上次 Activation 不少于 `min_interval_secs`、周期上限未到）后投递定时运行机会，并处理 epoch 迁移（reopen / restart：旧 Session 由其状态闸门结束、Goal State 存档、新 Session 建立）与结束（archive / achieved）。Goal 本身与 Goal Session 的语义见 [Agent State Protocol](../../../doc/opendan/protocol/Agent%20State%20Protocol.md) §9。`[session.goal.maintenance] enabled = true` 时 GoalHost 另播种内置整理 Goal `memory_maintenance`，并对它的 start 事件与定时 fire 加 30 分钟 / 2 小时的确定性 gate（Agent State Protocol §9.7；`loader.status.modules` 里的 `memory_maintenance`）。一次 Activation 是 Goal Session 的一个 Turn，因此也是一个 TaskMgr task；TaskMgr 取消它（`CancelBridge` 投递 `stop{scope: turn}`）只结束这次 Activation。
 
 托管循环在 `libopendan::host::Supervisor`：登记表里 `driver = 本进程身份` 且未结束（或有待处理 decide）的 Session 各有一个协程循环 `drive(Idle)`；启动后的第一次扫描就是恢复；空闲超过 `idle_unload_secs` 且没有待推进工作的 Session 被卸载，有新输入时再装载。
 
@@ -69,6 +69,8 @@ opendan --dev --agent-root <dir> --agent-did <did> --queue-dir <dir> \
 `--trust-loopback` 只用于本机调试：来自回环地址、不带 token 的调用按 owner 处理（本机网关转发来的请求也是回环地址，所以不要在正式环境里用）。服务端口被占用时进程直接退出：占着端口的就是同一个 Agent 的另一个宿主。
 
 端口：`--service-port`（= `--port`）→ `$BUCKYOS_SERVICE_PORT` / `$OPENDAN_SERVICE_PORT`（调度器分配）→ 4060。`xagent` 可执行文件与 `web/` 目录取自 `opendan` 所在目录。
+
+多入口：`opendan` 按调用名分派——`xagent` / `agent-session` → xagent CLI；`llm_understand_media`；buckyos-agent 的 AICC 命令（`aicc-tool`、`gen_image` …）与 `buckyos` → 在 `$BUCKYOS_ROOT/libexec/buckyos-tool/runtime/deno` 上运行 `libexec/buckyos-agent` / 调 `bin/buckyos[.cmd]`，在 Session 上下文里补上 Agent 的 BuckyOS 身份（`session.service_token`）；`agent_tool` 的工具名 → agent_tool CLI。`opendan install-agent-tools [<dir>]` 把标准环境的命令（清单 `xagent runtime baseline`）布置成本程序的入口（缺省 `$BUCKYOS_ROOT/bin/agent-tools`；Unix 符号链接，Windows 硬链接或复制，不经脚本转参）；node-daemon 启动时调用它，并把该目录放在节点执行器每条命令 PATH 的最前面（primary-runtime TODO §2.2）。
 
 开发形态下用 xagent 创建由 OpenDAN 驱动的 Session：
 
@@ -105,13 +107,13 @@ cd src && uv run start.py --skip-update
 
 ## kRPC 接口
 
-同一服务也挂载在 `/kapi/<agent_id>`（AgentSpec 的完整 AgentId，包含域名中的点），供 Desktop 经 zone 网关的 `service_info[agent_id]` 同源访问。两条路径使用相同的 owner/root 鉴权；客户端通过 `agent.list` 的 DID → AgentId 映射定位，不把会话 token 发送到消息提供的任意 URL。
+WebUI 通过同源 `/api/opendan` 访问托管本页面的 Agent，由 zone 网关按应用域名转发；本地调试也使用这条路径。`/kapi/opendan` 用于直连 Loader，同一服务也挂载在 `/kapi/<agent_id>`（AgentSpec 的完整 AgentId，包含域名中的点），供 Desktop 经 zone 网关的 `service_info[agent_id]` 同源访问。所有路径使用相同的 owner/root 鉴权；客户端通过 `agent.list` 的 DID → AgentId 映射定位，不把会话 token 发送到消息提供的任意 URL。zone 网关把 `/kapi/<name>` 解释为服务名，不能用 `/kapi/opendan` 访问没有同名系统服务的 Agent 应用。
 
-`GET /kapi/opendan` 不需要 token，返回 `{"app_id": "<托管本页面的 app>" | null}`：WebUI 用它向 zone 换取 session token（token 是签给这个 app 的）；`--dev` 形态返回 `null`。
+`GET /api/opendan` 不需要 RPC token，返回 `{"app_id": "<托管本页面的 app>" | null}`：WebUI 用它向 zone 换取 session token（token 是签给这个 app 的）；`--dev` 形态返回 `null`。经 zone 网关访问仍需本应用的 SSO cookie。
 
 经 zone 网关访问时，网关只放行带 zone 登录（本主机的 SSO cookie）的请求，其余一律 302 到 zone 登录页；脚本发起的调用跟不过去（跨源），表现为 `Failed to fetch`。续期失败（例如 verify-hub 重启后不再认得 refresh token）时 zone 会清掉 cookie，登录就此失效。WebUI 在调用出现传输错误时用 `GET`（`redirect: manual`）探一次：被网关重定向即显示“登录已失效”，“重新登录”重新加载页面，由网关带到登录页。
 
-路径 `/kapi/opendan`，标准 kRPC（`POST`，`{"method","params","sys":[seq, session_token]}`）。调用方身份 `who` 来自 session token（verify-hub 签发）：Agent 的 owner（经任何 app）与 zone root 可访问；`--dev` 形态不校验。错误的 `error` 字段里带 JSON 文本 `{"kind","message",…}`（kRPC 会加前缀 `Failed due to reason: `，从第一个 `{` 起解析）（`kind` 取值同 `OpenDanError::to_json`，如 `not_found`、`invalid_argument`、`input_full`、`queue_missing`）。
+以上路径均使用标准 kRPC（`POST`，`{"method","params","sys":[seq, session_token]}`）。调用方身份 `who` 来自 session token（verify-hub 签发）：Agent 的 owner（经任何 app）与 zone root 可访问；`--dev` 形态不校验。错误的 `error` 字段里带 JSON 文本 `{"kind","message",…}`（kRPC 会加前缀 `Failed due to reason: `，从第一个 `{` 起解析）（`kind` 取值同 `OpenDanError::to_json`，如 `not_found`、`invalid_argument`、`input_full`、`queue_missing`）。
 
 ### Agent State（与 `AgentStateClient` 一一对应）
 
@@ -127,9 +129,6 @@ cd src && uv run start.py --skip-update
 | `sessions.post_input` | `{sid, input: PostedInput}`（`from` 由服务端改写为调用方） | `index: number` |
 | `sessions.verify` | – | `string[]`（标记为 unreachable 的 sid） |
 | `activity.active` | `{me?: sid, limit?}` | `ActiveSession[]` |
-| `perception.cursor` | – | `PerceptionCursor` |
-| `perception.backlog` | `{cursor}` | `Backlog` |
-| `perception.read` | `{item: BacklogItem}` | `PerceptionRecord[]` |
 | `perception.last_seq` | `{sid}` | `number` |
 | `cognition.recall_hints` | `{query: {tags, max_hints}}` | `Hint[]` |
 | `cognition.notebook_append` | `{note: NotebookNote}` | `null` |
@@ -191,6 +190,19 @@ cd src && uv run start.py --skip-update
 
 返回 `{index}`（`session.post` 另带 `key`）。投递后服务端让 Supervisor 装载该 Session。三个操作都要求 Session 有输入队列；没有队列的 Session（如一次性的 work session）返回 `channel` 错误，它的产物验收走 `artifacts.decide`。`session.stop` 另收 `scope: session | turn`（缺省 `session`）；对 Goal Session 任何 stop 都只结束当前 Activation。
 
+### Session 进程（session token）
+
+节点 session-runtime 上的 `agent-session` 等 helper 看不到 AgentRoot、也收不到 `OPENDAN_*` 环境：它在 Session 工作目录找到 `.opendan/session.json` 与 `.opendan/session.token`（每次绑定由 libopendan 写入，24 小时），以该 token 调用本服务（节点上经 `http://127.0.0.1:3180/kapi/<agent_id>`）。session token 不走 verify-hub，只能调用下面四个方法，`sid` 若给出须与 token 一致，拒绝为 `forbidden`：
+
+| 方法 | 参数 | 作用 |
+| --- | --- | --- |
+| `session.helper` | `{request: {argv, stdin?, call_id?}}` | 在本服务所在机器以该 Session 的环境（`OPENDAN_*`、AgentRoot、PATH 层）运行一条 `agent-session` 命令（`xagent` 程序），返回 `{exit_code, stdout, stderr}`；`call_id` 进 `XLLM_CALL_ID`（建子 Session 的幂等键） |
+| `session.task` | `{request: {op: state \| wait \| cancel, task_id, wait_ms?}}` | 本进程正在推进的该 Session 的 run 的 task resolver（等同本机的 `XLLM_TASK_ENDPOINT`）；没有进行中的 run 时 `unknown` |
+| `session.token_refresh` | `{}` | 新 token 与到期时间 |
+| `session.service_token` | `{}` | Agent 自己的 BuckyOS 会话 token、app id、owner：节点上的 `buckyos` / AICC 命令以 Agent 身份调用服务 |
+
+密钥在 `<agent_root>/state/session_token.key`；任何能看到 AgentRoot 的驱动者都能签发，服务端校验。实现：`libopendan::session_context`。
+
 ### Goals
 
 Agent State 门面的 `goals.*`（读：`goals.list / get / revision / changes / state / epoch_state / activations / schedule`；写：`goals.create / revise / set_status / reopen / restart`，参数与权限见 Agent State Protocol §9.5–§9.6，`session` 参数是调用方自报的所在 Session）。写成功后服务端让 Supervisor 立即 reconcile 该 Goal（建 Session、迁移 epoch）。驱动者 / 宿主写（`goals.write_state`、`goals.append_activations`、`goals.prepare_epoch`、`goals.end_epoch`、`goals.write_schedule`）一律拒绝。宿主另提供：
@@ -204,7 +216,7 @@ Goal 不存在 → `not_found`；Goal 已结束（achieved / archived）→ `goa
 
 ### Skills
 
-Agent State 门面的 `skills.*`：Agent 的 cmd_skills（`cmd_skills/<name>.md` + `tools/<name>/bin`）与 goal_skills（`goal_skills/<name>.md`）。服务挂在 `/kapi/opendan` 与 `/kapi/<agent_id>`（经 NodeGateway 可达）；用户侧 CLI 是 `buckyos skill list|install|remove --agent <agent_id>`，Agent 在 Session 里用 `agent-session skill …`（直接读写 AgentRoot）。
+Agent State 门面的 `skills.*`：Agent 的 cmd_skills（`cmd_skills/<name>.md` + `tools/<name>/bin`）与 goal_skills（`goal_skills/<name>.md`）。服务挂在 `/kapi/opendan` 与 `/kapi/<agent_id>`（经 NodeGateway 可达）；用户侧 CLI 是 `buckyos skill list|install|remove --agent <agent_id>`，Agent 在 Session 里用 `agent-session skill …`（直接读写 AgentRoot；节点 session-runtime 上经 `session.helper` 转发，`skill install` 读不到控制侧的包，须在 Agent 自己的 runtime 上执行）。`skill list` 的每项带 `baseline`（`standard | extended`）与 `platforms`：Session 冻结 cmd_skills 时按其 session-runtime 声明的基线与平台过滤，不满足的不注入并在 `## Commands` 末尾列出原因。
 
 | method | params | 说明 |
 |---|---|---|
@@ -238,7 +250,10 @@ Agent State 门面的 `skills.*`：Agent 的 cmd_skills（`cmd_skills/<name>.md`
 {
   "agent_did": "…", "agent_id": "…", "who": "app:…@…", "agent_root": "…",
   "started_at_ms": 0, "now_ms": 0,
-  "modules": [ { "name": "ui | task_mgr | goals | self_check | self_improve | agent_state_service | webui",
+  "authentication": { "state": "ready | retry_pending | unavailable | reauthorization_required",
+                      "last_error": null, "error_code": null, "denial": null,
+                      "since": null, "next_retry_time": null } | null,
+  "modules": [ { "name": "ui | task_mgr | goals | self_check | memory_maintenance | notify | agent_state_service | webui",
                  "enabled": true, "running": true, "note": "…" } ],
   "hosted":  [ { "session_id", "class", "loaded", "loaded_at_ms", "drives", "last_result": DriveResult,
                  "last_result_at_ms", "idle_unload_secs", "reason" } ],
@@ -253,6 +268,8 @@ Agent State 门面的 `skills.*`：Agent 的 cmd_skills（`cmd_skills/<name>.md`
 ```
 
 `hosted` 只在内存里，重启后由登记表重建，不是协议。
+
+`authentication` 在独立 `--dev` 模式下为 `null`；Zone 模式直接读取共享 runtime 的认证状态，`since` 和 `next_retry_time` 为 Unix 秒。`retry_pending` 按退避重试；`unavailable` 和 `reauthorization_required` 停止复用失效凭据，需要宿主重新核验授权并重建实例。UI inbox bridge 和默认 AICC 调用先通过同一续期入口，新工具执行环境读取续期后的 token；显式配置的 AICC provider token 只作用于该请求。`hosted.last_result` 与 Session `last_error` 保留绑定失败诊断，临时认证失败允许退避重试，认证终止时保留输入游标和 outbox。进程或模块仍在运行不表示认证健康。宿主恢复流程见 [runtime-login](../../../doc/sdk/runtime-login.md)。
 
 zone 内启动时，进程把 `AGENT_TOOL_HOST_ID` 设为 `<device did>/<app instance id>`（已设置则不动）：容器每次重建都会换 hostname，Session 的 runtime 绑定与 lease 用这个稳定身份。
 

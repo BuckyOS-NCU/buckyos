@@ -36,6 +36,8 @@ function desktopServiceWorker(): Plugin {
 }
 
 const DRAWIO_DIR = resolve(import.meta.dirname, '../aiworkspace/import-drawio')
+// The wish program host (src/frame/aiworkspace/aiws/aiws.js) the local executor's Worker runs programs with: the file the service runs.
+const AIWS_DIR = resolve(import.meta.dirname, '../aiworkspace/aiws')
 
 // NFSP dev proxy: nfs-server has no CORS (in production the zone gateway
 // forwards the same-origin root path /nfs/v1/* to it), so dev mirrors that
@@ -105,14 +107,14 @@ export default defineConfig(() => {
       alias: [{ find: /^loro-crdt$/, replacement: 'loro-crdt/web' }, { find: /^@drawio\//, replacement: `${DRAWIO_DIR}/` }],
     },
     server: {
-      fs: { allow: [searchForWorkspaceRoot(process.cwd()), DRAWIO_DIR] },
+      fs: { allow: [searchForWorkspaceRoot(process.cwd()), DRAWIO_DIR, AIWS_DIR] },
       host: '0.0.0.0',
       port: 5174,
       proxy: {
         // listed first: more specific than the zone proxy's /kapi
         ...(aiwsTarget ? { '/kapi/aiworkspace': { target: aiwsTarget, changeOrigin: true } } : {}),
         ...hsProxy,
-        ...(nfsTarget ? { '/nfs/v1': { target: nfsTarget, changeOrigin: true } } : {}),
+        ...(nfsTarget ? { '/nfs/v1': { target: nfsTarget, changeOrigin: true }, '/ndm': { target: nfsTarget, changeOrigin: true } } : {}),
         ...zoneProxy,
       },
     },
@@ -121,6 +123,7 @@ export default defineConfig(() => {
     preview: {
       proxy: {
         ...(aiwsTarget ? { '/kapi/aiworkspace': { target: aiwsTarget, changeOrigin: true } } : {}),
+        ...(nfsTarget ? { '/nfs/v1': { target: nfsTarget, changeOrigin: true }, '/ndm': { target: nfsTarget, changeOrigin: true } } : {}),
         ...hsProxy,
       },
     },

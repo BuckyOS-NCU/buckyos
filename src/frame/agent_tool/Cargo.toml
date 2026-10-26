@@ -12,10 +12,12 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
 buckyos-api = { path = "../../kernel/buckyos-api" }
+name-lib = { workspace = true }
 llm_context = { path = "../llm_context" }
 ndn-lib = { workspace = true }
 kRPC = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
 reqwest = { workspace = true }
 log = { workspace = true }
 rusqlite = { workspace = true }

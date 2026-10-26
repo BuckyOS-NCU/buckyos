@@ -155,6 +155,37 @@ test('home preserves three layers, owner identity and truthful settings and runt
   )
 })
 
+test('the installing account switches customer sign-in by its App on and off', async ({
+  page,
+}) => {
+  await page.goto('/?scenario=normal')
+  await openAppService(page)
+  // bob's installation: alice is signed in, so no switch.
+  await page
+    .getByTestId('app-service-card-nostr-relay.buckyos.bns.did@bob')
+    .click()
+  await expect(page.getByText('Docker Engine')).toBeVisible()
+  await expect(page.getByTestId('app-service-app-login')).toHaveCount(0)
+  await page.getByRole('button', { name: 'Back to applications' }).click()
+  await page
+    .getByTestId('app-service-card-home-assistant.buckyos.bns.did@alice')
+    .click()
+  const section = page.getByTestId('app-service-app-login')
+  await expect(section.getByTestId('app-service-app-login-state')).toHaveText('Off')
+  await section.getByRole('switch').click()
+  await expect(section.getByTestId('app-service-app-login-state')).toHaveText('On')
+  await expect(section.getByRole('switch')).toHaveAttribute('aria-checked', 'true')
+  // The switch is server state, not page state: leaving and coming back shows it on.
+  await page.getByRole('button', { name: 'Back to applications' }).click()
+  await page
+    .getByTestId('app-service-card-home-assistant.buckyos.bns.did@alice')
+    .click()
+  await expect(page.getByTestId('app-service-app-login-state')).toHaveText('On')
+  await page.getByTestId('app-service-app-login-toggle').click()
+  await expect(page.getByTestId('app-service-app-login-state')).toHaveText('Off')
+  await expect(page.getByTestId('app-service-app-login')).toContainText('Sessions ended: 0')
+})
+
 test('local PIKG import, inspection, plan, sudo, task and independent runtime result', async ({
   page,
 }) => {
@@ -503,4 +534,50 @@ test.describe('mobile App Service', () => {
       fullPage: true,
     })
   })
+})
+
+test('real PIKG inspection waits for ready, uses object references and never opens mock install', async ({ page }) => {
+  await page.route('**/src/app/app-service/pages/InstallWizard.tsx*', async route => {
+    const response = await route.fetch()
+    const body = (await response.text()).replace(/import\s*\{\s*isMockRuntime\s*\}\s*from\s*[^;]+;/, 'const isMockRuntime = () => false;')
+    await route.fulfill({ response, body })
+  })
+  await page.route('**/src/app/app-service/realPikg.ts*', async route => {
+    const response = await route.fetch()
+    const body = (await response.text())
+      .replace(/import\s*\{\s*buckyos,\s*ndm\s*\}\s*from\s*[^;]+;/, 'const { buckyos, ndm } = globalThis.pikgBridgeTest;')
+      .replace(/import\s*\{\s*callRpc\s*\}\s*from\s*[^;]+;/, 'const { callRpc } = globalThis.pikgBridgeTest;')
+    await route.fulfill({ response, body })
+  })
+  await page.addInitScript(() => {
+    const state = window as unknown as { pikgBridgeTest: unknown; pikgCalls: Array<{ method: string; params?: unknown }>; finishPikgUpload: () => void }
+    state.pikgCalls = []
+    state.pikgBridgeTest = {
+      buckyos: { getZoneServiceURL: () => '/kapi/control-panel', getAccountInfo: async () => ({ session_token: 'user-session' }) },
+      ndm: {
+        importFiles: async (files: File[]) => { state.pikgCalls.push({ method: 'import', params: files.map(file => file.name) }); return { sessionId: 's1', selection: { objectId: 'cyfile:uploaded' } } },
+        ensureUploaded: async () => { state.pikgCalls.push({ method: 'ready' }); await new Promise<void>(resolve => { state.finishPikgUpload = resolve }) },
+        releaseImportSession: () => state.pikgCalls.push({ method: 'release-session' }),
+      },
+      callRpc: async (method: string, params: unknown) => {
+        state.pikgCalls.push({ method, params })
+        if (method === 'apps.staging.finalize') return { data: { handle: 'staging:mine', pikg_digest: 'a'.repeat(64), size: 4, expires_at: Date.now() + 1000 }, error: null }
+        if (method === 'apps.inspect') return { data: { plan: { app: { show_name: 'Validated package', version: '1.0', did: 'did:web:package', object_id: 'appdoc:actual' }, plan_fingerprint: 'plan:actual' }, status: { readiness: { content: 'READY' }, warnings: [] } }, error: null }
+        return { data: { ok: true }, error: null }
+      },
+    }
+  })
+  await openSource(page)
+  await page.getByTestId('app-service-pikg-upload').setInputFiles({ name: 'real.pikg', mimeType: 'application/octet-stream', buffer: Buffer.from('PIKG') })
+  await expect.poll(() => page.evaluate(() => (window as any).pikgCalls.map((entry: any) => entry.method))).toEqual(['import', 'ready'])
+  await expect(page.getByTestId('app-service-source-next')).toBeDisabled()
+  await page.evaluate(() => (window as any).finishPikgUpload())
+  await expect(page.getByTestId('app-service-real-inspection')).toContainText('Validated package')
+  await expect(page.getByTestId('app-service-real-inspection')).toContainText('this inspection does not install')
+  await expect(page.getByTestId('app-service-source-next')).toBeDisabled()
+  const calls = await page.evaluate(() => (window as any).pikgCalls)
+  expect(calls.find((entry: any) => entry.method === 'apps.staging.finalize').params).toEqual({ source_obj_id: 'cyfile:uploaded', size: 4, purpose: 'inspect' })
+  expect(calls.some((entry: any) => entry.method.includes('submit'))).toBe(false)
+  await page.getByLabel('Enter a link or application identifier').fill('changed')
+  await expect.poll(() => page.evaluate(() => (window as any).pikgCalls.some((entry: any) => entry.method === 'apps.staging.release' && entry.params.staging_handle === 'staging:mine'))).toBe(true)
 })

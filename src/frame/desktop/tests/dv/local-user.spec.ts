@@ -89,7 +89,7 @@ async function loginThroughUi(page: Page, username: string, password: string): P
   await expect(page.getByLabel('Username')).toBeVisible()
   await page.getByLabel('Username').fill(username)
   await page.getByLabel('Password').fill(password)
-  await page.getByRole('button', { name: 'Sign In' }).click()
+  await page.getByRole('button', { name: 'Sign In', exact: true }).click()
   await expect(page.getByRole('button', { name: 'BuckyOS' })).toBeVisible()
 }
 
@@ -121,7 +121,7 @@ async function refreshBrowserSso(page: Page, expectedUserId: string): Promise<vo
     }
   })
   expect(result.status).toBe(200)
-  expect(result.body.user_info).toMatchObject({ user_id: expectedUserId })
+  expect(result.body.identity).toMatchObject({ kind: 'account', user_id: expectedUserId })
   const sessionToken = result.body.session_token
   expect(typeof sessionToken).toBe('string')
   const claims = jwtPayload(String(sessionToken))
@@ -271,10 +271,11 @@ test('admin creates a real local user, then that user logs in and sees self', as
     await sudoDialog.getByRole('button', { name: 'Create user', exact: true }).click()
 
     await expect(appWindow.getByRole('heading', { name: displayName })).toBeVisible()
-    await expect(appWindow.getByText('Local account · zone-members')).toBeVisible()
+    await expect(appWindow.getByText('Local account', { exact: true }).first()).toBeVisible()
+    await expect(appWindow.getByTestId('user-account-admin').getByLabel('Account type')).toHaveValue('user')
     await expect(appWindow.getByText('Local', { exact: true })).toBeVisible()
-    await expect(appWindow.locator('.MuiChip-label').filter({ hasText: /^user$/ })).toBeVisible()
-    await expect(appWindow.locator('.MuiChip-label').filter({ hasText: /^active$/ })).toBeVisible()
+    await expect(appWindow.locator('.MuiChip-label').filter({ hasText: /^User$/ })).toBeVisible()
+    await expect(appWindow.locator('.MuiChip-label').filter({ hasText: /^Active$/ })).toBeVisible()
     await page.screenshot({ path: testInfo.outputPath('admin-created-user.png'), fullPage: true })
 
     await page.getByRole('button', { name: 'BuckyOS' }).hover()

@@ -26,15 +26,17 @@ collections:
     type: json_map
     file_path: ./node_gateway_info.json#node_info
     only_read_file: true
-  LOCAL_ACCESS_ORIGINS:
+  # Devices allowed to open Node Executor streams; node_daemon rewrites the
+  # file from the current authorization snapshot (empty when it is invalid).
+  EXECUTOR_ACL:
     type: json_map
-    file_path: ./local_access_origins.json
+    file_path: ./node_executor_acl.json#allowed
     only_read_file: true
 
 stacks:
   node_rtcp:
     protocol: rtcp
-    bind: "[::]:2980"
+    bind: "[::]:{{rtcp_port}}"
     device_did: "{{device_did}}"
     keep_tunnel: []
     hook_point:
@@ -42,6 +44,16 @@ stacks:
         id: main
         priority: 1
         blocks:
+          # Node Executor port: only RTCP-authenticated devices in the ACL,
+          # always to the loopback listener.
+          node_executor:
+            id: node_executor
+            priority: 0
+            block: |
+              if eq ${REQ.dest_port} "3184" then
+                match-include $EXECUTOR_ACL ${REQ.source_device_id} || reject;
+                forward "tcp:///127.0.0.1:3184";
+              end
           default:
             id: default
             priority: 1
@@ -77,7 +89,45 @@ stacks:
             block: |
               return "server node_gateway";
 
+  # Agent-side entry to remote Node Executors: SOCKS5 CONNECT <node-host>:3184
+  # from local processes or containers.
+  node_executor_entry:
+    protocol: tcp
+    bind: "0.0.0.0:3185"
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              if match ${REQ.conn_source_ip} "127.*" then
+                return "server node_executor_socks";
+              end
+              if match ${REQ.conn_source_ip} "172.*" then
+                return "server node_executor_socks";
+              end
+              reject;
+
 servers:
+  node_executor_socks:
+    type: socks
+    target: rtcp://executor.invalid/
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              eq ${REQ.target.port} "3184" || return "REJECT";
+              if eq ${REQ.target.type} "ip" then
+                eq ${REQ.target.ip} "127.0.0.1" && return "DIRECT";
+                return "REJECT";
+              end
+              eq ${REQ.target.type} "domain" || return "REJECT";
+              return "PROXY rtcp://${REQ.target.host}/";
+
   buckyos_public:
     type: dir
     root_path: ../data/srv/publish/
@@ -100,21 +150,6 @@ servers:
             block: |
               global THIS_NODE_ID=$NODE_INFO.this_node_id;
               global THIS_ZONE_HOST=$NODE_INFO.this_zone_host;
-              global ROUTE_HOST=$REQ.host;
-              map-create host_parts;
-              if match-reg --capture host_parts $ROUTE_HOST "^([^:]+):[0-9]+\$" then
-                global ROUTE_HOST=$host_parts[1];
-              end
-              local request_scheme="http";
-              if eq $REQ_target_port "443" then
-                request_scheme="https";
-              end
-              local request_origin="${request_scheme}://${REQ.host}";
-              if match-include $LOCAL_ACCESS_ORIGINS $request_origin then
-                if eq $LOCAL_ACCESS_ORIGINS[$request_origin] "true" then
-                  global ROUTE_HOST=$THIS_ZONE_HOST;
-                end
-              end
               global CONTROL_PANEL_URL="https://sys.${THIS_ZONE_HOST}/";
               global APP_ID="";
               global SERVICE_ID="";
@@ -135,13 +170,14 @@ servers:
               # several hosts (nfs-server: zone /nfs/v1 vs share.<zone>/s/*) read this.
               map-add REQ X-Forwarded-Host $REQ.host;
 
-              if eq $ROUTE_HOST "public.${THIS_ZONE_HOST}" then
+              if eq $REQ.host "public.${THIS_ZONE_HOST}" then
                 return --from chain $(exec forward_to_public);
               end
 
               exec get_app_info_from_req;
               exec get_service_info_from_req;
               if !eq $SERVICE_ID "" then
+                match-include $SERVICE_INFO $SERVICE_ID || return --from chain "error 503 service_not_ready:${SERVICE_ID}";
                 exec permit_check || echo "access service permit check failed" && reject;
                 return --from chain $(exec forward_to_service);
               elif !eq $APP_ID "" then
@@ -164,26 +200,30 @@ servers:
             priority: 120
             block: |
               app_lookup_key="";
-              if eq $ROUTE_HOST $THIS_ZONE_HOST then
+              if eq $REQ.host $THIS_ZONE_HOST then
                 app_lookup_key="_";
-              elif ends-with $ROUTE_HOST ".${THIS_ZONE_HOST}" then
-                app_lookup_key=$ROUTE_HOST;
+              elif ends-with $REQ.host ".${THIS_ZONE_HOST}" then
+                app_lookup_key=$REQ.host;
                 replace $app_lookup_key ".${THIS_ZONE_HOST}" "";
                 local expected_host=$(append $app_lookup_key ".${THIS_ZONE_HOST}");
-                eq $ROUTE_HOST $expected_host || return false;
+                eq $REQ.host $expected_host || return false;
                 map-create hp;
                 match-reg --capture hp $app_lookup_key "^([a-zA-Z0-9_-]+)\$" || return false;
                 eq $hp[1] $app_lookup_key || return false;
-              elif ends-with $ROUTE_HOST "-${THIS_ZONE_HOST}" then
-                app_lookup_key=$ROUTE_HOST;
+              elif ends-with $REQ.host "-${THIS_ZONE_HOST}" then
+                app_lookup_key=$REQ.host;
                 replace $app_lookup_key "-${THIS_ZONE_HOST}" "";
                 local expected_host=$(append $app_lookup_key "-${THIS_ZONE_HOST}");
-                eq $ROUTE_HOST $expected_host || return false;
+                eq $REQ.host $expected_host || return false;
                 map-create hp;
                 match-reg --capture hp $app_lookup_key "^([a-zA-Z0-9_-]+)\$" || return false;
                 eq $hp[1] $app_lookup_key || return false;
               else
                 return false;
+              end
+              # aiws-<workspace id>.<zone>: every AI Workspace's own origin, served by the aiworkspace service
+              if match-reg $app_lookup_key "^aiws-[a-z0-9]+\$" then
+                app_lookup_key="aiws";
               end
               match-include $APP_INFO $app_lookup_key || return false;
               local app_info=$APP_INFO[$app_lookup_key];
@@ -226,8 +266,12 @@ servers:
                 global SERVICE_ID="control-panel";
               elif match $REQ.path "/sso_logout" then
                 global SERVICE_ID="control-panel";
-              elif match $REQ.path "/ndm/*" then
+              elif match $REQ.path "/sso/did_callback" then
                 global SERVICE_ID="control-panel";
+              elif match $REQ.path "/ndm/*" then
+                # NDM 上传与代理协议（/ndm/v1/*、/ndm/proxy/v1/*）：nfs-server 承接，
+                # 原样转发；每个请求的身份与授权由 nfs-server 自己判。
+                global SERVICE_ID="nfs-server";
               elif match $REQ.path "/nfs/v1/*" then
                 # NFSP v0（NamedFileSystem_Protocol_v0）：zone 级通用协议入口，
                 # 与 /ndn 同级，不走 /kapi/<service> 形态；路径原样转发到 nfs-server。
@@ -244,10 +288,7 @@ servers:
               else
                 map-create krpc_hp;
                 match-reg --capture krpc_hp $REQ.path "^/kapi/([a-zA-Z0-9_.-]+)(/.*)?" || return false;
-                match-include $SERVICE_INFO $krpc_hp[1] || return false;
-                global TARGET_SERVICE_INFO=$SERVICE_INFO[$krpc_hp[1]];
                 global SERVICE_ID=$krpc_hp[1];
-                return $krpc_hp[1];
               end
 
               match-include $SERVICE_INFO $SERVICE_ID || return false;

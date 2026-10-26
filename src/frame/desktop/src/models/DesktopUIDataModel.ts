@@ -23,7 +23,8 @@
  *   - 正式环境                                              → initByReal
  */
 import { createContext, useContext, useSyncExternalStore } from 'react'
-import { fetchCurrentAccount, isLimitedUserType } from '../api/account'
+import { fetchCurrentAccount } from '../api/account'
+import { userTypeCanCreateAgents } from '../api/user_type'
 import { fetchAppList } from '../api/app_mgr'
 import { deleteDesktopItem, listDesktopFolder, writeDesktopItem, type DesktopFolderListing, type DesktopSeedItem } from '../api/desktop_items'
 import { translateNow } from '../i18n/translate'
@@ -96,7 +97,6 @@ import {
   clamp,
   invalidatePositions,
   layoutStorageKey,
-  migrateToSlotModel,
   readJson,
   readWindowAppearancePreferences,
   refreshSlotIndexes,
@@ -185,7 +185,7 @@ function minimizedWindow(w: WindowRecord, minimizedOrder: number | null): Window
 
 async function agentGuideAllowedForAccount(): Promise<boolean> {
   const account = await fetchCurrentAccount().catch(() => null)
-  return Boolean(account && !isLimitedUserType(account.user_type))
+  return Boolean(account && userTypeCanCreateAgents(account.user_type))
 }
 
 export interface ContextMenuState {
@@ -638,11 +638,8 @@ export class DesktopUIStore {
       const stored = scenario === 'normal' ? readJson<LayoutState>(layoutStorageKey(formFactor)) : null
       let layoutState = this.layoutFromFolder(apps, formFactor, stored, stored?.deadZone ?? payload.layout.deadZone)
 
-      // Fill slotIndex / seq for items that only carry x/y
-      const { gridCols, gridRows } = this.snapshot.runtime
-      layoutState = migrateToSlotModel(layoutState, gridCols, gridRows)
-
       // Validate positions against current grid (init-time reflow)
+      const { gridCols, gridRows } = this.snapshot.runtime
       layoutState = invalidatePositions(layoutState, gridCols, gridRows)
 
       this.update({
@@ -705,7 +702,6 @@ export class DesktopUIStore {
       const stored = readJson<LayoutState>(layoutStorageKey(formFactor))
       let layoutState = this.layoutFromFolder(apps, formFactor, stored, stored?.deadZone ?? payload.layout.deadZone)
       const { gridCols, gridRows } = this.snapshot.runtime
-      layoutState = migrateToSlotModel(layoutState, gridCols, gridRows)
       layoutState = invalidatePositions(layoutState, gridCols, gridRows)
 
       this.update({
@@ -772,6 +768,8 @@ export class DesktopUIStore {
       formFactor,
       deadZone,
       positions,
+      cols: this.snapshot.runtime.gridCols,
+      rows: this.snapshot.runtime.gridRows,
     })
   }
 
@@ -782,7 +780,6 @@ export class DesktopUIStore {
     const positions = positionsOverride === undefined ? (resolvedLayout ?? layoutState) : positionsOverride
     const { gridCols, gridRows } = this.snapshot.runtime
     let next = this.layoutFromFolder(apps, formFactor, positions, layoutState.deadZone)
-    next = migrateToSlotModel(next, gridCols, gridRows)
     next = invalidatePositions(next, gridCols, gridRows)
     if (JSON.stringify(next.pages) === JSON.stringify(layoutState.pages)) return
     this.update({ layoutState: next })
@@ -922,9 +919,6 @@ export class DesktopUIStore {
 
     const before = layoutState
     layoutState = invalidatePositions(layoutState, cols, rows)
-
-    // Migrate legacy layouts to slot model
-    layoutState = migrateToSlotModel(layoutState, cols, rows)
 
     // Slot indexes are grid-relative; keep them in step with the new grid.
     layoutState = refreshSlotIndexes(layoutState, cols, rows)
@@ -1071,7 +1065,8 @@ export class DesktopUIStore {
   /** Update the shell-visible metadata of a window (title, launch request). */
   updateWindow(windowId: string, patch: Partial<Pick<WindowRecord, 'title' | 'launch' | 'instanceKey'>>) {
     const { windows } = this.snapshot.runtime
-    if (!windows.some((w) => w.id === windowId)) return
+    const current = windows.find((w) => w.id === windowId)
+    if (!current || (Object.keys(patch) as Array<keyof typeof patch>).every((key) => current[key] === patch[key])) return
     this.update({
       runtime: {
         windows: windows.map((w) => (w.id === windowId ? { ...w, ...patch } : w)),

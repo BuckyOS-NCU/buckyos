@@ -1,4 +1,4 @@
-import { buckyos } from 'buckyos'
+import { accessDenialOf, buckyos, type AccessDenial, type EntryDescriptor } from 'buckyos'
 import { fetchUserDetail } from '../../../api/user_mgr'
 import type { DID, MsgObject, NotifyCategory, NotifyKind, NotifyStatus } from '../protocol/msgobj'
 import type { NotifyView } from '../notify/model'
@@ -213,23 +213,32 @@ export interface MailboxRecordPage {
 
 export class MessageHubApiError extends Error {
   readonly kind: 'permission_denied' | 'not_found' | 'invalid' | 'unavailable' | 'unknown'
+  /** The kRPC failure this was classified from; its `code` / `data` carry a structured denial. */
+  readonly source?: unknown
 
-  constructor(message: string, kind: MessageHubApiError['kind'] = 'unknown') {
+  constructor(message: string, kind: MessageHubApiError['kind'] = 'unknown', source?: unknown) {
     super(message)
     this.name = 'MessageHubApiError'
     this.kind = kind
+    this.source = source
   }
+}
+
+/** The structured denial (D-4) a failed call carries, whether or not it was classified here. */
+export function denialOf(error: unknown): AccessDenial | null {
+  return accessDenialOf(error instanceof MessageHubApiError ? error.source : error)
 }
 
 function classifyError(error: unknown): MessageHubApiError {
   if (error instanceof MessageHubApiError) return error
   const message = error instanceof Error ? error.message : String(error)
+  if (accessDenialOf(error)) return new MessageHubApiError(message, 'permission_denied', error)
   const lower = message.toLowerCase()
-  if (lower.includes('no permission') || lower.includes('permission')) return new MessageHubApiError(message, 'permission_denied')
-  if (lower.includes('not found')) return new MessageHubApiError(message, 'not_found')
-  if (lower.includes('invalid') || lower.includes('parse')) return new MessageHubApiError(message, 'invalid')
-  if (lower.includes('failed to fetch') || lower.includes('network') || lower.includes('timeout')) return new MessageHubApiError(message, 'unavailable')
-  return new MessageHubApiError(message)
+  if (lower.includes('no permission') || lower.includes('permission')) return new MessageHubApiError(message, 'permission_denied', error)
+  if (lower.includes('not found')) return new MessageHubApiError(message, 'not_found', error)
+  if (lower.includes('invalid') || lower.includes('parse')) return new MessageHubApiError(message, 'invalid', error)
+  if (lower.includes('failed to fetch') || lower.includes('network') || lower.includes('timeout')) return new MessageHubApiError(message, 'unavailable', error)
+  return new MessageHubApiError(message, 'unknown', error)
 }
 
 /* ── RPC plumbing ── */
@@ -357,10 +366,39 @@ export interface GroupSharedState {
   announcement?: string
 }
 
+/** A business Hook bound to a Session (`HookBinding`; the host never returns its secret). */
+export interface GroupHookBinding {
+  point: string
+  service: string
+  may_grant?: boolean
+  on_unavailable?: string
+  timeout_ms?: number
+  result_ttl_ms?: number
+}
+
+/** Display configuration of a group or Session (`DisplayConfig`, EXT-04). */
+export interface GroupDisplay {
+  announcement?: string | null
+  links?: Array<{ title?: string; url?: string }> | null
+  files?: Array<{ title?: string; obj_id?: string }> | null
+  featured_members?: string[] | null
+}
+
+/** An embedded application panel (`PanelDecl`, v2 §7.2); `list_sessions` items carry the effective ones. */
+export interface GroupPanelDecl {
+  id: string
+  title?: string
+  entry_url: string
+  scope?: 'group' | { sessions: string[] }
+}
+
 export interface GroupSessionRules {
   receipts?: string
   edit?: { edit_window_ms?: number | null; recall_window_ms?: number | null }
   allow_guests?: boolean
+  hooks?: GroupHookBinding[] | null
+  panels?: string[] | null
+  display?: GroupDisplay | null
 }
 
 export interface GroupSessionItem {
@@ -368,6 +406,10 @@ export interface GroupSessionItem {
   session: string
   shared_state?: Partial<GroupSharedState> | null
   rules?: GroupSessionRules | null
+  /** The panels in effect for this Session (scope covers it or its rules name them). */
+  panels?: GroupPanelDecl[] | null
+  /** The Session's display over the group's. */
+  display?: GroupDisplay | null
   lifecycle: string
   revision: string
   has_guests: boolean
@@ -379,6 +421,8 @@ export interface GroupConfig {
   revision: string
   profile?: { name?: unknown; description?: unknown } | null
   default_session?: GroupSessionRules | null
+  display?: GroupDisplay | null
+  extensions?: { panels?: GroupPanelDecl[] | null } | null
 }
 
 export interface GroupInviteLink {
@@ -398,7 +442,15 @@ export interface GroupReadMarkers {
 const key = (idempotencyKey: string) => ({ idempotency_key: idempotencyKey })
 const session = (sessionId: string | undefined) => sessionId !== undefined ? { session_id: sessionId } : {}
 
-export const listGroupsByMember = () => call<{ items?: GroupDocEnvelope[]; joined?: JoinedGroupSummary[] } | null>('group.list_by_member', {}).then(result => result ?? {})
+/** A Session invitation waiting for the caller's acceptance (msg-center `list_by_member`). */
+export interface PendingSessionInvitation {
+  group_did: DID
+  group_name?: string | null
+  session_id: string
+  title?: string | null
+  invited_by?: DID
+}
+export const listGroupsByMember = () => call<{ items?: GroupDocEnvelope[]; joined?: JoinedGroupSummary[]; session_invitations?: PendingSessionInvitation[] } | null>('group.list_by_member', {}).then(result => result ?? {})
 export const getGroupDoc = (groupDid: DID) => call<GroupDocEnvelope>('group.get_doc', { group_did: groupDid })
 export const getGroupConfig = (groupDid: DID) => call<GroupConfig>('group.get_config', { group_did: groupDid })
 /** Members of a hosted group plus the owner transfer still waiting for its target (members only; the public doc never carries it). */
@@ -415,7 +467,8 @@ export interface GroupSessionMemberRecord {
 }
 /** `complete` is false for a guest, or a member the member list is hidden from: only explicit participants and those who posted are listed. */
 export const listGroupSessionMembers = (groupDid: DID, sessionId?: string) => call<{ items?: GroupSessionMemberRecord[]; complete?: boolean; revision?: string } | null>('group.list_session_members', { group_did: groupDid, ...session(sessionId) }).then(result => ({ items: result?.items ?? [], complete: result?.complete === true, revision: result?.revision ?? '' }))
-export const checkGroupAccess = (groupDid: DID, action: string, sessionId?: string) => call<{ allowed: boolean; reason?: string | null }>('group.check_access', { group_did: groupDid, action, ...session(sessionId) })
+/** `allowed: 'hook_dependent'`: a `post` Hook with `may_grant` decides each message; the composer stays enabled. */
+export const checkGroupAccess = (groupDid: DID, action: string, sessionId?: string) => call<{ allowed: boolean | 'hook_dependent'; reason?: string | null }>('group.check_access', { group_did: groupDid, action, ...session(sessionId) })
 export const createGroup = (input: { idempotency_key: string; profile: { name: string }; invitations: Array<{ member_did: DID }> }) => call<{ group_did: DID; revision: string }>('group.create', input as unknown as Record<string, unknown>)
 /** `patch` is deep-merged into the configuration (`{ profile: { name, description } }` edits the profile). */
 export const applyGroupConfig = (groupDid: DID, expectedRevision: string, patch: Record<string, unknown>, idempotencyKey: string) => call<{ revision: string }>('group.apply_config', { group_did: groupDid, expected_revision: expectedRevision, patch, ...key(idempotencyKey) })
@@ -444,7 +497,12 @@ export const deleteGroupSession = (groupDid: DID, sessionId: string, expectedRev
 export const removeGroupSessionMember = (groupDid: DID, sessionId: string, memberDid: DID, expectedRevision: string, idempotencyKey: string) => call<{ revision: string }>('group.remove_session_member', { group_did: groupDid, session_id: sessionId, member_did: memberDid, expected_revision: expectedRevision, ...key(idempotencyKey) })
 export const leaveGroupSession = (groupDid: DID, sessionId: string, idempotencyKey: string) => call<{ revision: string }>('group.leave_session', { group_did: groupDid, session_id: sessionId, ...key(idempotencyKey) })
 export const inviteGroupSessionGuest = (groupDid: DID, sessionId: string, memberDid: DID, idempotencyKey: string) => call<unknown>('group.invite_session_guest', { group_did: groupDid, session_id: sessionId, member_did: memberDid, ...key(idempotencyKey) })
-export const acceptGroupSessionInvitation = (groupDid: DID, sessionId: string) => call<unknown>('group.accept_session_invitation', { group_did: groupDid, session_id: sessionId })
+/** With an idempotency key a retry of an accepted invitation returns the original result instead of `not-found`. */
+export const acceptGroupSessionInvitation = (groupDid: DID, sessionId: string, idempotencyKey?: string) => call<unknown>('group.accept_session_invitation', { group_did: groupDid, session_id: sessionId, ...(idempotencyKey ? key(idempotencyKey) : {}) })
+/** A guest's request through the group's public entry: a new Session from its template with the caller as guest; `request_id` makes it retry-safe. */
+export const submitGuestRequest = (groupDid: DID, requestId: string) => call<{ group_did: DID; session_id: string; session: string; revision: string }>('group.submit_guest_request', { group_did: groupDid, request_id: requestId })
+/** Public description of the group's Message Hub entry (`EntryDescription`: the resource service's own allowance). */
+export const describeGroupEntry = (groupDid: DID) => call<Pick<EntryDescriptor, 'state' | 'resource' | 'methods' | 'expires_at'>>('group.describe_entry', { group_did: groupDid })
 /** Message sequence numbers of a session (`seq` ↔ `obj_id`), which read markers are expressed in. */
 export const listGroupMessages = (groupDid: DID, sessionId: string | undefined, afterSeq: number, limit: number) => call<{ items?: Array<{ seq: number; obj_id: string; redacted?: boolean }>; next_after_seq?: number; limited?: boolean } | null>('group.list_messages', { group_did: groupDid, ...session(sessionId), after_seq: afterSeq, limit }).then(result => result ?? {})
 export const getGroupReadMarkers = (groupDid: DID, sessionId: string | undefined, sessionSeq: number) => call<GroupReadMarkers>('group.get_read_markers', { group_did: groupDid, ...session(sessionId), session_seq: sessionSeq })

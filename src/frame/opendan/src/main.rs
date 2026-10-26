@@ -280,7 +280,7 @@ async fn zone_env(args: &Args) -> Result<LoaderEnv> {
         .or_else(|| {
             [appid.clone(), format!("buckyos_{appid}")]
                 .into_iter()
-                .map(|n| PathBuf::from("/opt/buckyos/bin").join(n))
+                .map(|n| buckyos_kit::get_buckyos_root_dir().join("bin").join(n))
                 .find(|p| p.is_dir())
         });
     let queue = runtime
@@ -299,6 +299,9 @@ async fn zone_env(args: &Args) -> Result<LoaderEnv> {
     // Long `shell` commands become tasks of the zone's TaskMgr (under the
     // Turn they belong to), not of this process.
     let xllm = opendan::tasks::zone_xllm_deps(&spec.agent_did.to_string(), Some(owner.clone()));
+    let share: Arc<dyn libopendan::share::ShareHost> = Arc::new(libopendan::share::ZoneShare {
+        switch: Arc::new(records::RecordsShareSwitch(records.clone())),
+    });
     Ok(LoaderEnv {
         who: format!("app:{}@{owner}", runtime.get_app_id()),
         agent_did: spec.agent_did.to_string(),
@@ -331,6 +334,7 @@ async fn zone_env(args: &Args) -> Result<LoaderEnv> {
         notify: Some(Arc::new(opendan::notify::ZoneNotify {
             owner_user: owner.clone(),
         })),
+        share: Some(share),
         access: Access::Zone {
             owner,
             app_id: runtime.get_app_id(),
@@ -342,7 +346,7 @@ async fn zone_env(args: &Args) -> Result<LoaderEnv> {
         // Long `shell` commands become tasks of the zone's TaskMgr (under
         // the Turn they belong to), not of this process.
         xllm,
-        session_cli: beside_exe("xagent"),
+        session_cli: beside_exe(&format!("xagent{}", std::env::consts::EXE_SUFFIX)),
         session_helpers: libopendan::runtime::bin_overlay::standard_helpers(
             std::env::current_exe().ok().as_deref().and_then(std::path::Path::parent),
         ),
@@ -380,6 +384,10 @@ async fn dev_env(args: &Args) -> Result<LoaderEnv> {
         libopendan::notify::LocalNotify::enable(&agent_root, &agent_did)
             .map_err(|e| anyhow!("notifications: {e}"))?,
     );
+    // Shared results as files of the AgentRoot (`shares/`).
+    let share: Arc<dyn libopendan::share::ShareHost> = Arc::new(
+        libopendan::share::LocalShare::enable(&agent_root).map_err(|e| anyhow!("shares: {e}"))?,
+    );
     Ok(LoaderEnv {
         who: who.clone(),
         agent_did,
@@ -401,11 +409,12 @@ async fn dev_env(args: &Args) -> Result<LoaderEnv> {
         tasks: None,
         objects: None,
         notify: Some(notify),
+        share: Some(share),
         access: Access::Open { who },
         port: port_of(args),
         web_dir: args.web.clone().or_else(|| beside_exe("web")),
         xllm: XllmDeps::default(),
-        session_cli: beside_exe("xagent"),
+        session_cli: beside_exe(&format!("xagent{}", std::env::consts::EXE_SUFFIX)),
         session_helpers: libopendan::runtime::bin_overlay::standard_helpers(
             std::env::current_exe().ok().as_deref().and_then(std::path::Path::parent),
         ),
@@ -482,13 +491,56 @@ fn invoked_name() -> Option<String> {
     )
 }
 
+/// `opendan install-agent-tools [<dir>]`: lay out this host's agent tool
+/// directory (default `$BUCKYOS_ROOT/bin/agent-tools`) as entries of this
+/// program; node-daemon puts it on the PATH of the commands its executor
+/// runs.
+fn install_agent_tools(dir: Option<std::ffi::OsString>) -> ! {
+    use libopendan::baseline::{buckyos_root, install_entries, AGENT_TOOLS_BIN};
+    let result = (|| -> Result<Vec<PathBuf>> {
+        let root = buckyos_root().ok_or_else(|| anyhow!("cannot tell $BUCKYOS_ROOT; set it"))?;
+        let dir = dir.map(PathBuf::from).unwrap_or_else(|| root.join(AGENT_TOOLS_BIN));
+        let program = std::env::current_exe().context("this program")?;
+        Ok(install_entries(&dir, &program)?)
+    })();
+    match result {
+        Ok(made) => {
+            println!("{}", serde_json::json!({ "entries": made }));
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("opendan install-agent-tools: {e:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // On a node session-runtime the AICC clients get the agent's identity
+    // from its session (the executor passes no BUCKYOS_* environment).
+    if let Some(name @ ("agent_tool" | "llm_understand_media")) = invoked_name().as_deref() {
+        for (key, value) in libopendan::baseline::session_identity_env(name) {
+            std::env::set_var(key, value);
+        }
+    }
     match invoked_name().as_deref() {
-        Some("xagent") => libopendan::xagent_cli::main(),
+        Some("xagent" | "agent-session") => libopendan::xagent_cli::main(),
+        Some("llm_understand_media") => {
+            let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+            let args = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+            std::process::exit(rt.block_on(agent_tool::llm_understand_media::run_subcommand(args)))
+        }
+        Some(name) if libopendan::baseline::is_host_entry(name) => {
+            std::process::exit(libopendan::baseline::run_host_entry(name, &args))
+        }
         Some(name) if agent_tool_cli_dev::handles_invocation_name(name) => {
             agent_tool_cli_dev::main()
         }
         _ => {}
+    }
+    if args.first().and_then(|a| a.to_str()) == Some("install-agent-tools") {
+        install_agent_tools(args.get(1).cloned());
     }
     init_logging("opendan", true);
     pin_host_identity();

@@ -1,7 +1,7 @@
 //! The `shell` tool and the command runners behind it.
 //!
 //! `shell` runs a bash command in the runtime of the current run (native
-//! process, tmux session or remote host — see `runtime`). Its lifecycle
+//! process, Node Executor or remote host — see `runtime`). Its lifecycle
 //! follows standard parent / child process semantics
 //! (`notepads/llm-context-long-tool-todo.md` §3.2): only the command in
 //! progress is managed; whatever the command leaves behind (`&`, nohup,
@@ -53,7 +53,7 @@ const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// Bytes of output kept in a progress / cancel text.
 pub const OUTPUT_TAIL_BYTES: usize = 2048;
 pub(crate) const LOCAL_ENGINE: &str = "native";
-pub(crate) const TIMEOUT_EXIT_CODE: i32 = 124;
+pub const TIMEOUT_EXIT_CODE: i32 = 124;
 const UNLIMITED_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 
 /// How long `shell` waits inside the call.
@@ -89,7 +89,7 @@ pub fn new_run_binding_slot() -> RunBindingSlot {
 pub const ENV_CALL_ID: &str = "XLLM_CALL_ID";
 
 /// `<run_dir>/exec/<call_id>`, the execution directory of one call (native
-/// and tmux runtimes). `None` without a persistent run directory or call id.
+/// runtime). `None` without a persistent run directory or call id.
 pub fn exec_dir_for(run_dir: Option<&Path>, call_id: Option<&str>) -> Option<PathBuf> {
     let dir = run_dir?;
     let call_id = call_id.filter(|c| !c.is_empty())?;
@@ -117,10 +117,12 @@ pub fn sanitize_call_id(call_id: &str) -> String {
 /// Runtime facts rendered into the tool description (§3.3).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShellRuntimeNote {
-    /// `native | tmux | remote_ssh`.
+    /// `native | remote_ssh | remote_node`.
     pub kind: String,
-    /// tmux session name / SSH host, when relevant.
+    /// SSH host / node DID, when relevant.
     pub target: String,
+    /// OS of a `remote_node` target (`std::env::consts::OS` naming).
+    pub os: String,
 }
 
 impl ShellRuntimeNote {
@@ -128,21 +130,27 @@ impl ShellRuntimeNote {
         Self {
             kind: "native".into(),
             target: String::new(),
+            os: String::new(),
         }
     }
 
+    /// Windows nodes run `remote_node` commands in PowerShell, like native.
     fn powershell(&self) -> bool {
-        cfg!(windows) && self.kind == "native"
+        match self.kind.as_str() {
+            "native" => cfg!(windows),
+            "remote_node" => self.os == "windows",
+            _ => false,
+        }
     }
 
     fn lifecycle_sentence(&self) -> String {
         match self.kind.as_str() {
-            "tmux" => format!(
-                "The command runs in tmux session `{}`; it keeps running if this executor is interrupted or exits.",
-                self.target
-            ),
             "remote_ssh" => format!(
                 "The command runs on the remote host `{}`; it keeps running if this executor is interrupted or exits.",
+                self.target
+            ),
+            "remote_node" => format!(
+                "The command runs on node `{}` through its Node Executor; it keeps running if this executor or its connection goes away, an interrupt cancels it on the node, and it is bounded by the node's maximum execution time.",
                 self.target
             ),
             _ => "The command is a child process of this executor: an interrupt or a timeout ends its process group; processes it leaves behind after returning are not managed.".into(),
@@ -437,7 +445,7 @@ pub struct CommandProgress {
 }
 
 /// A started command. Dropping the handle without `detach` stops a native
-/// command (process group guard); tmux / remote commands keep running.
+/// command (process group guard); remote commands keep running.
 #[async_trait]
 pub trait CommandHandle: Send + Sync {
     /// Wait until the command exits or `timeout` passes (`Ok(None)`: still
@@ -457,7 +465,7 @@ pub trait CommandHandle: Send + Sync {
     fn cancellable(&self) -> bool;
 
     /// Where the command lives / how to look at it, for texts shown to the
-    /// model (e.g. `tmux window llm-c1 of session x; output in <dir>`).
+    /// model (e.g. `remote execution directory <dir>`).
     fn locator(&self) -> String;
 }
 
@@ -539,7 +547,7 @@ pub trait BashRunner: Send + Sync {
         }
     }
 
-    /// Engine label of this runner (`native | tmux | remote_ssh`).
+    /// Engine label of this runner (`native | remote_ssh | remote_node`).
     fn engine(&self) -> &str {
         LOCAL_ENGINE
     }
@@ -1610,7 +1618,7 @@ impl ShellTool {
                 progress.output_tail.trim_end()
             )
         };
-        if runtime != "tmux" && handle.cancellable() {
+        if handle.cancellable() {
             match handle.kill().await {
                 Ok(out) => AgentToolError::Cancelled {
                     message: format!(
@@ -2502,13 +2510,25 @@ mod tests {
             .with_default_timeout_ms(90_000)
             .with_max_timeout_ms(120_000)
             .with_runtime_note(ShellRuntimeNote {
-                kind: "tmux".into(),
-                target: "od_x".into(),
+                kind: "remote_ssh".into(),
+                target: "build-host".into(),
+                os: String::new(),
             });
         let spec = ShellTool::new(cfg).spec();
         assert!(spec.description.contains("Default timeout 90s, max 120s"));
-        assert!(spec.description.contains("tmux session `od_x`"));
+        assert!(spec.description.contains("remote host `build-host`"));
         assert!(spec.description.contains("bash"));
+
+        for (os, language) in [("windows", "PowerShell"), ("linux", "bash")] {
+            let (_dir, workspace) = ws();
+            let cfg = LlmBashConfig::local_workspace(workspace).with_runtime_note(ShellRuntimeNote {
+                kind: "remote_node".into(),
+                target: "did:web:pc.test.buckyos.io".into(),
+                os: os.into(),
+            });
+            let spec = ShellTool::new(cfg).spec();
+            assert!(spec.description.contains(&format!("with {language} syntax")), "{os}");
+        }
         assert!(spec.usage.unwrap_or_default().contains("timeout_ms=90000"));
     }
 

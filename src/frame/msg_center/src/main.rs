@@ -1,3 +1,4 @@
+mod attachment_retention;
 mod contact_mgr;
 mod contact_lookup;
 mod contact_rpc;
@@ -23,6 +24,8 @@ mod test_contact_network;
 #[cfg(test)]
 mod test_group_service;
 #[cfg(test)]
+mod test_hybrid_sso;
+#[cfg(test)]
 mod test_msg_center;
 #[cfg(test)]
 mod test_notify;
@@ -34,8 +37,9 @@ use anyhow::{Context, Result};
 use buckyos_api::{
     get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime, AccountBinding,
     BuckyOSRuntimeType, DeliveryRecordWithObject, DeliveryReportResult, DeliveryState,
-    MsgCenterClient, MsgCenterServerHandler, SystemConfigClient, UserContactSettings,
-    UserPrivateProfile, UserSettings, UserState, MSG_CENTER_SERVICE_NAME, MSG_CENTER_SERVICE_PORT,
+    project_contacts, MsgCenterClient, MsgCenterServerHandler, SystemConfigClient,
+    UserContactSettings, UserGroupDirectory, UserPrivateProfile, UserSettings,
+    contact_tag_kind, ContactTagKind, MSG_CENTER_SERVICE_NAME, MSG_CENTER_SERVICE_PORT,
 };
 use buckyos_http_server::Runner;
 use buckyos_http_server::{
@@ -56,7 +60,8 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::contact_mgr::ZoneUserContactSeed;
+use crate::contact_mgr::{ContactProjection, ProjectedContact, ZoneUserContactSeed};
+use crate::msg_center::ZoneAccounts;
 use crate::message_hub::MessageHubExecutor;
 use crate::msg_center::MessageCenter;
 use crate::msg_tunnel::{DeliveryExecutor, DeliveryExecutorMgr, ExecutorInstanceState};
@@ -192,14 +197,11 @@ impl RPCHandler for MsgCenterHttpServer {
         req: RPCRequest,
         ip_from: IpAddr,
     ) -> std::result::Result<RPCResponse, RPCErrors> {
-        if req.method == METHOD_RELOAD_SETTINGS
-            || req.method == METHOD_SERVICE_RELOAD_SETTINGS
-            || req.method == METHOD_REALOAD_SETTINGS
-            || req.method == METHOD_SERVICE_REALOAD_SETTINGS
-        {
-            let result = self.handle_reload_settings().await?;
+        let center = &self.rpc_handler.0;
+        if req.method == group_service::METHOD_GROUP_DESCRIBE_ENTRY {
+            let value = center.describe_group_entry(&req.params).await?;
             return Ok(RPCResponse {
-                result: RPCResult::Success(result),
+                result: RPCResult::Success(value),
                 seq: req.seq,
                 trace_id: req.trace_id,
             });
@@ -207,20 +209,38 @@ impl RPCHandler for MsgCenterHttpServer {
         if req.token.is_none() {
             return Err(RPCErrors::NoPermission("authentication-required".into()));
         }
-        if req.method.starts_with("group.") {
+        let method = req.method.clone();
+        let request = Box::pin(async move {
             let ctx = RPCContext::from_request(&req, ip_from);
-            let value = self
-                .rpc_handler
-                .0
-                .group_rpc(&req.method, req.params.clone(), ctx)
-                .await?;
-            return Ok(RPCResponse {
-                result: RPCResult::Success(value),
-                seq: req.seq,
-                trace_id: req.trace_id,
-            });
-        }
-        self.rpc_handler.handle_rpc_call(req, ip_from).await
+            // Every method checks the session first: restricted sessions only
+            // reach the methods that open their scope (D-4).
+            center.caller_identity(&ctx).await?;
+            if req.method == METHOD_RELOAD_SETTINGS
+                || req.method == METHOD_SERVICE_RELOAD_SETTINGS
+                || req.method == METHOD_REALOAD_SETTINGS
+                || req.method == METHOD_SERVICE_REALOAD_SETTINGS
+            {
+                center.require_service_caller(&ctx).await?;
+                let result = self.handle_reload_settings().await?;
+                return Ok(RPCResponse {
+                    result: RPCResult::Success(result),
+                    seq: req.seq,
+                    trace_id: req.trace_id,
+                });
+            }
+            if req.method.starts_with("group.") {
+                let value = center
+                    .group_rpc(&req.method, req.params.clone(), ctx)
+                    .await?;
+                return Ok(RPCResponse {
+                    result: RPCResult::Success(value),
+                    seq: req.seq,
+                    trace_id: req.trace_id,
+                });
+            }
+            self.rpc_handler.handle_rpc_call(req, ip_from).await
+        });
+        owner_session::serve_method(&method, request).await
     }
 }
 
@@ -477,45 +497,31 @@ fn profile_system_contact(profile: &UserPrivateProfile) -> Option<UserContactSet
         .and_then(|value| serde_json::from_value::<UserContactSettings>(value.clone()).ok())
 }
 
+/// The contact of an account. Its DID is the account's (`users/<id>/doc`);
+/// the user-writable profile only adds display data, a note, user tags and
+/// platform bindings, never another DID or a system tag.
 fn build_zone_user_seed(
     username: &str,
-    settings: UserSettings,
+    settings: &UserSettings,
+    did: DID,
     profile: Option<UserPrivateProfile>,
 ) -> Option<ZoneUserContactSeed> {
-    if !matches!(settings.state, UserState::Active) {
+    if !settings.is_active() {
         return None;
     }
 
-    let mut contact_did = profile
-        .as_ref()
-        .map(|profile| profile.did.clone())
-        .unwrap_or_else(|| DID::new("bns", username));
     let mut note = None;
     let mut tags = vec!["zone_user".to_string()];
     let mut bindings = Vec::new();
 
     if let Some(contact_cfg) = profile.as_ref().and_then(profile_system_contact) {
-        if let Some(raw_did) = contact_cfg.did.as_ref() {
-            let did = raw_did.trim();
-            if !did.is_empty() {
-                match DID::from_str(did) {
-                    Ok(parsed) => {
-                        contact_did = parsed;
-                    }
-                    Err(error) => {
-                        warn!(
-                            "invalid user contact.did, fallback to {}: did={}, error={}",
-                            contact_did.to_string(),
-                            did,
-                            error
-                        );
-                    }
-                }
-            }
-        }
-
         note = contact_cfg.note;
-        tags.extend(contact_cfg.tags);
+        tags.extend(
+            contact_cfg
+                .tags
+                .into_iter()
+                .filter(|tag| contact_tag_kind(tag) == ContactTagKind::User),
+        );
 
         for binding in contact_cfg.bindings {
             let platform = binding.platform.trim().to_string();
@@ -571,7 +577,7 @@ fn build_zone_user_seed(
         .unwrap_or_default();
     Some(ZoneUserContactSeed {
         avatar: public_profile.and_then(|profile| profile.avatar),
-        did: contact_did,
+        did,
         name: if name.is_empty() {
             username.to_string()
         } else {
@@ -609,21 +615,154 @@ async fn load_zone_user_profile(
     }
 }
 
-async fn load_zone_user_contact_seeds() -> Result<Vec<ZoneUserContactSeed>> {
+/// One account record of the Zone as the zone sync reads it.
+#[derive(Debug, Clone)]
+struct ZoneAccount {
+    username: String,
+    settings: UserSettings,
+    did: DID,
+    /// Present for active accounts.
+    seed: Option<ZoneUserContactSeed>,
+}
+
+/// The Zone's account records and user groups (product/users_and_agents/UserType.md).
+#[derive(Debug, Clone, Default)]
+struct ZoneDirectory {
+    accounts: Vec<ZoneAccount>,
+    /// Every account name, including records that cannot be read.
+    names: Vec<String>,
+    groups: UserGroupDirectory,
+}
+
+impl ZoneDirectory {
+    fn seeds(&self) -> Vec<ZoneUserContactSeed> {
+        self.accounts
+            .iter()
+            .filter_map(|account| account.seed.clone())
+            .collect()
+    }
+
+    /// Who is a local recipient: active Admin and User accounts.
+    fn zone_accounts(&self) -> ZoneAccounts {
+        ZoneAccounts {
+            recipients: self
+                .accounts
+                .iter()
+                .filter(|account| {
+                    account.seed.is_some() && account.settings.user_type.can_receive_direct_messages()
+                })
+                .filter_map(|account| account.seed.as_ref().map(|seed| seed.did.to_string()))
+                .collect(),
+            dids: self
+                .accounts
+                .iter()
+                .map(|account| account.did.to_string())
+                .collect(),
+            names: self.names.iter().cloned().collect(),
+            user_ids: self
+                .accounts
+                .iter()
+                .map(|account| (account.did.to_string(), account.username.clone()))
+                .collect(),
+        }
+    }
+
+    /// Every active account's view of the others through the projection rules.
+    fn contact_projection(&self, built_at_ms: u64) -> ContactProjection {
+        let rules = self.groups.projection_rules();
+        let defined = self.groups.defined_group_ids();
+        let active: Vec<(&ZoneAccount, &ZoneUserContactSeed, UserSettings)> = self
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                let seed = account.seed.as_ref()?;
+                let mut settings = account.settings.clone();
+                settings.user_id = account.username.clone();
+                Some((account, seed, settings))
+            })
+            .collect();
+        let mut projection = ContactProjection {
+            built_at_ms,
+            ..Default::default()
+        };
+        for (_, viewer_seed, viewer) in &active {
+            let viewer_did = viewer_seed.did.to_string();
+            if !viewer.can_edit_contacts() {
+                projection.read_only_owners.insert(viewer_did.clone());
+            }
+            let visible = project_contacts(
+                &rules,
+                &defined,
+                viewer,
+                active.iter().map(|(_, _, settings)| settings),
+            );
+            let entries: HashMap<DID, ProjectedContact> = active
+                .iter()
+                .filter_map(|(account, seed, _)| {
+                    let sources = visible.get(&account.username)?;
+                    Some((
+                        seed.did.clone(),
+                        ProjectedContact {
+                            seed: (*seed).clone(),
+                            sources: sources.iter().map(ToString::to_string).collect(),
+                        },
+                    ))
+                })
+                .filter(|(did, _)| did.to_string() != viewer_did)
+                .collect();
+            if !entries.is_empty() {
+                projection.by_owner.insert(viewer_did, entries);
+            }
+        }
+        projection
+    }
+
+    /// What a sync would change besides the contact seeds.
+    fn signature(&self) -> String {
+        let mut parts: Vec<String> = self
+            .accounts
+            .iter()
+            .map(|account| {
+                format!(
+                    "{}|{}|{}|{}|{:?}|{:?}",
+                    account.username,
+                    account.did.to_string(),
+                    account.settings.user_type,
+                    String::from(account.settings.state.clone()),
+                    account.settings.groups,
+                    account.settings.allow_contact_edit
+                )
+            })
+            .collect();
+        parts.extend(self.names.iter().map(|name| format!("name|{name}")));
+        parts.sort();
+        parts.push(serde_json::to_string(&self.groups.projection_rules()).unwrap_or_default());
+        let mut groups: Vec<&String> = self.groups.groups.iter().map(|g| &g.group_id).collect();
+        groups.sort();
+        parts.push(format!("{groups:?}"));
+        parts.join("\n")
+    }
+}
+
+async fn load_zone_directory() -> Result<ZoneDirectory> {
     let runtime = get_buckyos_api_runtime()?;
     let control_panel_client = runtime
         .get_control_panel_client()
         .await
         .map_err(|error| anyhow::anyhow!("get control panel client failed: {}", error))?;
 
-    let users = control_panel_client
+    let names = control_panel_client
         .get_user_list()
         .await
         .map_err(|error| anyhow::anyhow!("list users failed: {}", error))?;
-    let mut contacts = Vec::new();
+    let groups = control_panel_client
+        .load_user_groups()
+        .await
+        .map_err(|error| anyhow::anyhow!("load user groups failed: {}", error))?;
     let system_config_client = runtime.get_system_config_client().await?;
+    let mut accounts = Vec::new();
 
-    for username in users {
+    for username in names.iter() {
         let settings = match control_panel_client
             .get_user_settings_by_username(username.as_str())
             .await
@@ -637,14 +776,28 @@ async fn load_zone_user_contact_seeds() -> Result<Vec<ZoneUserContactSeed>> {
                 continue;
             }
         };
+        let did = match control_panel_client.get_user_did(username.as_str()).await {
+            Ok(did) => did,
+            Err(error) => {
+                warn!("account {} has no readable DID document; skipped: {}", username, error);
+                continue;
+            }
+        };
         let profile = load_zone_user_profile(&system_config_client, username.as_str()).await;
-
-        if let Some(seed) = build_zone_user_seed(username.as_str(), settings, profile) {
-            contacts.push(seed);
-        }
+        let seed = build_zone_user_seed(username.as_str(), &settings, did.clone(), profile);
+        accounts.push(ZoneAccount {
+            username: username.clone(),
+            settings,
+            did,
+            seed,
+        });
     }
 
-    Ok(contacts)
+    Ok(ZoneDirectory {
+        accounts,
+        names,
+        groups,
+    })
 }
 
 async fn load_msg_center_settings() -> Result<Value> {
@@ -766,13 +919,17 @@ impl ZoneSync {
         agents: &[ZoneAgent],
         force: bool,
     ) -> Result<()> {
-        let users = load_zone_user_contact_seeds().await?;
-        let signature = zone_contact_seed_signature(&users, agents);
+        let directory = load_zone_directory().await?;
+        let signature = format!(
+            "{}\n{}",
+            zone_contact_seed_signature(&directory.seeds(), agents),
+            directory.signature()
+        );
         if !force && applied.contacts.as_deref() == Some(signature.as_str()) {
             return Ok(());
         }
-        sync_zone_agent_contacts(&self.center, &users, agents).await?;
-        sync_zone_user_contacts(&self.center, users).await?;
+        apply_zone_directory(&self.center, &directory).await?;
+        sync_zone_agent_contacts(&self.center, &directory.seeds(), agents).await?;
         applied.contacts = Some(signature);
         Ok(())
     }
@@ -889,42 +1046,24 @@ async fn sync_zone_agent_contacts(
     Ok(())
 }
 
-async fn sync_zone_user_contacts(
-    center: &MessageCenter,
-    contacts: Vec<ZoneUserContactSeed>,
-) -> Result<()> {
-    let mut owner_scopes: Vec<Option<DID>> = vec![None];
-    for owner in contacts.iter().map(|contact| contact.did.clone()) {
-        if !owner_scopes.contains(&Some(owner.clone())) {
-            owner_scopes.push(Some(owner));
-        }
-    }
-
-    for owner in owner_scopes {
-        let updated = center
-            .upsert_zone_user_contacts(contacts.clone(), owner.clone())
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "zone user sync failed for owner_scope={}: {}",
-                    owner
-                        .as_ref()
-                        .map(|did| did.to_string())
-                        .unwrap_or_else(|| "__system__".to_string()),
-                    error
-                )
-            })?;
-
-        info!(
-            "zone user sync applied: owner_scope={}, contacts={}",
-            owner
-                .as_ref()
-                .map(|did| did.to_string())
-                .unwrap_or_else(|| "__system__".to_string()),
-            updated
-        );
-    }
-
+/// Apply the Zone's accounts: local recipients, the system scope contacts
+/// (tunnel routing), and every user's projected address book. Users' own
+/// stores do not receive Zone users.
+async fn apply_zone_directory(center: &MessageCenter, directory: &ZoneDirectory) -> Result<()> {
+    center.set_zone_accounts(directory.zone_accounts());
+    let seeds = directory.seeds();
+    let updated = center
+        .upsert_zone_user_contacts(seeds, None)
+        .await
+        .map_err(|error| anyhow::anyhow!("zone user sync failed for owner_scope=__system__: {}", error))?;
+    center
+        .contact_mgr
+        .set_projection(directory.contact_projection(now_ms()));
+    info!(
+        "zone directory applied: accounts={}, system contacts updated={}",
+        directory.accounts.len(),
+        updated
+    );
     Ok(())
 }
 
@@ -1288,6 +1427,8 @@ pub async fn start_msg_center_service() -> Result<()> {
     center.start_friend_request_sweep();
     center.start_notify_sweep();
     center.start_group_sync();
+    center.set_attachment_store(Arc::new(attachment_retention::RuntimeAttachmentStore));
+    center.start_attachment_retention();
 
     let executor_mgr = Arc::new(DeliveryExecutorMgr::new());
     register_message_hub(&center, executor_mgr.as_ref()).await?;
@@ -1343,6 +1484,37 @@ async fn main() {
     }
 }
 
+/// A Zone directory of active accounts named by DID host label.
+#[cfg(test)]
+pub(crate) fn test_zone_directory(
+    accounts: &[(&DID, buckyos_api::UserType, &[&str])],
+    groups: UserGroupDirectory,
+) -> ZoneDirectory {
+    let accounts: Vec<ZoneAccount> = accounts
+        .iter()
+        .map(|(did, user_type, user_groups)| {
+            let username = did.id.split('.').next().unwrap().to_string();
+            let settings: UserSettings = serde_json::from_value(serde_json::json!({
+                "user_id": username, "type": user_type.as_str(), "password": "", "state": "active",
+                "res_pool_id": "default", "groups": user_groups,
+            }))
+            .unwrap();
+            let seed = build_zone_user_seed(&username, &settings, (*did).clone(), None);
+            ZoneAccount {
+                username,
+                settings,
+                did: (*did).clone(),
+                seed,
+            }
+        })
+        .collect();
+    ZoneDirectory {
+        names: accounts.iter().map(|a| a.username.clone()).collect(),
+        accounts,
+        groups,
+    }
+}
+
 #[cfg(test)]
 mod zone_contact_tests {
     use super::*;
@@ -1387,15 +1559,43 @@ mod zone_contact_tests {
     }
 
     #[test]
-    fn zone_user_contact_uses_the_profile_did() {
+    fn zone_user_contact_is_the_account_did_whatever_the_profile_says() {
+        // The user-writable profile names another account's DID twice and
+        // claims a system group; only display data and user tags count.
+        let doc_did = DID::new("web", "alice.test.buckyos.io");
+        let victim = DID::new("web", "bob.test.buckyos.io");
         let profile: UserPrivateProfile = serde_json::from_value(json!({
-            "did": "did:web:alice.test.buckyos.io",
-            "display_name": "Alice"
+            "did": victim.to_string(),
+            "display_name": "Alice",
+            "private_extra": {"system_contact": {
+                "did": victim.to_string(),
+                "note": "night shift",
+                "tags": ["vip", "group:service", "type:admin", "zone_agent", "homestation.following"]
+            }}
         }))
         .unwrap();
-        let seed = build_zone_user_seed("alice", active_user(), Some(profile.clone())).unwrap();
-        assert_eq!(seed.did, profile.did);
+        let seed = build_zone_user_seed("alice", &active_user(), doc_did.clone(), Some(profile.clone())).unwrap();
+        assert_eq!(seed.did, doc_did);
         assert_eq!(seed.name, "Alice");
+        assert_eq!(seed.note.as_deref(), Some("night shift"));
+        assert_eq!(seed.tags, vec!["zone_user".to_string(), "vip".to_string()]);
+
+        let directory = ZoneDirectory {
+            accounts: vec![ZoneAccount {
+                username: "alice".into(),
+                settings: active_user(),
+                did: doc_did.clone(),
+                seed: Some(seed),
+            }],
+            names: vec!["alice".into()],
+            groups: Default::default(),
+        };
+        let accounts = directory.zone_accounts();
+        assert!(accounts.recipients.contains(&doc_did.to_string()));
+        assert!(!accounts.recipients.contains(&victim.to_string()));
+        assert!(!accounts.dids.contains(&victim.to_string()));
+        assert_eq!(accounts.user_ids.get(&doc_did.to_string()).map(String::as_str), Some("alice"));
+        assert!(!accounts.user_ids.contains_key(&victim.to_string()));
     }
 
     #[test]
@@ -1406,14 +1606,14 @@ mod zone_contact_tests {
             "avatar": "data:image/png;base64,AAAA"
         }))
         .unwrap();
-        let seed = build_zone_user_seed("alice", active_user(), Some(profile.clone())).unwrap();
+        let seed = build_zone_user_seed("alice", &active_user(), profile.did.clone(), Some(profile.clone())).unwrap();
         assert_eq!(seed.avatar.as_deref(), Some("data:image/png;base64,AAAA"));
 
         profile.privacy = serde_json::from_value(json!({
             "fields": {"avatar": {"visibility": "private"}}
         }))
         .unwrap();
-        let seed = build_zone_user_seed("alice", active_user(), Some(profile)).unwrap();
+        let seed = build_zone_user_seed("alice", &active_user(), profile.did.clone(), Some(profile)).unwrap();
         assert_eq!(seed.avatar, None);
         assert_eq!(seed.name, "Alice");
     }
@@ -1425,7 +1625,7 @@ mod zone_contact_tests {
             "display_name": "Alice"
         }))
         .unwrap();
-        let mut seed = build_zone_user_seed("alice", active_user(), Some(profile)).unwrap();
+        let mut seed = build_zone_user_seed("alice", &active_user(), profile.did.clone(), Some(profile)).unwrap();
         let original = zone_contact_seed_signature(&[seed.clone()], &[]);
         seed.avatar = Some("data:image/png;base64,AAAA".to_string());
         let with_avatar = zone_contact_seed_signature(&[seed.clone()], &[]);
@@ -1455,7 +1655,7 @@ mod zone_contact_tests {
             ]}}
         }))
         .unwrap();
-        let seed = build_zone_user_seed("alice", active_user(), Some(profile)).unwrap();
+        let seed = build_zone_user_seed("alice", &active_user(), profile.did.clone(), Some(profile)).unwrap();
         let accounts: Vec<_> = seed
             .bindings
             .iter()

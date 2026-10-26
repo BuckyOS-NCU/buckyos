@@ -64,8 +64,9 @@ use base64::{engine::general_purpose, Engine as _};
 use buckyos_api::{
     ai_methods, get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime,
     AiContent, AiMessage, AiMethodStatus, AiResponse, AiRole, AiToolCall, AiToolSpec, AiUsage,
-    AiccClient, AiccExecutionMode, BuckyOSRuntimeType, HelperModelRequirement,
-    LlmChatHelperRequest, LlmChatInvokeRequest, LlmResponseFormat, ModelDisable, ResourceRef,
+    AiccClient, AiccError, AiccErrorCode, AiccExecutionMode, AiccOnBehalfOf, BuckyOSRuntimeType,
+    HelperModelRequirement, LlmChatHelperRequest, LlmChatInvokeRequest, LlmResponseFormat,
+    ModelDisable, ResourceRef,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -76,7 +77,7 @@ use llm_context::deps::{
     InferenceHook, LLMContextDeps, LlmClient, LlmInferenceRequest, ToolCallCtx, ToolDispatchError,
     ToolManager, ToolSpecLite, WorkEvent, WorklogSink,
 };
-use llm_context::error::{ErrorSource, LLMComputeError, ProviderFailure};
+use llm_context::error::{ErrorSource, LLMComputeError, ProviderFailure, RefusalKind};
 use llm_context::observation::Observation;
 use llm_context::outcome::{BudgetKind, ContextOutput, LLMContextOutcome, ResumeFill};
 use llm_context::request::{
@@ -504,6 +505,9 @@ pub struct ProviderConfig {
     /// openai：附加 HTTP 头。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// buckyos：系统服务代用户调用 AICC 时的额度归属（AICC 只接受获授权的系统服务）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<AiccOnBehalfOf>,
 }
 
 impl ProviderConfig {
@@ -1316,6 +1320,7 @@ fn parse_provider(ctx: &YamlCtx<'_>, field: &str, v: &Yaml) -> Result<ProviderCo
             "api_key",
             "api_key_env",
             "headers",
+            "on_behalf_of",
         ],
     )?;
     let kind = match ctx.get_str(field, m, "type")? {
@@ -1365,12 +1370,19 @@ fn parse_provider(ctx: &YamlCtx<'_>, field: &str, v: &Yaml) -> Result<ProviderCo
             headers.insert(key.to_string(), val);
         }
     }
+    let on_behalf_of = match m.get("on_behalf_of") {
+        Some(v) => Some(serde_yaml::from_value::<AiccOnBehalfOf>(v.clone()).map_err(|e| {
+            ctx.err(&join_field(field, "on_behalf_of"), format!("invalid on_behalf_of: {e}"))
+        })?),
+        None => None,
+    };
     Ok(ProviderConfig {
         kind,
         session_token,
         base_url,
         api_key,
         headers,
+        on_behalf_of,
     })
 }
 
@@ -1454,7 +1466,7 @@ pub fn parse_llm_context_file(path: &Path, raw: &str) -> Result<LlmContextFile, 
             if v.get("kind").and_then(Yaml::as_str).is_some_and(|k| {
                 matches!(
                     k,
-                    "container" | "container_host" | "remote_node" | "http_proxy_runtime"
+                    "container" | "container_host" | "http_proxy_runtime"
                 )
             }) {
                 return Err(XllmError::Capability(format!(
@@ -1731,7 +1743,7 @@ pub fn merge_config_layers(layers: &[ConfigLayer]) -> Result<MergedConfig, XllmE
         let f = &layer.file;
         if let Some(runtime) = &f.runtime {
             merged.runtime.merge_over(runtime);
-            if runtime.workdir.is_some() && merged.runtime.kind() != "remote_ssh" {
+            if runtime.workdir.is_some() && !merged.runtime.is_remote() {
                 let base = layer.path.parent().unwrap_or(Path::new("."));
                 merged.runtime.workdir = runtime
                     .workdir
@@ -1770,6 +1782,12 @@ pub fn merge_config_layers(layers: &[ConfigLayer]) -> Result<MergedConfig, XllmE
             }
             for (k, v) in &p.headers {
                 merged.provider.headers.insert(k.clone(), v.clone());
+            }
+            if p.on_behalf_of.is_some() {
+                merged.provider.on_behalf_of = p.on_behalf_of.clone();
+                merged
+                    .sources
+                    .insert("provider.on_behalf_of".into(), src.clone());
             }
         }
         macro_rules! scalar {
@@ -2805,7 +2823,7 @@ fn build_cmd_manual_system_text(tools: &EffectiveTools) -> Option<String> {
     Some(s.trim_end().to_string())
 }
 
-fn build_contexts_system_text(
+pub(crate) fn build_contexts_system_text(
     env: &TemplateEnv,
     referenced: &BTreeMap<String, String>,
 ) -> Option<String> {
@@ -2820,12 +2838,16 @@ fn build_contexts_system_text(
         ("arch", "Architecture"),
         ("hostname", "Hostname"),
         ("shell", "Shell"),
+        ("baseline", "Environment baseline"),
         ("tools", "Available tools"),
     ] {
         if referenced.contains_key(&format!("runtime.{key}")) {
             continue;
         }
         if let Some(v) = env.runtime.get(key) {
+            if key == "baseline" && v.is_empty() {
+                continue;
+            }
             lines.push(format!("{label}: {v}"));
         }
     }
@@ -3767,6 +3789,10 @@ pub struct XllmDeps {
     pub lock_dir: Option<PathBuf>,
     /// 执行体（默认按 `.llm_context` 的 runtime 配置构造）。
     pub runtime: Option<Arc<dyn AgentRuntime>>,
+    /// How a `remote_node` runtime reaches Node Executors (stream + App
+    /// session token); provided by a BuckyOS host. `None`: `remote_node` is a
+    /// Capability error.
+    pub node_executor: Option<Arc<dyn crate::runtime::node::NodeExecutorConnector>>,
     /// 宿主可访问 buckyos task-mgr 时注入的 task 解析器（long-tool TODO §4）；
     /// 进程内 task-mgr 总是存在。
     pub buckyos_tasks: Option<Arc<dyn RunningTaskResolver>>,
@@ -3840,6 +3866,7 @@ impl Default for XllmDeps {
             observer: Arc::new(NoopRunObserver),
             lock_dir: None,
             runtime: None,
+            node_executor: None,
             buckyos_tasks: None,
             local_tasks: InProcessTaskManager::new(),
             shell_tasks: None,
@@ -3880,6 +3907,14 @@ impl XllmDeps {
 
     pub fn with_runtime(mut self, runtime: Arc<dyn AgentRuntime>) -> Self {
         self.runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_node_executor(
+        mut self,
+        connector: Arc<dyn crate::runtime::node::NodeExecutorConnector>,
+    ) -> Self {
+        self.node_executor = Some(connector);
         self
     }
 
@@ -4450,13 +4485,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// `shell` 工具说明里的 runtime 事实。
 fn shell_runtime_note(descriptor: &RuntimeDescriptor) -> ShellRuntimeNote {
     let target = match descriptor.kind.as_str() {
-        "tmux" => descriptor
-            .target
-            .get("tmux")
-            .and_then(|t| t.get("session"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        "remote_node" => descriptor.host.clone().unwrap_or_default(),
         "remote_ssh" => descriptor
             .target
             .get("connection")
@@ -4470,6 +4499,7 @@ fn shell_runtime_note(descriptor: &RuntimeDescriptor) -> ShellRuntimeNote {
     ShellRuntimeNote {
         kind: descriptor.kind.clone(),
         target,
+        os: descriptor.capabilities.os.clone(),
     }
 }
 
@@ -4560,10 +4590,16 @@ async fn expand_tool_sources(
         let desc = src.describe();
         match src {
             ToolSource::Group { groupname } => {
+                if groupname == "executor" {
+                    for tool in crate::runtime::executor::executor_tools(manager.run_binding()) {
+                        out.push(manager.register(tool, &desc)?);
+                    }
+                    continue;
+                }
                 let core = groupname == BUILTIN_TOOL_GROUP_BASH_CORE;
                 if groupname != BUILTIN_TOOL_GROUP_BASH && !core {
                     return Err(XllmError::Tools(format!(
-                        "unknown builtin tool group `{groupname}` (available: {BUILTIN_TOOL_GROUP_BASH}, {BUILTIN_TOOL_GROUP_BASH_CORE})"
+                        "unknown builtin tool group `{groupname}` (available: {BUILTIN_TOOL_GROUP_BASH}, {BUILTIN_TOOL_GROUP_BASH_CORE}, executor)"
                     )));
                 }
                 let mut extras = ShellExtras {
@@ -4817,7 +4853,10 @@ impl LlmClientFactory for DefaultLlmClientFactory {
                     Some(r) => Some(r.resolve()?),
                     None => None,
                 };
-                Ok(Arc::new(AiccLlmClient::with_session_token(token)))
+                Ok(Arc::new(
+                    AiccLlmClient::with_session_token(token)
+                        .with_on_behalf_of(provider.on_behalf_of.clone()),
+                ))
             }
             ProviderKind::Openai => {
                 let api_key = match &provider.api_key {
@@ -4931,8 +4970,7 @@ async fn bootstrap_service_session(
     let krpc = ::kRPC::kRPC::new_with_timeout_secs(&url, None, 30);
     let verify_hub = buckyos_api::VerifyHubClient::new(krpc);
     let pair = verify_hub.login_by_jwt(jwt.as_str(), target).await?;
-    *runtime.session_token.write().await = pair.session_token;
-    *runtime.refresh_token.write().await = pair.refresh_token;
+    runtime.replace_token_pair(pair).await?;
     Ok(())
 }
 
@@ -4972,27 +5010,36 @@ async fn bootstrap_appclient_session(
     };
     let verify_hub = runtime.get_verify_hub_client().await?;
     let pair = verify_hub.login_by_jwt(jwt.as_str(), target).await?;
-    *runtime.session_token.write().await = pair.session_token;
-    *runtime.refresh_token.write().await = pair.refresh_token;
+    runtime.replace_token_pair(pair).await?;
     Ok(())
 }
 
 /// AICC → `LlmClient` 适配（buckyos Provider）。
 pub struct AiccLlmClient {
     session_token: Option<String>,
+    on_behalf_of: Option<AiccOnBehalfOf>,
 }
 
 impl AiccLlmClient {
     pub fn new() -> Self {
         Self {
             session_token: None,
+            on_behalf_of: None,
         }
     }
 
     pub fn with_session_token(token: Option<String>) -> Self {
         Self {
             session_token: token,
+            on_behalf_of: None,
         }
+    }
+
+    /// Charge the calls to `on_behalf_of.user_id` (a system service running
+    /// a user's work, e.g. AIWorkspace wish runs).
+    pub fn with_on_behalf_of(mut self, on_behalf_of: Option<AiccOnBehalfOf>) -> Self {
+        self.on_behalf_of = on_behalf_of;
+        self
     }
 }
 
@@ -5038,21 +5085,33 @@ impl LlmClient for AiccLlmClient {
     async fn infer(&self, req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
         let runtime = get_buckyos_api_runtime()
             .map_err(|e| provider_error_from_rpc("get buckyos runtime failed", e))?;
-        if let Some(token) = &self.session_token {
-            let mut guard = runtime.session_token.write().await;
-            if guard.as_str() != token.as_str() {
-                *guard = token.clone();
-            }
-        }
-        let client = runtime
-            .get_aicc_client()
-            .await
-            .map_err(|e| provider_error_from_rpc("get aicc client failed", e))?;
+        let client = self.client(runtime).await?;
         Self::infer_with_client(&client, req).await
     }
 }
 
 impl AiccLlmClient {
+    async fn client(&self, runtime: &buckyos_api::BuckyOSRuntime) -> Result<AiccClient, LLMComputeError> {
+        if self.session_token.is_none() {
+            runtime.renew_token_from_verify_hub().await
+                .map_err(|e| provider_error_from_rpc("renew aicc session failed", e))?;
+        }
+        let client = runtime
+            .get_aicc_client()
+            .await
+            .map_err(|e| provider_error_from_rpc("get aicc client failed", e))?;
+        if let Some(token) = &self.session_token {
+            client.set_context(::kRPC::RPCContext {
+                token: Some(token.clone()),
+                ..Default::default()
+            }).await;
+        }
+        Ok(match &self.on_behalf_of {
+            Some(on_behalf_of) => client.with_on_behalf_of(on_behalf_of),
+            None => client,
+        })
+    }
+
     async fn infer_with_client(
         client: &AiccClient,
         req: LlmInferenceRequest,
@@ -5164,7 +5223,11 @@ impl AiccLlmClient {
                 })
             }
             AiMethodStatus::Failed => Err(LLMComputeError::provider(
-                ProviderFailure::Unknown,
+                response
+                    .error
+                    .as_ref()
+                    .and_then(|error| aicc_refusal(error.code))
+                    .unwrap_or(ProviderFailure::Unknown),
                 format!(
                     "aicc {method} failed{}: task_id={}, event_ref={}",
                     response.error.as_ref().map(|e| format!(" ({e})")).unwrap_or_default(),
@@ -5183,8 +5246,40 @@ impl AiccLlmClient {
     }
 }
 
-/// kRPC 错误 → Provider 失败类别。
+/// `RunErrorRecord.kind` of a refusal (stable names for hosts).
+pub fn refusal_kind_name(kind: RefusalKind) -> &'static str {
+    match kind {
+        RefusalKind::QuotaExhausted => "quota_exhausted",
+        RefusalKind::QuotaBudgetExceeded => "quota_budget_exceeded",
+        RefusalKind::ResourceNotPermitted => "resource_not_permitted",
+        RefusalKind::AttributionUnavailable => "attribution_unavailable",
+    }
+}
+
+/// AICC 额度与资源策略的拒绝（AI Center Quota PRD §7.4）；暂不可用的额度状态可以稍后重试。
+fn aicc_refusal(code: AiccErrorCode) -> Option<ProviderFailure> {
+    match code {
+        AiccErrorCode::QuotaExhausted => Some(ProviderFailure::Refused(RefusalKind::QuotaExhausted)),
+        AiccErrorCode::QuotaBudgetExceeded => {
+            Some(ProviderFailure::Refused(RefusalKind::QuotaBudgetExceeded))
+        }
+        AiccErrorCode::ResourceNotPermitted => {
+            Some(ProviderFailure::Refused(RefusalKind::ResourceNotPermitted))
+        }
+        AiccErrorCode::AttributionUnavailable => {
+            Some(ProviderFailure::Refused(RefusalKind::AttributionUnavailable))
+        }
+        AiccErrorCode::QuotaUnavailable => Some(ProviderFailure::Transient),
+        _ => None,
+    }
+}
+
+/// kRPC 错误 → Provider 失败类别（AICC 的结构化错误码优先）。
 pub fn provider_error_from_rpc(context: &str, err: RPCErrors) -> LLMComputeError {
+    if let Some(failure) = AiccError::from_krpc_error(&err).and_then(|error| aicc_refusal(error.code))
+    {
+        return LLMComputeError::provider(failure, format!("{context}: {err}"));
+    }
     let failure = match &err {
         RPCErrors::S2sTransientError(_) => ProviderFailure::Transient,
         RPCErrors::InvalidToken(_)
@@ -5198,7 +5293,8 @@ pub fn provider_error_from_rpc(context: &str, err: RPCErrors) -> LLMComputeError
         RPCErrors::ReasonError(_)
         | RPCErrors::ParseRequestError(_)
         | RPCErrors::ParserResponseError(_)
-        | RPCErrors::KeyNotExist(_) => ProviderFailure::Unknown,
+        | RPCErrors::KeyNotExist(_)
+        | RPCErrors::Detailed(_) => ProviderFailure::Unknown,
     };
     LLMComputeError::provider(failure, format!("{context}: {err}"))
 }
@@ -7992,7 +8088,7 @@ impl XllmRun {
             &store,
             &run_id,
             Path::new(&config.runtime_descriptor.workdir),
-            tools.enabled && config.runtime.kind() != "remote_ssh",
+            tools.enabled && !config.runtime.is_remote(),
             &deps,
         )
         .await?;
@@ -8167,7 +8263,7 @@ impl XllmRun {
             store,
             &run_id_s,
             Path::new(&record.config.runtime_descriptor.workdir),
-            record.config.tools.enabled && record.config.runtime.kind() != "remote_ssh",
+            record.config.tools.enabled && !record.config.runtime.is_remote(),
             &deps,
         )
         .await?;
@@ -8194,7 +8290,7 @@ impl XllmRun {
         }
         let runtime = match &deps.runtime {
             Some(r) => r.clone(),
-            None => crate::runtime::RuntimeRegistry::from_config(&record.config.runtime)?,
+            None => crate::runtime::RuntimeRegistry::from_config_with(&record.config.runtime, &deps)?,
         };
         let mut runtime_deps = deps.clone();
         runtime_deps.runtime = Some(runtime.clone());
@@ -8482,6 +8578,21 @@ impl XllmRun {
                 }
                 ProviderFailure::Unknown => (false, "provider_error", None),
                 ProviderFailure::ContextLimit => (false, "context_capacity", None),
+                ProviderFailure::Refused(kind) => (
+                    false,
+                    refusal_kind_name(*kind),
+                    Some(match kind {
+                        RefusalKind::QuotaExhausted | RefusalKind::QuotaBudgetExceeded => {
+                            "the AI token quota does not cover this call; wait for it to reset, lower the output budget, or ask an administrator; do not retry right away".into()
+                        }
+                        RefusalKind::ResourceNotPermitted => {
+                            "the model is not permitted to this user; choose a permitted model or ask an administrator".into()
+                        }
+                        RefusalKind::AttributionUnavailable => {
+                            "the user whose AI resources this run uses cannot be determined".into()
+                        }
+                    }),
+                ),
             },
             LLMComputeError::Checkpoint { .. } => (
                 true,
@@ -9425,6 +9536,24 @@ mod tests {
             "provider_task_ref": "provider-task"
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn aicc_token_override_does_not_replace_the_runtime_token_pair() {
+        let mut runtime = buckyos_api::BuckyOSRuntime::new(
+            "app2", Some("alice".into()), BuckyOSRuntimeType::AppClient,
+        );
+        runtime.zone_id = name_lib::DID::new("web", "test.invalid");
+        let session = json!({ "iss": "verify-hub", "exp": u64::MAX }).to_string();
+        *runtime.session_token.write().await = session.clone();
+        *runtime.refresh_token.write().await = "rotated-refresh-token".into();
+        let llm = AiccLlmClient::with_session_token(Some("provider-only-token".into()));
+        llm.client(&runtime).await.unwrap();
+        assert_eq!(*runtime.session_token.read().await, session);
+        assert_eq!(*runtime.refresh_token.read().await, "rotated-refresh-token");
+        AiccLlmClient::new().client(&runtime).await.unwrap();
+        assert_eq!(*runtime.session_token.read().await, session);
+        assert_eq!(*runtime.refresh_token.read().await, "rotated-refresh-token");
     }
 
     #[tokio::test]
@@ -11793,6 +11922,37 @@ there]]></write_file>
     }
 
     #[test]
+    fn provider_on_behalf_of_survives_the_merge() {
+        let env = Env::new();
+        env.write(
+            "project/src/.llm_context",
+            r#"{"provider":{"type":"buckyos","on_behalf_of":{"user_id":"alice","operator_id":"bob","mode":"workspace_owner","run_ref":{"workspace_id":"ws1","run_id":"run1"}}}}"#,
+        );
+        let merged = merge_config_layers(&load_config_layers(&env.workdir).unwrap()).unwrap();
+        let o = merged.provider.on_behalf_of.as_ref().expect("on_behalf_of merged");
+        assert_eq!(o.user_id, "alice");
+        assert_eq!(o.operator_id.as_deref(), Some("bob"));
+        assert_eq!(o.mode, buckyos_api::AiccAttributionMode::WorkspaceOwner);
+        assert_eq!(o.run_ref.as_ref().unwrap().run_id.as_deref(), Some("run1"));
+        assert!(merged.sources["provider.on_behalf_of"]
+            .replace('\\', "/")
+            .ends_with("src/.llm_context"));
+
+        // a child layer switching the provider type drops the delegation with the other fields
+        env.write(
+            "project/.llm_context",
+            r#"{"provider":{"type":"buckyos","on_behalf_of":{"user_id":"alice","mode":"current_user"}}}"#,
+        );
+        env.write(
+            "project/src/.llm_context",
+            "provider:\n  type: openai\n  api_key_env: K\n",
+        );
+        let merged = merge_config_layers(&load_config_layers(&env.workdir).unwrap()).unwrap();
+        assert_eq!(merged.provider.kind, Some(ProviderKind::Openai));
+        assert!(merged.provider.on_behalf_of.is_none());
+    }
+
+    #[test]
     fn filesystem_policy_config_precedence_and_validation() {
         let env = Env::new();
         env.write(
@@ -12778,6 +12938,12 @@ impl XllmToolManager {
         self.runner = Some(runner);
         self.descriptor = Some(descriptor);
         self.info = Some(info);
+    }
+
+    /// How this run's task resolver reads `shell` tasks a previous executor
+    /// left on the runtime (remote runtimes keep no local exec directory).
+    pub(crate) fn set_runtime_recovery(&self, reader: Arc<dyn crate::tasks::RuntimeRecoveryReader>) {
+        self.resolver.set_recovery(reader);
     }
     pub fn runtime_info(&self) -> Option<&RuntimeInfo> {
         self.info.as_ref()

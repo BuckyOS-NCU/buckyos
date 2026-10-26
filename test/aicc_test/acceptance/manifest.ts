@@ -175,6 +175,18 @@ export function validateProviderBaseline(value: unknown): ProviderBaseline {
         throw new Error(`${driver}.official_catalog.endpoint_ids must contain 1-50 unique ids`);
       }
     }
+    if (rawProvider.official_catalog.include_model_ids !== undefined) {
+      const ids = requireStringArray(
+        rawProvider.official_catalog.include_model_ids,
+        `${driver}.official_catalog.include_model_ids`,
+      );
+      if (ids.length === 0 || new Set(ids.map((id) => id.toLowerCase())).size !== ids.length) {
+        throw new Error(`${driver}.official_catalog.include_model_ids must be non-empty and unique`);
+      }
+      if (rawProvider.official_catalog.format === "frozen") {
+        throw new Error(`${driver}.official_catalog.include_model_ids is invalid for frozen catalogs`);
+      }
+    }
     if (rawProvider.official_catalog.supplemental_model_ids !== undefined) {
       const supplementalModelIds = requireStringArray(
         rawProvider.official_catalog.supplemental_model_ids,
@@ -377,9 +389,8 @@ function defaultInputCombinations(apiType: string, declared: string[]): string[]
     "audio.asr": [["audio"]],
     "audio.music": available.has("audio") ? [["text"], ["text", "audio"]] : [["text"]],
     "audio.enhance": [["audio"]],
-    "video.txt2video": [["text"]],
-    "video.img2video": [["text", "image"]],
-    "video.video2video": [["text", "video"]],
+    "video.generate": available.has("image") ? [["text"], ["text", "image"]] : [["text"]],
+    "video.edit": [["text", "video"]],
     "video.extend": [["video"]],
     "video.upscale": [["video"]],
     "agent.computer_use": [["observation", "action", "environment_state", "session_state"]],
@@ -409,9 +420,8 @@ function defaultOutputCombinations(apiType: string, declared: string[]): string[
     "audio.asr": "text",
     "audio.music": "audio",
     "audio.enhance": "audio",
-    "video.txt2video": "video",
-    "video.img2video": "video",
-    "video.video2video": "video",
+    "video.generate": "video",
+    "video.edit": "video",
     "video.extend": "video",
     "video.upscale": "video",
     "agent.computer_use": "structured",
@@ -421,11 +431,10 @@ function defaultOutputCombinations(apiType: string, declared: string[]): string[
 
 function generatedArtifactSourceApiType(apiType: string, declared: Set<string>): string | undefined {
   if (apiType === "image.img2img" && declared.has("image.txt2img")) return "image.txt2img";
-  if (apiType === "video.img2video" && declared.has("image.txt2img")) return "image.txt2img";
   if (
-    ["video.video2video", "video.extend", "video.upscale"].includes(apiType) &&
-    declared.has("video.txt2video")
-  ) return "video.txt2video";
+    ["video.edit", "video.extend", "video.upscale"].includes(apiType) &&
+    declared.has("video.generate")
+  ) return "video.generate";
   if (apiType === "audio.enhance" && declared.has("audio.tts")) return "audio.tts";
   return undefined;
 }
@@ -478,14 +487,24 @@ export function analyzeProviderMatrix(args: {
     }
     for (const model of inventory.models) {
       if (model.provider_actual_model_id || model.provider_model_id.includes(":")) continue;
-      const configuredRule = capabilityProfile.rules.find((candidate) =>
+      const matchingRules = capabilityProfile.rules.filter((candidate) =>
         globMatches(candidate.model_pattern, model.provider_model_id)
+      );
+      // A `*` rule declares "everything else is an LLM". It must not shadow what
+      // the official catalog reports: `task_type_api_types` is the capability
+      // authority, and only models the catalog leaves unspecified fall back to
+      // the catch-all.
+      const specificRule = matchingRules.find((candidate) =>
+        candidate.model_pattern !== "*"
+      );
+      const catchAllRule = matchingRules.find((candidate) =>
+        candidate.model_pattern === "*"
       );
       const catalogApiTypes = model.official_task_types?.flatMap((taskType) =>
         profile.official_catalog.task_type_api_types?.[taskType] ?? []
       );
       const derivedApiTypes = catalogApiTypes ? [...new Set(catalogApiTypes)] : [];
-      const rule = configuredRule ?? (derivedApiTypes.length > 0
+      const rule = specificRule ?? (derivedApiTypes.length > 0
         ? {
           model_pattern: model.provider_model_id,
           status: "active" as const,
@@ -497,7 +516,7 @@ export function analyzeProviderMatrix(args: {
           source_urls: profile.source_urls,
           evidence_summary: `Official catalog task_type: ${model.official_task_types?.join(", ")}.`,
         }
-        : undefined);
+        : catchAllRule);
       if (!rule) {
         errors.push(
           `missing official capability rule for ${inventory.provider_driver}/${model.provider_model_id}`,

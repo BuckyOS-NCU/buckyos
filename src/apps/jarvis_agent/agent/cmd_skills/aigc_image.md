@@ -1,7 +1,8 @@
 ---
 name: aigc_image
 description: Generate and edit images through the zone's AI models — text to image, edit or restyle from a reference image, masked inpaint, upscale, background removal — check the files and hand them over.
-requires: aios agent container with the buckyos-agent commands on PATH (gen_image, edit_image, …) and an AICC provider that serves the image method
+requires: the buckyos-agent commands on PATH (gen_image, edit_image, …: aios agent container, or a node's agent-tools) and an AICC provider that serves the image method; stored results are read through the Zone NDM proxy, which only read_write Agents may read
+baseline: standard
 ---
 #### When to use
 - Make a new picture from a description (`gen_image`), change an existing one (`edit_image`), repaint a marked region (`inpaint_image`), enlarge it (`upscale_image`), cut out the subject (`remove_bg`).
@@ -9,8 +10,9 @@ requires: aios agent container with the buckyos-agent commands on PATH (gen_imag
 - Reading or describing an image is `llm_understand_media` (or `ocr_image` / `caption_image`); speech and music: aigc_audio; clips and films: aigc_video.
 
 #### Before you start
+- The commands below are standard-environment commands: in the AIOS `container`, and on a node through its `$BUCKYOS_ROOT/bin/agent-tools` (they run there as your agent). If absent here, check `agent-session runtime list --available` (each runtime's `baseline_check` names what it lacks) and explicitly delegate generation to a runtime that has them with `aigc_image` and no workspace, exchanging inputs and outputs by `agent-session copy` or object ids. Preserve a user-selected runtime/workspace for its own work. Report a missing compatible runtime instead of treating missing commands as absent models. `identify`/`convert` (ImageMagick) for checks are not standard: use them where they exist.
 - `command -v gen_image resume_aicc_task` — the second one is newer; when it is missing, re-running a command with the same `--idempotency-key` is the way back to an interrupted task (see When it fails).
-- No provider check is needed before a call: run the command and read its result. To see which models serve a method: `ai_provider models --api-type image.txt2img` (exact model, logical names, list price). `ai_provider list` shows providers and their health; `ai_quota` reports `state: unknown` unless quotas are configured.
+- No provider check is needed before a call: run the command and read its result. To see which models serve a method: `ai_provider models --api-type image.txt2img` (exact model, logical names, list price). `ai_provider list` shows providers and their health and lists only the models your owner may use. `ai_quota` lists the token quota rules that limit you; image, audio and video methods are not under token quota.
 - Work in the session's working directory (the shell starts there) and write results under it, e.g. `out/…`.
 
 #### Find the real commands
@@ -35,7 +37,7 @@ Give the edit instruction as one quoted argument. Then list `out/lamp.png` in th
 - `inpaint_image <input> <mask> <prompt> <out>`: gpt-image-2 expects a PNG mask of the same size whose transparent pixels are the area to repaint (`alpha_zero_is_edit_area`, used when `--mask-semantics` is not given); `white_area_is_edit_area` / `black_area_is_edit_area` are rejected by this model. Make one: `convert in.png -alpha set -region 300x200+120+80 -alpha transparent mask.png`.
 - `upscale_image <in> <out> [--scale 2|4] [--target-width N] [--target-height N] [--preserve-faces]`, `remove_bg <in> <out> [--mode rgba_image|mask]` run on fal models.
 - Result: stdout is one `AgentToolResult` JSON line (no `--json` needed); stderr carries progress. On success read `detail.files[]`: `path` (an extension is added when the output name has none), `bytes`, `source_kind`, `obj_id` (typed object id when the result is a stored object), and `detail.task_id` (the AICC task). `mime` may read `application/octet-stream` for stored objects; trust `identify`.
-- Hand-over from a Work session: put the file under the working directory and list its relative path (no `./`, no absolute path) in the final report — `report({report: "…", artifacts: ["out/lamp.png"], is_end: true})`, or `<artifacts>["out/lamp.png"]</artifacts>` next to `<report end="true">` in behavior replies. An object id such as `cyfile:…` is also accepted there. The host sends them as attachments of the reply; a path written in prose is not a delivery.
+- Hand-over from a Work session: prefer the typed `detail.files[].obj_id` unchanged in the final report — `report({report: "…", artifacts: ["cyfile:…"], is_end: true})`, or `<artifacts>["cyfile:…"]</artifacts>` next to `<report end="true">`. If you changed the file afterward or the result has no object id, list its relative path under this session's working directory (e.g. `out/lamp.png`) so the host uploads those bytes. Cross-session hand-over uses the reported object id, never another session's path or `host:/…` reference. A path written in prose is not a delivery.
 
 #### When it fails
 - Exit codes: 0 done, 1 bad arguments (nothing sent), 2 AICC/provider failure, 3 no route or provider (`no_candidate_model`, e.g. a misspelled exact model `x@provider`), 4 wait timeout, 5 local file I/O.
@@ -44,6 +46,7 @@ Give the edit instruction as one quoted argument. Then list `out/lamp.png` in th
 - Two task layers: `shell` may return early with "still running … continues as task <id>" — a shell task; keep waiting as its hint says (`wait_task`, or `agent-session task wait <id> --wait-ms …`) rather than starting the command again. The AICC task id (`t-…`) is in `detail.task_id`, in timeout errors and in the `__BUCKYOS_AGENT_PROGRESS__` stderr lines.
 - Exit 4 / `wait_timeout` or a shell that ended early is not a failure: the AICC task keeps running. `resume_aicc_task <task_id> out/x.png` waits and downloads without paying again. If you passed `--idempotency-key K`, re-running the same command with the same K also re-attaches to the same task within 24 h (it also returns a failed task again — use a new key to really retry).
 - A retry after a real failure is a new billable call; change something first and say so in the report.
+- `=> resource_not_permitted` (exit 2, `detail.error_code`): the model is not open to your owner — pick one `ai_provider models` lists or tell the user; `=> quota_exhausted` / `quota_budget_exceeded`: the owner's AI quota does not cover the call (`detail.details` names the rule and `reset_at_ms`, `null` = only an admin recharge helps) — stop and report it, do not retry at once.
 
 #### Check the result
 - `identify out/x.png` (format, WxH, non-zero size); `compare -metric RMSE in.png out.png null:` shows whether an edit changed anything.

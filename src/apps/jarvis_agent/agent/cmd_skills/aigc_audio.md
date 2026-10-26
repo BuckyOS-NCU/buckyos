@@ -1,7 +1,8 @@
 ---
 name: aigc_audio
 description: Produce audio through the zone's AI models — read text aloud (text to speech), generate music, clean up a recording — then check that the file plays and hand it over; transcription is a side tool.
-requires: aios agent container with the buckyos-agent commands on PATH (text_to_speech, gen_music, enhance_audio, speech_to_text) plus ffmpeg/ffprobe, and an AICC provider that serves the audio method
+requires: an extended session-runtime (the aios agent container is one) with the buckyos-agent commands on PATH (text_to_speech, gen_music, enhance_audio, speech_to_text) plus ffmpeg/ffprobe, and an AICC provider that serves the audio method; stored results are read through the Zone NDM proxy, which only read_write Agents may read
+baseline: extended
 ---
 #### When to use
 - Typical requests: "read this aloud", "make a 30-second voice-over", "a short jingle for the intro", "remove the hum from this recording".
@@ -10,6 +11,7 @@ requires: aios agent container with the buckyos-agent commands on PATH (text_to_
 - Pictures: aigc_image; video and putting voice under video: aigc_video.
 
 #### Before you start
+- This manual needs an extended runtime (ffmpeg/ffprobe besides the standard AICC commands): the AIOS `container` is one. If the commands are absent here, check `agent-session runtime list --available` and explicitly delegate generation to such a runtime with `aigc_audio` and no workspace, exchanging inputs and outputs by `agent-session copy` or object ids. Preserve a user-selected runtime/workspace for its own work. Report a missing compatible runtime instead of treating missing commands as absent models.
 - `command -v text_to_speech resume_aicc_task ffprobe` — `resume_aicc_task` is newer; without it, re-run with the same `--idempotency-key` to get back to an interrupted task.
 - Which models serve a method: `ai_provider models --api-type audio.tts` (exact model, logical names, price). No health check is needed before a call.
 - Defaults in this zone today: audio.tts → `gemini-2.5-flash-preview-tts`; audio.music → `lyria-3-clip-preview` (0.04 USD per request); audio.enhance → `fal-ai/deepfilternet3`; audio.asr → `gemini-3.5-transcribe`.
@@ -37,13 +39,14 @@ List `out/welcome.wav` in the final report's artifacts.
 - `speech_to_text <in> [out.txt] [--lang L] [--timestamps none|segment|word] [--diarization] [--format txt|json|vtt|srt]`; without an output path the text is in the result's `output`.
 - Inputs: local path (inline base64; above ~700 KB it fails with `RPC call error: 500`), URL, or an object id copied with its type prefix (`named_object:cyfile:…`). `materialize_resource 'named_object:cyfile:…' in/rec.m4a` fetches an attachment for ffmpeg.
 - Result: one `AgentToolResult` JSON line on stdout (no `--json` needed). Read `status`, `detail.task_id` and `detail.files[]` (`path`, `bytes`, `obj_id`; `mime` may say `application/octet-stream`). `resume_aicc_task <task_id>` without an output path lists the true result mime (e.g. `audio/l16`) and the recorded cost; with a path it saves PCM as WAV too.
-- Hand-over from a Work session: file under the working directory, relative path in the final report — `report({report: "…", artifacts: ["out/welcome.wav"], is_end: true})` or `<artifacts>["out/welcome.wav"]</artifacts>` beside `<report end="true">`. An object id (`cyfile:…`) is accepted as well. Naming a path in prose does not attach it.
+- Hand-over from a Work session: list the final playable file's relative path under this session's working directory — `report({report: "…", artifacts: ["out/welcome.wav"], is_end: true})` or `<artifacts>["out/welcome.wav"]</artifacts>` beside `<report end="true">` — so the host uploads those bytes. An unmodified result's typed `detail.files[].obj_id` is also accepted. Use the saved path after any conversion, including the command's PCM-to-WAV wrapping; the source object id still names the raw PCM. Cross-session hand-over uses the report's resulting object id, never another session's path or `host:/…` reference. Naming a path in prose does not attach it.
 
 #### When it fails
 - Exit codes: 1 bad arguments (nothing sent), 2 AICC/provider failure, 3 no route (`no_candidate_model`), 4 wait timeout, 5 file I/O.
 - Provider rejection: exit 2 `=> failed` with `{"code":"provider_error",…,"provider_code":"400"}` — drop or change the offending option rather than repeating the call.
 - Two task layers: the `shell` call may return early with "still running … continues as task <id>" — that id is a shell task; keep waiting the way the hint says (`wait_task` with that id, or `agent-session task wait <id> --wait-ms …`) instead of starting the command again. The AICC generation has its own id (`t-…`), printed in the command's `__BUCKYOS_AGENT_PROGRESS__` stderr lines, in `detail.task_id` of the result and in a timeout error.
 - Exit 4 or a shell that returned early means still running, not failed: `resume_aicc_task <task_id> out/x` finishes it without a second charge. With `--idempotency-key K`, the same command and K re-attach within 24 h (and return an earlier failure again — use a new key for a real retry).
+- `=> resource_not_permitted` / `quota_exhausted` / `quota_budget_exceeded` (`detail.error_code`): the model is not open to your owner or the owner's AI quota does not cover the call — report it, do not retry at once; `ai_quota` shows the rules.
 - Costs: `ai_provider models --api-type audio.tts` shows list prices; `resume_aicc_task <task_id>` shows what a finished task cost (the TTS sentence above: 0.001 USD).
 
 #### Check the result

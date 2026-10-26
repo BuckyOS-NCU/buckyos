@@ -54,9 +54,12 @@ HTML runs in `sandbox=""` with an injected CSP (`default-src 'none'`), so script
 ## Providers
 
 - **NFSP (`nfspProvider.ts`)** — Source Resolver = `resolve` (`base/ident/access`), containers = `list`, read refs = `/nfs/v1/read/{node_id}` (plus `?download=1` for exports). The Pipeline maps onto `repr` / `get_repr` and is gated on the hello feature list: nfs_server does not advertise `repr` yet, so every non-Direct format is planned as **Unsupported** until the server ships it. The wire shape in that file is provisional (§23.8 item 2) and isolated there.
+- **Object IDs (`ndmSource.ts`)** — `cyfile`, chunk and chunk-list IDs use the authenticated NDM store/read endpoints; they do not use NFSP's unsupported object-ref resolution. File metadata supplies the name and MIME hint, and the server resolves single-chunk or chunk-list content. Object previews load the complete content into a Blob before rendering, with cancellation and a 256 MiB limit checked against metadata, response headers and received bytes. These previews currently have no HTTP Range streaming; CYFS path previews retain their existing streaming URLs. The SDK's structured store/proxy helpers reject Browser runtime, so this adapter calls the existing gateway endpoints with the active session token.
 - **Mock (`mockProvider.ts`)** — the File Browser mock library plus `cyfs:///samples` with generated content for every result family, `/home/Private` → permission denied, and a simulated built-in Pipeline catalog (`office-html`, `sheet-html` with a failing first attempt, `media-transmux` via MediaRecorder, `raster-decode`) with idempotent `ensure`, attempts, retry CAS and negative caching.
 
 The provider is chosen like the File Browser backend (`VITE_CP_USE_MOCK`, `?fbData=mock|nfsp`).
+
+Completed AICC tasks expose their named-object artifacts in Task Center's Results section. Each Preview action opens this component inside the task detail page, including the standalone `/taskcenter?taskid=…` route; content loads only after the action, and closing the preview releases it.
 
 ## Preview App
 
@@ -73,18 +76,27 @@ Settings (`settings.ts`, localStorage): window mode, cap, default UI mode, defau
 
 File Browser routes file open actions through the shared Content Open Router; when Preview is selected it receives a Container Context for folder listings and an explicit list for views / collections / search / multi-selection (`FileBrowserView.tsx` → `handleOpenFile`, menu commands `open`, `preview-new-window`, `preview-selection`). On mobile, tapping a file follows the same default Handler resolution. Explicit multi-selection preview continues to open Preview. `origin.windowId` identifies the Files window; Preview exit and the mobile shell Back action return focus to it. Files retains tab/location/search/scroll snapshots in memory across that transition. Metadata remains a separate Files details action. The built-in Preview manifest uses the standard mobile shell bar, reserving its height so the preview toolbar/content stay below it; the shell title follows the current file.
 
+## Embedding in an App (`/embed/preview`)
+
+Apps on their own origin show this component inside their UI through `<zone root>/embed/preview` (`embed/PreviewEmbedApp.tsx`; `main.tsx` renders only the component there — no shell, router or wallpaper). The wire protocol is `buckyos.preview-embed` v1 in websdk `buckyos/app-frame`: the App uses `PreviewEmbed` (it owns the iframe and sends `embed.init { source | blob, session?, theme, locale }`), the page uses `PreviewEmbedHost` and accepts only an embedder inside the Zone (`originInZone`; any `*.localhost` / `127.0.0.1` in the mock runtime). The page reads content with its own Zone-root session: no token crosses origins. Theme and language are fixed by the App and not written back to the desktop's stored preferences (`PrototypeThemeProvider mode`, `I18nProvider locale`). The page reports `embed.state` (`loading` / `ready` / `error` with the Preview error kind) and forwards Open with… as `embed.openWith`, which the App hands to the shell (`content.open` target `chooser`). A draft (blob) source offers no Open with.
+
+## Open with… (system chooser)
+
+`app/content/OpenWithSheet.tsx` is the one chooser: the Preview App renders it for its own content; `OpenWithHost` (mounted by `DesktopRoute`) renders it for App requests (`content.open` target `chooser`, from `WebAppFramePanel`) and for the system entry `/?open=…&intent=chooser[&name&mime&size&from=<AppId>]` (`parseSystemOpen`). Handlers of the requesting App are left out (`handlerOfApp`, by AppId — no App-specific code); Preview is offered for requests from outside Preview. `openContent(…, { exclude })` keeps that exclusion when a chosen handler turns out unavailable. Cancelling leaves the requesting App untouched.
+
 ## Verification
 
 ```bash
 pnpm run check && pnpm run lint
 node --experimental-strip-types tests/datamodel/preview-window-policy.test.ts
-npx playwright test tests/e2e/pages/preview.spec.ts
+deno test --no-check --allow-env --allow-read --allow-sys --node-modules-dir=manual --unstable-sloppy-imports tests/datamodel/preview-ndm-source.test.ts
+npx playwright test tests/e2e/pages/preview.spec.ts tests/e2e/pages/preview-embed.spec.ts tests/e2e/pages/content-open.spec.ts
 ```
 
 ## Known gaps (tracked against the PRD)
 
 - `repr` Pipeline on nfs_server is not implemented server-side; the client contract is provisional.
-- "Open with…" resolves installed App Handlers through `buckyos/content`, filtered by `apps.list` visibility and user defaults. Download / Copy reference remain available. Manifest projection, App Frame hosting and default app selection are implemented; third-party preview handlers, sandbox policy and the system default-app settings page remain later work (§23.8 item 10).
+- "Open with…" resolves installed App Handlers through `buckyos/content`, filtered by `apps.list` visibility and user defaults. Download / Copy reference remain available. Manifest projection, App Frame hosting, the system chooser for Apps and default app selection are implemented; third-party preview handlers, sandbox policy and the system default-app settings page remain later work (§23.8 item 10).
 - Provider-based sessions are one-shot; no Session Navigation Stack (P1).
 - nfs_server has no `repr`, so real-mode thumbnails come only from Runtime frame capture (videos the browser plays) — other formats show the host's placeholder.
 - Fullscreen uses the component's own element (`allowFullscreen`).

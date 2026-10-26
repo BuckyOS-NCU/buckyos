@@ -38,16 +38,30 @@ POST /sdk/appservice/selftest/xllm
 
 模型请求超时为 60 秒，任务超时为 90 秒，后台在 120 秒时强制结束未退出的子进程。`deno task start` 已包含运行 bash 和写入临时目录所需权限。
 
+## 客服群与客户链接（Self-host Group 扩展官方例子）
+
+对应 [应用扩展实施 TODO](../../../notepads/self-host-group-extension-todo.md) §11（EXT-10 / EXT-11）：一个真正装在 Zone 里的 App 用“L1 配置 + L2 面板 + 客户链接”服务外部客户。页面上的 `support_group` 卡片有三个按钮，源码在 `web/src/support_group.ts`（页面）与 `support_group.ts`（后台）。
+
+| 步骤 | 谁的身份 | 做了什么 |
+| --- | --- | --- |
+| 创建客服群 | 页面上登录用户在本 App 子域的会话 | `user.list` 取两位成员的 DID → msg-center `group.create`：模板 `support`（`allow_guests`、`post=all_participants`）、具名 Session `support`、群级 `display.announcement`，并把本 App 的 `GET /support/panel` 声明为面板 `tickets`（D-2：面板 host 必须是群主 Zone 的 App 子域） |
+| 生成客户链接 | 页面把自己的会话以 `Authorization: Bearer` 交给后台；后台先问 CP `auth.current_identity` 确认是本 App 实例的安装账号，再用 **App 服务会话**调 `user.app_login.issue {kind:"link", resource:{group_session}, return_path:"/messagehub/guest?group=&session="}` | 得到 `https://<zone>/sso/invite/<id>#s=<secret>`，有效 48 小时；CP 同时以 App 身份预置该账号的 Session 邀请。同一外部标识再次生成复用同一 Limited 账号 |
+| 清理 | 页面用户会话 | `group.delete`。客户账号与链接记录保留，链接到期自动失效 |
+
+客户点链接：未设密码时直接以自己的受限账号进入 `/messagehub/guest`，顶部出现非阻塞的“设置密码”提示（不点即跳过），点“加入”后聊天，侧栏显示“客服工单”面板。设置密码后再点同一链接会要求先输密码，密码登录后回到同一会话。面板内容来自后台 `GET /sdk/appservice/support/summary`（App 服务会话读 `group.list_messages`，只给条数、参与者数和时间，不给正文）。
+
+前置：App 实例 owner 在 App Service 的应用详情页打开“本应用为外部客户代登录”开关（`apps.app_login.set`），成员账号（缺省 alice、bob）存在。限制：只有 App 实例的安装账号能生成链接；客户是 Session Only Member，不进群成员表；面板摘要接口对持有群 DID 的任何人可读（只有计数）；`/support/panel` 由 `www` 端点的 `allow_guest: true` 放行，所以 iframe 内无 App 会话也能加载。
+
+验收脚本：后端 `test/test_sys_test/support_group_dv.ts`（见文件头）；浏览器 `src/frame/desktop/tests/dv/support-group-link.spec.ts`。
+
 ## 构建检查
 
 ```bash
 pnpm install
-pnpm update -r buckyos
-pnpm check
 pnpm build
 ```
 
-SDK 依赖跟随 `buckyos-websdk#main`。`pnpm build` 包含 Deno 后台和浏览器 TypeScript 类型检查，再生成可打包的 `dist/`。
+SDK 依赖跟随 `buckyos-websdk#main`。每次 `pnpm build` 先更新工作区根目录和 `web/` 的 SDK 依赖，再执行 Deno 后台和浏览器 TypeScript 类型检查，生成可打包的 `dist/`。`pnpm build:web` 和 `web/` 内的 `pnpm build` 也会先更新 SDK，无需手动执行 `pnpm update`。
 
 在已由 node-daemon 启动的应用页面，分别点击各组的页面/后台检测按钮。也可向应用地址发送 `POST /sdk/appservice/selftest` 运行全部后台用例；HTTP 200 且 `ok: true` 才算通过。全量检测包含上述 xllm 真实模型请求。
 
@@ -56,3 +70,21 @@ SDK 依赖跟随 `buckyos-websdk#main`。`pnpm build` 包含 Deno 后台和浏�
 使用 WebSDK `main` 的 `0.7.126`（`3cfc984`）在 `test.buckyos.io` 验证：后台 17/17、浏览器 15/15；真实 SSO 登录、NDM 小文件上传及存储状态回查通过。无 token/无效 token 的 AICC 请求被拒绝，未知自测分组（含 `toString`、`__proto__`）返回 404。
 
 `pnpm build` 和在 `src/` 执行的 `uv run buckyos-build.py -s buckyos_systest` 均通过，生成 `dapp_dist/buckyos-systest.buckyos.bns.did-0.5.1.pikg`。后台使用现有 OOD 应用容器内的临时候选进程，保留容器网关和设备环境；浏览器加载候选静态文件并连接该进程，SSO 与系统服务请求走真实 ZoneGateway。未替换已安装应用；大文件分块上传、断线重试及长期运行未在本轮验证。
+
+## 文件 / 目录 SDK 导入演示
+
+NDM 卡片提供单文件、多文件和目录选择，统一调用 `ndm.pickupAndImport` → `ndm.ensureUploaded`。页面只展示 SDK 给出的稳定 ObjId、对象就绪状态、逻辑进度、实际发送 payload 字节与查重警告；不重算 ChunkList，不读取 SDK 私有字段，不向后台发送 canonical 对象登记请求。旧 `/sdk/appservice/ndm_query` 登记接口已删除，浏览器使用自己的当前用户 / AppInstance session 完成 NDM finalize。
+
+默认只取就绪 ObjId，不产生实体文件。可填写有权限的目标父目录，点击“按 ObjId 本地提取”，由 `NfspClient.commitObject` 请求服务端通过 NamedStore 本地提取并提交路径；不会再从浏览器传文件字节。目标已存在时不覆盖，多项提取不宣称目录原子提交；页面保留已确认成功项，失败后点击提取只处理未确认项。网络响应丢失后若路径已存在，应检查目标内容再决定新路径，不能盲目覆盖。
+
+取消覆盖选择后哈希、查重、上传和 finalize；SDK session 内可重试失败任务，已上传 chunk 不重传，只有就绪才允许目标提取。释放任务或刷新后需重新选择，服务器仍可去重。目录 picker 保留根和嵌套路径，但 FileList 无法表达空目录，页面展示此限制；能枚举目录节点的应用应调用 `ndm.importDirectory` 保留空目录。不支持目录 picker 的浏览器仅启用文件按钮。
+
+重复验收建议：
+
+1. 首次导入单文件、多文件、目录及 >32 MiB 文件，确认状态最终为 `ready`，记录实际发送字节。
+2. 重新选择相同内容、改名文件及只修改一个叶文件的目录，确认授权 QCID 命中没有完整哈希，完全命中发送 0 字节，部分命中只传缺失内容。
+3. 在上传、登记、目标提交阶段分别取消或断网，检查 SDK 失败原因和重试；登记失败绝不能展示就绪。
+4. 同一个 ready ObjId 分别只取 ID 和提交目标目录，检查最终根目录、叶文件内容与空目录策略。普通用户和不同 AppInstance 分别验证；查重存在性不自动授予复用权限。
+5. 页面显示临时上传 holding 就绪不代表业务持久 retention；此 demo 的只取 ID 分支不会创建长期业务引用。真实应用应在业务提交中接管 retention。
+
+这些步骤要求已部署支持 `/ndm/v1/import/finalize`、授权 `reusable` lookup 和 NFSP `commit_object` 的服务。源码构建 / mock 测试通过不代表已在真实 Zone 完成上述验收；账号角色、SDK/服务版本、浏览器及实际发送字节应随验收记录保存。

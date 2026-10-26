@@ -146,6 +146,10 @@ impl ClaudeMessagesCodec {
         if !request.tools.is_empty() {
             body.insert("tools".to_string(), encode_tools(request)?);
         }
+        // Sampling parameters are forwarded only when the caller supplied them. Models that
+        // reject explicit sampling parameters (Claude 5.5 family) are handled one layer up:
+        // `claude.provider.json` and `openrouter.provider.json` remove `/temperature`, `/top_p`
+        // and `/top_k` for those models, so the values never reach this codec.
         if let Some(temperature) = request.temperature {
             body.insert(
                 "temperature".to_string(),
@@ -255,7 +259,7 @@ impl OperationCodec for ClaudeMessagesCodec {
         match &call.input.canonical_request {
             AiccCall::ChatCompletionsCreate(request) => self.encode_chat(request, call),
             AiccCall::VisionOcr(request) if self.api_type == ApiType::VisionOcr => {
-                self.encode_chat(&ocr_chat_request(request), call)
+                self.encode_chat(&ocr_chat_request(request, call.context)?, call)
             }
             AiccCall::VisionCaption(request) if self.api_type == ApiType::VisionCaption => {
                 self.encode_chat(&caption_chat_request(request), call)
@@ -315,16 +319,34 @@ pub(crate) fn claude_messages_operation_descriptor() -> OperationDescriptor {
     }
 }
 
-fn ocr_chat_request(request: &VisionOcrRequest) -> LlmChatInvokeRequest {
-    vision_chat_request(
-        &request.exact_model,
-        request.execution_mode,
-        "Extract all visible text from this document.",
+fn ocr_chat_request(
+    request: &VisionOcrRequest,
+    context: &super::CodecContext,
+) -> ProtocolResultValue<LlmChatInvokeRequest> {
+    let mime = match &request.document {
+        ResourceRef::Base64 { mime, .. } => mime.as_str(),
+        ResourceRef::Url { mime_hint, .. } => mime_hint.as_deref().unwrap_or_default(),
+        ResourceRef::NamedObject { .. } => context
+            .materialized_resource(&request.document)?
+            .mime
+            .as_str(),
+    };
+    let content = if mime.to_ascii_lowercase().starts_with("image/") {
+        AiContent::Image {
+            source: request.document.clone(),
+        }
+    } else {
         AiContent::Document {
             source: request.document.clone(),
             title: Some("document".to_string()),
-        },
-    )
+        }
+    };
+    Ok(vision_chat_request(
+        &request.exact_model,
+        request.execution_mode,
+        "Extract all visible text from this document.",
+        content,
+    ))
 }
 
 fn caption_chat_request(request: &VisionCaptionRequest) -> LlmChatInvokeRequest {
@@ -1053,6 +1075,7 @@ fn decode_usage(value: Option<&Value>) -> ProtocolResultValue<AiUsage> {
         image_units: None,
         audio_seconds: None,
         video_seconds: None,
+        reference_images: None,
         request_units: None,
         characters: None,
         audio_input_tokens: None,
@@ -1654,6 +1677,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind, ProtocolErrorKind::InvalidRequest);
         assert!(error.message.contains("requires max_output_tokens"));
+    }
+
+    #[test]
+    fn maps_ocr_images_to_image_blocks_and_pdfs_to_document_blocks() {
+        let context = context();
+        let image = VisionOcrRequest::new(
+            "claude-test@instance",
+            ResourceRef::base64("image/png".to_string(), "aW1hZ2U=".to_string()),
+        );
+        let image_request = ocr_chat_request(&image, &context).unwrap();
+        assert!(matches!(
+            image_request.messages[0].content[1],
+            AiContent::Image { .. }
+        ));
+
+        let pdf = VisionOcrRequest::new(
+            "claude-test@instance",
+            ResourceRef::base64("application/pdf".to_string(), "cGRm".to_string()),
+        );
+        let pdf_request = ocr_chat_request(&pdf, &context).unwrap();
+        assert!(matches!(
+            pdf_request.messages[0].content[1],
+            AiContent::Document { .. }
+        ));
     }
 
     #[test]
@@ -2379,7 +2426,7 @@ mod review_parameter_tests {
         ] {
             assert!(apply_resolved_parameters(
                 &mut Map::new(),
-                &BTreeMap::from([(field.into(), value)])
+                &BTreeMap::from([(field.into(), value)]),
             )
             .is_err());
         }

@@ -101,7 +101,7 @@ function contact(did: string, now: number, patch: Partial<Contact> & { ageDays: 
 
 function contacts(now: number): Contact[] {
   return [
-    contact('did:bns:bob', now, { ageDays: 300, source: 'shared', is_verified: true, access_level: 'allow', friend_state: 'friend', tags: ['zone_user'] }),
+    contact('did:bns:bob', now, { ageDays: 300, source: 'shared', is_verified: true, access_level: 'allow', friend_state: 'friend', tags: ['zone_user', 'type:user'], projected_from: ['type:user'] }),
     contact('did:bns:carol', now, { ageDays: 280, source: 'shared', is_verified: true, access_level: 'allow', friend_state: 'friend', tags: ['zone_user'] }),
     contact('did:bns:assistant.alice', now, { ageDays: 90, source: 'shared', is_verified: true, access_level: 'allow', friend_state: 'friend', tags: ['zone_agent'] }),
     contact('did:bns:eve', now, {
@@ -165,7 +165,7 @@ export function createMockWorld(options: { empty: boolean }, now = Date.now()): 
   world.friendRequests = [
     { request_id: 'fr-nina', peer_did: 'did:bns:nina', direction: 'incoming', state: 'pending', message: 'Hi Alice, we met at the BuckyOS meetup last week.', peer_name: 'Nina', msg_id: 'msg-fr-nina', created_at_ms: now - 5 * HOUR, expires_at_ms: now + 6 * DAY, updated_at_ms: now - 5 * HOUR },
     { request_id: 'fr-peggy', peer_did: 'did:bns:peggy', direction: 'incoming', state: 'pending', peer_name: 'Peggy', msg_id: 'msg-fr-peggy', created_at_ms: now - 2 * DAY, expires_at_ms: now + 5 * DAY, updated_at_ms: now - 2 * DAY },
-    { request_id: 'fr-ivan', peer_did: 'did:bns:ivan', direction: 'outgoing', state: 'pending', message: 'Let us keep in touch about the spring trip.', delivery: { state: 'delivered' }, created_at_ms: now - 3 * DAY, expires_at_ms: now + 4 * DAY, updated_at_ms: now - 3 * DAY },
+    { request_id: 'fr-ivan', peer_did: 'did:bns:ivan', direction: 'outgoing', state: 'pending', message: 'Let us keep in touch about the spring trip.', delivery: { state: 'failed', reason: 'signing-key-unavailable' }, created_at_ms: now - 3 * DAY, expires_at_ms: now + 4 * DAY, updated_at_ms: now - 3 * DAY },
   ]
   world.requestSessions = [
     { sessionId: 'dm:did:bns:victor', peerDid: 'did:bns:victor', peerName: 'Victor', count: 2, lastAtMs: now - HOUR, preview: 'I also have a question about your HomeStation post.' },

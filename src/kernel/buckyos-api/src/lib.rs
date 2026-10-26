@@ -3,17 +3,20 @@ use std::env;
 
 use log::{info, warn};
 
+mod aiworkspace_client;
 mod control_panel;
 mod device_identity;
+mod group_hook;
+mod homestation_client;
+mod hybrid_sso;
 mod msg_center_client;
 mod msg_contact;
 mod msg_notify;
-mod aiworkspace_client;
-mod homestation_client;
-mod nfs_server_client;
-mod nfs_copy;
-mod nfs_share;
 pub mod msg_queue;
+mod nfs_copy;
+mod nfs_server_client;
+mod nfs_share;
+mod named_store_client;
 mod scheduler_client;
 mod sn_user_client;
 mod system_config;
@@ -21,6 +24,7 @@ mod task_dispatcher;
 mod task_mgr;
 mod taskdata;
 mod thunk_object;
+mod user_groups;
 mod verify_hub_client;
 pub mod workflow_dsl;
 pub mod workflow_runtime;
@@ -28,10 +32,16 @@ mod workflow_service;
 pub mod workflow_types;
 mod zone_gateway;
 
+pub mod agent_daemon;
+pub use agent_daemon::*;
+mod agent_daemon_transport;
+pub use agent_daemon_transport::agent_daemon_byte_stream;
+mod agent_permissions;
 mod aicc_client;
 mod aicc_decision;
+mod aicc_quota;
 mod aicc_usage_log;
-mod agent_permissions;
+mod aicc_video;
 mod app_availability;
 mod app_doc;
 mod app_identity;
@@ -44,6 +54,10 @@ mod kevent_client;
 mod kevent_ringbuffer;
 pub mod network_observation;
 pub mod node_control;
+mod computer;
+pub use computer::*;
+mod node_executor;
+mod node_executor_proto;
 mod opendan_client;
 mod permission;
 mod process_util;
@@ -53,10 +67,13 @@ mod repo_client;
 mod runtime;
 pub mod test_config;
 
+pub use agent_permissions::*;
 pub use aicc_client::*;
 pub use aicc_decision::*;
+pub use aicc_quota::*;
 pub use aicc_usage_log::*;
-pub use agent_permissions::*;
+pub use aicc_video::*;
+pub use aiworkspace_client::*;
 pub use app_availability::*;
 pub use app_doc::*;
 pub use app_identity::*;
@@ -71,22 +88,25 @@ pub use cyfs_gateway_api::{
     SN_DEVICE_TOKEN_DEFAULT_TTL_SECS,
 };
 pub use device_identity::*;
+pub use group_hook::*;
+pub use homestation_client::*;
+pub use hybrid_sso::*;
 pub use msg_center_client::*;
 pub use msg_contact::*;
 pub use msg_notify::*;
-pub use aiworkspace_client::*;
-pub use homestation_client::*;
+pub use nfs_copy::*;
 pub use nfs_server_client::*;
+pub use nfs_share::*;
+pub use named_store_client::RuntimeNamedStore;
 pub use repo_client::*;
 pub use scheduler_client::*;
 pub use sn_user_client::*;
 pub use system_config::*;
 pub use task_dispatcher::*;
 pub use task_mgr::*;
-pub use nfs_copy::*;
-pub use nfs_share::*;
 pub use taskdata::*;
 pub use thunk_object::*;
+pub use user_groups::*;
 pub use verify_hub_client::*;
 pub use workflow_dsl::*;
 pub use workflow_runtime::*;
@@ -100,6 +120,8 @@ pub use kevent_bridge::*;
 pub use kevent_client::*;
 pub use kevent_ringbuffer::*;
 pub use network_observation::*;
+pub use node_executor::*;
+pub use node_executor_proto::*;
 pub use opendan_client::*;
 pub use permission::*;
 pub use process_util::*;
@@ -391,9 +413,7 @@ mod tests {
         init_buckyos_api_runtime, parse_app_identity_from_instance_config, AppDoc, AppId,
         AppInstanceId, AppServiceInstanceConfig, AppType, BuckyOSRuntimeType, DeploymentIdentity,
         NodeExecutionSpec, ServiceInstanceState, ServiceSpecConfig, SubPkgDesc,
-        BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV, BUCKYOS_APP_DID_ENV, BUCKYOS_APP_ID_ENV,
-        BUCKYOS_APP_INSTANCE_ID_ENV, BUCKYOS_APP_TOKEN_ENV, BUCKYOS_DATA_DIR_ENV,
-        BUCKYOS_OWNER_USER_ID_ENV, NODE_EXECUTION_SPEC_SCHEMA_VERSION, OBJ_TYPE_APP_DOC,
+        BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV, NODE_EXECUTION_SPEC_SCHEMA_VERSION, OBJ_TYPE_APP_DOC,
     };
 
     pub(super) fn test_env_lock() -> &'static Mutex<()> {
@@ -461,6 +481,7 @@ mod tests {
                 spec_generation: 1,
                 pikg_digest: None,
             },
+            run_mode: crate::AppRunMode::Container,
         };
         let raw = serde_json::to_string(&config).expect("serialize app_instance_config");
 
@@ -477,54 +498,6 @@ mod tests {
         assert_eq!(
             app_instance_id.runtime_key(),
             "0f77133700c08ac0aff571f1b710c5ade021d76b9a4a86477887f7d319c90768"
-        );
-    }
-
-    #[tokio::test]
-    async fn init_app_service_runtime_skips_system_etc_and_uses_env_bootstrap() {
-        let _lock = test_env_lock().lock().expect("lock env");
-        let app_id = "buckyos-jarvis.devtest.bns.did";
-        let app_instance_id = format!("{app_id}@devtest");
-        let missing_root = env::temp_dir().join(format!(
-            "buckyos-appservice-runtime-missing-root-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("unix epoch")
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&missing_root);
-        assert!(!missing_root.exists(), "test root should not exist");
-
-        let prev_root = set_env_var("BUCKYOS_ROOT", missing_root.to_string_lossy().as_ref());
-        let prev_app_did = set_env_var(BUCKYOS_APP_DID_ENV, "did:bns:buckyos-jarvis.devtest");
-        let prev_app_id = set_env_var(BUCKYOS_APP_ID_ENV, app_id);
-        let prev_instance_id = set_env_var(BUCKYOS_APP_INSTANCE_ID_ENV, &app_instance_id);
-        let prev_owner = set_env_var(BUCKYOS_OWNER_USER_ID_ENV, "devtest");
-        let prev_data_dir = set_env_var(
-            BUCKYOS_DATA_DIR_ENV,
-            missing_root.join("data").to_string_lossy().as_ref(),
-        );
-        let prev_token = set_env_var(BUCKYOS_APP_TOKEN_ENV, "dummy-session-token");
-
-        let result = init_buckyos_api_runtime("", None, BuckyOSRuntimeType::AppService).await;
-
-        restore_env_var(BUCKYOS_APP_TOKEN_ENV, prev_token);
-        restore_env_var(BUCKYOS_DATA_DIR_ENV, prev_data_dir);
-        restore_env_var(BUCKYOS_OWNER_USER_ID_ENV, prev_owner);
-        restore_env_var(BUCKYOS_APP_INSTANCE_ID_ENV, prev_instance_id);
-        restore_env_var(BUCKYOS_APP_ID_ENV, prev_app_id);
-        restore_env_var(BUCKYOS_APP_DID_ENV, prev_app_did);
-        restore_env_var("BUCKYOS_ROOT", prev_root);
-
-        let runtime = result.expect("init app service runtime should succeed without system etc");
-        assert_eq!(runtime.get_app_id(), app_id);
-        assert_eq!(runtime.get_owner_user_id().as_deref(), Some("devtest"));
-        assert_eq!(runtime.user_id.as_deref(), Some("devtest"));
-        assert_eq!(runtime.get_authenticated_user_id().as_deref(), None);
-        assert_eq!(
-            runtime.session_token.read().await.as_str(),
-            "dummy-session-token"
         );
     }
 

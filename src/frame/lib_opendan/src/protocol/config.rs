@@ -23,7 +23,6 @@ pub const SESSION_CONFIG_SCHEMA: &str = "opendan.session_config/7";
 pub enum SessionKind {
     Ui,
     Work,
-    SelfImprove,
     SelfCheck,
     /// The context of a Goal (`state/goals/<goal_id>`): one per `(goal,
     /// epoch)`, created by the host, never a sub session.
@@ -35,7 +34,6 @@ impl SessionKind {
         match self {
             SessionKind::Ui => "ui",
             SessionKind::Work => "work",
-            SessionKind::SelfImprove => "self_improve",
             SessionKind::SelfCheck => "self_check",
             SessionKind::Goal => "goal",
         }
@@ -46,7 +44,6 @@ impl SessionKind {
         match self {
             SessionKind::Ui => "ui",
             SessionKind::Work => "work",
-            SessionKind::SelfImprove => "si",
             SessionKind::SelfCheck => "sc",
             SessionKind::Goal => "goal",
         }
@@ -595,6 +592,20 @@ pub enum InputMedia {
 /// Image / document blocks one batch may carry (`input.media = inline`).
 pub const MAX_INLINE_MEDIA: usize = 8;
 
+/// What the host shows a context besides its inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InputBackground {
+    /// Only what an input batch carries (the chat format's background).
+    #[default]
+    Batch,
+    /// Also after every batch of tool results (behavior loop: every step
+    /// with action results): the TodoList and sub session lines that
+    /// changed since they were last shown, as a `<<background_context>>`
+    /// message before the next inference.
+    AfterTools,
+}
+
 /// Input consumption policy of a context (separate from its templates).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -603,6 +614,8 @@ pub struct InputSection {
     pub mode: InputMode,
     #[serde(default)]
     pub media: InputMedia,
+    #[serde(default)]
+    pub background: InputBackground,
 }
 
 impl InputSection {
@@ -641,6 +654,12 @@ pub struct BehaviorEntry {
     /// contract (function call loop only). A fork may declare its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<super::behavior::BehaviorReply>,
+    /// Every native function call of the context carries a non-empty
+    /// `intent` (`[capabilities] call_intent`): declared in each function's
+    /// schema, checked before the call runs, kept with the call's record and
+    /// removed from the arguments the tool receives.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub call_intent: bool,
 }
 
 impl BehaviorEntry {
@@ -677,6 +696,11 @@ impl BehaviorEntry {
         }
         if let Some(r) = &self.reply {
             r.validate(name)?;
+        }
+        if self.call_intent && self.llm_context.get("loop_model").and_then(Value::as_str) == Some("behavior") {
+            return Err(format!(
+                "behavior `{name}`: call_intent applies to native function calls; the behavior loop states its intent in <intent>"
+            ));
         }
         match self.mode {
             ContextMode::Fork => {
@@ -728,6 +752,43 @@ pub struct RuntimeRequirement {
     pub app_tools: Vec<String>,
 }
 
+/// How a session's session-runtime was chosen (primary-runtime TODO §3):
+/// the workspace never chooses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSelection {
+    /// Named by the creator (`--runtime`, a Todo's runtime).
+    Explicit,
+    /// The parent session's frozen runtime.
+    Inherited,
+    /// The agent's default runtime.
+    Default,
+}
+
+/// The session-runtime a session was frozen to at creation: the
+/// registration it resolved to and how that runtime is reached, so a
+/// restart or a changed default never moves the session to another target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FrozenRuntime {
+    pub runtime_id: String,
+    pub kind: super::RuntimeKind,
+    /// The registration's `exec` (`agent_tool` RuntimeConfig) at selection.
+    #[serde(default)]
+    pub exec: Option<serde_json::Value>,
+    /// `RuntimeRecord.revision` the selection was read from.
+    pub revision: u64,
+    pub selected_by: RuntimeSelection,
+    #[serde(default)]
+    pub computer: buckyos_api::ComputerAccess,
+    /// The registration's declared baseline: which cmd_skills the session
+    /// takes.
+    pub baseline: buckyos_api::RuntimeBaseline,
+    /// What is known of its platform at selection (empty fields: not yet
+    /// learned from the runtime).
+    #[serde(default)]
+    pub platform: super::RuntimePlatform,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeSection {
     #[serde(default)]
@@ -736,6 +797,26 @@ pub struct RuntimeSection {
     pub tool_plan: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Set by `create_session`; `None` only in sessions created by tests
+    /// without an Agent State, which run in the agent's own environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen: Option<FrozenRuntime>,
+}
+
+impl RuntimeSection {
+    /// The runtime the session is frozen to (`container` when none).
+    pub fn runtime_id(&self) -> &str {
+        self.frozen
+            .as_ref()
+            .map(|f| f.runtime_id.as_str())
+            .or(self.requirement.runtime_id.as_deref())
+            .unwrap_or(super::CONTAINER_RUNTIME)
+    }
+
+    /// Whether the session executes through a Node Executor.
+    pub fn is_node(&self) -> bool {
+        self.frozen.as_ref().is_some_and(|f| f.kind.is_node())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1049,6 +1130,7 @@ impl SessionConfig {
                 tool: None,
                 todo: false,
                 reply: None,
+                call_intent: false,
             });
         }
         Err(format!(

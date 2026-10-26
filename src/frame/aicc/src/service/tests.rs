@@ -1,5 +1,5 @@
 use super::*;
-use buckyos_api::{QuotaState, QuotaView, UsageQueryTimeRange};
+use buckyos_api::{QuotaState, UsageQueryTimeRange};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct FakeAuthorizer {
@@ -25,6 +25,14 @@ impl ServiceAuthorizer for FakeAuthorizer {
             user_id: "alice".to_string(),
             app_id: Some("app:test@alice".to_string()),
             token: "caller-token".to_string(),
+            principal: CallerPrincipal::Account {
+                user_type: buckyos_api::UserType::User,
+                groups: Vec::new(),
+                operator_id: Some("alice".to_string()),
+                caller: "app:test@alice".to_string(),
+                mode: buckyos_api::AiccAttributionMode::Direct,
+                run_ref: None,
+            },
         })
     }
 }
@@ -251,20 +259,23 @@ impl UsageQueryPort for FakeUsage {
 struct FakeQuota;
 
 #[async_trait]
-impl QuotaQueryPort for FakeQuota {
-    async fn query_quota(
+impl QuotaPort for FakeQuota {
+    async fn access(
         &self,
         _caller: &AuthorizedCaller,
-        _request: QuotaQueryRequest,
-    ) -> Result<QuotaQueryResponse, RPCErrors> {
-        Ok(QuotaQueryResponse {
-            quota: QuotaView {
-                state: QuotaState::Normal,
-                remaining_request_units: Some(10),
-                remaining_cost: None,
-                reset_at: None,
-            },
-        })
+        _inventory: &crate::visibility::Inventory,
+    ) -> Result<crate::visibility::Access, RPCErrors> {
+        Ok(crate::visibility::Access::Unrestricted)
+    }
+
+    async fn handle(
+        &self,
+        caller: &AuthorizedCaller,
+        method: &str,
+        _params: Value,
+        _inventory: &crate::visibility::Inventory,
+    ) -> Result<Value, RPCErrors> {
+        Ok(json!({"method": method, "user_id": caller.user_id}))
     }
 }
 
@@ -501,6 +512,7 @@ async fn aicc_artifact_authorizer_is_tenant_scoped() {
         tenant_id: "tenant-a".into(),
         caller_id: "alice".into(),
         storage: storage.clone(),
+        token: None,
     };
     assert!(own
         .authorize(
@@ -514,6 +526,7 @@ async fn aicc_artifact_authorizer_is_tenant_scoped() {
         tenant_id: "tenant-b".into(),
         caller_id: "bob".into(),
         storage,
+        token: None,
     };
     assert!(foreign
         .authorize(
@@ -521,6 +534,32 @@ async fn aicc_artifact_authorizer_is_tenant_scoped() {
             &target,
             ResourceAccessOperation::Inspect,
         )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn imported_named_object_requires_original_caller_token() {
+    let authorizer = AuthenticatedResourceAuthorizer {
+        tenant_id: "tenant-a".into(),
+        caller_id: "alice".into(),
+        storage: Arc::new(
+            AiccStorage::open("sqlite::memory:", buckyos_api::RdbBackend::Sqlite)
+                .await
+                .unwrap(),
+        ),
+        token: None,
+    };
+    let target = ResourceTarget::NamedObject {
+        obj_id: ndn_lib::ObjId::new("cyfile:010203").unwrap(),
+    };
+    let context = ResourceAccessContext::new("tenant-a", "alice", "request-a").unwrap();
+    assert!(authorizer
+        .authorize(&context, &target, ResourceAccessOperation::Inspect)
+        .await
+        .is_err());
+    assert!(authorizer
+        .authorize(&context, &target, ResourceAccessOperation::ReadContent)
         .await
         .is_err());
 }
@@ -1237,7 +1276,8 @@ fn builtin_logical_tree_is_not_an_inventory_snapshot() {
         "llm.kimi-code",
         "image.txt2img",
         "audio.tts",
-        "video.txt2video",
+        "video.generate",
+        "video.edit",
     ] {
         assert!(directory.get(path).is_some(), "{path}");
         assert!(
@@ -1742,99 +1782,6 @@ fn materialized_output_rejects_known_payload_leaks_outside_resource_refs() {
         .contains("retained an inline artifact payload"));
 }
 
-fn quota_record() -> QuotaTruthRecord {
-    QuotaTruthRecord {
-        period_start_ms: 1,
-        period_end_ms: 10_000,
-        max_request_units: Some(100),
-        max_cost: Some(buckyos_api::Money::new(10.0, "USD")),
-        reset_at: "2026-09-05T00:00:00Z".to_string(),
-    }
-}
-
-#[test]
-fn quota_combines_budget_usage_and_provider_minimum() {
-    let usage = buckyos_api::UsageAggregate {
-        consumed_request_units: 91,
-        finance_totals: vec![buckyos_api::Money::new(9.2, "USD")],
-        ..Default::default()
-    };
-    let provider = ProviderQuotaObservation {
-        state: ProviderQuotaObservationState::Normal,
-        remaining_request_units: Some(8),
-        remaining_cost: Some(buckyos_api::AiCost {
-            amount: 0.5,
-            currency: "USD".to_string(),
-        }),
-        reset_at_ms: None,
-        observed_at_ms: 1,
-        source: "provider-api".to_string(),
-    };
-    let quota = combine_quota(quota_record(), &usage, Some(&provider)).unwrap();
-    assert_eq!(quota.state, Some(QuotaState::NearLimit));
-    assert_eq!(quota.remaining_request_units, Some(8));
-    assert_eq!(
-        quota.remaining_cost,
-        Some(buckyos_api::Money::new(0.5, "USD"))
-    );
-}
-
-#[test]
-fn quota_rejects_invalid_local_finance_but_ignores_provider_failure() {
-    let incomplete = buckyos_api::UsageAggregate {
-        finance_complete: false,
-        ..Default::default()
-    };
-    assert!(combine_quota(quota_record(), &incomplete, None).is_err());
-
-    let mixed = buckyos_api::UsageAggregate {
-        finance_totals: vec![
-            buckyos_api::Money::new(1.0, "EUR"),
-            buckyos_api::Money::new(2.0, "USD"),
-        ],
-        ..Default::default()
-    };
-    assert!(combine_quota(quota_record(), &mixed, None).is_err());
-
-    let mismatched = buckyos_api::UsageAggregate {
-        finance_totals: vec![buckyos_api::Money::new(1.0, "EUR")],
-        ..Default::default()
-    };
-    assert!(combine_quota(quota_record(), &mismatched, None).is_err());
-
-    let empty = combine_quota(
-        quota_record(),
-        &buckyos_api::UsageAggregate::default(),
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        empty.remaining_cost,
-        Some(buckyos_api::Money::new(10.0, "USD"))
-    );
-
-    let failed = ProviderQuotaObservation {
-        state: ProviderQuotaObservationState::QueryFailed,
-        remaining_request_units: None,
-        remaining_cost: None,
-        reset_at_ms: None,
-        observed_at_ms: 1,
-        source: "provider-api".to_string(),
-    };
-    let quota = combine_quota(
-        quota_record(),
-        &buckyos_api::UsageAggregate::default(),
-        Some(&failed),
-    )
-    .unwrap();
-    assert_eq!(quota.state, Some(QuotaState::Normal));
-    assert_eq!(quota.remaining_request_units, Some(100));
-    assert_eq!(
-        quota.remaining_cost,
-        Some(buckyos_api::Money::new(10.0, "USD"))
-    );
-}
-
 #[test]
 fn unavailable_provider_quota_is_unknown_and_exhausted_is_preserved() {
     let unsupported = ProviderQuotaObservation {
@@ -1863,26 +1810,6 @@ fn unavailable_provider_quota_is_unknown_and_exhausted_is_preserved() {
         provider_quota(Some(&exhausted)).state,
         Some(QuotaState::Exhausted)
     );
-}
-
-#[test]
-fn exhausted_provider_overrides_normal_budget() {
-    let exhausted = ProviderQuotaObservation {
-        state: ProviderQuotaObservationState::Exhausted,
-        remaining_request_units: Some(0),
-        remaining_cost: None,
-        reset_at_ms: None,
-        observed_at_ms: 1,
-        source: "provider-api".to_string(),
-    };
-    let quota = combine_quota(
-        quota_record(),
-        &buckyos_api::UsageAggregate::default(),
-        Some(&exhausted),
-    )
-    .unwrap();
-    assert_eq!(quota.state, Some(QuotaState::Exhausted));
-    assert_eq!(quota.remaining_request_units, Some(0));
 }
 
 #[tokio::test]
@@ -2151,12 +2078,7 @@ fn media_family_preferences_remain_static_and_cannot_be_bypassed_by_auto_mounts(
     let empty = builtin_tree(&[]);
     let directory = model_directory_json(&empty);
     let mut media_count = 0;
-    for task in [
-        "image.txt2img",
-        "image.img2img",
-        "video.txt2video",
-        "video.img2video",
-    ] {
+    for task in ["image.txt2img", "image.img2img", "video.generate"] {
         let entries = directory[task].as_array().unwrap();
         media_count += entries.len();
         assert!(entries.iter().all(|item| item["target"]
@@ -2164,7 +2086,7 @@ fn media_family_preferences_remain_static_and_cannot_be_bypassed_by_auto_mounts(
             .unwrap()
             .starts_with(&format!("{task}."))));
     }
-    assert_eq!(media_count, 57);
+    assert_eq!(media_count, 43);
     let mut contract_count = 0;
     for line in include_str!("model_defaults.rs").lines() {
         let Some((left, right)) = line.split_once(" -> ") else {
@@ -2195,7 +2117,7 @@ fn media_family_preferences_remain_static_and_cannot_be_bypassed_by_auto_mounts(
         );
         contract_count += 1;
     }
-    assert_eq!(contract_count, 57);
+    assert_eq!(contract_count, 43);
 
     assert_eq!(
         dir_item(&directory, "image.txt2img", "gpt_image")["weight"],

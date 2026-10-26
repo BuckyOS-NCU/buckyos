@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// `.locks/*.lease`). Rewritten in place by the holder; never replaced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LockInfo {
-    /// `session:<sid> | run:<run_id> | self_improve | artifact:<aid>`.
+    /// `session:<sid> | run:<run_id> | memory_consolidation | artifact:<aid>`.
     pub resource: String,
     /// +1 on every successful acquisition.
     pub epoch: u64,
@@ -34,7 +34,7 @@ pub struct Binding {
     pub schema: String,
     pub target: serde_json::Value,
     pub runtime_id: String,
-    /// `native | tmux`.
+    /// `native | remote_node`.
     pub kind: String,
     /// Absolute workdir for exec (the only place absolute paths are allowed
     /// besides `runs/`).

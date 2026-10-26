@@ -2,7 +2,29 @@
 name: opendan_agent_dev
 description: Develop OpenDAN Agents — AgentRootFS layout, agent.toml, behaviors, cmd_skills and TypeScript CLI tools on the buckyos SDK, sessions and report artifacts, debugging, packaging an Agent template PIKG, registering it and creating an Agent from it, and extending agents with skill packages.
 requires: an OpenDAN session (agent-session on PATH) and the buckyos command; registering templates and creating Agents is done by the owner (Control Panel/Desktop or host CLI); host debugging needs the BuckyOS repo
+baseline: standard
 ---
+#### Explicit remote executor tools
+The `executor` tool group provides `executor_list` and `executor_call` without moving the Agent Session.
+Discover a permitted online executor and use its exact executor_id, generation, profile_id and store_id.
+Linux supports exec/read/write/edit/query/cancel; UI, input and capture remain unsupported.
+macOS 14+ and Windows interactive user sessions add native ComputerUse drivers through the authenticated Command Stream and SDK
+`ExecutorCommandStream.computer`; it does not add an Agent tool or change Session Runtime binding.
+Windows runs the foreground `buckyos_agent_daemon.exe`, uses PowerShell for command execution and
+stores its ledger under `%LOCALAPPDATA%\buckyos-agent-daemon` by default. Its desktop driver supports
+the primary display with visual/auto observations, click, Unicode type, keypress, line scrolling and
+delay waits. Semantic/hybrid, dragging and pixel scrolling are unsupported. Do not run it in Session 0.
+Desktop grants, local pause/resume and recovery are documented in `doc/arch/agent_daemon.md`.
+If the Windows input monitor stops being healthy after sleep, a debugger pause or a scheduling stall,
+restart the daemon and check readiness; local resume alone cannot restore it. Query old operations and observe again.
+The planned `buckyos computer` CLI and image-to-model bridge are not yet available; PNG bytes alone
+do not prove the model received an image. Do not publish a `computer_use` recipe requiring those commands.
+The CLI alternative is `buckyos executor --help`; inspect the installed command schema before use.
+Management URL credentials authenticate the target daemon only, while tool calls use the Agent's App session.
+After connection loss, rediscover the active generation and query the original operation using its
+operation_call_id and original store_id; do not replay commands. A different store_id cannot recover
+the previous machine's ledger. See `doc/arch/agent_daemon.md`.
+
 #### When to use
 Making a new Agent template or changing one (identity text, behaviors, session classes), writing a cmd_skill with its commands, packaging/installing skill packages, or explaining how Agents, templates and Apps relate. Packaging, test installs, waiting for tasks and publish limits are shared with Apps and live in `buckyos_dev_release`; when it is not in this session, read `$OPENDAN_AGENT_ROOT/cmd_skills/buckyos_dev_release.md`. Ordinary Apps are `buckyos_app_dev`.
 
@@ -41,11 +63,15 @@ default_behavior = "chat_route"
 default_cmd_skills = ["ui_core"]   # ≤ 8, files in cmd_skills/
 [session.work]
 default_behavior = "plan"          # Work manuals come from create-worksession --cmd-skill
+[session.plan_simple]              # a class of the package: base + overrides
+base = "work"
+default_behavior = "plan_simple"
+completion = "explicit_report"     # only report(is_end=true) finishes it
 ```
-Other `[session.<class>]` keys: `base`, `turns`, `objective`, `ask_user_timeout_secs`, `max_process_depth`, `max_sub_sessions`, goal `budget.*`. Every `default_behavior`, its `meta.next` chain and each `behavior:<name>` reference have to exist, or session creation fails ("the agent has no behavior …").
+Other `[session.<class>]` keys: `turns`, `objective`, `completion` (`natural` | `explicit_report`), `ask_user_timeout_secs`, `max_process_depth`, `max_sub_sessions`, goal `budget.*`; a class with `base` takes only the built-in's defaults, not another class's overrides. Every `default_behavior`, its `meta.next` chain and each `behavior:<name>` reference have to exist, or session creation fails ("the agent has no behavior …").
 
 #### Behaviors
-`behaviors/<name>.toml`: `[meta] name` (= file name), `objective`, `next`; `[prompt] mode = "function_call"|"behavior"`, `system`, `on_init`…; `[capabilities] tool_whitelist` / `action_whitelist` (`group:bash`, `group:bash_core`, `report`, `behavior:<name>`); `[budget]`, `[model] preferred` (`llm.chat`, `llm.plan`, `llm.code`, `llm.swift`); `[entry] mode`; `[tool]` to expose a behavior as a tool; `[reply] schema`. Copy `work_simple.toml` (one bounded task) or `plan.toml`/`do.toml`. Try a change with a throw-away Work: `agent-session create-worksession --objective "<t>" --behavior <name>` (add `--wait` to watch it run); a parse or reference error comes back at creation.
+`behaviors/<name>.toml`: `[meta] name` (= file name), `objective`, `next`; `[prompt] mode = "function_call"|"behavior"`, `system`, `on_init`…; `[capabilities] tool_whitelist` / `action_whitelist` (`group:bash`, `group:bash_core`, `report`, `behavior:<name>`); `[capabilities] call_intent = true` (function_call only: every native call must carry a non-empty `intent` argument — added as required to each function's schema, checked before the call runs, kept in the worklog, removed before the tool gets the arguments); `[input] background = "after_tools"` (after every batch of tool results the host appends the changed TodoList / sub session lines as a `<<background_context>>` message); `[budget]` (`max_tool_iterations` counts tool batches), `[model] preferred` (`llm.chat`, `llm.plan`, `llm.code`, `llm.swift`); `[entry] mode`; `[tool]` to expose a behavior as a tool; `[reply] schema`. Copy `work_simple.toml` (one bounded task), `plan_simple.toml` (TodoList plan in one Turn, function calls) or `plan.toml`/`do.toml` (XML PLAN/DO). Try a change with a throw-away Work: `agent-session create-worksession --objective "<t>" --behavior <name>` (add `--wait` to watch it run); a parse or reference error comes back at creation.
 
 #### cmd_skills and their commands
 - `cmd_skills/<name>.md`: front matter `name`/`description`/`requires` (one line each), body with `####` headings; the whole body goes into the system prompt of sessions that chose it, frozen for their life. A Work picks ≤ 8 at creation: `agent-session create-worksession --objective "<t>" --cmd-skill <name> [--cmd-skill …]`; a child Work inherits its parent Work's choice.
@@ -65,7 +91,13 @@ console.log(JSON.stringify(await rpc.call("<method>", {})));
 For login handling, results and errors reuse buckyos-agent `lib/` (`initRuntime()`, `emit()`) through that tool's `deno.json`. RPC names and params are in the CLI sources `/opt/buckyos/libexec/buckyos-tool/cli/modules/*.ts`. Print JSON on stdout, exit non-zero on failure. Keep the bin wrapper executable (`chmod +x`).
 
 #### Sessions, workspace, deliverables
-A Work runs in its session dir (`$OPENDAN_SESSION_DIR`) or its bound workspace (`--workspace inherit|none|<id>`); write outputs there and list them in the final report (`report` → `artifacts`, or `<artifacts>["rel/path"]</artifacts>` in behavior mode); files outside the work dir are refused, accepted ones are copied and get object ids. A Work's history: `agent-session read-session <sid> --report --worklog 50`; files under `<session>/.opendan_agent_session/` (`worklog.jsonl`, `session_config.json` with the frozen config).
+A Work runs on one session-runtime for its whole life, frozen at creation (`session_config.json` → `runtime.frozen`, with its declared `baseline`): `--runtime <id>` (`agent-session runtime list --available`), else the parent's, else the owner's default (`host` = the owner's computer on a Desktop zone, `container` = this container; a Zone owner's Agent whose default is a node's `host` runs its Agent Service natively on that node and has no `container` runtime). The workspace never chooses it: a workspace is `runtime + directory + url` on its own runtime (`agent-session workspace create --runtime <id> --directory <abs path on it> --name <n> [--url https://…] --key <k>`, `import`, `set-url`); a Todo takes `--runtime` / `--workspace` independently. Commands always start in the session's working directory on its session-runtime (`$OPENDAN_SESSION_DIR` here; `<roots[0]>/.opendan/<agent>/sessions/<sid>` on a node, its OS and paths — `C:\…` on Windows); the workspace directory is in the runtime context (and `$OPENDAN_WORKSPACE_DIR` here): `cd` to it when it is on the same runtime, otherwise move files with `agent-session copy --from workspace:<path> --to session:<path>` and back (one regular file per copy, hash-verified, `--replace` to overwrite, `copy status|cancel <id>`). On a node the standard commands (`agent-session`, `llm_understand_media`, `buckyos`, `aicc-tool`, …) are the node's own (`$BUCKYOS_ROOT/bin/agent-tools`); `agent-session` there reaches this agent over kRPC with the token in `.opendan/`. Write outputs in the session's working directory and list them in the final report (`report` → `artifacts`, or `<artifacts>["rel/path"]</artifacts>` in behavior mode); files outside it are refused, accepted ones are copied and get object ids; say where a delivery into the workspace landed. A Work's history: `agent-session read-session <sid> --report --worklog 50`; files under `<session>/.opendan_agent_session/` (`worklog.jsonl`, `session_config.json` with the frozen config).
+
+#### Plans with Todos: plan_simple and PLAN/DO
+Two ways for a Work to plan with its TodoList (`agent-session todo …`, list in `.opendan_agent_session/todos.json`):
+- `plan_simple` (`agent-session create-worksession --class plan_simple --objective "<t>" [--cmd-skill …]`): native function calls, each with an `intent`; the whole plan is one Turn. Every Todo runs in a sub session of its own: `todo add` + `todo dispatch <id>` (serial: `work_simple`, one at a time, only after every returned result is reviewed and its `--after` Todos are accepted; inherits the workspace) or `todo explore` (read-only, `explore`, parallel, no workspace). The plan waits with `agent-session wait <child_sid>` as a shell call of its own (the Turn stays open), reads `todo show <id> --report`, records `todo review`, retries or adds Todos, and ends with `report(is_end=true)`; the host refuses the end while a Todo is running, pending or unreviewed. After tool results it sees the changed `<todo …>` lines in `<<background_context>>`.
+- `plan` / `do` (the default `[session.work]`): XML behavior steps; `next_behavior = do` executes the next ready serial Todo as a sub context, explorations are waited for with a report-only step.
+A Todo keeps its runtime, workspace, skills and behavior across retries; a serial Todo writing the workspace runs only while the plan waits for it (the workspace lease is handed over), so dispatch and then wait.
 
 #### Package a template
 ```
@@ -94,10 +126,23 @@ Installed files go to `cmd_skills/`, `goal_skills/`, `tools/<name>/` and `.meta/
 
 #### Debug
 - Inside: `agent-session sessions --children --active`, `read-session`, your logs under `/opt/buckyos/logs/`.
-- Host, in `buckyos/src`: `./debug_jarvis.sh <owner> --agent <agent_id> [--no-build]` runs that Agent's Loader in the foreground from source; `JARVIS_PACKAGE_ROOT=<agent dir>` points it at your package. `opendan --dev --agent-root <dir> --agent-did <did> --queue-dir <dir>` runs without a zone. Container changes need `./build_aios --local-test` and a recreated container (`buckyos_dev_release`). Tests: `cargo test -p opendan --test loader -- --test-threads=1`, `cargo test -p libopendan -- --test-threads=1`.
+- Host, in `buckyos/src`: `./debug_jarvis.sh <owner> --agent <agent_id> [--no-build]` runs that Agent's Loader in the foreground from source; `JARVIS_PACKAGE_ROOT=<agent dir>` points it at your package. `opendan --dev --agent-root <dir> --agent-did <did> --queue-dir <dir>` runs without a zone. Container changes need `./build_aios --local-test` and a recreated container (`buckyos_dev_release`); a natively run Agent Service is the node's own `$BUCKYOS_ROOT/bin/opendan/opendan`, so it follows the node install (`buckyos-build.py` + `start.py`), not the image. Tests: `cargo test -p opendan --test loader -- --test-threads=1`, `cargo test -p libopendan -- --test-threads=1`.
 
 #### When it fails
+- MessageHub links ending in `.bns.did`: inspect `/opt/buckyos/etc/machine.json` and `web3_bridge.bns`. The file is
+  part of the host's read-only `etc/` mount, and AppService uses it to initialize DID hostname conversion.
+  Updating this behavior requires both node-daemon and aios, then a recreated container; see `buckyos_admin`.
+- Auth failure: read `loader.status.authentication` (`state`, `last_error`, `error_code`, `denial`, `next_retry_time`)
+  and `errors`, then `session.read` for persistent `bind_failed`, input ACK and outbox. Renewal is serialized in the
+  shared Rust runtime; new mail operations and tool calls take its latest token. Keep auth bind errors recoverable,
+  preserve unacknowledged input and existing outbox IDs, and do not report recovery before a successful credential exchange.
+- `reauthorization_required` or `unavailable`: use an authorized owner/host session and the existing
+  `buckyos app restart <full_app_instance_id> --strategy recreate` flow after checking current owner/App/Agent grants
+  (`buckyos_admin`). This recreates with a newly signed startup assertion and retains AgentRootFS; `docker restart`
+  reuses the old assertion. Do not copy device keys into the container or automatically relogin after revocation.
+  Verify the same pending message has one reply and later renewal succeeds; `Up` is not an Agent health check.
 - `unknown method skills.list|install` from `buckyos skill`: that Agent's container predates the skills kRPC; it needs a newer aios image and a recreated container.
+- WebUI `503 service_not_ready:opendan`: check that the app uses `/api/opendan` on its own host. The zone gateway reserves `/kapi/<name>` for named services; cross-app callers use `/kapi/<agent_id>` with the full AgentId. See `src/frame/opendan/README.md` for endpoint and login details.
 - Session creation errors name the missing behavior or cmd_skill, or `> 8` / duplicate manual names.
 - Template install refused: `app_type` not `agent`, App DID/AppId mismatch, or no `www` endpoint.
 - Your edits to template files in your own AgentRoot survive template updates as local changes; to share them, put them into the template package.

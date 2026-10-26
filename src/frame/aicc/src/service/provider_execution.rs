@@ -7,6 +7,7 @@ pub(crate) struct RuntimeProviderExecutionPort {
     url_fetcher: Arc<dyn UrlResourceFetcher>,
     storage: Arc<AiccStorage>,
     model_health: Arc<ModelHealthRegistry>,
+    native_input_leases: tokio::sync::Mutex<HashMap<String, Vec<crate::resource::ResourceLease>>>,
 }
 
 impl RuntimeProviderExecutionPort {
@@ -25,6 +26,7 @@ impl RuntimeProviderExecutionPort {
             url_fetcher,
             storage,
             model_health,
+            native_input_leases: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -392,6 +394,7 @@ impl RuntimeProviderExecutionPort {
                 tenant_id: context.tenant_id.clone(),
                 caller_id: context.caller_id.clone(),
                 storage: self.storage.clone(),
+                token: None,
             }),
             self.resource_store.clone(),
             self.url_fetcher.clone(),
@@ -482,6 +485,7 @@ impl RuntimeProviderExecutionPort {
                 tenant_id: context.tenant_id.clone(),
                 caller_id: context.caller_id.clone(),
                 storage: self.storage.clone(),
+                token: None,
             }),
             self.resource_store.clone(),
             self.url_fetcher.clone(),
@@ -935,6 +939,17 @@ impl RuntimeProviderExecutionPort {
                             &mut output.value,
                             &call.context.state_coordinate,
                         );
+                        if is_video_api(call.api_type) {
+                            let parameters = &call.input.resolved_parameters;
+                            if let Some(images) = reference_image_count(parameters) {
+                                let usage = output.usage.get_or_insert_with(Default::default);
+                                usage.reference_images = usage.reference_images.or(Some(images));
+                            }
+                            crate::protocol::finish_video_output(
+                                &mut output,
+                                requested_video_output(parameters).as_ref(),
+                            );
+                        }
                         let output = self
                             .materialize_embedding_output(call, output)
                             .await
@@ -1058,9 +1073,30 @@ impl RuntimeProviderExecutionPort {
                         &request,
                     )
                     .map_err(|error| ProviderStartFailure::before_accept(error, false))?;
+                // Everything the resume descriptor needs is checked before the
+                // submit: once the Provider holds a task, only its handle may
+                // be lost to a failure, never resubmitted.
+                let resource_access_context =
+                    call.resource_access_context.clone().ok_or_else(|| {
+                        ProviderStartFailure::before_accept(
+                            ProtocolError::invalid_configuration(
+                                "native task resource context is missing",
+                            ),
+                            false,
+                        )
+                    })?;
+                let max_poll_duration = self
+                    .codecs
+                    .native_task_max_poll_duration(
+                        &call.protocol_adapter_id,
+                        &call.operation,
+                        call.api_type,
+                    )
+                    .map_err(|error| ProviderStartFailure::before_accept(error, false))?;
                 let response = Self::send_cancelable(cancellation, transport.send(request))
                     .await
-                    .map_err(ProviderStartFailure::after_accept)?;
+                    .map_err(ProviderStartFailure::native_submit_unknown)?;
+                let rejected = !response.status.is_success();
                 let output = self
                     .codecs
                     .decode_native(
@@ -1071,9 +1107,15 @@ impl RuntimeProviderExecutionPort {
                         response,
                     )
                     .await
-                    .map_err(ProviderStartFailure::after_accept)?;
+                    .map_err(|error| {
+                        if rejected {
+                            ProviderStartFailure::native_submit_rejected(error)
+                        } else {
+                            ProviderStartFailure::native_submit_unknown(error)
+                        }
+                    })?;
                 let NativeTaskOutput::Submitted(handle) = output else {
-                    return Err(ProviderStartFailure::after_accept(
+                    return Err(ProviderStartFailure::native_submit_unknown(
                         ProtocolError::invalid_response(
                             "native submit returned a non-submit result",
                         ),
@@ -1089,23 +1131,26 @@ impl RuntimeProviderExecutionPort {
                             header_name: call.credential_header_name.clone(),
                             fingerprint: credential_fingerprint(&call.credential_reference),
                         });
+                self.native_input_leases.lock().await.insert(
+                    format!("{}:{}", call.provider_instance_name, handle.remote_task_id),
+                    call.resource_leases.clone(),
+                );
                 Ok(ProviderExecution::NativeTask {
                     handle,
                     resume: NativeTaskResumeDescriptor {
                         base_url: call.context.base_url.clone(),
                         credential,
-                        resource_access_context: call.resource_access_context.clone().ok_or_else(
-                            || {
-                                ProviderStartFailure::after_accept(
-                                    ProtocolError::invalid_configuration(
-                                        "native task resource context is missing",
-                                    ),
-                                )
-                            },
-                        )?,
+                        resource_access_context,
+                        input_leases: call
+                            .resource_leases
+                            .iter()
+                            .map(|lease| lease.spec.clone())
+                            .collect(),
                         resolved_parameters: call.input.resolved_parameters.clone(),
                         output_video_seconds,
                         request_timeout_ms: call.context.limits.request_timeout.as_millis() as u64,
+                        max_poll_duration_ms: max_poll_duration.as_millis() as u64,
+                        active_poll_elapsed_ms: 0,
                         max_request_bytes: call.context.limits.max_request_bytes as u64,
                         max_response_bytes: call.context.limits.max_response_bytes as u64,
                     },
@@ -1113,6 +1158,33 @@ impl RuntimeProviderExecutionPort {
             }
         }
     }
+}
+
+fn is_video_api(api_type: buckyos_api::ApiType) -> bool {
+    matches!(
+        api_type,
+        buckyos_api::ApiType::VideoGenerate
+            | buckyos_api::ApiType::VideoEdit
+            | buckyos_api::ApiType::VideoExtend
+            | buckyos_api::ApiType::VideoUpscale
+    )
+}
+
+fn video_plan(parameters: &BTreeMap<String, Value>) -> Option<crate::video::VideoPlan> {
+    crate::video::VideoPlan::from_parameters(parameters).ok()
+}
+
+fn requested_video_output(
+    parameters: &BTreeMap<String, Value>,
+) -> Option<buckyos_api::VideoOutputSpec> {
+    video_plan(parameters)?.requested_output
+}
+
+fn reference_image_count(parameters: &BTreeMap<String, Value>) -> Option<u64> {
+    video_plan(parameters).map(|plan| {
+        plan.inputs(buckyos_api::VideoConditionKind::ReferenceImage)
+            .count() as u64
+    })
 }
 
 #[async_trait]
@@ -1142,6 +1214,15 @@ impl ProviderExecutionPort for RuntimeProviderExecutionPort {
         }
         let result = match result {
             Ok(ProviderExecution::Stream(stream)) => {
+                // Providers may fetch URL-backed input after the response stream
+                // starts. Keep request-owned content until that stream is dropped.
+                let input_leases = call.resource_leases.clone();
+                let stream = ProtocolStream {
+                    events: Box::pin(stream.events.map(move |event| {
+                        let _retained_inputs = &input_leases;
+                        event
+                    })),
+                };
                 Ok(ProviderExecution::Stream(observed_protocol_stream(
                     stream,
                     self.model_health.clone(),
@@ -1162,6 +1243,11 @@ impl ProviderExecutionPort for RuntimeProviderExecutionPort {
                 now_ms(),
             ),
             Err(failure) => {
+                if failure.provider_accepted {
+                    for lease in &call.resource_leases {
+                        lease.keep_until_expiry();
+                    }
+                }
                 let kind = health_failure_kind(&failure.error);
                 self.model_health.record_failure(
                     &call.exact_model,
@@ -1180,7 +1266,42 @@ impl ProviderExecutionPort for RuntimeProviderExecutionPort {
         binding: &PinnedProviderTask,
         cancellation: crate::protocol::Cancellation,
     ) -> Result<NativeTaskPoll, NativeTaskResumeError> {
-        return match self
+        let lease_key = format!(
+            "{}:{}",
+            binding.provider_instance_name,
+            binding.remote_task_id.as_deref().unwrap_or_default()
+        );
+        let mut retained = self.native_input_leases.lock().await;
+        if !retained.contains_key(&lease_key) {
+            let mut leases = Vec::new();
+            for spec in binding
+                .resume
+                .as_ref()
+                .into_iter()
+                .flat_map(|resume| &resume.input_leases)
+            {
+                let obj_id = ndn_lib::ObjId::new(&spec.obj_id).map_err(|_| {
+                    NativeTaskResumeError::Protocol(ProtocolError::invalid_configuration(
+                        "invalid retained input ID",
+                    ))
+                })?;
+                if let Some(lease) = self
+                    .resource_store
+                    .retain(&obj_id, Some(spec))
+                    .await
+                    .map_err(|_| {
+                        NativeTaskResumeError::Protocol(ProtocolError::invalid_configuration(
+                            "retained input is unavailable",
+                        ))
+                    })?
+                {
+                    leases.push(lease);
+                }
+            }
+            retained.insert(lease_key.clone(), leases);
+        }
+        drop(retained);
+        let result = match self
             .native_request(binding, NativeTaskOperation::Status, Some(&cancellation))
             .await?
         {
@@ -1204,19 +1325,31 @@ impl ProviderExecutionPort for RuntimeProviderExecutionPort {
                     .await?
                 {
                     NativeTaskOutput::Result(mut output) => {
-                        let seconds =
-                            result_usage
-                                .and_then(|usage| usage.video_seconds)
-                                .or_else(|| {
-                                    binding
-                                        .resume
-                                        .as_ref()?
-                                        .output_video_seconds
-                                        .map(|seconds| seconds as f64)
-                                });
-                        if let Some(seconds) = seconds {
-                            let usage = output.usage.get_or_insert_with(Default::default);
-                            usage.video_seconds = usage.video_seconds.or(Some(seconds));
+                        merge_native_result_usage(
+                            &mut output,
+                            result_usage,
+                            binding
+                                .resume
+                                .as_ref()
+                                .and_then(|resume| resume.output_video_seconds)
+                                .map(|seconds| seconds as f64),
+                        );
+                        if is_video_api(binding.api_type) {
+                            let parameters = binding
+                                .resume
+                                .as_ref()
+                                .map(|resume| &resume.resolved_parameters);
+                            if let Some(parameters) = parameters {
+                                if let Some(images) = reference_image_count(parameters) {
+                                    let usage = output.usage.get_or_insert_with(Default::default);
+                                    usage.reference_images =
+                                        usage.reference_images.or(Some(images));
+                                }
+                            }
+                            crate::protocol::finish_video_output(
+                                &mut output,
+                                parameters.and_then(requested_video_output).as_ref(),
+                            );
                         }
                         let mut artifact_refs = binding.result_artifacts.clone();
                         artifact_refs.extend(result_artifacts);
@@ -1281,6 +1414,20 @@ impl ProviderExecutionPort for RuntimeProviderExecutionPort {
                 ProtocolError::invalid_response("native status returned an unexpected result"),
             )),
         };
+        if matches!(
+            result,
+            Ok(NativeTaskPoll::Complete(_)) | Ok(NativeTaskPoll::Failed(_))
+        ) {
+            self.native_input_leases.lock().await.remove(&lease_key);
+        }
+        result
+    }
+
+    async fn release_native_inputs(&self, binding: &PinnedProviderTask, outcome_unknown: bool) {
+        let key = format!("{}:{}", binding.provider_instance_name, binding.remote_task_id.as_deref().unwrap_or_default());
+        if let Some(leases) = self.native_input_leases.lock().await.remove(&key) {
+            if outcome_unknown { for lease in leases { lease.keep_until_expiry(); } }
+        }
     }
 
     async fn cancel_native(
@@ -1291,7 +1438,16 @@ impl ProviderExecutionPort for RuntimeProviderExecutionPort {
             .native_request(binding, NativeTaskOperation::Cancel, None)
             .await?
         {
-            NativeTaskOutput::Cancelled { accepted } => Ok(accepted),
+            NativeTaskOutput::Cancelled { accepted } => {
+                if accepted {
+                    self.native_input_leases.lock().await.remove(&format!(
+                        "{}:{}",
+                        binding.provider_instance_name,
+                        binding.remote_task_id.as_deref().unwrap_or_default()
+                    ));
+                }
+                Ok(accepted)
+            }
             _ => Err(NativeTaskResumeError::Protocol(
                 ProtocolError::invalid_response(
                     "native cancellation returned an unexpected response",
@@ -1349,6 +1505,31 @@ fn observed_protocol_stream(
     }
 }
 
+fn merge_native_result_usage(
+    output: &mut ProtocolOutput,
+    status_usage: Option<buckyos_api::AiUsage>,
+    fallback_video_seconds: Option<f64>,
+) {
+    let reported_cost = status_usage.as_ref().and_then(|usage| usage.reported_cost);
+    let settled_cost = status_usage.as_ref().and_then(|usage| usage.cost.clone());
+    let video_seconds = status_usage
+        .and_then(|usage| usage.video_seconds)
+        .or(fallback_video_seconds);
+    if reported_cost.is_none() && settled_cost.is_none() && video_seconds.is_none() {
+        return;
+    }
+    let usage = output.usage.get_or_insert_with(Default::default);
+    if usage.reported_cost.is_none() {
+        usage.reported_cost = reported_cost;
+    }
+    if usage.cost.is_none() {
+        usage.cost = settled_cost;
+    }
+    if usage.video_seconds.is_none() {
+        usage.video_seconds = video_seconds;
+    }
+}
+
 fn health_failure_kind(error: &ProtocolError) -> HealthFailureKind {
     if error.is_account_exhausted() {
         HealthFailureKind::Permanent
@@ -1380,6 +1561,66 @@ fn credential_fingerprint(reference: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_result_usage_keeps_result_values_and_fills_status_settlement() {
+        let mut output = ProtocolOutput {
+            value: Value::Null,
+            usage: Some(buckyos_api::AiUsage {
+                request_units: Some(1),
+                ..Default::default()
+            }),
+            artifacts: Vec::new(),
+        };
+        merge_native_result_usage(
+            &mut output,
+            Some(buckyos_api::AiUsage {
+                reported_cost: Some(0.5),
+                cost: Some(buckyos_api::AiCost::new(0.5, "USD")),
+                video_seconds: Some(8.0),
+                ..Default::default()
+            }),
+            Some(10.0),
+        );
+        let usage = output.usage.as_ref().unwrap();
+        assert_eq!(usage.request_units, Some(1));
+        assert_eq!(usage.reported_cost, Some(0.5));
+        assert_eq!(usage.cost, Some(buckyos_api::AiCost::new(0.5, "USD")));
+        assert_eq!(usage.video_seconds, Some(8.0));
+
+        let mut existing = ProtocolOutput {
+            value: Value::Null,
+            usage: Some(buckyos_api::AiUsage {
+                reported_cost: Some(0.25),
+                cost: Some(buckyos_api::AiCost::new(0.25, "CNY")),
+                video_seconds: Some(4.0),
+                ..Default::default()
+            }),
+            artifacts: Vec::new(),
+        };
+        merge_native_result_usage(
+            &mut existing,
+            Some(buckyos_api::AiUsage {
+                reported_cost: Some(0.5),
+                cost: Some(buckyos_api::AiCost::new(0.5, "USD")),
+                video_seconds: Some(8.0),
+                ..Default::default()
+            }),
+            None,
+        );
+        let usage = existing.usage.unwrap();
+        assert_eq!(usage.reported_cost, Some(0.25));
+        assert_eq!(usage.cost, Some(buckyos_api::AiCost::new(0.25, "CNY")));
+        assert_eq!(usage.video_seconds, Some(4.0));
+
+        let mut empty = ProtocolOutput {
+            value: Value::Null,
+            usage: None,
+            artifacts: Vec::new(),
+        };
+        merge_native_result_usage(&mut empty, None, None);
+        assert!(empty.usage.is_none());
+    }
 
     #[test]
     fn artifact_materialization_does_not_recollect_replaced_value_resource() {

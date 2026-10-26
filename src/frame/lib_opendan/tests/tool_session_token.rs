@@ -2,11 +2,10 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use agent_tool::llm_bash::{BashRunRequest, BashTarget};
-use agent_tool::runtime::{RuntimeConfig, RuntimeOpenCtx, RuntimeRegistry, Sandbox, TmuxConfig};
+use agent_tool::runtime::{RuntimeConfig, RuntimeOpenCtx, RuntimeRegistry, Sandbox};
 use agent_tool::xllm::{LoopModel, ToolsConfig, XllmDeps};
 use agent_tool::{SessionRuntimeContext, BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV as TOKEN_ENV};
 use buckyos_api::{
@@ -33,18 +32,6 @@ fn request(cwd: &Path, command: &str) -> BashRunRequest {
         env: vec![(TOKEN_ENV.into(), "stale-call-token".into())],
         target: BashTarget::Local,
         call_id: None,
-    }
-}
-
-struct TmuxSocket(PathBuf);
-
-impl Drop for TmuxSocket {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .arg("-S")
-            .arg(&self.0)
-            .arg("kill-server")
-            .output();
     }
 }
 
@@ -110,22 +97,8 @@ async fn session_tools_use_current_runtime_token_without_owner_keys() {
         session_id: ctx.session_id.clone(),
         read_token_limit: agent_tool::DEFAULT_READ_TOKEN_LIMIT,
     };
-    let mut configs = vec![RuntimeConfig::default()];
-    let socket = TmuxSocket(tmp.path().join("tmux.sock"));
-    if Command::new("tmux").arg("-V").output().is_ok() {
-        configs.push(RuntimeConfig {
-            kind: Some("tmux".into()),
-            tmux: Some(TmuxConfig {
-                session: Some("token-test".into()),
-                socket: Some(socket.0.display().to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-    } else {
-        eprintln!("tmux unavailable; checking native token injection only");
-    }
-    for config in configs {
+    let mut sandboxes = Vec::new();
+    for config in [RuntimeConfig::default()] {
         let rt = RuntimeRegistry::from_config(&config).unwrap();
         let mut open = RuntimeOpenCtx::new(tmp.path(), "token-test", LoopModel::FunctionCall);
         open.env = env.iter().cloned().collect();
@@ -151,17 +124,7 @@ async fn session_tools_use_current_runtime_token_without_owner_keys() {
             assert!(std::env::var_os(TOKEN_ENV).is_none());
         }
 
-        for invalid in [String::new(), "malformed-token".into(), token("expired", 1)] {
-            *runtime.session_token.write().await = invalid;
-            assert!(session_env_vars(&ctx, "test").await.is_err());
-            let err = sandbox
-                .exec(request(tmp.path(), "touch must-not-run"), &context)
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("appclient session token"), "{err}");
-            assert!(!tmp.path().join("must-not-run").exists());
-        }
-        *runtime.session_token.write().await = token("restored", expires);
+        sandboxes.push(sandbox);
     }
 
     let session = common::Env::new();
@@ -203,4 +166,26 @@ async fn session_tools_use_current_runtime_token_without_owner_keys() {
         .unwrap()
         .contains(&json!(TOKEN_ENV)));
     assert!(!record.config.runtime.env.contains_key(TOKEN_ENV));
+
+    for invalid in [
+        String::new(),
+        "malformed-token".into(),
+        token("expired", 1),
+        token("raw-restoration-cannot-clear-terminal-auth", expires),
+    ] {
+        *runtime.session_token.write().await = invalid;
+        assert!(session_env_vars(&ctx, "test").await.is_err());
+        assert_eq!(
+            runtime.get_authentication_status().await.state,
+            buckyos_api::RuntimeAuthState::Unavailable,
+        );
+        for sandbox in &sandboxes {
+            let err = sandbox
+                .exec(request(tmp.path(), "touch must-not-run"), &context)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("appclient session token"), "{err}");
+            assert!(!tmp.path().join("must-not-run").exists());
+        }
+    }
 }

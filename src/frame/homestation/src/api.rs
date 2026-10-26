@@ -46,7 +46,7 @@ impl Station {
     /// Methods of the user's own HomeStation; `Host::handle_rpc` routes each caller to their
     /// own station, other users' homes are read through `portal.*`.
     pub async fn handle_rpc(&self, caller: &Caller, method: &str, params: Value) -> HsResult<Value> {
-        if caller.did.as_deref().is_some_and(|did| did != self.cfg.owner) {
+        if caller.did != self.cfg.owner {
             return Err(HsError::Forbidden("only the HomeStation's user may call this method".into()));
         }
         let eval_scope = match caller.app_id.as_deref() {
@@ -148,6 +148,7 @@ impl Station {
                 json!({ "ok": true })
             }
 
+            "object.register" => self.register_object(&arg::<String>(p, "objId")?, p.get("metadata").cloned().unwrap_or_else(|| json!({}))).await?,
             "publish.create" => {
                 let key: String = arg(p, "key")?;
                 let input: PublishInput = arg(p, "input")?;
@@ -338,12 +339,15 @@ impl Station {
                     "comments" => json!({ "synced": self.sync_tracked().await? }),
                     "friends" => {
                         self.sync_friends().await?;
+                        self.sync_zone_relations().await?;
                         self.reconcile_following().await?;
                         json!({ "ok": true })
                     }
+                    "retention" => json!(self.reconcile_retentions().await?),
                     other => return Err(bad(format!("unknown task {other}"))),
                 }
             }
+            "admin.retention" => self.retention_status().await?,
             "admin.compact_stream" => {
                 self.compact_stream(arg(p, "through")?).await?;
                 json!({ "ok": true })
@@ -376,7 +380,7 @@ impl Station {
                 )?)
             })
             .await?;
-        let ctx = self.view_ctx(Reader::Owner).await;
+        let ctx = self.view_ctx(Reader::Owner).await?;
         let identities: Vec<Value> = ctx.names.keys().map(|did| crate::projection::identity_view(&ctx, did)).collect();
         let followers = self.active_followers().await?;
         let following: Vec<Value> = self
@@ -441,7 +445,7 @@ impl Station {
 
     /// Entry view (state, audience, kind) and card of one of my entries as `reader` sees it.
     pub async fn entry_card(&self, reader: &Reader, entry: &str) -> HsResult<Option<(Value, Option<Value>)>> {
-        let ctx = self.view_ctx(reader.clone()).await;
+        let ctx = self.view_ctx(reader.clone()).await?;
         let found = self.entry_card_with(&ctx, entry).await?;
         Ok(found.filter(|(view, _)| ctx.is_owner() || view["head"]["state"] != "withdrawn"))
     }
@@ -507,7 +511,7 @@ impl Station {
         let profile_feed = kind.is_none();
         let kind = kind.or_else(|| Some("feed".into()));
         let page = self.read_display(&reader, kind, cursor, limit, false).await?;
-        let ctx = self.view_ctx(reader.clone()).await;
+        let ctx = self.view_ctx(reader.clone()).await?;
         let is_owner = reader == Reader::Owner;
         let mut entries = Vec::new();
         let mut cards = Vec::new();
@@ -677,6 +681,8 @@ impl Station {
                 "featured": profile.featured,
                 "stream": profile.stream,
                 "inbox": profile.inbox,
+                "kind": profile.kind,
+                "owner": profile.owner,
             }));
         }
         let remote = self.fetch_remote_profile_as(did, reader == Reader::Owner).await?;
@@ -693,6 +699,8 @@ impl Station {
             "featured": remote.get("featured"),
             "stream": remote.get("stream"),
             "inbox": remote.get("inbox"),
+            "kind": remote.get("kind"),
+            "owner": remote.get("owner"),
             "readerApproximated": approximated.then_some(true),
         })))
     }

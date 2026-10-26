@@ -1,12 +1,14 @@
 import { callRpc, type RpcCallOptions } from './rpc.ts'
+import type { AssignableUserType, ContactProjectionRule, UserType } from './user_type.ts'
 import { isMockRuntime } from '../runtime.ts'
 
 /** Agent and own-profile calls; the mock runtime answers them from an in-browser control panel. */
 async function callControlPanel<T>(
   method: string,
   params: Record<string, unknown>,
+  options: RpcCallOptions = {},
 ): Promise<{ data: T | null; error: unknown }> {
-  if (!isMockRuntime()) return callRpc<T>(method, params)
+  if (!isMockRuntime()) return callRpc<T>(method, params, options)
   const { callMockControlPanel } = await import('./control_panel_mock.ts')
   return callMockControlPanel<T>(method, params)
 }
@@ -15,8 +17,7 @@ async function callControlPanel<T>(
 // Types
 // ---------------------------------------------------------------------------
 
-/** Possible user types. Mirrors `UserType` in `buckyos-api/src/control_panel.rs`. */
-export type UserType = 'admin' | 'user' | 'root' | 'limited' | 'guest'
+export type { AssignableUserType, ContactProjectionRule, UserType }
 
 /**
  * User state as serialized by the backend. Active/Deleted are plain strings;
@@ -49,7 +50,6 @@ export interface UserTunnelBinding {
 export interface UserContactSettings {
   did?: string | null
   note?: string | null
-  groups?: string[]
   tags?: string[]
   bindings?: UserTunnelBinding[]
 }
@@ -99,7 +99,14 @@ export interface UserInfo {
   user_type: UserType | string
   state: UserStateString
   is_local?: boolean
-  allow_password_change?: boolean
+  /** Raw per-account override; null/absent means the type default. */
+  allow_password_change?: boolean | null
+  allow_contact_edit?: boolean | null
+  /** Effective values. */
+  can_change_password?: boolean
+  can_edit_contacts?: boolean
+  /** System user group ids. */
+  groups?: string[]
 }
 
 export interface UsersListResponse {
@@ -117,7 +124,12 @@ export interface UserDetail {
   is_local?: boolean
   profile?: UserProfile | Record<string, unknown> | null
   local_profile?: UserPrivateProfile | null
+  /** Effective: the account may change its own password. */
   allow_password_change?: boolean
+  /** Effective: the account may edit its own address book. */
+  allow_contact_edit?: boolean
+  /** System user group ids. */
+  groups?: string[]
   /** Optional DID document loaded from `users/{uid}/doc`. */
   did_document?: Record<string, unknown>
 }
@@ -232,7 +244,62 @@ export interface AgentSettings {
   role_supplement: string
   template_auto_update: boolean
   desktop_entry?: string | null
+  /** The Agent has a HomeStation of its own and follows / is followed by its owner and the zone's Agents. */
+  homestation?: boolean
+  /** After a user task ends, the Agent posts a privacy-free note about it to its HomeStation. */
+  auto_share_results?: boolean
   msg_tunnels: AgentMsgTunnelSummary[]
+  /** Execution runtimes beyond the Agent's container, by runtime id (`host` = the owner's desktop). */
+  runtimes?: Record<string, AgentRuntimeSetting>
+  /** The runtime new sessions start in (`container` when none is chosen). */
+  default_runtime_id?: string
+}
+
+export type ComputerAccess = 'none' | 'observe' | 'control'
+
+/** What the owner declares a runtime provides: decides which cmd_skills its sessions take. */
+export type RuntimeBaseline = 'standard' | 'extended'
+
+export interface AgentRuntimeSetting {
+  enabled: boolean
+  computer: ComputerAccess
+  target: { kind: 'node'; node_id: string; node_did: string } | { kind: 'executor'; executor_id: string }
+  baseline?: RuntimeBaseline | null
+}
+
+/** One machine the owner's Agents may run on (`agent.runtime_directory`). */
+export interface AgentRuntimeOffer {
+  runtime_id: string
+  kind: 'node' | 'executor'
+  node_id?: string
+  node_did?: string
+  device_type?: string
+  name?: string
+  computer_max: ComputerAccess
+  workdir_roots?: string[]
+  /** The policy exists but the administrator closed it. */
+  closed: boolean
+  /** `linux | windows | apple` as the node reports it. */
+  os?: string
+  /** The node no longer offers it (the Agent's setting still names it). */
+  withdrawn?: boolean
+  enabled: boolean
+  computer: ComputerAccess
+  baseline: RuntimeBaseline
+}
+
+export interface AgentRuntimeDirectory {
+  runtimes: AgentRuntimeOffer[]
+  default_runtime_id: string | null
+  container: string
+  /** A node of this zone runs Agent containers. */
+  container_available?: boolean
+  /** A new Agent runs on `host` unless the owner chooses its container
+   * (Windows / macOS hosts; on Linux the container is the default). */
+  host_by_default?: boolean
+  /** How this Agent runs its Agent Service: natively on the node of its
+   * host default runtime, or in its container. */
+  agent_service?: { mode: 'native' | 'container'; node_id?: string }
 }
 
 export interface AgentTemplateBinding {
@@ -312,10 +379,14 @@ export interface AgentCreateRequest {
   permission_mode: AgentPermissionMode
   allow_group: boolean
   allow_other_users: boolean
+  homestation?: boolean
+  auto_share_results?: boolean
   template_id: string
   template_auto_update: boolean
   desktop_entry?: AgentDesktopEntry
   msg_tunnel?: AgentMsgTunnelInput
+  runtimes?: Record<string, { enabled?: boolean; computer?: ComputerAccess } | null>
+  default_runtime_id?: string | null
 }
 
 export interface AgentCreateResponse {
@@ -332,7 +403,7 @@ export interface AgentCreateResponse {
 export const fetchUserList = async (): Promise<{
   data: UsersListResponse | null
   error: unknown
-}> => callRpc<UsersListResponse>('user.list', {})
+}> => callControlPanel<UsersListResponse>('user.list', {})
 
 /** Get a single user's detail. Defaults to the caller when `user_id` omitted. */
 export const fetchUserDetail = async (
@@ -343,13 +414,15 @@ export const fetchUserDetail = async (
   return callControlPanel<UserDetail>('user.get', params)
 }
 
-/** Create a new user. Admin-only. */
+/** Create a new user (User or Limited). Admin-only. */
 export const createUser = async (input: {
   userId: string
   passwordHash: string
   showName?: string
-  userType?: Exclude<UserType, 'root'>
+  userType?: Exclude<AssignableUserType, 'admin'>
+  groups?: string[]
   allowPasswordChange?: boolean
+  allowContactEdit?: boolean
 }, options: RpcCallOptions = {}): Promise<{
   data: UserCreateResponse | null
   error: unknown
@@ -360,8 +433,12 @@ export const createUser = async (input: {
   }
   if (input.showName !== undefined) params.show_name = input.showName
   if (input.userType !== undefined) params.user_type = input.userType
+  if (input.groups !== undefined) params.groups = input.groups
   if (input.allowPasswordChange !== undefined) {
     params.allow_password_change = input.allowPasswordChange
+  }
+  if (input.allowContactEdit !== undefined) {
+    params.allow_contact_edit = input.allowContactEdit
   }
   return callRpc<UserCreateResponse>('user.create', params, options)
 }
@@ -386,7 +463,6 @@ export const updateUserContact = async (input: {
   userId?: string
   did?: string
   note?: string
-  groups?: string[]
   tags?: string[]
   bindings?: UserTunnelBinding[]
 }): Promise<{
@@ -397,7 +473,6 @@ export const updateUserContact = async (input: {
   if (input.userId) params.user_id = input.userId
   if (input.did !== undefined) params.did = input.did
   if (input.note !== undefined) params.note = input.note
-  if (input.groups !== undefined) params.groups = input.groups
   if (input.tags !== undefined) params.tags = input.tags
   if (input.bindings !== undefined) params.bindings = input.bindings
   return callRpc<SimpleOkResponse & { contact?: UserContactSettings }>(
@@ -524,9 +599,10 @@ export const createUserInvite = async (input: {
   userId?: string
   targetDid?: string
   showName?: string
-  userType?: Exclude<UserType, 'root'>
+  userType?: AssignableUserType
   expiresAt?: number
   ttlSecs?: number
+  /** System user group ids. */
   groups?: string[]
 }): Promise<{ data: UserInviteResponse | null; error: unknown }> => {
   const params: Record<string, unknown> = {}
@@ -544,7 +620,7 @@ export const createUserInvite = async (input: {
 export const fetchUserInvite = async (
   inviteId: string,
 ): Promise<{ data: UserInviteResponse | null; error: unknown }> =>
-  callRpc<UserInviteResponse>('user.invite.get', { invite_id: inviteId })
+  callControlPanel<UserInviteResponse>('user.invite.get', { invite_id: inviteId }, { sessionToken: null })
 
 export const acceptUserInvite = async (input: {
   inviteId: string
@@ -556,7 +632,7 @@ export const acceptUserInvite = async (input: {
     owner_config: input.ownerConfig,
   }
   if (input.passwordHash !== undefined) params.password_hash = input.passwordHash
-  return callRpc<UserInviteResponse>('user.invite.accept', params)
+  return callControlPanel<UserInviteResponse>('user.invite.accept', params)
 }
 
 /** Soft-delete a user (state → `deleted`). Admin-only; cannot delete root or self. */
@@ -587,15 +663,120 @@ export const changeUserState = async (input: {
     state: input.state,
   })
 
-/** Change a user's type. Admin-only; cannot promote to root or change root's type. */
+/** Change a user's type between Admin, User and Limited. Admin-only; the owner record cannot change. */
 export const changeUserType = async (input: {
   userId: string
-  userType: Exclude<UserType, 'root'>
+  userType: AssignableUserType
 }): Promise<{ data: SimpleOkResponse | null; error: unknown }> =>
-  callRpc<SimpleOkResponse>('user.change_type', {
+  callControlPanel<SimpleOkResponse>('user.change_type', {
     user_id: input.userId,
     user_type: input.userType,
   })
+
+export interface UserAccountOptionsResponse extends SimpleOkResponse {
+  user_id: string
+  allow_password_change: boolean
+  allow_contact_edit: boolean
+}
+
+/** Per-account overrides; `null` restores the account type's default. Admin-only. */
+export const setUserAccountOptions = async (input: {
+  userId: string
+  allowPasswordChange?: boolean | null
+  allowContactEdit?: boolean | null
+}): Promise<{ data: UserAccountOptionsResponse | null; error: unknown }> => {
+  const params: Record<string, unknown> = { user_id: input.userId }
+  if (input.allowPasswordChange !== undefined) params.allow_password_change = input.allowPasswordChange
+  if (input.allowContactEdit !== undefined) params.allow_contact_edit = input.allowContactEdit
+  return callControlPanel<UserAccountOptionsResponse>('user.set_account_options', params)
+}
+
+// ---------------------------------------------------------------------------
+// System user groups and contact projection (admin-only)
+// ---------------------------------------------------------------------------
+
+export interface UserGroup {
+  group_id: string
+  name: string
+  description?: string | null
+  updated_by: string
+  created_at: number
+  updated_at: number
+}
+
+export interface UserGroupListItem extends UserGroup {
+  members: string[]
+}
+
+export interface ContactProjections {
+  rules: ContactProjectionRule[]
+  /** No rules were saved; the Zone uses the default rules. */
+  is_default: boolean
+  updated_by?: string
+  updated_at?: number
+}
+
+export interface UserGroupListResponse {
+  groups: UserGroupListItem[]
+  projections: ContactProjections
+}
+
+export const fetchUserGroups = async (): Promise<{ data: UserGroupListResponse | null; error: unknown }> =>
+  callControlPanel<UserGroupListResponse>('user_group.list', {})
+
+export const createUserGroup = async (input: {
+  groupId: string
+  name: string
+  description?: string
+}): Promise<{ data: { ok: boolean; group: UserGroup } | null; error: unknown }> => {
+  const params: Record<string, unknown> = { group_id: input.groupId, name: input.name }
+  if (input.description !== undefined) params.description = input.description
+  return callControlPanel<{ ok: boolean; group: UserGroup }>('user_group.create', params)
+}
+
+export const updateUserGroup = async (input: {
+  groupId: string
+  name?: string
+  description?: string
+}): Promise<{ data: { ok: boolean; group: UserGroup } | null; error: unknown }> => {
+  const params: Record<string, unknown> = { group_id: input.groupId }
+  if (input.name !== undefined) params.name = input.name
+  if (input.description !== undefined) params.description = input.description
+  return callControlPanel<{ ok: boolean; group: UserGroup }>('user_group.update', params)
+}
+
+export interface UserGroupDeleteResponse {
+  ok: boolean
+  group_id: string
+  removed_members: number
+  removed_rules: number
+}
+
+export const deleteUserGroup = async (
+  groupId: string,
+): Promise<{ data: UserGroupDeleteResponse | null; error: unknown }> =>
+  callControlPanel<UserGroupDeleteResponse>('user_group.delete', { group_id: groupId })
+
+export const setUserGroupMembers = async (input: {
+  groupId: string
+  add?: string[]
+  remove?: string[]
+}): Promise<{ data: { ok: boolean; group_id: string; members: string[] } | null; error: unknown }> => {
+  const params: Record<string, unknown> = { group_id: input.groupId }
+  if (input.add !== undefined) params.add = input.add
+  if (input.remove !== undefined) params.remove = input.remove
+  return callControlPanel<{ ok: boolean; group_id: string; members: string[] }>('user_group.set_members', params)
+}
+
+export const setContactProjections = async (
+  rules: ContactProjectionRule[],
+): Promise<{ data: { ok: boolean; projections: ContactProjections } | null; error: unknown }> =>
+  callControlPanel<{ ok: boolean; projections: ContactProjections }>('user_group.set_projections', { rules })
+
+export const resetContactProjections = async (): Promise<{
+  data: { ok: boolean; projections: ContactProjections } | null
+  error: unknown
+}> => callControlPanel<{ ok: boolean; projections: ContactProjections }>('user_group.reset_projections', {})
 
 // ---------------------------------------------------------------------------
 // Agent management RPC
@@ -650,12 +831,28 @@ export const fetchAgentDetail = async (
 
 export const updateAgent = async (input: {
   agentId: string
-  allowGroup: boolean
-}): Promise<{ data: AgentEntry | null; error: unknown }> =>
-  callControlPanel<AgentEntry>('agent.update', {
-    agent_id: input.agentId,
-    allow_group: input.allowGroup,
-  })
+  allowGroup?: boolean
+  homestation?: boolean
+  autoShareResults?: boolean
+  /** `{ "<id>": { enabled?, computer?, baseline? } | null }`; targets come from the directory, never from here. */
+  runtimes?: Record<string, { enabled?: boolean; computer?: ComputerAccess; baseline?: RuntimeBaseline | null } | null>
+  /** `null` or `'container'`: the Agent's own environment. */
+  defaultRuntimeId?: string | null
+}): Promise<{ data: AgentEntry | null; error: unknown }> => {
+  const params: Record<string, unknown> = { agent_id: input.agentId }
+  if (input.allowGroup !== undefined) params.allow_group = input.allowGroup
+  if (input.homestation !== undefined) params.homestation = input.homestation
+  if (input.autoShareResults !== undefined) params.auto_share_results = input.autoShareResults
+  if (input.runtimes !== undefined) params.runtimes = input.runtimes
+  if (input.defaultRuntimeId !== undefined) params.default_runtime_id = input.defaultRuntimeId
+  return callControlPanel<AgentEntry>('agent.update', params)
+}
+
+/** The machines the caller's Agents may run on; with `agentId`, that Agent's choice too. */
+export const fetchAgentRuntimeDirectory = async (
+  agentId?: string,
+): Promise<{ data: AgentRuntimeDirectory | null; error: unknown }> =>
+  callControlPanel<AgentRuntimeDirectory>('agent.runtime_directory', agentId ? { agent_id: agentId } : {})
 
 export const fetchAgentProfile = async (
   agentId: string,

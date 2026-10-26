@@ -3,7 +3,7 @@ use crate::provider::{ProviderDraftValidationStage, ProviderRefreshFailure};
 use crate::routing::policy::PolicyScope;
 use crate::routing::{FilterReasonTrace, FilteredCandidateTrace};
 use crate::settings::MetadataSource;
-use buckyos_api::{AiccError, AiccErrorCode};
+use buckyos_api::{AiUsage, AiccError, AiccErrorCode};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
@@ -46,6 +46,8 @@ pub(crate) enum CallLoweringError {
         execution_mode: String,
     },
     InvalidRule(String),
+    /// The request cannot be planned for the selected video model.
+    Video(buckyos_api::AiccError),
 }
 
 #[derive(Debug)]
@@ -241,7 +243,6 @@ pub(crate) enum PolicyError {
         attempted_by: PolicyScope,
     },
     InvalidPolicy(String),
-    QuotaSourceUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,7 +279,7 @@ pub(crate) fn protocol_error_kind_from_http_status(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProtocolError {
     pub kind: ProtocolErrorKind,
     pub message: String,
@@ -286,6 +287,10 @@ pub(crate) struct ProtocolError {
     pub http_status: Option<u16>,
     pub request_id: Option<String>,
     pub retry_after: Option<Duration>,
+    /// Usage the Provider reported before the attempt failed. A failed attempt
+    /// that already consumed tokens, seconds, or money must still be settled
+    /// and billed, so the error carries whatever the Provider told us.
+    pub usage: Option<AiUsage>,
 }
 
 pub(crate) type ProtocolResultValue<T> = Result<T, ProtocolError>;
@@ -327,6 +332,7 @@ pub(crate) type ProviderResult<T> = Result<T, ProviderError>;
 pub(crate) struct ProviderDraftValidationError {
     pub stage: ProviderDraftValidationStage,
     pub kind: ProviderRefreshFailure,
+    pub message: String,
 }
 
 #[derive(Clone, Error, PartialEq, Eq)]
@@ -436,6 +442,8 @@ pub(crate) enum StorageError {
     Database(#[from] sqlx::Error),
     #[error("invalid storage record: {0}")]
     InvalidRecord(String),
+    #[error("unsupported AICC storage schema: {0}")]
+    UnsupportedSchema(String),
     #[error("invalid cursor")]
     InvalidCursor,
     #[error("json error: {0}")]
@@ -468,7 +476,13 @@ impl ProtocolError {
             http_status: None,
             request_id: None,
             retry_after: None,
+            usage: None,
         }
+    }
+
+    pub(crate) fn with_usage(mut self, usage: Option<AiUsage>) -> Self {
+        self.usage = usage;
+        self
     }
 
     pub(crate) fn with_request_id(mut self, request_id: Option<String>) -> Self {

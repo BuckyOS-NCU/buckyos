@@ -3,7 +3,8 @@ use crate::app_loader::{
     container_list_contains_name, docker_deployment_health, docker_desc_requires_exact_match,
     docker_image_tar_candidates_for_arch, docker_missing_text, docker_runtime_matches_deployment,
     docker_runtime_matches_target, inspect_docker_image_layout, normalize_digest,
-    parse_docker_container_inspect, AppLoader, CommandSpec, ControlOperation, DockerCommandRunner,
+    parse_docker_container_inspect, validate_app_launch_config, AppLoader, CommandSpec,
+    ControlOperation, DockerCommandRunner,
     DockerExecOutcome, DockerRuntimeIdentity, PlatformArch, PlatformOs, PlatformTarget,
     RuntimeType, DOCKER_LABEL_APP_DOC_OBJECT_ID, DOCKER_LABEL_IMAGE_DIGEST, DOCKER_LABEL_PKG_ID,
     DOCKER_LABEL_PKG_OBJID, DOCKER_LABEL_SPEC_GENERATION,
@@ -79,6 +80,208 @@ fn build_agent_doc_without_category() -> AppDoc {
     .service_port("main", 4060)
     .build()
     .unwrap()
+}
+
+#[test]
+fn container_system_config_mount_is_read_only_and_scoped() {
+    if std::env::var_os("BUCKYOS_SYSTEM_CONFIG_MOUNT_TEST_CHILD").is_none() {
+        let root = tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "test_app_loader::container_system_config_mount_is_read_only_and_scoped",
+                "--nocapture",
+            ])
+            .env("BUCKYOS_ROOT", root.path())
+            .env("BUCKYOS_SYSTEM_CONFIG_MOUNT_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    let root = buckyos_kit::get_buckyos_root_dir();
+    let canonical_root = fs::canonicalize(&root).unwrap();
+    let etc = root.join("etc");
+    let pkg = root.join("test-package");
+    fs::create_dir_all(&etc).unwrap();
+    fs::create_dir_all(&pkg).unwrap();
+    fs::create_dir_all(root.join("security")).unwrap();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::write(root.join("security/start_config.json"), "private-start-config").unwrap();
+    fs::write(etc.join("node_identity.json"), "host-node-identity").unwrap();
+    fs::write(root.join("security/device.key"), "private-device-key").unwrap();
+    fs::write(root.join("bin/host-runtime"), "host-platform-binary").unwrap();
+    let machine = etc.join("machine.json");
+    let target = "/opt/buckyos/etc";
+    let platform = PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64);
+    let docker = build_service_loader(build_appservice_doc(), HashMap::new(), platform, true);
+    let agent = build_agent_loader(platform);
+    let script = AppLoader::new_for_local(
+        "desktop-tool",
+        LocalAppInstanceConfig {
+            target_state: ServiceInstanceState::Started,
+            enable: true,
+            app_doc: build_local_service_doc(),
+            user_id: "alice".to_string(),
+            install_config: ServiceSpecConfig::default(),
+        },
+    )
+    .with_platform(platform)
+    .with_container_support_override(false)
+    .with_worker_image_repo_override("paios/aios")
+    .with_paios_images_root(local_paios_root());
+    let loaders = [
+        (RuntimeType::Docker, docker),
+        (RuntimeType::Agent, agent),
+        (RuntimeType::HostScript, script),
+    ];
+
+    for present in [false, true] {
+        if present {
+            fs::write(
+                &machine,
+                r#"{"web3_bridge":{"bns":"bridge.example.org"},"force_https":true}"#,
+            )
+            .unwrap();
+        }
+        for (runtime, loader) in &loaders {
+            let mounts = match runtime {
+                RuntimeType::Docker => loader.test_docker_volume_mounts(),
+                RuntimeType::Agent => loader.test_worker_volume_mounts(&pkg, true),
+                RuntimeType::HostScript => loader.test_worker_volume_mounts(&pkg, false),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            let config_mounts = mounts
+                .iter()
+                .filter(|(container_path, _, _)| container_path == target)
+                .collect::<Vec<_>>();
+            assert_eq!(config_mounts.len(), 1, "{runtime:?}");
+            assert_eq!(
+                fs::canonicalize(&config_mounts[0].1).unwrap(),
+                fs::canonicalize(&etc).unwrap(),
+                "{runtime:?}"
+            );
+            assert_eq!(config_mounts[0].2, "ro", "{runtime:?}");
+            for (container_path, host_path, _) in &mounts {
+                let canonical_host_path = fs::canonicalize(host_path).unwrap();
+                if canonical_host_path.starts_with(canonical_root.join("etc")) {
+                    assert_eq!(
+                        canonical_host_path,
+                        fs::canonicalize(&etc).unwrap(),
+                        "{runtime:?}: {host_path:?}"
+                    );
+                }
+                assert!(
+                    !canonical_host_path.starts_with(canonical_root.join("security")),
+                    "{runtime:?}"
+                );
+                assert!(
+                    !canonical_host_path.starts_with(canonical_root.join("bin")),
+                    "{runtime:?}"
+                );
+                if Path::new(container_path).starts_with("/opt/buckyos/etc") {
+                    assert_eq!(container_path, target, "{runtime:?}");
+                }
+                assert_ne!(container_path, "/opt/buckyos", "{runtime:?}");
+                assert!(
+                    !Path::new(container_path).starts_with("/opt/buckyos/security"),
+                    "{runtime:?}"
+                );
+                assert!(
+                    !Path::new(container_path).starts_with("/opt/buckyos/bin"),
+                    "{runtime:?}"
+                );
+            }
+            if present {
+                if let Ok(image) = std::env::var("BUCKYOS_MACHINE_CONFIG_DOCKER_IMAGE") {
+                    let mut command = std::process::Command::new("docker");
+                    command.args([
+                        "run", "--rm", "--network", "none", "--user", "0", "--cap-drop",
+                        "ALL", "--security-opt", "no-new-privileges", "--entrypoint", "sh",
+                    ]);
+                    for (container_path, host_path, access) in &mounts {
+                        command.args([
+                            "-v",
+                            &format!("{}:{container_path}:{access}", host_path.display()),
+                        ]);
+                    }
+                    let script = r#"set -eu
+test "$(cat /opt/buckyos/etc/machine.json)" = '{"web3_bridge":{"bns":"bridge.example.org"},"force_https":true}'
+if (printf changed >> /opt/buckyos/etc/machine.json) 2>/dev/null; then exit 23; fi
+test ! -e /opt/buckyos/etc/start_config.json
+test "$(cat /opt/buckyos/etc/node_identity.json)" = 'host-node-identity'
+if (touch /opt/buckyos/etc/new-config.json) 2>/dev/null; then exit 24; fi
+test ! -e /opt/buckyos/security/start_config.json
+test ! -e /opt/buckyos/security/device.key
+test ! -e /opt/buckyos/bin/host-runtime
+"#;
+                    let output = command.args([&image, "-c", script]).output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{runtime:?}: {}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+
+            let preview = loader.preview_operation(ControlOperation::Start).unwrap();
+            assert_eq!(&preview.runtime, runtime);
+            let preview_etc = if cfg!(target_os = "windows") {
+                etc.clone()
+            } else {
+                canonical_root.join("etc")
+            };
+            let config_mount = format!("{}:{target}:ro", preview_etc.display());
+            let preview_mounts = preview.commands[1]
+                .args
+                .windows(2)
+                .filter(|pair| pair[0] == "-v")
+                .map(|pair| pair[1].as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                preview_mounts.contains(&config_mount.as_str()),
+                "{runtime:?}"
+            );
+            for mount in preview_mounts {
+                for forbidden in [
+                    "start_config.json",
+                    ":/opt/buckyos/security",
+                    ":/opt/buckyos/bin",
+                ] {
+                    assert!(!mount.contains(forbidden), "{runtime:?}: {mount}");
+                }
+            }
+        }
+        assert_eq!(machine.is_file(), present);
+        assert!(!machine.is_dir());
+        if !present {
+            assert!(!machine.exists());
+        }
+    }
+    fs::create_dir_all(etc.join("scheduler")).unwrap();
+    for name in ["start_config.json", "ca_key.pem", "scheduler/boot.template.toml"] {
+        let misplaced = etc.join(name);
+        fs::write(&misplaced, "-----BEGIN PRIVATE KEY-----").unwrap();
+        for (runtime, loader) in &loaders {
+            let result = match runtime {
+                RuntimeType::Docker => loader.test_docker_volume_mounts(),
+                RuntimeType::Agent => loader.test_worker_volume_mounts(&pkg, true),
+                RuntimeType::HostScript => loader.test_worker_volume_mounts(&pkg, false),
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{runtime:?}: {name}");
+        }
+        fs::remove_file(misplaced).unwrap();
+    }
 }
 
 #[test]
@@ -431,6 +634,64 @@ fn build_spec_config(app_doc: &AppDoc) -> ServiceSpecConfig {
         );
     }
     install_config
+}
+
+#[test]
+fn app_launch_requires_current_authorized_identity_and_deployment() {
+    let doc = build_agent_doc_without_category();
+    let spec = build_test_app_spec(doc.clone(), build_spec_config(&doc));
+    let config = AppServiceInstanceConfig::new("ood1", &spec).unwrap();
+    assert!(validate_app_launch_config(&config, &spec, "ood1").is_ok());
+    assert!(validate_app_launch_config(&config, &spec, "other-node").is_err());
+    let mut stopped = config.clone();
+    stopped.target_state = ServiceInstanceState::Stopped;
+    assert!(validate_app_launch_config(&stopped, &spec, "ood1").is_err());
+    let mut updated = spec.clone();
+    updated.deployment.spec_generation += 1;
+    assert!(validate_app_launch_config(&config, &updated, "ood1").is_err());
+    let mut revoked_grant = spec.clone();
+    revoked_grant.permission.push(PermissionItem {
+        scope_path: APP_PERMISSION_USER_HOME.into(),
+        required: true,
+        actions: vec!["read".into()],
+        exp: None,
+    });
+    assert!(validate_app_launch_config(&config, &revoked_grant, "ood1").is_err());
+    let mut other = config.clone();
+    other.node_execution_spec.app_instance_id =
+        AppInstanceId::new(spec.app_id().clone(), "bob").unwrap();
+    assert!(validate_app_launch_config(&other, &spec, "ood1").is_err());
+}
+
+#[test]
+fn agent_recreation_keeps_instance_storage_and_requests_new_startup_credentials() {
+    let doc = build_agent_doc_without_category();
+    let spec = build_test_app_spec(doc.clone(), build_spec_config(&doc));
+    let instance_id = spec.app_instance_id.to_string();
+    let config = AppServiceInstanceConfig::new("ood1", &spec).unwrap();
+    let loader = || {
+        AppLoader::new_for_service(&instance_id, config.clone())
+            .with_platform(PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64))
+            .with_container_support_override(true)
+            .with_paios_images_root(local_paios_root())
+            .with_worker_image_repo_override("paios/aios")
+    };
+    let before = loader().preview_operation(ControlOperation::Start).unwrap();
+    let after = loader().preview_operation(ControlOperation::Start).unwrap();
+    assert_eq!(before.commands[0].args, after.commands[0].args);
+    assert_eq!(&after.commands[0].args[..2], &["rm", "-f"]);
+    assert!(!after.commands[0].args.iter().any(|arg| arg == "-v"));
+    let mounts = |command: &CommandSpec| {
+        command.args.windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(mounts(&before.commands[1]), mounts(&after.commands[1]));
+    assert!(mounts(&after.commands[1]).iter()
+        .any(|mount| mount.contains(":/opt/buckyos/instance:rw")));
+    assert!(after.commands[1].args.iter()
+        .any(|arg| arg == "BUCKYOS_APP_TOKEN=<value>"));
 }
 
 fn build_agent_loader(platform: PlatformTarget) -> AppLoader {
@@ -1947,4 +2208,67 @@ async fn deployment_observation_does_not_cache_missing_digest_metadata() {
         ServiceInstanceState::Started
     );
     assert_eq!(fixture.lock().unwrap().commands.len(), 5);
+}
+
+fn build_native_agent_loader(support_container: bool, state_root: &Path, program: &Path) -> AppLoader {
+    let app_doc = build_agent_doc_without_category();
+    let install_config = build_spec_config(&app_doc);
+    let app_spec = build_test_app_spec(app_doc, install_config);
+    let app_instance_id = app_spec.app_instance_id.to_string();
+    let mut config = AppServiceInstanceConfig::new("ood1", &app_spec).unwrap();
+    config.service_ports_config =
+        HashMap::from([("www".to_string(), 10080), ("main".to_string(), 14060)]);
+    config.run_mode = buckyos_api::AppRunMode::Native;
+    AppLoader::new_for_service(&app_instance_id, config)
+        .with_platform(PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64))
+        .with_container_support_override(support_container)
+        .with_paios_images_root(local_paios_root())
+        .with_native_agent(program, state_root)
+}
+
+/// A natively run Agent (the zone owner's Agent on its host-native
+/// runtime) needs no worker image and no container support: deploy only
+/// installs its packages, start runs the node's own OpenDAN.
+#[test]
+fn a_native_agent_runs_the_nodes_opendan_without_containers() {
+    let state = tempdir().unwrap();
+    for support_container in [true, false] {
+        let loader = build_native_agent_loader(support_container, state.path(), Path::new("/opt/buckyos/bin/opendan/opendan"));
+        let deploy = loader.preview_operation(ControlOperation::Deploy).unwrap();
+        assert_eq!(deploy.runtime, RuntimeType::NativeAgent);
+        assert!(deploy.commands.iter().all(|c| c.program == "pkg-install"), "{:?}", deploy.commands);
+        assert!(!deploy.commands.is_empty());
+        let start = loader.preview_operation(ControlOperation::Start).unwrap();
+        assert_eq!(start.runtime, RuntimeType::NativeAgent);
+        assert_eq!(start.commands.len(), 1);
+        assert_eq!(start.commands[0].program, "/opt/buckyos/bin/opendan/opendan");
+        let args = &start.commands[0].args;
+        assert_eq!(args[0], "--appid");
+        assert!(args.windows(2).any(|w| w[0] == "--service-port" && w[1] == "14060"), "{args:?}");
+        assert!(!start.commands.iter().any(|c| c.program == "docker"));
+    }
+}
+
+/// The native process is found again from its record (also by a new
+/// node_daemon), and stopping it ends the process and forgets it.
+#[tokio::test]
+async fn a_native_agent_process_is_recorded_found_and_stopped() {
+    let state = tempdir().unwrap();
+    let loader = build_native_agent_loader(false, state.path(), Path::new("/bin/sleep"));
+    assert_eq!(loader.test_running_native_agent_pid(), None);
+    loader.test_spawn_native_agent(&["30".to_string()], state.path()).unwrap();
+    let pid = loader.test_running_native_agent_pid().expect("the recorded process runs");
+    let again = build_native_agent_loader(false, state.path(), Path::new("/bin/sleep"));
+    assert_eq!(again.test_running_native_agent_pid(), Some(pid), "found from the record");
+    again.test_stop_native_agent().await.unwrap();
+    for _ in 0..50 {
+        crate::service_pkg::reap_detached_children();
+        if crate::service_pkg::read_process_identity(pid).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(crate::service_pkg::read_process_identity(pid).is_none(), "the process ended");
+    assert_eq!(loader.test_running_native_agent_pid(), None);
+    assert!(fs::read_dir(state.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".json")));
 }

@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
-use tokio::process::Command;
 
 use agent_did_object_lib::{
     AgentDIDObjectRuntime, ObjectRouteConfig, ReadInput as ObjectReadInput, ReadLineRange,
@@ -369,8 +368,6 @@ enum AgentMemoryVerb {
         repair: bool,
     },
     Compact,
-    /// Explicit schema migration (2.10 → 3.0).
-    Migrate,
 }
 
 /// Run the `agent_tool` command line and exit with its status: the
@@ -553,21 +550,17 @@ async fn execute(
             recursive,
         } => {
             let task_mgr = build_task_manager_client(&env).await?;
-            let before = task_mgr.get_task(&task_id).await.map_err(|err| {
-                AgentToolError::ExecFailed(format!("get task `{task_id}` failed: {err}"))
-            })?;
             task_mgr
                 .cancel_task(&task_id, recursive)
                 .await
                 .map_err(|err| {
                     AgentToolError::ExecFailed(format!("cancel task `{task_id}` failed: {err}"))
                 })?;
-            let interrupt_error = interrupt_task_if_supported(&before).await;
             let after = task_mgr.get_task(&task_id).await.map_err(|err| {
                 AgentToolError::ExecFailed(format!("reload task `{task_id}` failed: {err}"))
             })?;
             Ok(render_cli_output(
-                &build_cancel_task_result(&tool_name, after, recursive, interrupt_error),
+                &build_cancel_task_result(&tool_name, after, recursive),
                 EXIT_SUCCESS,
             ))
         }
@@ -1344,7 +1337,7 @@ fn parse_task_id_value(raw: &str, tool_name: &str) -> Result<String, AgentToolEr
 // =================================================================
 
 const AGENT_MEMORY_USAGE: &str = "agent-memory [--root <path>] [--quiet] \
-<init|occasion|object|observe|relate|set-status|set|remove|get|list|load|verify|compact|migrate> [...]";
+<init|occasion|object|observe|relate|set-status|set|remove|get|list|load|verify|compact> [...]";
 
 fn agent_memory_invalid(message: impl Into<String>) -> AgentToolError {
     AgentToolError::InvalidArgs(format!("{}\nUsage: {}", message.into(), AGENT_MEMORY_USAGE))
@@ -1405,7 +1398,6 @@ fn parse_agent_memory_cli_command(
         "load" => parse_agent_memory_load(rest)?,
         "verify" => parse_agent_memory_verify(rest)?,
         "compact" => parse_agent_memory_compact(rest)?,
-        "migrate" if rest.is_empty() => AgentMemoryVerb::Migrate,
         other => {
             return Err(agent_memory_invalid(format!("unknown verb `{other}`")));
         }
@@ -2313,6 +2305,18 @@ async fn dispatch_agent_memory(
 
     let root = resolve_agent_memory_root(env, root_override);
 
+    // Cognitions change only through the memory_maintenance Goal's
+    // consolidation (its host tools, under the consolidation lease). The CLI
+    // writes are administrative: refused inside a Session shell.
+    if agent_memory_verb_writes(&verb) && !env.allow_dev_overrides() {
+        return agent_memory_error_output(
+            AgentMemoryError::ReadOnly(
+                "agent-memory writes are administrative and refused inside a session: cognitions change only through the memory_maintenance goal's consolidation (perceive with `agent-session ctl perceive`)".to_string(),
+            ),
+            quiet,
+        );
+    }
+
     // `set` form B reads content from stdin BEFORE spawn_blocking so we can
     // surface the same async stdin path as the rest of the CLI.
     let resolved_verb = match verb {
@@ -2397,22 +2401,23 @@ async fn read_stdin_content(stdin_override: Option<String>) -> Result<String, Ag
 /// Synchronous worker: opens the memory root and dispatches a single verb.
 /// The returned `String` is the verb's stdout body per §5 (or empty for
 /// verbs with no stdout output).
+/// Verbs that change the Graph or its root.
+fn agent_memory_verb_writes(verb: &AgentMemoryVerb) -> bool {
+    !matches!(
+        verb,
+        AgentMemoryVerb::Get { .. }
+            | AgentMemoryVerb::List { .. }
+            | AgentMemoryVerb::ListObjects { .. }
+            | AgentMemoryVerb::Load { .. }
+            | AgentMemoryVerb::Verify { repair: false }
+    )
+}
+
 fn run_agent_memory_blocking(
     root: &Path,
     verb: AgentMemoryVerb,
 ) -> Result<String, AgentMemoryError> {
     let cfg = AgentMemoryConfig::new(root);
-    if let AgentMemoryVerb::Migrate = verb {
-        let r = AgentMemory::migrate(cfg)?;
-        let mut out = format!("FROM {}\nTO {}\nOCCASIONS {}\n", r.from, r.to, r.occasions);
-        for n in &r.notes {
-            out.push_str(&format!("NOTE {n}\n"));
-        }
-        if !r.legacy_dir.is_empty() {
-            out.push_str(&format!("LEGACY {}\n", r.legacy_dir));
-        }
-        return Ok(out);
-    }
     let mem = AgentMemory::open(cfg)?;
     match verb {
         AgentMemoryVerb::Init => Ok(String::new()),
@@ -2538,7 +2543,6 @@ fn run_agent_memory_blocking(
             mem.compact()?;
             Ok(String::new())
         }
-        AgentMemoryVerb::Migrate => unreachable!("handled before open"),
     }
 }
 
@@ -4898,21 +4902,14 @@ fn build_cancel_task_result(
     tool_name: &str,
     task: Task,
     recursive: bool,
-    interrupt_error: Option<String>,
 ) -> AgentToolResult {
     let mut detail = normalized_task_detail(&task);
     if let Some(map) = detail.as_object_mut() {
         map.insert("task".to_string(), json!(task.clone()));
         map.insert("recursive".to_string(), Json::Bool(recursive));
-        if let Some(err) = interrupt_error.as_ref() {
-            map.insert("interrupt_error".to_string(), Json::String(err.clone()));
-        }
     }
 
-    let summary = match interrupt_error {
-        Some(err) => format!("canceled task {} (interrupt failed: {err})", task.task_id),
-        None => format!("canceled task {}", task.task_id),
-    };
+    let summary = format!("canceled task {}", task.task_id);
 
     AgentToolResult::from_details(detail)
         .with_status(AgentToolStatus::Success)
@@ -5059,33 +5056,6 @@ fn task_pending_reason(task: &Task) -> Option<AgentToolPendingReason> {
             }
             TaskPhase::Terminal => None,
         })
-}
-
-async fn interrupt_task_if_supported(task: &Task) -> Option<String> {
-    let tmux_target = tool_shell_task_data(task)?.tmux_target?;
-    let tmux_target = tmux_target.trim();
-    if tmux_target.is_empty() {
-        return None;
-    }
-
-    let output = match Command::new("tmux")
-        .args(["send-keys", "-t", tmux_target, "C-c"])
-        .output()
-        .await
-    {
-        Ok(output) => output,
-        Err(err) => return Some(format!("tmux interrupt `{tmux_target}` failed: {err}")),
-    };
-    if output.status.success() {
-        return None;
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Some(if stderr.is_empty() {
-        format!("tmux interrupt `{tmux_target}` failed")
-    } else {
-        format!("tmux interrupt `{tmux_target}` failed: {stderr}")
-    })
 }
 
 fn tool_shell_task_data(task: &Task) -> Option<ToolShellTaskData> {
@@ -5709,7 +5679,7 @@ methods = ["x_call"]
         let root = temp.path().join("agent");
         let output = execute(
             vec![OsString::from(MAIN_BINARY_NAME), OsString::from("--help")],
-            test_env(root.clone(), root),
+            dev_test_env(root.clone(), root),
             None,
         )
         .await
@@ -5742,18 +5712,47 @@ methods = ["x_call"]
                 OsString::from("--reason"),
                 OsString::from("user conversation;c=1"),
             ],
-            test_env(root.clone(), cwd.clone()),
+            dev_test_env(root.clone(), cwd.clone()),
             None,
         )
         .await
         .expect("run agent-memory set");
         assert_eq!(set_output.exit_code, EXIT_SUCCESS);
 
-        let item_dir = root.join("memory").join("item");
+        let item_dir = cwd.join(".opendan-cli").join("memory").join("item");
         assert!(
             fs::metadata(&item_dir).await.is_ok(),
             "free hints are materialized as canonical item JSON files"
         );
+        // Inside a session shell the same write is refused: cognitions change
+        // only through the consolidation of the memory_maintenance goal.
+        let refused = execute(
+            vec![
+                OsString::from("/tmp/agent-memory"),
+                OsString::from("set"),
+                OsString::from("/user/preference/other"),
+                OsString::from("verbose"),
+                OsString::from("--reason"),
+                OsString::from("user conversation;c=2"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("run agent-memory set in a session");
+        assert_ne!(refused.exit_code, EXIT_SUCCESS);
+        assert!(refused.stderr.contains("administrative"), "{}", refused.stderr);
+        let readable = execute(
+            vec![
+                OsString::from("/tmp/agent-memory"),
+                OsString::from("list"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("run agent-memory list in a session");
+        assert_eq!(readable.exit_code, EXIT_SUCCESS);
 
         // get echoes content directly (no envelope, per §4.5)
         let get_output = execute(
@@ -5762,7 +5761,7 @@ methods = ["x_call"]
                 OsString::from("get"),
                 OsString::from("/user/preference/style"),
             ],
-            test_env(root.clone(), cwd.clone()),
+            dev_test_env(root.clone(), cwd.clone()),
             None,
         )
         .await
@@ -5779,7 +5778,7 @@ methods = ["x_call"]
                 OsString::from("--reason"),
                 OsString::from("user removed"),
             ],
-            test_env(root.clone(), cwd.clone()),
+            dev_test_env(root.clone(), cwd.clone()),
             None,
         )
         .await
@@ -5793,7 +5792,7 @@ methods = ["x_call"]
                 OsString::from("get"),
                 OsString::from("/user/preference/style"),
             ],
-            test_env(root.clone(), cwd),
+            dev_test_env(root.clone(), cwd),
             None,
         )
         .await
@@ -5819,7 +5818,7 @@ methods = ["x_call"]
                 OsString::from("--reason"),
                 OsString::from("user conversation;c=1"),
             ],
-            test_env(root.clone(), cwd),
+            dev_test_env(root.clone(), cwd),
             Some(body.to_string()),
         )
         .await
@@ -5832,7 +5831,7 @@ methods = ["x_call"]
                 OsString::from("get"),
                 OsString::from("/user/note"),
             ],
-            test_env(root.clone(), root.join("workspace")),
+            dev_test_env(root.clone(), root.join("workspace")),
             None,
         )
         .await
@@ -5859,7 +5858,7 @@ methods = ["x_call"]
                 OsString::from("--reason"),
                 OsString::from("user conversation;c=1"),
             ],
-            test_env(root.clone(), cwd.clone()),
+            dev_test_env(root.clone(), cwd.clone()),
             None,
         )
         .await
@@ -5871,7 +5870,7 @@ methods = ["x_call"]
                 OsString::from("load"),
                 OsString::from("dental"),
             ],
-            test_env(root.clone(), cwd),
+            dev_test_env(root.clone(), cwd),
             None,
         )
         .await
@@ -5882,30 +5881,6 @@ methods = ["x_call"]
         assert!(load_output.stdout.contains("---\n"));
         assert!(load_output.stdout.contains("\nEND\n"));
         assert!(load_output.stdout.contains("MATCHED tag:dental"));
-    }
-
-    #[tokio::test]
-    async fn agent_memory_migrate_reports_on_a_current_root() {
-        let temp = tempdir().expect("create tempdir");
-        let root = temp.path().join("agent");
-        let cwd = root.join("workspace");
-        fs::create_dir_all(&cwd).await.expect("create workspace dir");
-        execute(
-            vec![OsString::from("/tmp/agent-memory"), OsString::from("init")],
-            test_env(root.clone(), cwd.clone()),
-            None,
-        )
-        .await
-        .expect("init");
-        let out = execute(
-            vec![OsString::from("/tmp/agent-memory"), OsString::from("migrate")],
-            test_env(root.clone(), cwd),
-            None,
-        )
-        .await
-        .expect("run agent-memory migrate");
-        assert_eq!(out.exit_code, EXIT_SUCCESS, "{}", out.stderr);
-        assert!(out.stdout.contains("FROM 3.0\nTO 3.0\n"), "{}", out.stdout);
     }
 
     #[tokio::test]
@@ -5927,7 +5902,7 @@ methods = ["x_call"]
                     OsString::from("--reason"),
                     OsString::from("r"),
                 ],
-                test_env(root.clone(), cwd.clone()),
+                dev_test_env(root.clone(), cwd.clone()),
                 None,
             )
             .await
@@ -5940,7 +5915,7 @@ methods = ["x_call"]
                 OsString::from("list"),
                 OsString::from("/user/"),
             ],
-            test_env(root.clone(), cwd),
+            dev_test_env(root.clone(), cwd),
             None,
         )
         .await

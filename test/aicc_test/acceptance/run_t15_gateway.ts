@@ -29,6 +29,7 @@ import {
   protocolContract,
   type ProviderProtocolCatalog,
   selectOfficialModels,
+  videoScenarioOf,
 } from "./provider_protocol_contracts.ts";
 import { defectFromFailure, writeReport } from "./report.ts";
 import { inventoriesFromModelsList } from "./inventory.ts";
@@ -761,6 +762,10 @@ export function buildT15TypedParams(
         ? "openrouter"
         : "openai";
       const structuredOutput = requestKey.endsWith(".structured-output");
+      // The sampling probes send explicit sampling parameters so the Provider
+      // Rules removal (or forwarding) is observable on the wire.
+      const samplingProbe = requestKey.endsWith(".sampling-omitted") ||
+        requestKey.endsWith(".sampling-forwarded");
       const providerSwitch = requestKey.endsWith(".provider-switch");
       const videoInput = requestKey.endsWith(".video-input");
       const providerState = typedOptions.foreignProviderState;
@@ -911,10 +916,9 @@ export function buildT15TypedParams(
                 type: "document",
                 source: {
                   kind: "url",
-                  url: "https://example.test/video.mp4",
+                  url: "https://example.test/media?id=4827",
                   mime_hint: "video/mp4",
                 },
-                title: "video.mp4",
               },
             ],
           }]
@@ -954,6 +958,7 @@ export function buildT15TypedParams(
           }
           : {}),
         max_output_tokens: 32,
+        ...(samplingProbe ? { temperature: 0.4, top_p: 0.9 } : {}),
       };
     }
     case "embedding.text":
@@ -1015,19 +1020,43 @@ export function buildT15TypedParams(
       };
     case "audio.enhance":
       return { ...common, audio: resource("audio/wav"), task: "denoise" };
-    case "video.txt2video":
+    case "video.generate": {
+      // Condition scenarios of one API (`video_generate_scenarios` in the
+      // contract catalog); the case id names the scenario.
+      const keyframe = (id: string, position: "start" | "end") => ({
+        type: "keyframe",
+        id,
+        position,
+        resource: resource("image/png"),
+      });
+      const scenario = videoScenarioOf(requestKey);
+      if (scenario === "keyframe") {
+        return { ...common, prompt: "@{first} comes alive with subtle motion", conditions: [keyframe("first", "start")] };
+      }
+      if (scenario === "keyframes") {
+        return {
+          ...common,
+          prompt: "Move from @{first} to @{last}",
+          conditions: [keyframe("first", "start"), keyframe("last", "end")],
+        };
+      }
+      if (scenario === "reference-images") {
+        return {
+          ...common,
+          prompt: "The character from @{hero} picks up the cup from @{prop}",
+          conditions: [
+            { type: "reference_image", id: "hero", resource: resource("image/png") },
+            { type: "reference_image", id: "prop", resource: resource("image/png") },
+          ],
+        };
+      }
       return { ...common, prompt: "A paper plane moves across a desk" };
-    case "video.img2video":
-      return {
-        ...common,
-        prompt: "Subtle motion",
-        image: resource("image/png"),
-      };
-    case "video.video2video":
+    }
+    case "video.edit":
       return {
         ...common,
         video: resource("video/mp4"),
-        prompt: "Preserve motion",
+        prompt: "Make it snow",
       };
     case "video.extend":
       return {
@@ -1340,11 +1369,10 @@ export function assertT15ResponseMapping(
     "audio.asr": ["text", "segments"],
     "audio.music": ["audio", "artifacts"],
     "audio.enhance": ["audio", "artifacts"],
-    "video.txt2video": ["video", "artifacts"],
-    "video.img2video": ["video", "artifacts"],
-    "video.video2video": ["video", "artifacts"],
-    "video.extend": ["video", "artifacts"],
-    "video.upscale": ["video", "artifacts"],
+    "video.generate": ["videos", "artifacts"],
+    "video.edit": ["videos", "artifacts"],
+    "video.extend": ["videos", "artifacts"],
+    "video.upscale": ["videos", "artifacts"],
     "agent.computer_use": ["action", "actions"],
   };
   if (apiType === "decision") assertDecisionResult(value);
@@ -1559,6 +1587,28 @@ async function executeCase(
       diagnostics.push(
         "Claude canonical JSON Schema was not lowered to output_config.format",
       );
+    }
+  }
+  if (testCase.tags.includes("sampling_omitted")) {
+    for (const field of ["temperature", "top_p", "top_k"]) {
+      if (wireBody && wireBody[field] !== undefined) {
+        diagnostics.push(
+          `sampling parameter ${field} reached the wire for a model that rejects it: ${
+            JSON.stringify(wireBody[field])
+          }`,
+        );
+      }
+    }
+  }
+  if (testCase.tags.includes("sampling_forwarded")) {
+    for (const [field, expected] of [["temperature", 0.4], ["top_p", 0.9]]) {
+      if (wireBody?.[field] !== expected) {
+        diagnostics.push(
+          `sampling parameter ${field} was not forwarded: expected ${expected}, got ${
+            JSON.stringify(wireBody?.[field])
+          }`,
+        );
+      }
     }
   }
   const contract = protocolContract(
@@ -2119,14 +2169,20 @@ export function variantCells(
       );
     }
   }
-  return runtimeVariants.flatMap((model) =>
-    model.api_types.map((apiType) => {
+  return runtimeVariants.flatMap((model) => {
+    const baseModelId = model.provider_actual_model_id ??
+      model.provider_model_id.slice(0, model.provider_model_id.lastIndexOf(":"));
+    return model.api_types.filter((apiType) => {
+      const officialModels = new Set([
+        ...(provider.official_aggregated_model_ids?.[apiType] ?? []),
+        ...(provider.official_first_party_model_ids?.[apiType] ?? []),
+      ]);
+      return officialModels.size === 0 || officialModels.has(baseModelId);
+    }).map((apiType) => {
       const candidates = provider.contracts.filter((candidate) =>
           candidate.api_types.includes(apiType) ||
           candidate.variant_api_types?.includes(apiType)
         );
-      const baseModelId = model.provider_actual_model_id ??
-        model.provider_model_id.slice(0, model.provider_model_id.lastIndexOf(":"));
       const aggregated = new Set(
         provider.official_aggregated_model_ids?.[apiType] ?? [],
       );
@@ -2158,7 +2214,7 @@ export function variantCells(
         expected_provider_options: expected.get(model.provider_model_id),
       };
     })
-  );
+  });
 }
 
 async function main(): Promise<void> {

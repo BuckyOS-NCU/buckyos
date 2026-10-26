@@ -12,9 +12,9 @@
 use std::path::PathBuf;
 
 pub use agent_tool::todo_tools::{
-    one_line, CallRef, ChildObservation, DispatchState, NewTodo, ReportRef, ReviewState,
-    ReviewVerdict, SerialPick, TodoAttempt, TodoList, TodoMode, TodoRecord, TodoStatus, TodoStore,
-    TODO_LIST_FILE, TODO_LIST_SCHEMA,
+    one_line, AttemptTarget, CallRef, ChildObservation, DispatchState, NewTodo, ReportRef,
+    ReviewState, ReviewVerdict, SerialPick, TodoAttempt, TodoList, TodoMode, TodoRecord,
+    TodoStatus, TodoStore, TODO_LIST_FILE, TODO_LIST_SCHEMA,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -28,6 +28,9 @@ use crate::state::AgentStateClient;
 
 /// Behavior an exploration sub session starts with, unless told otherwise.
 pub const EXPLORE_BEHAVIOR: &str = "explore";
+/// Behavior a serial Todo's own work session starts with (one bounded task
+/// on another runtime or workspace), unless told otherwise.
+pub const SERIAL_SESSION_BEHAVIOR: &str = "work_simple";
 /// Sub sessions the host drives at the same time (`xagent --max-children`),
 /// exported to the session's tool processes so a dispatch beyond it is
 /// refused instead of silently queued.
@@ -87,21 +90,77 @@ pub fn explore_key(todo_id: &str, attempt: u32) -> String {
     format!("todo:{todo_id}:{attempt}")
 }
 
-fn explore_spec(list: &TodoList, t: &TodoRecord, attempt: u32, opts: &ExploreOptions) -> SubSessionSpec {
+/// The workspace a Todo's sub session takes: what the Todo says, else none
+/// for an exploration and the session's own for a serial Todo.
+fn todo_workspace(t: &TodoRecord, mode: TodoMode) -> SubWorkspace {
+    match t.workspace.as_deref() {
+        Some("inherit") => SubWorkspace::Inherit,
+        Some("none") => SubWorkspace::None,
+        Some(id) => SubWorkspace::Id(id.to_string()),
+        None if mode == TodoMode::Serial => SubWorkspace::Inherit,
+        None => SubWorkspace::None,
+    }
+}
+
+/// Whether a serial Todo executes in a work session of its own instead of
+/// a sub context of this session: it names another session-runtime, or
+/// another workspace than the session's. The two are independent (primary
+/// runtime TODO §3): the work session takes both as named.
+pub fn needs_own_session(t: &TodoRecord, cfg: &SessionConfig) -> bool {
+    if t.mode != TodoMode::Serial {
+        return false;
+    }
+    let other_runtime = t
+        .runtime_id
+        .as_deref()
+        .is_some_and(|r| canonical_runtime(r) != cfg.runtime.runtime_id());
+    let parent_workspace = cfg.workspace.as_ref().map(|w| w.workspace_id.as_str());
+    let other_workspace = match t.workspace.as_deref() {
+        None | Some("inherit") => false,
+        Some("none") => parent_workspace.is_some(),
+        Some(id) => parent_workspace != Some(id),
+    };
+    other_runtime || other_workspace
+}
+
+/// The behavior a Todo's sub session starts with: the dispatch's choice,
+/// else the Todo's own (set when it was first dispatched), else the mode's
+/// default.
+fn todo_behavior(t: &TodoRecord, opts: &ExploreOptions, mode: TodoMode) -> String {
+    opts.behavior
+        .clone()
+        .or_else(|| t.behavior.clone())
+        .unwrap_or_else(|| match mode {
+            TodoMode::Explore => EXPLORE_BEHAVIOR.to_string(),
+            TodoMode::Serial => SERIAL_SESSION_BEHAVIOR.to_string(),
+        })
+}
+
+fn child_spec(list: &TodoList, t: &TodoRecord, attempt: u32, opts: &ExploreOptions, mode: TodoMode) -> SubSessionSpec {
     let mut task = t.task_text(list, attempt);
-    task.push_str(
-        "\nYou are an exploration sub session of a parent work session: do exactly this Todo, within its scope. \
+    let note = match mode {
+        TodoMode::Explore => {
+            "\nYou are an exploration sub session of a parent work session: do exactly this Todo, within its scope. \
 Leads outside the scope go into your report for the parent, not into more work. \
-Finish with a final report (is_end) that the parent's PLAN can review.\n",
-    );
+Finish with a final report (is_end) that the parent's PLAN can review.\n"
+        }
+        TodoMode::Serial => {
+            "\nYou are a work session executing exactly this serial Todo of a parent session's plan, on your own session-runtime and in your own working directory. \
+When you have a workspace, the project files are there: change them there and say what you changed; other results go into your report's artifacts. \
+Do only this Todo, within its scope; leads outside it go into your report. \
+Finish with a final report (is_end) with the evidence for each acceptance criterion; the parent's PLAN reviews it before the next Todo runs.\n"
+        }
+    };
+    task.push_str(note);
     SubSessionSpec {
         objective: t.task_text(list, attempt),
         msgs: vec![task],
         class: opts.class.clone(),
-        behavior: Some(opts.behavior.clone().unwrap_or_else(|| EXPLORE_BEHAVIOR.to_string())),
+        behavior: Some(todo_behavior(t, opts, mode)),
         // The Todo's cmd_skills; without any the parent Work's are inherited.
         cmd_skills: (!t.skills.is_empty()).then(|| t.skills.clone()),
-        workspace: SubWorkspace::None,
+        workspace: todo_workspace(t, mode),
+        runtime_id: t.runtime_id.clone(),
         report: ReportMode::Final,
         key: Some(explore_key(&t.todo_id, attempt)),
         ..Default::default()
@@ -123,6 +182,45 @@ pub async fn dispatch(
     todo_id: &str,
     opts: &ExploreOptions,
 ) -> Result<Dispatched> {
+    dispatch_as(agent, who, channels, parent, todo_id, opts, TodoMode::Explore).await
+}
+
+/// Dispatch a serial Todo that executes in a work session of its own (see
+/// [`needs_own_session`]): the attempt stays serial, the session waits for
+/// the sub session and reviews its report. A running attempt of the Todo
+/// is returned as it is (a hand-over redone after a crash).
+pub async fn dispatch_serial(
+    agent: &dyn AgentStateClient,
+    who: &str,
+    channels: &dyn InputChannelFactory,
+    parent: &SessionDir,
+    todo_id: &str,
+    opts: &ExploreOptions,
+) -> Result<Dispatched> {
+    let store = store_of(parent);
+    let list = store.load().map_err(todo_error)?;
+    if let Some(a) = list.get(todo_id).and_then(|t| t.latest()) {
+        if let (Some(sid), false, Some(DispatchState::Dispatched)) = (&a.child_sid, a.ended(), a.dispatch) {
+            return Ok(Dispatched {
+                todo_id: todo_id.to_string(),
+                attempt: a.attempt,
+                child_sid: sid.clone(),
+                path: PathBuf::new(),
+            });
+        }
+    }
+    dispatch_as(agent, who, channels, parent, todo_id, opts, TodoMode::Serial).await
+}
+
+async fn dispatch_as(
+    agent: &dyn AgentStateClient,
+    who: &str,
+    channels: &dyn InputChannelFactory,
+    parent: &SessionDir,
+    todo_id: &str,
+    opts: &ExploreOptions,
+    mode: TodoMode,
+) -> Result<Dispatched> {
     let parent_sid = parent.sid().to_string();
     let store = store_of(parent);
     let lock = store.lock().map_err(todo_error)?;
@@ -132,13 +230,24 @@ pub async fn dispatch(
         .ok_or_else(|| OpenDanError::NotFound(format!("todo {todo_id}")))?;
     let attempt = match t.latest() {
         Some(a) if a.dispatch == Some(DispatchState::Dispatching) => a.attempt,
-        _ => t.next_attempt(),
+        _ => {
+            // A serial Todo starts only in order: checked and recorded
+            // under the same lock.
+            if mode == TodoMode::Serial {
+                list.admit_serial(todo_id).map_err(todo_error)?;
+            }
+            t.next_attempt()
+        }
     };
-    let sub = explore_spec(&list, t, attempt, opts);
+    let behavior = todo_behavior(t, opts, mode);
+    let sub = child_spec(&list, t, attempt, opts, mode);
     let child_sid = sub_session_id(agent, who, &parent_sid, &sub)?;
     let now = crate::now_ms();
     let n = lock
-        .update(|l| l.begin_explore(todo_id, &child_sid, now))
+        .update(|l| match mode {
+            TodoMode::Explore => l.begin_explore(todo_id, &child_sid, now),
+            TodoMode::Serial => l.begin_serial_session(todo_id, &child_sid, now),
+        })
         .map_err(todo_error)?;
     crate::fault::point("todo:after_dispatch_record");
     let refuse = |reason: String| -> Result<Dispatched> {
@@ -158,7 +267,7 @@ pub async fn dispatch(
             if running >= max.max(1) {
                 return refuse(format!(
                     "the host drives at most {max} sub sessions at once (--max-children) and {running} are running: \
-end your step with a progress report to wait for one, then dispatch {todo_id} again (`agent-session todo dispatch {todo_id}`)"
+wait for one of them to finish, then dispatch {todo_id} again (`agent-session todo dispatch {todo_id}`)"
                 ));
             }
         }
@@ -178,7 +287,16 @@ end your step with a progress report to wait for one, then dispatch {todo_id} ag
         }
     };
     crate::fault::point("todo:after_child_created");
-    lock.update(|l| l.bind_explore(todo_id, n, crate::now_ms()))
+    let target = created
+        .config()
+        .map(|c| AttemptTarget {
+            runtime_id: Some(c.runtime.runtime_id().to_string()),
+            baseline: c.runtime.frozen.as_ref().map(|f| f.baseline.as_str().to_string()),
+            workspace_id: c.workspace.map(|w| w.workspace_id),
+            behavior: Some(behavior.clone()),
+        })
+        .unwrap_or_default();
+    lock.update(|l| l.bind_explore(todo_id, n, crate::now_ms(), target))
         .map_err(todo_error)?;
     crate::fault::point("todo:after_bind");
     Ok(Dispatched {
@@ -329,7 +447,7 @@ pub async fn sync(agent: &dyn AgentStateClient, sd: &SessionDir, state: &Session
     let mut seen = Vec::new();
     for (todo_id, attempt, child, mode) in &open {
         match (mode, child) {
-            (TodoMode::Explore, Some(sid)) => {
+            (_, Some(sid)) => {
                 let entry = agent.sessions().lookup(sid).await?;
                 let child_state = entry
                     .as_ref()
@@ -362,7 +480,8 @@ pub async fn sync(agent: &dyn AgentStateClient, sd: &SessionDir, state: &Session
                     continue;
                 };
                 match obs {
-                    Some(o) if a.mode == TodoMode::Serial => {
+                    // A serial sub context (no sub session of its own).
+                    Some(o) if a.mode == TodoMode::Serial && a.child_sid.is_none() => {
                         changed |= l.end_serial(&todo_id, attempt, "", o, now)?;
                     }
                     Some(o) => changed |= l.observe_child(&todo_id, attempt, o, now)?,

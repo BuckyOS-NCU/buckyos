@@ -22,7 +22,7 @@ use buckyos_api::{
     AppServiceSpec, AvailabilityEffect, KernelServiceSpec, NodeConfig,
     SchedulerRefreshRbacResponse, ServiceInstanceReportInfo, ServiceState, SystemConfigClient,
     UserSettings, UserState, UserType as ApiUserType, ZoneConfig, ZoneGatewaySettings,
-    APP_REGISTRY_KEY, CONTROL_PANEL_SERVICE_PORT, NFS_SERVER_SERVICE_NAME,
+    validate_user_group_id, USER_GROUPS_CONFIG_PREFIX, USER_GROUP_REF_PREFIX, APP_REGISTRY_KEY, CONTROL_PANEL_SERVICE_PORT, NFS_SERVER_SERVICE_NAME,
 };
 use buckyos_kit::*;
 use name_client::*;
@@ -33,12 +33,20 @@ const FIXED_SERVICE_WEIGHT: u32 = 100;
 const DEFAULT_REQUIRED_CPU_MHZ: u32 = 50;
 const DEFAULT_REQUIRED_MEMORY: u64 = 32 * 1024 * 1024;
 
-fn map_api_user_type(user_type: &ApiUserType) -> UserType {
-    match user_type {
-        ApiUserType::Admin | ApiUserType::Root => UserType::Admin,
-        ApiUserType::Limited => UserType::Limited,
-        _ => UserType::User,
+/// Account records with an unknown `type` join no group: they are skipped
+/// with a warning instead of falling back to an ordinary user.
+fn parse_user_settings_record(key: &str, value: &str) -> Result<Option<UserSettings>> {
+    let raw: Value = serde_json::from_str(value)?;
+    let raw_type = raw.get("type").and_then(Value::as_str).unwrap_or_default();
+    if ApiUserType::parse(raw_type).is_none() {
+        warn!("skip account record {key}: unknown user type `{raw_type}`");
+        return Ok(None);
     }
+    let settings: UserSettings = serde_json::from_value(raw).map_err(|e| {
+        error!("UserSettings serde_json::from_str failed: {:?}", e);
+        e
+    })?;
+    Ok(Some(settings))
 }
 
 fn craete_node_item_by_device_info(device_name: &str, device_info: &DeviceInfo) -> NodeItem {
@@ -48,7 +56,8 @@ fn craete_node_item_by_device_info(device_name: &str, device_info: &DeviceInfo) 
     NodeItem {
         id: device_name.to_string(),
         node_type: NodeType::from(device_info.device_doc.device_type.clone()),
-        labels: vec![],
+        // `node:<id>` pins a spec to this node (`ServiceSpec.node_affinity`).
+        labels: vec![node_label(device_name)],
         network_zone: net_id,
         state: node_state,
         support_container: device_info.support_container,
@@ -66,16 +75,27 @@ fn craete_node_item_by_device_info(device_name: &str, device_info: &DeviceInfo) 
     }
 }
 
+/// The label every node carries with its own id.
+fn node_label(node_id: &str) -> String {
+    format!("node:{node_id}")
+}
+
 fn create_service_spec_by_app_config(
     full_app_id: &str,
     owner_user_id: &str,
     app_config: &AppServiceSpec,
+    input_config: &HashMap<String, String>,
 ) -> ServiceSpec {
     let spec_state = ServiceSpecState::from(app_config.state.clone());
     let is_agent = app_config.app_doc.get_app_type() == AppType::Agent;
+    // The zone owner's Agent on its host-native runtime: its Agent Service
+    // runs natively on that node, without a container.
+    let native_node = is_agent
+        .then(|| buckyos_api::native_agent_node(input_config, owner_user_id, &app_config.app_id()))
+        .flatten();
 
-    let mut need_container = is_agent;
-    if !need_container {
+    let mut need_container = is_agent && native_node.is_none();
+    if !is_agent {
         need_container = true;
         if app_config
             .app_doc
@@ -106,7 +126,7 @@ fn create_service_spec_by_app_config(
         required_memory: DEFAULT_REQUIRED_MEMORY,
         required_gpu_tflops: 0.0,
         required_gpu_mem: 0,
-        node_affinity: None,
+        node_affinity: native_node.as_deref().map(node_label),
         network_affinity: None,
         service_ports_config: service_ports_config,
     }
@@ -185,6 +205,7 @@ pub fn create_scheduler_by_system_config(
                             &app_instance_id.to_string(),
                             user_id,
                             &app_config,
+                            input_config,
                         );
                         scheduler_ctx.add_service_spec(service_spec);
                     }
@@ -193,18 +214,17 @@ pub fn create_scheduler_by_system_config(
                 let parts: Vec<&str> = key.split('/').collect();
                 if parts.len() == 3 {
                     let user_id = parts[1];
-                    let user_settings: UserSettings = serde_json::from_str(value.as_str())
-                        .map_err(|e| {
-                            error!("UserSettings serde_json::from_str failed: {:?}", e);
-                            e
-                        })?;
+                    let Some(user_settings) = parse_user_settings_record(key, value)? else {
+                        continue;
+                    };
                     if !matches!(user_settings.state, UserState::Active) {
                         continue;
                     }
                     let user_item = UserItem {
                         userid: user_id.to_string(),
                         res_pool_id: None,
-                        user_type: map_api_user_type(&user_settings.user_type),
+                        user_type: user_settings.user_type,
+                        groups: user_settings.groups.clone(),
                     };
                     scheduler_ctx.add_user(user_item);
                     if user_id == "root" {
@@ -580,6 +600,19 @@ fn reconcile_app_instance_specs(
             let desired_execution_spec = desired_spec
                 .to_node_execution_spec()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            // An Agent's run mode follows its owner's runtime choice
+            // (native on the node of its host-native default runtime).
+            let desired_run_mode = crate::app::app_run_mode(node_id, &desired_spec, input_system_config);
+            if instance_config.run_mode != desired_run_mode {
+                set_paths.insert(
+                    format!("/apps/{instance_id}/run_mode"),
+                    Some(serde_json::to_value(desired_run_mode)?),
+                );
+                info!(
+                    "will switch app instance run mode: instance={} node={} {:?}->{:?}",
+                    instance_id, node_id, instance_config.run_mode, desired_run_mode
+                );
+            }
             if instance_config.node_execution_spec == desired_execution_spec
                 && instance_config.deployment == desired_spec.deployment
             {
@@ -1216,6 +1249,18 @@ pub(crate) async fn update_node_gateway_info(
                             .or_insert_with(|| service_entry.clone());
                     }
                 }
+            } else if spec_id == "aiworkspace" {
+                // `aiws-<workspace id>.<zone>`: every Workspace's own origin (AI Workspace 内核架构改进 D21); the
+                // gateway folds such hosts onto the `aiws` entry (boot_gateway.yaml get_app_info_from_req)
+                if let Some(selector) = selector.as_ref() {
+                    node_gateway_info.app_info.insert(
+                        "aiws".to_string(),
+                        NodeGatewayAppEntry::Service(NodeGatewayAppServiceInfoEntry {
+                            service_id: spec_id.clone(),
+                            selector: selector.clone(),
+                        }),
+                    );
+                }
             } else if spec_id == NFS_SERVER_SERVICE_NAME {
                 // `share.<zone>/s/{token}`: share links served by nfs-server (its own
                 // origin, apart from the Desktop), see notepads/share-content-mgr-tech-design-todo.md.
@@ -1482,42 +1527,48 @@ async fn update_rbac(
         agent_specs.push(agent_spec);
     }
 
-    for (user_id, user_item) in scheduler_ctx.users.iter() {
+    let defined_user_groups: HashSet<&str> = input_config
+        .keys()
+        .filter_map(|key| key.strip_prefix(&format!("{USER_GROUPS_CONFIG_PREFIX}/")))
+        .filter(|group_id| validate_user_group_id(group_id).is_ok())
+        .collect();
+    let mut user_ids = scheduler_ctx.users.keys().collect::<Vec<_>>();
+    user_ids.sort();
+    for user_id in user_ids {
+        let user_item = &scheduler_ctx.users[user_id];
         if user_id == "root" {
             continue;
         }
         match user_item.user_type {
-            crate::scheduler::UserType::Admin => {
+            ApiUserType::Admin => {
                 info!("add admin rbac policy for user {}", user_id);
                 push_policy_line(&mut rbac_policy, format!("g, {}, admin", user_id));
                 push_policy_line(&mut rbac_policy, format!("g, su_{}, su_admin", user_id));
             }
-            crate::scheduler::UserType::User => {
+            ApiUserType::User => {
                 info!("add users rbac policy for user {}", user_id);
                 push_policy_line(&mut rbac_policy, format!("g, {}, users", user_id));
-                let sudo_user_id = format!("su_{}", user_id);
-                push_policy_line(&mut rbac_policy, format!("g, {}, su_users", sudo_user_id));
-                push_policy_line(
-                    &mut rbac_policy,
-                    format!(
-                        "p, {}, obj://config/users/{}/settings, read|write,allow",
-                        sudo_user_id, user_id
-                    ),
-                );
-                push_policy_line(
-                    &mut rbac_policy,
-                    format!(
-                        "p, {}, obj://config/users/{}/doc, read|write,allow",
-                        sudo_user_id, user_id
-                    ),
-                );
+                push_policy_line(&mut rbac_policy, format!("g, su_{}, su_users", user_id));
             }
-            crate::scheduler::UserType::Limited => {
+            ApiUserType::Limited => {
                 info!("add limited rbac policy for user {}", user_id);
                 push_policy_line(&mut rbac_policy, format!("g, {}, limited", user_id));
             }
-            _ => {
+            ApiUserType::Root => {
                 continue;
+            }
+        }
+        let mut groups = user_item.groups.iter().collect::<Vec<_>>();
+        groups.sort();
+        groups.dedup();
+        for group_id in groups {
+            if defined_user_groups.contains(group_id.as_str()) {
+                push_policy_line(
+                    &mut rbac_policy,
+                    format!("g, {}, {}{}", user_id, USER_GROUP_REF_PREFIX, group_id),
+                );
+            } else {
+                warn!("user {} refers to undefined user group `{}`", user_id, group_id);
             }
         }
     }
@@ -1628,6 +1679,9 @@ async fn update_rbac(
             }
         }
     }
+    for line in crate::executor_auth::executor_rbac_lines(input_config) {
+        push_policy_line(&mut rbac_policy, line);
+    }
     for app_id in read_only_apps {
         push_policy_line(
             &mut rbac_policy,
@@ -1652,6 +1706,15 @@ async fn update_rbac(
     Ok(result)
 }
 
+#[cfg(test)]
+pub(crate) async fn update_rbac_for_test(
+    input_config: &HashMap<String, String>,
+) -> HashMap<String, KVAction> {
+    update_rbac(input_config, &NodeScheduler::new_empty(1))
+        .await
+        .unwrap()
+}
+
 fn rbac_literal(value: &str) -> String {
     let mut escaped = String::new();
     for ch in value.chars() {
@@ -1661,6 +1724,88 @@ fn rbac_literal(value: &str) -> String {
         escaped.push(ch);
     }
     escaped
+}
+
+#[cfg(test)]
+mod user_type_rbac_tests {
+    use super::*;
+
+    fn settings(user_id: &str, user_type: &str, groups: &[&str]) -> String {
+        json!({
+            "user_id": user_id,
+            "type": user_type,
+            "password": "",
+            "state": "active",
+            "res_pool_id": "default",
+            "groups": groups,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn user_types_and_system_groups_become_rbac_groups() {
+        let mut input = HashMap::new();
+        for (user_id, user_type, groups) in [
+            ("root", "root", vec![]),
+            ("alice", "admin", vec!["staff"]),
+            ("bob", "user", vec![]),
+            ("carol", "limited", vec!["customer", "ghost"]),
+            ("dave", "guest", vec!["customer"]),
+        ] {
+            input.insert(
+                format!("users/{user_id}/settings"),
+                settings(user_id, user_type, &groups),
+            );
+        }
+        for group_id in ["customer", "staff"] {
+            input.insert(
+                format!("{USER_GROUPS_CONFIG_PREFIX}/{group_id}"),
+                json!({"group_id": group_id, "name": group_id, "updated_by": "alice", "created_at": 1, "updated_at": 1}).to_string(),
+            );
+        }
+        let (scheduler, _) = create_scheduler_by_system_config(&input).unwrap();
+        assert!(!scheduler.users.contains_key("dave"));
+        let actions = update_rbac(&input, &scheduler).await.unwrap();
+        let Some(KVAction::Update(policy)) = actions.get("system/rbac/policy") else {
+            panic!("RBAC policy should be generated");
+        };
+        for line in [
+            "g, alice, admin",
+            "g, alice, group:staff",
+            "g, bob, users",
+            "g, carol, limited",
+            "g, carol, group:customer",
+            "g, su_bob, su_users",
+        ] {
+            assert!(policy.lines().any(|l| l == line), "{line}");
+        }
+        assert!(!policy.contains("ghost"));
+        assert!(!policy.contains("dave"));
+        assert!(!policy.lines().any(|l| l.starts_with("g, root,")));
+        assert!(!policy.lines().any(|l| l.starts_with("p,") && l.contains("group:")));
+        assert!(!policy.lines().any(|l| l.starts_with("p, su_")));
+
+        // PRE-01: a User's sudo session cannot rewrite its own settings or doc.
+        let config = buckyos_api::build_current_rbac_config(Some(policy));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let sudo = || Some(rbac::SudoMode::Sudo("su_bob".to_string()));
+        for key in ["settings", "doc"] {
+            let resource = format!("obj://config/users/bob/{key}");
+            assert!(!rbac::enforce("bob", "system:control-panel", &resource, "write", sudo()).await, "{key}");
+        }
+        assert!(
+            rbac::enforce(
+                "bob",
+                "system:control-panel",
+                "obj://config/users/bob/profile",
+                "write",
+                sudo()
+            )
+            .await
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1751,7 +1896,8 @@ mod agent_rbac_tests {
             "bob".into(),
             UserItem {
                 userid: "bob".into(),
-                user_type: UserType::User,
+                user_type: ApiUserType::User,
+                groups: Vec::new(),
                 res_pool_id: None,
             },
         );
@@ -1759,6 +1905,7 @@ mod agent_rbac_tests {
             "reader.example.com@bob",
             "bob",
             &super::app_lifecycle_tests::app_spec(),
+            &input,
         );
         service.app_id = readonly.agent_id.to_string();
         scheduler.specs.insert(service.id.clone(), service);
@@ -2095,6 +2242,125 @@ pub(crate) mod app_lifecycle_tests {
                 *config.pointer_mut(&path).expect("existing node allocation") = value.unwrap();
             }
             input.insert(key, config.to_string());
+        }
+    }
+
+    /// The zone owner's Agent whose default runtime is the node's host
+    /// runtime: no container is needed (also on a node without containers),
+    /// it is pinned to that node and its instance runs natively; switching
+    /// the default back to the container flips the instance in place.
+    #[test]
+    fn an_owner_agent_on_its_host_runtime_runs_natively() {
+        use buckyos_api::{AgentRuntimeSettings, AgentRuntimeTarget, AgentSettings, AppRunMode, ComputerAccess};
+        for node_has_containers in [true, false] {
+            let owner = DID::new("bns", "alice");
+            let app_doc = AppDoc::builder(AppType::Agent, "jarvis", "0.7.0", "alice", &owner)
+                .app_did(DID::from_str("did:web:jarvis.test.buckyos.io").unwrap())
+                .agent_pkg(
+                    SubPkgDesc::new("agent.jarvis.test.buckyos.io#0.7.0")
+                        .package_meta_object_id(ndn_lib::ObjId::new_by_raw("pkg".into(), vec![2; 32])),
+                )
+                .build()
+                .unwrap();
+            let app_instance_id =
+                AppInstanceId::new(AppId::from_app_did(app_doc.app_did()).unwrap(), "alice").unwrap();
+            let spec = AppServiceSpec {
+                app_instance_id: app_instance_id.clone(),
+                app_did: app_doc.app_did().clone(),
+                deployment: DeploymentIdentity {
+                    app_instance_id: app_instance_id.clone(),
+                    task_id: "agent-1".into(),
+                    app_doc_object_id: app_doc.gen_obj_id().0,
+                    spec_generation: 1,
+                    pikg_digest: None,
+                },
+                app_doc,
+                app_name: "jarvis".into(),
+                app_host_name: "jarvis".into(),
+                app_index: 12,
+                owner_user_id: "alice".into(),
+                permission: Vec::new(),
+                selected_components: Vec::new(),
+                packages: Vec::new(),
+                enable: true,
+                expected_instance_count: 1,
+                state: ServiceState::New,
+                spec_config: ServiceSpecConfig::default(),
+            };
+            let mut doc = DeviceDocument::new("node1", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into());
+            doc.support_container = node_has_containers;
+            let mut device = DeviceInfo::from_device_doc(&doc);
+            device.arch = "amd64".into();
+            let agent_id = buckyos_api::AgentId::parse(spec.app_id().as_str()).unwrap();
+            let settings = |default: Option<&str>| AgentSettings {
+                runtimes: std::collections::BTreeMap::from([(
+                    "host".to_string(),
+                    AgentRuntimeSettings {
+                        enabled: true,
+                        computer: ComputerAccess::None,
+                        target: AgentRuntimeTarget::Node { node_id: "node1".into(), node_did: device.id.to_string() },
+                        baseline: None,
+                    },
+                )]),
+                default_runtime_id: default.map(str::to_string),
+                ..AgentSettings::default()
+            };
+            let mut input = HashMap::from([
+                ("devices/node1/info".to_string(), serde_json::to_string(&device).unwrap()),
+                (buckyos_api::user_app_spec_key("alice", spec.app_id()), serde_json::to_string(&spec).unwrap()),
+                (buckyos_api::ZONE_OWNER_USER_ID_KEY.to_string(), json!("alice").to_string()),
+                (
+                    buckyos_api::agent_settings_key("alice", &agent_id),
+                    serde_json::to_string(&settings(Some("host"))).unwrap(),
+                ),
+                (
+                    buckyos_api::node_settings_key("node1"),
+                    json!({"executor": {"enabled": true, "owner_agents": {"enabled": true, "workdir_roots": ["/home/alice"]}}}).to_string(),
+                ),
+                (
+                    "nodes/node1/config".to_string(),
+                    json!({"node_id": "node1", "node_did": device.id, "kernel": {}, "frame_services": {},
+                           "state": buckyos_api::NodeState::Running, "apps": {}})
+                    .to_string(),
+                ),
+            ]);
+            let (mut scheduler, devices) = create_scheduler_by_system_config(&input).unwrap();
+            let agent_spec = scheduler.get_service_spec(&app_instance_id.to_string()).unwrap().clone();
+            assert!(!agent_spec.need_container, "containers={node_has_containers}");
+            assert_eq!(agent_spec.node_affinity.as_deref(), Some("node:node1"));
+            let actions = scheduler.schedule(None).unwrap();
+            let instance = actions
+                .iter()
+                .find_map(|a| match a {
+                    SchedulerAction::InstanceReplica(i) => Some(i.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no placement (containers={node_has_containers}): {actions:?}"));
+            assert_eq!(instance.node_id, "node1");
+            let node_actions = instance_app_service(&instance, &devices, &input).unwrap();
+            let Some(KVAction::SetByJsonPath(paths)) = node_actions.get("nodes/node1/config") else {
+                panic!("no node config action")
+            };
+            let mut config: Value = serde_json::from_str(&input["nodes/node1/config"]).unwrap();
+            config["apps"][app_instance_id.to_string()] = paths[&format!("/apps/{app_instance_id}")].clone().unwrap();
+            input.insert("nodes/node1/config".into(), config.to_string());
+            let node: NodeConfig = serde_json::from_str(&input["nodes/node1/config"]).unwrap();
+            assert_eq!(node.apps[&app_instance_id].run_mode, AppRunMode::Native);
+            assert!(reconcile_app_instance_specs(&input).unwrap().0.is_empty(), "stable");
+
+            // The owner makes the container the default again.
+            input.insert(
+                buckyos_api::agent_settings_key("alice", &agent_id),
+                serde_json::to_string(&settings(None)).unwrap(),
+            );
+            let (scheduler, _) = create_scheduler_by_system_config(&input).unwrap();
+            let agent_spec = scheduler.get_service_spec(&app_instance_id.to_string()).unwrap();
+            assert!(agent_spec.need_container && agent_spec.node_affinity.is_none());
+            let (actions, nodes) = reconcile_app_instance_specs(&input).unwrap();
+            assert!(nodes.contains("node1"));
+            apply_node_actions(&mut input, actions);
+            let node: NodeConfig = serde_json::from_str(&input["nodes/node1/config"]).unwrap();
+            assert_eq!(node.apps[&app_instance_id].run_mode, AppRunMode::Container);
         }
     }
 
@@ -2461,6 +2727,19 @@ pub(crate) async fn build_schedule_plan(
         } else if scheduler_ctx.specs != last_schedule_snapshot.specs
             || scheduler_ctx.users != last_schedule_snapshot.users
         {
+            need_update_rbac = true;
+        }
+    }
+
+    if !is_boot {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let (executor_actions, executor_changed) =
+            crate::executor_auth::update_executor_snapshots(input_system_config, now_ms);
+        extend_kv_action_map(&mut tx_actions, &executor_actions);
+        if executor_changed {
             need_update_rbac = true;
         }
     }

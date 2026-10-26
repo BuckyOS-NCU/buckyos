@@ -27,6 +27,7 @@ import {
 } from 'lucide-react'
 import {
   getMessageDeliveryStatus,
+  getMessageMetaString,
   getMessageSenderName,
   getMessageStableId,
   messageNotify,
@@ -44,7 +45,7 @@ import { knownAttachmentKind } from '../media/objectCache'
 import { outgoingUpload } from '../../store/outgoing'
 import type { OutgoingUpload } from '../../store/types'
 import { formatAttachmentSize } from '../input/attachmentDraft'
-import { attachmentKindOf, attachmentMediaType, attachmentOfRef, isHttpUri, type AttachmentKind, type MessageAttachment } from '../media/source'
+import { attachmentKindOf, attachmentMediaType, attachmentOfRef, isHttpUri, objectContextOf, type AttachmentKind, type MessageAttachment } from '../media/source'
 import { ConversationMessageActionsContext } from './actions'
 import { MessageMarkdown } from './MessageMarkdown'
 import { getObjectAccess } from './objectAccess'
@@ -273,7 +274,7 @@ function voiceOf(message: MessageObject, messageIndex: number): { voice: VoiceNo
   if (!voice || messageRelations(message)?.edited) return null
   const refs = (message.content.refs ?? []).filter(ref => ref.target.type === 'data_obj')
   if (refs.length !== 1) return null
-  const attachment = attachmentOfRef(refs[0], `${getMessageStableId(message, messageIndex)}#0`)
+  const attachment = attachmentOfRef(refs[0], `${getMessageStableId(message, messageIndex)}#0`, objectContextOf(message))
   return attachment?.objId ? { voice, attachment: { ...attachment, objId: attachment.objId } } : null
 }
 
@@ -289,7 +290,7 @@ function VoiceMessage({ message, context }: { message: MessageObject; context: M
       <div className={`mh-bubble ${bubbleWidthClass} min-w-[200px]`} style={bubbleStyle(isSelf, context.continued)} data-testid="message-voice" data-message-id={messageObjId(message)} {...details}>
         {!isSelf && context.isGroup && !context.continued ? <p className="mb-1 text-[13px] font-semibold" style={{ color: 'var(--cp-accent)' }}>{getMessageSenderName(message)}</p> : null}
         <ReplyQuote message={message} />
-        <VoiceNoteView id={messageObjId(message) ?? note.attachment.id} objId={note.attachment.objId} voice={note.voice} isSelf={isSelf} />
+        <VoiceNoteView id={messageObjId(message) ?? note.attachment.id} source={note.attachment} voice={note.voice} isSelf={isSelf} />
         {upload ? <UploadProgress upload={upload} alignEnd={isSelf} /> : null}
         {caption ? <p className={`${bodyTextClass} mt-1.5 whitespace-pre-wrap break-words`}>{caption}</p> : null}
         <MessageFooter message={message} isSelf={isSelf} deliveryStatus={getMessageDeliveryStatus(message)} selfDid={context.selfDid} />
@@ -572,6 +573,7 @@ function MessageFooter({ message, isSelf, deliveryStatus, selfDid, frameless = f
         </span>
         {isSelf ? <MessageStatusIcon status={deliveryStatus} /> : null}
       </div>
+      {isSelf && deliveryStatus === 'failed' && getMessageMetaString(message, 'ui_delivery_reason') ? <p role="alert" className="mt-0.5 text-right text-[11px]" data-testid="post-rejected" data-reason={getMessageMetaString(message, 'ui_delivery_reason')} style={{ color: metaColor }}>{t('messagehub.message.rejected')} · {groupErrorText(t, `rejected: ${getMessageMetaString(message, 'ui_delivery_reason')}`)}</p> : null}
       {receipt ? <p className="mt-0.5 text-right text-[11px]" data-testid="read-receipt" style={{ color: metaColor }} title={receipt.readers?.map(did => displayName?.(did) ?? did).join(', ')}>{t('messagehub.message.readBy', undefined, { count: receipt.count })}{receipt.readers?.length ? ` · ${receipt.readers.map(did => displayName?.(did) ?? did).join(', ')}` : ''}</p> : null}
       {isSelf && record?.delivery && (failedTargets.length > 0 || record.delivery.overall === 'partial_failed') ? (
         <div className="mt-1 text-[11px]" data-testid="delivery-failure" style={{ color: metaColor }}>
@@ -637,8 +639,8 @@ function isLikelyImageUri(uri: string): boolean {
 }
 
 /** The kind a ref is expected to render as, from what is already known (resolved object, or its name). */
-function expectedKind(item: RefItem, id: string): AttachmentKind | null {
-  const attachment = attachmentOfRef(item, id)
+function expectedKind(item: RefItem, id: string, context: string | undefined): AttachmentKind | null {
+  const attachment = attachmentOfRef(item, id, context)
   if (!attachment) return null
   if (attachment.uri) return 'image'
   return knownAttachmentKind(attachment) ?? attachmentKindOf(attachmentMediaType(undefined, attachment.label), attachment.label)
@@ -656,14 +658,15 @@ function AttachmentMessage({ message, context }: { message: MessageObject; conte
   const captionBody = format === 'text/markdown' || (context.peerMarkdown && !isSelf && (format ?? 'text/plain') === 'text/plain') ? <div className="whitespace-normal"><MessageMarkdown text={caption} /></div> : caption
   const refs = effectiveContent(message).refs ?? []
   const messageId = getMessageStableId(message, context.messageIndex)
+  const objectContext = objectContextOf(message)
   // Kinds reported by the attachments once their objects resolve; until then
   // the name decides.
   const [resolved, setResolved] = useState<Record<number, AttachmentKind>>({})
   const reportKind = useCallback((index: number, kind: AttachmentKind) => setResolved(previous => previous[index] === kind ? previous : { ...previous, [index]: kind }), [])
   // Pictures and videos stand on the canvas: a coloured bubble around them only frames them.
-  const frameless = refs.length > 0 && refs.every((ref, index) => isMediaKind(resolved[index] ?? expectedKind(ref, `${messageId}#${index}`)))
+  const frameless = refs.length > 0 && refs.every((ref, index) => isMediaKind(resolved[index] ?? expectedKind(ref, `${messageId}#${index}`, objectContext)))
   const sender = !isSelf && context.isGroup && !context.continued ? <p className="text-[13px] font-semibold mb-1" style={{ color: 'var(--cp-accent)' }}>{senderName}</p> : null
-  const items = refs.map((ref, index) => <MessageRef key={`${index}:${ref.target.type === 'data_obj' ? ref.target.obj_id : ref.target.did}`} item={ref} id={`${messageId}#${index}`} isSelf={isSelf && !frameless} index={index} onKind={reportKind} />)
+  const items = refs.map((ref, index) => <MessageRef key={`${index}:${ref.target.type === 'data_obj' ? ref.target.obj_id : ref.target.did}`} item={ref} id={`${messageId}#${index}`} objectContext={objectContext} isSelf={isSelf && !frameless} index={index} onKind={reportKind} />)
   const upload = outgoingUpload(message)
   const progress = upload ? <UploadProgress upload={upload} alignEnd={isSelf} /> : null
   if (frameless) {
@@ -718,13 +721,13 @@ function UploadProgress({ upload, alignEnd }: { upload: OutgoingUpload; alignEnd
   )
 }
 
-function MessageRef({ item, id, isSelf, index, onKind }: { item: RefItem; id: string; isSelf: boolean; index: number; onKind: (index: number, kind: AttachmentKind) => void }) {
+function MessageRef({ item, id, objectContext, isSelf, index, onKind }: { item: RefItem; id: string; objectContext: string | undefined; isSelf: boolean; index: number; onKind: (index: number, kind: AttachmentKind) => void }) {
   const target = item.target
   const report = useCallback((kind: AttachmentKind) => onKind(index, kind), [onKind, index])
   if (target.type === 'service_did') {
     return <span className="text-xs break-all" data-testid="attachment-service">{item.label ? `${item.label} · ` : ''}{target.did} · {item.role}</span>
   }
-  const attachment = attachmentOfRef(item, id)
+  const attachment = attachmentOfRef(item, id, objectContext)
   if (attachment) return <MessageAttachmentView attachment={attachment} isSelf={isSelf} onKind={report} />
   const uri = target.uri_hint?.trim()
   if (uri && isHttpUri(uri)) {

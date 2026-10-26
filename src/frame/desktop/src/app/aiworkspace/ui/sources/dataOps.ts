@@ -4,6 +4,7 @@ import { randomId } from '../../api/ids'
 import { SYSTEM_IDS, type EntityEnvelope, type Json, type Operation } from '../../api/types'
 import { aiwsT, localizedLabels } from '../../i18n'
 import type { WorkspaceStore } from '../../state/store'
+import type { ImportedAsset } from '../../api/session'
 import { MOCK_WISH_DEF_ID, mockWishDefOp } from '../wish/mockWishDef'
 
 export const TYPE_LABEL: Readonly<Record<string, string>> = localizedLabels({
@@ -17,7 +18,33 @@ export function entityLabel(entity: EntityEnvelope): string {
   return entity.title ?? entity.name ?? entity.entity_id
 }
 
-export type NewDataKind = 'folder' | 'table' | 'richtext' | 'record' | 'wish' | 'note'
+export type NewDataKind = 'folder' | 'table' | 'richtext' | 'record' | 'wish' | 'note' | 'link'
+
+export function importedAssetOps(store: WorkspaceStore, parentId: string, items: ImportedAsset[], canvas?: { parentId: string; free: boolean; x: number; y: number }): Operation[] {
+  const operations: Operation[] = []
+  const walk = (parent: string, children: ImportedAsset[], surface?: typeof canvas) => {
+    let key = store.outline.childrenOf(parent).at(-1)?.order_key
+    let viewKey = surface ? store.outline.childrenOf(surface.parentId).at(-1)?.order_key : undefined
+    children.forEach((item, index) => {
+      key = store.core.order_key_between(key, undefined)
+      const id = randomId(item.kind === 'dir' ? 'f' : 'a')
+      operations.push({ op: 'entity.create', entity_id: id, type_id: item.kind === 'dir' ? 'buckyos.container' : 'buckyos.asset-ref', parent_id: parent, order_key: key, name: item.name,
+        payload: item.kind === 'dir' ? { kind: 'folder', title: item.name } : { object_id: item.object_id, file_name: item.name } })
+      let childSurface: typeof canvas
+      if (surface) {
+        viewKey = store.core.order_key_between(viewKey, undefined)
+        const viewId = randomId('c')
+        operations.push({ op: 'entity.create', entity_id: viewId, type_id: item.kind === 'dir' ? 'buckyos.container' : 'buckyos.cell', parent_id: surface.parentId, order_key: viewKey,
+          ...(surface.free ? { placement: { x: surface.x + (index % 3) * 344, y: surface.y + Math.floor(index / 3) * 264, w: 320, h: 240 } } : {}),
+          payload: item.kind === 'dir' ? { kind: 'group', title: item.name, layout: { mode: 'flow' } } : { view: { type: 'asset' }, source_ref: { entity_id: id }, title: item.name } })
+        childSurface = { parentId: viewId, free: false, x: 0, y: 0 }
+      }
+      if (item.kind === 'dir') walk(id, item.children, childSurface)
+    })
+  }
+  walk(parentId, items, canvas)
+  return operations
+}
 
 /** Operations creating new data in the data tree (no Block). */
 export function newDataOps(store: WorkspaceStore, parentId: string, kind: NewDataKind, title: string): Operation[] {
@@ -33,6 +60,7 @@ export function newDataOps(store: WorkspaceStore, parentId: string, kind: NewDat
       { key: 'amount', name: aiwsT('aiworkspace.data.default.amount'), type: 'decimal', scale: 2 },
     ] }, props: { name: title } })]
     case 'note': return [create(randomId('n'), 'buckyos.annotation', { kind: 'note', body: title || aiwsT('aiworkspace.data.stickyNote'), style: { color: '#fff2cc' } })]
+    case 'link': return [] // inserted through insertLinkedSource (sourceLinks.ts): the link decides the type
     case 'wish': {
       const ops: Operation[] = []
       if (!store.outline.get(MOCK_WISH_DEF_ID)) ops.push(mockWishDefOp(store.core.order_key_between(store.outline.childrenOf('data').filter((e) => !SYSTEM_IDS.has(e.entity_id)).at(-1)?.order_key ?? undefined, undefined)) as Operation)

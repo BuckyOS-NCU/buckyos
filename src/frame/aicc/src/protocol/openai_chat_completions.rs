@@ -149,8 +149,20 @@ impl OpenAiChatCompletionsCodec {
         dialect: Arc<dyn OpenAiChatCompletionsDialect>,
         api_type: ApiType,
     ) -> Self {
+        Self::with_dialect_api_type_and_descriptor(
+            dialect,
+            api_type,
+            openai_chat_completions_operation_descriptor(),
+        )
+    }
+
+    pub(crate) fn with_dialect_api_type_and_descriptor(
+        dialect: Arc<dyn OpenAiChatCompletionsDialect>,
+        api_type: ApiType,
+        descriptor: OperationDescriptor,
+    ) -> Self {
         Self {
-            descriptor: openai_chat_completions_operation_descriptor(),
+            descriptor,
             dialect,
             api_type,
         }
@@ -1056,6 +1068,7 @@ fn decode_usage(value: Option<&Value>) -> ProtocolResultValue<Option<AiUsage>> {
         image_units: None,
         audio_seconds: None,
         video_seconds: None,
+        reference_images: None,
         request_units: None,
         characters: None,
         audio_input_tokens: value

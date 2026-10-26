@@ -4,6 +4,7 @@
 //! goes through that session's own `drive`, under its own lease.
 
 pub mod goals;
+pub mod maintenance;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -51,6 +52,9 @@ pub struct HostDeps {
     pub turn_tasks: Option<Arc<dyn crate::runner::TurnTaskSink>>,
     /// Where a Work's questions to the user go (`None`: a Work cannot ask).
     pub notify: Option<Arc<dyn crate::notify::NotifyHost>>,
+    /// Where a finished user task is shared as the agent's own post
+    /// (`None`: nothing is shared).
+    pub share: Option<Arc<dyn crate::share::ShareHost>>,
     /// Binding identity required of the sessions driven directly (not of
     /// their sub sessions).
     pub runtime_id: Option<String>,
@@ -59,14 +63,16 @@ pub struct HostDeps {
 impl HostDeps {
     /// Runner dependencies of one session (its own runtime, its own stop
     /// signal).
-    pub fn runner_deps(&self, sd: &SessionDir, stop: StopSignal) -> Result<RunnerDeps> {
+    pub async fn runner_deps(&self, sd: &SessionDir, stop: StopSignal) -> Result<RunnerDeps> {
         let cfg = sd.config()?;
         let runtime = crate::runtime::runtime_for_session(
             sd,
             &cfg,
-            self.agent.agent_root(),
+            self.agent.as_ref(),
             self.runtime_id.as_deref(),
-        )?;
+            &self.xllm,
+        )
+        .await?;
         let mut deps = RunnerDeps::new(
             &self.who,
             self.agent.clone(),
@@ -84,12 +90,13 @@ impl HostDeps {
         deps.objects = self.objects.clone();
         deps.turn_tasks = self.turn_tasks.clone();
         deps.notify = self.notify.clone();
+        deps.share = self.share.clone();
         deps.stop = stop;
         Ok(deps)
     }
 
     async fn drive(&self, sd: &SessionDir, until: StopWhen, stop: StopSignal) -> DriveResult {
-        match self.runner_deps(sd, stop) {
+        match self.runner_deps(sd, stop).await {
             Ok(deps) => drive(sd, &deps, until).await,
             Err(e) => DriveResult::BindFailed { error: e.to_json() },
         }
@@ -188,9 +195,9 @@ impl ChildDriver {
             Some(
                 DriveResult::NotDriver { .. }
                 | DriveResult::Unregistered
-                | DriveResult::BindFailed { .. }
                 | DriveResult::RecoveryBlocked(_),
             ) => false,
+            Some(DriveResult::BindFailed { error }) if error["recoverable"] != true => false,
             // Waiting for input it has no channel for: only its parent's
             // answer (a new session input) or the answer to a question it
             // asked through a notification can change that; the latter is
@@ -564,6 +571,10 @@ async fn serve_one(
                 // applied by this drive.
                 break r;
             }
+            DriveResult::BindFailed { error } if error["recoverable"] == true => {
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+                backoff
+            }
             DriveResult::NotDriver { .. }
             | DriveResult::Unregistered
             | DriveResult::BindFailed { .. }
@@ -690,12 +701,14 @@ impl Slot {
 }
 
 fn blocked(r: Option<&DriveResult>) -> bool {
+    if let Some(DriveResult::BindFailed { error }) = r {
+        return error["recoverable"] != true;
+    }
     matches!(
         r,
         Some(
             DriveResult::NotDriver { .. }
                 | DriveResult::Unregistered
-                | DriveResult::BindFailed { .. }
                 | DriveResult::RecoveryBlocked(_)
         )
     )
@@ -770,18 +783,17 @@ impl Supervisor {
         if slots.get(&sid).is_some_and(Slot::running) {
             return;
         }
-        let drives = slots
+        let previous = slots
             .get(&sid)
-            .map(|s| s.status.lock().expect("status").drives)
-            .unwrap_or(0);
+            .map(|s| s.status.lock().expect("status").clone());
         let status = Arc::new(Mutex::new(HostedStatus {
             session_id: sid.clone(),
             class: class.to_string(),
             loaded: true,
             loaded_at_ms: crate::now_ms(),
-            drives,
-            last_result: None,
-            last_result_at_ms: 0,
+            drives: previous.as_ref().map(|s| s.drives).unwrap_or(0),
+            last_result: previous.as_ref().and_then(|s| s.last_result.clone()),
+            last_result_at_ms: previous.as_ref().map(|s| s.last_result_at_ms).unwrap_or(0),
             idle_unload_secs: idle.map(|d| d.as_secs()),
             reason: reason.to_string(),
         }));

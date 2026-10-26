@@ -23,12 +23,12 @@ use libopendan::state::krpc::{KrpcTransport, StateTransport};
 use libopendan::state::{connect, AgentStateClient, ConnectOptions, StateLocator};
 use libopendan::{OpenDanError, SessionDir, SessionTemplate};
 use llm_context::deps::{LlmClient, LlmInferenceRequest};
-use llm_context::error::{LLMComputeError, ProviderFailure};
+use llm_context::error::{LLMComputeError, ProviderFailure, RefusalKind};
 use name_lib::DID;
 use ndn_lib::{MsgObjKind, MsgObject, ObjId};
 use opendan::loader::{Loader, LoaderEnv, SpecRef};
 use opendan::records::{self, AgentRecords, LocalRecords};
-use opendan::service::{Access, SERVICE_PATH};
+use opendan::service::{Access, SERVICE_PATH, WEB_API_PATH};
 use opendan::tasks::{NewTask, TaskService, TaskView};
 use opendan::ui::MailService;
 use serde_json::{json, Value};
@@ -41,6 +41,8 @@ struct Llm {
     calls: AtomicUsize,
     /// Calls that fail before the script answers.
     failures: AtomicUsize,
+    /// What the failing calls are: a provider error, or this policy refusal.
+    refusal: std::sync::Mutex<Option<RefusalKind>>,
     script: Box<dyn Fn(&LlmInferenceRequest, usize) -> String + Send + Sync>,
 }
 
@@ -49,6 +51,7 @@ impl Llm {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             failures: AtomicUsize::new(0),
+            refusal: std::sync::Mutex::new(None),
             script: Box::new(f),
         })
     }
@@ -59,8 +62,9 @@ impl LlmClient for Llm {
     async fn infer(&self, req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
         if self.failures.load(Ordering::SeqCst) > 0 {
             self.failures.fetch_sub(1, Ordering::SeqCst);
+            let refusal = *self.refusal.lock().unwrap();
             return Err(LLMComputeError::Provider {
-                failure: ProviderFailure::Unknown,
+                failure: refusal.map(ProviderFailure::Refused).unwrap_or(ProviderFailure::Unknown),
                 message: "provider refused the request".into(),
             });
         }
@@ -132,6 +136,7 @@ struct Mail {
     sent: Mutex<Vec<(String, MsgObject)>>,
     send_calls: AtomicUsize,
     unreachable: AtomicBool,
+    authentication_unavailable: AtomicBool,
     /// The conversations can replace a message in place.
     editable: AtomicBool,
     seq: AtomicUsize,
@@ -186,6 +191,9 @@ impl Mail {
 #[async_trait]
 impl MailService for Mail {
     async fn list_inboxes(&self, _owner: &DID) -> Result<Vec<MailboxAddress>, String> {
+        if self.authentication_unavailable.load(Ordering::SeqCst) {
+            return Err("authentication unavailable: host authorization required".into());
+        }
         let mut out: Vec<MailboxAddress> = Vec::new();
         for (r, _) in self.records.lock().unwrap().iter() {
             if !out.contains(&r.mailbox) {
@@ -495,6 +503,7 @@ impl World {
                 .notify
                 .clone()
                 .map(|n| n as Arc<dyn libopendan::notify::NotifyHost>),
+            share: None,
             access: Access::Open { who: WHO.into() },
             port,
             web_dir: None,
@@ -609,6 +618,53 @@ async fn rpc(port: u16, method: &str, params: Value) -> libopendan::Result<Value
         .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn web_api_routes_metadata_and_rpc_with_the_same_access_policy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for app_id in [None, Some("jarvis.alice")] {
+        let w = World::new();
+        let port = free_port();
+        let mut env = w.env(Llm::new(|_, _| "unused".into()), port).await;
+        std::fs::write(w.root.join("index.html"), "<html>WebUI</html>").unwrap();
+        env.web_dir = Some(w.root.clone());
+        if let Some(app_id) = app_id {
+            env.access = Access::Zone {
+                owner: "bob".into(),
+                app_id: app_id.into(),
+                trust_loopback: false,
+                zone_host: Some("test.buckyos.io".into()),
+            };
+        }
+        let loader = Loader::start(env).await.unwrap();
+        until("service answers", || {
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+        }).await;
+        let agent_path = format!("/kapi/{}", loader.agent.agent_id());
+        for path in [WEB_API_PATH, SERVICE_PATH, agent_path.as_str()] {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            stream.write_all(format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+                .await.unwrap().unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(headers.contains("application/json"), "{headers}");
+            assert_eq!(serde_json::from_str::<Value>(body).unwrap(), json!({ "app_id": app_id }));
+            let result = KrpcTransport::new(&format!("http://127.0.0.1:{port}{path}"), None)
+                .call("loader.status", json!({})).await;
+            if app_id.is_some() {
+                assert!(result.unwrap_err().to_string().contains("a session token is required"));
+            } else {
+                assert_eq!(result.unwrap()["agent_did"], AGENT);
+            }
+        }
+        loader.shutdown().await;
+    }
+}
+
 /// M1 / E4: what a caller without the AgentRoot gets over real kRPC is what
 /// the files say; signed writes arrive; a driver's writes are not served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -674,12 +730,6 @@ async fn agent_state_over_krpc_matches_the_files() {
         remote.behaviors().revision().await.unwrap(),
         local.behaviors().revision().await.unwrap()
     );
-    let cursor = remote.perception().cursor().await.unwrap();
-    assert_eq!(cursor, local.perception().cursor().await.unwrap());
-    assert_eq!(
-        remote.perception().backlog(&cursor).await.unwrap(),
-        local.perception().backlog(&cursor).await.unwrap()
-    );
     assert_eq!(
         remote.perception().last_seq(done.sid()).await.unwrap(),
         local.perception().last_seq(done.sid()).await.unwrap()
@@ -738,7 +788,7 @@ async fn agent_state_over_krpc_matches_the_files() {
     let err = rpc(port, "sessions.lookup", json!({})).await.unwrap_err();
     assert!(matches!(err, OpenDanError::InvalidArgument(_)), "{err:?}");
     // A driver's writes need the AgentRoot.
-    assert!(remote.locks().is_held("self_improve").is_err());
+    assert!(remote.locks().is_held(libopendan::memory::CONSOLIDATION_LEASE).is_err());
 
     // Observation and the Loader's own state.
     let view = rpc(port, "session.read", json!({ "sid": ui.sid() })).await.unwrap();
@@ -763,6 +813,7 @@ async fn agent_state_over_krpc_matches_the_files() {
     assert_eq!(view["hosted"]["session_id"], ui.sid());
     let status = rpc(port, "loader.status", json!({})).await.unwrap();
     assert_eq!(status["agent_did"], AGENT);
+    assert!(status["authentication"].is_null());
     let modules: HashMap<String, bool> = status["modules"]
         .as_array()
         .unwrap()
@@ -970,6 +1021,28 @@ async fn a_failed_turn_is_reported_to_the_speaker() {
     loader.shutdown().await;
 }
 
+/// AI Center Quota PRD §9.6: a Turn refused under the owner's AI quota tells
+/// the owner where to look in a direct chat, and fails without retrying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quota_refusal_tells_the_owner_where_to_look() {
+    let w = World::new();
+    std::fs::write(
+        w.root.join("i18n/en.toml"),
+        "[outbound]\nturn_failed = \"(something went wrong)\"\nai_quota_limited = \"(limited)\"\nai_quota_limited_owner = \"(your quota)\"\n",
+    )
+    .unwrap();
+    let llm = Llm::new(|_, _| "fine now".to_string());
+    *llm.refusal.lock().unwrap() = Some(RefusalKind::QuotaExhausted);
+    llm.failures.store(1, Ordering::SeqCst);
+    let loader = w.start(llm.clone()).await;
+    let session = format!("dm:{BOB}");
+    w.mail.deliver(&session, chat(BOB, "hello"));
+    until("refusal notice", || w.mail.sent().len() == 1).await;
+    assert_eq!(w.mail.sent().remove(0).1.content.content, "(your quota)");
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 0, "a refusal is not retried");
+    loader.shutdown().await;
+}
+
 /// M3: the Loader dies after the reply was committed and before msg-center
 /// took it. The next process sends the stored message — the same ObjId
 /// under the same key — and nothing is inferred or sent twice.
@@ -1016,6 +1089,37 @@ async fn a_committed_reply_survives_a_restart_and_is_sent_once() {
     assert_eq!(llm.calls.load(Ordering::SeqCst), 1, "no second inference");
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(w.mail.sent().len(), 1);
+    loader.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authentication_failure_keeps_the_inbox_unread_until_recovery() {
+    let w = World::new();
+    w.mail.authentication_unavailable.store(true, Ordering::SeqCst);
+    w.mail.deliver(&format!("dm:{BOB}"), chat(BOB, "message during auth failure"));
+    let llm = Llm::new(|_, _| "recovered reply".into());
+    let loader = w.start(llm.clone()).await;
+    let ui = loader.ui.as_ref().unwrap();
+    until("authentication unavailable is visible", || {
+        ui.status().last_error.as_deref().is_some_and(|error| error.contains("authentication unavailable"))
+    }).await;
+    assert_eq!(w.mail.unread(), 1);
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+    assert!(w.mail.sent().is_empty());
+    assert!(loader.agent.sessions().query(&RegistryQuery::default()).await.unwrap().is_empty());
+    loader.shutdown().await;
+
+    w.mail.authentication_unavailable.store(false, Ordering::SeqCst);
+    let loader = w.start(llm.clone()).await;
+    until("backlog reply delivered", || w.mail.sent().len() == 1).await;
+    assert_eq!(w.mail.unread(), 0);
+    assert_eq!(w.mail.sent()[0].1.content.content, "recovered reply");
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+    loader.shutdown().await;
+    let loader = w.start(llm.clone()).await;
+    loader.ui.as_ref().unwrap().scan().await.unwrap();
+    assert_eq!(w.mail.sent().len(), 1);
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
     loader.shutdown().await;
 }
 
@@ -1191,10 +1295,17 @@ async fn the_jarvis_package_loads_and_answers() {
     let loader = Loader::start(env).await.unwrap();
     assert_eq!(loader.config.language, "zh");
     assert_eq!(loader.config.llm_context["provider"]["type"], "buckyos");
-    for name in ["chat_route", "plan", "do", "work_simple", "goal"] {
+    for name in ["chat_route", "plan", "do", "work_simple", "goal", "plan_simple"] {
         let b = loader.agent.behaviors().get(name).await.unwrap().unwrap();
         assert!(b.prompt.system.is_some(), "{name}");
     }
+    // plan_simple: native function calls with an intent on every call and
+    // the background after tool results; its session class ends with an
+    // explicit report.
+    let plan_simple = loader.agent.behaviors().get("plan_simple").await.unwrap().unwrap();
+    let entry = plan_simple.to_entry("plan_simple", &loader.config.llm_context, true).unwrap();
+    assert!(entry.call_intent);
+    assert_eq!(entry.input.unwrap().background, libopendan::protocol::InputBackground::AfterTools);
     assert!(loader.agent.behaviors().get("task_route").await.unwrap().is_none());
     // Intent analysis: a fork of the UI context offered as a named function.
     let analyze = loader.agent.behaviors().get("analyze_intent").await.unwrap().unwrap();
@@ -2279,5 +2390,105 @@ async fn a_notification_shown_in_a_conversation_is_observed() {
     w.mail.deliver(&session, chat(BOB, "yes, postgres"));
     until("reply", || w.mail.sent().len() == 1).await;
     assert_eq!(w.mail.sent()[0].1.content.content, "noted");
+    loader.shutdown().await;
+}
+
+/// Q1 (primary-runtime TODO §6.1): a Session process on a machine without
+/// the agent's environment — no `OPENDAN_*` variable, no AgentRoot — finds
+/// its session in `.opendan/session.json` and reaches AgentService over
+/// kRPC with the session's token; what needs the control side runs there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_process_elsewhere_reaches_its_session_through_the_service() {
+    use libopendan::session_context::{SessionContext, TokenKey, CONTEXT_DIR, CONTEXT_FILE, TOKEN_FILE};
+    let w = World::new();
+    let port = free_port();
+    let bin = w.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["xagent", "agent-session"] {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_opendan"), bin.join(name)).unwrap();
+    }
+    let mut env = w.env(Llm::new(|_, _| "done".into()), port).await;
+    env.session_cli = Some(bin.join("xagent"));
+    let loader = Loader::start(env).await.unwrap();
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+    let mut spec = work_spec("work driven elsewhere", "go");
+    spec.driver = Some("app:other@alice".into());
+    let sd = create_session(&w.root.join("sessions"), spec, loader.agent.as_ref(), WHO, w.channels().as_ref())
+        .await
+        .unwrap();
+
+    // The session's working directory on "another machine".
+    let workdir = w.root.join("node").join("sessions").join(sd.sid());
+    let deep = workdir.join("build").join("out");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::create_dir_all(workdir.join(CONTEXT_DIR)).unwrap();
+    let key = TokenKey::load_or_create(&w.root).unwrap();
+    let write_context = |token: &str| {
+        let ctx = SessionContext {
+            agent_did: AGENT.into(),
+            agent_id: loader.agent.agent_id().into(),
+            session_id: sd.sid().into(),
+            trace_id: sd.sid().into(),
+            runtime_id: "lab".into(),
+            workdir: workdir.display().to_string(),
+            state_url: format!("http://127.0.0.1:{port}{SERVICE_PATH}"),
+            token_file: TOKEN_FILE.into(),
+            expires_at_ms: libopendan::session_context::token_expiry(token).unwrap_or(0),
+            workspace: None,
+        };
+        std::fs::write(workdir.join(CONTEXT_DIR).join(CONTEXT_FILE), serde_json::to_vec(&ctx).unwrap()).unwrap();
+        std::fs::write(workdir.join(CONTEXT_DIR).join(TOKEN_FILE), token).unwrap();
+    };
+    let helper = |args: &[&str], stdin: Option<&str>| {
+        use std::io::Write;
+        let mut cmd = std::process::Command::new(bin.join("agent-session"));
+        cmd.args(args).current_dir(&deep).env_clear().env("PATH", "/usr/bin:/bin")
+            .env(buckyos_api::ENV_EXECUTOR_CALL_ID, "call-7")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(stdin.unwrap_or_default().as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let soon = libopendan::now_ms() + 30 * 60 * 1000;
+    write_context(&key.sign(loader.agent.agent_id(), sd.sid(), soon));
+
+    let out = helper(&["sessions"], None);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(sd.sid()));
+    let out = helper(&["todo", "add", "from the node", "--content", "-"], Some("the Todo's text"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let list = libopendan::todos::store_of(&sd).load().unwrap().render_view();
+    assert!(list.contains("from the node"), "{list}");
+    // The token was close to its end: it was renewed on the way.
+    let renewed = std::fs::read_to_string(workdir.join(CONTEXT_DIR).join(TOKEN_FILE)).unwrap();
+    assert!(libopendan::session_context::token_expiry(&renewed).unwrap() > soon);
+
+    // Tasks of a run that is not in progress here; ask-user answers for the
+    // call it belongs to without asking the service.
+    let out = helper(&["task", "state", "t-1"], None);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
+    let out = helper(&["ask-user", "Which database?"], None);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let asked: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(asked["task_id"], "userinput:call-7");
+
+    // A token of another agent's key, an expired one: refused.
+    let stranger = TokenKey::load_or_create(&w.root.join("elsewhere")).unwrap();
+    write_context(&stranger.sign(loader.agent.agent_id(), sd.sid(), soon * 2));
+    let out = helper(&["sessions"], None);
+    assert_eq!(out.status.code(), Some(6), "{}", String::from_utf8_lossy(&out.stderr));
+    write_context(&key.sign(loader.agent.agent_id(), sd.sid(), libopendan::now_ms() - 1));
+    let out = helper(&["sessions"], None);
+    assert_eq!(out.status.code(), Some(6));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("expired"));
+    // A session token is for the session's methods only.
+    let token = key.sign(loader.agent.agent_id(), sd.sid(), soon * 2);
+    let err = KrpcTransport::new(&format!("http://127.0.0.1:{port}{SERVICE_PATH}"), Some(token))
+        .call("sessions.post_input", json!({"sid": sd.sid()}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cannot call"), "{err}");
     loader.shutdown().await;
 }

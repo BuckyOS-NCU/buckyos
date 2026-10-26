@@ -39,7 +39,6 @@
 | kind | 规则 |
 |---|---|
 | work | `work-<yyyymmddThhmmss>-<uuid_v4 32hex>`（UTC 时间）；带幂等键时 `work-H("work", agent_did, creator_principal, key)` |
-| self_improve | `si-<yyyymmddThhmmss>-<uuid>`；带幂等键时 `si-H("self_improve", agent_did, creator_principal, key)` |
 | self_check | `sc-H("self_check", agent_did)` |
 | goal | `goal-H("goal", agent_did, goal_id, epoch)`（epoch 为十进制字符串）；只由宿主为 Goal 创建（[Agent State Protocol](<Agent State Protocol.md>) §9），普通创建与子 Session 创建都拒绝 `goal` 类 |
 | ui | `ui-H("ui", agent_did, route_key)`；`route_key` 是该 Session 绑定的会话（OpenDAN 的 UI Session 用 msg-center 的 `MailboxAddress` 字符串）。未给 `route_key` 的 ui Session（本地对话）由创建函数补一个 `local:<幂等键或 uuid>`。宿主需要同一个 `route_key` 下的多代 Session 时显式传 sid（OpenDAN：`ui-H("ui", agent_did, route_key, <代次>)`） |
@@ -56,7 +55,7 @@ Schema：`schema/session_config.schema.json`。要点：
   "config_rev": 1,                    // 运行中可改的字段（订阅）变化时 +1
   "session": {
     "session_id": "...", "agent_did": "did:bns:jarvis.alice",
-    "kind": "work | self_improve | self_check | ui | goal", "class": "work",
+    "kind": "work | self_check | ui | goal", "class": "work",
     "created_at_ms": 0,
     "created_by": { "principal": "app:app2@alice", "via": "app" },
     "driver": { "principal": "app:app2@alice" },   // 推进身份，创建后不变
@@ -91,7 +90,10 @@ Schema：`schema/session_config.schema.json`。要点：
     "history_budget_tokens": null, "compact_ratio": null
   },
   "runtime": { "requirement": { "runtime_id": null, "tools": ["node"], "app_tools": [] },
-               "tool_plan": null, "env": {} },
+               "tool_plan": null, "env": {},
+               "frozen": { "runtime_id": "host", "kind": "host_native", "exec": { "kind": "remote_node", "remote_node": { "node_did": "did:dev:…", "profile_id": "agent-…" } },
+                           "revision": 3, "selected_by": "explicit | inherited | default", "computer": "observe",
+                           "baseline": "standard | extended", "platform": { "os": "macos", "arch": "aarch64", "shell": "zsh" } } },
   "workspace": null | { "workspace_id": "ws-…", "access": "read_write" },
   "workspace_binding": null | { "workspace_id": "ws-…", "revision": 1, "location_revision": 1, "runtime_host": "host:…", "location": { "runtime_id": "local", "directory": "/abs" }, "access": "read_write" },
   "artifact_id": null,
@@ -122,8 +124,7 @@ Schema：`schema/session_config.schema.json`。要点：
   - 会话的初始 behavior（`prompt.behavior`）没有自己的条目时，视为使用会话基础配置的 `switch_context` 目标。交接到其它没有条目的 behavior 是配置错误：当前 Turn 以 `failed` 结束（`last_error.kind = behavior_config`）；发生在子 context 内时作为失败结果交回调用方。
   - 表在每次推进开始时校验，非法（未知 mode、fork 带 system 等）则不做任何推理。旧的 `extensions.opendan.process_modes` 不再接受。
 - 工具 `call_behavior({behavior, task})`：在 `prompt.llm_context.tools.tools` 中以 `{"name": "call_behavior"}` 显式装配后，context 可以用工具调用（或 behavior action）发起子 context（目标必须是 `create_sub_context` / `fork`）。只由会话自己的 runner 提供；xllm 不具备该工具，拒绝接手装配了它的 run。
-- `extensions.opendan.perception_window`：self_improve session 要整理的感知窗口（见 Agent State Protocol §4）。
-- `session.policy`（版本 6）：Session 模板（`work / ui / self_improve / self_check / goal`，`agent.toml [session.<class>]` 可覆盖）在创建时解析的结果，随配置冻结。
+- `session.policy`（版本 6）：Session 模板（`work / ui / self_check / goal`，`agent.toml [session.<class>]` 可覆盖）在创建时解析的结果，随配置冻结。
   - `completion`：`natural`（缺省）沿用普通 function-call `Done` 和已获准结束报告的 end_condition；`explicit_report` 仅获准的结束报告可正常关闭 Session。普通 Done 完成 Turn：有输入队列则等待，无队列则 `finished + failed`、`missing_end_report`。`agent.toml [session.<class>] completion` 可覆盖模板值。
   - `wait_user_msg`：`WAIT_USER_MSG` 在该 Session 的含义。`allowed`：Turn 保持打开等输入（已交付回复则完成该 Turn）；`finish_failed`：Turn 以 `failed` 关闭、Session `finished + failed`，`last_error.kind = needs_user_input`，问题写入 report（不影响工具 / task 等待）；`finish_completed`：按交付结果处理；`end_turn`：没有人此刻回答，Turn 以 `completed` 关闭（带着它的问题），Session 不结束、继续等下一个输入（Goal Session）。
   - `observe`：`off` 不注入半订阅快照；`events` 注入快照；`events_and_active` 另在受控输入里给出活动 Session 列表。`load_hints`：是否装配 hints。
@@ -304,7 +305,9 @@ runs/<run_id>/exec/<call_id>/     shell 命令的执行目录：command、stdout
 | `handover` | run 停在 behavior 交接点：`{next_behavior, at_ms}`，与让出时的快照、`status = paused` 在**同一次** run.json 写入中记录（run.json 版本 6）。非空时任何执行者都不得在该 run 上继续推理：xllm 遇到宿主 run 的 `Done{next_behavior=B}` 只记录它（不记 `completed`），`xllm --resume` 拒绝接手；由会话读取 B 的进入模式并提交转移。会话重新打开该 run 执行（status 回到 `running`）时清除 |
 | `usage.llm_requests` | 本 run 的推理尝试数：libopendan 在每个 outcome 后加上本段经 run 的 `LlmClient::infer` 发起的 Round 数（含失败 / 中断），xllm 接手后在其上继续累加；任何执行者都不重置或覆盖 |
 
-快照 `state.host["libopendan"]`（HostMeta）：`{session_id, base_input_len, process_entry, inherited_below, input_receipts[], history_epoch?, epoch_turn?, epoch_input_seq?}`，各执行者必须原样保留。后三项在第一次中途重写后出现（为 0 时省略）：`history_epoch` 是本 run 已发生的中途重写次数，`epoch_turn` 是当前 epoch 开始时所在的 Turn（新 epoch 中先于任何 receipt 的条目归属于它），`input_seq ≤ epoch_input_seq` 的 receipt 属于更早的 epoch（身份仍有效，位置不再适用）。
+快照 `state.host["libopendan"]`（HostMeta）：`{session_id, base_input_len, process_entry, inherited_below, input_receipts[], history_epoch?, epoch_turn?, epoch_input_seq?, observed?, observed_epoch?}`，各执行者必须原样保留。`history_epoch` 三项在第一次中途重写后出现（为 0 时省略）：`history_epoch` 是本 run 已发生的中途重写次数，`epoch_turn` 是当前 epoch 开始时所在的 Turn（新 epoch 中先于任何 receipt 的条目归属于它），`input_seq ≤ epoch_input_seq` 的 receipt 属于更早的 epoch（身份仍有效，位置不再适用）。`observed`（行键 → 文本摘要）与 `observed_epoch` 只出现在 `[input] background = "after_tools"` 的 run：工具结果后已展示的背景行，随展示它们的 `<<background_context>>` 消息一起发布；`observed_epoch ≠ history_epoch` 时视为空（重写后重新展示）。这条消息没有 receipt，不是输入，按普通用户消息写入 worklog。
+
+run.json `host.extra` 中由宿主冻结、恢复与重建工具时沿用的键：`call_intent: true`（该 run 的 behavior 声明 `[capabilities] call_intent`：每个原生函数的 schema 带 required 的 `intent`，执行前校验，交给工具前去掉，in-flight 记录与快照保留原始参数）、`background: "after_tools"`。
 
 **run 生命周期**：
 
@@ -348,7 +351,7 @@ Session 的 function_call 默认启用工具列表含宿主 `report`；自定义
 
 XML 的 `<report end="true">` 与工具 `is_end=true` 使用相同的宿主校验、报告归属及最终交付。`end` 缺省或 false 为阶段报告；true 与任何本次动作（XML actions、sendmsg、provider-native tool_calls）或非空 next_behavior 互斥。空 actions 允许；非法布尔值、重复 report、空结束报告，以及 END/done 终止指令均拒绝，副作用前反馈可修正错误。没有 report/动作/调度的空决策也反馈纠错。同层可带 `<artifacts>["out.txt"]</artifacts>` 和 `<result>{"ok":true}</result>`，须同次有 report；正文保持自由文本。
 
-产物是显式选择的工作目录相对文件路径或对象 id（如 `cyfile:…`），不从正文或目录扫描推断。不含路径分隔符和空白、能解析为 ObjId 的项按对象 id 处理，原样登记，不读文件。文件项拒绝绝对路径、上级路径、目录及逃逸工作目录的符号链接；宿主保存 `.opendan_agent_session/reports/<submission_id>/<index>-<sha256>` 稳定副本，源文件随后变化不改变交付。宿主提供对象库（`RunnerDeps.objects`）时，接受报告时把稳定副本放入对象库，对象名取产物文件名。记录为 `{path, reference?, digest?, obj_id?}`：文件项有 reference / digest，放入成功或本来就是对象 id 时有 obj_id（规范的 `type:hex` 形式）。放入失败只记日志，报告照常接受，产物不带 obj_id。JSON result 不固定业务 schema，显式 null 也保留。
+产物是显式选择的工作目录相对文件路径或对象 id（如 `cyfile:…`），不从正文或目录扫描推断。不含路径分隔符和空白、能解析为 ObjId 的项按对象 id 处理，原样登记，不读文件。文件项拒绝绝对路径、上级路径、runtime URI（如 `host:/…`）、目录及逃逸工作目录的符号链接；跨 Session 转交使用已提交的 obj_id，不能转交另一个 Session 的相对路径或节点路径。宿主保存 `.opendan_agent_session/reports/<submission_id>/<index>-<sha256>` 稳定副本，源文件随后变化不改变交付。宿主提供对象库（`RunnerDeps.objects`）时，接受报告时把稳定副本放入对象库，对象名取产物文件名。记录为 `{path, reference?, digest?, obj_id?}`：文件项有 reference / digest，放入成功或本来就是对象 id 时有 obj_id（规范的 `type:hex` 形式）。对象库上传失败时拒绝该次报告并返回可纠正错误，不接受无附件的成功交付；未提供对象库的独立运行环境仍可保留稳定文件。JSON result 不固定业务 schema，显式 null 也保留。
 
 `ReportSubmission` 的 schema 为 `report_submission.schema.json`：`{id, run_id, source, report, artifacts, result?, is_end, accepted_at_ms}`。source 是 `{kind:"tool", call_id}` 或 `{kind:"behavior", step_index}`；id 由 run 和 source 确定。`run.json.host.extra.reports` 保存已接受提交，结束意图独立于普通阶段报告。重复同源同参数返回已保存回执；同源变参拒绝。工具结果仅给出 accepted、report_id 和 is_end，不重复报告正文。
 
@@ -393,16 +396,20 @@ XML 的 `<report end="true">` 与工具 `is_end=true` 使用相同的宿主校�
 ## 9. binding.json 与 .runtime/bin
 
 ```jsonc
-{ "schema": "opendan.binding/4", "runtime_id": "rt-…", "kind": "native | tmux", "target": {"host":"host:…", "uid":"1000"}, "workdir": "/abs", "workspace": null, "bound_at_ms": 0, "bound_by": "rn-…" }
+{ "schema": "opendan.binding/5", "runtime_id": "rt-…", "kind": "native | remote_node", "target": {"host":"host:…", "uid":"1000"}, "workdir": "/abs", "workspace": null, "bound_at_ms": 0, "bound_by": "rn-…" }
 ```
 
+- `runtime.frozen`（2026-10-25 起为 session-runtime）：创建时由 `api::freeze_runtime` 一次解析并冻结的 session-runtime（显式 > 继承父 Session > Agent 默认；Workspace 不参与），带登记时声明的 `baseline` 与已知的 `platform`，恢复与重试只用它，不再读 Agent 默认值；`kind` 为 `host_native | remote_node` 的 Session 经 Node Executor 执行，binding 的 `workdir` 是节点上的目录（`C:\…` 等按目标 OS 书写，控制侧不 canonicalize），`target` 含 node_did / profile_id / store_id / workdir_roots / identity_mode。幂等重建比较 `runtime.runtime_id()`：同 idempotency key 换 runtime 是冲突。
+
 - 首次推进时用不覆盖发布写入（`link` / `renameat2(NOREPLACE)`），之后不变；runtime_id 不同必须拒绝（RuntimeMismatch），发生在任何推理之前。
-- workdir：有 Workspace 时只采用创建时固化的 `workspace_binding.location.directory`；显式 Runtime workdir 必须与它一致。无 Workspace 时采用 SessionDir。`binding.workspace` 保存同一快照；运行及恢复时核验稳定身份和位置修订，失效终态失败、不重绑。见 [Agent Workspace Protocol](<Agent Workspace Protocol.md>)。
+- workdir：始终是 session-runtime 上的 Session 工作目录（container 为 SessionDir，节点为 `<roots[0]>/.opendan/<agent>/sessions/<sid>`）；显式 Runtime workdir 必须与它一致，否则绑定失败。Workspace 不改变默认位置：`binding.workspace` 保存创建时固化的 `workspace_binding` 快照（其 `location.runtime_id` 即 Workspace 的 runtime，可与 session-runtime 不同），运行及恢复时核验稳定身份和位置修订，失效终态失败、不重绑。见 [Agent Workspace Protocol](<Agent Workspace Protocol.md>)。版本 4 的 binding（workdir 曾是 Workspace 目录）读取即阻塞，不迁移。
+- 节点 Session 的工作目录里另有 `.opendan/session.json`（Session 上下文：agent、session、runtime、workdir、`state_url`、workspace 视图）与 `.opendan/session.token`（只对本 Agent 服务、本 Session 有效的 token，24 小时，每次绑定重写）：节点上的 `agent-session` 等 helper 由此经 kRPC（`session.helper / session.task / session.token_refresh / session.service_token`）找 AgentService，见 [Agent State Protocol](<Agent State Protocol.md>)。
+- `state/transfers/<transfer_id>.json`：`agent-session copy` 的记录（源 / 目的的 runtime 与实际路径、临时文件、大小、整文件 hash、`transferring | verifying | committed | failed | cancelled`、失败步骤）；同一调用的重试据此核验目标而不重复覆盖。
 - binding.json 核验打开后的 runtime_id、kind、target、workdir，不只比较声明的 kind；每次推进都要幂等修复并核验环境：`.runtime/bin` 按期望集合（tool_plan 墓碑 + `agent-session` 包装脚本）重写，`.manifest.json`（条目 → sha256）最后写入；核验失败（缺文件、内容不符、不可执行）不得推理，下次推进修复。
 - 墓碑：`#!/bin/sh` 输出 `{"blocked_by":"tool_plan",...}` 与人读说明到 stderr，`exit 127`。
-- **tmux runtime 属于 Session**：`runtime_id`（配置、run 的 runtime descriptor、binding 三处）等于 session_id；tmux session 名由 session_id 导出（`od_` + 非 `[A-Za-z0-9_]` 字符替换为 `_`）。配置、`runtime.requirement.runtime_id` 或显式参数给出别的 id / 名称是配置错误，在创建目标和推理之前拒绝。首次绑定时目标不存在则创建、已存在则复用；已有 binding 时只 attach 绑定记录的目标，目标丢失或身份改变按绑定错误停止，不以同名新目标继续旧执行。目标上的 tmux 选项 `@opendan_session` 记录所属 session_id：两个 session_id 的名称规整后相同，后者被拒绝。同一 Session 的全部 Turn、behavior、子 context、fork 与恢复使用这一个目标；子 Session 继承的是配置，按自己的 session_id 得到自己的目标。创建 Session 不创建目标；run / Turn 结束与宿主退出不销毁它。
+- **runtime 属于 Session**：同一 Session 的全部 Turn、behavior、子 context、fork 与恢复使用同一个 runtime 与绑定；子 Session 继承父冻结的 runtime 与配置，首次推进时自己绑定。创建 Session 不绑定。
 
-共享 Runtime 来自 agent_tool::runtime，执行实现不再保留在 Session 层；Session 仅装配 bin/helper 与通用环境。prompt.llm_context.runtime 是构造配置，runtime.requirement 是绑定要求；推理、工具及旧执行恢复前先核验 binding。control workdir（run.json.workdir）与执行 cwd（config.runtime.workdir）分开保存。Session helper 未部署到远端时 remote_ssh 报 Capability，不把本地 bin 路径放进远端 PATH。
+共享 Runtime 来自 agent_tool::runtime，执行实现不再保留在 Session 层；Session 仅装配 bin/helper 与通用环境。prompt.llm_context.runtime 是构造配置，runtime.requirement 是绑定要求；推理、工具及旧执行恢复前先核验 binding。control workdir（run.json.workdir）与执行 cwd（config.runtime.workdir）分开保存。Session helper 未部署到远端时 remote_ssh 报 Capability，不把本地 bin 路径放进远端 PATH。节点 runtime（`remote_node`）的 Session 不把控制侧的 bin、cmd_skill 命令目录与 AgentRoot `tools/` 放进节点 PATH，命令只来自节点自身的 PATH；`agent-session` 等 helper 需在节点上安装并经 kRPC 访问控制面（[Session Runtime TODO](../../../notepads/opendan-primary-runtime-tools-todo.md) §6.1，未实施），在此之前节点 Session 中调用它们会失败；报告中列出的节点文件通过冻结的 Node Executor 分段读取到控制侧稳定副本，再上传对象库取得 obj_id；核验绑定的节点、profile、store 和执行身份，按节点的路径规则拒绝越出会话工作目录的符号链接，每段核对规范路径、整文件长度、分段长度和内容摘要。分段遵守 executor 的 max_file_bytes，不能截断大文件后作为成功产物提交。现有读取协议不提供跨分段文件快照，产物提交期间不得继续改写源文件。
 
 ## 10. 恢复顺序（drive 开头）
 

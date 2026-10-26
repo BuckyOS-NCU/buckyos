@@ -9,13 +9,16 @@
 //! present a verified session token (`Authorization: Bearer` or `?token=`).
 
 use crate::msg_center::MessageCenter;
-use buckyos_api::get_buckyos_api_runtime;
+use buckyos_api::{
+    get_buckyos_api_runtime, AccessDenial, DenyReason, SessionScope, ACCESS_DENIED_ERROR_CODE,
+    MSG_CENTER_SERVICE_NAME,
+};
 use buckyos_http_server::ServerError;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use kRPC::RPCContext;
-use ndn_lib::{load_named_obj, ChunkId, FileObject, ObjId};
+use ndn_lib::{load_named_obj, FileObject, ObjId};
 use tokio::io::AsyncReadExt;
 
 type Body = BoxBody<Bytes, ServerError>;
@@ -129,6 +132,12 @@ pub(crate) fn guess_mime(name: &str) -> &'static str {
 /// Serve an object request. Returns `None` when the path is not an object
 /// route so the caller can fall through to other handlers.
 pub(crate) async fn serve(center: &MessageCenter, req: &Request<Body>) -> Option<Response<Body>> {
+    req.uri().path().strip_prefix(OBJECTS_PATH)?;
+    let request = Box::pin(serve_object(center, req));
+    crate::owner_session::serve_opened("objects.read", SessionScope::MsgGroup, request).await
+}
+
+async fn serve_object(center: &MessageCenter, req: &Request<Body>) -> Option<Response<Body>> {
     let path = req.uri().path();
     let rest = path.strip_prefix(OBJECTS_PATH)?;
     if req.method() != http::Method::GET {
@@ -161,10 +170,36 @@ pub(crate) async fn serve(center: &MessageCenter, req: &Request<Body>) -> Option
         token: Some(token),
         ..Default::default()
     };
-    match center.caller_identity(&ctx).await {
-        Ok(Some(_)) => {}
+    let caller = match center.caller_identity(&ctx).await {
+        Ok(Some(caller)) => caller,
         Ok(None) => return Some(text_response(StatusCode::UNAUTHORIZED, "unauthenticated")),
-        Err(_) => return Some(text_response(StatusCode::UNAUTHORIZED, "unauthenticated")),
+        Err(error) => {
+            if let Some(denial) = AccessDenial::from_rpc_error(&error) {
+                return Some(denial_response(StatusCode::FORBIDDEN, denial));
+            }
+            return Some(text_response(StatusCode::UNAUTHORIZED, "unauthenticated"));
+        }
+    };
+    let context = query_param(req.uri().query().unwrap_or(""), "context_path");
+
+    // A restricted session (Session Only guest) has no objects grant: it
+    // reads a Session message, or an object one references, only through
+    // that message's context, checked now.
+    if caller.restricted() {
+        let authorized = match context.as_deref() {
+            Some(context) => center
+                .authorize_session_object(&ctx, &obj_id, context)
+                .await
+                .is_ok(),
+            None => false,
+        };
+        if !authorized {
+            return Some(grant_missing(&caller.user_id));
+        }
+        if let Ok(Some((_, body, jwt))) = center.groups.object(&obj_id).await {
+            return Some(group_message_response(body, jwt));
+        }
+        return Some(fetch_authorized_object_path(&obj_id, want_content, query_param(req.uri().query().unwrap_or(""), "inner_path")).await);
     }
 
     if center
@@ -179,16 +214,8 @@ pub(crate) async fn serve(center: &MessageCenter, req: &Request<Body>) -> Option
         if center.authorize_message(&ctx, &obj_id).await.is_err() {
             return Some(text_response(StatusCode::NOT_FOUND, "not-found"));
         }
-        let (mime, body) = match jwt {
-            Some(jwt) => (ndn_lib::CYFS_CONTENT_TYPE_NAMED_OBJECT_JWT, Some(jwt)),
-            None => (ndn_lib::CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON, body),
-        };
-        return Some(match body {
-            Some(body) => bytes_response(StatusCode::OK, mime, body.into_bytes()),
-            None => text_response(StatusCode::NOT_FOUND, "not-found"),
-        });
+        return Some(group_message_response(body, jwt));
     }
-    let context = query_param(req.uri().query().unwrap_or(""), "context_path");
     if center
         .authorize_attachment(&ctx, &obj_id, context.as_deref())
         .await
@@ -196,18 +223,74 @@ pub(crate) async fn serve(center: &MessageCenter, req: &Request<Body>) -> Option
     {
         return Some(text_response(StatusCode::NOT_FOUND, "not-found"));
     }
-    Some(fetch_authorized_object(&obj_id, want_content).await)
+    Some(fetch_authorized_object_path(&obj_id, want_content, query_param(req.uri().query().unwrap_or(""), "inner_path")).await)
+}
+
+/// A stored group message: its signed form when it has one.
+fn group_message_response(body: Option<String>, jwt: Option<String>) -> Response<Body> {
+    let (mime, body) = match jwt {
+        Some(jwt) => (ndn_lib::CYFS_CONTENT_TYPE_NAMED_OBJECT_JWT, Some(jwt)),
+        None => (ndn_lib::CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON, body),
+    };
+    match body {
+        Some(body) => bytes_response(StatusCode::OK, mime, body.into_bytes()),
+        None => text_response(StatusCode::NOT_FOUND, "not-found"),
+    }
+}
+
+/// A refused read of a restricted visitor: missing and not granted read the
+/// same, as a D-4 denial (`resource_grant_missing`).
+fn grant_missing(subject: &str) -> Response<Body> {
+    log::warn!("msg-center denied {} on objects.read: resource_grant_missing", subject);
+    let denial = AccessDenial::new(DenyReason::ResourceGrantMissing)
+        .at(MSG_CENTER_SERVICE_NAME, "objects.read");
+    denial_response(StatusCode::NOT_FOUND, denial)
+}
+
+/// A D-4 denial as the kRPC wire carries it (`error`, `code`, `data`).
+fn denial_response(status: StatusCode, denial: AccessDenial) -> Response<Body> {
+    let body = serde_json::json!({
+        "error": denial.reason.as_str(),
+        "code": ACCESS_DENIED_ERROR_CODE,
+        "data": denial,
+    });
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .body(
+            Full::new(Bytes::from(body.to_string()))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
 }
 
 pub(crate) async fn fetch_authorized_object(obj_id: &ObjId, want_content: bool) -> Response<Body> {
+    fetch_authorized_object_path(obj_id, want_content, None).await
+}
+
+async fn fetch_authorized_object_path(root: &ObjId, want_content: bool, inner_path: Option<String>) -> Response<Body> {
     let runtime = match get_buckyos_api_runtime() {
         Ok(runtime) => runtime,
         Err(_) => return text_response(StatusCode::SERVICE_UNAVAILABLE, "named store unavailable"),
     };
-    let named_store = match runtime.get_named_store().await {
+    let named_store = match runtime.get_local_named_store().await {
         Ok(store) => store,
         Err(_) => return text_response(StatusCode::SERVICE_UNAVAILABLE, "named store unavailable"),
     };
+    let mut obj_id = root.clone();
+    if let Some(path) = inner_path {
+        for name in path.split('/') {
+            if name.is_empty() || name == "." || name == ".." || name.contains('\\') {
+                return text_response(StatusCode::BAD_REQUEST, "invalid inner path");
+            }
+            obj_id = match named_store.get_dir_child(&obj_id, name).await {
+                Ok(child) => child,
+                Err(_) => return text_response(StatusCode::NOT_FOUND, "directory entry unavailable"),
+            };
+        }
+    }
     let obj_str = match named_store.get_object(&obj_id).await {
         Ok(value) => value,
         Err(error) => {
@@ -245,16 +328,7 @@ pub(crate) async fn fetch_authorized_object(obj_id: &ObjId, want_content: bool) 
             "file is too large for inline download",
         );
     }
-    let chunk_id = match ChunkId::new(file_obj.content.trim()) {
-        Ok(id) => id,
-        Err(_) => {
-            return text_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "file content is not a single chunk",
-            )
-        }
-    };
-    let (mut reader, len) = match named_store.open_chunk_reader(&chunk_id, 0).await {
+    let (mut reader, len) = match named_store.open_reader(&obj_id, None).await {
         Ok(value) => value,
         Err(_) => return text_response(StatusCode::NOT_FOUND, "file content unavailable"),
     };

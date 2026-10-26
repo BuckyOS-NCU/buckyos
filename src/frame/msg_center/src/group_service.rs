@@ -2,8 +2,9 @@ use crate::group_store::{db_error, GroupTransaction};
 use crate::group_types::*;
 use crate::msg_center::MessageCenter;
 use buckyos_api::{
-    get_buckyos_api_runtime, DeliveryRecord, DeliveryState, DispatchResult, MailboxAddress,
-    MailboxKind, MailboxRecord, RecipientState, TokenPrincipalKind,
+    get_buckyos_api_runtime, DeliveryRecord, DeliveryState, DenyReason, DispatchResult,
+    EntryDescription, EntryMethods, EntryResource, EntryState, MailboxAddress, MailboxKind,
+    MailboxRecord, RecipientState, SessionScope, TokenPrincipalKind,
 };
 use kRPC::RPCContext;
 use name_lib::DID;
@@ -45,6 +46,8 @@ fn within(window: Option<u64>, start: u64, now: u64) -> bool {
     window.is_none_or(|w| w > 0 && now.saturating_sub(start) <= w)
 }
 const AGENT_GROUP_DISABLED: &str = "agent_group_disabled";
+/// Public (no session): the guest entry of a hosted group (contract §8.4).
+pub(crate) const METHOD_GROUP_DESCRIBE_ENTRY: &str = "group.describe_entry";
 const JOIN_METHODS: &[&str] = &[
     "group.accept_invitation",
     "group.request_join",
@@ -68,13 +71,17 @@ impl MessageCenter {
             .caller_identity(ctx)
             .await?
             .ok_or_else(|| denied("authentication-required"))?;
-        let verified = self
-            .token_verifier
-            .get()
-            .verify(ctx.token.as_deref().unwrap())
-            .await?;
         let did = match caller.user_did {
             Some(d) => d,
+            // An App's own service session acts as its owner in groups (the token subject),
+            // with the App as the client that `allowed_clients` judges (EXT-09: the App
+            // pre-invites the customers it signs in).
+            None if caller.principal_kind == TokenPrincipalKind::App => self
+                .token_verifier
+                .get()
+                .resolve_user_did(&caller.user_id)
+                .await
+                .map_err(|error| denied(format!("cannot resolve app owner identity: {error}")))?,
             None => {
                 let config = self.cyfs_dispatch.read().unwrap().clone();
                 config
@@ -85,22 +92,129 @@ impl MessageCenter {
                     .ok_or_else(|| denied("principal-did-unavailable"))?
             }
         };
-        if caller.principal_kind == TokenPrincipalKind::App && verified.appid.is_none() {
+        if caller.principal_kind == TokenPrincipalKind::App && caller.appid.is_none() {
             return Err(denied("client-identity-required"));
         }
         Ok(GroupActor {
             did,
-            client: verified.appid,
+            client: caller.appid,
             remote: false,
         })
     }
 
+    /// `group.*` kRPC; opened to restricted sessions (Session Only guests),
+    /// whom the group and Session ACLs then decide on. A restricted visitor
+    /// sees one D-4 reason for a group or Session that is missing or not
+    /// granted (`resource_grant_missing`, the group's reason as detail).
     pub(crate) async fn group_rpc(&self, method: &str, p: Value, ctx: RPCContext) -> Result<Value> {
-        if p.get("actor_did").is_some() || p.get("host_owner").is_some() {
-            return Err(invalid("actor-is-derived-from-authentication"));
+        let request = Box::pin(async move {
+            if p.get("actor_did").is_some() || p.get("host_owner").is_some() {
+                return Err(invalid("actor-is-derived-from-authentication"));
+            }
+            let caller = self.caller_identity(&ctx).await?;
+            let actor = self.group_actor(&ctx).await?;
+            self.group_rpc_authenticated(method, p, ctx, actor)
+                .await
+                .map_err(|error| match (error, caller) {
+                    (kRPC::RPCErrors::NoPermission(reason), Some(caller)) if caller.restricted() => {
+                        crate::owner_session::restricted_group_denial(&caller.user_id, reason)
+                    }
+                    (error, _) => error,
+                })
+        });
+        crate::owner_session::serve_opened(method, SessionScope::MsgGroup, request).await
+    }
+
+    /// Public description of a hosted group's guest entry: the group name and
+    /// the sign-in methods the entry allows, nothing about members or
+    /// Sessions. Missing, disabled and closed entries read the same.
+    pub(crate) async fn describe_group_entry(&self, p: &Value) -> Result<Value> {
+        let group: DID = field(p, "group_did")?;
+        let unavailable = || encoded(EntryDescription::unavailable());
+        let Some(g) = self
+            .groups
+            .load(&group)
+            .await?
+            .filter(|g| g.lifecycle == "active")
+        else {
+            return unavailable();
+        };
+        let config = g.config()?;
+        let Some(entry) = config.membership.guest_entry else {
+            return unavailable();
+        };
+        let methods = EntryMethods::from(entry.auth_methods);
+        if methods == EntryMethods::default() {
+            return unavailable();
         }
-        let actor = self.group_actor(&ctx).await?;
-        self.group_rpc_authenticated(method, p, ctx, actor).await
+        let title = config
+            .profile
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| group.to_string());
+        let owner_name = self
+            .contact_mgr
+            .get_contact(g.owner.clone(), None)
+            .await?
+            .map(|contact| contact.name)
+            .filter(|name| !name.trim().is_empty());
+        encoded(EntryDescription {
+            state: EntryState::Active,
+            resource: Some(EntryResource {
+                kind: "message_group".into(),
+                title,
+                owner_name,
+                path: format!("/messagehub/guest?group={}", group.to_string()),
+            }),
+            methods,
+            expires_at: None,
+        })
+    }
+
+    /// A visitor opens a Session through the public entry only by a sign-in
+    /// method the entry allows and the Zone has not switched off (D-8).
+    async fn require_guest_entry_method(&self, ctx: &RPCContext, group: &DID) -> Result<()> {
+        let Some(caller) = self.caller_identity(ctx).await? else {
+            return Ok(());
+        };
+        let entry = self
+            .groups
+            .load(group)
+            .await?
+            .filter(|g| g.lifecycle == "active")
+            .map(|g| g.config())
+            .transpose()?
+            .and_then(|config| config.membership.guest_entry);
+        let Some(entry) = entry else {
+            return Err(crate::owner_session::gate_denial(
+                DenyReason::EntryUnavailable,
+                &caller.user_id,
+            ));
+        };
+        let methods = EntryMethods::from(entry.auth_methods);
+        if !methods.allows_session(caller.auth_method) {
+            return Err(crate::owner_session::gate_denial(
+                DenyReason::EntryUnavailable,
+                &caller.user_id,
+            ));
+        }
+        let settings = self.token_verifier.get().sso_settings().await.map_err(|error| {
+            log::warn!("read Zone SSO settings failed: {}", error);
+            crate::owner_session::gate_denial(
+                DenyReason::AuthorizationUnavailable,
+                &caller.user_id,
+            )
+        })?;
+        if !methods.effective(&settings).0.allows_session(caller.auth_method) {
+            return Err(crate::owner_session::gate_denial(
+                DenyReason::ZoneMethodDisabled,
+                &caller.user_id,
+            ));
+        }
+        Ok(())
     }
     /// The App an Agent is built into (AppId == AgentId) speaks for that
     /// Agent when it runs as the Agent's owner.
@@ -179,9 +293,22 @@ impl MessageCenter {
         if method == "group.list_by_member" {
             let mut groups = vec![];
             let mut invitations = vec![];
+            let mut session_invitations = vec![];
             for g in self.groups.list().await? {
                 if g.lifecycle == "deleted" || g.check_client(&actor).is_err() {
                     continue;
+                }
+                // Sessions the caller is invited into as a guest (Session Only).
+                for (sid, records) in &g.participants {
+                    let invited = records
+                        .get(&actor.did.to_string())
+                        .filter(|r| r.kind == "guest" && r.state == "invited");
+                    let session = g.sessions.get(sid).filter(|s| s.lifecycle == "active");
+                    if let (Some(r), Some(session)) = (invited, session) {
+                        if g.lifecycle == "active" && !g.blocked(&actor.did) {
+                            session_invitations.push(json!({"group_did":g.group_did,"group_name":g.config()?.profile.get("name"),"session_id":sid,"session":session_key(&g.group_did,Some(sid))?,"title":session.shared_state.get("title"),"invited_by":r.actor}));
+                        }
+                    }
                 }
                 let record = g.members.get(&actor.did.to_string());
                 if g.role(&actor.did).is_some()
@@ -208,9 +335,14 @@ impl MessageCenter {
                 }
             }
             let joined = self.joined_groups(&actor.did).await?;
-            return Ok(json!({"items":groups,"invitations":invitations,"joined":joined}));
+            return Ok(
+                json!({"items":groups,"invitations":invitations,"session_invitations":session_invitations,"joined":joined}),
+            );
         }
         let group: DID = field(&p, "group_did")?;
+        if method == "group.submit_guest_request" {
+            self.require_guest_entry_method(&ctx, &group).await?;
+        }
         if method == "group.sync_joined" {
             let route = self
                 .cyfs_dispatch
@@ -236,7 +368,9 @@ impl MessageCenter {
             "group.get_config" => {
                 let g = self.groups.load(&group).await?.ok_or_else(missing)?;
                 g.require_cap(&actor, "session.read", None)?;
-                return Ok(g.configuration);
+                let mut configuration = g.configuration;
+                redact_hook_secrets(&mut configuration);
+                return Ok(configuration);
             }
             "group.list_sessions" => return self.group_sessions(&actor, &group).await,
             "group.list_session_members" => {
@@ -249,7 +383,7 @@ impl MessageCenter {
                     .await
             }
             "group.list_messages" => {
-                return self
+                let mut page = self
                     .group_inbox(
                         &actor,
                         &group,
@@ -257,7 +391,11 @@ impl MessageCenter {
                         optional(&p, "after_seq")?.unwrap_or(0),
                         optional(&p, "limit")?.unwrap_or(100),
                     )
-                    .await
+                    .await?;
+                if optional::<bool>(&p, "with_object")?.unwrap_or(false) {
+                    self.attach_group_messages(&mut page).await?;
+                }
+                return Ok(page);
             }
             "group.changes" => {
                 return self
@@ -283,6 +421,15 @@ impl MessageCenter {
                                         .is_some_and(|s| g.sessions[s].lifecycle != "active")) =>
                         {
                             Err(denied("session-archived"))
+                        }
+                        Ok(())
+                            if action == "session.post"
+                                && g.rules(s.as_deref())?
+                                    .hooks
+                                    .iter()
+                                    .any(|h| h.point == "post" && h.may_grant) =>
+                        {
+                            return Ok(json!({"allowed":"hook_dependent","reason":null}));
                         }
                         Ok(())
                             if action == "session.post"
@@ -644,10 +791,11 @@ impl MessageCenter {
         if let Some(profile) = p.get("profile") {
             config["profile"] = profile.clone();
         }
+        let hook_secrets = Self::fill_configuration_hook_secrets(&mut config);
         let mut c: GroupConfiguration =
             serde_json::from_value(config).map_err(|e| invalid(e.to_string()))?;
         c.revision = revision();
-        c.validate()?;
+        c.validate(&host)?;
         // Persist the fully populated form: a later partial patch of a map
         // such as `roles` must not wipe the defaults of the other keys.
         let config = encoded(&c)?;
@@ -725,7 +873,9 @@ impl MessageCenter {
         for i in optional::<Vec<Value>>(&p, "invitations")?.unwrap_or_default() {
             self.invite_group_member(&mut tx, a, &i).await?;
         }
-        let result = json!({"group_did":did,"revision":c.revision});
+        tx.state.validate_config_refs(&c)?;
+        let mut result = json!({"group_did":did,"revision":c.revision});
+        Self::attach_hook_secrets(&mut result, hook_secrets);
         let sql=self.groups.db.render_sql("INSERT INTO group_create_operations(actor,operation_key,request_json,result_json) VALUES(?,?,?,?)");
         sqlx::query(&sql)
             .bind(a.did.to_string())
@@ -742,6 +892,43 @@ impl MessageCenter {
         );
         self.register_local_recipients([did]);
         Ok(result)
+    }
+
+    /// Generate the missing hook secrets of a whole configuration; the result
+    /// goes back to the writer once (`scope` is `default_session` or
+    /// `template:<id>`).
+    fn fill_configuration_hook_secrets(config: &mut Value) -> Vec<Value> {
+        let mut out = vec![];
+        if let Some(rules) = config.get_mut("default_session") {
+            for (i, secret) in fill_hook_secrets(rules) {
+                out.push(json!({"scope":"default_session","index":i,"secret":secret}));
+            }
+        }
+        if let Some(templates) = config
+            .get_mut("session_templates")
+            .and_then(Value::as_object_mut)
+        {
+            for (id, t) in templates.iter_mut() {
+                if let Some(rules) = t.get_mut("rules") {
+                    for (i, secret) in fill_hook_secrets(rules) {
+                        out.push(json!({"scope":format!("template:{id}"),"index":i,"secret":secret}));
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// `hook_secrets` appears in a write result only when this write generated some.
+    fn attach_hook_secrets(result: &mut Value, hook_secrets: Vec<Value>) {
+        if !hook_secrets.is_empty() {
+            result["hook_secrets"] = json!(hook_secrets);
+        }
+    }
+    fn session_hook_secrets(sid: &str, overrides: &mut Value) -> Vec<Value> {
+        fill_hook_secrets(overrides)
+            .into_iter()
+            .map(|(i, secret)| json!({"scope":format!("session:{sid}"),"index":i,"secret":secret}))
+            .collect()
     }
 
     async fn run_group_hooks(
@@ -779,31 +966,25 @@ impl MessageCenter {
             {
                 continue;
             }
-            let configured = self
-                .cyfs_dispatch
-                .read()
-                .unwrap()
-                .group_hook_authorization
-                .clone();
-            let token = match get_buckyos_api_runtime() {
-                Ok(r) => Some(r.session_token.read().await.clone()).filter(|s| !s.is_empty()),
-                Err(_) => None,
-            }
-            .map(|s| format!("Bearer {s}"))
-            .or(configured);
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(db_error)?;
-            let mut call=client.post(&h.service).json(&json!({"operation":point,"actor":a.did,"group_did":g.group_did,"session_id":s,"msg":msg}));
-            if let Some(t) = token {
-                call = call.header("authorization", t);
-            } else {
+            if h.secret.is_empty() {
                 if h.on_unavailable == "deny" {
                     return Err(kRPC::RPCErrors::ReasonError("hook-unavailable".into()));
                 }
                 continue;
             }
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(db_error)?;
+            let body = json!({"operation":point,"actor":a.did,"group_did":g.group_did,"group_host":g.host,"session_id":s,"msg":msg}).to_string();
+            let timestamp = Self::now_ms() / 1000;
+            let signature = buckyos_api::group_hook_signature(&h.secret, timestamp, body.as_bytes());
+            let call = client
+                .post(&h.service)
+                .header("content-type", "application/json")
+                .header(buckyos_api::GROUP_HOOK_TIMESTAMP_HEADER, timestamp.to_string())
+                .header(buckyos_api::GROUP_HOOK_SIGNATURE_HEADER, signature)
+                .body(body);
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(h.timeout_ms as u64),
                 async {
@@ -899,7 +1080,7 @@ impl MessageCenter {
             MailboxAddress::new(group.clone(), msg.to_session.clone()).map_err(invalid)?;
         record.sort_key = accepted_at_ms;
         tx.mailbox(&record, msg).await?;
-        if msg.kind == MsgObjKind::GroupMsg && self.is_local_recipient(&msg.from) {
+        if msg.kind == MsgObjKind::GroupMsg && self.is_personal_recipient(&msg.from).await {
             let mut sent = Self::build_mailbox_record(
                 msg.from.clone(),
                 MailboxKind::Sent,
@@ -949,7 +1130,7 @@ impl MessageCenter {
                     updated_at_ms: accepted_at_ms,
                 };
                 tx.delivery(&record).await?;
-            } else if self.is_local_recipient(&did) {
+            } else if self.is_personal_recipient(&did).await {
                 // The local sender already holds the SENT record of their own
                 // group message; projecting it again would double it up in
                 // every client and count as unread.
@@ -1081,15 +1262,17 @@ impl MessageCenter {
             .transpose()?
             .unwrap_or_default();
         let membership = optional(p, "membership")?.unwrap_or(t.membership);
-        let overrides = p.get("rule_overrides").cloned().unwrap_or(json!({}));
+        let mut overrides = p.get("rule_overrides").cloned().unwrap_or(json!({}));
         if !overrides.is_object() {
             return Err(invalid("rule-overrides-must-be-object"));
         }
+        let hook_secrets = Self::session_hook_secrets(&sid, &mut overrides);
         let mut rules = encoded(t.rules)?;
         merge(&mut rules, &overrides);
         let rules: SessionRules =
             serde_json::from_value(rules).map_err(|e| invalid(e.to_string()))?;
-        validate_rules(&membership, &rules, false)?;
+        validate_rules(&membership, &rules, false, &c.extensions.panels)?;
+        tx.state.validate_display_members(&rules.display)?;
         let rev = revision();
         let address = session_key(&tx.state.group_did, Some(&sid))?;
         let mut shared = json!({"schema_version":1,"session":{"authority_did":tx.state.group_did,"session_key":address},"revision":revision(),"updated_at_ms":Self::now_ms(),"extensions":{}});
@@ -1140,9 +1323,10 @@ impl MessageCenter {
             .insert(sid.clone(), tx.state.sessions[&sid].shared_state.clone());
         self.group_event(tx, a, Some(&sid), "session.created", None, json!([]))
             .await?;
-        Ok(
-            json!({"group_did":tx.state.group_did,"session_id":sid,"session":address,"revision":rev}),
-        )
+        let mut result =
+            json!({"group_did":tx.state.group_did,"session_id":sid,"session":address,"revision":rev});
+        Self::attach_hook_secrets(&mut result, hook_secrets);
+        Ok(result)
     }
     fn include_session_member(g: &mut GroupState, a: &GroupActor, s: &str, d: &DID) -> Result<()> {
         let m = g
@@ -1195,6 +1379,11 @@ impl MessageCenter {
             ..Default::default()
         };
         tx.object(&msg, None).await?;
+        if self.lacks_personal_inbox(d).await {
+            // No personal inbox (Limited): the invitation waits in the group
+            // (`group.list_by_member`), nothing is delivered.
+            return Ok(());
+        }
         if self.is_local_recipient(d) {
             let access = self
                 .contact_mgr
@@ -1564,6 +1753,23 @@ impl MessageCenter {
         )
         .await
     }
+    /// A configuration edit that changes no rule semantics (hook secret
+    /// rotation): new revision, history entry and an empty change event.
+    async fn bump_config_revision(
+        &self,
+        tx: &mut GroupTransaction<'_>,
+        a: &GroupActor,
+    ) -> Result<String> {
+        let rev = revision();
+        tx.state.configuration["revision"] = json!(rev);
+        tx.state.doc_updated_at_ms = tx.state.doc_updated_at_ms.max(Self::now_ms());
+        tx.state
+            .config_history
+            .insert(rev.clone(), tx.state.configuration.clone());
+        self.group_event(tx, a, None, "entity.config_changed", None, json!([]))
+            .await?;
+        Ok(rev)
+    }
     async fn mutate_group(
         &self,
         tx: &mut GroupTransaction<'_>,
@@ -1587,12 +1793,15 @@ impl MessageCenter {
                 }
                 let before = tx.state.configuration.clone();
                 merge(&mut tx.state.configuration, &patch);
+                let hook_secrets =
+                    Self::fill_configuration_hook_secrets(&mut tx.state.configuration);
                 if before == tx.state.configuration {
                     return Ok(json!({"revision":old.revision}));
                 }
                 let mut c = tx.state.config()?;
                 c.revision = revision();
-                c.validate()?;
+                c.validate(&tx.state.host)?;
+                tx.state.validate_config_refs(&c)?;
                 for r in tx
                     .state
                     .sessions
@@ -1600,7 +1809,8 @@ impl MessageCenter {
                     .filter(|r| r.lifecycle != "deleted")
                 {
                     let rules = tx.state.rules(Some(&r.session_id))?;
-                    validate_rules(&r.membership, &rules, false)?;
+                    validate_rules(&r.membership, &rules, false, &c.extensions.panels)?;
+                    tx.state.validate_display_members(&rules.display)?;
                 }
                 if tx
                     .state
@@ -1624,10 +1834,65 @@ impl MessageCenter {
                 tx.state
                     .config_history
                     .insert(c.revision.clone(), tx.state.configuration.clone());
-                let changes: Vec<_> = tx.state.configuration.as_object().unwrap().iter().filter(|(k, v)| before.get(*k) != Some(*v)).map(|(k, v)| json!({"field":k,"before":before.get(k).map(|v|json!({"present":true,"value":v})).unwrap_or(json!({"present":false})),"after":{"present":true,"value":v}})).collect();
-                self.group_event(tx, a, None, "entity.config_changed", None, json!(changes))
+                let mut changes = json!(tx.state.configuration.as_object().unwrap().iter().filter(|(k, v)| before.get(*k) != Some(*v)).map(|(k, v)| json!({"field":k,"before":before.get(k).map(|v|json!({"present":true,"value":v})).unwrap_or(json!({"present":false})),"after":{"present":true,"value":v}})).collect::<Vec<_>>());
+                redact_hook_secrets(&mut changes);
+                self.group_event(tx, a, None, "entity.config_changed", None, changes)
                     .await?;
-                Ok(json!({"revision":c.revision}))
+                let mut result = json!({"revision":c.revision});
+                Self::attach_hook_secrets(&mut result, hook_secrets);
+                Ok(result)
+            }
+            "group.rotate_hook_secret" => {
+                let index: usize = field(p, "index")?;
+                let secret = buckyos_api::random_secret(buckyos_api::GROUP_HOOK_SECRET_BYTES);
+                let hook_at = |rules: &mut Value| -> Result<()> {
+                    let h = rules
+                        .get_mut("hooks")
+                        .and_then(Value::as_array_mut)
+                        .and_then(|hooks| hooks.get_mut(index))
+                        .filter(|h| h.is_object())
+                        .ok_or_else(|| invalid("unknown-hook"))?;
+                    h[HOOK_SECRET_FIELD] = json!(secret);
+                    Ok(())
+                };
+                let revision_out = match s.as_deref() {
+                    None => {
+                        tx.state.require_cap(a, "group.update_config", None)?;
+                        hook_at(&mut tx.state.configuration["default_session"])?;
+                        self.bump_config_revision(tx, a).await?
+                    }
+                    Some(sid) => {
+                        let r = tx
+                            .state
+                            .sessions
+                            .get(sid)
+                            .filter(|r| r.lifecycle != "deleted")
+                            .ok_or_else(missing)?;
+                        if r.rule_overrides.get("hooks").is_some() {
+                            tx.state.require_cap(a, "session.manage", Some(sid))?;
+                            let r = tx.state.sessions.get_mut(sid).unwrap();
+                            hook_at(&mut r.rule_overrides)?;
+                            r.revision = revision();
+                            let rev = r.revision.clone();
+                            self.group_event(tx, a, Some(sid), "session.rules_changed", None, json!([]))
+                                .await?;
+                            rev
+                        } else {
+                            let template = r.template.clone().ok_or_else(|| invalid("unknown-hook"))?;
+                            tx.state.require_cap(a, "group.update_config", None)?;
+                            let rules = tx
+                                .state
+                                .configuration
+                                .get_mut("session_templates")
+                                .and_then(|t| t.get_mut(&template))
+                                .and_then(|t| t.get_mut("rules"))
+                                .ok_or_else(|| invalid("unknown-hook"))?;
+                            hook_at(rules)?;
+                            self.bump_config_revision(tx, a).await?
+                        }
+                    }
+                };
+                Ok(json!({"revision":revision_out,"secret":secret}))
             }
             "group.archive" | "group.delete" => {
                 if tx.state.owner != a.did {
@@ -2048,22 +2313,28 @@ impl MessageCenter {
                         Some(serde_json::from_value(t.clone()).map_err(db_error)?)
                     };
                 }
+                let mut hook_secrets = vec![];
                 if let Some(patch) = p.get("rule_overrides") {
                     if !patch.is_object() {
                         return Err(invalid("invalid-rule-overrides"));
                     }
                     merge(&mut r.rule_overrides, patch);
+                    hook_secrets = Self::session_hook_secrets(sid, &mut r.rule_overrides);
                 }
                 r.revision = revision();
                 let rev = r.revision.clone();
                 let rules = tx.state.rules(Some(sid))?;
-                validate_rules(&tx.state.sessions[sid].membership, &rules, false)?;
+                let c = tx.state.config()?;
+                validate_rules(&tx.state.sessions[sid].membership, &rules, false, &c.extensions.panels)?;
+                tx.state.validate_display_members(&rules.display)?;
                 for d in optional::<Vec<DID>>(p, "add_members")?.unwrap_or_default() {
                     Self::include_session_member(&mut tx.state, a, sid, &d)?;
                 }
                 self.group_event(tx, a, Some(sid), "session.rules_changed", None, json!([]))
                     .await?;
-                Ok(json!({"revision":rev}))
+                let mut result = json!({"revision":rev});
+                Self::attach_hook_secrets(&mut result, hook_secrets);
+                Ok(result)
             }
             "group.archive_session" | "group.delete_session" => {
                 let sid = s
@@ -2585,6 +2856,11 @@ impl MessageCenter {
                 continue;
             }
             let rule = g.rules(sid)?;
+            let c = g.config()?;
+            let panels = GroupState::session_panels(&c, sid, &rule);
+            let display = rule.display.over(&c.display);
+            let mut rule = encoded(&rule)?;
+            redact_hook_secrets(&mut rule);
             let audience = g.audience(sid);
             let has_guests = g.participants.get(sid.unwrap_or("")).is_some_and(|p| {
                 p.values().any(|r| {
@@ -2596,7 +2872,7 @@ impl MessageCenter {
                 .get(sid.unwrap_or(""))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let mut item = json!({"session_id":sid,"session":session_key(group,sid)?,"state_ref":{"authority_did":group,"session_key":session_key(group,sid)?},"shared_state":shared,"has_guests":has_guests,"owner_can_read":true,"rules":rule,"lifecycle":sid.map(|s|g.sessions[s].lifecycle.as_str()).unwrap_or(&g.lifecycle),"revision":sid.map(|s|g.sessions[s].revision.clone()).unwrap_or(g.config()?.revision)});
+            let mut item = json!({"session_id":sid,"session":session_key(group,sid)?,"state_ref":{"authority_did":group,"session_key":session_key(group,sid)?},"shared_state":shared,"has_guests":has_guests,"owner_can_read":true,"rules":rule,"panels":panels,"display":display,"lifecycle":sid.map(|s|g.sessions[s].lifecycle.as_str()).unwrap_or(&g.lifecycle),"revision":sid.map(|s|g.sessions[s].revision.clone()).unwrap_or(g.config()?.revision)});
             if g.role(&a.did).is_some() {
                 item["participant_count"] = json!(audience.len());
             }
@@ -2712,6 +2988,22 @@ impl MessageCenter {
         Ok(
             json!({"items":items,"next_after_seq":messages.last().map(|m|m.session_seq).unwrap_or(after),"limited":more}),
         )
+    }
+    /// Adds each listed message object (`msg`) to a `group_inbox` page, so a
+    /// reader without a mailbox here reads the timeline from the group alone.
+    async fn attach_group_messages(&self, page: &mut Value) -> Result<()> {
+        for item in page["items"].as_array_mut().into_iter().flatten() {
+            if item["redacted"] == json!(true) {
+                continue;
+            }
+            let Some(id) = item["obj_id"].as_str().and_then(|id| ObjId::new(id).ok()) else {
+                continue;
+            };
+            if let Some((_, Some(body), _)) = self.groups.object(&id).await? {
+                item["msg"] = serde_json::from_str(&body).map_err(db_error)?;
+            }
+        }
+        Ok(())
     }
     pub(crate) async fn group_changes(
         &self,
@@ -2892,6 +3184,9 @@ impl MessageCenter {
         }
         let group = msg.to[0].clone();
         let id = msg.gen_obj_id().0;
+        // Held before the group transaction locks the database; a rejected
+        // message drops its holds below.
+        self.retain_attachments(&id, &msg).await?;
         let mut tx = self.groups.begin(&group).await?;
         let key = format!("message:{}", id.to_string());
         if let Some(saved) = tx.state.operations.get(&key) {
@@ -2930,6 +3225,11 @@ impl MessageCenter {
             },
         );
         tx.commit().await?;
+        if result.ok {
+            self.confirm_attachments(&id).await;
+        } else {
+            self.drop_unaccepted_attachments(&id).await;
+        }
         if let Some(group) = &result.delivered_group {
             Self::publish_event(
                 format!("/msg_center/group/{}/changed", group.to_string()),
@@ -3187,6 +3487,36 @@ impl MessageCenter {
             }
         }
         Err(missing())
+    }
+    /// An object of a hosted group Session by its context
+    /// (`<session address>/<msg_id>`): the message itself, or an object that
+    /// message references. The Session is readable and the message is in the
+    /// caller's visible history.
+    pub(crate) async fn authorize_session_object(
+        &self,
+        ctx: &RPCContext,
+        id: &ObjId,
+        context_path: &str,
+    ) -> Result<()> {
+        let (mailbox, msg) = context_path.rsplit_once('/').ok_or_else(missing)?;
+        let mailbox = MailboxAddress::try_from(mailbox.to_string()).map_err(|_| missing())?;
+        if self.groups.load(mailbox.owner()).await?.is_none() {
+            return Err(missing());
+        }
+        let actor = self.group_actor(ctx).await?;
+        if ObjId::new(msg).ok().as_ref() != Some(id) {
+            return self
+                .authorize_group_attachment(&actor, id, context_path)
+                .await;
+        }
+        self.authorize_group_message(&actor, id).await?;
+        let (group, body, _) = self.groups.object(id).await?.ok_or_else(missing)?;
+        let message: MsgObject =
+            serde_json::from_str(&body.ok_or_else(missing)?).map_err(db_error)?;
+        if group != *mailbox.owner() || message.to_session.as_deref() != mailbox.session_id() {
+            return Err(missing());
+        }
+        Ok(())
     }
     pub(crate) async fn authorize_group_attachment(
         &self,

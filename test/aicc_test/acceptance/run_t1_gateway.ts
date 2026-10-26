@@ -536,8 +536,7 @@ async function waitForMockInventories(
     );
     const geminiReady = selected.some((item) =>
       item.provider_driver === "google-gemini" && item.models.some((model) =>
-        model.provider_model_id.toLowerCase().includes("veo-") &&
-        model.api_types.includes("video.txt2video")
+        model.api_types.includes("video.generate")
       )
     );
     const falReady = selected.some((item) =>
@@ -554,8 +553,7 @@ async function waitForMockInventories(
       ) &&
       item.models.some((model) =>
         model.provider_model_id === "MiniMax-H3" &&
-        model.api_types.includes("video.txt2video") &&
-        model.api_types.includes("video.img2video")
+        model.api_types.includes("video.generate")
       )
     );
     const typesafeReady = selected.some((item) =>
@@ -2303,13 +2301,19 @@ async function runCases(
   }
 
   const probeCell = cells.find((cell) => cell.provider_driver === "openai" && cell.method === "chat.completions.create") ?? cells[0];
-  const asyncInventory = mockInventories.find((inventory) => inventory.provider_driver === "google-gemini");
+  // Gemini no longer ships a `predictLongRunning` video model: the Veo 3.1
+  // previews were shut down on 2026-10-22 and Gemini Omni routes video through
+  // `interactions.create`, i.e. immediate execution. The async lifecycle probe
+  // therefore runs on MiniMax H3, which is still a native task.
+  const asyncInventory = mockInventories.find((inventory) =>
+    inventory.provider_driver === "minimax" &&
+    inventory.models.some((model) => model.api_types.includes("video.generate"))
+  );
   const asyncModel = asyncInventory?.models.find((model) =>
-    model.provider_model_id.toLowerCase().includes("veo-") &&
-    model.api_types.includes("video.txt2video")
+    model.api_types.includes("video.generate")
   );
   const asyncProbeCell = asyncInventory && asyncModel
-    ? cellFor(asyncInventory, asyncModel, "video.txt2video", "video.txt2video")
+    ? cellFor(asyncInventory, asyncModel, "video.generate", "video.generate")
     : undefined;
   const cancelProbeCell = cells.find((cell) =>
     cell.provider_driver === "fal" && cell.api_type === "image.upscale" && cell.method === "image.upscale"
@@ -2354,7 +2358,7 @@ async function runCases(
         api_type: cell.api_type,
         method: cell.method,
       }));
-      throw new Error(`Mock inventory has no asynchronous video.txt2video cell; available=${JSON.stringify(available)}`);
+      throw new Error(`Mock inventory has no asynchronous video.generate cell; available=${JSON.stringify(available)}`);
     }
     await setScenario(input.mockControlUrl, scenario);
     const request = buildExactRequest({
@@ -2377,7 +2381,7 @@ async function runCases(
     }
   });
 
-  await pushProbe("t1.task.running_succeeded", asyncProbeCell?.method ?? "video.txt2video", "task_lifecycle_failed", async () => {
+  await pushProbe("t1.task.running_succeeded", asyncProbeCell?.method ?? "video.generate", "task_lifecycle_failed", async () => {
     try {
       const initial = await invokeAsyncProbe("t1.task.running_succeeded");
       if (initial.status !== "running") throw new Error(`expected running, received ${initial.status}`);
@@ -2386,9 +2390,9 @@ async function runCases(
     } finally {
       await setScenario(input.mockControlUrl, "success");
     }
-  }, "video.txt2video");
+  }, "video.generate");
 
-  await pushProbe("t1.task.running_failed", asyncProbeCell?.method ?? "video.txt2video", "task_lifecycle_failed", async () => {
+  await pushProbe("t1.task.running_failed", asyncProbeCell?.method ?? "video.generate", "task_lifecycle_failed", async () => {
     try {
       const initial = await invokeAsyncProbe("t1.task.running_failed", "async_failed");
       if (initial.status !== "running") throw new Error(`expected running task, received ${initial.status}`);
@@ -2401,7 +2405,7 @@ async function runCases(
     } finally {
       await setScenario(input.mockControlUrl, "success");
     }
-  }, "video.txt2video");
+  }, "video.generate");
 
   await pushProbe("t1.task.cancelled", cancelProbeCell?.method ?? "image.upscale", "task_lifecycle_failed", async () => {
     if (!cancelProbeCell) throw new Error("Mock inventory has no cancellable FAL queue cell");
@@ -2524,7 +2528,7 @@ async function runCases(
     }
   });
 
-  await pushProbe("t1.task.terminal_idempotent", asyncProbeCell?.method ?? "video.txt2video", "task_lifecycle_failed", async () => {
+  await pushProbe("t1.task.terminal_idempotent", asyncProbeCell?.method ?? "video.generate", "task_lifecycle_failed", async () => {
     const initial = await invokeAsyncProbe("t1.task.terminal_idempotent");
     try {
       await terminal(session, initial, input.timeoutMs);
@@ -2545,9 +2549,9 @@ async function runCases(
     } finally {
       await setScenario(input.mockControlUrl, "success");
     }
-  }, "video.txt2video");
+  }, "video.generate");
 
-  await pushProbe("t1.task.reload_recovery", asyncProbeCell?.method ?? "video.txt2video", "task_lifecycle_failed", async () => {
+  await pushProbe("t1.task.reload_recovery", asyncProbeCell?.method ?? "video.generate", "task_lifecycle_failed", async () => {
     const initial = await invokeAsyncProbe("t1.task.reload_recovery");
     try {
       if (initial.status !== "running") throw new Error(`expected running task, received ${initial.status}`);
@@ -2557,7 +2561,7 @@ async function runCases(
     } finally {
       await setScenario(input.mockControlUrl, "success");
     }
-  }, "video.txt2video");
+  }, "video.generate");
 
   await pushProbe("t1.task.restart_recovery", "node-daemon.restart", "task_lifecycle_failed", async () => {
     const initial = await invokeAsyncProbe("t1.task.restart_recovery");

@@ -50,6 +50,22 @@ const IDEMPOTENCY_GLOBAL_MAX_ROWS: u64 = 100_000;
 const IDEMPOTENCY_GLOBAL_TARGET_ROWS: u64 = 80_000;
 const IDEMPOTENCY_GLOBAL_SWEEP_BATCH_ROWS: u64 = 10_000;
 
+/// The account records of this Zone as the last zone sync saw them
+/// (product/users_and_agents/UserType.md).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ZoneAccounts {
+    /// Active accounts with a personal inbox (Admin, User): the local
+    /// recipients among the Zone's users.
+    pub(crate) recipients: HashSet<String>,
+    /// Every account record's DID, whatever its type or state.
+    pub(crate) dids: HashSet<String>,
+    /// Every account name: `<name>.<zone host>` is an account DID as well.
+    pub(crate) names: HashSet<String>,
+    /// Account DID → user id. Both are stable: the DID comes from the
+    /// account's `users/<id>/doc` and user ids are never reused.
+    pub(crate) user_ids: HashMap<String, String>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct MessageCenterState {
     messages: HashMap<String, MsgObject>,
@@ -78,6 +94,8 @@ pub struct MessageCenter {
     /// DIDs hosted by this zone (zone users / agents / hosted groups): the
     /// message hub delivers to them natively via local dispatch.
     local_recipients: Arc<RwLock<HashSet<String>>>,
+    /// Account records of the Zone: which users are local recipients.
+    zone_accounts: Arc<RwLock<ZoneAccounts>>,
     /// Transport DID of the MessageHub executor. Unset means shareable-DID
     /// targets cannot be planned (post_send fails them with a clear reason
     /// instead of parking records in a queue nobody consumes).
@@ -99,6 +117,8 @@ pub struct MessageCenter {
     pub(crate) friend_lock: Arc<tokio::sync::Mutex<()>>,
     /// Unauthenticated signed ingress per sender: (window start, count).
     pub(crate) ingress_budget: Arc<std::sync::Mutex<HashMap<String, (u64, u32)>>>,
+    /// Where accepted messages hold their attachments (`attachment_retention.rs`).
+    pub(crate) attachment_store: Arc<crate::attachment_retention::AttachmentStoreSlot>,
 }
 
 impl MessageCenter {
@@ -114,6 +134,7 @@ impl MessageCenter {
         let contact_mgr = ContactMgr::new_with_msg_box(msg_box_db.clone()).await?;
         let groups = crate::group_store::GroupStore::open(msg_box_db.clone()).await?;
         let notifies = crate::notify::NotifyStore::open(msg_box_db.clone()).await?;
+        crate::attachment_retention::open_tables(&msg_box_db).await?;
         let hosted = groups
             .list()
             .await?
@@ -129,6 +150,7 @@ impl MessageCenter {
             tunnel_registry: Arc::new(RwLock::new(HashMap::new())),
             edit_capabilities: Arc::new(RwLock::new(HashMap::new())),
             local_recipients: Arc::new(RwLock::new(hosted)),
+            zone_accounts: Arc::new(RwLock::new(ZoneAccounts::default())),
             message_hub_did: Arc::new(OnceLock::new()),
             cyfs_dispatch: Arc::new(RwLock::new(Default::default())),
             token_verifier: Arc::new(TokenVerifierSlot::default()),
@@ -140,6 +162,7 @@ impl MessageCenter {
             zone_signer: Arc::new(Default::default()),
             friend_lock: Arc::new(tokio::sync::Mutex::new(())),
             ingress_budget: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            attachment_store: Arc::new(Default::default()),
         })
     }
 
@@ -218,26 +241,154 @@ impl MessageCenter {
         }
     }
 
-    /// Registered explicitly (Zone users and Agents from the Zone sync, hosted
-    /// groups); the agreed native receive path serves only these.
+    /// Registered explicitly (Agents from the Zone sync, hosted groups, the
+    /// Zone's users with a personal inbox); the agreed native receive path
+    /// serves only these.
     pub(crate) fn is_registered_recipient(&self, did: &DID) -> bool {
-        self.local_recipients
-            .read()
-            .unwrap()
-            .contains(&did.to_string())
+        let did = did.to_string();
+        self.local_recipients.read().unwrap().contains(&did)
+            || self.zone_accounts.read().unwrap().recipients.contains(&did)
     }
 
-    /// Is this DID hosted by this zone? True for explicitly registered
-    /// recipients and for DIDs under the zone host (`<agent>.<zone>`,
-    /// `telegram.<zone>` aliases, the zone DID itself).
-    pub fn is_local_recipient(&self, did: &DID) -> bool {
-        if self
-            .local_recipients
+    /// Replace what the Zone's account records say (zone sync).
+    pub(crate) fn set_zone_accounts(&self, accounts: ZoneAccounts) {
+        *self.zone_accounts.write().unwrap() = accounts;
+    }
+
+    /// An account record of this Zone, by DID or as `<name>.<zone host>`.
+    pub(crate) fn is_zone_account(&self, did: &DID) -> bool {
+        let accounts = self.zone_accounts.read().unwrap();
+        if accounts.dids.contains(&did.to_string()) {
+            return true;
+        }
+        let Ok(runtime) = get_buckyos_api_runtime() else {
+            return false;
+        };
+        let zone_host = runtime.zone_id.to_host_name();
+        did.to_host_name()
+            .strip_suffix(&format!(".{zone_host}"))
+            .is_some_and(|name| accounts.names.contains(name))
+    }
+
+    /// Session Only guests (restricted sessions) do not upload media in the
+    /// first phase (SSO-12): their messages reference no objects.
+    pub(crate) fn refuse_guest_attachments(
+        caller: Option<&crate::owner_session::CallerIdentity>,
+        msg: &MsgObject,
+    ) -> std::result::Result<(), RPCErrors> {
+        match caller.filter(|caller| caller.restricted()) {
+            Some(caller) if !crate::attachment_retention::attachment_ids(msg).is_empty() => {
+                Err(crate::owner_session::gate_denial(
+                    buckyos_api::DenyReason::SessionKindNotAllowed,
+                    &caller.user_id,
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A restricted visitor removed from, banned in or never admitted to the
+    /// Session gets a D-4 denial instead of a rejected post, so its page
+    /// stops; the full checks run when the message is accepted.
+    async fn require_guest_session(
+        &self,
+        caller: &crate::owner_session::CallerIdentity,
+        actor: &crate::group_types::GroupActor,
+        msg: &MsgObject,
+    ) -> std::result::Result<(), RPCErrors> {
+        let group = self
+            .groups
+            .load(&msg.to[0])
+            .await?
+            .ok_or_else(crate::group_types::missing);
+        match group.and_then(|g| g.require_session(actor, msg.to_session.as_deref(), false)) {
+            Err(RPCErrors::NoPermission(reason)) => Err(
+                crate::owner_session::restricted_group_denial(&caller.user_id, reason),
+            ),
+            result => result,
+        }
+    }
+
+    /// Whether `did` gets personal records here (INBOX, SENT, owner sessions,
+    /// a delivered notice). The synced snapshot decides for what it knows; a
+    /// DID under the Zone host it does not know may be an account created
+    /// since the last sync and counts only when its settings, read now, say
+    /// Active Admin or User. An answer that cannot be read creates nothing.
+    pub(crate) async fn is_personal_recipient(&self, did: &DID) -> bool {
+        if self.is_registered_recipient(did) {
+            return true;
+        }
+        if !self.is_local_recipient(did) {
+            return false;
+        }
+        let zone_host = get_buckyos_api_runtime()
+            .map(|runtime| runtime.zone_id.to_host_name())
+            .unwrap_or_default();
+        self.unsynced_account_is_personal(did, &zone_host).await
+    }
+
+    /// `did` is local by its host name only: an account named by its first
+    /// labels (`<user_id>.<zone host>`) has a personal inbox only as an Active
+    /// Admin or User; no account of that name is an Agent or an alias.
+    pub(crate) async fn unsynced_account_is_personal(&self, did: &DID, zone_host: &str) -> bool {
+        let host = did.to_host_name();
+        let Some(user_id) = host
+            .strip_suffix(&format!(".{zone_host}"))
+            .filter(|user_id| !zone_host.is_empty() && !user_id.is_empty())
+        else {
+            return true;
+        };
+        match self.token_verifier.get().account_settings(user_id).await {
+            Ok(None) => true,
+            Ok(Some(settings)) => {
+                settings.is_active() && settings.user_type.can_receive_direct_messages()
+            }
+            Err(error) => {
+                warn!("read account {} failed; no personal records: {}", user_id, error);
+                false
+            }
+        }
+    }
+
+    /// An account of this Zone without a personal inbox, by the snapshot or,
+    /// for a local DID the snapshot does not know, by its settings now.
+    pub(crate) async fn lacks_personal_inbox(&self, did: &DID) -> bool {
+        self.is_account_without_inbox(did)
+            || (self.is_local_recipient(did) && !self.is_personal_recipient(did).await)
+    }
+
+    /// The user id of an account of this Zone by its DID.
+    pub(crate) fn zone_account_user_id(&self, did: &DID) -> Option<String> {
+        self.zone_accounts
             .read()
             .unwrap()
-            .contains(&did.to_string())
-        {
+            .user_ids
+            .get(&did.to_string())
+            .cloned()
+    }
+
+    /// An account of this Zone that cannot receive direct messages: it takes
+    /// part through group sessions only.
+    pub(crate) fn is_account_without_inbox(&self, did: &DID) -> bool {
+        !self.is_registered_recipient(did) && self.is_zone_account(did)
+    }
+
+    /// An identity this Zone holds custody of: a local recipient or any of its
+    /// accounts (a Limited account has no inbox but is still signed for).
+    pub(crate) fn is_hosted_identity(&self, did: &DID) -> bool {
+        self.is_local_recipient(did) || self.is_zone_account(did)
+    }
+
+    /// Is this DID hosted by this zone? True for registered recipients, the
+    /// zone DID and other DIDs under the zone host (`<agent>.<zone>`,
+    /// `telegram.<zone>` aliases). An account of the Zone is local only with a
+    /// personal inbox (Admin, User), never by its host name.
+    pub fn is_local_recipient(&self, did: &DID) -> bool {
+        if self.is_registered_recipient(did) {
             return true;
+        }
+        if self.is_zone_account(did) {
+            return false;
         }
         let Ok(runtime) = get_buckyos_api_runtime() else {
             return false;
@@ -254,13 +405,41 @@ impl MessageCenter {
         target_host == zone_host || target_host.ends_with(&format!(".{}", zone_host))
     }
 
+    fn is_zone_user_contact(contact: &Contact) -> bool {
+        contact
+            .tags
+            .iter()
+            .any(|tag| tag == buckyos_api::CONTACT_TAG_ZONE_USER)
+    }
+
+    /// A user (not a service) reading the system scope.
+    async fn user_reads_system_scope(
+        &self,
+        ctx: &RPCContext,
+        owner: Option<&DID>,
+    ) -> std::result::Result<bool, RPCErrors> {
+        if owner.is_some() {
+            return Ok(false);
+        }
+        Ok(self.caller_identity(ctx).await?.is_some_and(|caller| {
+            caller.principal_kind == buckyos_api::TokenPrincipalKind::User
+        }))
+    }
+
+    /// What the owner's address book shows of a contact: an owner that may
+    /// not change its address book sees only the projected Zone users.
+    pub(crate) fn contact_visible(&self, owner: Option<&DID>, contact: &Contact) -> bool {
+        owner.map_or(true, |owner| self.contact_mgr.owner_can_edit(owner))
+            || !contact.projected_from.is_empty()
+    }
+
+    /// Write Zone user contacts into one store (system scope, an Agent's
+    /// store). Users' own address books get Zone users by projection instead.
     pub async fn upsert_zone_user_contacts(
         &self,
         contacts: Vec<ZoneUserContactSeed>,
         owner: Option<DID>,
     ) -> std::result::Result<usize, RPCErrors> {
-        // Zone users are native local recipients of the message hub.
-        self.register_local_recipients(contacts.iter().map(|seed| seed.did.clone()));
         self.contact_mgr
             .upsert_zone_user_contacts(contacts, owner)
             .await
@@ -783,7 +962,7 @@ impl MessageCenter {
             }
             Err(error) => return Err(error),
         };
-        let named_store = runtime.get_named_store().await?;
+        let named_store = runtime.get_local_named_store().await?;
         named_store
             .put_object(&msg_id, &msg_json)
             .await
@@ -810,7 +989,7 @@ impl MessageCenter {
         }
         let msg_id = msg_id.clone();
         let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_named_store().await?;
+        let named_store = runtime.get_local_named_store().await?;
         let msg_json = named_store.get_object(&msg_id).await.map_err(|error| {
             RPCErrors::ReasonError(format!(
                 "load message {} from named_store failed: {}",
@@ -1137,6 +1316,12 @@ impl MessageCenter {
             });
         }
 
+        if self.is_account_without_inbox(&target_did) {
+            return Err(format!(
+                "recipient-has-no-inbox: {} has no personal inbox in this Zone; message it in a group session",
+                target_did.to_string()
+            ));
+        }
         // Shareable DID → MessageHub native delivery.
         let hub_did = self.message_hub_did().ok_or_else(|| {
             format!(
@@ -1350,6 +1535,15 @@ impl MessageCenter {
                 );
             }
             for recipient in recipients {
+                if self.lacks_personal_inbox(&recipient).await {
+                    warn!(
+                        "dispatch dropped a recipient without a personal inbox: msg_id={}, recipient={}",
+                        stored_msg_id.to_string(),
+                        recipient.to_string(),
+                    );
+                    result.dropped_recipients.push(recipient);
+                    continue;
+                }
                 if self
                     .is_contact_blocked(&sender, Some(recipient.clone()))
                     .await?
@@ -1467,6 +1661,9 @@ impl MessageCenter {
             }
         }
 
+        if !mailbox_records.is_empty() {
+            self.retain_attachments(&stored_msg_id, &stored_msg).await?;
+        }
         let now_ms = Self::now_ms();
         let expires_at_ms = if receiver.is_some() {
             None
@@ -1491,6 +1688,9 @@ impl MessageCenter {
         {
             IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
             IdempotencyCommitOutcome::Committed => {
+                if !mailbox_records.is_empty() {
+                    self.confirm_attachments(&stored_msg_id).await;
+                }
                 self.note_records_committed(&mailbox_records).await;
                 for record in mailbox_records.iter() {
                     Self::publish_box_changed_event(record, "upsert");
@@ -1871,6 +2071,7 @@ impl MessageCenter {
             deliveries,
             reason: None,
         };
+        self.retain_attachments(&stored_msg_id, &stored_msg).await?;
         let expires_at_ms = Self::idempotency_expires_at(now_ms);
         match self
             .msg_box_db
@@ -1891,6 +2092,7 @@ impl MessageCenter {
         {
             IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
             IdempotencyCommitOutcome::Committed => {
+                self.confirm_attachments(&stored_msg_id).await;
                 self.note_records_committed(std::slice::from_ref(&sent_record))
                     .await;
                 Self::publish_box_changed_event(&sent_record, "upsert");
@@ -2060,7 +2262,7 @@ impl MessageCenter {
     /// time and never changes the SENT record itself, so the record is
     /// announced as changed for the sender's own subscribers (MessageHub
     /// refreshes its delivery state from that event).
-    async fn publish_sent_delivery_changed(&self, msg_id: &ObjId) {
+    pub(crate) async fn publish_sent_delivery_changed(&self, msg_id: &ObjId) {
         match self.msg_box_db.list_message_records(msg_id).await {
             Ok(records) => {
                 for record in records
@@ -2520,7 +2722,7 @@ impl MessageCenter {
         }
 
         let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_named_store().await?;
+        let named_store = runtime.get_local_named_store().await?;
         match named_store.get_object(&msg_id).await {
             Ok(msg_json) => {
                 let msg = serde_json::from_str::<MsgObject>(&msg_json).map_err(|error| {
@@ -2679,8 +2881,18 @@ impl MsgCenterHandler for MessageCenter {
             Self::derive_session_id(&MailboxKind::Sent, &msg),
         )
         .map_err(RPCErrors::ParseRequestError)?;
-        self.authorize_mailbox(&ctx, &mailbox, MailboxKind::Sent, "write")
-            .await?;
+        // An External user or a restricted session (Session Only guest) has
+        // no mailbox here: it may only post into a group hosted by this Zone,
+        // as a participant of it; no SENT record or mailbox is created.
+        let caller = self.caller_identity(&ctx).await?;
+        let guest = caller
+            .as_ref()
+            .is_some_and(|caller| caller.external || caller.restricted());
+        if !(guest && Self::is_group_message(&msg)) {
+            self.authorize_mailbox(&ctx, &mailbox, MailboxKind::Sent, "write")
+                .await?;
+        }
+        self.authorize_outgoing_attachments(&ctx, &msg).await?;
         // Friend messages carry state msg-center keeps for the owner; only
         // the `contact.*` friend RPCs build them.
         if crate::friend_service::is_friend_message(&msg) {
@@ -2695,7 +2907,22 @@ impl MsgCenterHandler for MessageCenter {
                 return Err(crate::group_types::denied("sender-mismatch"));
             }
             if msg.to.len() == 1 && self.groups.load(&msg.to[0]).await?.is_some() {
+                if let Some(caller) = caller.as_ref().filter(|caller| caller.restricted()) {
+                    Self::refuse_guest_attachments(Some(caller), &msg)?;
+                    self.require_guest_session(caller, &actor, &msg).await?;
+                }
                 return self.post_hosted_group(&actor, msg).await;
+            }
+            if let Some(caller) = caller.as_ref().filter(|caller| caller.restricted()) {
+                return Err(crate::owner_session::gate_denial(
+                    buckyos_api::DenyReason::SessionKindNotAllowed,
+                    &caller.user_id,
+                ));
+            }
+            if guest {
+                return Err(crate::group_types::denied(
+                    "external-users-post-to-hosted-groups-only",
+                ));
             }
         }
         self.post_send_internal(msg, idempotency_key).await
@@ -3279,8 +3506,10 @@ impl MsgCenterHandler for MessageCenter {
         account_id: String,
         profile_hint: Option<Value>,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
+        // Routing helpers: any verified caller, no restricted session.
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_did(platform, account_id, profile_hint, contact_mgr_owner)
             .await
@@ -3293,8 +3522,9 @@ impl MsgCenterHandler for MessageCenter {
         account_type: String,
         tunnel_instance_id: String,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_endpoint_did(
                 platform,
@@ -3311,8 +3541,9 @@ impl MsgCenterHandler for MessageCenter {
         contact_did: DID,
         selector: String,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_target(contact_did, selector, contact_mgr_owner)
             .await
@@ -3322,8 +3553,9 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         endpoint_did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Option<DID>, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_contact_for_endpoint(endpoint_did, contact_mgr_owner)
             .await
@@ -3333,8 +3565,9 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_canonical_did(did, contact_mgr_owner)
             .await
@@ -3344,8 +3577,9 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         canonical_did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Vec<DID>, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .list_alias_dids(canonical_did, contact_mgr_owner)
             .await
@@ -3355,8 +3589,9 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<AccountBinding, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .get_preferred_binding(did, contact_mgr_owner)
             .await
@@ -3469,7 +3704,19 @@ impl MsgCenterHandler for MessageCenter {
     ) -> std::result::Result<Option<Contact>, RPCErrors> {
         self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), false)
             .await?;
-        self.contact_mgr.get_contact(did, contact_mgr_owner).await
+        let user_reads_system = self.user_reads_system_scope(&ctx, contact_mgr_owner.as_ref()).await?;
+        let contact = self
+            .contact_mgr
+            .get_contact(did, contact_mgr_owner.clone())
+            .await?
+            .filter(|contact| {
+                self.contact_visible(contact_mgr_owner.as_ref(), contact)
+                    && !(user_reads_system && Self::is_zone_user_contact(contact))
+            });
+        Ok(match (contact, contact_mgr_owner.as_ref()) {
+            (Some(contact), Some(owner)) => Some(self.with_current_projection(owner, contact).await),
+            (contact, _) => contact,
+        })
     }
 
     async fn handle_list_contacts(
@@ -3480,9 +3727,33 @@ impl MsgCenterHandler for MessageCenter {
     ) -> std::result::Result<Vec<Contact>, RPCErrors> {
         self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), false)
             .await?;
-        self.contact_mgr
-            .list_contacts(query, contact_mgr_owner)
-            .await
+        if !self.user_reads_system_scope(&ctx, contact_mgr_owner.as_ref()).await? {
+            return self
+                .contact_mgr
+                .list_contacts(query, contact_mgr_owner)
+                .await;
+        }
+        // The system scope holds every Zone account for routing; a user sees
+        // the Zone's users through its own projected address book only.
+        let offset = query.offset.unwrap_or(0) as usize;
+        let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+        let all = self
+            .contact_mgr
+            .list_contacts(
+                ContactQuery {
+                    offset: None,
+                    limit: Some(usize::MAX),
+                    ..query
+                },
+                None,
+            )
+            .await?;
+        Ok(all
+            .into_iter()
+            .filter(|contact| !Self::is_zone_user_contact(contact))
+            .skip(offset)
+            .take(limit)
+            .collect())
     }
 
     async fn handle_get_group_subscribers(

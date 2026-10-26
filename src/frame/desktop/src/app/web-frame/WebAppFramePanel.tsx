@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { buckyos } from 'buckyos'
 import { AppFrameHost } from 'buckyos/app-frame'
-import { expandOpenPath, isOpenRequest, type OpenBinding, type OpenRequest } from 'buckyos/content'
+import { contentDescriptor, expandOpenPath, isOpenRequest, type OpenBinding, type OpenRequest } from 'buckyos/content'
 import { desktopUIStore, useDesktopRuntime } from '../../models/DesktopUIDataModel'
 import { useMobileBackHandler } from '../../desktop/windows/MobileNavContext'
 import type { AppContentLoaderProps } from '../types'
 import { appFrames, openContent } from '../content/open'
+import { requestOpenWith } from '../content/OpenWithSheet'
 import { openPreview } from '../preview/launch'
 import { isMockRuntime } from '../../runtime'
 import { useAppText } from '../../presentation/appText'
+import { useAppLaunch } from './launch'
+import { AppLaunchStatus } from './AppLaunchStatus'
 export function WebAppFramePanel({ app, windowId, launch, themeMode, locale }: AppContentLoaderProps) {
   const iframe = useRef<HTMLIFrameElement>(null)
   const title = useAppText()(app).title
@@ -32,21 +35,27 @@ export function WebAppFramePanel({ app, windowId, launch, themeMode, locale }: A
       url.hash = `bfp=${nonce}`; return url.href
     } catch { return undefined }
   }, [origin, nonce, request, payload])
+  const appLaunch = useAppLaunch(app.appInstanceId ?? app.id, src)
+  const frameUrl = appLaunch.outcome?.kind === 'ready' ? appLaunch.outcome.url : undefined
+  const unopenable = !src || appLaunch.outcome?.kind === 'invalid_target'
   const latest = useRef({ request, themeMode, locale })
   useEffect(() => { latest.current = { request, themeMode, locale } }, [request, themeMode, locale])
   useEffect(() => {
-    if (!src && request) { desktopUIStore.setSnackbar(`Unable to open with ${title}`); openPreview({ source: request.source, session: request.session }) }
-  }, [src, request, title])
+    if (unopenable && request) { desktopUIStore.setSnackbar(`Unable to open with ${title}`); openPreview({ source: request.source, session: request.session }) }
+  }, [unopenable, request, title])
   useEffect(() => {
-    if (!origin || !windowId || !src) return
+    if (!origin || !windowId || !frameUrl) return
     const { request, themeMode, locale } = latest.current
     const frame = new AppFrameHost({ target: () => iframe.current?.contentWindow ?? null, origin,
       init: { nonce, windowId, theme: { mode: themeMode }, locale, formFactor: matchMedia('(max-width: 900px)').matches ? 'mobile' : 'desktop', launch: request, shellCapabilities: ['content.open', 'beforeClose', 'back'] },
       onTitle: (title, dirty) => desktopUIStore.updateWindow(windowId, { title: `${dirty ? '● ' : ''}${title}` }),
       onRequestClose: () => desktopUIStore.closeWindow(windowId, true),
-      onContentOpen: (next, target, newWindow) => {
-        const req = { source: next.source, session: next.session, origin: { app: app.appInstanceId ?? app.id, windowId }, newWindow }
-        if (target === 'preview') openPreview(req); else void openContent(req)
+      onContentOpen: (next, target, { newWindow, hints }) => {
+        const requester = app.appInstanceId ?? app.id
+        const req = { source: next.source, session: next.session, origin: { app: requester, windowId }, newWindow }
+        if (target === 'preview') openPreview(req)
+        else if (target === 'chooser') requestOpenWith({ source: next.source, session: next.session, name: hints.name ?? contentDescriptor(next.source).name ?? '', mediaType: hints.mime, size: hints.size, exclude: requester, origin: req.origin })
+        else void openContent(req, { name: hints.name, mime: hints.mime, size: hints.size })
       },
     })
     host.current = frame; appFrames.set(windowId, { host: frame, handlerKey: payload?.handlerKey })
@@ -55,7 +64,7 @@ export function WebAppFramePanel({ app, windowId, launch, themeMode, locale }: A
       catch { return window.confirm(locale.startsWith('zh') ? '应用无响应，是否强制关闭？' : 'App is not responding. Force close?') }
     })
     return () => { unregister(); appFrames.delete(windowId); frame.dispose(); host.current = undefined }
-  }, [origin, src, windowId, app.id, app.appInstanceId, nonce, payload?.handlerKey])
+  }, [origin, frameUrl, windowId, app.id, app.appInstanceId, nonce, payload?.handlerKey])
   useEffect(() => { host.current?.update({ theme: { mode: themeMode }, locale }); host.current?.send('frame.themeChanged', { mode: themeMode }); host.current?.send('frame.localeChanged', { locale }) }, [themeMode, locale])
   // A click inside the (cross-origin) iframe never reaches the shell document, so the window
   // container's pointer handling cannot raise this window. What the shell does observe is that
@@ -68,12 +77,13 @@ export function WebAppFramePanel({ app, windowId, launch, themeMode, locale }: A
   }, [windowId])
   useEffect(() => {
     const top = [...runtime.windows].filter(w => w.state !== 'minimized').sort((a, b) => b.zIndex - a.zIndex)[0]
-    host.current?.send('frame.focusChanged', { focused: top?.id === windowId })
-  }, [runtime.windows, windowId])
+    host.current?.setFocused(top?.id === windowId)
+  }, [runtime.windows, windowId, frameUrl])
   useMobileBackHandler(() => {
     void host.current?.back().then(handled => { if (!handled && windowId) desktopUIStore.closeWindow(windowId) }).catch(() => { if (windowId) desktopUIStore.closeWindow(windowId) })
     return true
   })
   if (!src) return <p>Unable to open {title}</p>
-  return <iframe ref={iframe} className="block h-full w-full border-0" data-testid="web-app-frame" src={src} title={title} allow="clipboard-read; clipboard-write; fullscreen" onError={() => { if (request) { desktopUIStore.setSnackbar(`Unable to open with ${title}`); openPreview({ source: request.source, session: request.session }) } }} />
+  if (!frameUrl) return <AppLaunchStatus outcome={appLaunch.outcome} title={title} onRetry={appLaunch.retry} />
+  return <iframe ref={iframe} className="block h-full w-full border-0" data-testid="web-app-frame" src={frameUrl} title={title} allow="clipboard-read; clipboard-write; fullscreen" onError={() => { if (request) { desktopUIStore.setSnackbar(`Unable to open with ${title}`); openPreview({ source: request.source, session: request.session }) } }} />
 }

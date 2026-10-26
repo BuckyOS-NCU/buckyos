@@ -15,6 +15,8 @@ mod minimax_messages;
 mod openai_chat_completions;
 mod openai_responses;
 pub(crate) mod openrouter_decisions;
+mod openrouter_media;
+mod openrouter_videos;
 mod provider_state;
 mod qwen_media;
 mod result;
@@ -24,8 +26,11 @@ mod sn_openai;
 mod sse;
 mod task;
 mod transport;
+pub(crate) mod video;
 pub(crate) mod typesafe;
 
+pub(crate) use openrouter_videos::OPENROUTER_VIDEOS_OPERATION_ID;
+pub(crate) use video::finish_video_output;
 pub(crate) use sn_openai::{register_sn_openai_adapter, SN_OPENAI_ADAPTER_ID};
 
 use minimax_media::minimax_media_registration;
@@ -86,7 +91,6 @@ pub(crate) use openai_chat_completions::{
     OPENAI_CHAT_COMPLETIONS_ADAPTER_ID, OPENAI_CHAT_COMPLETIONS_OPERATION_ID,
     OPENAI_PROTOCOL_FAMILY_ID,
 };
-#[cfg(test)]
 pub(crate) use openai_responses::OPENAI_VIDEOS_OPERATION_ID;
 pub(crate) use openai_responses::{
     openai_responses_adapter, OPENAI_AUDIO_SPEECH_OPERATION_ID,
@@ -94,6 +98,7 @@ pub(crate) use openai_responses::{
     OPENAI_IMAGES_GENERATE_OPERATION_ID, OPENAI_RESPONSES_ADAPTER_ID,
     OPENAI_RESPONSES_OPERATION_ID,
 };
+pub(crate) use openrouter_media::{OPENROUTER_IMAGES_OPERATION_ID, OPENROUTER_MUSIC_OPERATION_ID};
 pub(crate) use provider_state::{
     bind_provider_state_source, drop_foreign_thinking, foreign_provider_state_text,
     provider_state_is_native,

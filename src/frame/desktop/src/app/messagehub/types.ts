@@ -1,3 +1,5 @@
+import type { GroupDisplayInfo, GroupHookInfo, GroupPanelRef } from './extensions/model'
+
 /* ── Entity ── */
 
 export type EntityType = 'person' | 'agent' | 'group' | 'service'
@@ -235,7 +237,15 @@ export interface GroupSessionInfo {
   /** Session record revision (`group.archive_session` / `group.update_session` expect it). */
   revision: string
   hasGuests: boolean
+  /** The session's rules let it invite guests (`SessionRules.allow_guests`). */
+  allowGuests: boolean
   receipts: 'hidden' | 'count' | 'readers'
+  /** Embedded application panels in effect for the session (EXT-01/02). */
+  panels: GroupPanelRef[]
+  /** Display configuration, the session's over the group's (EXT-04). */
+  display: GroupDisplayInfo
+  /** Business Hooks bound to the session (EXT-06). */
+  hooks: GroupHookInfo[]
 }
 
 /** One participant of a Group Session (`group.list_session_members`). */
@@ -264,6 +274,8 @@ export interface GroupInfo {
   name: string
   description: string
   ownerDid: string
+  /** The Zone hosting the group (group Doc `host`); panels must come from its Apps (D-2). */
+  hostDid: string
   hosted: boolean
   lifecycle: 'active' | 'archived' | 'deleted'
   /** Configuration revision (`group.apply_config` expects it). */

@@ -1,7 +1,7 @@
 // Builds and runs the real `aiworkspace` backend in standalone mode for the e2e suite:
 // a temporary data folder, static test identities, the port given by AIWS_E2E_BACKEND_PORT.
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -22,22 +22,48 @@ if (!binary) {
 if (!existsSync(binary)) throw new Error(`aiworkspace binary not found: ${binary}`)
 
 const root = mkdtempSync(join(tmpdir(), 'aiws-e2e-'))
+let nfsBinary = process.env.NFS_BIN
+if (!nfsBinary) {
+  execFileSync('cargo', ['build', '-p', 'nfs_server'], { cwd: workspace, stdio: 'inherit' })
+  const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--format-version', '1', '--no-deps'], { cwd: workspace, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }))
+  nfsBinary = join(metadata.target_directory, 'debug', 'nfs_server')
+}
+const ndmBase = `http://127.0.0.1:${process.env.AIWS_E2E_NDM_PORT}`
+const store = join(root, 'named-store')
+const exported = join(root, 'files')
+mkdirSync(exported, { recursive: true })
+const storeConfig = join(root, 'named-store.json')
+writeFileSync(storeConfig, JSON.stringify({ stores: [{ path: store }] }))
+const nfs = spawn(nfsBinary, ['--data-dir', join(root, 'nfs'), '--export', `home=${exported}`, '--named-store', store, '--listen', `127.0.0.1:${process.env.AIWS_E2E_NDM_PORT}`, '--log-level', 'warn'], { stdio: 'inherit' })
 const auth = join(root, 'tokens.json')
-writeFileSync(auth, JSON.stringify({ tokens: { 'tok-alice': { principal: 'alice' }, 'tok-bob': { principal: 'bob' } } }))
+// a Limited account (restricted session) and an External DID stand for the hybrid SSO visitors (entries.spec.ts)
+writeFileSync(auth, JSON.stringify({
+  tokens: {
+    'tok-alice': { principal: 'alice', auth_method: 'password' },
+    'tok-bob': { principal: 'bob', auth_method: 'password' },
+    'tok-lim': { principal: 'acme-c1', restricted: true, auth_method: 'password' },
+    'tok-ext': { principal: 'did:bns:carol', class: 'external', auth_method: 'did_federation' },
+  },
+  sso: { self_register_enabled: true, did_login_enabled: false },
+}))
 // wish runs talk to a scripted OpenAI-compatible model (许愿格 §16.1: controlled model returns)
-const llmPort = await new Promise((resolvePort) => { const s = createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolvePort(p)) }) })
+// the port is chosen by playwright.aiworkspace.config.ts: the local executor spec reaches the same model from the browser
+const llmPort = process.env.AIWS_E2E_LLM_PORT ?? await new Promise((resolvePort) => { const s = createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolvePort(p)) }) })
 const llm = startMockLlm(llmPort)
 const wishConfig = join(root, 'wish.json')
 writeFileSync(wishConfig, JSON.stringify({ provider: { type: 'openai', base_url: `http://127.0.0.1:${llmPort}/v1`, api_key_env: 'AIWS_E2E_LLM_KEY' }, analyze_model: 'scripted', execute_model: 'scripted', map_model: 'scripted', program_timeout_secs: 60 }))
 const env = { ...process.env, AIWS_E2E_LLM_KEY: 'e2e' }
+// a local run whose browser went away is interrupted within seconds (the browser heartbeats at a third of the lease)
+env.AIWS_RUN_LEASE_MS ??= '6000'
 delete env.AIWS_FAILPOINT
-const child = spawn(binary, ['--data-dir', join(root, 'data'), '--listen', `127.0.0.1:${port}`, '--auth-file', auth, '--fixture-sources', '--wish-config', wishConfig, '--log-level', 'warn'], { stdio: 'inherit', env })
+const child = spawn(binary, ['--data-dir', join(root, 'data'), '--listen', `127.0.0.1:${port}`, '--auth-file', auth, '--fixture-sources', '--wish-config', wishConfig, '--named-store-config', storeConfig, '--ndm-gateway', ndmBase, '--log-level', 'warn'], { stdio: 'inherit', env })
 
 let stopping = false
 const stop = () => {
   if (stopping) return
   stopping = true
   child.kill('SIGKILL')
+  nfs.kill('SIGKILL')
   llm.close()
   try { rmSync(root, { recursive: true, force: true }) } catch { /* best effort */ }
 }

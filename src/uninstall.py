@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import platform
 import shutil
@@ -25,8 +26,11 @@ WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_APP_KEY = r"Software\BuckyOS"
 WINDOWS_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\BuckyOS"
 
-MACOS_DAEMON_PLIST = Path("/Library/LaunchDaemons/buckyos.service.plist")
-MACOS_SERVICE_LABEL = "buckyos.service"
+MACOS_RUNTIME_LABEL = "com.buckyos.runtime"
+MACOS_RUNTIME_EXECUTABLE = Path("bin", "node-daemon", "BuckyOS Runtime.app", "Contents", "MacOS", "node_daemon")
+# Pre-LaunchAgent installs; removed when found, never used to run the node.
+MACOS_LEGACY_DAEMON_PLIST = Path("/Library/LaunchDaemons/buckyos.service.plist")
+MACOS_LEGACY_LABEL = "buckyos.service"
 
 LINUX_SYSTEMD_UNIT = "buckyos.service"
 LINUX_SYSTEMD_PATHS = (
@@ -169,8 +173,6 @@ def _detect_windows_root_candidates() -> list[str]:
         ("HKEY_CURRENT_USER", WINDOWS_APP_KEY, "InstallDir"),
         ("HKEY_CURRENT_USER", WINDOWS_APP_KEY, "BuckyOSUserDir"),
         ("HKEY_CURRENT_USER", WINDOWS_APP_KEY, "InstDir_buckyos"),
-        ("HKEY_LOCAL_MACHINE", r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "BUCKYOS_ROOT"),
-        ("HKEY_LOCAL_MACHINE", WINDOWS_APP_KEY, "BuckyOSServiceDir"),
     ):
         value = _read_windows_reg_value(root_key, subkey, value_name)
         if value:
@@ -265,8 +267,6 @@ def _delete_windows_reg_value(
     subkey: str,
     value_name: str,
     results: list[ActionResult],
-    *,
-    only_if_matches: str | None = None,
 ) -> None:
     winreg = _import_winreg()
     if winreg is None:
@@ -285,11 +285,6 @@ def _delete_windows_reg_value(
     target = f"{root_key}\\{subkey}\\{value_name}"
     try:
         with winreg.OpenKey(hive, subkey, 0, access) as key:
-            value, _ = winreg.QueryValueEx(key, value_name)
-            value_text = value.strip() if isinstance(value, str) else str(value)
-            if only_if_matches and only_if_matches not in value_text:
-                _append_result(results, "registry", target, "skipped", f"value kept: {value_text}")
-                return
             winreg.DeleteValue(key, value_name)
             _append_result(results, "registry", target, "ok", "deleted")
     except FileNotFoundError:
@@ -368,49 +363,51 @@ def _cleanup_windows_platform(root: Path, results: list[ActionResult]) -> None:
     _delete_windows_reg_value("HKEY_CURRENT_USER", WINDOWS_RUN_KEY, "BuckyOSDaemon", results)
     _kill_process_windows(results)
 
-    root_text = str(root)
     _delete_windows_reg_value("HKEY_CURRENT_USER", "Environment", "BUCKYOS_ROOT", results)
-    _delete_windows_reg_value(
-        "HKEY_LOCAL_MACHINE",
-        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-        "BUCKYOS_ROOT",
-        results,
-        only_if_matches=root_text,
-    )
     _delete_windows_reg_key("HKEY_CURRENT_USER", WINDOWS_UNINSTALL_KEY, results)
     _delete_windows_reg_key("HKEY_CURRENT_USER", WINDOWS_APP_KEY, results)
-    _delete_windows_reg_key("HKEY_LOCAL_MACHINE", WINDOWS_APP_KEY, results)
     _broadcast_windows_environment_change(results)
 
 
+def _read_macos_binding(root: Path) -> dict | None:
+    try:
+        binding = json.loads((root / "etc" / "desktop_runtime.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return binding if isinstance(binding, dict) else None
+
+
 def _cleanup_macos_platform(root: Path, results: list[ActionResult]) -> None:
-    _kill_process_posix(results, root)
-
-    disable_result = _run_command(["launchctl", "disable", f"system/{MACOS_SERVICE_LABEL}"])
-    disable_output = _safe_command_output(disable_result)
-    if disable_result.returncode == 0:
-        _append_result(results, "service", f"launchctl disable system/{MACOS_SERVICE_LABEL}", "ok", "disabled")
+    """Remove this root's login item and binding. Runs after the installed
+    stop script, which still needs the binding to find the Runtime user."""
+    executable = root / MACOS_RUNTIME_EXECUTABLE
+    binding = _read_macos_binding(root)
+    if executable.is_file():
+        result = _run_command([str(executable), "service", "unregister", "--root", str(root)])
+        output = _safe_command_output(result)
+        status = "ok" if result.returncode == 0 else "failed"
+        _append_result(results, "service", f"{MACOS_RUNTIME_LABEL} unregister", status, output)
+    elif binding is not None:
+        target = f"gui/{binding.get('uid')}/{MACOS_RUNTIME_LABEL}"
+        bootout = _run_command(["launchctl", "bootout", target])
+        status = "ok" if bootout.returncode == 0 else "skipped"
+        _append_result(results, "service", f"launchctl bootout {target}", status, _safe_command_output(bootout))
+        home = binding.get("home")
+        if isinstance(home, str) and home:
+            _remove_fs_path(
+                Path(home) / "Library" / "LaunchAgents" / f"{MACOS_RUNTIME_LABEL}.plist",
+                results,
+                kind="service-file",
+            )
     else:
-        _append_result(
-            results,
-            "service",
-            f"launchctl disable system/{MACOS_SERVICE_LABEL}",
-            "skipped",
-            disable_output or "not enabled",
-        )
+        _append_result(results, "service", MACOS_RUNTIME_LABEL, "skipped", "root is not bound to an OS user")
 
-    plist_path = MACOS_DAEMON_PLIST
-    if plist_path.exists():
-        bootout = _run_command(["launchctl", "bootout", "system", str(plist_path)])
-        output = _safe_command_output(bootout)
-        if bootout.returncode == 0:
-            _append_result(results, "service", str(plist_path), "ok", output or "booted out")
-        else:
-            _append_result(results, "service", str(plist_path), "skipped", output or "not loaded")
-    else:
-        _append_result(results, "service", str(plist_path), "skipped", "not found")
-
-    _remove_fs_path(plist_path, results, kind="service-file")
+    if MACOS_LEGACY_DAEMON_PLIST.exists():
+        _run_command(["launchctl", "disable", f"system/{MACOS_LEGACY_LABEL}"])
+        bootout = _run_command(["launchctl", "bootout", "system", str(MACOS_LEGACY_DAEMON_PLIST)])
+        status = "ok" if bootout.returncode == 0 else "skipped"
+        _append_result(results, "service", str(MACOS_LEGACY_DAEMON_PLIST), status, _safe_command_output(bootout))
+        _remove_fs_path(MACOS_LEGACY_DAEMON_PLIST, results, kind="service-file")
 
 
 def _cleanup_linux_platform(root: Path, results: list[ActionResult]) -> None:
@@ -495,7 +492,7 @@ def _run_installed_stop_script(root: Path, results: list[ActionResult]) -> None:
         if not script_path.exists():
             _append_result(results, "stop-script", str(script_path), "skipped", "not found")
             return
-        result = _run_command(["/bin/sh", str(script_path)])
+        result = _run_command(["/usr/bin/env", f"BUCKYOS_ROOT={root}", "/bin/sh", str(script_path)])
     else:
         script_path = root / "bin" / "stop.py"
         if not script_path.exists():
@@ -591,8 +588,12 @@ def main() -> int:
         return 1
 
     results: list[ActionResult] = []
-    _cleanup_platform(root, results)
-    _run_installed_stop_script(root, results)
+    if platform.system().lower() == "darwin":
+        _run_installed_stop_script(root, results)
+        _cleanup_platform(root, results)
+    else:
+        _cleanup_platform(root, results)
+        _run_installed_stop_script(root, results)
     _remove_install_paths(root, app_info, results)
     if parsed.all:
         _remove_root_all(root, results)

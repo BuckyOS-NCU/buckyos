@@ -44,6 +44,7 @@ pub use agent_tool::agent_memory::{
 pub use changes::{Change, ChangeKind, ChangeSet};
 pub use consolidation::{
     Batch, BatchOptions, CleanupReport, Consolidator, Material, MaterialState, PendingWork,
+    ReviewDue, DEFAULT_BATCH_LIMIT, DEFAULT_CONTEXT_LIMIT,
 };
 pub use hint::{Budget, Hint, HintLayer, HintState};
 pub use observation::{
@@ -59,9 +60,10 @@ pub use recall::{MemoryQuery, QueryResult, RecallStatus, TopicQuery, TopicResult
 pub use snapshot::MemorySnapshot;
 pub use source::{SourceEventInfo, SourceEvents};
 
-/// The Agent-level lease a consolidation commit must hold (the existing
-/// self-improve lease, reused for the Memory consolidation Goal).
-pub const CONSOLIDATION_LEASE: &str = "self_improve";
+/// The Agent-level lease a consolidation commit must hold: the drive of the
+/// Goal Session whose Goal has the `memory_consolidation` capability takes
+/// it for the whole drive.
+pub const CONSOLIDATION_LEASE: &str = "memory_consolidation";
 /// Upper bound of a deferral window (§5.9; an evaluation start value).
 pub const DEFAULT_DEFERRAL_WINDOW: Duration = Duration::from_secs(72 * 3600);
 
@@ -91,7 +93,7 @@ pub enum MemoryError {
     ReadOnly(String),
     #[error("memory store is corrupted: {0}")]
     Corrupted(String),
-    /// Storage cannot be read right now (IO, needs migration); never an
+    /// Storage cannot be read right now (IO, unsupported format); never an
     /// empty result.
     #[error("memory store unavailable: {0}")]
     Unavailable(String),
@@ -116,8 +118,8 @@ impl From<AgentMemoryError> for MemoryError {
             AgentMemoryError::CommitUnknown(m) => MemoryError::CommitUnknown(m),
             AgentMemoryError::ReadOnly(m) => MemoryError::ReadOnly(m),
             AgentMemoryError::Corrupted(m) => MemoryError::Corrupted(m),
-            AgentMemoryError::NeedsMigration(m) => {
-                MemoryError::Unavailable(format!("needs migration: {m}"))
+            AgentMemoryError::Unsupported(m) => {
+                MemoryError::Unavailable(format!("unsupported format: {m}"))
             }
             AgentMemoryError::Io(e) => MemoryError::Unavailable(e.to_string()),
             AgentMemoryError::Sqlite(e) => MemoryError::Unavailable(e.to_string()),
@@ -337,7 +339,7 @@ impl Memory {
         Ok(self.graph()?.view()?)
     }
 
-    /// Administrative handle (init, verify, compact, repair, migrate).
+    /// Administrative handle (init, verify, compact, repair).
     pub fn admin(&self) -> MemoryResult<AgentMemory> {
         self.graph_writer()
     }

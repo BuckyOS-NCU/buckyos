@@ -1,9 +1,10 @@
-import type { AgentEntry, AgentStatus, UserDetail } from '../../src/api/user_mgr.ts'
+import type { AgentEntry, AgentRuntimeOffer, AgentStatus, UserDetail } from '../../src/api/user_mgr.ts'
 import type { AppSummary } from '../../src/api/app_mgr.ts'
 import {
   agentDisplayName,
   agentHomeTarget,
   buildAgentCreateRequest,
+  canChooseRuntime,
   canCancelCreation,
   classifyAgentError,
   computeAgentGuideState,
@@ -15,6 +16,7 @@ import {
   parseAgentSetupDraft,
   applyTemplateToDraft,
   pickTemplate,
+  runsOnHost,
 } from '../../src/app/agent-setup/model.ts'
 import { agentStateToStatus, toAgentEntity } from '../../src/app/users-agents/datamodel/transforms.ts'
 import { createBackendAppDefinitionMapper, launcherDefinitions, withAccountBuiltins } from '../../src/app/backend-apps.ts'
@@ -157,8 +159,12 @@ Deno.test('a template fills only an untouched bio, and the create request follow
     profile: { display_name: '小白', bio: 'Mine' },
     role_supplement: '日本語で',
     permission_mode: 'read_write',
+    runtimes: { host: null },
+    default_runtime_id: 'container',
     allow_group: false,
     allow_other_users: false,
+    homestation: true,
+    auto_share_results: true,
     template_id: 'bundled:jarvis',
     template_auto_update: true,
     desktop_entry: 'jarvis_guide',
@@ -167,6 +173,43 @@ Deno.test('a template fills only an untouched bio, and the create request follow
   const plain = buildAgentCreateRequest({ ...newAgentSetupDraft('users_agents', 'k2'), name: 'b', templateId: 't', permissionMode: 'read_only' }, 'ignored')
   assertEquals(plain.permission_mode, 'read_only', 'read-only choice is sent to the backend')
   assertEquals(['desktop_entry' in plain, 'msg_tunnel' in plain], [false, false], 'Add Agent sends no desktop entry and a skipped channel sends no tunnel')
+})
+
+Deno.test('host creation follows the offer and preserves an explicit opt-out', () => {
+  const draft = newAgentSetupDraft('users_agents', 'host-key')
+  const host: AgentRuntimeOffer = {
+    runtime_id: 'host', kind: 'node', node_id: 'ood1', node_did: 'did:dev:ood1',
+    computer_max: 'observe', closed: false, computer: 'none', enabled: false,
+  }
+  const enabled = buildAgentCreateRequest(draft, '', host)
+  assertEquals(enabled.runtimes, { host: { enabled: true, computer: 'observe' } }, 'use the node computer grant')
+  assertEquals(enabled.default_runtime_id, 'host', 'host is the new session default')
+  const restored = parseAgentSetupDraft({ ...draft, hostRuntimeEnabled: false }, 'users_agents')!
+  const disabled = buildAgentCreateRequest(restored, '', host)
+  assertEquals(disabled.runtimes, { host: null }, 'opt-out explicitly clears the server default')
+  assertEquals(disabled.default_runtime_id, 'container', 'opt-out resets the default')
+  assertEquals(buildAgentCreateRequest(draft, '', { ...host, closed: true }).runtimes, { host: null }, 'a closed node never gets enabled')
+  assertEquals(buildAgentCreateRequest(draft, '').runtimes, { host: null }, 'no offered host never gets enabled')
+})
+
+Deno.test('the machine decides the default, the owner the choice', () => {
+  const draft = newAgentSetupDraft('users_agents', 'choice-key')
+  const host: AgentRuntimeOffer = {
+    runtime_id: 'host', kind: 'node', node_id: 'ood1', node_did: 'did:dev:ood1', os: 'linux',
+    computer_max: 'none', closed: false, computer: 'none', enabled: false,
+  }
+  const linux = { container_available: true, host_by_default: false }
+  assertEquals(canChooseRuntime(host, linux), true, 'host and containers: the owner chooses')
+  assertEquals(runsOnHost(draft, host, linux), false, 'a Linux host defaults to the container')
+  assertEquals(buildAgentCreateRequest(draft, '', host, linux).default_runtime_id, 'container', 'the default is sent')
+  const chosen = parseAgentSetupDraft({ ...draft, hostRuntimeEnabled: true }, 'users_agents')!
+  assertEquals(buildAgentCreateRequest(chosen, '', host, linux).default_runtime_id, 'host', 'the owner may still choose the host')
+  assertEquals(parseAgentSetupDraft({ ...draft, hostRuntimeEnabled: 'yes' }, 'users_agents')!.hostRuntimeEnabled, null, 'no choice keeps the default')
+  const noContainer = { container_available: false, host_by_default: true }
+  assertEquals(canChooseRuntime(host, noContainer), false, 'without containers there is nothing to choose')
+  const declined = parseAgentSetupDraft({ ...draft, hostRuntimeEnabled: false }, 'users_agents')!
+  assertEquals(runsOnHost(declined, host, noContainer), true, 'the host is the only place left')
+  assertEquals(canChooseRuntime({ ...host, closed: true }, linux), false, 'a closed host offers no choice')
 })
 
 Deno.test('unknown Agent states map to unknown, never to an error', () => {

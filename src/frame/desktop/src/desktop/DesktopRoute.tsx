@@ -6,8 +6,9 @@ import {
   MenuItem,
   useMediaQuery,
 } from '@mui/material'
-import { isTransferableRef } from 'buckyos/content'
+import { contentDescriptor, parseSystemOpen } from 'buckyos/content'
 import { openContent } from '../app/content/open'
+import { OpenWithHost, requestOpenWith } from '../app/content/OpenWithSheet'
 import { openPreview } from '../app/preview/launch'
 import { agentGuide } from '../app/agent-setup/guide'
 import { agentSetupLaunchSchema, openAgentSetup } from '../app/agent-setup/launch'
@@ -254,13 +255,13 @@ export function DesktopRoute() {
   const currentUser = useCurrentUser()
   const launchHandled = useRef(false)
   useEffect(() => {
-    const value = searchParams.get('open')
-    if (snap.status !== 'success' || !value || launchHandled.current) return
-    const source = value.startsWith('obj://') ? { kind: 'object-id' as const, objectId: value.slice(6) } : { kind: 'cyfs-path' as const, path: value }
-    if (!isTransferableRef(source)) return
+    const open = parseSystemOpen(searchParams)
+    if (snap.status !== 'success' || !open || launchHandled.current) return
     launchHandled.current = true
-    if (searchParams.get('intent') === 'preview') openPreview({ source })
-    else void openContent({ source })
+    const { request: { source, session }, hints } = open
+    if (open.target === 'preview') openPreview({ source, session })
+    else if (open.target === 'chooser') requestOpenWith({ source, session, name: hints.name ?? contentDescriptor(source).name ?? '', mediaType: hints.mime, size: hints.size, exclude: open.from })
+    else void openContent({ source, session }, { name: hints.name, mime: hints.mime, size: hints.size })
   }, [snap.status, searchParams])
 
   // The Agent setup wizard comes back here after a sign-in (`?agent_setup=<source>[&agent_id=]`).
@@ -675,14 +676,16 @@ export function DesktopRoute() {
       _pageId: string,
       oldItem: GridLayoutItem | null,
       newItem: GridLayoutItem | null,
+      event: Event,
     ) => {
+      if (isMobile && event.type.startsWith('touch')) return
       const itemId = newItem?.i ?? oldItem?.i
       if (!itemId) return
       blockOpenAfterDrag(itemId)
       suppressNextOpen(itemId)
     },
     // The helpers only touch refs.
-    [],
+    [isMobile],
   )
 
   const handleGridDragStop = useCallback(
@@ -690,9 +693,10 @@ export function DesktopRoute() {
       pageId: string,
       oldItem: GridLayoutItem | null,
       newItem: GridLayoutItem | null,
+      event: Event,
     ) => {
       const itemId = newItem?.i ?? oldItem?.i
-      if (itemId) {
+      if (itemId && !(isMobile && event.type.startsWith('touch'))) {
         blockOpenAfterDrag(itemId)
         suppressNextOpen(itemId)
       }
@@ -700,7 +704,7 @@ export function DesktopRoute() {
       store.handleGridDragStop(pageId, oldItem, newItem)
     },
     // The helpers only touch refs.
-    [store],
+    [isMobile, store],
   )
 
   const handleOpenItem = useCallback(
@@ -1027,6 +1031,7 @@ export function DesktopRoute() {
         </MenuItem>
       </Menu>
 
+      <OpenWithHost />
       <Alert
         severity="success"
         onClose={() => store.setSnackbar(null)}
@@ -1062,11 +1067,13 @@ interface DesktopPagesProps {
     pageId: string,
     oldItem: GridLayoutItem | null,
     newItem: GridLayoutItem | null,
+    event: Event,
   ) => void
   onGridDragStop: (
     pageId: string,
     oldItem: GridLayoutItem | null,
     newItem: GridLayoutItem | null,
+    event: Event,
   ) => void
   onOpenItem: (item: LayoutItem) => void
   onOpenItemContextMenu: (item: LayoutItem, event: ReactMouseEvent<HTMLDivElement>) => void
@@ -1169,12 +1176,12 @@ const DesktopPages = memo(function DesktopPages({
               resizeConfig={{ enabled: false }}
               dragConfig={dragConfig}
               compactor={dragOverlayCompactor}
-              onDragStart={(_, oldItem, newItem) =>
-                onGridDragStart(page.id, oldItem, newItem)
+              onDragStart={(_, oldItem, newItem, _placeholder, event) =>
+                onGridDragStart(page.id, oldItem, newItem, event)
               }
               onLayoutChange={noopLayoutChange}
-              onDragStop={(_, oldItem, newItem) =>
-                onGridDragStop(page.id, oldItem, newItem)
+              onDragStop={(_, oldItem, newItem, _placeholder, event) =>
+                onGridDragStop(page.id, oldItem, newItem, event)
               }
             >
               {page.items.map((item) => (
@@ -1307,6 +1314,7 @@ function DesktopTile({
     pointerId: number
   } | null>(null)
   const releaseAppPointerRef = useRef<(() => void) | null>(null)
+  const appPointerTypeRef = useRef<string | null>(null)
 
   useEffect(() => {
     return () => {
@@ -1329,8 +1337,8 @@ function DesktopTile({
   ) => {
     if (isDesktop || pointerType === 'mouse') return
     const start = touchStartRef.current
-    clearAppPointer()
     if (!start || start.pointerId !== pointerId) return
+    clearAppPointer()
     const distance = Math.hypot(clientX - start.x, clientY - start.y)
     if (distance <= 12) onOpen(item)
   }
@@ -1338,12 +1346,21 @@ function DesktopTile({
   const handleAppPointerDown = (
     event: ReactPointerEvent<HTMLButtonElement>,
   ) => {
+    appPointerTypeRef.current = event.pointerType
     if (isDesktop || event.pointerType === 'mouse') return
     clearAppPointer()
     touchStartRef.current = {
       x: event.clientX,
       y: event.clientY,
       pointerId: event.pointerId,
+    }
+
+    const handleWindowPointerMove = (pointerEvent: PointerEvent) => {
+      const start = touchStartRef.current
+      if (!start || start.pointerId !== pointerEvent.pointerId) return
+      if (Math.hypot(pointerEvent.clientX - start.x, pointerEvent.clientY - start.y) > 12) {
+        clearAppPointer()
+      }
     }
 
     const handleWindowPointerUp = (pointerEvent: PointerEvent) => {
@@ -1361,9 +1378,11 @@ function DesktopTile({
       }
     }
 
+    window.addEventListener('pointermove', handleWindowPointerMove, true)
     window.addEventListener('pointerup', handleWindowPointerUp)
     window.addEventListener('pointercancel', handleWindowPointerCancel)
     releaseAppPointerRef.current = () => {
+      window.removeEventListener('pointermove', handleWindowPointerMove, true)
       window.removeEventListener('pointerup', handleWindowPointerUp)
       window.removeEventListener('pointercancel', handleWindowPointerCancel)
     }
@@ -1422,7 +1441,11 @@ function DesktopTile({
       {tile ? (
         <button
           type="button"
-          onClick={isDesktop ? () => onOpen(item) : undefined}
+          onClick={(event) => {
+            if (!event.defaultPrevented && (isDesktop || event.detail === 0 || appPointerTypeRef.current === 'mouse')) {
+              onOpen(item)
+            }
+          }}
           onPointerDown={handleAppPointerDown}
           onPointerUp={handleAppPointerUp}
           onPointerCancel={clearAppPointer}

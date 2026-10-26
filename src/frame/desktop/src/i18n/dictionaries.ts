@@ -2,6 +2,7 @@ import { aiCenterPlaygroundEn, aiCenterPlaygroundZh } from './ai-center-playgrou
 import { modelCatalogEn, modelCatalogZh } from './model-catalog'
 import { aiCenterEn, aiCenterZh } from './ai-center'
 import { aiCenterRoutingEn, aiCenterRoutingZh } from './ai-center-routing'
+import { aiCenterQuotaEn, aiCenterQuotaZh } from './ai-center-quota'
 import { fileBrowserReviewEn, fileBrowserReviewZh } from './filebrowser-review'
 import { messageHubEn, messageHubZh } from './messagehub'
 import { homeStationEn, homeStationZh } from './homestation'
@@ -16,6 +17,8 @@ import { networkEn, networkZh } from './network'
 import { myNetworkEn, myNetworkZh } from './my-network'
 import { loadingTipsEn, loadingTipsZh } from './loading-tips'
 import { sharesEn, sharesZh } from './shares'
+import { appLaunchEn, appLaunchZh } from './app-launch'
+import { ssoEn, ssoZh } from './sso'
 import type { SupportedLocale } from '../models/ui'
 
 type Dictionary = Record<string, string>
@@ -25,6 +28,7 @@ const en: Dictionary = {
   ...aiCenterEn,
   ...aiCenterPlaygroundEn,
   ...aiCenterRoutingEn,
+  ...aiCenterQuotaEn,
   ...messageHubEn,
   ...homeStationEn,
   ...loadingTipsEn,
@@ -799,6 +803,7 @@ const zhCN: Dictionary = {
   ...aiCenterZh,
   ...aiCenterPlaygroundZh,
   ...aiCenterRoutingZh,
+  ...aiCenterQuotaZh,
   ...messageHubZh,
   ...homeStationZh,
   ...loadingTipsZh,
@@ -1718,8 +1723,8 @@ const ar: Dictionary = {
 }
 
 export const dictionaries: Record<SupportedLocale, Dictionary> = {
-  en: { ...en, ...appServiceEn, ...fileBrowserReviewEn, ...agentSetupEn, ...usersAgentsEn, ...presentationEn, ...settingsEn, ...trayEn, ...filePermissionsEn, ...networkEn, ...myNetworkEn, ...sharesEn },
-  'zh-CN': { ...zhCN, ...appServiceZh, ...fileBrowserReviewZh, ...agentSetupZh, ...usersAgentsZh, ...presentationZh, ...settingsZh, ...trayZh, ...filePermissionsZh, ...networkZh, ...myNetworkZh, ...sharesZh },
+  en: { ...en, ...appServiceEn, ...fileBrowserReviewEn, ...agentSetupEn, ...usersAgentsEn, ...presentationEn, ...settingsEn, ...trayEn, ...filePermissionsEn, ...networkEn, ...myNetworkEn, ...sharesEn, ...appLaunchEn, ...ssoEn },
+  'zh-CN': { ...zhCN, ...appServiceZh, ...fileBrowserReviewZh, ...agentSetupZh, ...usersAgentsZh, ...presentationZh, ...settingsZh, ...trayZh, ...filePermissionsZh, ...networkZh, ...myNetworkZh, ...sharesZh, ...appLaunchZh, ...ssoZh },
   ja,
   ko,
   fr,

@@ -16,7 +16,7 @@ use libopendan::bridge::{EventBridge, KEventBridge, TimerBridge};
 use libopendan::channel::{KmsgChannels, Waker};
 use libopendan::host::goals::{GoalHost, GoalHostOptions};
 use libopendan::host::{HostDeps, Supervisor};
-use libopendan::protocol::builtin_runtimes;
+use libopendan::protocol::{builtin_runtimes, RuntimeAvailability};
 use libopendan::runner::{BehaviorAssembler, ObjectStore, OutboundSink, RunnerOptions};
 use libopendan::state::{
     register_in_process, unregister_in_process, AgentStateClient, FsAgentStateClient, WithNotify,
@@ -28,7 +28,7 @@ use crate::config::AgentConfig;
 use crate::home::Home;
 use crate::records::{self, AgentRecords};
 use crate::rootfs::{self, RootIdentity};
-use crate::service::{Access, LoaderInfo, ModuleStatus, StateService, SERVICE_PATH};
+use crate::service::{Access, LoaderInfo, ModuleStatus, StateService, SERVICE_PATH, WEB_API_PATH};
 use crate::tasks::{owner_of, CancelBridge, TaskService, TurnTasks};
 use crate::ui::{MailService, MsgCenterSink, OutboundTexts, UiModule};
 
@@ -77,6 +77,9 @@ pub struct LoaderEnv {
     /// The owner's notification service (msg-center; files with `--dev`).
     /// `None`: a Work cannot ask, `agent-session notify` is not available.
     pub notify: Option<Arc<dyn libopendan::notify::NotifyHost>>,
+    /// Where a finished user task is shared as the agent's own post (the
+    /// agent's HomeStation; files with `--dev`). `None`: nothing is shared.
+    pub share: Option<Arc<dyn libopendan::share::ShareHost>>,
     pub access: Access,
     pub port: u16,
     pub web_dir: Option<PathBuf>,
@@ -111,6 +114,12 @@ fn container_roots(agent_root: &std::path::Path) -> Vec<PathBuf> {
         roots.push(home.to_path_buf());
     }
     roots
+}
+
+/// node_daemon runs this Agent Service natively on its node (the zone
+/// owner's Agent on its host runtime): there is no agent container.
+fn native_service() -> bool {
+    std::env::var("OPENDAN_SERVICE_MODE").is_ok_and(|v| v == "native")
 }
 
 fn container_note() -> &'static str {
@@ -227,21 +236,11 @@ impl Loader {
             None => Arc::new(fs),
         };
         register_in_process(agent.clone());
-        // The runtimes every agent has, before anything can choose one.
-        match agent
-            .runtimes()
-            .ensure_builtin(&builtin_runtimes(container_roots(&env.agent_root), container_note()), &env.who)
-            .await
-        {
-            Ok(r) => log::info!(
-                "loader: runtimes {}",
-                r.iter()
-                    .map(|r| format!("{}={:?}", r.runtime_id, r.availability))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            Err(e) => log::warn!("loader: built-in runtimes not registered: {e}"),
-        }
+        // The runtimes the system configures for this agent (its container,
+        // the owner's host, further enabled nodes), before anything can
+        // choose one; followed while running (`watch_runtime_settings`).
+        project_runtimes(agent.as_ref(), &env.agent_root, &env.settings, &env.who).await;
+        tokio::spawn(check_runtimes(agent.clone()));
 
         let info = Arc::new(LoaderInfo {
             agent_did: env.agent_did.clone(),
@@ -312,6 +311,7 @@ impl Loader {
             outbound,
             objects: env.objects.clone(),
             notify: env.notify.clone(),
+            share: env.share.clone(),
             turn_tasks: env.tasks.clone().map(|tasks| {
                 Arc::new(TurnTasks {
                     tasks,
@@ -375,17 +375,23 @@ impl Loader {
             config.loader.goals.enabled,
             config.loader.goals.enabled.then_some("schedule backend: local"),
         );
-        for (name, switch) in [
-            ("self_check", &config.loader.self_check),
-            ("self_improve", &config.loader.self_improve),
-        ] {
-            module(
-                name,
-                switch.enabled,
-                false,
-                switch.enabled.then_some("not available in this version"),
-            );
-        }
+        module(
+            "self_check",
+            config.loader.self_check.enabled,
+            false,
+            config.loader.self_check.enabled.then_some("not available in this version"),
+        );
+        let maintenance = libopendan::goal::defaults(Some(&env.agent_root), libopendan::goal::GOAL_CLASS).maintenance;
+        module(
+            "memory_maintenance",
+            maintenance.enabled,
+            maintenance.enabled && config.loader.goals.enabled,
+            Some(if maintenance.enabled {
+                "built-in goal seeded by the goals module; decision pre-check off"
+            } else {
+                "[session.goal.maintenance] enabled = false"
+            }),
+        );
 
         if config.loader.agent_state_service || config.loader.webui {
             let runner = Runner::new(env.port);
@@ -396,6 +402,16 @@ impl Loader {
                     info: info.clone(),
                     ui: ui.clone(),
                     access: env.access.clone(),
+                    sessions: match libopendan::session_context::SessionService::new(
+                        &env.agent_root,
+                        env.session_cli.clone(),
+                    ) {
+                        Ok(s) => Some(Arc::new(s)),
+                        Err(e) => {
+                            log::warn!("loader: no session tokens ({e}); helpers on other runtimes cannot reach this agent");
+                            None
+                        }
+                    },
                     home: Home::new(
                         env.records.clone(),
                         env.owner_did.as_ref().map(|d| d.to_string()),
@@ -405,9 +421,11 @@ impl Loader {
                         },
                     ),
                 });
-                runner
-                    .add_http_server(SERVICE_PATH.to_string(), service.clone())
-                    .map_err(|e| anyhow!("mount {SERVICE_PATH}: {e:?}"))?;
+                for path in [SERVICE_PATH, WEB_API_PATH] {
+                    runner
+                        .add_http_server(path.to_string(), service.clone())
+                        .map_err(|e| anyhow!("mount {path}: {e:?}"))?;
+                }
                 let agent_path = format!("/kapi/{}", agent.agent_id());
                 if agent_path != SERVICE_PATH {
                     runner.add_http_server(agent_path.clone(), service)
@@ -476,6 +494,14 @@ impl Loader {
                 ),
             ));
         }
+        tasks.push(tokio::spawn(watch_runtime_settings(
+            env.records.clone(),
+            agent.clone(),
+            env.agent_root.clone(),
+            env.settings.clone(),
+            env.who.clone(),
+            env.options.poll_interval.saturating_mul(6).max(Duration::from_secs(15)),
+        )));
         if let Some(shell_tasks) = env.xllm.shell_tasks.clone() {
             // The `shell` tasks a previous process left open are taken
             // back (or failed) before anything asks for them.
@@ -547,6 +573,98 @@ impl Loader {
         }
         self.supervisor.shutdown().await;
         unregister_in_process(self.agent.agent_did());
+    }
+}
+
+/// Register / refresh the agent's runtimes from its settings.
+pub async fn project_runtimes(
+    agent: &dyn AgentStateClient,
+    agent_root: &std::path::Path,
+    settings: &AgentSettings,
+    who: &str,
+) {
+    let builtin = builtin_runtimes(
+        container_roots(agent_root),
+        container_note(),
+        settings,
+        agent.agent_did(),
+        native_service(),
+    );
+    match agent.runtimes().ensure_builtin(&builtin, who).await {
+        Ok(r) => log::info!(
+            "loader: runtimes {}",
+            r.iter()
+                .map(|r| format!(
+                    "{}={:?}{}",
+                    r.runtime_id,
+                    r.availability,
+                    if r.default { " (default)" } else { "" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Err(e) => log::warn!("loader: runtimes not registered: {e}"),
+    }
+}
+
+/// Check every usable runtime once it is projected (start, upgrade,
+/// settings change): whether it answers, and whether its standard tools are
+/// there (`baseline_check`, a hint beside the declared baseline). In the
+/// background: a node that does not answer never holds the loader up.
+pub async fn check_runtimes(agent: Arc<dyn AgentStateClient>) {
+    let runtimes = match agent.runtimes().list().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("loader: runtimes not checked: {e}");
+            return;
+        }
+    };
+    for r in runtimes.into_iter().filter(|r| r.availability == RuntimeAvailability::Available) {
+        match agent.runtimes().check(&r.runtime_id).await {
+            Ok(c) => match &c.baseline_check {
+                Some(b) if !b.ok => log::warn!(
+                    "loader: runtime {} ({:?} declared {}): {}",
+                    c.runtime_id,
+                    c.availability,
+                    c.baseline.as_str(),
+                    b.error.clone().unwrap_or_else(|| format!(
+                        "standard tools missing: {} (install them on that machine, see `xagent runtime baseline`)",
+                        b.missing.join(", ")
+                    ))
+                ),
+                _ => log::info!("loader: runtime {} {:?}, standard tools complete", c.runtime_id, c.availability),
+            },
+            Err(e) => log::warn!("loader: runtime {} not checked: {e}", r.runtime_id),
+        }
+    }
+}
+
+/// The owner changes an agent's runtimes (enable the host, pick a default,
+/// adjust ComputerUse) while the agent runs: the projection follows the
+/// settings. Existing sessions keep what they froze.
+async fn watch_runtime_settings(
+    records: Arc<dyn AgentRecords>,
+    agent: Arc<dyn AgentStateClient>,
+    agent_root: PathBuf,
+    mut last: AgentSettings,
+    who: String,
+    every: Duration,
+) {
+    loop {
+        tokio::time::sleep(every).await;
+        let current = match records::settings(records.as_ref()).await {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("loader: agent settings not readable ({e}); runtimes stay as projected");
+                continue;
+            }
+        };
+        if current.runtimes != last.runtimes || current.default_runtime_id != last.default_runtime_id {
+            log::info!("loader: runtime settings changed; re-projecting runtimes");
+            project_runtimes(agent.as_ref(), &agent_root, &current, &who).await;
+            tokio::spawn(check_runtimes(agent.clone()));
+            last = current;
+        }
     }
 }
 

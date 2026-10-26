@@ -141,6 +141,10 @@
             "null"
           ]
         },
+        "call_intent": {
+          "description": "Every native function call carries a non-empty `intent` argument: why the call is made now and what it should yield.",
+          "type": "boolean"
+        },
         "tool_whitelist": {
           "description": "Tools offered as native functions (`None`: the session's tools). An entry is a tool name or `group:<builtin group>`.",
           "items": {
@@ -487,6 +491,15 @@
       ],
       "type": "string"
     },
+    "ComputerAccess": {
+      "description": "ComputerUse capability of an Agent on a runtime: `none` grants no Computer operation, `observe` grants inspect/observe, `control` adds act.",
+      "enum": [
+        "none",
+        "observe",
+        "control"
+      ],
+      "type": "string"
+    },
     "ContextMode": {
       "description": "How a behavior is entered when a hand-over (`next_behavior`) or a `call_behavior` tool call names it. Decided by the target behavior, never by the session as a whole; there is no default mode.",
       "oneOf": [
@@ -642,8 +655,15 @@
           "type": "object"
         },
         {
-          "description": "A perception record of this session (the former `perception` input).",
+          "description": "A perception of this session (Memory §4.2): the model gives content and hints, the driver binds identity, subjects, source event, time and policy through `Memory::record_perception`.",
           "properties": {
+            "cites": {
+              "description": "Cognitions (`item_…@rev`) the observation derives from or corrects.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "command": {
               "enum": [
                 "perceive"
@@ -654,11 +674,50 @@
               "default": "observation",
               "type": "string"
             },
+            "memory_intent": {
+              "description": "`explicit` when the user asked to remember.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mentions": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "objects": {
               "items": {
                 "type": "string"
               },
               "type": "array"
+            },
+            "occurred_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "description": "Input key of the message of this session the observation comes from (`None`: the observation itself is the event).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "subjects": {
+              "description": "Narrows the session's default subjects (must stay within its grants).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "suggested_kind": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "summary": {
               "default": "",
@@ -820,8 +879,76 @@
             }
           ],
           "default": {}
+        },
+        "unavailable_cmd_skills": {
+          "description": "cmd_skills named for the session that its session-runtime does not meet (baseline, platform): not frozen, reported with the reason.",
+          "items": {
+            "$ref": "#/definitions/UnavailableCmdSkill"
+          },
+          "type": "array"
         }
       },
+      "type": "object"
+    },
+    "FrozenRuntime": {
+      "description": "The session-runtime a session was frozen to at creation: the registration it resolved to and how that runtime is reached, so a restart or a changed default never moves the session to another target.",
+      "properties": {
+        "baseline": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RuntimeBaseline"
+            }
+          ],
+          "description": "The registration's declared baseline: which cmd_skills the session takes."
+        },
+        "computer": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ComputerAccess"
+            }
+          ],
+          "default": "none"
+        },
+        "exec": {
+          "default": null,
+          "description": "The registration's `exec` (`agent_tool` RuntimeConfig) at selection."
+        },
+        "kind": {
+          "$ref": "#/definitions/RuntimeKind"
+        },
+        "platform": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RuntimePlatform"
+            }
+          ],
+          "default": {
+            "arch": "",
+            "os": "",
+            "shell": ""
+          },
+          "description": "What is known of its platform at selection (empty fields: not yet learned from the runtime)."
+        },
+        "revision": {
+          "description": "`RuntimeRecord.revision` the selection was read from.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "runtime_id": {
+          "type": "string"
+        },
+        "selected_by": {
+          "$ref": "#/definitions/RuntimeSelection"
+        }
+      },
+      "required": [
+        "baseline",
+        "kind",
+        "revision",
+        "runtime_id",
+        "selected_by"
+      ],
       "type": "object"
     },
     "GoalBinding": {
@@ -952,6 +1079,25 @@
         }
       ]
     },
+    "InputBackground": {
+      "description": "What the host shows a context besides its inputs.",
+      "oneOf": [
+        {
+          "description": "Only what an input batch carries (the chat format's background).",
+          "enum": [
+            "batch"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Also after every batch of tool results (behavior loop: every step with action results): the TodoList, sub session and runtime / workspace lines that changed since they were last shown, as a `<<background_context>>` message before the next inference.",
+          "enum": [
+            "after_tools"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "InputMedia": {
       "description": "Whether attachments also enter the context as image / document blocks.",
       "oneOf": [
@@ -1002,6 +1148,14 @@
       "additionalProperties": false,
       "description": "Input consumption policy of a context (separate from its templates).",
       "properties": {
+        "background": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InputBackground"
+            }
+          ],
+          "default": "batch"
+        },
         "media": {
           "allOf": [
             {
@@ -1467,6 +1621,57 @@
         }
       ]
     },
+    "RuntimeBaseline": {
+      "description": "Declared environment baseline of an execution runtime: `standard` has the core Agent tools and BuckyOS access, `extended` adds build tool chains and heavy tools. Declared by whoever registers the runtime, never probed.",
+      "enum": [
+        "standard",
+        "extended"
+      ],
+      "type": "string"
+    },
+    "RuntimeKind": {
+      "oneOf": [
+        {
+          "enum": [
+            "container",
+            "remote_ssh"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The owner's desktop host (`host`): a node's embedded executor.",
+          "enum": [
+            "host_native"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Another node's embedded executor.",
+          "enum": [
+            "remote_node"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RuntimePlatform": {
+      "description": "The platform of a runtime: `os` is `linux | macos | windows`, `shell` the program name commands are written for (`bash`, `pwsh`, …).",
+      "properties": {
+        "arch": {
+          "default": "",
+          "type": "string"
+        },
+        "os": {
+          "default": "",
+          "type": "string"
+        },
+        "shell": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RuntimeRequirement": {
       "properties": {
         "app_tools": {
@@ -1500,6 +1705,17 @@
           },
           "type": "object"
         },
+        "frozen": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FrozenRuntime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set by `create_session`; `None` only in sessions created by tests without an Agent State, which run in the agent's own environment."
+        },
         "requirement": {
           "allOf": [
             {
@@ -1516,6 +1732,32 @@
         }
       },
       "type": "object"
+    },
+    "RuntimeSelection": {
+      "description": "How a session's session-runtime was chosen (primary-runtime TODO §3): the workspace never chooses it.",
+      "oneOf": [
+        {
+          "description": "Named by the creator (`--runtime`, a Todo's runtime).",
+          "enum": [
+            "explicit"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The parent session's frozen runtime.",
+          "enum": [
+            "inherited"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The agent's default runtime.",
+          "enum": [
+            "default"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "Scope": {
       "description": "Initial activity declaration: what this session plans to modify (§6.7).",
@@ -1541,7 +1783,6 @@
           "enum": [
             "ui",
             "work",
-            "self_improve",
             "self_check"
           ],
           "type": "string"
@@ -1942,6 +2183,22 @@
       "required": [
         "kind",
         "ref"
+      ],
+      "type": "object"
+    },
+    "UnavailableCmdSkill": {
+      "description": "A cmd_skill a session did not take, and why.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
       ],
       "type": "object"
     },

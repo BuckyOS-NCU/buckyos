@@ -2,6 +2,7 @@
 name: buckyos_admin
 description: Inspect and manage a BuckyOS Zone — identify runtime, identity and versions, read or change settings and apps, check tasks, query logs and diagnostic bundles, and trace a fault into the source of the running version.
 requires: the buckyos command (agent container: /usr/local/bin/buckyos with the host Tool mounted at /opt/buckyos/libexec/buckyos-tool; host: $BUCKYOS_ROOT/bin/buckyos); writes depend on the agent's and its owner's RBAC
+baseline: standard
 ---
 #### When to use
 The Zone itself: what runs, which version, is it healthy, change a setting, start/stop an app, why something fails,
@@ -19,9 +20,25 @@ buckyos system info                                 # BuckyOS version, build_ver
 - In the container the Tool scripts are the host's files mounted read-only (same version as the system), the endpoint
   is `BUCKYOS_TOOL_ENDPOINT` (host NodeGateway `http://host.docker.internal:3180`), the identity is
   `BUCKYOS_APPCLIENT_SESSION_TOKEN`: the agent app, `principal` = your owner, `appid` = your agent id.
-  On a host, `buckyos` uses the device identity on `127.0.0.1:3180` and asks for `--yes`.
+  On a host, `buckyos` uses the device identity on `127.0.0.1:3180` and asks for `--yes`. In a session on a node
+  runtime, `buckyos` is the node's `$BUCKYOS_ROOT/bin/agent-tools/buckyos` entry: it runs the host's launcher with
+  your agent's identity (asked of your agent over the session token in `.opendan/`), so `whoami` shows your agent.
+- Runtimes of an Agent: `agent-session runtime list` shows each one's declared `baseline` (standard | extended),
+  `platform` and its last tool check (`baseline_check.missing`); `agent-session runtime baseline` lists the standard
+  commands and `xagent runtime baseline --check [--overlay]` checks this machine. A node's agent tool directory is
+  `$BUCKYOS_ROOT/bin/agent-tools` (laid out by node-daemon with `opendan install-agent-tools`); missing entries mean
+  that node's install lacks OpenDAN. The owner declares a runtime extended in the Agent's runtime settings
+  (OpenDAN WebUI or control-panel `agent.update {runtimes: {"<id>": {"baseline": "extended"}}}`).
 - Container paths are not host paths. Your `/opt/buckyos/logs` is the host's `$BUCKYOS_ROOT/logs/apps/<instance-hash>/`;
-  the host's `etc/`, `security/`, `bin/`, other containers and processes are not visible to you.
+  `/opt/buckyos/etc/` is the host's configuration directory mounted read-only. Host `security/`, `bin/`, other
+  containers and processes are not visible to you. Startup credentials are in the host's `security/start_config.json`;
+  development CA keys and private scheduler templates also belong under `security/`, outside this mount.
+- A browser link ending in `.bns.did`: check `web3_bridge.bns` in the container's `machine.json` against the host's
+  policy. AppService loads that policy before name resolution; an absent file uses defaults. After updating
+  node-daemon and aios, recreate the Agent container to apply its mount; `docker restart` keeps the old mounts.
+- Container creation reports misplaced `etc/start_config.json` or `etc/ca_key.pem`: an authorized host operator must
+  move those files into the security root and restore the public boot template before exposing `etc/`. See the repo's
+  `doc/path_usage.md`; never copy startup credentials or private templates into a container.
 - Agent creation defaults to `permission_mode: read_write`; the owner can choose `read_only` in Add Agent.
   `agent get <agent_id>` returns the selected mode. Owner home follows that mode; `$OPENDAN_AGENT_ROOT` is always
   writable for sessions, memory, workspaces, tools and skills. This grant is in AgentSpec, not agent settings.
@@ -29,8 +46,47 @@ buckyos system info                                 # BuckyOS version, build_ver
   give the owner the exact host commands instead of guessing results.
 - Host-side `uv run src/check.py` (repo) checks processes and ports. "Activation Ready" means waiting for activation,
   not running; "Running" with exit 0 can still come with an error-heavy log warning below it.
+- macOS Desktop nodes run node_daemon as `$BUCKYOS_ROOT/bin/node-daemon/BuckyOS Runtime.app`, the LaunchAgent
+  `com.buckyos.runtime` of the one OS user in `etc/desktop_runtime.json`. Host command for the owner:
+  `"$BUCKYOS_ROOT/bin/node-daemon/BuckyOS Runtime.app/Contents/MacOS/node_daemon" service status` (bound user,
+  launchd state, login autostart, Login Items disabled, the Runtime's own GUI/permission report); `service
+  start|stop|restart|autostart on|off` controls it. Not running before the user logs in is expected; launchd output
+  is in `logs/node_daemon/launchd.err.log`. Screen Recording and Accessibility are granted to "BuckyOS Runtime" (not
+  the BuckyOS App or Terminal); Screen Recording applies after a Runtime restart.
 
 #### Find the real commands
+- Lightweight Linux/macOS/Windows executors: Settings → Cluster Manager → Nodes/Devices issues an access URL;
+  `buckyos executor --help` describes device management and online/exec/read/write/edit/query/cancel.
+  Admin Control Panel sessions manage devices; an authorized Agent App session executes operations.
+  Select the current `executor_id`, `generation`, `profile_id` and `store_id` from online discovery;
+  never substitute a Node DID or silently select a new generation. URL creation alone does not make a target online.
+  On the target, `buckyos_agent_daemon doctor --json` and `stop --executor <id>` need no Zone login.
+  URL expiry/revocation or foreground exit removes availability; Linux UI is `unsupported`.
+  macOS 14+ desktop access is a separate profile grant (`computer_inspect`, `computer_observe`,
+  `computer_act`) and requires Screen Recording/Accessibility readiness on the logged-in user's Mac.
+  Windows uses `buckyos_agent_daemon.exe` in the logged-in user's foreground desktop session, with the same
+  desktop grants; Session 0 services, locked/secure desktops and targets with higher integrity than the daemon
+  are not supported. Elevation does not grant access across users or secure desktops.
+  Its command backend uses PowerShell 7 from PATH or Windows PowerShell, and data defaults to
+  `%LOCALAPPDATA%\buckyos-agent-daemon`. Run `doctor --json` before desktop work.
+  The standalone Windows package build links the MSVC CRT statically; ordinary Cargo development binaries
+  require the matching VC++ v14 runtime. `--binary` packages are unverified: inspect their manifest and
+  provide the prebuilt binary's runtime dependencies instead of assuming VC runtime DLLs ship with Windows.
+  Windows supports the primary display, visual/auto observations, click, Unicode type, keypress,
+  line scrolling and delay waits; semantic/hybrid, dragging and pixel scrolling are unsupported.
+  The owner can run `buckyos_agent_daemon pause|resume --executor <id>`; request acceptance is not
+  cancellation confirmation. Inspect `instances[].capabilities` in local status, query the original operation,
+  and take a new observation after resuming. Never replace the original store or replay uncertain input.
+  Windows automatically pauses on detected human input; the owner must resume locally and observe again.
+  If a crash loses the pending Unicode release data, resume stays paused/dirty and requires owner handling;
+  do not delete its coordination file to bypass that state.
+  A Windows input monitor heartbeat gap disables desktop access until daemon restart, including gaps after
+  sleep or debugger pauses. Resume cannot repair this state; restart, check readiness and observe again,
+  while querying the original operation instead of replaying uncertain input.
+  The native driver and SDK `ExecutorCommandStream.computer` are implemented; use the source protocol
+  in `src/kernel/buckyos-api/src/computer.rs`. Do not assume the planned `buckyos computer` CLI or `--present` bridge exists.
+  Keep URL secrets out of logs/messages. Query an uncertain operation by its original store/op locator before
+  deciding on a new action. Protocol and lifecycle: `doc/arch/agent_daemon.md`.
 - `buckyos command list` (modules and verbs of this install), `buckyos command describe <module> <verb>` (syntax,
   options, `access` read/write/privileged, `async_mode`), `buckyos <module> --help`.
 - Source: `/opt/buckyos/libexec/buckyos-tool/cli/modules/<module>.ts` (`system-config` is `system_config.ts`); identity
@@ -41,16 +97,81 @@ buckyos system info                                 # BuckyOS version, build_ver
 - Agents: `buckyos agent list`, `agent get|profile-get <agent_id>` (raw host name like `xiaobai.test.buckyos.io`, not
   the `did:web:` DID), `agent profile-set <agent_id> --display-name <n> [--bio <t>]` (given fields only, `''` clears;
   returns `before` and `profile`, which is your revert). Users, agent create/delete/settings: Desktop "Users and Agents".
+- Users (definition: `product/users_and_agents/UserType.md`): account types are `admin`, `user`, `limited` (zero
+  permissions until an admin puts it in a system user group) and `root` (Zone owner record, never logs in). System user
+  groups (`system/user_groups/<id>`, membership in `users/<u>/settings` `groups`) and contact projection rules
+  (`system/user_groups/_projections`; absent = Admin and User see each other) change only through admin control-panel
+  RPCs: `user_group.list|create|update|delete|set_members|set_projections|reset_projections`, `user.change_type`,
+  `user.set_account_options` (`allow_password_change` / `allow_contact_edit`, `null` = type default); no CLI verb, use
+  Desktop "Users and Agents". Don't write those keys with raw system-config: the RPCs also refresh RBAC and reload
+  msg-center. A group carries no RBAC policy (`g, <u>, group:<id>` only): a Limited user in a group still has no
+  mailbox, tasks or uploads; app access comes from `apps.availability` group rules (`group:<id>`).
+- External access (hybrid SSO, contract `doc/arch/verify-hub/混合SSO技术契约.md`): Zone switches `self_register_enabled` /
+  `did_login_enabled` / `jump_base_url` in `system/sso/settings` via admin RPC `sso.settings.get|set` (Desktop Settings ›
+  Sign-in & Sharing). Exclusive invites (a Limited account + password-free link, 48 h): admin RPCs
+  `user.exclusive_invite.create|list|get|revoke|rotate|retry_resource` (Desktop Users and Agents › Exclusive invites);
+  the link with its secret is returned only once by `create`/`rotate` — never log it or put it in a task/message. A
+  customer's resend request arrives to the issuer as a System Notify; send the rotated link through the original
+  channel yourself (the system sends no email/SMS). Limited and External sessions are restricted: a service that has
+  not opened a method answers kRPC `code: "access_denied"` with `data.reason` (`session_kind_not_allowed` = product
+  boundary, not a setting); branch on `data.reason`, never on the error text.
 - Apps: `buckyos app list|get|status|start|stop|restart|install|upgrade|uninstall|cancel`. Availability
   (`apps.availability.*`) has no CLI verb and needs a user's Control Panel login.
 - Devices, network, gateway, certificates: control-panel `zone.devices.list`, `network.overview`, `gateway.overview`,
   `zone.certificates.list` are read-only and not in the CLI. `devices/<id>/info` is node-reported Info, not a setting.
+- DID account invitations (`user.invite.create|get|accept`, `/users/invite/:inviteId`) require the invited DID's
+  Control Panel `did_federation` session before acceptance. An invite link alone or a password session is insufficient;
+  the submitted OwnerDocument must match that DID and declare this Zone. These differ from exclusive invite links.
+- The local gateway's RTCP listener follows the device document's `rtcp_port` (default `2980`), rendered into
+  `etc/node_gateway_params.json` at activation and startup. Inspect the document and listening socket together.
 - Storage: no settings API; `system status` warns on disk/memory/swap of the control-panel host.
 - AI providers: `buckyos ai providers` (auth as configured/kind, health, models; never secrets), `ai routing`,
   `ai usage [--range last1d|last7d|last30d | --since <t>] [--group-by provider_instance_name,provider_model] [--bucket day]`
-  (your own calls only); per-model health and prices: `ai_provider health <exact_model>|models` (agent container).
-  Adding/editing providers or routing: no CLI verb, the owner uses Control Panel AI settings.
+  (your own calls only; an admin's Desktop Usage page can show the whole Zone); per-model health and prices:
+  `ai_provider health <exact_model>|models` (agent container). `ai quota [--app <app_id>]` lists the token quota
+  rules that limit you (admin rules on you and your Apps / Agents, shared App rules, your own limits) with
+  settled / reserved / available and `reset_at_ms` (`null`: a total account, only an admin recharge refills it).
+  Which Providers / models each user group may use, quota rules and recharges are set in Desktop › AI Center
+  (Quota, Visibility); no CLI write verb. Adding/editing providers or routing: no CLI verb, the owner uses Control
+  Panel AI settings.
 - Developer mode, Zone display, desktop appearance: Desktop UI (`system/buckyos_dev_config` needs a sudo token the CLI lacks).
+- Node Executor (Agents running commands/files on a node, `doc/arch/node_exector.md`): the setting is the `executor`
+  field of `nodes/<node>/settings` (`enabled`, `allowed_devices` = exact device DIDs from `devices/<id>/info`,
+  `profiles.<id>` = `run_as{uid,gid}` (non-root; omitted for Windows nodes), `workdir_roots` (absolute node paths,
+  e.g. `C:\Users\<u>\ws` on Windows), `env`, `principals` = exact Agent DIDs, `ops`, and
+  `limits`, and `owner_agents` = the node's policy for the zone owner's Agents: `enabled`, default `workdir_roots`,
+  `env`, `ops` (empty = all), `computer` max `none|observe|control`, optional `run_as`; a Desktop node seeds it open on
+  first start, absent = never initialized, `enabled:false` = closed by the administrator); writing it needs an owner
+  sudo token. Which Agent uses a node is the Agent's own setting: `agent.runtime_directory [agent_id]` lists the nodes
+  offered to the owner (`host` = the desktop), `agent.update {agent_id, runtimes: {"host": {enabled, computer}},
+  default_runtime_id}` enables one (targets come from the directory, never from the caller). Desktop's Add Agent
+  permissions step asks where the Agent runs (host or its container) when the host is open and a node runs containers;
+  the directory's `host_by_default` is true on a Windows / macOS host, false on Linux (there the native Agent Service
+  would run as root), and with no container node (`container_available: false`) the host is the only choice.
+  `agent.create` accepts these same runtime fields; for the container, use
+  `runtimes: {"host": null}, default_runtime_id: "container"`. Create retries keep the saved choice.
+- A Zone owner's Agent whose default runtime is a node's `host` runs its Agent Service natively on that node: no
+  `buckyos-app-<agent>` container, no `container` runtime (`runtime_unavailable`), the node config shows
+  `apps/<instance>/run_mode: "native"`, and `agent.runtime_directory <agent_id>` says `agent_service: {mode: "native",
+  node_id}`. Changing the default between host and container restarts the Agent Service the other way; a default of
+  `container` with no container node is refused (`container_unavailable`).
+  Linux `dev` / `devtest_ood1` config generation seeds a bounded host workspace at
+  `data/home/devtest/host-runtime`, with a non-root execution identity and no desktop control; explicit node settings
+  take precedence. The scheduler multiplies
+  both into `nodes/<node>/config.executor` (never edit): a profile `agent-<12 hex>` per enabled Agent, check
+  `generation` grew, the Agent is in `principal_bindings` with `enabled`/`app_installed` true (a runtime shared by two
+  AgentSpecs is not mapped), and `auth_valid_until_ms` keeps moving (30 s lease). On the node:
+  `etc/node_executor_acl.json` lists the allowed devices, node_daemon logs `node executor opened, store_id=…`, the
+  executor listens on `127.0.0.1:3184`, Agents enter through the gateway SOCKS entry `:3185`. Its ledger is
+  `local/node_daemon/executor/`; a reinstall (`start.py --all`/`--reinstall`) clears `local/`, gives a new store_id, and
+  earlier runs then report StoreMismatch instead of resuming. Command/file execution: a root Linux/macOS node_daemon
+  (A-system) switches to the profile's `run_as`; on macOS give it a dedicated non-admin account (no no_new_privs
+  there, and uid 65534 has no account). A desktop node_daemon (Windows desktop session, macOS `BuckyOS Runtime`
+  LaunchAgent) cannot switch users: profiles omit `run_as`, operations run as the desktop user with all of that
+  user's rights, the Windows shell is PowerShell, and only trusted Agents should get such a profile. A profile whose
+  `run_as` does not fit the node (missing on a root node, present on a desktop node) and a non-root Unix node_daemon
+  outside desktop mode expose only control capabilities (`open_stream`, `describe`, `query`, `cancel`); execution,
+  file operations, and workdir resolution return `Capability`.
 - The rest goes through raw `system-config get|list|set|set-file|append`. Settings (user-adjustable, fine to edit):
   `users/<u>/apps/<app>/settings`, `users/<u>/agents/<agent>/{settings,profile}`, `services/<svc>/settings`,
   `users/<u>/desktop/<session>/<state>`. Config (derived by the scheduler, rewritten or broken by hand edits):
@@ -88,6 +209,8 @@ Keep a timeline: symptom (user words, time) → evidence (command, `trace_id`, q
   `buckyos log export --services a,b --since <RFC3339> --path $OPENDAN_SESSION_DIR/logs.zip`.
 - App and agent container logs are out of reach of `log`: `apps` holds per-instance subdirectories that query does
   not read, and `opendan` there is the host's. Your own runtime logs are files under `/opt/buckyos/logs/` in your container.
+  A natively run Agent Service has no container: its log is the host's `$BUCKYOS_ROOT/logs/opendan/opendan.<pid>.log`
+  (service `opendan`), its process record `$BUCKYOS_ROOT/local/app_native/<instance>.json` (pid, start time, port).
 - `buckyos diagnostic collect --services a,b --since <RFC3339>` (privileged; waits for the task; result has `bundle_id`,
   expiring in about an hour) → `buckyos diagnostic export <bundle_id> --path $OPENDAN_SESSION_DIR/diag.zip` (sha256
   checked). Scheduler logs run to tens of MB per hour; narrow the window.
@@ -97,6 +220,11 @@ Keep a timeline: symptom (user words, time) → evidence (command, `trace_id`, q
   host command for the owner, e.g. `uv run src/check.py`, `docker ps`, `ls $BUCKYOS_ROOT/logs/apps/`.
 
 #### When it fails
+- HTTP 503 `service_not_ready:<service>` from `/kapi/<service>` means the gateway has no registered route for that
+  service. Verify the requested service name, `services/<service>/info`, the node's `gateway_info`, and service/scheduler
+  logs. For an Agent, the gateway service name is its full AgentId: use `/kapi/<agent_id>`; its own WebUI uses
+  `/api/opendan` on the app host. `/kapi/opendan` is only for direct Loader access and has no global gateway route.
+  For a valid service name during startup, retry after instance reporting and route publication.
 - Exit codes: 2 usage; 3 auth (`AUTH_REQUIRED`, `INVALID_SESSION`, `SESSION_EXPIRED`); 4 permission
   (`PERMISSION_DENIED`, `CONFIRMATION_REQUIRED`); 5 `SERVICE_UNAVAILABLE` (`fetch failed`, retryable);
   6 operation (`RESOURCE_NOT_FOUND`, `OPERATION_FAILED`); 8 timeout.
@@ -113,6 +241,16 @@ Keep a timeline: symptom (user words, time) → evidence (command, `trace_id`, q
   agent cannot collect an administrator diagnostic bundle. `task list` shows the tasks your agent created.
 - A refusal is an answer: report the code and the owner-side path; don't retry as another identity or route around
   it through raw keys.
+- Agent stops replying with `bind_failed` or refresh failures: inspect `loader.status.authentication` and `errors`
+  through the Agent's existing kRPC endpoint, plus `session.read` input ACK/outbox state. `retry_pending` is transient;
+  `reauthorization_required`/`unavailable` needs host diagnosis. Container `Up` and old service `Healthy` do not prove
+  working authentication. Keep tokens out of the evidence; record the exact owner, AppInstanceId, message ID and error.
+- For authorized recovery, use the existing App lifecycle: check `buckyos command describe app restart`, then
+  `buckyos app restart <full_app_instance_id> --strategy recreate`. node-daemon rechecks the active owner, current
+  enabled installed App and Agent binding before issuing a fresh LoginAssertion. Do not auto-recreate on a revocation
+  or denial; resolve authorization through the owner/admin first. `docker restart` keeps the expired startup assertion.
+  Preserve AgentRootFS, message storage and Session ACK/outbox state. Check the original pending message is consumed
+  and answered once, then observe subsequent renewal; a successful restart task alone is insufficient.
 - `SESSION_EXPIRED` in a long `tail`/`wait`: the injected token lasts minutes and is refreshed per shell call; rerun in
   a new call. `CONNECTION_REQUIRED`: no endpoint; add `--endpoint http://host.docker.internal:3180`.
 - Re-running writes: pass `--idempotency-key <k>` to app and diagnostic verbs; re-read before repeating a set.
@@ -142,4 +280,4 @@ SDK types: `/opt/buckyos/libexec/buckyos-tool/dist/*.d.ts` (`node.d.ts`, `task_m
 and run it with `deno run --config /opt/buckyos/libexec/buckyos-tool/cli/deno.json` (maps `buckyos` to the mounted SDK),
 using `BUCKYOS_TOOL_ENDPOINT` and the session token; this recipe is untested. Leave the mounted Tool files unchanged.
 
-Checked against: BuckyOS 0.7.0 (build261017.main.1b6e277fadd9.dirty), Tool/SDK 0.7.131 (`system info`, `log services`, `agent`, `ai` verbs from websdk source, run on the host as device and as devtest), test.buckyos.io; agent-identity results read from policy and code, not run in a container, 2026-10-17.
+Checked against: BuckyOS 0.7.0 (build261017.main.1b6e277fadd9.dirty), Tool/SDK 0.7.131 (`system info`, `log services`, `agent`, `ai` verbs from websdk source, run on the host as device and as devtest), test.buckyos.io; agent-identity results read from policy and code, not run in a container, 2026-10-17. User types, system user groups and projection RPCs: read from source and unit tests, not run on a Zone, 2026-10-21.

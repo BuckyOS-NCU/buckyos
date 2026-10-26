@@ -254,6 +254,9 @@ impl SystemConfigBuilder {
             res_pool_id: "default".to_string(),
             is_local: true,
             allow_password_change: None,
+            allow_contact_edit: None,
+            groups: Vec::new(),
+            password_state: buckyos_api::PasswordState::Set,
         };
         self.insert_json("users/root/settings", &root_settings)?;
 
@@ -266,6 +269,9 @@ impl SystemConfigBuilder {
             res_pool_id: "default".to_string(),
             is_local: true,
             allow_password_change: None,
+            allow_contact_edit: None,
+            groups: Vec::new(),
+            password_state: buckyos_api::PasswordState::Set,
         };
         self.insert_json(&admin_key, &admin_settings)?;
         self.insert_json_if_absent(ZONE_OWNER_USER_ID_KEY, &config.user_name)?;
@@ -577,7 +583,8 @@ impl SystemConfigBuilder {
         .await?;
         // NFSP is a zone-level protocol: the gateway exposes it at the root
         // `/nfs/v1/*` path (see boot_gateway.yaml get_service_info_from_req),
-        // not under /kapi/<service>. Keep the spec metadata in sync.
+        // not under /kapi/<service>; the NDM protocols `/ndm/*` go to this
+        // service the same way. Keep the spec metadata in sync.
         if let Some(expose) = config.spec_config.expose_config.get_mut("www") {
             expose.route = ServiceExposeRouteConfig::Web {
                 sub_hostname: Vec::new(),
@@ -655,6 +662,7 @@ impl SystemConfigBuilder {
             apps: HashMap::new(),
             frame_services: HashMap::new(),
             state: NodeState::Running,
+            executor: None,
         };
         self.insert_json(&format!("nodes/{}/config", ood_name), &config)?;
 
@@ -753,7 +761,6 @@ fn build_zone_user_contact_settings(config: &StartConfigSummary) -> Option<UserC
     Some(UserContactSettings {
         did: Some(config.owner_document.id.to_string()),
         note: None,
-        groups: vec!["users".to_string()],
         tags: vec!["zone_user".to_string()],
         bindings: vec![UserTunnelBinding {
             platform: "telegram".to_string(),

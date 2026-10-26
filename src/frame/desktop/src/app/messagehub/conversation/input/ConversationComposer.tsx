@@ -1,3 +1,4 @@
+import { releaseAttachmentUploads } from '../../api/upload'
 import {
   forwardRef,
   memo,
@@ -34,6 +35,8 @@ import { VoiceRecorder } from './VoiceRecorder'
 import { isStopCommand, mergeMentions, type AnswerInputState } from './inputState'
 import { applyMention, collectMentions, matchMentionCandidates, mentionQueryAt, type MentionCandidate, type MentionQuery } from './mentions'
 import {
+  oversizedAttachmentNames,
+  attachmentSize,
   createAttachmentItem,
   extractTransferFiles,
   filesFromInputList,
@@ -51,12 +54,13 @@ const COMPOSER_FIELD_MIN_HEIGHT = 44
 const COMPOSER_FIELD_CHROME = 18
 
 function sameAttachmentInputs(a: readonly ComposerAttachmentInput[], b: readonly ComposerAttachmentInput[]) {
-  return a.length === b.length && a.every((item, index) => item.file === b[index].file && item.relativePath === b[index].relativePath && item.voice === b[index].voice)
+  return a.length === b.length && a.every((item, index) => item.file === b[index].file && item.relativePath === b[index].relativePath && item.voice === b[index].voice && item.directory === b[index].directory)
 }
 
-const attachmentInput = ({ file, relativePath, voice }: ComposerAttachmentInput): ComposerAttachmentInput => ({ file, relativePath, ...(voice ? { voice } : {}) })
+const attachmentInput = ({ file, relativePath, voice, directory }: ComposerAttachmentInput): ComposerAttachmentInput => ({ file, relativePath, directory, ...(voice ? { voice } : {}) })
 
 export interface ConversationComposerSubmitPayload {
+  signal?: AbortSignal
   attachments: ComposerAttachmentItem[]
   content: string
   /** MsgObject v2 `relates_to` of a reply (`thread`) or an edit of an own message. */
@@ -112,6 +116,8 @@ interface ConversationComposerProps {
   /** Members offered while typing `@` and by the @ button (group sessions only). */
   mentionCandidates?: MentionCandidate[]
   canMentionAll?: boolean
+  /** false: text only, no files, folders, pasted or dropped files or voice notes (Session Only guests, v1). */
+  allowFiles?: boolean
 }
 
 
@@ -119,7 +125,7 @@ const ConversationComposerInner = forwardRef<
   ConversationComposerHandle,
   ConversationComposerProps
 >(function ConversationComposer(
-  { placeholder, maxHeight, onSendMessage, onQueueChange, initialDraft = '', initialAttachments = [], onAttachmentsChange, onDraftChange, relation = null, onCancelRelation, answer = null, mentionCandidates = [], canMentionAll = false },
+  { placeholder, maxHeight, onSendMessage, onQueueChange, initialDraft = '', initialAttachments = [], onAttachmentsChange, onDraftChange, relation = null, onCancelRelation, answer = null, mentionCandidates = [], canMentionAll = false, allowFiles = true },
   ref,
 ) {
   const { t } = useI18n()
@@ -140,6 +146,7 @@ const ConversationComposerInner = forwardRef<
   // once, so typing continues while earlier messages are still being sent.
   // Sends run one at a time to keep their order; a failure stops the queue
   // and puts the failed and still-queued drafts back into the composer.
+  const uploadAbort = useRef<AbortController | null>(null)
   const sendQueue = useRef<ConversationComposerSubmitPayload[]>([])
   const draining = useRef(false)
   const mounted = useRef(false)
@@ -293,8 +300,8 @@ const ConversationComposerInner = forwardRef<
   }, [pickerOpen, mentionOpen, emojiOpen])
 
   const appendAttachmentInputs = useCallback((selected: ComposerAttachmentInput[]) => {
-    const items = selected.filter(item => item.file.size <= MAX_ATTACHMENT_BYTES)
-    setOversizeNames(selected.filter(item => item.file.size > MAX_ATTACHMENT_BYTES).map(item => item.relativePath || item.file.name))
+    const items = selected.filter(item => oversizedAttachmentNames(item).length === 0)
+    setOversizeNames(selected.flatMap(oversizedAttachmentNames))
     if (items.length === 0) {
       return
     }
@@ -339,6 +346,7 @@ const ConversationComposerInner = forwardRef<
       const target = previous.find((item) => item.id === id)
 
       if (target) {
+        releaseAttachmentUploads([target])
         revokeAttachmentItem(target)
       }
 
@@ -374,7 +382,8 @@ const ConversationComposerInner = forwardRef<
       while (sendQueue.current.length > 0) {
         const next = sendQueue.current[0]
         try {
-          await sendCallback.current(next)
+          uploadAbort.current = new AbortController()
+          await sendCallback.current({ ...next, signal: uploadAbort.current.signal })
         } catch (error) {
           const failed = sendQueue.current.splice(0)
           reportQueue()
@@ -388,6 +397,7 @@ const ConversationComposerInner = forwardRef<
         if (mounted.current) setPendingSends(sendQueue.current.length)
       }
     } finally {
+      uploadAbort.current = null
       draining.current = false
       if (mounted.current) setPendingSends(sendQueue.current.length)
     }
@@ -546,9 +556,13 @@ const ConversationComposerInner = forwardRef<
   }
 
   const addTransferData = useCallback(async (dataTransfer: DataTransfer) => {
-    const transferFiles = await extractTransferFiles(dataTransfer)
-    appendAttachmentInputs(transferFiles)
-  }, [appendAttachmentInputs])
+    if (!allowFiles) return
+    try {
+      appendAttachmentInputs(await extractTransferFiles(dataTransfer))
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : String(error))
+    }
+  }, [appendAttachmentInputs, allowFiles])
 
   useImperativeHandle(ref, () => ({
     addTransferData,
@@ -563,7 +577,8 @@ const ConversationComposerInner = forwardRef<
       (item) => item.kind === 'file',
     )
 
-    if (!hasFileItems) {
+    // Without files the browser pastes the text as usual.
+    if (!hasFileItems || !allowFiles) {
       return
     }
 
@@ -580,14 +595,16 @@ const ConversationComposerInner = forwardRef<
   const handleFileInputChange = (
     event: React.ChangeEvent<HTMLInputElement>,
   ) => {
-    appendAttachmentInputs(filesFromInputList(event.target.files))
+    const inputs = filesFromInputList(event.target.files)
+    if (!inputs.length && event.target === directoryInputRef.current) setSendError('This browser did not enumerate the folder. Drag the folder to include empty directories.')
+    else appendAttachmentInputs(inputs)
     event.target.value = ''
   }
 
   const hasDraft = relation?.kind === 'edit' ? Boolean(inputValue.trim()) : hasAttachments || Boolean(inputValue.trim())
   // An empty input offers a voice note in place of the send button (Telegram);
   // a recording keeps it until the note is sent or discarded.
-  const showVoice = canRecord && showInput && (recording || (!hasDraft && relation?.kind !== 'edit'))
+  const showVoice = allowFiles && canRecord && showInput && (recording || (!hasDraft && relation?.kind !== 'edit'))
   const showMentions = mentionCandidates.length > 0 || canMentionAll
   const answerBusy = directSend !== null || pendingSends > 0
   const stopButton = answer ? (
@@ -624,7 +641,7 @@ const ConversationComposerInner = forwardRef<
         onChange={handleFileInputChange}
       />
 
-      {pendingSends > 0 && <p role="status" className="sr-only">{t('messagehub.sendingQueue', undefined, { count: pendingSends })}</p>}
+      {pendingSends > 0 && <button type="button" className="px-3 text-xs underline" onClick={() => uploadAbort.current?.abort()}>{t('messagehub.cancel')} · {t('messagehub.sendingQueue', undefined, { count: pendingSends })}</button>}
       {oversizeNames.length > 0 && <p role="alert" className="px-3 pt-2 text-xs text-[color:var(--cp-danger)]" data-testid="attachment-too-large">{t('messagehub.attachmentTooLarge', undefined, { name: oversizeNames.join(', '), limit: formatAttachmentSize(MAX_ATTACHMENT_BYTES) })}</p>}
       {sendError && <p role="alert" className="px-3 pt-2 text-xs text-[color:var(--cp-danger)]">{t('messagehub.sendFailed')}{typeof sendError === 'string' && sendError !== 'true' ? ` ${describeSendError(sendError, t)}` : ''}</p>}
       {/* Anchored to the composer root: the message input area is overflow-hidden
@@ -650,6 +667,7 @@ const ConversationComposerInner = forwardRef<
             className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm"
             style={{ color: 'var(--cp-text)' }}
             onClick={() => directoryInputRef.current?.click()}
+            title="The folder picker omits empty subfolders. Drop a folder to include them."
             type="button"
           >
             <FolderOpen size={16} />
@@ -738,18 +756,20 @@ const ConversationComposerInner = forwardRef<
           className="relative flex min-w-0 items-end gap-0.5 rounded-[22px] border px-0.5 transition-[border-color,box-shadow] focus-within:border-[color:color-mix(in_srgb,var(--cp-accent)_55%,var(--cp-border))] focus-within:shadow-[0_0_0_3px_color-mix(in_srgb,var(--cp-accent)_14%,transparent)]"
           style={{ background: 'var(--cp-message-canvas)', borderColor: 'var(--cp-border)' }}
         >
-          <button
-            className="flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center rounded-full"
-            style={{ color: 'var(--cp-muted)' }}
-            onClick={() => { if (canPickFolder) setPickerOpen((previous) => !previous); else fileInputRef.current?.click() }}
-            type="button"
-            aria-label={t('messagehub.addAttachment', 'Add attachment')}
-            aria-haspopup={canPickFolder ? 'menu' : undefined}
-            aria-expanded={canPickFolder ? pickerOpen : undefined}
-            title={t('messagehub.addAttachment', 'Add attachment')}
-          >
-            <Paperclip size={18} />
-          </button>
+          {allowFiles ? (
+            <button
+              className="flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center rounded-full"
+              style={{ color: 'var(--cp-muted)' }}
+              onClick={() => { if (canPickFolder) setPickerOpen((previous) => !previous); else fileInputRef.current?.click() }}
+              type="button"
+              aria-label={t('messagehub.addAttachment', 'Add attachment')}
+              aria-haspopup={canPickFolder ? 'menu' : undefined}
+              aria-expanded={canPickFolder ? pickerOpen : undefined}
+              title={t('messagehub.addAttachment', 'Add attachment')}
+            >
+              <Paperclip size={18} />
+            </button>
+          ) : null}
           {showMentions ? (
             <button
               className="flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center rounded-full"
@@ -887,13 +907,16 @@ function describeSendError(message: string, t: (key: string, fallback?: string, 
   const [prefix, ...rest] = message.split(':')
   const detail = rest.join(':').trim()
   switch (prefix.trim()) {
-    case 'rejected': return t('messagehub.sendRejected', undefined, { reason: detail || 'unknown' })
+    case 'rejected':
+      // A Limited account has no personal inbox: point to group sessions instead.
+      if (detail.startsWith('recipient-has-no-inbox')) return t('messagehub.sendNoInbox')
+      return t('messagehub.sendRejected', undefined, { reason: detail || 'unknown' })
     case 'result_unknown': return t('messagehub.sendResultUnknown')
     case 'attachment_upload_unavailable': return t('messagehub.attachmentUploadUnavailable')
     case 'attachment_upload_failed': return t('messagehub.attachmentUploadFailed')
     case 'attachment_too_large': return t('messagehub.attachmentTooLarge', undefined, { name: detail, limit: formatAttachmentSize(MAX_ATTACHMENT_BYTES) })
     case 'permission_denied': return t('messagehub.reason.permission_denied')
-    default: return ''
+    default: return message === 'true' ? '' : message
   }
 }
 
@@ -908,7 +931,7 @@ const MemoAttachmentCard = memo(function AttachmentCard({
 }) {
   const { t } = useI18n()
   const displayPath = attachment.relativePath || attachment.file.name
-  const metaLine = `${attachment.file.name} · ${formatAttachmentSize(attachment.file.size)}`
+  const metaLine = `${attachment.file.name} · ${formatAttachmentSize(attachmentSize(attachment))}`
 
   return (
     <div

@@ -5,6 +5,7 @@ import type {
   LocalUserEntity,
   SelfEntity,
   SocialAccount,
+  UserGroupsInfo,
   UsersAgentsSnapshot,
 } from './types'
 import {
@@ -15,13 +16,22 @@ import {
 } from './api'
 import { toAgentEntity, toSelfEntity, toSocialAccounts } from './transforms'
 import {
+  changeUserType,
+  createUserGroup,
   deleteAgent,
+  deleteUserGroup,
   fetchUserDetail,
   removeUserMsgTunnel,
+  resetContactProjections,
+  setContactProjections,
+  setUserAccountOptions,
+  setUserGroupMembers,
   setUserMsgTunnel,
   setUserProfile,
   updateAgent,
+  updateUserGroup,
 } from '../../../api/user_mgr'
+import type { AssignableUserType, ContactProjectionRule } from '../../../api/user_type'
 import { isMockRuntime } from '../../../runtime'
 import { notifyAgentsChanged, notifyOwnProfileChanged } from '../../agent-setup/events'
 
@@ -59,6 +69,8 @@ export class UsersAgentsStore {
   private localUsers: LocalUserEntity[]
   private entityGroups: EntityGroupEntity[]
   private canCreateAgents: boolean
+  private viewerIsAdmin: boolean
+  private userGroups: UserGroupsInfo | null
 
   private snapshot: UsersAgentsSnapshot
   private listeners = new Set<() => void>()
@@ -74,6 +86,8 @@ export class UsersAgentsStore {
     this.localUsers = initial.localUsers
     this.entityGroups = initial.entityGroups
     this.canCreateAgents = initial.canCreateAgents
+    this.viewerIsAdmin = initial.viewerIsAdmin
+    this.userGroups = initial.userGroups
     this.snapshot = this.buildSnapshot()
 
     void this.reload().catch((error) => {
@@ -105,6 +119,8 @@ export class UsersAgentsStore {
     this.localUsers = snapshot.localUsers
     this.entityGroups = snapshot.entityGroups
     this.canCreateAgents = snapshot.canCreateAgents
+    this.viewerIsAdmin = snapshot.viewerIsAdmin
+    this.userGroups = snapshot.userGroups
   }
 
   private notify() {
@@ -119,6 +135,8 @@ export class UsersAgentsStore {
       localUsers: this.localUsers,
       entityGroups: this.entityGroups,
       canCreateAgents: this.canCreateAgents,
+      viewerIsAdmin: this.viewerIsAdmin,
+      userGroups: this.userGroups,
     }
   }
 
@@ -171,11 +189,71 @@ export class UsersAgentsStore {
     return null
   }
 
+  // ── Accounts, system user groups and projection rules (admin; every change is read back) ──
+
+  /** Runs one admin call, then reloads; resolves with an error, or null once the reload shows the change. */
+  private async adminChange(call: Promise<{ data: unknown; error: unknown }>, method: string): Promise<unknown> {
+    const { data, error } = await call
+    if (!data) return error ?? new Error(`${method} failed`)
+    try {
+      await this.reload()
+    } catch (reloadError) {
+      return reloadError
+    }
+    return null
+  }
+
+  changeUserType(userId: string, userType: AssignableUserType): Promise<unknown> {
+    return this.adminChange(changeUserType({ userId, userType }), 'user.change_type')
+  }
+
+  /** `null` restores the account type's default. */
+  setAccountOptions(
+    userId: string,
+    options: { allowPasswordChange?: boolean | null; allowContactEdit?: boolean | null },
+  ): Promise<unknown> {
+    return this.adminChange(setUserAccountOptions({ userId, ...options }), 'user.set_account_options')
+  }
+
+  createUserGroup(groupId: string, name: string, description?: string): Promise<unknown> {
+    return this.adminChange(createUserGroup({ groupId, name, description }), 'user_group.create')
+  }
+
+  updateUserGroup(groupId: string, patch: { name?: string; description?: string }): Promise<unknown> {
+    return this.adminChange(updateUserGroup({ groupId, ...patch }), 'user_group.update')
+  }
+
+  deleteUserGroup(groupId: string): Promise<unknown> {
+    return this.adminChange(deleteUserGroup(groupId), 'user_group.delete')
+  }
+
+  setUserGroupMembers(groupId: string, change: { add?: string[]; remove?: string[] }): Promise<unknown> {
+    return this.adminChange(setUserGroupMembers({ groupId, ...change }), 'user_group.set_members')
+  }
+
+  setProjectionRules(rules: ContactProjectionRule[]): Promise<unknown> {
+    return this.adminChange(setContactProjections(rules), 'user_group.set_projections')
+  }
+
+  resetProjectionRules(): Promise<unknown> {
+    return this.adminChange(resetContactProjections(), 'user_group.reset_projections')
+  }
+
   // ── Agents ──
 
   /** `agent.update`; resolves with an error message, or null on success. */
   async setAgentAllowGroup(agentId: string, allowGroup: boolean): Promise<unknown> {
     const { data, error } = await updateAgent({ agentId, allowGroup })
+    if (!data) return error ?? new Error('agent.update failed')
+    this.agents = this.agents.map((agent) => (agent.id === agentId ? toAgentEntity(data) : agent))
+    this.notify()
+    notifyAgentsChanged()
+    return null
+  }
+
+  /** `agent.update` of the social switches; resolves with an error message, or null on success. */
+  async setAgentSocial(agentId: string, input: { homestation?: boolean; autoShareResults?: boolean }): Promise<unknown> {
+    const { data, error } = await updateAgent({ agentId, ...input })
     if (!data) return error ?? new Error('agent.update failed')
     this.agents = this.agents.map((agent) => (agent.id === agentId ? toAgentEntity(data) : agent))
     this.notify()

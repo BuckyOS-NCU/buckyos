@@ -420,9 +420,14 @@ pub(crate) enum ProviderDraftValidationStage {
 
 impl ProviderDraftValidationError {
     fn from_provider_error(stage: ProviderDraftValidationStage, error: &ProviderError) -> Self {
+        let message = crate::observability::redact(&serde_json::Value::String(error.to_string()))
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         Self {
             stage,
             kind: ProviderRefreshFailure::from_error(error),
+            message,
         }
     }
 }
@@ -601,15 +606,11 @@ fn validate_discovery(discovery: &ProviderDiscoverySnapshot) -> ProviderResult<(
             )));
         }
         if let Some(pricing) = &model.pricing {
-            validate_pricing(pricing)?;
+            crate::catalog::validate_pricing(&model.provider_model_id, pricing)
+                .map_err(|error| ProviderError::DiscoveryResponse(error.to_string()))?;
         }
     }
     Ok(())
-}
-
-fn validate_pricing(pricing: &Pricing) -> ProviderResult<()> {
-    crate::catalog::validate_pricing("discovery", pricing)
-        .map_err(|error| ProviderError::DiscoveryResponse(error.to_string()))
 }
 
 fn resolve_operation(
@@ -634,13 +635,22 @@ fn resolve_operation(
                 .iter()
                 .any(|binding| binding.api_type == api_type)
         })
-        .map(|operation| operation.operation_id.clone())
+        .map(|operation| {
+            let priority = operation
+                .bindings
+                .iter()
+                .filter(|binding| binding.api_type == api_type)
+                .map(|binding| binding.default_priority)
+                .max()
+                .unwrap_or_default();
+            (operation.operation_id.clone(), priority)
+        })
         .collect::<Vec<_>>();
     let matching = match remote_methods {
         Some(methods) => {
             let exact = matching
                 .iter()
-                .filter(|operation| methods.contains(*operation))
+                .filter(|(operation, _)| methods.contains(operation))
                 .cloned()
                 .collect::<Vec<_>>();
             if !exact.is_empty() {
@@ -653,12 +663,33 @@ fn resolve_operation(
         }
         None => matching,
     };
+    // One adapter may bind the same API type through several operations. The
+    // descriptor declares which of them an instance without an `operations`
+    // override defaults to, so a custom channel can refresh its catalog without
+    // hand-written provider rules.
+    let highest_priority = matching
+        .iter()
+        .map(|(_, priority)| *priority)
+        .max()
+        .unwrap_or_default();
+    let matching = if highest_priority == 0 {
+        matching
+    } else {
+        matching
+            .into_iter()
+            .filter(|(_, priority)| *priority == highest_priority)
+            .collect::<Vec<_>>()
+    };
     match matching.as_slice() {
         [] => Ok(None),
-        [operation] => Ok(Some(operation.clone())),
+        [(operation, _)] => Ok(Some(operation.clone())),
         _ => Err(ProviderError::Inventory(format!(
             "adapter {:?} has multiple default operations {:?} for api_type `{api_type_name}`",
-            adapter.protocol_adapter_id, matching
+            adapter.protocol_adapter_id,
+            matching
+                .iter()
+                .map(|(operation, _)| operation.clone())
+                .collect::<Vec<_>>()
         ))),
     }
 }

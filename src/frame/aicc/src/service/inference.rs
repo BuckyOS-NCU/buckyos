@@ -5,10 +5,11 @@ pub(crate) struct RuntimeInferencePort {
     codecs: Arc<CodecRegistry>,
     quota: Arc<QuotaSourceFactory>,
     execution: Arc<ExecutionEngine>,
-    storage: Arc<AiccStorage>,
-    resource_store: Arc<dyn ResourceStore>,
-    url_fetcher: Arc<dyn UrlResourceFetcher>,
+    pub(super) storage: Arc<AiccStorage>,
+    pub(super) resource_store: Arc<dyn ResourceStore>,
+    pub(super) url_fetcher: Arc<dyn UrlResourceFetcher>,
     model_health: Arc<ModelHealthRegistry>,
+    governance: Arc<QuotaService>,
 }
 
 fn named_object_url_provider(settings: &AiccSettings) -> Arc<dyn NamedObjectUrlProvider> {
@@ -43,6 +44,7 @@ impl RuntimeInferencePort {
         resource_store: Arc<dyn ResourceStore>,
         url_fetcher: Arc<dyn UrlResourceFetcher>,
         model_health: Arc<ModelHealthRegistry>,
+        governance: Arc<QuotaService>,
     ) -> Self {
         Self {
             runtime,
@@ -53,7 +55,21 @@ impl RuntimeInferencePort {
             resource_store,
             url_fetcher,
             model_health,
+            governance,
         }
+    }
+
+    async fn access(
+        &self,
+        caller: &AuthorizedCaller,
+        snapshot: &crate::runtime::RuntimeSnapshot,
+    ) -> Result<crate::visibility::Access, RPCErrors> {
+        self.governance
+            .access(
+                caller,
+                &crate::visibility::Inventory::from_runtime(snapshot),
+            )
+            .await
     }
 
     async fn route(
@@ -76,20 +92,51 @@ impl RuntimeInferencePort {
             .transpose()
             .map_err(|error| inference_error(AiccErrorCode::InvalidRequest, error.to_string()))?;
         let models = route_models.as_ref().unwrap_or(snapshot.models.as_ref());
+        let access = self.access(caller, snapshot.as_ref()).await?;
         let provider_names = if input.model.contains('@') {
+            if !access.allows_model(&input.model) {
+                return Err(not_permitted());
+            }
+            // A permitted exact model answers a video demand it cannot meet
+            // with the field at fault, not an anonymous "no candidate".
+            if let Some(unmet) = exact_video_unmet(
+                models,
+                &input.model,
+                input.requirements.video.as_ref(),
+                &input.video_clips,
+            ) {
+                return Err(buckyos_api::video_error(
+                    AiccErrorCode::UnsupportedOperation,
+                    format!(
+                        "{} cannot serve this request: {}",
+                        input.model, unmet.reason
+                    ),
+                    &unmet.field,
+                    None,
+                    None,
+                    None,
+                )
+                .to_krpc_error());
+            }
             vec![crate::model::ExactModelName::parse(&input.model)
                 .map_err(|error| inference_error(AiccErrorCode::InvalidRequest, error.to_string()))?
                 .provider_instance_name()
                 .to_owned()]
         } else {
-            models
+            let reachable = models
                 .reachable_models(&input.model, input.api_type)
                 .map_err(|error| {
                     inference_error(AiccErrorCode::NoCandidateModel, error.to_string())
-                })?
+                })?;
+            let permitted = reachable
                 .into_iter()
+                .filter(|model| access.allows_model(&model.exact_model.to_string()))
                 .map(|model| model.identity.provider_instance_name)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            if permitted.is_empty() {
+                return Err(not_permitted());
+            }
+            permitted
         };
         let quota = self
             .quota
@@ -107,6 +154,8 @@ impl RuntimeInferencePort {
             self.model_health.as_ref(),
             input.estimated_input_tokens,
             input.estimated_output_tokens,
+            input.requirements.video.as_ref(),
+            &access,
         )
         .await;
         let session_overlay = input
@@ -133,6 +182,7 @@ impl RuntimeInferencePort {
         request.disable = input.disable;
         request.estimated_input_tokens = input.estimated_input_tokens;
         request.estimated_output_tokens = input.estimated_output_tokens;
+        request.video_clips = input.video_clips;
         if let Some(session_id) = input.session_id.as_deref() {
             if session_id.trim().is_empty() || session_id.len() > 512 {
                 return Err(inference_error(
@@ -153,9 +203,23 @@ impl RuntimeInferencePort {
                     inference_error(AiccErrorCode::InternalError, error.to_string())
                 })?;
         }
-        let decision = Router::new(models, &policy, &runtime_states)
+        let mut decision = Router::new(models, &policy, &runtime_states)
             .route(&request)
-            .map_err(|error| inference_error(AiccErrorCode::NoCandidateModel, error.to_string()))?;
+            .map_err(|error| {
+                if access.is_restricted() {
+                    inference_error(
+                        AiccErrorCode::NoCandidateModel,
+                        "no permitted model is available for this request",
+                    )
+                } else {
+                    inference_error(AiccErrorCode::NoCandidateModel, error.to_string())
+                }
+            })?;
+        if access.is_restricted() {
+            decision
+                .trace
+                .retain_models(&|model| access.allows_model(model));
+        }
         if let Some(session_id) = input.session_id.as_deref() {
             self.storage
                 .remember_session_exact_model(
@@ -185,6 +249,7 @@ impl RuntimeInferencePort {
         snapshot: &crate::runtime::RuntimeSnapshot,
         decision: &RouteDecision,
         call: &AiccCall,
+        video_facts: &crate::video::VideoMaterialFacts,
     ) -> Result<ResolvedProviderCall, RPCErrors> {
         let selected = &decision.selected;
         let provider = snapshot
@@ -204,14 +269,14 @@ impl RuntimeInferencePort {
             request_timeout: provider.config.request_timeout,
             ..HttpTransportConfig::default()
         };
-        let pricing = provider
-            .inventory
-            .models
-            .iter()
-            .find(|model| {
-                model.provider_model_id == selected.provider_model_id
-                    && model.model_driver_id == selected.model_driver_id
-            })
+        let inventory_model = provider.inventory.models.iter().find(|model| {
+            model.provider_model_id == selected.provider_model_id
+                && model.model_driver_id == selected.model_driver_id
+        });
+        let video_contract = inventory_model.and_then(|model| {
+            crate::video::VideoGenerationContract::from_capabilities(&model.capabilities)
+        });
+        let pricing = inventory_model
             .and_then(|model| model.pricing.as_ref())
             .map(|pricing| ResolvedPricing {
                 source: match pricing.source {
@@ -260,9 +325,14 @@ impl RuntimeInferencePort {
                     },
                     pricing,
                     match_dimensions,
+                    video_contract,
+                    video_facts: video_facts.clone(),
                 },
             )
-            .map_err(|error| inference_error(error.code(), error.to_string()))
+            .map_err(|error| match error {
+                crate::error::CallLoweringError::Video(error) => error.to_krpc_error(),
+                error => inference_error(error.code(), error.to_string()),
+            })
     }
 
     async fn materialize_resources(
@@ -309,6 +379,7 @@ impl RuntimeInferencePort {
                 tenant_id: caller.tenant_id.clone(),
                 caller_id: caller.user_id.clone(),
                 storage: self.storage.clone(),
+                token: Some(caller.token.clone()),
             }),
             self.resource_store.clone(),
             self.url_fetcher.clone(),
@@ -322,6 +393,33 @@ impl RuntimeInferencePort {
             .iter()
             .map(|requirement| requirement.resource.clone())
             .collect::<Vec<_>>();
+        for resource in &resources {
+            if let ResourceRef::NamedObject { obj_id } = resource {
+                AuthenticatedResourceAuthorizer {
+                    tenant_id: caller.tenant_id.clone(),
+                    caller_id: caller.user_id.clone(),
+                    storage: self.storage.clone(),
+                    token: Some(caller.token.clone()),
+                }
+                .authorize(
+                    &context,
+                    &ResourceTarget::NamedObject {
+                        obj_id: obj_id.clone(),
+                    },
+                    ResourceAccessOperation::Inspect,
+                )
+                .await
+                .map_err(resource_rpc_error)?;
+                if let Some(lease) = self
+                    .resource_store
+                    .retain(obj_id, None)
+                    .await
+                    .map_err(resource_rpc_error)?
+                {
+                    call.resource_leases.push(lease);
+                }
+            }
+        }
         // A `ResourceRef::NamedObject` input carries the object id with it, and
         // the resource key is derived from that same id — so this map recovers
         // the id the key was built from. That matters because the object id is
@@ -471,6 +569,7 @@ pub(super) struct AuthenticatedResourceAuthorizer {
     pub(super) tenant_id: String,
     pub(super) caller_id: String,
     pub(super) storage: Arc<AiccStorage>,
+    pub(super) token: Option<String>,
 }
 
 #[async_trait]
@@ -502,16 +601,82 @@ impl ResourceAuthorizer for AuthenticatedResourceAuthorizer {
                             "artifact ownership lookup failed",
                         )
                     })?;
-                if owner.is_some_and(|owner| owner != context.tenant_id) {
+                if owner
+                    .as_ref()
+                    .is_some_and(|owner| owner != &context.tenant_id)
+                {
                     return Err(ResourceError::new(
                         ResourceFailure::Unauthorized,
                         "AICC artifact belongs to another tenant",
                     ));
                 }
+                if owner.is_none() {
+                    let token = self
+                        .token
+                        .as_deref()
+                        .filter(|token| !token.is_empty())
+                        .ok_or_else(|| {
+                            ResourceError::new(
+                                ResourceFailure::Unauthorized,
+                                "NDM input requires the authenticated caller session",
+                            )
+                        })?;
+                    authorize_ndm_input(token, obj_id).await?;
+                }
             }
         }
         Ok(())
     }
+}
+
+async fn authorize_ndm_input(token: &str, obj_id: &ndn_lib::ObjId) -> Result<(), ResourceError> {
+    let unavailable = |_| {
+        ResourceError::new(
+            ResourceFailure::Unavailable,
+            "NDM authorization is unavailable",
+        )
+    };
+    let runtime = get_buckyos_api_runtime().map_err(unavailable)?;
+    let endpoint = runtime
+        .get_zone_service_url(buckyos_api::NFS_SERVER_SERVICE_NAME, false)
+        .await
+        .map_err(unavailable)?;
+    let mut url = reqwest::Url::parse(&endpoint)
+        .map_err(|_| ResourceError::new(ResourceFailure::Unavailable, "invalid NDM service URL"))?;
+    url.set_path("/ndm/v1/store/get_object");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| {
+            ResourceError::new(
+                ResourceFailure::Unavailable,
+                "NDM authorization client failed",
+            )
+        })?;
+    let response = client
+        .post(url)
+        .bearer_auth(token)
+        .json(&json!({ "obj_id": obj_id.to_string() }))
+        .send()
+        .await
+        .map_err(|_| {
+            ResourceError::new(
+                ResourceFailure::Unavailable,
+                "NDM authorization request failed",
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(ResourceError::new(
+            if matches!(response.status().as_u16(), 401 | 403 | 404) {
+                ResourceFailure::Unauthorized
+            } else {
+                ResourceFailure::Unavailable
+            },
+            "input object is not readable by the authenticated caller",
+        ));
+    }
+    Ok(())
 }
 
 fn resource_rpc_error(error: ResourceError) -> RPCErrors {
@@ -540,6 +705,7 @@ impl InferencePort for RuntimeInferencePort {
                     session_id: request.session_id,
                     estimated_input_tokens: request.estimated_input_tokens,
                     estimated_output_tokens: request.estimated_output_tokens,
+                    video_clips: Default::default(),
                 },
             )
             .await?;
@@ -586,12 +752,15 @@ impl InferencePort for RuntimeInferencePort {
                 })
                 .collect()
         };
+        let access = self.access(caller, snapshot.as_ref()).await?;
         let runtime_states = candidate_runtime_states(
             snapshot.as_ref(),
             caller,
             self.model_health.as_ref(),
             None,
             None,
+            None,
+            &access,
         )
         .await;
         let provider_names = snapshot
@@ -658,14 +827,25 @@ impl InferencePort for RuntimeInferencePort {
             );
             routing_request.requirements = request.requirements.clone().unwrap_or_default();
             match Router::new(models, &policy, &runtime_states).route(&routing_request) {
-                Ok(decision) => {
+                Ok(mut decision) => {
                     entry.available = true;
                     entry.selected_exact_model = Some(decision.selected.exact_model.clone());
                     if request.explain {
+                        if access.is_restricted() {
+                            decision
+                                .trace
+                                .retain_models(&|model| access.allows_model(model));
+                        }
                         entry.trace = Some(public_route_trace_json(&decision)?);
                     }
                 }
-                Err(error) => entry.error = Some(error.to_string()),
+                Err(error) => {
+                    entry.error = Some(if access.is_restricted() {
+                        "no permitted model is available".to_string()
+                    } else {
+                        error.to_string()
+                    })
+                }
             }
             entries.push(entry);
         }
@@ -679,9 +859,65 @@ impl InferencePort for RuntimeInferencePort {
         let route_input = route_input_for_call(&call)?;
         let request_model = route_input.model.clone();
         let has_explicit_trace_id = call.trace_id().is_some();
-        let mut routed = self.route(caller, route_input).await?;
-        let exact_call = exact_call_for_route(call, &routed.decision.selected.exact_model)?;
-        let canonical_body = call_params(&exact_call)?;
+        // A helper's identity is the request the caller sent, not the model it
+        // happened to route to, so a retry finds the same task.
+        let helper_body = matches!(
+            call,
+            AiccCall::HelperLlmChat(_)
+                | AiccCall::HelperTextToImage(_)
+                | AiccCall::HelperVideoGenerate(_)
+        )
+        .then(|| call_params(&call))
+        .transpose()?;
+        let canonical_body = match helper_body {
+            Some(body) => body,
+            None => call_params(&call)?,
+        };
+        if let Some(key) = canonical_body
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+        {
+            if let Some((receipt, exact_model)) = self
+                .execution
+                .replay(&caller.tenant_id, exact_method(&call), key, &canonical_body)
+                .await
+                .map_err(|error| error.to_krpc_error())?
+            {
+                return inference_response(
+                    receipt,
+                    RouteTrace {
+                        attempts: Vec::new(),
+                        final_model: exact_model,
+                    },
+                );
+            }
+        }
+        // The first route applies privacy, local-only and visibility policy
+        // before any material is fetched.
+        let mut routed = self.route(caller, route_input.clone()).await?;
+        let mut exact_call = exact_call_for_route(call, &routed.decision.selected.exact_model)?;
+        let mut video_facts = crate::video::VideoMaterialFacts::new();
+        if let AiccCall::VideoGenerate(request) = &exact_call {
+            let prepared = self
+                .prepare_video_materials(
+                    caller,
+                    &routed.request_id,
+                    &routed.decision.selected.exact_model,
+                    request,
+                )
+                .await?;
+            let mut final_input = route_input;
+            final_input.trace_id = Some(routed.trace_id.clone());
+            final_input.request_id = Some(routed.request_id.clone());
+            final_input.video_clips =
+                crate::video::clip_summary(&prepared.request, &prepared.facts);
+            routed = self.route(caller, final_input).await?;
+            exact_call = AiccCall::VideoGenerate(buckyos_api::VideoGenerateRequest {
+                exact_model: routed.decision.selected.exact_model.clone(),
+                ..prepared.request
+            });
+            video_facts = prepared.facts;
+        }
         let idempotency_key = canonical_body
             .get("idempotency_key")
             .and_then(Value::as_str)
@@ -710,7 +946,12 @@ impl InferencePort for RuntimeInferencePort {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut primary = self
-            .lower_call(routed.snapshot.as_ref(), &routed.decision, &exact_call)
+            .lower_call(
+                routed.snapshot.as_ref(),
+                &routed.decision,
+                &exact_call,
+                &video_facts,
+            )
             .await?;
         let mut resource_cache = Vec::new();
         self.materialize_resources(
@@ -722,12 +963,24 @@ impl InferencePort for RuntimeInferencePort {
         )
         .await?;
         let mut failover = Vec::new();
+        let mut primary_denial = None;
+        if let Err(error) = self.governance.precheck(caller, &primary).await {
+            if !routed.runtime_failover || routed.decision.fallback_candidates.is_empty() {
+                return Err(error.to_krpc_error());
+            }
+            primary_denial = Some(error);
+        }
         for candidate in &routed.decision.fallback_candidates {
             let mut fallback_decision = routed.decision.clone();
             fallback_decision.selected = candidate.clone();
             let fallback_call = call_with_exact_model(&exact_call, &candidate.exact_model)?;
             if let Ok(mut call) = self
-                .lower_call(routed.snapshot.as_ref(), &fallback_decision, &fallback_call)
+                .lower_call(
+                    routed.snapshot.as_ref(),
+                    &fallback_decision,
+                    &fallback_call,
+                    &video_facts,
+                )
                 .await
             {
                 match self
@@ -740,7 +993,14 @@ impl InferencePort for RuntimeInferencePort {
                     )
                     .await
                 {
-                    Ok(()) => failover.push(call),
+                    Ok(()) => {
+                        if primary_denial.is_some()
+                            && self.governance.precheck(caller, &call).await.is_err()
+                        {
+                            continue;
+                        }
+                        failover.push(call)
+                    }
                     Err(error) => log::warn!(
                         "fallback_resource_materialization_failed: exact_model={} error={}",
                         candidate.exact_model,
@@ -749,12 +1009,28 @@ impl InferencePort for RuntimeInferencePort {
                 }
             }
         }
+        if let Some(denial) = primary_denial {
+            if failover.is_empty() {
+                return Err(denial.to_krpc_error());
+            }
+            primary = failover.remove(0);
+            if let Some(position) = routed
+                .decision
+                .fallback_candidates
+                .iter()
+                .position(|candidate| candidate.exact_model == primary.exact_model)
+            {
+                let promoted = routed.decision.fallback_candidates.remove(position);
+                routed.decision.selected = promoted;
+            }
+        }
         let receipt = self
             .execution
             .execute(crate::execution::ExecutionRequest {
                 tenant_id: caller.tenant_id.clone(),
                 user_id: caller.user_id.clone(),
                 caller_app_id: caller.app_id.clone(),
+                attribution: Some(caller.attribution()),
                 trace_id: Some(routed.trace_id.clone()),
                 request_model: request_model.clone(),
                 idempotency_key,
@@ -803,7 +1079,7 @@ impl InferencePort for RuntimeInferencePort {
                     .await;
             });
         }
-        inference_response(receipt, &routed.decision)
+        inference_response(receipt, public_route_trace(&routed.decision))
     }
 }
 
@@ -841,12 +1117,21 @@ pub(super) fn inference_error(code: AiccErrorCode, message: impl Into<String>) -
     AiccError::new(code, message).to_krpc_error()
 }
 
+fn not_permitted() -> RPCErrors {
+    inference_error(
+        AiccErrorCode::ResourceNotPermitted,
+        "no permitted model is available for this request",
+    )
+}
+
 async fn candidate_runtime_states(
     snapshot: &crate::runtime::RuntimeSnapshot,
     caller: &AuthorizedCaller,
     model_health: &ModelHealthRegistry,
     estimated_input_tokens: Option<u64>,
     estimated_output_tokens: Option<u64>,
+    video: Option<&buckyos_api::VideoGenerationRequirement>,
+    access: &crate::visibility::Access,
 ) -> BTreeMap<String, CandidateRuntimeState> {
     let mut credentials = BTreeMap::new();
     let mut health_states = BTreeMap::new();
@@ -880,7 +1165,9 @@ async fn candidate_runtime_states(
                 .provider_metadata
                 .get(&model.provider_instance_name)
                 .is_none_or(|metadata| metadata.routable);
-            let enabled = settings.is_some_and(|provider| provider.enabled) && metadata_routable;
+            let enabled = settings.is_some_and(|provider| provider.enabled)
+                && metadata_routable
+                && access.allows_model(&model.exact_model);
             let observed =
                 model_health.snapshot(&model.exact_model, &model.provider_instance_name, now_ms());
             let health = if observed.circuit_open {
@@ -931,6 +1218,7 @@ async fn candidate_runtime_states(
                             &pricing.value,
                             estimated_input_tokens,
                             estimated_output_tokens,
+                            video.map(|video| video_usage_estimate(video, &model.capabilities)),
                         )
                     })
                     .and_then(|cost| {
@@ -949,21 +1237,43 @@ async fn candidate_runtime_states(
         .collect()
 }
 
+/// Units a video request is expected to bill: its output seconds (requested,
+/// else the model default) and its reference images. Unknown seconds stay
+/// unknown so the estimate is not mistaken for free.
+fn video_usage_estimate(
+    video: &buckyos_api::VideoGenerationRequirement,
+    capabilities: &BTreeMap<String, Value>,
+) -> buckyos_api::AiUsage {
+    let default_seconds = crate::video::VideoGenerationContract::from_capabilities(capabilities)
+        .and_then(|contract| contract.output.default_duration_seconds);
+    buckyos_api::AiUsage {
+        video_seconds: video
+            .output
+            .as_ref()
+            .and_then(|output| output.duration_seconds)
+            .or(default_seconds),
+        reference_images: Some(u64::from(video.reference_images)),
+        request_units: Some(1),
+        ..Default::default()
+    }
+}
+
 fn estimate_model_cost(
     pricing: &crate::catalog::Pricing,
     estimated_input_tokens: Option<u64>,
     estimated_output_tokens: Option<u64>,
+    video_usage: Option<buckyos_api::AiUsage>,
 ) -> Option<buckyos_api::Money> {
     if let Some(amount) = pricing.estimated_cost {
         return (amount.is_finite() && amount >= 0.0)
             .then(|| buckyos_api::Money::new(amount, pricing.currency.to_ascii_uppercase()));
     }
-    let usage = buckyos_api::AiUsage {
+    let usage = video_usage.unwrap_or_else(|| buckyos_api::AiUsage {
         input_tokens: Some(estimated_input_tokens.unwrap_or(1_000)),
         output_tokens: Some(estimated_output_tokens.unwrap_or(1_000)),
         request_units: Some(1),
         ..Default::default()
-    };
+    });
     let quote = crate::execution::PinnedPricingSnapshot::from_pricing(
         pricing,
         None,
@@ -988,6 +1298,7 @@ fn route_input_for_call(call: &AiccCall) -> Result<InferenceRouteInput, RPCError
             session_id: request.session_id.clone(),
             estimated_input_tokens: None,
             estimated_output_tokens: request.max_output_tokens,
+            video_clips: Default::default(),
         }),
         AiccCall::HelperTextToImage(request) => Ok(InferenceRouteInput {
             trace_id: request.trace_id.clone(),
@@ -1001,7 +1312,27 @@ fn route_input_for_call(call: &AiccCall) -> Result<InferenceRouteInput, RPCError
             session_id: request.session_id.clone(),
             estimated_input_tokens: None,
             estimated_output_tokens: None,
+            video_clips: Default::default(),
         }),
+        AiccCall::HelperVideoGenerate(request) => {
+            let mut requirements: buckyos_api::ModelRequirement =
+                request.requirements.clone().into();
+            requirements.video = Some(request.requirement().map_err(|e| e.to_krpc_error())?);
+            Ok(InferenceRouteInput {
+                trace_id: request.trace_id.clone(),
+                request_id: None,
+                model: request.logical_model.clone(),
+                api_type: buckyos_api::ApiType::VideoGenerate,
+                requirements,
+                disable: request.disable.clone(),
+                policy: request.policy.clone(),
+                session_overlay: request.session_overlay.clone(),
+                session_id: request.session_id.clone(),
+                estimated_input_tokens: None,
+                estimated_output_tokens: None,
+                video_clips: Default::default(),
+            })
+        }
         AiccCall::RouteResolve(_) => Err(inference_error(
             AiccErrorCode::InvalidMethod,
             "route.resolve is not an inference invocation",
@@ -1030,6 +1361,9 @@ fn route_input_for_call(call: &AiccCall) -> Result<InferenceRouteInput, RPCError
             if let AiccCall::ChatCompletionsCreate(request) = call {
                 requirements.web_search = request.web_search;
             }
+            if let AiccCall::VideoGenerate(request) = call {
+                requirements.video = Some(request.requirement());
+            }
             if let Some(voice) = params.get("voice") {
                 requirements.canonical_fields.insert(
                     "/voice".into(),
@@ -1053,6 +1387,7 @@ fn route_input_for_call(call: &AiccCall) -> Result<InferenceRouteInput, RPCError
                     .map(str::to_owned),
                 estimated_input_tokens: None,
                 estimated_output_tokens: None,
+                video_clips: Default::default(),
             })
         }
     }
@@ -1105,11 +1440,38 @@ mod search_tests {
     }
 }
 
-fn exact_call_for_route(call: AiccCall, exact_model: &str) -> Result<AiccCall, RPCErrors> {
-    let method = match &call {
+/// The first video demand an exact model's contract cannot meet.
+fn exact_video_unmet(
+    models: &crate::model::ModelRegistry,
+    exact_model: &str,
+    requirement: Option<&buckyos_api::VideoGenerationRequirement>,
+    clips: &crate::video::ClipSummary,
+) -> Option<crate::video::Unmet> {
+    let model = models.exact_model(exact_model)?;
+    let contract = crate::video::VideoGenerationContract::from_capabilities(&model.capabilities)?;
+    crate::video::unmet_requirements(&contract, requirement?, clips)
+        .into_iter()
+        .next()
+}
+
+/// The exact method a helper call executes as; other calls execute as
+/// themselves.
+fn helper_exact_method(call: &AiccCall) -> Option<&'static str> {
+    Some(match call {
         AiccCall::HelperLlmChat(_) => buckyos_api::ai_methods::CHAT_COMPLETIONS_CREATE,
         AiccCall::HelperTextToImage(_) => buckyos_api::ai_methods::IMAGES_GENERATE,
-        _ => return Ok(call),
+        AiccCall::HelperVideoGenerate(_) => buckyos_api::ai_methods::VIDEO_GENERATE,
+        _ => return None,
+    })
+}
+
+fn exact_method(call: &AiccCall) -> &'static str {
+    helper_exact_method(call).unwrap_or_else(|| call.method())
+}
+
+fn exact_call_for_route(call: AiccCall, exact_model: &str) -> Result<AiccCall, RPCErrors> {
+    let Some(method) = helper_exact_method(&call) else {
+        return Ok(call);
     };
     let mut params = call_params(&call)?;
     let object = params.as_object_mut().ok_or_else(|| {
@@ -1207,7 +1569,7 @@ fn public_route_trace_json(decision: &RouteDecision) -> Result<Value, RPCErrors>
 
 fn inference_response(
     receipt: crate::execution::ExecutionReceipt,
-    decision: &RouteDecision,
+    route_trace: RouteTrace,
 ) -> Result<Value, RPCErrors> {
     let mut response = match receipt.output.as_ref() {
         Some(output) => match &output.value {
@@ -1248,7 +1610,7 @@ fn inference_response(
     }
     response.insert(
         "route_trace".into(),
-        serde_json::to_value(public_route_trace(decision)).expect("RouteTrace serializes"),
+        serde_json::to_value(route_trace).expect("RouteTrace serializes"),
     );
     response.insert("event_ref".into(), Value::String(receipt.event_ref));
     if let Some(provider_task_ref) = receipt.provider_task_ref {
@@ -1282,15 +1644,6 @@ pub(crate) trait UsageQueryPort: Send + Sync {
         tenant_id: &str,
         request: QueryRouteTraceRequest,
     ) -> Result<QueryRouteTraceResponse, RPCErrors>;
-}
-
-#[async_trait]
-pub(crate) trait QuotaQueryPort: Send + Sync {
-    async fn query_quota(
-        &self,
-        caller: &AuthorizedCaller,
-        request: QuotaQueryRequest,
-    ) -> Result<QuotaQueryResponse, RPCErrors>;
 }
 
 #[async_trait]

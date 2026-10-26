@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useI18n } from '../../../../i18n/provider'
 import { record, resourceUrl, type JsonObject } from '../../datamodel/playground'
 import { panelStyle } from './styles'
+import { QuotaRefusalNote } from '../quota/QuotaWidgets'
 
 export function JsonDetails({ label, value, open = false }: { label: string; value: unknown; open?: boolean }) {
   const { t } = useI18n()
@@ -31,7 +32,7 @@ function MediaResult({ value, path }: { value: unknown; path: string }) {
   const ref = record(value)
   const url = resourceUrl(ref)
   const mime = String(ref.mime ?? ref.mime_hint ?? '')
-  const kind = mime.startsWith('audio/') || /audio|stems/.test(path) ? 'audio' : mime.startsWith('video/') || /video/.test(path) ? 'video' : mime.startsWith('image/') || /image|mask/.test(path) ? 'image' : 'file'
+  const kind = mime.startsWith('audio/') || /audio|stems/.test(path) ? 'audio' : mime.startsWith('image/') || /image|mask|last_frame/.test(path) ? 'image' : mime.startsWith('video/') || /video/.test(path) ? 'video' : 'file'
   return <div className="space-y-2 rounded-lg border p-3 min-w-0" style={{ borderColor: 'var(--cp-border)' }}>
     <p className="text-xs break-all">{path}</p>
     {url && !failed && kind === 'image' && <img src={url} alt={path} className="max-h-80 max-w-full rounded-lg object-contain" onError={() => setFailed(true)} />}
@@ -70,13 +71,13 @@ export function PlaygroundResult({ request, response, task, elapsed, error }: { 
         {Boolean(task?.phase) && <p>{String(task?.phase)} {task?.message ? `· ${String(task.message)}` : ''}</p>}
       </div>
       {resultError != null && <div role="alert" className="rounded-xl p-3 text-sm break-all" style={{ ...panelStyle, color: 'var(--cp-danger)' }}>
-        <strong>{t('aiCenter.playground.error')}</strong><pre className="whitespace-pre-wrap">{typeof resultError === 'string' ? resultError : JSON.stringify(resultError, null, 2)}</pre>
+        <strong>{t('aiCenter.playground.error')}</strong><QuotaRefusalNote error={resultError} /><pre className="whitespace-pre-wrap">{typeof resultError === 'string' ? resultError : JSON.stringify(resultError, null, 2)}</pre>
       </div>}
       {textBlocks.map((block, index) => (typeof block.text === 'string' || typeof block.summary === 'string') && <div key={index} className="rounded-xl p-4" style={panelStyle}><div className="text-xs mb-2" style={{ color: 'var(--cp-muted)' }}>{String(block.type)}</div><p className="text-sm whitespace-pre-wrap break-words">{String(block.text ?? block.summary)}</p></div>)}
       {typeof response?.text === 'string' && <p className="rounded-xl p-4 text-sm whitespace-pre-wrap break-words" style={panelStyle}>{response.text}</p>}
       {resources.map((resource) => <MediaResult key={resource.path} {...resource} />)}
       {embeddings.length > 0 && <div className="overflow-auto rounded-xl p-3" style={panelStyle}><table className="w-full text-sm"><thead><tr><th>ID</th><th>{t('aiCenter.playground.dimensions')}</th><th>{t('aiCenter.playground.vectorPreview')}</th></tr></thead><tbody>{embeddings.map((item, index) => <tr key={index}><td>{String(item.id ?? item.index ?? index)}</td><td>{(item.embedding as unknown[]).length}</td><td className="font-mono text-xs">{JSON.stringify((item.embedding as unknown[]).slice(0, 6))}…</td></tr>)}</tbody></table></div>}
-      {['answers', 'results', 'captions', 'detections', 'masks', 'segments', 'actions', 'tool_calls', 'pages', 'structure', 'diagnostic'].map((key) => response?.[key] !== undefined && <JsonDetails key={key} label={t(`aiCenter.playground.field.${key}`, key)} value={response[key]} open />)}
+      {['videos', 'answers', 'results', 'captions', 'detections', 'masks', 'segments', 'actions', 'tool_calls', 'pages', 'structure', 'diagnostic'].map((key) => response?.[key] !== undefined && <JsonDetails key={key} label={t(`aiCenter.playground.field.${key}`, key)} value={response[key]} open />)}
       {response && <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))' }}>
         <JsonDetails label={t('aiCenter.playground.usage')} value={response.usage ?? t('aiCenter.playground.notReported')} open />
         <JsonDetails label={t('aiCenter.playground.cost')} value={response.cost ?? t('aiCenter.playground.notReported')} open />

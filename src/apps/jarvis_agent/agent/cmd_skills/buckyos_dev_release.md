@@ -2,6 +2,7 @@
 name: buckyos_dev_release
 description: Shared BuckyOS develop-and-release loop — where to work, system build vs App build, PIKG build/pack/info, test install (first install, local new version, catalog upgrade) with versions/digests/task evidence, what App publish really does, and how system/SDK/image releases are made.
 requires: buckyos command (agent container: /usr/local/bin/buckyos with the host Tool mounted; host: $BUCKYOS_ROOT/bin/buckyos); installs need an identity the control-panel accepts; system builds, Docker images and releases need the host repo and the owner
+baseline: extended
 ---
 #### When to use
 Building, packaging, test-installing, upgrading or publishing anything for BuckyOS, and questions on how system or image releases happen. Writing the App itself is `buckyos_app_dev`; Agent templates, behaviors and skill packages are `opendan_agent_dev`; running-zone diagnosis is `buckyos_admin`. Those manuals point here for the shared steps.
@@ -24,10 +25,30 @@ buckyos auth whoami                                 # identity + zone actually u
 - BuckyOS itself (host): repo `buckyos/` with siblings `buckyos-websdk`, `buckyos-devkit`, `cyfs-gateway`; Cargo and `uv run` scripts run in `buckyos/src`; read `AGENTS.md` there first. Runtime root `$BUCKYOS_ROOT` (default `/opt/buckyos`).
 
 #### System build vs App build
+- Independent Linux/macOS Agent Daemon: from `buckyos/src`, `uv run buckyos-build.py --agent-daemon` builds only
+  the self-contained executable into `rootfs/bin/buckyos-agent-daemon/`, without SDK/Web preparation.
+  `uv run src/tools/package_agent_daemon.py --target <target> --output /tmp/agent-daemon-dist` from the repo
+  root produces the portable package, manifest and checksum; targets include x86_64-unknown-linux-musl,
+  aarch64-unknown-linux-gnu, x86_64-apple-darwin and aarch64-apple-darwin. macOS requires Xcode Command
+  Line Tools to build and macOS 14+ to run; the archive is not Developer ID signed or notarized.
+  Stop the daemon before replacing a package, retain
+  its per-executor ledger, then rerun the valid URL. Default launch installs no service. Do not claim an
+  architecture is validated until its package has run there; see `doc/arch/agent_daemon.md`.
 - An App builds with its own toolchain (vite/npm, cargo, `docker build`, python); `pikg` packages existing output and runs no build.
-- System, in `buckyos/src`: `uv run buckyos-build.py [-s <module>] [--skip-web]` (modules from `bucky_project.yaml`). It first prepares the SDK/Tool (sibling `buckyos-websdk` source, else npm `buckyos@latest`; prebuilt mode needs all four `BUCKYOS_SDK_TOOL_*`), then runs devkit, which also packs the built-in PIKGs (`jarvis_agent`, `text_editor`, `buckyos_systest` → `rootfs/data/cache/<app_id>-<ver>.pikg`).
-- Apply, all restart the zone, ask the owner first: `uv run start.py` (stop, update installed files, start), `--skip-update` (restart), `--all` (fresh dev install devtest/test.buckyos.io, keeps `data/home`, `data/srv`, `storage`), `--reinstall release`. Then `uv run check.py`: "Activation Ready" is not running.
+- Built-in `text_editor` and `sys_test` refresh their Git `#main` SDK dependency before every `pnpm build`; Text Editor prefers a configured or sibling local SDK, which must already be built.
+- System, in `buckyos/src`: `uv run buckyos-build.py [-s <module>] [--skip-web]` (modules from `bucky_project.yaml`). It first prepares the SDK/Tool (sibling `buckyos-websdk` source, else npm `buckyos@latest`; prebuilt mode needs all four `BUCKYOS_SDK_TOOL_*`), then runs devkit, which also packs the built-in PIKGs (`jarvis_agent`, `text_editor`, `buckyos_systest` → `rootfs/data/cache/<app_id>-<ver>.pikg`). On macOS it then moves node_daemon into `rootfs/bin/node-daemon/BuckyOS Runtime.app` (`tools/macos_runtime_bundle.py assemble`, ad-hoc signed unless `BUCKYOS_MACOS_CODESIGN_IDENTITY` is set); a bare devkit `buckyos-build` needs that step added.
+- Apply, all restart the zone, ask the owner first: `uv run start.py` (stop, update installed files, start), `--skip-update` (restart), `--all` (fresh dev install devtest/test.buckyos.io, keeps `data/home`, `data/srv`, `storage`), `--reinstall release`. On macOS in the owner's GUI session start.py binds the root to that user and starts the `com.buckyos.runtime` LaunchAgent (same path as the pkg); under sudo or SSH it starts node_daemon directly without desktop control. Then `uv run check.py`: "Activation Ready" is not running.
+- macOS pkg: `make_local_pkg.py build-pkg` then `verify-pkg` (one signed Runtime, non-relocatable bundles, LaunchAgent scripts). Release signing needs a Developer ID identity in `BUCKYOS_MACOS_CODESIGN_IDENTITY` before the build; ad-hoc builds lose TCC grants on every rebuild, so they cannot show upgrade continuity.
 - Container code (opendan, xagent, agent_tool, buckyos-agent, entrypoint): repo root `./build_aios --local-test` (writes `$BUCKYOS_ROOT/etc/devenv.json` `{"aios":"local/aios-test"}`), then `uv run src/start.py --skip-update` (or wait: node-daemon recreates worker containers whose image id differs from the current one within about 30 s). node-daemon never pulls paios images: a dev install uses local `<repo>:latest-<arch>` and fails deploy when it is missing (`docker pull paios/aios:latest-<arch>` or `uv run build.py`); a release install loads the pinned tarballs in `bin/paios-images/`.
+
+- Runtime startup credentials now live in `security/start_config.json`; development CA keys and private boot
+  templates also stay in `security/`. Containers receive a read-only host `etc/` mount. Before applying this layout
+  to an existing install, move its sensitive files out of `etc/` and restore the public boot template; see
+  `doc/path_usage.md` and `buckyos_admin`. Use the current backup script with the new layout.
+- Refresh-race fixes span the aios image (OpenDAN/runtime) and host binaries (verify-hub/node-daemon). Record the
+  source commit/build id, actual installed binary hashes and running image id for both; publishing only the host or
+  only the image is insufficient. Preserve verify-hub `sessions.db` and AgentRootFS. Use the existing authorized App
+  recreate flow for an invalidated instance, then verify its pending-message reply and later renewals (`buckyos_admin`).
 
 #### Package and inspect
 ```

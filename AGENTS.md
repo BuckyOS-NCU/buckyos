@@ -22,6 +22,8 @@
 uv run buckyos-build.py
 # 指定构建模块，名称取自 bucky_project.yaml 的 modules
 uv run buckyos-build.py -s scheduler
+# 独立 Linux Agent Daemon；不准备 Web/SDK 分发包，不安装完整节点
+uv run buckyos-build.py --agent-daemon
 # 跳过 Web 模块，仍会准备 SDK/CLI
 uv run buckyos-build.py --skip-web
 # 停止现有系统、更新安装文件，再启动 node_daemon；不会自动 build
@@ -39,6 +41,8 @@ uv run check.py
 # 停止 BuckyOS 进程和相关应用容器
 uv run stop.py
 ```
+
+macOS 上 node_daemon 是 `bin/node-daemon/BuckyOS Runtime.app` 的主程序（构建后由 `tools/macos_runtime_bundle.py assemble` 组装签名；直接跑 devkit `buckyos-build` 需补这一步），以绑定用户的 LaunchAgent `com.buckyos.runtime` 运行：`start.py` 在 GUI 会话中为当前用户注册并启动它，sudo/SSH 下退回直接启动且没有桌面能力；管理与诊断用 bundle 内 `node_daemon service status|start|stop|restart|autostart on|off`。
 
 `start.py` 默认要求 `rootfs/libexec/buckyos-tool/` 中已有构建生成的分发包。`--all` 与 `--reinstall` 走全新安装流程，清理范围由 `bucky_project.yaml` 的模块映射和 `clean_paths` 决定，不能当成普通重启；`data/home/`、`data/srv/`、`storage/` 属于保留数据。`start.py` 会调用 `stop.py`：后者按进程名停止服务、删除 `buckyos-app-*` 容器，并在非 Windows 平台停止 `devtest-*` 容器。
 
@@ -180,7 +184,7 @@ cmd_skills 是 Agent 完成一类事的命令手册（加可选命令），是�
 | AICC 协议、provider 能力、媒体 CLI、Task/结果/下载和消息附件 | `aigc_image`、`aigc_audio`、`aigc_video`：真实生成、长任务恢复、交付可访问 |
 | xllm 参数、模型路由、工具开关、上下文/behavior 协议 | `xllm`：示例调用、结构化结果、上下文与执行边界 |
 | SDK/Tool、PIKG/AppDoc、devkit、Installer/Repo/BNS、系统/镜像发布 | `buckyos_dev_release`、`buckyos_app_dev` 及相关场景：构建、包验证、测试安装、发布回读 |
-| AIWorkspace schema/RPC、对象/资源、renderer、Wish/Block 执行器、模板格式 | `aiworkspace_template_dev`（暂缓，恢复后生效）：新建、导出导入、引用和运行 |
+| AIWorkspace schema/RPC、对象/资源、renderer、Wish/Block 执行器、模板格式、`proc.*` 执行器协议 | `aiworkspace_run`：领取 run、读快照、跑程序、交结果、心跳；`aiworkspace_template_dev`：新建、导出导入、引用、运行和发布 |
 | skill 安装 kRPC、PIKG 的 `agent_skills` 子包、AgentRoot 的 `cmd_skills/` / `goal_skills/` / `tools/` 布局 | `opendan_agent_dev` 及所有内置手册的打包位置：安装、列表、选择、删除 |
 | AgentRootFS、Loader、Session/Behavior、cmd_skill 冻结/装配、PATH/helper、模板和扩展分发 | `opendan_agent_dev`、`ui_core` 及受影响的专项手册：发现/选择/执行、冻结与升级 |
 

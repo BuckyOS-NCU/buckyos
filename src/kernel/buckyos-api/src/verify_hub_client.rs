@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{AppDoc, AppType, AuthTarget, SelectorType, UserInfo};
+use crate::{AccessDenial, AppDoc, AppType, AuthMethod, AuthTarget, SelectorType, UserInfo};
 
 pub const VERIFY_HUB_UNIQUE_ID: &str = "verify-hub";
 pub const VERIFY_HUB_SERVICE_NAME: &str = "verify-hub";
@@ -303,6 +303,191 @@ impl RefreshTokenRequest {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateUserSessionRequest {
+    pub source_session_token: String,
+    pub target: AuthTarget,
+}
+
+impl DelegateUserSessionRequest {
+    pub fn new(source_session_token: String, target: AuthTarget) -> Self {
+        Self {
+            source_session_token,
+            target,
+        }
+    }
+
+    pub fn to_json(&self) -> Result<Value> {
+        serde_json::to_value(self).map_err(|error| {
+            RPCErrors::ReasonError(format!(
+                "Failed to serialize DelegateUserSessionRequest: {error}"
+            ))
+        })
+    }
+
+    pub fn from_json(value: Value) -> Result<Self> {
+        serde_json::from_value(value).map_err(|error| {
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse DelegateUserSessionRequest: {error}"
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DelegateUserSessionResult {
+    Issued(TokenPair),
+    SourceInactive,
+    AccessDenied,
+}
+
+// ─── hybrid SSO (doc/arch/verify-hub/混合SSO技术契约.md §5, §9) ─────────────
+
+/// `login_by_exclusive_invite`: Control Panel only; the browser never calls it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExclusiveInviteLoginRequest {
+    pub invite_id: String,
+    pub secret: String,
+    pub target: AuthTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ExclusiveInviteLoginResult {
+    Issued {
+        user_id: String,
+        token_pair: TokenPair,
+    },
+    Denied {
+        denial: AccessDenial,
+    },
+}
+
+/// `login_by_app_access_token`: Control Panel only, on behalf of an App page that
+/// presents the one-time `code` its backend obtained from `user.app_login.issue`.
+/// `target` is the App instance the code was minted for; a retry with the same
+/// `nonce` returns the pair already issued, another nonce is refused.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAccessTokenLoginRequest {
+    pub code: String,
+    pub nonce: String,
+    pub target: AuthTarget,
+}
+
+pub type AppAccessTokenLoginResult = ExclusiveInviteLoginResult;
+
+/// `revoke_families`: end the subject's families matching every given filter,
+/// except the one `except_session_token` belongs to. Control Panel only.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeFamiliesRequest {
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<AuthMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_invite_id: Option<String>,
+    /// Families an App signed in (`SessionSource::AppLogin`) for this instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_app_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub except_session_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevokeFamiliesResult {
+    pub revoked: u32,
+}
+
+/// Public profile a canonical zone shares with the target zone (Q-05).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FederationProfile {
+    pub show_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+}
+
+/// Canonical side, after consent: Control Panel only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueFederationCodeRequest {
+    pub user_id: String,
+    pub did: String,
+    pub client_zone: String,
+    pub redirect_uri: String,
+    pub nonce: String,
+    pub code_challenge: String,
+    pub profile: FederationProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueFederationCodeResult {
+    pub code: String,
+    pub expires_in: u64,
+}
+
+/// Canonical side, public over HTTPS: the code is the credential and PKCE
+/// binds it to the target zone's pending login.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExchangeFederationCodeRequest {
+    pub code: String,
+    pub code_verifier: String,
+    pub client_zone: String,
+    pub redirect_uri: String,
+}
+
+pub const FEDERATION_PURPOSE_LOGIN: &str = "login";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederationAssertion {
+    pub did: String,
+    pub client_zone: String,
+    pub nonce: String,
+    pub purpose: String,
+    pub issued_at: u64,
+    pub profile: FederationProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ExchangeFederationCodeResult {
+    Ok { assertion: FederationAssertion },
+    InvalidCode,
+}
+
+/// Target side: Control Panel calls it from `/sso/did_callback`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginByRemoteVerifyHubRequest {
+    pub did: String,
+    pub code: String,
+    pub code_verifier: String,
+    pub nonce: String,
+    pub redirect_uri: String,
+    pub target: AuthTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LoginByRemoteVerifyHubResult {
+    Issued {
+        /// The local account the DID maps to; `None` for an External session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        token_pair: TokenPair,
+        profile: FederationProfile,
+    },
+    Denied {
+        denial: AccessDenial,
+    },
+    /// Resolution of the canonical zone or the exchange call failed; retryable.
+    CanonicalUnavailable,
+}
+
 pub enum VerifyHubClient {
     InProcess(Box<dyn VerifyHubApiHandler>),
     KRPC(Box<kRPC>),
@@ -425,6 +610,120 @@ impl VerifyHubClient {
         }
     }
 
+    pub async fn delegate_user_session(
+        &self,
+        source_session_token: &str,
+        target: AuthTarget,
+    ) -> Result<DelegateUserSessionResult> {
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_delegate_user_session(None, source_session_token, &target)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let params =
+                    DelegateUserSessionRequest::new(source_session_token.to_string(), target)
+                        .to_json()?;
+                let result = client.call("delegate_user_session", params).await?;
+                serde_json::from_value(result)
+                    .map_err(|e| RPCErrors::ParserResponseError(e.to_string()))
+            }
+        }
+    }
+
+    async fn call_typed<R: serde::de::DeserializeOwned>(
+        client: &kRPC,
+        method: &str,
+        params: impl Serialize,
+    ) -> Result<R> {
+        let params = serde_json::to_value(params)
+            .map_err(|e| RPCErrors::ReasonError(format!("serialize {method}: {e}")))?;
+        let result = client.call(method, params).await?;
+        serde_json::from_value(result).map_err(|e| RPCErrors::ParserResponseError(e.to_string()))
+    }
+
+    pub async fn login_by_exclusive_invite(
+        &self,
+        request: ExclusiveInviteLoginRequest,
+    ) -> Result<ExclusiveInviteLoginResult> {
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_login_by_exclusive_invite(None, request)
+                    .await
+            }
+            Self::KRPC(client) => {
+                Self::call_typed(client, "login_by_exclusive_invite", request).await
+            }
+        }
+    }
+
+    pub async fn login_by_app_access_token(
+        &self,
+        request: AppAccessTokenLoginRequest,
+    ) -> Result<AppAccessTokenLoginResult> {
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_login_by_app_access_token(None, request)
+                    .await
+            }
+            Self::KRPC(client) => {
+                Self::call_typed(client, "login_by_app_access_token", request).await
+            }
+        }
+    }
+
+    pub async fn revoke_families(
+        &self,
+        request: RevokeFamiliesRequest,
+    ) -> Result<RevokeFamiliesResult> {
+        match self {
+            Self::InProcess(handler) => handler.handle_revoke_families(None, request).await,
+            Self::KRPC(client) => Self::call_typed(client, "revoke_families", request).await,
+        }
+    }
+
+    pub async fn issue_federation_code(
+        &self,
+        request: IssueFederationCodeRequest,
+    ) -> Result<IssueFederationCodeResult> {
+        match self {
+            Self::InProcess(handler) => handler.handle_issue_federation_code(None, request).await,
+            Self::KRPC(client) => Self::call_typed(client, "issue_federation_code", request).await,
+        }
+    }
+
+    pub async fn exchange_federation_code(
+        &self,
+        request: ExchangeFederationCodeRequest,
+    ) -> Result<ExchangeFederationCodeResult> {
+        match self {
+            Self::InProcess(handler) => handler.handle_exchange_federation_code(request).await,
+            Self::KRPC(client) => {
+                client.reset_session_token().await;
+                Self::call_typed(client, "exchange_federation_code", request).await
+            }
+        }
+    }
+
+    pub async fn login_by_remote_verify_hub(
+        &self,
+        request: LoginByRemoteVerifyHubRequest,
+    ) -> Result<LoginByRemoteVerifyHubResult> {
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_login_by_remote_verify_hub(None, request)
+                    .await
+            }
+            Self::KRPC(client) => {
+                Self::call_typed(client, "login_by_remote_verify_hub", request).await
+            }
+        }
+    }
+
     pub async fn verify_token(
         &self,
         session_token: &str,
@@ -478,6 +777,81 @@ pub trait VerifyHubApiHandler: Send + Sync {
         aud: Option<String>,
         login_nonce: u64,
     ) -> Result<SudoByPasswordResponse>;
+
+    async fn handle_delegate_user_session(
+        &self,
+        caller_token: Option<&str>,
+        source_session_token: &str,
+        target: &AuthTarget,
+    ) -> Result<DelegateUserSessionResult>;
+
+    async fn handle_login_by_exclusive_invite(
+        &self,
+        _caller_token: Option<&str>,
+        _request: ExclusiveInviteLoginRequest,
+    ) -> Result<ExclusiveInviteLoginResult> {
+        Err(RPCErrors::UnknownMethod(
+            "login_by_exclusive_invite".to_string(),
+        ))
+    }
+
+    async fn handle_login_by_app_access_token(
+        &self,
+        _caller_token: Option<&str>,
+        _request: AppAccessTokenLoginRequest,
+    ) -> Result<AppAccessTokenLoginResult> {
+        Err(RPCErrors::UnknownMethod(
+            "login_by_app_access_token".to_string(),
+        ))
+    }
+
+    async fn handle_revoke_families(
+        &self,
+        _caller_token: Option<&str>,
+        _request: RevokeFamiliesRequest,
+    ) -> Result<RevokeFamiliesResult> {
+        Err(RPCErrors::UnknownMethod("revoke_families".to_string()))
+    }
+
+    async fn handle_issue_federation_code(
+        &self,
+        _caller_token: Option<&str>,
+        _request: IssueFederationCodeRequest,
+    ) -> Result<IssueFederationCodeResult> {
+        Err(RPCErrors::UnknownMethod(
+            "issue_federation_code".to_string(),
+        ))
+    }
+
+    async fn handle_exchange_federation_code(
+        &self,
+        _request: ExchangeFederationCodeRequest,
+    ) -> Result<ExchangeFederationCodeResult> {
+        Err(RPCErrors::UnknownMethod(
+            "exchange_federation_code".to_string(),
+        ))
+    }
+
+    async fn handle_login_by_remote_verify_hub(
+        &self,
+        _caller_token: Option<&str>,
+        _request: LoginByRemoteVerifyHubRequest,
+    ) -> Result<LoginByRemoteVerifyHubResult> {
+        Err(RPCErrors::UnknownMethod(
+            "login_by_remote_verify_hub".to_string(),
+        ))
+    }
+}
+
+fn parse_request<T: serde::de::DeserializeOwned>(method: &str, params: Value) -> Result<T> {
+    serde_json::from_value(params)
+        .map_err(|error| RPCErrors::ParseRequestError(format!("invalid {method} request: {error}")))
+}
+
+fn success_value(value: impl Serialize) -> Result<RPCResult> {
+    Ok(RPCResult::Success(serde_json::to_value(value).map_err(
+        |e| RPCErrors::ParserResponseError(e.to_string()),
+    )?))
 }
 
 /// Adapter that exposes a VerifyHubHandler as a RPCHandler.
@@ -571,6 +945,69 @@ impl<T: VerifyHubApiHandler> RPCHandler for VerifyHubRpcHandler<T> {
                         .map_err(|e| RPCErrors::ParserResponseError(e.to_string()))?,
                 )
             }
+            "delegate_user_session" => {
+                let request = DelegateUserSessionRequest::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_delegate_user_session(
+                        req.token.as_deref(),
+                        &request.source_session_token,
+                        &request.target,
+                    )
+                    .await?;
+                RPCResult::Success(
+                    serde_json::to_value(result)
+                        .map_err(|e| RPCErrors::ParserResponseError(e.to_string()))?,
+                )
+            }
+            "login_by_exclusive_invite" => success_value(
+                self.0
+                    .handle_login_by_exclusive_invite(
+                        req.token.as_deref(),
+                        parse_request("login_by_exclusive_invite", req.params)?,
+                    )
+                    .await?,
+            )?,
+            "login_by_app_access_token" => success_value(
+                self.0
+                    .handle_login_by_app_access_token(
+                        req.token.as_deref(),
+                        parse_request("login_by_app_access_token", req.params)?,
+                    )
+                    .await?,
+            )?,
+            "revoke_families" => success_value(
+                self.0
+                    .handle_revoke_families(
+                        req.token.as_deref(),
+                        parse_request("revoke_families", req.params)?,
+                    )
+                    .await?,
+            )?,
+            "issue_federation_code" => success_value(
+                self.0
+                    .handle_issue_federation_code(
+                        req.token.as_deref(),
+                        parse_request("issue_federation_code", req.params)?,
+                    )
+                    .await?,
+            )?,
+            "exchange_federation_code" => success_value(
+                self.0
+                    .handle_exchange_federation_code(parse_request(
+                        "exchange_federation_code",
+                        req.params,
+                    )?)
+                    .await?,
+            )?,
+            "login_by_remote_verify_hub" => success_value(
+                self.0
+                    .handle_login_by_remote_verify_hub(
+                        req.token.as_deref(),
+                        parse_request("login_by_remote_verify_hub", req.params)?,
+                    )
+                    .await?,
+            )?,
             "verify_token" => {
                 let verify_req = VerifyTokenRequest::from_json(req.params)?;
                 let value = self
@@ -722,6 +1159,37 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn delegate_result_status_is_the_wire_discriminant() {
+        for (result, expected) in [
+            (
+                DelegateUserSessionResult::SourceInactive,
+                json!({"status": "source_inactive"}),
+            ),
+            (
+                DelegateUserSessionResult::AccessDenied,
+                json!({"status": "access_denied"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&result).unwrap(), expected);
+        }
+        let issued: DelegateUserSessionResult = serde_json::from_value(json!({
+            "status": "issued",
+            "session_token": "s",
+            "refresh_token": "r"
+        }))
+        .unwrap();
+        assert!(matches!(
+            issued,
+            DelegateUserSessionResult::Issued(TokenPair { ref session_token, ref refresh_token })
+                if session_token == "s" && refresh_token == "r"
+        ));
+        assert!(serde_json::from_value::<DelegateUserSessionResult>(json!({
+            "status": "revoked"
+        }))
+        .is_err());
+    }
+
     #[derive(Default, Debug)]
     struct MockCalls {
         login_jwt: Option<(String, AuthTarget)>,
@@ -730,6 +1198,7 @@ mod tests {
         verify_token: Option<(String, Option<AuthTarget>)>,
         refresh_token: Option<String>,
         logout: Option<String>,
+        delegate: Option<(Option<String>, String, AuthTarget)>,
     }
 
     #[derive(Clone)]
@@ -768,6 +1237,7 @@ mod tests {
                     user_id: "mock_id".to_string(),
                     user_type: UserType::Admin,
                     state: UserState::Active,
+                    groups: Vec::new(),
                 },
                 session_token: "session-1".to_string(),
                 refresh_token: "refresh-1".to_string(),
@@ -818,6 +1288,24 @@ mod tests {
             let mut calls = self.calls.lock().unwrap();
             calls.verify_token = Some((session_token.to_string(), expected_target));
             Ok(true)
+        }
+
+        async fn handle_delegate_user_session(
+            &self,
+            caller_token: Option<&str>,
+            source_session_token: &str,
+            target: &AuthTarget,
+        ) -> Result<DelegateUserSessionResult> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.delegate = Some((
+                caller_token.map(str::to_string),
+                source_session_token.to_string(),
+                target.clone(),
+            ));
+            Ok(DelegateUserSessionResult::Issued(TokenPair {
+                session_token: "delegated-session".to_string(),
+                refresh_token: "delegated-refresh".to_string(),
+            }))
         }
     }
 
@@ -975,7 +1463,55 @@ mod tests {
             _ => panic!("Expected success response"),
         }
 
+        let delegate_req = RPCRequest {
+            method: "delegate_user_session".to_string(),
+            params: json!({
+                "source_session_token": "desktop-session",
+                "target": {"kind": "app", "app_instance_id": "notes@bob"}
+            }),
+            seq: 11,
+            token: Some("control-panel-service".to_string()),
+            trace_id: None,
+        };
+        let delegate_resp = rpc_handler.handle_rpc_call(delegate_req, ip).await.unwrap();
+        match delegate_resp.result {
+            RPCResult::Success(value) => {
+                assert_eq!(
+                    value,
+                    json!({
+                        "status": "issued",
+                        "session_token": "delegated-session",
+                        "refresh_token": "delegated-refresh"
+                    })
+                );
+            }
+            _ => panic!("Expected success response"),
+        }
+        let unknown_field_req = RPCRequest {
+            method: "delegate_user_session".to_string(),
+            params: json!({
+                "source_session_token": "desktop-session",
+                "target": {"kind": "app", "app_instance_id": "notes@bob"},
+                "username": "alice"
+            }),
+            seq: 12,
+            token: Some("control-panel-service".to_string()),
+            trace_id: None,
+        };
+        assert!(matches!(
+            rpc_handler.handle_rpc_call(unknown_field_req, ip).await,
+            Err(RPCErrors::ParseRequestError(_))
+        ));
+
         let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.delegate.clone().unwrap(),
+            (
+                Some("control-panel-service".to_string()),
+                "desktop-session".to_string(),
+                AuthTarget::app("notes@bob".parse().unwrap()),
+            )
+        );
         let (jwt, params) = calls.login_jwt.clone().unwrap();
         assert_eq!(jwt, "jwt-2");
         assert_eq!(params, AuthTarget::system("kernel".parse().unwrap()));

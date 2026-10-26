@@ -29,7 +29,7 @@ pub struct BackgroundLine {
 }
 
 impl BackgroundLine {
-    fn new(key: impl Into<String>, text: impl Into<String>) -> Self {
+    pub(super) fn new(key: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             key: key.into(),
             text: text.into(),
@@ -89,7 +89,7 @@ fn outcome_name(o: Option<Outcome>) -> String {
         .unwrap_or_else(|| "no outcome".into())
 }
 
-fn child_line(e: &RegistryEntry) -> BackgroundLine {
+pub(super) fn child_line(e: &RegistryEntry) -> BackgroundLine {
     let st = &e.status;
     let sid = &e.session_id;
     let status = one_line(&st.one_line_status, 200);
@@ -142,7 +142,28 @@ pub fn lines(i: &BackgroundInput) -> Vec<BackgroundLine> {
         if !cwd.is_empty() {
             t.push_str(&format!(", cwd {cwd}"));
         }
+        let shell = field("shell_kind");
+        if !shell.is_empty() {
+            t.push_str(&format!(", shell {shell}"));
+        }
+        let baseline = field("baseline");
+        if !baseline.is_empty() {
+            t.push_str(&format!(", {baseline} environment"));
+        }
         out.push(BackgroundLine::new("runtime", t));
+    }
+    if let Some(w) = i.runtime_status.get("workspace").filter(|w| w.is_object()) {
+        let s = |k: &str| w.get(k).and_then(Value::as_str).unwrap_or_default();
+        let dir = w.get("directory").and_then(Value::as_str).unwrap_or_default();
+        let reach = if w.get("same_runtime").and_then(Value::as_bool) == Some(true) {
+            "on this runtime: cd there or use absolute paths"
+        } else {
+            "on another runtime: copy files with agent-session copy"
+        };
+        out.push(BackgroundLine::new(
+            "workspace",
+            format!("workspace {} at {dir} on runtime {} ({reach})", s("workspace_id"), s("runtime_id")),
+        ));
     }
     if let Some(t) = i.tunnel.filter(|t| !t.is_empty()) {
         out.push(BackgroundLine::new("channel", format!("channel: the user writes through {t}")));
@@ -237,7 +258,7 @@ pub fn lines(i: &BackgroundInput) -> Vec<BackgroundLine> {
     out
 }
 
-fn digest(text: &str) -> String {
+pub(super) fn digest(text: &str) -> String {
     hex::encode(&Sha256::digest(text.as_bytes())[..8])
 }
 

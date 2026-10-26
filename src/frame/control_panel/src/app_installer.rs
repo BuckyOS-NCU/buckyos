@@ -1401,7 +1401,7 @@ impl AppInstaller {
         plan: PublishScanPlan,
     ) -> Result<PreparedPublishPlan, RPCErrors> {
         let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_named_store().await.map_err(|error| {
+        let named_store = runtime.get_local_named_store().await.map_err(|error| {
             RPCErrors::ReasonError(format!("Open named store for publish failed: {error}"))
         })?;
         let temp_root = std::env::temp_dir().join(format!("buckyos-publish-{}", Uuid::new_v4()));
@@ -1480,7 +1480,7 @@ impl AppInstaller {
         prepared: &PreparedPublishPlan,
     ) -> Result<(ObjId, AppDoc, Vec<Value>), RPCErrors> {
         let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_named_store().await.map_err(|error| {
+        let named_store = runtime.get_local_named_store().await.map_err(|error| {
             RPCErrors::ReasonError(format!("Open named store for publish failed: {error}"))
         })?;
         info!(
@@ -2133,10 +2133,7 @@ impl ControlPanelServer {
     }
 
     fn principal_is_admin(principal: &RpcAuthPrincipal) -> bool {
-        matches!(
-            principal.user_type,
-            crate::UserType::Admin | crate::UserType::Root
-        )
+        principal.user_type.is_privileged()
     }
 
     fn require_install_scope(
@@ -2204,6 +2201,42 @@ impl ControlPanelServer {
         Ok(options)
     }
 
+    async fn authorize_staging_source(
+        token: Option<&str>,
+        source: &ObjId,
+    ) -> Result<(), RPCErrors> {
+        let token = token
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| {
+                RPCErrors::ReasonError("PIKG input requires the original caller token".into())
+            })?;
+        let runtime = get_buckyos_api_runtime()?;
+        let endpoint = runtime
+            .get_zone_service_url(buckyos_api::NFS_SERVER_SERVICE_NAME, false)
+            .await?;
+        let mut url = reqwest::Url::parse(&endpoint)
+            .map_err(|_| RPCErrors::ReasonError("invalid NDM authorization endpoint".into()))?;
+        url.set_path("/ndm/v1/store/get_object");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| RPCErrors::ReasonError("NDM authorization unavailable".into()))?;
+        let response = client
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "obj_id": source.to_string() }))
+            .send()
+            .await
+            .map_err(|_| RPCErrors::ReasonError("NDM authorization unavailable".into()))?;
+        if !response.status().is_success() {
+            return Err(RPCErrors::ReasonError(
+                "PIKG source is not readable by the authenticated caller".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn handle_apps_staging_finalize(
         &self,
         req: RPCRequest,
@@ -2217,7 +2250,7 @@ impl ControlPanelServer {
                 "provide exactly one of source_obj_id (FileObject) or local_file_id".to_string(),
             ));
         }
-        let digest = Self::require_param_str(&req, "pikg_digest")?;
+        let digest = Self::param_str(&req, "pikg_digest");
         let size = req
             .params
             .get("size")
@@ -2239,7 +2272,9 @@ impl ControlPanelServer {
             self.staging_store
                 .finalize_local_file(
                     &file_id,
-                    &digest,
+                    digest.as_deref().ok_or_else(|| {
+                        RPCErrors::ParseRequestError("local_file_id requires pikg_digest".into())
+                    })?,
                     size,
                     principal.username.as_str(),
                     principal.authenticated_app_id.as_str(),
@@ -2251,10 +2286,11 @@ impl ControlPanelServer {
             let source = ObjId::new(source_raw.as_deref().unwrap()).map_err(|error| {
                 RPCErrors::ParseRequestError(format!("invalid source_obj_id: {error}"))
             })?;
+            Self::authorize_staging_source(req.token.as_deref(), &source).await?;
             self.staging_store
                 .finalize_named_object(
                     &source,
-                    &digest,
+                    digest.as_deref(),
                     size,
                     principal.username.as_str(),
                     principal.authenticated_app_id.as_str(),
@@ -3586,7 +3622,9 @@ impl ControlPanelServer {
             owner_did: String::new(),
             is_user_session: false,
             is_control_panel_session: true,
+            principal_kind: buckyos_api::TokenPrincipalKind::User,
             agent_permission_mode: None,
+            session: crate::PrincipalSession::default(),
         };
         let mut options = serde_json::json!({
             "policy": "SYSTEM_INTERNAL",
@@ -4294,6 +4332,13 @@ impl ControlPanelServer {
 mod submit_action_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn staging_object_requires_original_caller_token() {
+        let source = ObjId::new_by_raw("cyfile".into(), vec![1; 32]);
+        assert!(ControlPanelServer::authorize_staging_source(None, &source).await.is_err());
+        assert!(ControlPanelServer::authorize_staging_source(Some(" "), &source).await.is_err());
+    }
+
     #[test]
     fn uninstalled_specs_can_be_inspected_and_submitted_as_fresh_install() {
         let owner = name_lib::DID::new("bns", "alice");
@@ -4391,7 +4436,9 @@ mod submit_action_tests {
             owner_did: "did:bns:devtest".to_string(),
             is_user_session: false,
             is_control_panel_session: false,
+            principal_kind: buckyos_api::TokenPrincipalKind::User,
             agent_permission_mode: None,
+            session: crate::PrincipalSession::default(),
         }
     }
 
@@ -4541,8 +4588,14 @@ mod submit_action_tests {
             supersedes: Some("t-failed"),
         };
         assert_ne!(
-            ControlPanelServer::internal_intent_id(old_runtime, "alice", &app_id, "digest-a", &seed)
-                .unwrap(),
+            ControlPanelServer::internal_intent_id(
+                old_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                &seed
+            )
+            .unwrap(),
             ControlPanelServer::internal_intent_id(
                 retried_runtime,
                 "alice",

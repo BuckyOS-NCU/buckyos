@@ -498,15 +498,13 @@ async fn decide_accept_and_discard_move_the_artifact_head() {
         None
     );
     // Perception carries task_discarded with its source.
-    let backlog = agent
-        .perception()
-        .backlog(&PerceptionCursor::default())
-        .await
-        .unwrap();
     let mut kinds = Vec::new();
-    for item in &backlog.items {
-        for r in agent.perception().read(item).await.unwrap() {
-            kinds.push(r.kind);
+    for e in std::fs::read_dir(agent.layout().perception_dir()).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some(sid) = name.strip_suffix(".jsonl") {
+            for r in libopendan::state::perception::read_records(&agent.layout().perception_file(sid)).unwrap() {
+                kinds.push(r.kind);
+            }
         }
     }
     assert_eq!(
@@ -609,6 +607,13 @@ async fn activity_control_and_perception_inputs_are_applied() {
                         summary: "the door is red".into(),
                         tags: vec!["door".into()],
                         objects: vec![],
+                        subjects: vec![],
+                        cites: vec![],
+                        source: None,
+                        occurred_at: None,
+                        suggested_kind: None,
+                        memory_intent: None,
+                        mentions: vec![],
                     },
                 ),
             );
@@ -630,15 +635,14 @@ async fn activity_control_and_perception_inputs_are_applied() {
         |e| matches!(&e.body, WorklogBody::ControlApplied { command, .. } if command == "activity")
     ));
     let agent = env.agent();
-    let backlog = agent
-        .perception()
-        .backlog(&PerceptionCursor::default())
-        .await
-        .unwrap();
-    let recs = agent.perception().read(&backlog.items[0]).await.unwrap();
-    assert!(recs
+    let recs = libopendan::state::perception::read_records(&agent.layout().perception_file(sd.sid())).unwrap();
+    let door = recs
         .iter()
-        .any(|r| r.kind == "observation" && r.summary == "the door is red"));
+        .find(|r| r.kind == "observation" && r.summary == "the door is red")
+        .expect("observation recorded through the Memory facade");
+    assert_eq!(door.idempotency_key.as_deref(), Some("p-1"), "the control input key is the replay key");
+    assert!(door.source_ref.as_ref().is_some_and(|s| s.event_ref.is_some()), "the host binds the source");
+    assert!(door.scope.as_ref().is_some_and(|s| !s.subjects.is_empty()), "the host binds the subjects");
     let seqs: Vec<u64> = recs.iter().map(|r| r.seq).collect();
     let mut sorted = seqs.clone();
     sorted.sort();
@@ -1043,52 +1047,6 @@ async fn sub_context_wait_and_failure_return_to_the_caller() {
     let st = sd.state().unwrap();
     assert_eq!((st.turn_seq, st.turns_completed), (1, 1));
     assert_eq!(st.outcome, Some(Outcome::Succeeded));
-}
-
-#[tokio::test]
-async fn tmux_runtime_runs_exec_in_the_session_pane() {
-    if !libopendan::runtime::TmuxRuntime::available() {
-        eprintln!("tmux not available; skipped");
-        return;
-    }
-    let env = Env::new();
-    let sd = env.create_work(work_spec("tmux exec")).await;
-    let llm = ScriptedLlm::new(|req, _| match has_tool_result(req, "c1") {
-        Some(r) => {
-            assert!(r.contains("from-tmux") && r.contains("work-"), "{r}");
-            text("tmux ok")
-        }
-        None => tool_call(
-            "c1",
-            "shell",
-            json!({ "command": "echo from-tmux; echo $OPENDAN_SESSION_ID; echo x > t.txt" }),
-        ),
-    });
-    let mut deps = env.deps(llm.clone());
-    let rt = std::sync::Arc::new(libopendan::runtime::TmuxRuntime::from_config(
-        agent_tool::runtime::RuntimeConfig {
-            kind: Some("tmux".into()),
-            tmux: Some(agent_tool::runtime::TmuxConfig {
-                session: Some(libopendan::runtime::tmux::tmux_session_name(sd.sid())),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    ));
-    deps.runtime = rt;
-    let r = drive(&sd, &deps, StopWhen::Finished).await;
-    assert!(r.is_finished(), "{r:?}");
-    assert!(sd.path().join("t.txt").exists());
-    assert_eq!(sd.binding_opt().unwrap().unwrap().kind, "tmux");
-    let name = libopendan::runtime::tmux::tmux_session_name(sd.sid());
-    let has = std::process::Command::new("tmux")
-        .args(["has-session", "-t", &name])
-        .status()
-        .unwrap();
-    assert!(has.success(), "tmux session kept for audit");
-    let _ = std::process::Command::new("tmux")
-        .args(["kill-session", "-t", &name])
-        .status();
 }
 
 #[tokio::test]

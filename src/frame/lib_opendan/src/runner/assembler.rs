@@ -50,8 +50,6 @@ pub struct InputMaterial {
     pub active: Vec<ActiveSession>,
     pub runtime_status: Value,
     pub now_ms: u64,
-    /// Self-improve sessions: the perception window to consolidate.
-    pub perceptions: Vec<PerceptionRecord>,
     /// The session's TodoList in its compact view, when it changed since
     /// the top-level context last saw it.
     pub todos: Option<String>,
@@ -436,7 +434,6 @@ impl SessionAssembler for DefaultAssembler {
             "hints": m.hints.iter().map(|h| json!({"id": h.id, "time": h.time, "sentence": h.sentence})).collect::<Vec<_>>(),
             "task_text": blocks.task,
             "handover_text": blocks.handover,
-            "perceptions_text": blocks.perceptions,
             "todos_text": blocks.todos,
             "hints_text": blocks.hints,
             "active_sessions_text": blocks.active,
@@ -460,7 +457,6 @@ struct Blocks {
     handover: String,
     task: String,
     todos: String,
-    perceptions: String,
     hints: String,
     active: String,
     runtime: String,
@@ -519,20 +515,6 @@ impl Blocks {
                 }
             }
         }
-        let mut perceptions = String::new();
-        if !m.perceptions.is_empty() {
-            perceptions.push_str("<perceptions>\n");
-            for p in &m.perceptions {
-                perceptions.push_str(&format!(
-                    "<perception session=\"{}\" seq=\"{}\" kind=\"{}\">{}</perception>\n",
-                    escape_xml_attr(&p.session_id),
-                    p.seq,
-                    escape_xml_attr(&p.kind),
-                    esc(&p.summary)
-                ));
-            }
-            perceptions.push_str("</perceptions>\n");
-        }
         let mut hints = String::new();
         if !m.hints.is_empty() {
             hints.push_str("<hints>\n");
@@ -563,7 +545,6 @@ impl Blocks {
             handover,
             task,
             todos,
-            perceptions,
             hints,
             active,
             runtime,
@@ -604,7 +585,6 @@ impl Blocks {
             s.push('\n');
         }
         s.push_str(&self.todos);
-        s.push_str(&self.perceptions);
         s.push_str(&self.hints);
         s.push_str(&self.active);
         s.push_str(&self.runtime);
@@ -657,11 +637,17 @@ fn commands_section(cfg: &SessionConfig, ui: bool) -> String {
         .as_ref()
         .map(|f| f.cmd_skills.iter().filter(|k| !k.text.trim().is_empty()).collect())
         .unwrap_or_default();
-    if skills.is_empty() {
+    let unavailable: &[UnavailableCmdSkill] = cfg
+        .prompt
+        .frozen
+        .as_ref()
+        .map(|f| f.unavailable_cmd_skills.as_slice())
+        .unwrap_or_default();
+    if skills.is_empty() && unavailable.is_empty() {
         return String::new();
     }
     let mut s = String::from("## Commands\n");
-    if !ui {
+    if !ui && !skills.is_empty() {
         s.push_str("The manuals below were chosen for this session: shortcuts that tend to get this kind of work done faster and more reliably. Use what fits; a better way for the task at hand is fine.\n\n");
     }
     let several = skills.len() > 1 || !ui;
@@ -671,6 +657,13 @@ fn commands_section(cfg: &SessionConfig, ui: bool) -> String {
         }
         s.push_str(k.text.trim());
         s.push_str("\n\n");
+    }
+    if !unavailable.is_empty() {
+        s.push_str("Not available on this session's runtime (work that needs them goes to a session on a runtime that has them):\n");
+        for u in unavailable {
+            s.push_str(&format!("- {}: {}\n", u.name, u.reason));
+        }
+        s.push('\n');
     }
     s
 }

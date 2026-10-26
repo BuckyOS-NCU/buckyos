@@ -1,4 +1,5 @@
-//! Agent Memory Graph, schema 3.0 (Memory requirements, appendix A).
+//! Agent Memory Graph, schema 4.0 (Memory requirements, appendix A; TODO
+//! §3: stability, last evidence time, structured review date).
 //!
 //! `.meta/occasions.jsonl` is the append-only commit log and replay truth.
 //! Canonical JSON files, graph snapshots, path indexes and SQLite are derived
@@ -7,7 +8,6 @@
 
 mod derived;
 mod log;
-mod migrate;
 mod model;
 mod recall;
 mod state;
@@ -26,7 +26,6 @@ use thiserror::Error;
 
 pub use derived::{seg as percent_segment, SQLITE_FILE};
 pub use log::{occasion_digest, tail_seq, ArchiveEntry, ArchiveManifest, Tail};
-pub use migrate::MigrationReport;
 pub use model::*;
 pub use recall::{
     group_by_semantic_kind, item_search_text, AliasCandidate, AmbiguousAlias, FadeConfig, IndexUse,
@@ -45,7 +44,7 @@ pub use text::{
 
 use state::ApplyCtx;
 
-pub const SCHEMA_VERSION: &str = "3.0";
+pub const SCHEMA_VERSION: &str = "4.0";
 /// Multilingual: CJK bigram + word tokens (TD-13, TD-24).
 pub const PRIMARY_LANGUAGE: &str = "mul";
 pub const FTS_TOKENIZER: &str = "unicode61 remove_diacritics 2 + cjk-bigram";
@@ -56,7 +55,6 @@ pub const META_JSON: &str = "meta.json";
 pub const OCCASIONS_LOG_FILE: &str = "occasions.jsonl";
 pub const LOCK_FILE: &str = "lock";
 pub const ARCHIVE_DIR: &str = "archive";
-pub const LEGACY_DIR: &str = "legacy-2.10";
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_SUMMARY_CHARS: usize = 500;
 /// Bounds of one recall query (TD-13).
@@ -88,8 +86,8 @@ pub enum AgentMemoryError {
     CommitUnknown(String),
     #[error("read-only memory: {0}")]
     ReadOnly(String),
-    #[error("memory needs migration: {0}")]
-    NeedsMigration(String),
+    #[error("unsupported memory format: {0}")]
+    Unsupported(String),
     #[error("corrupted state: {0}")]
     Corrupted(String),
     #[error("io error: {0}")]
@@ -249,8 +247,8 @@ fn schema_parts(v: &str) -> (String, String) {
     )
 }
 
-/// TD-24: another major refuses (needs migration); another minor, language
-/// or tokenizer mounts read-only.
+/// TD-24: another major refuses; another minor, language or tokenizer
+/// mounts read-only.
 fn check_meta(meta: &Value) -> Result<Option<String>> {
     let found = meta
         .get("schema_version")
@@ -259,8 +257,8 @@ fn check_meta(meta: &Value) -> Result<Option<String>> {
     let (major, minor) = schema_parts(found);
     let (want_major, want_minor) = schema_parts(SCHEMA_VERSION);
     if major != want_major {
-        return Err(AgentMemoryError::NeedsMigration(format!(
-            "schema_version {found}; this build reads {SCHEMA_VERSION} (run migrate)"
+        return Err(AgentMemoryError::Unsupported(format!(
+            "schema_version {found}; this build reads {SCHEMA_VERSION}"
         )));
     }
     let lang = meta
@@ -282,6 +280,20 @@ fn check_meta(meta: &Value) -> Result<Option<String>> {
         )));
     }
     Ok(None)
+}
+
+/// A commit log without `meta.json` is not an empty root.
+fn reject_unversioned_log(root: &Path) -> Result<()> {
+    let log = root.join(META_DIR).join(OCCASIONS_LOG_FILE);
+    match fs::metadata(&log) {
+        Ok(m) if m.len() > 0 => Err(AgentMemoryError::Unsupported(format!(
+            "{} has entries but no {META_JSON}",
+            log.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Who commits: the real Session and the consolidation lease epoch (fencing
@@ -456,6 +468,7 @@ impl AgentMemory {
     pub fn open(cfg: AgentMemoryConfig) -> Result<Self> {
         let meta_dir = cfg.root.join(META_DIR);
         if read_meta_value(&meta_dir.join(META_JSON))?.is_none() {
+            reject_unversioned_log(&cfg.root)?;
             fs::create_dir_all(&meta_dir)?;
             let m = Self {
                 cfg: cfg.clone(),
@@ -486,7 +499,10 @@ impl AgentMemory {
                     "meta.json missing after init".into(),
                 ))
             }
-            None => (false, Some("memory root is not initialized".to_string())),
+            None => {
+                reject_unversioned_log(&cfg.root)?;
+                (false, Some("memory root is not initialized".to_string()))
+            }
             Some(m) => (true, check_meta(m)?),
         };
         Ok(Self {
@@ -1206,6 +1222,10 @@ impl AgentMemory {
                 state: i.status.to_string(),
                 source_occasion: i.source_occasion.clone(),
                 noticed_at: i.noticed_at.clone(),
+                created_at: i.created_at.clone(),
+                stability: i.stability.to_string(),
+                last_evidence_at: i.last_evidence_at.clone(),
+                review_at: i.review_at.clone(),
                 evidence: i.evidence.clone(),
                 matched: i.matched.clone(),
                 size: i.size,
@@ -1235,6 +1255,19 @@ impl AgentMemory {
             out.push_str(&format!("STATE {}\n", item.state));
             out.push_str(&format!("SOURCE_OCCASION {}\n", item.source_occasion));
             out.push_str(&format!("NOTICED_AT {}\n", item.noticed_at));
+            out.push_str(&format!(
+                "CREATED_AT {}\n",
+                item.created_at.as_deref().unwrap_or("-")
+            ));
+            out.push_str(&format!("STABILITY {}\n", item.stability));
+            out.push_str(&format!(
+                "LAST_EVIDENCE {}\n",
+                item.last_evidence_at.as_deref().unwrap_or("-")
+            ));
+            out.push_str(&format!(
+                "REVIEW_AT {}\n",
+                item.review_at.as_deref().unwrap_or("-")
+            ));
             out.push_str(&format!("EVIDENCE {}\n", item.evidence.join(",")));
             out.push_str(&format!("MATCHED {}\n", item.matched.join(",")));
             out.push_str(&format!("SIZE {}\n", item.size));
@@ -1431,100 +1464,6 @@ impl AgentMemory {
             derived::materialize(&self.cfg.root, &view)
         })
     }
-
-    /// Migrate a 2.10 root to 3.0 explicitly. Old logs, meta and snapshot are
-    /// moved to `.meta/legacy-2.10/`; nothing is deleted.
-    pub fn migrate(cfg: AgentMemoryConfig) -> Result<MigrationReport> {
-        let meta_path = cfg.root.join(META_DIR).join(META_JSON);
-        let meta = read_meta_value(&meta_path)?
-            .ok_or_else(|| AgentMemoryError::NotFound("meta.json".into()))?;
-        let from = meta
-            .get("schema_version")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if from == SCHEMA_VERSION {
-            return Ok(MigrationReport {
-                from: from.clone(),
-                to: from,
-                ..MigrationReport::default()
-            });
-        }
-        if schema_parts(&from).0 != "2" {
-            return Err(AgentMemoryError::NeedsMigration(format!(
-                "no migration from schema {from}"
-            )));
-        }
-        let handle = Self {
-            cfg: cfg.clone(),
-            initialized: false,
-            read_only: None,
-            cache: Arc::new(Mutex::new(None)),
-        };
-        handle.with_writer_lock(|| {
-            let meta_dir = cfg.root.join(META_DIR);
-            let legacy = meta_dir.join(LEGACY_DIR);
-            // 1. Preserve the originals (once; a rerun after a crash converts
-            //    from this copy again).
-            if !legacy.join(".complete").exists() {
-                fs::create_dir_all(legacy.join(ARCHIVE_DIR))?;
-                let mut copies = vec![
-                    (
-                        meta_dir.join(OCCASIONS_LOG_FILE),
-                        legacy.join(OCCASIONS_LOG_FILE),
-                    ),
-                    (meta_dir.join("state.jsonl"), legacy.join("state.jsonl")),
-                    (meta_path.clone(), legacy.join(META_JSON)),
-                ];
-                if let Ok(rd) = fs::read_dir(meta_dir.join(ARCHIVE_DIR)) {
-                    for e in rd.flatten() {
-                        copies.push((e.path(), legacy.join(ARCHIVE_DIR).join(e.file_name())));
-                    }
-                }
-                for (from, to) in copies {
-                    if from.is_file() {
-                        fs::copy(&from, &to)?;
-                        fs::File::open(&to)?.sync_all()?;
-                    }
-                }
-                derived::atomic_write(&legacy.join(".complete"), b"")?;
-            }
-            // 2. Convert from the preserved copy.
-            let mut notes = Vec::new();
-            let mut occasions = migrate::convert_legacy_logs(&legacy, &mut notes)?;
-            let mut view = GraphView::default();
-            for o in &mut occasions {
-                o.digest = occasion_digest(o)?;
-                state::apply_occasion(o, &mut view, ApplyCtx::REPLAY).map_err(|e| {
-                    AgentMemoryError::Corrupted(format!(
-                        "converted {} does not replay: {e}",
-                        o.occasion_id
-                    ))
-                })?;
-            }
-            let mut buf = Vec::new();
-            for o in &occasions {
-                serde_json::to_writer(&mut buf, o)?;
-                buf.push(b'\n');
-            }
-            // 3. Swap in the converted log, drop the old archives and
-            //    snapshot (their copies stay in the legacy directory), and
-            //    only then declare the new schema.
-            derived::atomic_write(&meta_dir.join(OCCASIONS_LOG_FILE), &buf)?;
-            let _ = fs::remove_dir_all(meta_dir.join(ARCHIVE_DIR));
-            let _ = fs::remove_file(meta_dir.join("state.jsonl"));
-            let new_meta = MetaJson::current(&now_iso(&cfg));
-            derived::atomic_write(&meta_path, &serde_json::to_vec_pretty(&new_meta)?)?;
-            derived::materialize(&cfg.root, &view)?;
-            Ok(MigrationReport {
-                from: from.clone(),
-                to: SCHEMA_VERSION.to_string(),
-                occasions: occasions.len(),
-                notes,
-                legacy_dir: legacy.display().to_string(),
-            })
-        })
-    }
 }
 
 /// Store every deadline and validity end as UTC seconds (`…Z`), so that
@@ -1577,6 +1516,10 @@ pub struct LoadItem {
     pub state: String,
     pub source_occasion: String,
     pub noticed_at: String,
+    pub created_at: Option<String>,
+    pub stability: String,
+    pub last_evidence_at: Option<String>,
+    pub review_at: Option<String>,
     pub evidence: Vec<String>,
     pub matched: Vec<String>,
     pub size: usize,

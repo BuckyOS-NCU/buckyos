@@ -23,6 +23,7 @@ pub mod protocol;
 pub mod publish;
 pub mod pull;
 pub mod resources;
+pub mod retention;
 pub mod selection;
 pub mod settings;
 pub mod sign;
@@ -86,6 +87,8 @@ pub struct StationConfig {
     pub comment_sync_interval: Duration,
     /// Directly reachable web for the Spider (off in tests that must stay offline).
     pub spider_enabled: bool,
+    /// Set when this home belongs to a zone Agent (§4.3 zone-basis follows).
+    pub agent: Option<crate::users::ZoneAgentRef>,
 }
 
 impl StationConfig {
@@ -108,6 +111,7 @@ impl StationConfig {
             select_interval: Duration::from_secs(60),
             comment_sync_interval: Duration::from_secs(600),
             spider_enabled: true,
+            agent: None,
         }
     }
 }
@@ -209,6 +213,22 @@ impl Station {
         tokio::spawn(async move { station.comment_sync_loop().await });
         let station = self.clone();
         tokio::spawn(async move { station.housekeeping_loop().await });
+        let station = self.clone();
+        tokio::spawn(async move { station.retention_loop().await });
+    }
+
+    /// Finishes interrupted pins and releases, and backfills older entries (D17).
+    async fn retention_loop(self: Arc<Self>) {
+        loop {
+            match self.reconcile_retentions().await {
+                Ok(report) if report.pinned + report.released + report.failed > 0 || !report.issues.is_empty() => {
+                    log::info!("retention of {}: {:?}", self.cfg.user, report)
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("retention reconcile failed: {e}"),
+            }
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        }
     }
 
     async fn housekeeping_loop(self: Arc<Self>) {
@@ -216,6 +236,9 @@ impl Station {
         // change (`contacts_changed`), not polled.
         if let Err(e) = self.sync_friends().await {
             log::warn!("friend sync failed: {e}");
+        }
+        if let Err(e) = self.sync_zone_relations().await {
+            log::warn!("zone relation sync failed: {e}");
         }
         if let Err(e) = self.reconcile_following().await {
             log::warn!("following tag reconciliation failed: {e}");

@@ -1,13 +1,13 @@
 # Session Only Member 设计
 
 - 版本：草案，2026-10-04；修订为标准 BuckyOS guest 身份、App access token 登录和统一授权模型。
-- 状态：**设计结论，尚未实现**。本文确定认证与授权边界；协议细节和上线前置见 §10、§12。
+- 状态：**已实现（2026-10-22 随混合 SSO；2026-10-24 随应用扩展 EXT-09 补齐 §5）**。已实现：受限会话闸口（Limited / External 默认拒绝、msg-center 群路径按 `msg_group` 开放）、Session Guest 的 Limited 与 External 访客经专属邀请或 DID 登录进入、无个人邮箱的群消息发送与带 `context_path` 的附件读取、Message Hub 访客页 `/messagehub/guest`、群公开入口的认证方式、§5 的 App 代登录（契约见 [混合 SSO 技术契约](<../arch/verify-hub/混合SSO技术契约.md>) §5.6，决策见 [应用扩展实施 TODO](<../../notepads/self-host-group-extension-todo.md>) D-7）。未实现：Session 邀请的独立版本与过期。本文的 guest user 对应 Limited（专属邀请 / 自助注册 / App 代登录账号）或 External（DID 登录）。
 - 核心流程：**App 页面取得外部用户的 access token，调用 verify-hub 的 `login_by_app_access_token`，换取标准 BuckyOS guest session token。** 后续调用沿用系统认证、RBAC 和资源授权。
 - 实施原则：**先完整设计并验证权限模型，再开放 guest 登录。** 可以逐项开放业务能力，不能先签发全系统认可的 token，再逐个服务补权限检查。
 - 相关文档：
   - [SSO.md](<../sdk/SSO.md>)：标准登录与 AuthTarget
   - [BuckyOS RBAC权限设计.md](<../arch/verify-hub/BuckyOS RBAC权限设计.md>)：用户与 App 的权限交集
-  - [UserType.md](<../../product/users_and_agents/UserType.md>)：用户类型，需要按本文区分匿名访问者与已认证 guest
+  - [UserType.md](<../../product/users_and_agents/UserType.md>)：用户类型、系统用户组与 External 的权威定义；本文的 guest user 按 §2 末尾的对应关系落到 Limited 或 External
   - [Self-Host-Groupv2.md](<./Self-Host-Groupv2.md>)（下称 v2）：Session Guest、双方同意和群授权
   - [Contact Mgr.md](<./Contact Mgr.md>)：联系人、身份绑定与规范身份解析
   - [扩展 Self-host Group：应用开发指南](<../sdk/扩展self-host-group.md>)（下称 SDK 指南）：从 host 读取群会话
@@ -52,7 +52,12 @@ SSO 负责应用身份域登记、外部账号绑定、稳定 DID 映射、App �
 | 标准 guest session token | verify-hub 签发的标准用户 session token；用户类型为 guest，不是另一种 token 格式 |
 | AuthTarget | 当前登录对应的精确 App 实例或系统服务；不同于证明用户身份的身份源 App |
 
-token 的 `principal_kind` 沿用 `user`。guest 是用户类型与授权策略，不新增一个能落入“非 User 默认放行”分支的主体类型。后端必须从可信用户状态识别 guest，不能由页面自报用户类型。
+本文的 guest user 不是单独的 UserType（`Guest` 类型已删除），按身份源落到 [UserType.md](<../../product/users_and_agents/UserType.md>) 的定义：
+
+- 本 Zone 为其保存了账号记录（如企业预建或公开注册的客户账号）：类型为 `Limited`，权限经管理员维护的系统用户组（如 `group:customer`）和资源授权获得；token 的 `principal_kind` 沿用 `user`。
+- 本 Zone 没有账号记录：是 External，token 的 `principal_kind` 仍为 `user`，另带 `external: true` 标记，`sub` 为原 DID；v1 只开放 verify-hub、msg-center 群路径、AI Workspace、HomeStation，其余服务默认拒绝。
+
+两种情况都不能落入“非 User 默认放行”分支。后端必须从可信用户状态识别它们，不能由页面自报用户类型。
 
 ## 3. 稳定 guest 身份
 
@@ -143,6 +148,8 @@ App 本次授予 guest 的权限
 系统保证 App 只能认证自己获准管理的账号，且最终操作受 §4.3 的交集约束。只有群邀请权的客服不因此获得客户的代登录权；认证和邀请是两项不同的能力。
 
 ## 5. `login_by_app_access_token` 登录流程
+
+> **已实施（2026-10-24）**，契约见混合 SSO 契约 §5.6。实现与本节旧设计的差别：“App access token” 就是 CP 为 App 签发的一枚一次性登录码（D-7 推荐方案），App 不登记公钥、也没有回调校验 URL；兑换由 App 页面调 CP 公开方法 `auth.app_login.exchange`，CP 再代调 verify-hub（与专属邀请一致，verify-hub 方法不对浏览器公开）。下文保留为设计背景。
 
 ### 5.1 主流程
 
@@ -292,7 +299,7 @@ msg-center 从标准用户 token 解析 guest DID，构造正常的 `GroupActor`
 
 以下入口按本次工作区核对，仅描述需要改造的位置，不表示本文方案已经落地：
 
-- `buckyos-api/src/app_availability.rs` 的 `user_is_active` 明确排除 `UserType::Guest`；verify-hub 尚无 `login_by_app_access_token`。需区分“guest 可通过获准方式登录”与“匿名入口公开”，同时覆盖刷新和 App availability。
+- `UserType::Guest` 已删除：有账号记录的 guest user 是 Limited（可登录，App 可用性默认拒绝、经系统用户组开放），无账号记录的是 External。verify-hub 的 `login_by_app_access_token` 已于 2026-10-24 实现（D-7：App 以服务身份向 CP 领一次性 code，CP 代调 verify-hub；App 代登录的会话 target 即签发 App 实例，不经 `app_availability` 策略）。
 - 标准 token 已有 `principal_kind=user` 与结构化 AuthTarget；应扩展这套会话体系。`runtime.enforce` 使用 target 的 `authorization_key`，其中 App 授权键按 AppId 构造；身份域管理、代登录和实例范围的授权不能因此丢失 AppInstance / owner 隔离。
 - msg-center 的 `caller_identity` 会为 User 解析 DID，当前依赖用户 profile；标准 guest 必须可由同一可信身份层解析。无 token 且无来源 IP 的内部调用分支不能被网络请求触发。
 - `owner_session.rs` 的邮箱授权存在非 User 放行和 User 可观察本 Zone Agent 的逻辑；必须连同 RBAC 检查 guest 的实际权限，不能仅改变 token 类型。
@@ -325,7 +332,7 @@ msg-center 从标准用户 token 解析 guest DID，构造正常的 `GroupActor`
 
 ### 11.2 文档联动
 
-实现时应同步 SSO 使用者指南、UserType、RBAC 设计、verify-hub / SDK 协议，以及 Message Hub 和群应用接入说明。SSO 与 UserType 现有“guest 即匿名且不可登录”的表述需要调整；普通用户与匿名访问的行为也要回归验证。
+实现时应同步 SSO 使用者指南、UserType、RBAC 设计、verify-hub / SDK 协议，以及 Message Hub 和群应用接入说明。UserType 与 SSO 指南已按用户类型定义改写（匿名访问者不是用户类型，guest user 落到 Limited 或 External）；普通用户与匿名访问的行为仍需回归验证。
 
 v2 的 Session Guest 角色、成员状态机和双方同意规则保持不变，补充标准 guest 登录的入口说明即可。Message Tunnel 无需为此增加身份型实例。本次修订只更新本设计，相关文档当前仍描述各自的现有实现。
 
@@ -335,8 +342,8 @@ v2 的 Session Guest 角色、成员状态机和双方同意规则保持不变�
 
 | 问题 | 约束 / 方向 |
 | --- | --- |
-| guest DID 命名和身份域存储 | 纳入系统身份规范；稳定、不可复用、不含隐私原文；首次写入消息前确定 |
-| App access token 验证协议 | 统一选择登记公钥验签或受信服务端校验；明确兑换用途、受众、失效、一次性链接及幂等规则 |
+| guest DID 命名和身份域存储 | **已定（D-7 工程契约）**：账号 `user_id = <app label>-<16 hex of sha256(digest)>`，DID 由 `users/<id>/doc` 决定；绑定表 `services/control_panel/app_identities/<app_instance_id>/<digest>`，只存外部账号摘要 |
+| App access token 验证协议 | **已定（D-7 推荐）**：CP 签发的一次性登录码 `<invite_id>.<secret>`，10 分钟、单次消费、同 nonce 幂等重试；不登记公钥、无回调 URL |
 | 登录接口与会话 scope 表达 | 沿用标准 AuthTarget、TokenPair / 用户信息契约；来源和范围可验证、可撤销，全部消费者都执行 |
 | guest 创建、绑定与转授权 API | 系统统一提供；分离管理、认证、资源使用和转授能力，明确实例与资源路径粒度 |
 | 默认有效期和多设备策略 | 登录链接短时且一次性；session / refresh 沿用系统生命周期，刷新受来源、状态和范围约束 |

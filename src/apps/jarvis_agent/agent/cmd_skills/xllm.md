@@ -2,6 +2,7 @@
 name: xllm
 description: One-shot model calls from the shell with `agent_tool xllm` — analysis, rewriting, translation and JSON/schema extraction over text, files or piped output, plus small tool-assisted jobs in a scratch directory, with run records you can inspect, re-export and resume.
 requires: `agent_tool` on PATH and the session shell's own token (BUCKYOS_APPCLIENT_SESSION_TOKEN, BUCKYOS_APP_ID); models come from the Zone's AICC routes
+baseline: standard
 ---
 #### When to use
 - One-off work on material you already have: classify, summarize, compare, rewrite, translate, pull fields
@@ -16,7 +17,8 @@ requires: `agent_tool` on PATH and the session shell's own token (BUCKYOS_APPCLI
 #### Before you start
 - `xllm` is not on PATH; call it as `agent_tool xllm …`.
 - In a session shell it logs in to AICC with the agent's token from the environment (refreshed per shell call,
-  ~15 min life). Without it (a bare `docker exec`) you get exit 2 `cannot initialize BuckyOS runtime …`.
+  ~15 min life); on a node session-runtime the `agent_tool` entry asks your agent for that token over the session's
+  `.opendan/` token. Without either (a bare `docker exec`) you get exit 2 `cannot initialize BuckyOS runtime …`.
 - Check: `agent_tool xllm --run-logs warn "Reply with: ok"` prints `ok`, exit 0.
 - A directory per task keeps runs and files apart:
   `mkdir -p xllm/<task> && cd xllm/<task> && printf 'runs_dir: ./runs\n' > .llm_context`.
@@ -76,6 +78,29 @@ The Zone's `llm.chat` lands on an OpenAI strict route: every property listed in 
   (`filesystem_policy: workspace`, the default; elsewhere: `path not allowed by policy`); shell is not
   sandboxed and runs with the agent's permissions.
 - The default loop is `function_call`; `actions`/`tools2actions` need `--loop-model behavior`.
+- To target an online Agent Daemon from an authenticated BuckyOS runtime, add
+  `groupname: executor` to the `.llm_context` tool list:
+
+  ```yaml
+  tools:
+    enabled: true
+    tools:
+      - groupname: bash
+      - groupname: executor
+  ```
+
+  This adds `executor_list` and `executor_call` while keeping the current runtime.
+  Copy the discovered `executor_id`, `generation` and `store_id`, then choose
+  `profile_id` from `profiles`. Query or cancel an accepted operation by its returned
+  `operation_call_id`; after reconnection rediscover the generation and retain
+  the original store. Unknown outcomes and invalid locators must not be replayed.
+  Linux targets expose commands and files only; UI is unsupported. The current
+  tool schema comes from `src/frame/agent_tool/src/runtime/executor.rs`.
+  Windows target commands use PowerShell 7 from PATH or Windows PowerShell; do not send Bash syntax.
+  Native Windows/macOS desktop operations use the SDK Computer protocol described in
+  `doc/arch/agent_daemon.md`; this does not add Computer commands to `executor_call` or deliver PNGs to the model.
+  Shell users can inspect the equivalent CLI with
+  `buckyos command describe executor exec` and `buckyos command describe executor query`.
 - Limits: `--max-tool-iterations` (default 8), `--timeout` total seconds (3600), `--llm-timeout` per request
   (600), `--max-tokens` per reply. With the tool budget spent the model still answers, perhaps saying it
   could not finish (exit 0).
@@ -99,6 +124,10 @@ extraction or JSON check failed (raw reply saved).
   a new run for the same job would duplicate the work.
 - Exit 4 (Ctrl-C/SIGINT): resumable. The interrupted tool call is not replayed, but the model may run it
   again; mind commands that are not idempotent.
+- Last error kind `quota_exhausted` / `quota_budget_exceeded` / `resource_not_permitted` (exit 1,
+  `status --run <id>`): AICC refused the call under the AI quota or model permissions of the user it is
+  charged to. Retrying does not help until the quota resets or the user changes the model; report it
+  (`buckyos ai quota` shows the rules and `reset_at_ms`). A lower `--max-tokens` can fit `quota_budget_exceeded`.
 - Exit 1 runs are final: `--resume` on them shows the saved record (with limit flags: exit 1 `is terminal`).
 - Exit 5/6: `agent_tool xllm result --run <id> --result-format raw [--output f]`.
 - `--resume` with a new question, or on a run another process is executing: exit 2.

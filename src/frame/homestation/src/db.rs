@@ -13,6 +13,8 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
+CREATE TABLE IF NOT EXISTS import_metadata (obj_id TEXT PRIMARY KEY, metadata TEXT NOT NULL);
+
 CREATE TABLE IF NOT EXISTS objects (
   obj_id TEXT PRIMARY KEY,
   obj_type TEXT NOT NULL,
@@ -103,6 +105,22 @@ CREATE TABLE IF NOT EXISTS object_grants (
   obj_id TEXT NOT NULL,
   entry TEXT NOT NULL,
   PRIMARY KEY (obj_id, entry)
+);
+
+CREATE TABLE IF NOT EXISTS retentions (
+  entry TEXT NOT NULL,
+  obj_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (entry, obj_id)
+);
+
+CREATE TABLE IF NOT EXISTS retention_issues (
+  entry TEXT NOT NULL,
+  obj_id TEXT NOT NULL,
+  issue TEXT NOT NULL,
+  checked_at INTEGER NOT NULL,
+  PRIMARY KEY (entry, obj_id)
 );
 
 CREATE TABLE IF NOT EXISTS publish_tasks (

@@ -53,6 +53,7 @@ import {
   deviceIdentityPathsForRoots,
   ensureCa,
   getDevTestKeyPairById,
+  hashAdminPassword,
   IdentityRoots,
   loadLocalNodeIdentityConfig,
 } from "buckyos/provision";
@@ -527,11 +528,12 @@ function writeLocalDeviceIdentityFiles(
 
   const documentIat = requireNumber(zoneConfig, "iat", zoneConfigPath);
   const documentExp = requireNumber(bootDocument, "exp", bootSeedPath);
-  const usesSnRelay = params.netid !== "wan";
+  const usesSnDdns = params.netid !== "wan";
+  const usesSnRelay = usesSnDdns && params.netid !== "wan_dyn";
   const snApiUrl = makeSnApiUrl(params);
-  if (usesSnRelay && !snApiUrl) {
+  if (usesSnDdns && !snApiUrl) {
     throw new Error(
-      `group ${params.username} needs SN relay but has no SN base host`,
+      `group ${params.username} needs SN DDNS but has no SN base host`,
     );
   }
   bootDocument.id = zoneDid;
@@ -551,7 +553,7 @@ function writeLocalDeviceIdentityFiles(
   deviceConfig.iat = documentIat;
   deviceConfig.exp = documentExp;
   deviceConfig.version_seq = 0;
-  if (usesSnRelay) {
+  if (usesSnDdns) {
     deviceConfig.ddns_sn_url = snApiUrl;
   } else {
     delete deviceConfig.ddns_sn_url;
@@ -655,6 +657,7 @@ function writeLocalDeviceIdentityFiles(
   writeJson(path.join(etcDir, "node_gateway_params.json"), {
     params: {
       device_did: deviceDid,
+      rtcp_port: String(params.rtcp_port),
     },
   });
   writeJson(didJsonPath, deviceConfig);
@@ -767,6 +770,13 @@ export function copyIdentityOutputs(
   targetDir: string,
   params: OODGroupParams,
 ): LocalDeviceIdentityFiles {
+  const startConfigPath = path.join(nodeDir, "start_config.json");
+  const startConfig = readJsonObject(startConfigPath);
+  if (startConfig.admin_password_hash !== hashAdminPassword(params.username, "bucky2025")) {
+    throw new Error(
+      `${startConfigPath} has a stale admin_password_hash for ${params.username}; use a new --env_root and regenerate OOD and SN together`,
+    );
+  }
   const etcDir = ensureDir(path.join(targetDir, "etc"));
 
   const localIdentity = writeLocalDeviceIdentityFiles(
@@ -776,8 +786,6 @@ export function copyIdentityOutputs(
     params,
   );
 
-  const startConfigPath = path.join(nodeDir, "start_config.json");
-  const startConfig = readJsonObject(startConfigPath);
   startConfig.owner_document = localIdentity.ownerDocument;
   startConfig.zone_name = localIdentity.zoneDid;
   startConfig.access_hostname = makeAccessHostname(params);
@@ -794,7 +802,9 @@ export function copyIdentityOutputs(
   delete startConfig.public_key;
   delete startConfig.device_private_key;
   delete startConfig.device_public_key;
-  writeJson(path.join(etcDir, "start_config.json"), startConfig);
+  const runtimeStartConfigPath = path.join(targetDir, "security", "start_config.json");
+  writeJson(runtimeStartConfigPath, startConfig);
+  fs.chmodSync(runtimeStartConfigPath, 0o600);
   writeText(
     path.join(etcDir, ZONE_DOCUMENT_JWT_FILE_NAME),
     localIdentity.zoneDocumentJwt,
@@ -825,12 +835,13 @@ export function copyIdentityOutputs(
 function makeUnactivatedIdentityConfig(targetDir: string): void {
   const etcDir = ensureDir(path.join(targetDir, "etc"));
   removeIfExists(path.join(etcDir, "node_identity.json"));
-  removeIfExists(path.join(etcDir, "start_config.json"));
+  removeIfExists(path.join(targetDir, "security", "start_config.json"));
   removeIfExists(path.join(etcDir, ZONE_DOCUMENT_JWT_FILE_NAME));
   removeTreeIfExists(path.join(etcDir, ".buckycli"));
   writeJson(path.join(etcDir, "node_gateway_params.json"), {
     params: {
       device_did: "did:bns:unactivated.local",
+      rtcp_port: "2980",
     },
   });
 }
@@ -891,8 +902,9 @@ async function generateTls(
   );
   copyIfExists(
     path.join(caDir, `${caName}_ca_key.pem`),
-    path.join(etcDir, "ca_key.pem"),
+    path.join(securityRoot, "ca_key.pem"),
   );
+  fs.chmodSync(path.join(securityRoot, "ca_key.pem"), 0o600);
   console.log(`tls identity certs generated under ${publicRoot}`);
 
   if (!writePostGateway) {
@@ -1052,14 +1064,20 @@ function applyDevBootTemplate(
     console.log(`skip missing dev boot override: ${localBootToml}`);
   }
 
-  const dstBootTemplate = path.join(
+  const baseBootTemplate = path.join(
     targetDir,
     "etc",
     "scheduler",
     "boot.template.toml",
   );
-  let merged = fs.existsSync(dstBootTemplate)
-    ? fs.readFileSync(dstBootTemplate, "utf8")
+  const dstBootTemplate = path.join(
+    targetDir,
+    "security",
+    "scheduler",
+    "boot.template.toml",
+  );
+  let merged = fs.existsSync(baseBootTemplate)
+    ? fs.readFileSync(baseBootTemplate, "utf8")
     : "";
   let replaced = 0;
   let added = 0;
@@ -1086,7 +1104,41 @@ function applyDevBootTemplate(
     added += 1;
   }
 
+  const params = getParamsFromGroupName(groupName);
+  const nodeSettingsKey = `nodes/${params.node_name}/settings`;
+  if (Deno.build.os === "linux" &&
+    ![...merged.matchAll(BOOT_ENTRY_PATTERN)].some((match) => match[1] === nodeSettingsKey)) {
+    const user = os.userInfo();
+    const runAs = user.uid === 0
+      ? { uid: 65534, gid: 65534 }
+      : { uid: user.uid, gid: user.gid };
+    const workspace = path.resolve(targetDir, "data", "home", params.username, "host-runtime");
+    ensureDir(path.dirname(workspace));
+    if (!fs.existsSync(workspace)) {
+      fs.mkdirSync(workspace, { mode: 0o750 });
+      if (user.uid === 0) fs.chownSync(workspace, runAs.uid, runAs.gid);
+    }
+    const workspaceInfo = fs.lstatSync(workspace);
+    if (!workspaceInfo.isDirectory() || workspaceInfo.uid !== runAs.uid || workspaceInfo.gid !== runAs.gid) {
+      throw new Error(`dev host runtime workspace must be a directory owned by ${runAs.uid}:${runAs.gid}: ${workspace}`);
+    }
+    const settings = {
+      executor: {
+        enabled: true,
+        owner_agents: {
+          enabled: true,
+          workdir_roots: [workspace],
+          computer: "none",
+          run_as: runAs,
+        },
+      },
+    };
+    merged += `\n"${nodeSettingsKey}" = """\n${JSON.stringify(settings, null, 2)}\n"""\n`;
+    added += 1;
+  }
+
   writeText(dstBootTemplate, merged);
+  fs.chmodSync(dstBootTemplate, 0o600);
   console.log(
     `merge dev boot entries into template: ${dstBootTemplate} (replaced=${replaced}, added=${added})`,
   );

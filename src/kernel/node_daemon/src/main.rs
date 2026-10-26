@@ -5,6 +5,7 @@ mod active_server;
 mod app_loader;
 mod app_mgr; // support manager app service (run in docker,run for one user)
 mod boot;
+mod desktop_runtime;
 mod finder;
 mod frame_service_mgr; // support manager frame service (run in docker,run for all users)
 mod gateway_name_provider;
@@ -13,6 +14,7 @@ mod kernel_mgr; // support manager kernel service (run in native, run for system
 mod kevent_server;
 mod local_app_mgr;
 mod node_daemon;
+mod node_executor_host;
 mod paios_images;
 mod region_probe;
 mod run_item;
@@ -33,6 +35,17 @@ use log::*;
 use std::panic;
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(node_executor::worker::WORKER_ARG) {
+        node_executor::worker::worker_main();
+    }
+    if args.first().map(String::as_str) == Some(desktop_runtime::SERVICE_ARG) {
+        std::process::exit(desktop_runtime::service_main(args[1..].to_vec()));
+    }
+    #[cfg(target_os = "macos")]
+    if desktop_runtime::is_app_entry(&args) {
+        std::process::exit(desktop_runtime::app_entry_main(&args));
+    }
     let matches = Command::new("BuckyOS Node Daemon")
         .version(get_version())
         .arg(
@@ -64,6 +77,15 @@ fn main() {
         )
         .get_matches();
     init_logging("node_daemon", true);
+    #[cfg(target_os = "macos")]
+    let _instance_guard = match desktop_runtime::acquire_instance_guard() {
+        Ok(guard) => guard,
+        Err(err) => {
+            error!("{}", err);
+            eprintln!("{}", err);
+            std::process::exit(1);
+        }
+    };
     if matches.get_flag("as_win_srv") {
         #[cfg(windows)]
         {

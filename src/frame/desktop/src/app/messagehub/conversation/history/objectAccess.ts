@@ -2,6 +2,11 @@
  * Registry for attachment object access. The api store registers a handler
  * that resolves `refs[].target.obj_id` through the msg-center object route;
  * mock mode leaves it unregistered so renderers fall back to `uri_hint`.
+ *
+ * `context` is msg-center's `context_path` of an object shown in a hosted
+ * group session (`<session MailboxAddress>/<msg ObjId>`, see
+ * `objectContextOf`); the host only serves a group attachment, to a guest in
+ * particular, with it.
  */
 export interface ObjectInfo {
   objId: string
@@ -9,12 +14,14 @@ export interface ObjectInfo {
   size?: number
   mimeType?: string
   isFile: boolean
+  isDirectory?: boolean
+  entries?: string[]
 }
 
 export interface ObjectAccess {
-  describe(objId: string): Promise<ObjectInfo>
-  /** Blob URL of the file content (cached per object id). */
-  contentUrl(objId: string): Promise<string>
+  describe(objId: string, context?: string, innerPath?: string): Promise<ObjectInfo>
+  /** Blob URL of the file content (cached per viewer, context and object id). */
+  contentUrl(objId: string, context?: string, innerPath?: string): Promise<string>
 }
 
 export interface LocalObject {
@@ -25,24 +32,41 @@ export interface LocalObject {
 let handler: ObjectAccess | null = null
 let wrapped: ObjectAccess | null = null
 const localObjects = new Map<string, LocalObject>()
-const localIds = new WeakMap<Blob, string>()
+let localIds = new WeakMap<Blob, string>()
+const cacheResets = new Set<() => void>()
 
 export function registerObjectAccess(access: ObjectAccess | null) {
   handler = access
   wrapped = access ? {
-    describe: objId => {
-      const local = localObjects.get(objId)
-      return local ? Promise.resolve(local.info) : access.describe(objId)
+    describe: (objId, context, innerPath) => {
+      const local = innerPath ? undefined : localObjects.get(objId)
+      return local ? Promise.resolve(local.info) : access.describe(objId, context, innerPath)
     },
-    contentUrl: objId => {
-      const local = localObjects.get(objId)
-      return local ? Promise.resolve(local.url) : access.contentUrl(objId)
+    contentUrl: (objId, context, innerPath) => {
+      const local = innerPath ? undefined : localObjects.get(objId)
+      return local ? Promise.resolve(local.url) : access.contentUrl(objId, context, innerPath)
     },
   } : null
 }
 
 export function getObjectAccess(): ObjectAccess | null {
   return handler ? wrapped : null
+}
+
+/** A cache of resolved objects to drop with `resetObjectCaches`. */
+export function onObjectCachesReset(reset: () => void) {
+  cacheResets.add(reset)
+}
+
+/**
+ * Drops every resolved object and revokes its Blob URL: another subject
+ * (identity change, sign-out) must never see the previous one's attachments.
+ */
+export function resetObjectCaches() {
+  for (const local of localObjects.values()) URL.revokeObjectURL(local.url)
+  localObjects.clear()
+  localIds = new WeakMap()
+  cacheResets.forEach(reset => reset())
 }
 
 export function localObject(objId: string | undefined): LocalObject | undefined {

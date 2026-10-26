@@ -10,8 +10,8 @@ use crate::protocol::{
 use crate::resource::ResourceAccessContext;
 use async_trait::async_trait;
 use buckyos_api::{
-    AiArtifact, AiCost, AiUsage, AiccComputeProgress, AiccComputeTaskData, AiccComputeTaskRequest,
-    AiccError, AiccErrorCode, ApiType, Capability,
+    AiArtifact, AiCost, AiUsage, AiccAttribution, AiccComputeProgress, AiccComputeTaskData,
+    AiccComputeTaskRequest, AiccError, AiccErrorCode, ApiType, Capability,
 };
 use futures_util::{future::join_all, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,14 @@ impl IdempotencyScope {
         }
         Ok(scope)
     }
+}
+
+fn idempotency_conflict() -> AiccError {
+    aicc_error(
+        AiccErrorCode::IdempotencyConflict,
+        "idempotency key was already used with a different canonical request body",
+        false,
+    )
 }
 
 pub(crate) fn canonical_body_fingerprint(body: &Value) -> Result<String, AiccError> {
@@ -231,6 +239,9 @@ pub(crate) struct PinnedProviderTask {
     pub resume: Option<NativeTaskResumeDescriptor>,
     pub pricing: Option<PinnedPricingSnapshot>,
     pub reported_cost_currency: Option<String>,
+    /// Token quota reservation of the attempt this binding was started by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_attempt_id: Option<String>,
 }
 
 impl PinnedProviderTask {
@@ -263,6 +274,7 @@ impl PinnedProviderTask {
             resume: None,
             pricing: PinnedPricingSnapshot::from_call(call)?,
             reported_cost_currency: call.reported_cost_currency.clone(),
+            quota_attempt_id: None,
         })
     }
 }
@@ -292,6 +304,8 @@ pub(crate) enum PinnedPricingBasis {
     Units {
         unit: PricingUnit,
         amount: f64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        addons: Vec<crate::catalog::PricingAddon>,
     },
 }
 
@@ -390,6 +404,7 @@ fn apply_time_window(base: &Pricing, window: Option<&PricingTimeWindow>) -> Pric
         tiers: base.tiers.clone(),
         // Already resolved; clearing prevents a second pass from re-applying it.
         time_windows: Vec::new(),
+        addons: base.addons.clone(),
     }
 }
 
@@ -449,7 +464,18 @@ impl PinnedPricingSnapshot {
             if invalid_price(amount) {
                 return Err(invalid_pinned_pricing());
             }
-            PinnedPricingBasis::Units { unit, amount }
+            if pricing
+                .addons
+                .iter()
+                .any(|addon| invalid_price(addon.amount))
+            {
+                return Err(invalid_pinned_pricing());
+            }
+            PinnedPricingBasis::Units {
+                unit,
+                amount,
+                addons: pricing.addons.clone(),
+            }
         } else {
             return Ok(None);
         };
@@ -487,19 +513,16 @@ impl PinnedPricingSnapshot {
                 };
                 resolved.apply(usage)?
             }
-            PinnedPricingBasis::Units { unit, amount } => {
-                let units = match unit {
-                    PricingUnit::Request => usage.request_units? as f64,
-                    PricingUnit::Image => usage.image_units? as f64,
-                    PricingUnit::AudioSecond => usage.audio_seconds?,
-                    PricingUnit::VideoSecond => usage.video_seconds?,
-                    PricingUnit::Character => usage.characters? as f64,
-                    // Billable by compute-second or megapixel (for example fal.ai);
-                    // the vocabulary is expressible but no adapter reports these
-                    // counters yet, so the cost stays unresolved rather than wrong.
-                    PricingUnit::Second | PricingUnit::Megapixel => return None,
-                };
-                units * amount
+            PinnedPricingBasis::Units {
+                unit,
+                amount,
+                addons,
+            } => {
+                let mut total = unit_count(*unit, usage)? * amount;
+                for addon in addons {
+                    total += unit_count(addon.unit, usage)? * addon.amount;
+                }
+                total
             }
         };
         if invalid_price(amount) {
@@ -510,6 +533,23 @@ impl PinnedPricingSnapshot {
             currency: self.currency.clone(),
         })
     }
+}
+
+/// Billable units of `unit` in `usage`; `None` when the usage does not report
+/// them, which leaves the cost unknown rather than zero.
+fn unit_count(unit: PricingUnit, usage: &AiUsage) -> Option<f64> {
+    Some(match unit {
+        PricingUnit::Request => usage.request_units? as f64,
+        PricingUnit::Image => usage.image_units? as f64,
+        PricingUnit::AudioSecond => usage.audio_seconds?,
+        PricingUnit::VideoSecond => usage.video_seconds?,
+        PricingUnit::Character => usage.characters? as f64,
+        PricingUnit::ReferenceImage => usage.reference_images? as f64,
+        // Billable by compute-second or megapixel (for example fal.ai); the
+        // vocabulary is expressible but no adapter reports these counters yet,
+        // so the cost stays unresolved rather than wrong.
+        PricingUnit::Second | PricingUnit::Megapixel => return None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -719,9 +759,13 @@ pub(crate) struct NativeTaskResumeDescriptor {
     pub base_url: String,
     pub credential: Option<ResumeCredential>,
     pub resource_access_context: ResourceAccessContext,
+    #[serde(default)]
+    pub input_leases: Vec<crate::resource::ResourceLeaseSpec>,
     pub resolved_parameters: BTreeMap<String, Value>,
     pub output_video_seconds: Option<u64>,
     pub request_timeout_ms: u64,
+    pub max_poll_duration_ms: u64,
+    pub active_poll_elapsed_ms: u64,
     pub max_request_bytes: u64,
     pub max_response_bytes: u64,
 }
@@ -743,6 +787,8 @@ impl NativeTaskResumeDescriptor {
             || self.resource_access_context.caller_id.trim().is_empty()
             || self.resource_access_context.request_id.trim().is_empty()
             || self.request_timeout_ms == 0
+            || self.max_poll_duration_ms == 0
+            || self.active_poll_elapsed_ms > self.max_poll_duration_ms
             || self.max_request_bytes == 0
             || self.max_response_bytes == 0
         {
@@ -774,6 +820,20 @@ impl NativeTaskResumeDescriptor {
         }
         Ok(())
     }
+
+    fn remaining_active_poll_duration(&self) -> Duration {
+        Duration::from_millis(
+            self.max_poll_duration_ms
+                .saturating_sub(self.active_poll_elapsed_ms),
+        )
+    }
+
+    fn record_active_poll_session(&mut self, elapsed_before_session_ms: u64, elapsed: Duration) {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.active_poll_elapsed_ms = elapsed_before_session_ms
+            .saturating_add(elapsed_ms)
+            .min(self.max_poll_duration_ms);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -783,6 +843,8 @@ pub(crate) struct ExecutionRecord {
     pub trace_id: Option<String>,
     pub user_id: String,
     pub caller_app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<AiccAttribution>,
     pub request_model: String,
     pub body_fingerprint: String,
     pub task_id: String,
@@ -825,6 +887,23 @@ fn log_llm_input(record: &ExecutionRecord, call: &ResolvedProviderCall) {
     log::info!("aicc.llm.input {}", event);
 }
 
+/// Non-terminal executions found at startup. A record this build can no
+/// longer read (written for a removed method or API type) is retired: stored
+/// as failed without its provider binding, so it is never polled again and
+/// cannot block the recovery of other tasks.
+#[derive(Debug, Default)]
+pub(crate) struct RecoverableExecutions {
+    pub records: Vec<ExecutionRecord>,
+    pub retired: Vec<RetiredExecution>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetiredExecution {
+    pub task_id: String,
+    pub error: AiccError,
+    pub quota_attempt_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum IdempotencyClaim {
     Created(ExecutionRecord),
@@ -848,7 +927,8 @@ pub(crate) trait ExecutionStore: Send + Sync {
         -> Result<bool, AiccError>;
     async fn try_fail(&self, task_id: &str, error: AiccError) -> Result<bool, AiccError>;
     async fn try_cancel(&self, task_id: &str) -> Result<bool, AiccError>;
-    async fn recoverable(&self) -> Result<Vec<ExecutionRecord>, AiccError>;
+    async fn recoverable(&self) -> Result<RecoverableExecutions, AiccError>;
+    async fn find(&self, scope: &IdempotencyScope) -> Result<Option<ExecutionRecord>, AiccError>;
 }
 
 #[derive(Debug, Clone)]
@@ -905,12 +985,41 @@ pub(crate) struct UsageCompletion {
     pub provider_model: String,
     pub usage: AiUsage,
     pub finance_snapshot: Option<AiCost>,
+    pub operator_id: Option<String>,
+    pub attribution: Option<AiccAttribution>,
     pub completed_at_ms: i64,
 }
 
 #[async_trait]
 pub(crate) trait UsageCompletionPort: Send + Sync {
     async fn write_once(&self, completion: UsageCompletion) -> Result<(), AiccError>;
+}
+
+/// How an upstream attempt ended, for its token quota reservation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AttemptSettlement {
+    /// The Provider reported this usage.
+    Usage(AiUsage, ApiType),
+    /// The Provider never accepted the attempt.
+    Released,
+    /// The attempt may have consumed tokens that were not reported.
+    Unknown,
+}
+
+/// Token quota admission of each upstream attempt (PRD §7.1–§7.2).
+#[async_trait]
+pub(crate) trait AdmissionPort: Send + Sync {
+    /// Reserve the attempt's budget on every applicable rule, or refuse with
+    /// a quota error. `Ok(None)` when the call is outside token quota.
+    async fn admit(
+        &self,
+        record: &ExecutionRecord,
+        call: &ResolvedProviderCall,
+        attempt_id: &str,
+    ) -> Result<Option<String>, AiccError>;
+
+    /// Settle a reservation; repeating it changes nothing.
+    async fn settle(&self, attempt_id: &str, settlement: AttemptSettlement);
 }
 
 #[derive(Debug)]
@@ -937,6 +1046,52 @@ impl ProviderStartFailure {
         Self {
             error,
             provider_accepted: true,
+            retryable,
+            retry_same_model,
+        }
+    }
+
+    /// A video job the Provider accepted may already be generating and
+    /// billed, so it is neither repeated nor moved to another Provider, even
+    /// when the error would allow that for other APIs. The same holds for any
+    /// attempt that reported usage before it failed.
+    fn for_api(mut self, api_type: ApiType) -> Self {
+        if self.provider_accepted
+            && (self.error.usage.is_some()
+                || matches!(
+                    api_type,
+                    ApiType::VideoGenerate
+                        | ApiType::VideoEdit
+                        | ApiType::VideoExtend
+                        | ApiType::VideoUpscale
+                ))
+        {
+            self.retryable = false;
+            self.retry_same_model = false;
+        }
+        self
+    }
+
+    /// A native submit whose outcome is unknown (no response, or a success
+    /// response that could not be read): the Provider may hold a billed task,
+    /// so it is neither resubmitted nor failed over.
+    pub(crate) fn native_submit_unknown(error: ProtocolError) -> Self {
+        Self {
+            error,
+            provider_accepted: true,
+            retryable: false,
+            retry_same_model: false,
+        }
+    }
+
+    /// A native submit the Provider answered with an error status: no task
+    /// exists, so the usual retry and failover policy applies.
+    pub(crate) fn native_submit_rejected(error: ProtocolError) -> Self {
+        let retryable = error.allows_model_failover();
+        let retry_same_model = error.retry_same_model();
+        Self {
+            error,
+            provider_accepted: false,
             retryable,
             retry_same_model,
         }
@@ -980,6 +1135,10 @@ pub(crate) trait ProviderExecutionPort: Send + Sync {
         binding: &PinnedProviderTask,
     ) -> Result<bool, NativeTaskResumeError>;
 
+    /// Stop renewal when execution no longer tracks an upstream task. Unknown
+    /// outcomes retain the bounded TTL because the provider may still read input.
+    async fn release_native_inputs(&self, _binding: &PinnedProviderTask, _outcome_unknown: bool) {}
+
     fn completion_cost(
         &self,
         binding: &PinnedProviderTask,
@@ -993,6 +1152,7 @@ pub(crate) struct ExecutionRequest {
     pub tenant_id: String,
     pub user_id: String,
     pub caller_app_id: Option<String>,
+    pub attribution: Option<AiccAttribution>,
     pub trace_id: Option<String>,
     pub request_model: String,
     pub idempotency_key: String,
@@ -1036,11 +1196,18 @@ struct ActiveExecution {
     cancel: CancelHandle,
 }
 
+enum AttemptFailure {
+    /// Token quota refused the attempt before any upstream call.
+    Admission(AiccError),
+    Provider(ProviderStartFailure),
+}
+
 pub(crate) struct ExecutionEngine {
     store: Arc<dyn ExecutionStore>,
     tasks: Arc<dyn TaskManagerPort>,
     providers: Arc<dyn ProviderExecutionPort>,
     usage: Arc<dyn UsageCompletionPort>,
+    admission: Option<Arc<dyn AdmissionPort>>,
     active: Mutex<BTreeMap<String, ActiveExecution>>,
 }
 
@@ -1056,8 +1223,57 @@ impl ExecutionEngine {
             tasks,
             providers,
             usage,
+            admission: None,
             active: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn with_admission(mut self, admission: Arc<dyn AdmissionPort>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
+    async fn admit(
+        &self,
+        record: &ExecutionRecord,
+        call: &ResolvedProviderCall,
+        attempt_id: &str,
+    ) -> Result<Option<String>, AiccError> {
+        match &self.admission {
+            Some(admission) => admission.admit(record, call, attempt_id).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn settle(&self, attempt_id: Option<&str>, settlement: AttemptSettlement) {
+        if let (Some(admission), Some(attempt_id)) = (&self.admission, attempt_id) {
+            admission.settle(attempt_id, settlement).await;
+        }
+    }
+
+    /// The task an earlier call with the same idempotency key started, with
+    /// the exact model it is bound to. A retry returns it before routing, so
+    /// a route that would now pick another model (or none) and material
+    /// preparation are not repeated.
+    pub(crate) async fn replay(
+        &self,
+        tenant_id: &str,
+        method: &str,
+        idempotency_key: &str,
+        canonical_body: &Value,
+    ) -> Result<Option<(ExecutionReceipt, Option<String>)>, AiccError> {
+        let scope = IdempotencyScope::new(tenant_id, method, idempotency_key)?;
+        let Some(record) = self.store.find(&scope).await? else {
+            return Ok(None);
+        };
+        if record.body_fingerprint != canonical_body_fingerprint(canonical_body)? {
+            return Err(idempotency_conflict());
+        }
+        let exact_model = record
+            .binding
+            .as_ref()
+            .map(|binding| binding.exact_model.clone());
+        Ok(Some((record.into(), exact_model)))
     }
 
     pub(crate) async fn execute(
@@ -1131,6 +1347,7 @@ impl ExecutionEngine {
             trace_id: request.trace_id,
             user_id: request.user_id,
             caller_app_id: request.caller_app_id,
+            attribution: request.attribution,
             request_model: request.request_model,
             body_fingerprint: fingerprint,
             task_id: task.task_id,
@@ -1144,13 +1361,7 @@ impl ExecutionEngine {
         };
         let record = match self.store.claim(initial).await? {
             IdempotencyClaim::Existing(record) => return Ok(record.into()),
-            IdempotencyClaim::Conflict => {
-                return Err(aicc_error(
-                    AiccErrorCode::IdempotencyConflict,
-                    "idempotency key was already used with a different canonical request body",
-                    false,
-                ));
-            }
+            IdempotencyClaim::Conflict => return Err(idempotency_conflict()),
             IdempotencyClaim::Created(record) => record,
         };
 
@@ -1200,12 +1411,37 @@ impl ExecutionEngine {
             let mut same_model_attempt = 0;
             let execution = loop {
                 same_model_attempt += 1;
-                match self
+                let attempt_id = format!("{}:{index}:{same_model_attempt}", record.task_id);
+                let quota_attempt = match self.admit(&record, call, &attempt_id).await {
+                    Ok(quota_attempt) => quota_attempt,
+                    Err(error) => break Err(AttemptFailure::Admission(error)),
+                };
+                let started = self
                     .providers
                     .start(request.runtime_generation, call, cancellation.clone())
                     .await
-                {
-                    Ok(execution) => break Ok(execution),
+                    .map_err(|failure| failure.for_api(call.api_type));
+                if let Err(failure) = &started {
+                    // A failed attempt that reported usage already consumed
+                    // tokens, seconds, or money, so it is settled against what
+                    // the Provider said instead of being written off.
+                    self.settle(
+                        quota_attempt.as_deref(),
+                        match (&failure.error.usage, failure.provider_accepted) {
+                            (Some(usage), _) => {
+                                AttemptSettlement::Usage(usage.clone(), call.api_type)
+                            }
+                            (None, true) => AttemptSettlement::Unknown,
+                            (None, false) => AttemptSettlement::Released,
+                        },
+                    )
+                    .await;
+                }
+                match started {
+                    Ok(execution) => {
+                        binding.quota_attempt_id = quota_attempt;
+                        break Ok(execution);
+                    }
                     Err(failure)
                         if failure.retry_same_model
                             && same_model_attempt < MAX_SAME_MODEL_ATTEMPTS =>
@@ -1228,7 +1464,7 @@ impl ExecutionEngine {
                             .min(MAX_SAME_MODEL_RETRY_DELAY);
                         tokio::time::sleep(delay).await;
                     }
-                    Err(failure) => break Err(failure),
+                    Err(failure) => break Err(AttemptFailure::Provider(failure)),
                 }
             };
             match execution {
@@ -1239,6 +1475,16 @@ impl ExecutionEngine {
                             .set_running(&record.task_id, ExecutionState::Running, binding.clone())
                             .await?
                         {
+                            self.settle(
+                                binding.quota_attempt_id.as_deref(),
+                                match &output.usage {
+                                    Some(usage) => {
+                                        AttemptSettlement::Usage(usage.clone(), binding.api_type)
+                                    }
+                                    None => AttemptSettlement::Unknown,
+                                },
+                            )
+                            .await;
                             self.remove_active(&record.task_id);
                             return self.current_receipt(&record.task_id).await;
                         }
@@ -1252,6 +1498,11 @@ impl ExecutionEngine {
                             .set_running(&record.task_id, ExecutionState::Running, binding.clone())
                             .await?
                         {
+                            self.settle(
+                                binding.quota_attempt_id.as_deref(),
+                                AttemptSettlement::Unknown,
+                            )
+                            .await;
                             self.remove_active(&record.task_id);
                             return self.current_receipt(&record.task_id).await;
                         }
@@ -1274,26 +1525,36 @@ impl ExecutionEngine {
                             .await;
                     }
                     ProviderExecution::NativeTask { handle, resume } => {
+                        binding.remote_task_id = Some(handle.remote_task_id.clone());
                         if let Err(error) = resume.validate() {
+                            self.providers.release_native_inputs(&binding, true).await;
                             return self.finish_failure(&record.task_id, error).await;
                         }
-                        binding.remote_task_id = Some(handle.remote_task_id.clone());
                         binding.result_artifacts = handle.result_artifacts.clone();
                         binding.cancel_supported = handle.cancel_supported;
                         binding.resume = Some(resume);
                         let state = ExecutionState::from(handle.state);
-                        if !self
-                            .store
-                            .set_running(&record.task_id, state, binding.clone())
-                            .await?
-                        {
+                        let running = match self.store.set_running(&record.task_id, state, binding.clone()).await {
+                            Ok(running) => running,
+                            Err(error) => {
+                                self.providers.release_native_inputs(&binding, true).await;
+                                return Err(error);
+                            }
+                        };
+                        if !running {
                             if binding.cancel_supported {
                                 let _ = self.providers.cancel_native(&binding).await;
                             }
+                            self.providers.release_native_inputs(&binding, true).await;
+                            self.settle(
+                                binding.quota_attempt_id.as_deref(),
+                                AttemptSettlement::Unknown,
+                            )
+                            .await;
                             self.remove_active(&record.task_id);
                             return self.current_receipt(&record.task_id).await;
                         }
-                        self.tasks
+                        if let Err(error) = self.tasks
                             .report_state(
                                 &record.task_id,
                                 state,
@@ -1303,16 +1564,38 @@ impl ExecutionEngine {
                                     record.trace_id.as_deref(),
                                 ),
                             )
-                            .await?;
+                            .await {
+                                self.providers.release_native_inputs(&binding, true).await;
+                                return Err(error);
+                            }
                         self.remove_active(&record.task_id);
                         let mut receipt = self.current_receipt(&record.task_id).await?;
                         receipt.initial_poll_after = handle.poll_after;
                         return Ok(receipt);
                     }
                 },
-                Err(failure) => {
+                Err(AttemptFailure::Admission(error)) => {
+                    if request.runtime_failover && index + 1 < calls.len() {
+                        self.tasks
+                            .report_state(
+                                &record.task_id,
+                                ExecutionState::Submitted,
+                                json_state(
+                                    "quota_failover",
+                                    Some(Value::String(call.exact_model.clone())),
+                                    record.trace_id.as_deref(),
+                                ),
+                            )
+                            .await?;
+                        last_error = Some(error);
+                        continue;
+                    }
+                    return self.finish_failure(&record.task_id, error).await;
+                }
+                Err(AttemptFailure::Provider(failure)) => {
                     let can_failover =
                         failure.retryable && request.runtime_failover && index + 1 < calls.len();
+                    let consumed = failure.error.usage.clone();
                     let mut error: AiccError = failure.error.into();
                     if failure.provider_accepted {
                         error.code = AiccErrorCode::ProviderError;
@@ -1331,6 +1614,17 @@ impl ExecutionEngine {
                             .await?;
                         last_error = Some(error);
                         continue;
+                    }
+                    if let Some(usage) = consumed {
+                        return self
+                            .finish_failure_with_usage(
+                                &record.task_id,
+                                &record.scope,
+                                &binding,
+                                error,
+                                usage,
+                            )
+                            .await;
                     }
                     return self.finish_failure(&record.task_id, error).await;
                 }
@@ -1368,7 +1662,7 @@ impl ExecutionEngine {
         if record.state.is_terminal() {
             return Ok(record.into());
         }
-        let Some(binding) = record.binding.clone() else {
+        let Some(mut binding) = record.binding.clone() else {
             return self
                 .finish_failure(
                     task_id,
@@ -1421,15 +1715,25 @@ impl ExecutionEngine {
             return self.current_receipt(task_id).await;
         }
         let mut next_poll_after = initial_poll_after;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+        let mut current_state = record.state;
+        let active_poll_started = tokio::time::Instant::now();
+        let resume = binding
+            .resume
+            .as_ref()
+            .expect("validated native task resume descriptor");
+        let active_poll_elapsed_at_start_ms = resume.active_poll_elapsed_ms;
+        let remaining_poll_duration = resume.remaining_active_poll_duration();
+        let deadline = active_poll_started + remaining_poll_duration;
         loop {
             if tokio::time::Instant::now() >= deadline {
+                self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+                    .await;
                 return self
                     .finish_failure(
                         task_id,
                         aicc_error(
                             AiccErrorCode::Timeout,
-                            "native Provider task exceeded the 30 minute polling deadline",
+                            "native Provider task exceeded its polling deadline",
                             false,
                         ),
                     )
@@ -1438,6 +1742,13 @@ impl ExecutionEngine {
             if let Some(delay) = next_poll_after.take().filter(|delay| !delay.is_zero()) {
                 tokio::select! {
                     _ = cancellation.cancelled() => {
+                        let elapsed = active_poll_started.elapsed();
+                        binding
+                            .resume
+                            .as_mut()
+                            .expect("validated native task resume descriptor")
+                            .record_active_poll_session(active_poll_elapsed_at_start_ms, elapsed);
+                        let _ = self.store.set_running(task_id, current_state, binding.clone()).await?;
                         self.remove_active(task_id);
                         return self.current_receipt(task_id).await;
                     }
@@ -1445,6 +1756,16 @@ impl ExecutionEngine {
                 }
             }
             if cancellation.is_cancelled() {
+                let elapsed = active_poll_started.elapsed();
+                binding
+                    .resume
+                    .as_mut()
+                    .expect("validated native task resume descriptor")
+                    .record_active_poll_session(active_poll_elapsed_at_start_ms, elapsed);
+                let _ = self
+                    .store
+                    .set_running(task_id, current_state, binding.clone())
+                    .await?;
                 self.remove_active(task_id);
                 return self.current_receipt(task_id).await;
             }
@@ -1454,12 +1775,14 @@ impl ExecutionEngine {
             )
             .await;
             let Ok(polled) = polled else {
+                self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+                    .await;
                 return self
                     .finish_failure(
                         task_id,
                         aicc_error(
                             AiccErrorCode::Timeout,
-                            "native Provider task exceeded the 30 minute polling deadline",
+                            "native Provider task exceeded its polling deadline",
                             false,
                         ),
                     )
@@ -1468,6 +1791,8 @@ impl ExecutionEngine {
             match polled {
                 Ok(NativeTaskPoll::Pending(state, progress, retry_after)) => {
                     if state.is_terminal() {
+                        self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+                            .await;
                         let error = aicc_error(
                             AiccErrorCode::ProviderError,
                             "terminal Provider task state did not include a final result",
@@ -1475,9 +1800,18 @@ impl ExecutionEngine {
                         );
                         return self.finish_failure(task_id, error).await;
                     }
+                    current_state = ExecutionState::from(state);
+                    let resume = binding
+                        .resume
+                        .as_mut()
+                        .expect("validated native task resume descriptor");
+                    resume.record_active_poll_session(
+                        active_poll_elapsed_at_start_ms,
+                        active_poll_started.elapsed(),
+                    );
                     if !self
                         .store
-                        .set_running(task_id, ExecutionState::from(state), binding.clone())
+                        .set_running(task_id, current_state, binding.clone())
                         .await?
                     {
                         self.remove_active(task_id);
@@ -1498,9 +1832,13 @@ impl ExecutionEngine {
                         .await;
                 }
                 Ok(NativeTaskPoll::Failed(error)) => {
+                    self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+                        .await;
                     return self.finish_failure(task_id, error.into()).await;
                 }
                 Err(error) => {
+                    self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+                        .await;
                     return self.finish_failure(task_id, error.into_aicc_error()).await;
                 }
             }
@@ -1508,7 +1846,23 @@ impl ExecutionEngine {
     }
 
     pub(crate) async fn recover(&self) -> Result<Vec<ExecutionReceipt>, AiccError> {
-        let records = self.store.recoverable().await?;
+        let RecoverableExecutions { records, retired } = self.store.recoverable().await?;
+        for retired in retired {
+            // An upstream task an earlier build submitted keeps running at
+            // the Provider; its result is not collected, so the reservation
+            // settles as unknown rather than as a charge or a refund.
+            self.settle(
+                retired.quota_attempt_id.as_deref(),
+                AttemptSettlement::Unknown,
+            )
+            .await;
+            if let Err(error) = self.tasks.fail_task(&retired.task_id, &retired.error).await {
+                log::warn!(
+                    "AICC task recovery: cannot report retired task {}: {error}",
+                    retired.task_id
+                );
+            }
+        }
         let task_ids: Vec<String> = records
             .iter()
             .map(|record| record.task_id.clone())
@@ -1568,6 +1922,14 @@ impl ExecutionEngine {
             if !self.store.try_cancel(task_id).await? {
                 return Ok(false);
             }
+            self.settle(
+                record
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.quota_attempt_id.as_deref()),
+                AttemptSettlement::Unknown,
+            )
+            .await;
             self.log_llm_terminal(task_id, false).await;
             active.cancel.cancel();
             if let Some(binding) = record
@@ -1576,6 +1938,9 @@ impl ExecutionEngine {
                 .filter(|binding| binding.cancel_supported && binding.remote_task_id.is_some())
             {
                 let _ = self.providers.cancel_native(binding).await;
+            }
+            if let Some(binding) = record.binding.as_ref() {
+                self.providers.release_native_inputs(binding, true).await;
             }
             self.tasks
                 .cancel_task(
@@ -1611,6 +1976,8 @@ impl ExecutionEngine {
         if !accepted || !self.store.try_cancel(task_id).await? {
             return Ok(false);
         }
+        self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+            .await;
         self.log_llm_terminal(task_id, false).await;
         self.tasks
             .cancel_task(
@@ -1640,6 +2007,8 @@ impl ExecutionEngine {
         loop {
             let event = tokio::select! {
                 _ = cancellation.cancelled() => {
+                    self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+                        .await;
                     self.remove_active(task_id);
                     return self.current_receipt(task_id).await;
                 }
@@ -1670,9 +2039,15 @@ impl ExecutionEngine {
                 Ok(ProtocolEvent::Final(output)) => {
                     return self.finish_success(task_id, scope, binding, output).await;
                 }
-                Err(error) => return self.finish_failure(task_id, error.into()).await,
+                Err(error) => {
+                    self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+                        .await;
+                    return self.finish_failure(task_id, error.into()).await;
+                }
             }
         }
+        self.settle(binding.quota_attempt_id.as_deref(), AttemptSettlement::Unknown)
+            .await;
         self.finish_failure(
             task_id,
             aicc_error(
@@ -1691,6 +2066,15 @@ impl ExecutionEngine {
         binding: PinnedProviderTask,
         output: ProtocolOutput,
     ) -> Result<ExecutionReceipt, AiccError> {
+        self.providers.release_native_inputs(&binding, false).await;
+        self.settle(
+            binding.quota_attempt_id.as_deref(),
+            match &output.usage {
+                Some(usage) => AttemptSettlement::Usage(usage.clone(), binding.api_type),
+                None => AttemptSettlement::Unknown,
+            },
+        )
+        .await;
         if let Err(error) = output.validate_canonical_type(binding.api_type) {
             return self.finish_failure(task_id, error.into()).await;
         }
@@ -1703,10 +2087,6 @@ impl ExecutionEngine {
             Ok(cost) => cost,
             Err(error) => return self.finish_failure(task_id, error).await,
         };
-        let completed_at_ms = match current_time_ms() {
-            Ok(timestamp) => timestamp,
-            Err(error) => return self.finish_failure(task_id, error).await,
-        };
         let mut output = match ExecutionOutput::try_from(output) {
             Ok(output) => output,
             Err(error) => return self.finish_failure(task_id, error).await,
@@ -1716,6 +2096,52 @@ impl ExecutionEngine {
         if let Err(error) = check_result_payload(&output) {
             return self.finish_failure(task_id, error).await;
         }
+        if let Err(error) = self
+            .record_usage_completion(task_id, scope, &binding, &output.usage, finance_snapshot)
+            .await
+        {
+            return self.finish_failure(task_id, error).await;
+        }
+        if !self.store.stage_output(task_id, output.clone()).await? {
+            self.remove_active(task_id);
+            return self.current_receipt(task_id).await;
+        }
+        self.commit_staged_success(task_id, output).await
+    }
+
+    /// Bills what a failed attempt already consumed.
+    ///
+    /// A Provider that reports usage before failing has already charged for
+    /// those tokens, seconds, or images. The attempt is therefore settled with
+    /// its own usage and written to the usage ledger, so the cost is not lost;
+    /// the partial output is still discarded and the task still ends failed.
+    async fn finish_failure_with_usage(
+        &self,
+        task_id: &str,
+        scope: &IdempotencyScope,
+        binding: &PinnedProviderTask,
+        error: AiccError,
+        usage: AiUsage,
+    ) -> Result<ExecutionReceipt, AiccError> {
+        let finance_snapshot = binding.completion_cost(&usage);
+        if let Err(error) = self
+            .record_usage_completion(task_id, scope, binding, &usage, finance_snapshot)
+            .await
+        {
+            return self.finish_failure(task_id, error).await;
+        }
+        self.finish_failure(task_id, error).await
+    }
+
+    /// Writes the usage ledger entry of one attempt.
+    async fn record_usage_completion(
+        &self,
+        task_id: &str,
+        scope: &IdempotencyScope,
+        binding: &PinnedProviderTask,
+        usage: &AiUsage,
+        finance_snapshot: Option<AiCost>,
+    ) -> Result<(), AiccError> {
         let record = self.store.get_task(task_id).await?.ok_or_else(|| {
             aicc_error(
                 AiccErrorCode::InternalError,
@@ -1723,8 +2149,13 @@ impl ExecutionEngine {
                 false,
             )
         })?;
-        if let Err(error) = self
-            .usage
+        let operator_id = record
+            .attribution
+            .as_ref()
+            .and_then(|attribution| attribution.operator_id.clone())
+            .filter(|operator| operator != &record.user_id);
+        let completed_at_ms = current_time_ms()?;
+        self.usage
             .write_once(UsageCompletion {
                 event_id: record.usage_event_id,
                 tenant_id: scope.tenant_id.clone(),
@@ -1736,21 +2167,15 @@ impl ExecutionEngine {
                 method: scope.method.clone(),
                 capability: capability_name(binding.api_type).to_string(),
                 request_model: record.request_model,
-                provider_instance_name: binding.provider_instance_name,
-                provider_model: binding.exact_model,
-                usage: output.usage.clone(),
+                provider_instance_name: binding.provider_instance_name.clone(),
+                provider_model: binding.exact_model.clone(),
+                usage: usage.clone(),
                 finance_snapshot,
+                operator_id,
+                attribution: record.attribution,
                 completed_at_ms,
             })
             .await
-        {
-            return self.finish_failure(task_id, error).await;
-        }
-        if !self.store.stage_output(task_id, output.clone()).await? {
-            self.remove_active(task_id);
-            return self.current_receipt(task_id).await;
-        }
-        self.commit_staged_success(task_id, output).await
     }
 
     async fn commit_staged_success(
@@ -1777,6 +2202,9 @@ impl ExecutionEngine {
         task_id: &str,
         error: AiccError,
     ) -> Result<ExecutionReceipt, AiccError> {
+        if let Some(binding) = self.store.get_task(task_id).await?.and_then(|record| record.binding) {
+            self.providers.release_native_inputs(&binding, true).await;
+        }
         if self.store.try_fail(task_id, error.clone()).await? {
             self.log_llm_terminal(task_id, false).await;
             self.tasks.fail_task(task_id, &error).await?;
@@ -2111,15 +2539,25 @@ mod tests {
             })
         }
 
-        async fn recoverable(&self) -> Result<Vec<ExecutionRecord>, AiccError> {
-            Ok(self
-                .scopes
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|record| !record.state.is_terminal())
-                .cloned()
-                .collect())
+        async fn recoverable(&self) -> Result<RecoverableExecutions, AiccError> {
+            Ok(RecoverableExecutions {
+                records: self
+                    .scopes
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|record| !record.state.is_terminal())
+                    .cloned()
+                    .collect(),
+                retired: Vec::new(),
+            })
+        }
+
+        async fn find(
+            &self,
+            scope: &IdempotencyScope,
+        ) -> Result<Option<ExecutionRecord>, AiccError> {
+            Ok(self.scopes.lock().unwrap().get(scope).cloned())
         }
     }
 
@@ -2270,10 +2708,15 @@ mod tests {
         cancel_result: Mutex<bool>,
         cancel_error: Mutex<Option<NativeTaskResumeError>>,
         completion_cost: Mutex<Option<AiCost>>,
+        released_inputs: Mutex<Vec<(Option<String>, bool)>>,
     }
 
     #[async_trait]
     impl ProviderExecutionPort for FakeProviders {
+        async fn release_native_inputs(&self, binding: &PinnedProviderTask, outcome_unknown: bool) {
+            self.released_inputs.lock().unwrap().push((binding.remote_task_id.clone(), outcome_unknown));
+        }
+
         async fn start(
             &self,
             runtime_generation: u64,
@@ -2355,20 +2798,45 @@ mod tests {
                 kind: ResumeCredentialKind::Bearer,
                 header_name: None,
             }),
+            input_leases: Vec::new(),
             resolved_parameters: BTreeMap::from([("provider_model_id".into(), json!("model"))]),
             resource_access_context: ResourceAccessContext::new("tenant-a", "alice", "request-a")
                 .unwrap(),
             output_video_seconds: None,
             request_timeout_ms: 10_000,
+            max_poll_duration_ms: 30 * 60 * 1_000,
+            active_poll_elapsed_ms: 0,
             max_request_bytes: 1_024,
             max_response_bytes: 2_048,
         }
+    }
+
+    #[test]
+    fn native_task_poll_budget_survives_restart_without_counting_downtime() {
+        let mut resume = resume_descriptor();
+        resume.max_poll_duration_ms = 24 * 60 * 60 * 1_000;
+        resume.active_poll_elapsed_ms = 60 * 60 * 1_000;
+
+        let encoded = serde_json::to_value(&resume).unwrap();
+        resume = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            resume.remaining_active_poll_duration(),
+            Duration::from_secs(23 * 60 * 60)
+        );
+
+        resume.record_active_poll_session(60 * 60 * 1_000, Duration::from_secs(2 * 60 * 60));
+        assert_eq!(resume.active_poll_elapsed_ms, 3 * 60 * 60 * 1_000);
+        assert_eq!(
+            resume.remaining_active_poll_duration(),
+            Duration::from_secs(21 * 60 * 60)
+        );
     }
 
     fn call(instance: &str) -> ResolvedProviderCall {
         let request = LlmChatInvokeRequest::new(format!("model@{instance}"), Vec::new());
         ResolvedProviderCall {
             reported_cost_currency: None,
+            model_max_output_tokens: None,
             exact_model: format!("model@{instance}"),
             provider_model_id: "model".into(),
             provider_instance_name: instance.into(),
@@ -2411,6 +2879,7 @@ mod tests {
             credential_reference: "credential-1".into(),
             credential_header_name: None,
             resource_requirements: Vec::new(),
+            resource_leases: Vec::new(),
             resource_access_context: Some(
                 ResourceAccessContext::new("tenant-1", "user-1", "request-1").unwrap(),
             ),
@@ -2521,6 +2990,7 @@ mod tests {
             rules: Vec::new(),
             tiers: None,
             time_windows: Vec::new(),
+            addons: Vec::new(),
         };
         let window = time_window("09:00", "12:00", None, Some(9e-6), None);
         let merged = apply_time_window(&base, Some(&window));
@@ -2554,6 +3024,7 @@ mod tests {
             rules: Vec::new(),
             tiers: None,
             time_windows: vec![time_window("09:00", "12:00", None, Some(9e-6), None)],
+            addons: Vec::new(),
         };
         let unchanged = apply_time_window(&base, None);
         assert_eq!(unchanged.input_token, Some(1e-6));
@@ -2589,6 +3060,7 @@ mod tests {
                 tiers: None,
 
                 time_windows: Vec::new(),
+                addons: Vec::new(),
             }),
             matched_amount: None,
             estimated_cost: Some(buckyos_api::Money::new(777.0, "USD")),
@@ -2621,6 +3093,7 @@ mod tests {
                 tiers: None,
 
                 time_windows: Vec::new(),
+                addons: Vec::new(),
             }),
             matched_amount: None,
             estimated_cost: None,
@@ -2640,6 +3113,7 @@ mod tests {
             image_units: None,
             audio_seconds: None,
             video_seconds: None,
+            reference_images: None,
             request_units: None,
             characters: None,
             audio_input_tokens: None,
@@ -2698,7 +3172,8 @@ mod tests {
             pinned.basis,
             PinnedPricingBasis::Units {
                 unit: PricingUnit::Request,
-                amount: 0.1
+                amount: 0.1,
+                addons: Vec::new(),
             }
         );
         let cost = pinned
@@ -2783,6 +3258,29 @@ mod tests {
     }
 
     #[test]
+    /// An attempt that reported usage has already been charged upstream, so it
+    /// is neither retried nor moved to another Provider.
+    #[test]
+    fn a_failure_that_reported_usage_is_neither_retried_nor_failed_over() {
+        let plain = ProtocolError::new(
+            crate::error::ProtocolErrorKind::Transport,
+            "transport failed",
+        );
+        let billed = plain.clone().with_usage(Some(buckyos_api::AiUsage {
+            total_tokens: Some(7),
+            reported_cost: Some(0.25),
+            ..Default::default()
+        }));
+        let without_usage = ProviderStartFailure::after_accept(plain).for_api(ApiType::AudioMusic);
+        let with_usage = ProviderStartFailure::after_accept(billed).for_api(ApiType::AudioMusic);
+        assert!(
+            without_usage.retryable,
+            "a transport failure without usage keeps its failover policy"
+        );
+        assert!(!with_usage.retryable);
+        assert!(!with_usage.retry_same_model);
+    }
+
     fn pinned_pricing_uses_cached_input_rate_and_provider_reported_cost_wins() {
         let pricing = PinnedPricingSnapshot {
             currency: "USD".into(),
@@ -2832,6 +3330,7 @@ mod tests {
             tenant_id: "tenant-1".into(),
             user_id: "user-1".into(),
             caller_app_id: Some("app-1".into()),
+            attribution: None,
             trace_id: Some("trace-1".into()),
             request_model: "smart-chat".into(),
             idempotency_key: "idem-1".into(),
@@ -3225,7 +3724,7 @@ mod tests {
         let record = store.get_task("task-1").await.unwrap().unwrap();
         assert_eq!(record.state, ExecutionState::Running);
         assert!(record.output.is_some());
-        assert_eq!(store.recoverable().await.unwrap().len(), 1);
+        assert_eq!(store.recoverable().await.unwrap().records.len(), 1);
         assert_eq!(usage.writes.lock().unwrap().len(), 1);
         assert!(tasks.completed.lock().unwrap().is_empty());
 
@@ -3425,6 +3924,52 @@ mod tests {
         conflict.canonical_body["prompt"] = json!("different");
         let error = engine.execute(conflict).await.unwrap_err();
         assert_eq!(error.code, AiccErrorCode::IdempotencyConflict);
+    }
+
+    #[tokio::test]
+    async fn replay_returns_the_bound_task_before_routing_and_rejects_another_body() {
+        let providers = Arc::new(FakeProviders::default());
+        providers
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(StartPlan::Success(ProviderExecution::Immediate(output(
+                "ok",
+            ))));
+        let (engine, _, _, _) = make_engine(providers.clone());
+        let original = request(call("primary"));
+        let method = original.primary.method.clone();
+        let exact_model = original.primary.exact_model.clone();
+        let body = original.canonical_body.clone();
+        assert!(engine
+            .replay("tenant-1", &method, "idem-1", &body)
+            .await
+            .unwrap()
+            .is_none());
+        let receipt = engine.execute(original).await.unwrap();
+
+        let (replayed, bound_model) = engine
+            .replay("tenant-1", &method, "idem-1", &body)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.task_id, receipt.task_id);
+        assert_eq!(replayed.state, ExecutionState::Succeeded);
+        assert_eq!(bound_model.as_deref(), Some(exact_model.as_str()));
+        assert_eq!(providers.starts.lock().unwrap().len(), 1);
+
+        let mut different = body.clone();
+        different["prompt"] = json!("different");
+        let error = engine
+            .replay("tenant-1", &method, "idem-1", &different)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, AiccErrorCode::IdempotencyConflict);
+        assert!(engine
+            .replay("tenant-2", &method, "idem-1", &body)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -3654,6 +4199,179 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct FakeAdmission {
+        deny: Mutex<Vec<String>>,
+        admitted: Mutex<Vec<String>>,
+        settled: Mutex<Vec<(String, AttemptSettlement)>>,
+    }
+
+    #[async_trait]
+    impl AdmissionPort for FakeAdmission {
+        async fn admit(
+            &self,
+            _record: &ExecutionRecord,
+            call: &ResolvedProviderCall,
+            attempt_id: &str,
+        ) -> Result<Option<String>, AiccError> {
+            if self.deny.lock().unwrap().contains(&call.exact_model) {
+                return Err(AiccError::new(
+                    AiccErrorCode::QuotaExhausted,
+                    "token quota is exhausted",
+                ));
+            }
+            self.admitted.lock().unwrap().push(attempt_id.to_string());
+            Ok(Some(attempt_id.to_string()))
+        }
+
+        async fn settle(&self, attempt_id: &str, settlement: AttemptSettlement) {
+            self.settled
+                .lock()
+                .unwrap()
+                .push((attempt_id.to_string(), settlement));
+        }
+    }
+
+    fn engine_with_admission(
+        providers: Arc<FakeProviders>,
+        admission: Arc<FakeAdmission>,
+    ) -> ExecutionEngine {
+        let (engine, _, _, _) = make_engine(providers);
+        engine.with_admission(admission)
+    }
+
+    #[tokio::test]
+    async fn each_attempt_is_reserved_before_start_and_settled_with_its_usage() {
+        let providers = Arc::new(FakeProviders::default());
+        providers.plans.lock().unwrap().extend([
+            StartPlan::Failure(ProviderStartFailure::before_accept(
+                ProtocolError::new(ProtocolErrorKind::Transport, "unavailable"),
+                true,
+            )),
+            StartPlan::Success(ProviderExecution::Immediate(output("ok"))),
+        ]);
+        let admission = Arc::new(FakeAdmission::default());
+        let engine = engine_with_admission(providers.clone(), admission.clone());
+        let receipt = engine.execute(request(call("primary"))).await.unwrap();
+        assert_eq!(receipt.state, ExecutionState::Succeeded);
+        let task = receipt.task_id;
+        assert_eq!(
+            admission.admitted.lock().unwrap().as_slice(),
+            [format!("{task}:0:1"), format!("{task}:0:2")]
+        );
+        let settled = admission.settled.lock().unwrap();
+        assert_eq!(settled[0], (format!("{task}:0:1"), AttemptSettlement::Released));
+        assert!(matches!(
+            &settled[1],
+            (id, AttemptSettlement::Usage(usage, ApiType::Llm)) if id == &format!("{task}:0:2") && usage.total_tokens == Some(3)
+        ));
+    }
+
+    #[tokio::test]
+    async fn quota_denial_fails_over_only_when_routing_allows_it() {
+        let providers = Arc::new(FakeProviders::default());
+        providers
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(StartPlan::Success(ProviderExecution::Immediate(output("backup"))));
+        let admission = Arc::new(FakeAdmission::default());
+        admission.deny.lock().unwrap().push("model@primary".into());
+        let engine = engine_with_admission(providers.clone(), admission.clone());
+        let mut req = request(call("primary"));
+        req.failover.push(call("backup"));
+        req.runtime_failover = true;
+        assert_eq!(
+            engine.execute(req).await.unwrap().state,
+            ExecutionState::Succeeded
+        );
+        assert_eq!(providers.starts.lock().unwrap().as_slice(), ["model@backup"]);
+
+        let providers = Arc::new(FakeProviders::default());
+        let engine = engine_with_admission(providers.clone(), admission);
+        let mut req = request(call("primary"));
+        req.idempotency_key = "idem-locked".into();
+        req.failover.push(call("backup"));
+        let receipt = engine.execute(req).await.unwrap();
+        assert_eq!(receipt.state, ExecutionState::Failed);
+        assert_eq!(receipt.error.unwrap().code, AiccErrorCode::QuotaExhausted);
+        assert!(providers.starts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_video_job_is_never_retried_or_failed_over() {
+        let providers = Arc::new(FakeProviders::default());
+        providers.plans.lock().unwrap().extend([
+            StartPlan::Failure(ProviderStartFailure::after_accept(ProtocolError::new(
+                ProtocolErrorKind::Transport,
+                "connection lost after submit",
+            ))),
+            StartPlan::Success(ProviderExecution::Immediate(output("duplicate"))),
+        ]);
+        let (engine, _, _, _) = make_engine(providers.clone());
+        let mut primary = call("primary");
+        primary.api_type = ApiType::VideoGenerate;
+        let mut backup = call("backup");
+        backup.api_type = ApiType::VideoGenerate;
+        let mut req = request(primary);
+        req.failover.push(backup);
+        req.runtime_failover = true;
+        let receipt = engine.execute(req).await.unwrap();
+        assert_eq!(receipt.state, ExecutionState::Failed);
+        assert_eq!(receipt.error.unwrap().code, AiccErrorCode::ProviderError);
+        assert_eq!(
+            providers.starts.lock().unwrap().as_slice(),
+            ["model@primary"]
+        );
+
+        // A submit the Provider answered with an error status left no job, so
+        // the usual failover still applies.
+        let providers = Arc::new(FakeProviders::default());
+        providers.plans.lock().unwrap().extend([
+            StartPlan::Failure(ProviderStartFailure::native_submit_rejected(
+                ProtocolError::new(ProtocolErrorKind::InvalidRequest, "model does not exist")
+                    .with_provider_code(Some("1211".to_owned())),
+            )),
+            StartPlan::Success(ProviderExecution::Immediate(output("fallback"))),
+        ]);
+        let (engine, _, _, _) = make_engine(providers.clone());
+        let mut primary = call("primary");
+        primary.api_type = ApiType::VideoGenerate;
+        let mut backup = call("backup");
+        backup.api_type = ApiType::VideoGenerate;
+        let mut req = request(primary);
+        req.idempotency_key = "idem-video-rejected".into();
+        req.failover.push(backup);
+        req.runtime_failover = true;
+        assert_eq!(
+            engine.execute(req).await.unwrap().state,
+            ExecutionState::Succeeded
+        );
+        assert_eq!(
+            providers.starts.lock().unwrap().last().map(String::as_str),
+            Some("model@backup")
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_failures_keep_the_reservation_for_reconciliation() {
+        let providers = Arc::new(FakeProviders::default());
+        providers.plans.lock().unwrap().push_back(StartPlan::Failure(
+            ProviderStartFailure::after_accept(ProtocolError::new(
+                ProtocolErrorKind::InvalidRequest,
+                "rejected after submit",
+            )),
+        ));
+        let admission = Arc::new(FakeAdmission::default());
+        let engine = engine_with_admission(providers, admission.clone());
+        let receipt = engine.execute(request(call("primary"))).await.unwrap();
+        assert_eq!(receipt.state, ExecutionState::Failed);
+        assert_eq!(
+            admission.settled.lock().unwrap()[0].1,
+            AttemptSettlement::Unknown
+        );
+    }
+
     #[tokio::test]
     async fn unavailable_model_skips_same_model_retry_and_fails_over() {
         let providers = Arc::new(FakeProviders::default());
@@ -3872,9 +4590,10 @@ mod tests {
         let started = engine.execute(request(call("primary"))).await.unwrap();
         *providers.poll_error.lock().unwrap() = Some(NativeTaskResumeError::CredentialUnavailable);
 
-        let restarted = ExecutionEngine::new(store.clone(), tasks.clone(), providers, usage);
+        let restarted = ExecutionEngine::new(store.clone(), tasks.clone(), providers.clone(), usage);
         let recovered = restarted.recover().await.unwrap();
         assert_eq!(recovered[0].state, ExecutionState::Failed);
+        assert!(providers.released_inputs.lock().unwrap().contains(&(Some("remote-credential-lost".into()), true)));
         let error = recovered[0].error.as_ref().unwrap();
         assert_eq!(error.code, AiccErrorCode::ProviderError);
         assert!(!error.retriable);
@@ -3921,6 +4640,7 @@ mod tests {
             trace_id: orphan_request.trace_id.clone(),
             user_id: orphan_request.user_id.clone(),
             caller_app_id: orphan_request.caller_app_id.clone(),
+            attribution: None,
             request_model: orphan_request.request_model.clone(),
             body_fingerprint: canonical_body_fingerprint(&orphan_request.canonical_body).unwrap(),
             task_id: "orphan-task".into(),

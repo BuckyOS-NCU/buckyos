@@ -12,13 +12,14 @@
 //!   active session view, perception, cognition facade, artifact list).
 //! - [`channel`]: kmsg inputs + kevent wake-ups.
 //! - [`bridge`]: msg-center / task state → Session Input Bus records.
-//! - [`runtime`]: execution environments for `exec` (native, tmux).
+//! - [`runtime`]: execution environments for `exec` (native, Node Executor).
 //! - [`runner`]: drives a session to its end condition.
 //! - [`goal`]: Goals and their Goal Sessions (derivation, run
 //!   opportunities, budgets); the Goal object is in [`state::GoalStore`].
 //! - [`xagent_cli`]: the `xagent` command line.
 
 pub mod api;
+pub mod baseline;
 pub mod bridge;
 pub mod channel;
 pub mod error;
@@ -34,14 +35,17 @@ pub mod protocol;
 pub mod runner;
 pub mod runtime;
 pub mod session;
+pub mod session_context;
+pub mod share;
 pub mod skills;
 pub mod state;
 pub mod template;
 pub mod todos;
+pub mod transfer;
 pub mod xagent_cli;
 
 pub use api::{
-    create_self_improve_session, create_session, post_input, read_session, InputChannel,
+    create_session, post_input, read_session, InputChannel,
     SessionSpec, SessionView,
 };
 pub use error::{OpenDanError, RecoveryBlocked, Result};

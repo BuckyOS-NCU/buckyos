@@ -54,9 +54,9 @@ struct NativeServiceSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ProcessIdentity {
-    pid: i32,
-    start_time: u64,
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: i32,
+    pub(crate) start_time: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -764,7 +764,7 @@ fn is_active_process_status(status: ProcessStatus) -> bool {
     !matches!(status, ProcessStatus::Zombie | ProcessStatus::Dead)
 }
 
-fn read_process_identity(pid: i32) -> Option<ProcessIdentity> {
+pub(crate) fn read_process_identity(pid: i32) -> Option<ProcessIdentity> {
     if pid <= 0 {
         return None;
     }
@@ -783,7 +783,7 @@ fn read_process_identity(pid: i32) -> Option<ProcessIdentity> {
 }
 
 // An established identity uses only PID and start time; replaced executables may be deleted.
-fn process_identity_is_current(identity: &ProcessIdentity) -> bool {
+pub(crate) fn process_identity_is_current(identity: &ProcessIdentity) -> bool {
     read_process_identity(identity.pid).as_ref() == Some(identity)
 }
 
@@ -878,7 +878,7 @@ fn check_local_port(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
 
-async fn stop_process_tree(pid: i32) -> Result<()> {
+pub(crate) async fn stop_process_tree(pid: i32) -> Result<()> {
     if pid <= 0 {
         return Ok(());
     }
@@ -958,7 +958,7 @@ async fn run_command(
     })
 }
 
-fn spawn_detached(
+pub(crate) fn spawn_detached(
     program: &Path,
     args: &[String],
     envs: Option<&HashMap<String, String>>,
@@ -994,7 +994,44 @@ fn spawn_detached(
     let child = cmd.spawn().map_err(|error| {
         ServiceControlError::ReasonError(format!("spawn {} failed: {}", program.display(), error))
     })?;
-    Ok(child.id())
+    let pid = child.id();
+    DETACHED_CHILDREN.lock().unwrap().insert(pid);
+    Ok(pid)
+}
+
+/// Detached service processes whose `Child` was dropped; nothing else waits
+/// for them, so the main loop reaps exactly these pids.
+static DETACHED_CHILDREN: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(unix)]
+pub(crate) fn reap_detached_children() -> usize {
+    let pids: Vec<u32> = DETACHED_CHILDREN.lock().unwrap().iter().copied().collect();
+    let mut reaped = 0usize;
+    for pid in pids {
+        let mut status = 0i32;
+        let rc = loop {
+            let rc = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break rc;
+        };
+        if rc == 0 {
+            continue;
+        }
+        DETACHED_CHILDREN.lock().unwrap().remove(&pid);
+        if rc > 0 {
+            reaped += 1;
+            info!("reaped exited child process pid={} status={}", pid, status);
+        }
+    }
+    reaped
+}
+
+#[cfg(not(unix))]
+pub(crate) fn reap_detached_children() -> usize {
+    0
 }
 
 fn exit_code(status: &std::process::ExitStatus) -> i32 {
@@ -1030,6 +1067,36 @@ fn log_command_output(program: &Path, args: &[String], output: &CommandOutput) {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_reaper_does_not_steal_other_children() {
+        let pid = spawn_detached(Path::new("/bin/true"), &[], None, None).unwrap();
+        let reaper = tokio::spawn(async {
+            for _ in 0..300 {
+                reap_detached_children();
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        for i in 0..60 {
+            let status = tokio::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("exit {}", i % 7))
+                .status()
+                .await
+                .expect("child status must not be stolen by the reaper");
+            assert_eq!(status.code(), Some(i % 7));
+        }
+        reaper.await.unwrap();
+        for _ in 0..200 {
+            reap_detached_children();
+            if !DETACHED_CHILDREN.lock().unwrap().contains(&pid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!DETACHED_CHILDREN.lock().unwrap().contains(&pid));
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()

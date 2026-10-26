@@ -157,10 +157,15 @@ fn actor(d: DID) -> GroupActor {
     }
 }
 struct Verifier {
+    imports: std::sync::RwLock<std::collections::HashSet<(String, String)>>,
     agents: HashMap<DID, ZoneAgentInfo>,
 }
 #[async_trait::async_trait]
 impl SessionTokenVerifier for Verifier {
+    async fn authorize_imported_attachment(&self, token: &str, id: &ndn_lib::ObjId) -> Result<bool> {
+        let caller = self.verify(token).await?.sub.unwrap();
+        Ok(self.imports.read().unwrap().contains(&(caller, id.to_string())))
+    }
     async fn authorize(&self, _: &str, _: &str, _: &str) -> Result<()> {
         Ok(())
     }
@@ -175,6 +180,9 @@ impl SessionTokenVerifier for Verifier {
     async fn zone_agent(&self, d: &DID) -> Result<Option<ZoneAgentInfo>> {
         Ok(self.agents.get(d).cloned())
     }
+    async fn sso_settings(&self) -> Result<buckyos_api::SsoSettings> {
+        Ok(Default::default())
+    }
 }
 /// `agent()` may join groups; `private_agent()` only when `private_allow_group`.
 fn verifier(private_allow_group: bool) -> Arc<Verifier> {
@@ -183,6 +191,7 @@ fn verifier(private_allow_group: bool) -> Arc<Verifier> {
         allow_group,
     };
     Arc::new(Verifier {
+        imports: Default::default(),
         agents: HashMap::from([
             (agent(), info(true)),
             (private_agent(), info(private_allow_group)),
@@ -1007,7 +1016,7 @@ async fn joined_sync_erases_redacted_bodies_and_stops_after_removal_or_group_del
 #[tokio::test]
 async fn guest_requests_are_atomic_idempotent_and_do_not_leak_other_sessions() {
     let (c, _tmp, _) = center().await;
-    create(&c, json!({"membership":{"guest_entry":{"session_template":"tickets","max_open_per_guest":1}},"session_templates":{"tickets":{"membership":{"roles":["owner","admin"]},"rules":{"allow_guests":true}}}})).await;
+    create(&c, json!({"membership":{"guest_entry":{"session_template":"tickets","max_open_per_guest":1,"auth_methods":{"password":true}}},"session_templates":{"tickets":{"membership":{"roles":["owner","admin"]},"rules":{"allow_guests":true}}}})).await;
     let p = json!({"request_id":"request1"});
     let one = call(&c, &guest(), "group.submit_guest_request", p.clone())
         .await
@@ -1060,18 +1069,38 @@ async fn post_hooks_cache_terminal_decisions_retry_unavailability_and_cannot_byp
     use std::sync::atomic::{AtomicUsize, Ordering};
     let decision = Arc::new(std::sync::Mutex::new("deny".to_string()));
     let count = Arc::new(AtomicUsize::new(0));
+    let secret = Arc::new(std::sync::Mutex::new(String::new()));
     let hook_decision = decision.clone();
     let hook_count = count.clone();
+    let hook_secret = secret.clone();
     let (url, server) = http_fixture(move |req| {
         let decision = hook_decision.lock().unwrap().clone();
+        let secret = hook_secret.lock().unwrap().clone();
         hook_count.fetch_add(1, Ordering::SeqCst);
         async move {
-            assert_eq!(req.headers()["authorization"], "Bearer group-service");
-            let body: Value =
-                serde_json::from_slice(&req.into_body().collect().await.unwrap().to_bytes())
+            assert!(req.headers().get("authorization").is_none());
+            let timestamp = req.headers()[buckyos_api::GROUP_HOOK_TIMESTAMP_HEADER]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let signature = req.headers()[buckyos_api::GROUP_HOOK_SIGNATURE_HEADER]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let raw = req.into_body().collect().await.unwrap().to_bytes();
+            let now = MessageCenter::now_ms() / 1000;
+            if !buckyos_api::verify_group_hook_signature(&secret, &timestamp, &raw, &signature, now) {
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(http_body("{}"))
                     .unwrap();
+            }
+            assert!(!buckyos_api::verify_group_hook_signature("other", &timestamp, &raw, &signature, now));
+            assert!(!buckyos_api::verify_group_hook_signature(&secret, &timestamp, &raw, &signature, now + 301));
+            let body: Value = serde_json::from_slice(&raw).unwrap();
             assert_eq!(body["operation"], "post");
             assert_eq!(body["group_did"], json!(group()));
+            assert_eq!(body["group_host"], json!(DID::new("web", "test.example")));
             assert!(body["msg"].is_object());
             Response::builder()
                 .status(if decision == "unavailable" {
@@ -1086,9 +1115,23 @@ async fn post_hooks_cache_terminal_decisions_retry_unavailability_and_cannot_byp
     })
     .await;
     let (c, _tmp, _) = center().await;
-    c.cyfs_dispatch.write().unwrap().group_hook_authorization = Some("Bearer group-service".into());
-    create(&c, json!({"default_session":{"hooks":[{"point":"post","service":url,"may_grant":true,"on_unavailable":"deny","timeout_ms":1000}]}})).await;
+    let created = create(&c, json!({"default_session":{"hooks":[{"point":"post","service":url,"may_grant":true,"on_unavailable":"deny","timeout_ms":1000}]}})).await;
+    assert_eq!(created["hook_secrets"][0]["scope"], "default_session");
+    assert_eq!(created["hook_secrets"][0]["index"], 0);
+    *secret.lock().unwrap() = created["hook_secrets"][0]["secret"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let config = call(&c, &owner(), "group.get_config", json!({}))
+        .await
+        .unwrap();
+    assert!(config["default_session"]["hooks"][0].get("secret").is_none());
+    assert_eq!(config["default_session"]["hooks"][0]["service"], json!(url));
     join(&c, &member()).await;
+    let access = call(&c, &member(), "group.check_access", json!({"action":"session.post"}))
+        .await
+        .unwrap();
+    assert_eq!(access["allowed"], "hook_dependent");
     let before = c.groups.load(&group()).await.unwrap().unwrap().group_seq;
     let denied = message(&member(), None, "denied", 1);
     let one = c
@@ -1128,6 +1171,37 @@ async fn post_hooks_cache_terminal_decisions_retry_unavailability_and_cannot_byp
             .ok
     );
     assert_eq!(count.load(Ordering::SeqCst), 3);
+    let rotated = call(&c, &owner(), "group.rotate_hook_secret", json!({"index":0}))
+        .await
+        .unwrap();
+    let new_secret = rotated["secret"].as_str().unwrap().to_string();
+    assert_ne!(new_secret, *secret.lock().unwrap());
+    assert_ne!(rotated["revision"], created["revision"]);
+    assert!(call(&c, &owner(), "group.rotate_hook_secret", json!({"index":1}))
+        .await
+        .is_err());
+    assert!(call(&c, &member(), "group.rotate_hook_secret", json!({"index":0}))
+        .await
+        .is_err());
+    let stale = message(&member(), None, "stale secret", 20);
+    assert!(c
+        .accept_group_message(&actor(member()), stale, None)
+        .await
+        .is_err());
+    *secret.lock().unwrap() = new_secret.clone();
+    assert!(
+        c.accept_group_message(&actor(member()), message(&member(), None, "rotated", 21), None)
+            .await
+            .unwrap()
+            .ok
+    );
+    let events = call(&c, &owner(), "group.list_events", json!({}))
+        .await
+        .unwrap();
+    assert!(!events.to_string().contains(&new_secret));
+    let sessions = c.group_sessions(&actor(owner()), &group()).await.unwrap();
+    assert!(!sessions.to_string().contains(&new_secret));
+    assert!(sessions["items"][0]["rules"]["hooks"][0].get("secret").is_none());
     let mut tx = c.groups.begin(&group()).await.unwrap();
     tx.state.configuration["default_session"]["post"] = json!("nobody");
     tx.state.configuration["default_session"]["hooks"][0]["on_unavailable"] = json!("native_only");
@@ -1268,7 +1342,7 @@ async fn attachments_require_the_exact_message_context_and_remote_client_policy(
 #[tokio::test]
 async fn deleted_guest_sessions_keep_minimal_notifications_and_existing_local_copies() {
     let (host, _htmp, _) = center().await;
-    create(&host, json!({"membership":{"guest_entry":{"session_template":"tickets","max_open_per_guest":1}},"session_templates":{"tickets":{"membership":{"roles":["owner"]},"rules":{"allow_guests":true}}}})).await;
+    create(&host, json!({"membership":{"guest_entry":{"session_template":"tickets","max_open_per_guest":1,"auth_methods":{"password":true}}},"session_templates":{"tickets":{"membership":{"roles":["owner"]},"rules":{"allow_guests":true}}}})).await;
     let session = call(
         &host,
         &guest(),
@@ -2455,6 +2529,7 @@ async fn an_agent_runtime_app_posts_group_messages_as_its_agent() {
     let (c, _tmp, _) = center().await;
     let helper = DID::new("web", "helper.test.example");
     c.set_token_verifier(Arc::new(Verifier {
+        imports: Default::default(),
         agents: HashMap::from([(
             helper.clone(),
             ZoneAgentInfo {
@@ -2489,4 +2564,321 @@ fn member_kind_comes_from_the_owner_document_not_the_zone_document() {
     assert_eq!(member_entity_kind(&zone, &owner_doc).unwrap(), "user");
     let lucy = DID::from_str("did:web:lucy.demo.buckyos.io").unwrap();
     assert!(member_entity_kind(&lucy, &owner_doc).is_err());
+}
+
+mod attachment_holds {
+    use super::*;
+    use crate::attachment_retention::{attachment_owner, AttachmentStore};
+    use named_store::{NamedDataMgr, NamedLocalStore, PinScope, StoreLayout, StoreTarget};
+    use ndn_lib::{NdnError, ObjId};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The real store, with a switch that makes pins fail.
+    struct Flaky {
+        store: NamedDataMgr,
+        fail: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl AttachmentStore for Flaky {
+        async fn retain(&self, obj_id: &ObjId, owner: &str) -> Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(kRPC::RPCErrors::ReasonError("named store: injected failure".into()));
+            }
+            self.store.retain(obj_id, owner).await
+        }
+        async fn release(&self, obj_id: &ObjId, owner: &str) -> Result<()> {
+            self.store.release(obj_id, owner).await
+        }
+        async fn issue(&self, obj_id: &ObjId) -> Option<String> {
+            self.store.issue(obj_id).await
+        }
+    }
+
+    async fn open_store(dir: &std::path::Path) -> NamedDataMgr {
+        let store = NamedLocalStore::get_named_store_by_path(dir.to_path_buf()).await.unwrap();
+        let store_id = store.store_id().to_string();
+        let mgr = NamedDataMgr::new();
+        mgr.register_store(Arc::new(tokio::sync::Mutex::new(store))).await;
+        let target = StoreTarget { store_id, device_did: String::new(), capacity: None, used: None, readonly: false, enabled: true, weight: 1 };
+        mgr.add_layout(StoreLayout::new(1, vec![target], 0, 0)).await;
+        mgr
+    }
+
+    /// One GC pass as a deployment would run it: deliver pending pin cascades, then evict.
+    async fn run_gc(mgr: &NamedDataMgr) -> named_store::GcReport {
+        let id = mgr.get_store_ids().await.pop().unwrap();
+        let store = mgr.get_store(&id).await.unwrap();
+        let store = store.lock().await;
+        loop {
+            let batch = store.fetch_outbox_ready(100).await.unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for entry in batch {
+                store.apply_edge(entry.msg.clone()).await.unwrap();
+                store.complete_outbox_entry(entry.seq).await.unwrap();
+            }
+        }
+        store.gc_round(0).await.unwrap()
+    }
+
+    /// A file as a share snapshot leaves it: chunk + FileObject, pinned by the share.
+    async fn snapshot(mgr: &NamedDataMgr, name: &str, data: &[u8]) -> (ObjId, ObjId) {
+        let chunk = ndn_lib::ChunkHasher::new(None).unwrap().calc_mix_chunk_id_from_bytes(data).unwrap();
+        mgr.put_chunk(&chunk, data).await.unwrap();
+        let file = ndn_lib::FileObject::new(name.to_string(), data.len() as u64, chunk.to_string());
+        let (id, body) = file.gen_obj_id();
+        mgr.put_object(&id, &body).await.unwrap();
+        mgr.pin(&id, "share:s", PinScope::Recursive, None).await.unwrap();
+        (id, chunk.to_obj_id())
+    }
+
+    fn with_refs(mut msg: MsgObject, ids: &[&ObjId]) -> MsgObject {
+        for id in ids {
+            msg.content.refs.push(ndn_lib::RefItem {
+                role: ndn_lib::RefRole::Output,
+                target: ndn_lib::RefTarget::DataObj { obj_id: (*id).clone(), uri_hint: None },
+                label: None,
+            });
+        }
+        msg
+    }
+
+    fn direct(from: &DID, to: &DID, text: &str, created: u64) -> MsgObject {
+        let mut msg = MsgObject { from: from.clone(), to: vec![to.clone()], kind: MsgObjKind::Chat, created_at_ms: created, ..Default::default() };
+        msg.content.content = text.into();
+        msg
+    }
+
+    async fn holds(mgr: &NamedDataMgr, obj: &ObjId, msg: &ObjId) -> bool {
+        match mgr.anchor_state(obj, &attachment_owner(msg)).await {
+            Ok(_) => true,
+            Err(NdnError::NotFound(_)) => false,
+            Err(e) => panic!("anchor_state: {e}"),
+        }
+    }
+
+    async fn rows(c: &MessageCenter, state: &str) -> i64 {
+        let sql = c.msg_box_db.render_sql("SELECT COUNT(*) AS n FROM msg_attachment_retentions WHERE state=?");
+        sqlx::Row::try_get(&sqlx::query(&sql).bind(state).fetch_one(c.msg_box_db.pool()).await.unwrap(), "n").unwrap()
+    }
+
+    #[tokio::test]
+    async fn outgoing_attachments_require_a_caller_grant_before_any_hold() {
+        let (c, tmp, _) = center().await;
+        let mgr = open_store(&tmp.path().join("store")).await;
+        c.set_attachment_store(Arc::new(mgr.clone()));
+        let verifier = verifier(false);
+        c.set_token_verifier(verifier.clone());
+        let (known, _) = snapshot(&mgr, "private.txt", b"another target owns this").await;
+        let attempt = with_refs(direct(&owner(), &member(), "guess", 1), &[&known]);
+        let attempted_id = attempt.gen_obj_id().0;
+        assert!(c.handle_post_send(attempt.clone(), None, context(&owner())).await.is_err());
+        assert!(!holds(&mgr, &known, &attempted_id).await);
+        assert!(c.msg_box_db.list_message_records(&attempted_id).await.unwrap().is_empty());
+
+        // A verified, complete import belongs to this caller's canonical target.
+        verifier.imports.write().unwrap().insert((owner().to_string(), known.to_string()));
+        c.authorize_outgoing_attachments(&context(&owner()), &attempt).await.expect("valid import authorization");
+        c.handle_post_send(attempt, None, context(&owner())).await.expect("accept imported message");
+        assert!(holds(&mgr, &known, &attempted_id).await);
+        verifier.imports.write().unwrap().clear();
+        // The existing readable sent message remains a legitimate source.
+        c.handle_post_send(with_refs(direct(&owner(), &member(), "forward", 2), &[&known]), None, context(&owner())).await.unwrap();
+
+        // A group member can reuse a visible attachment, without an NDM import;
+        // recall revokes that source before a new message can pin it.
+        create(&c, json!({})).await;
+        join(&c, &member()).await;
+        let (group_file, _) = snapshot(&mgr, "group.txt", b"group-only").await;
+        let shared = with_refs(message(&owner(), None, "group file", 3), &[&group_file]);
+        let shared_id = shared.gen_obj_id().0;
+        assert!(c.accept_group_message(&actor(owner()), shared, None).await.unwrap().ok);
+        let forward = with_refs(direct(&member(), &owner(), "forward group", 4), &[&group_file]);
+        c.authorize_outgoing_attachments(&context(&member()), &forward).await.unwrap();
+        let mut recall = message(&owner(), None, "", 5);
+        recall.relates_to = Some(MsgRelation { rel: MsgRelType::Redact, target: shared_id, key: None });
+        assert!(c.accept_group_message(&actor(owner()), recall, None).await.unwrap().ok);
+        assert!(c.handle_post_send(forward.clone(), None, context(&member())).await.is_err());
+        assert!(!holds(&mgr, &group_file, &forward.gen_obj_id().0).await);
+    }
+
+    #[tokio::test]
+    async fn attachments_are_held_while_a_message_references_them() {
+        let (c, tmp, _) = center().await;
+        let mgr = open_store(&tmp.path().join("store")).await;
+        let flaky = Arc::new(Flaky { store: mgr.clone(), fail: AtomicBool::new(false) });
+        c.set_attachment_store(flaky.clone());
+        create(&c, json!({})).await;
+        join(&c, &member()).await;
+        call(&c, &owner(), "group.create_session", json!({"session_id":"files"})).await.unwrap();
+        let (only_group, _) = snapshot(&mgr, "a.txt", b"only in the group").await;
+        let (shared, _) = snapshot(&mgr, "b.txt", b"in the group and a direct message").await;
+        let (inbound, inbound_chunk) = snapshot(&mgr, "c.txt", b"dispatched to the owner").await;
+
+        // Hosted group, local send and dispatch all hold before they accept.
+        let group_msg = with_refs(message(&owner(), Some("files"), "files", 1), &[&only_group, &shared]);
+        assert!(c.accept_group_message(&actor(owner()), group_msg.clone(), None).await.unwrap().ok);
+        let group_id = group_msg.gen_obj_id().0;
+        let dm = with_refs(direct(&owner(), &member(), "for you", 2), &[&shared]);
+        let dm_id = c.post_send_internal(dm, None).await.unwrap().msg_id;
+        let incoming = with_refs(direct(&member(), &owner(), "for you too", 3), &[&inbound]);
+        let incoming_id = incoming.gen_obj_id().0;
+        assert!(c.handle_dispatch(incoming, None, None, context(&member())).await.unwrap().ok);
+        assert!(holds(&mgr, &only_group, &group_id).await && holds(&mgr, &shared, &group_id).await);
+        assert!(holds(&mgr, &shared, &dm_id).await);
+        assert!(holds(&mgr, &inbound, &incoming_id).await);
+        assert_eq!(rows(&c, "held").await, 4);
+
+        // The shares stop; GC keeps everything messages reference.
+        for id in [&only_group, &shared, &inbound] {
+            mgr.unpin(id, "share:s").await.unwrap();
+        }
+        assert_eq!(run_gc(&mgr).await.evicted_objects, 0);
+
+        // A recall ends the group message: its holds go, the direct message keeps the shared file.
+        let mut recall = message(&owner(), Some("files"), "", 4);
+        recall.relates_to = Some(MsgRelation { rel: MsgRelType::Redact, target: group_id.clone(), key: None });
+        assert!(c.accept_group_message(&actor(owner()), recall, None).await.unwrap().ok);
+        assert_eq!(rows(&c, "releasing").await, 2);
+        let report = c.reconcile_attachments(0).await.unwrap();
+        assert_eq!(report.released, 2, "{report:?}");
+        assert!(!holds(&mgr, &only_group, &group_id).await && !holds(&mgr, &shared, &group_id).await);
+        assert!(holds(&mgr, &shared, &dm_id).await);
+        assert_eq!(run_gc(&mgr).await.evicted_objects, 1);
+        assert!(!mgr.is_object_exist(&only_group).await.unwrap());
+        assert!(mgr.is_object_exist(&shared).await.unwrap() && mgr.is_object_exist(&inbound).await.unwrap());
+
+        // A failed pin fails the send; the reconcile drops the half-made hold; a retry works.
+        let (late, _) = snapshot(&mgr, "d.txt", b"sent while the store failed").await;
+        let retry = with_refs(direct(&owner(), &member(), "retry", 5), &[&late]);
+        flaky.fail.store(true, Ordering::SeqCst);
+        assert!(c.post_send_internal(retry.clone(), None).await.is_err());
+        assert_eq!(rows(&c, "pending").await, 1);
+        c.reconcile_attachments(0).await.unwrap();
+        assert_eq!(rows(&c, "pending").await, 0);
+        flaky.fail.store(false, Ordering::SeqCst);
+        let retry_id = c.post_send_internal(retry, None).await.unwrap().msg_id;
+        assert!(holds(&mgr, &late, &retry_id).await);
+
+        // Backfill: messages accepted before holds were recorded get them once; unreadable content is reported.
+        mgr.unpin(&shared, &attachment_owner(&dm_id)).await.unwrap();
+        for sql in ["DELETE FROM msg_attachment_retentions WHERE msg_id=?", "DELETE FROM msg_attachment_meta WHERE name<>?"] {
+            sqlx::query(&c.msg_box_db.render_sql(sql)).bind(dm_id.to_string()).execute(c.msg_box_db.pool()).await.unwrap();
+        }
+        mgr.remove_chunk(&ndn_lib::ChunkId::from_obj_id(&inbound_chunk)).await.unwrap();
+        let report = c.reconcile_attachments(0).await.unwrap();
+        assert_eq!(report.backfilled_messages, 1, "{report:?}");
+        assert!(holds(&mgr, &shared, &dm_id).await);
+        assert_eq!(report.issues, vec![(incoming_id.to_string(), inbound.to_string(), "content_missing".to_string())]);
+    }
+}
+
+#[tokio::test]
+async fn panel_declarations_display_and_hook_secrets_follow_the_extension_contract() {
+    let (c, _tmp, _) = center().await;
+    let created = call(&c, &owner(), "group.create", json!({"idempotency_key":"create",
+        "sessions":[{"session_id":"tickets","template":"support"},{"session_id":"plain","rule_overrides":{"display":{"links":[{"title":"Runbook","url":"https://wiki.test.example/r"}]}}}],
+        "configuration":{
+        "required_features":["panels"],
+        "extensions":{"panels":[
+            {"id":"crm","title":"CRM","entry_url":"https://crm.test.example/panel?x=1"},
+            {"id":"tickets-view","title":"Tickets","entry_url":"https://crm-test.example/tickets","scope":{"sessions":["tickets"]}}
+        ]},
+        "display":{"announcement":"Welcome","links":[{"title":"Docs","url":"https://docs.test.example/"}],"featured_members":[owner()]},
+        "session_templates":{"support":{"membership":{"roles":["owner","admin"]},"rules":{"panels":["crm"],"display":{"announcement":"Support hours 9-5"}}}}
+    }}))
+    .await
+    .unwrap();
+    assert!(created.get("hook_secrets").is_none());
+    let sessions = c.group_sessions(&actor(owner()), &group()).await.unwrap();
+    let items = sessions["items"].as_array().unwrap();
+    let by_id = |id: Option<&str>| {
+        items
+            .iter()
+            .find(|i| i["session_id"].as_str() == id)
+            .unwrap()
+            .clone()
+    };
+    let default = by_id(None);
+    assert_eq!(default["panels"], json!([{"id":"crm","title":"CRM","entry_url":"https://crm.test.example/panel?x=1"}]));
+    assert_eq!(default["display"]["announcement"], "Welcome");
+    assert_eq!(default["display"]["links"][0]["title"], "Docs");
+    assert_eq!(default["display"]["featured_members"], json!([owner()]));
+    let tickets = by_id(Some("tickets"));
+    assert_eq!(tickets["panels"].as_array().unwrap().len(), 2);
+    assert_eq!(tickets["panels"][1]["id"], "tickets-view");
+    assert_eq!(tickets["display"]["announcement"], "Support hours 9-5");
+    assert_eq!(tickets["display"]["links"][0]["title"], "Docs");
+    let plain = by_id(Some("plain"));
+    assert_eq!(plain["panels"].as_array().unwrap().len(), 1);
+    assert_eq!(plain["display"]["links"][0]["title"], "Runbook");
+    assert_eq!(plain["display"]["announcement"], "Welcome");
+    let doc = call(&c, &owner(), "group.get_doc", json!({})).await.unwrap();
+    assert!(doc.get("panels").is_none() && doc.get("extensions").is_none());
+
+    let mut revision = created["revision"].as_str().unwrap().to_string();
+    let mut rejected = |key: &str, patch: Value, reason: &str| {
+        let c = c.clone();
+        let revision = revision.clone();
+        let key = key.to_string();
+        let reason = reason.to_string();
+        async move {
+            let err = call(&c, &owner(), "group.apply_config", json!({"expected_revision":revision,"idempotency_key":key,"patch":patch}))
+                .await
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains(&reason), "{key}: {err}");
+        }
+    };
+    let panel = |id: &str, url: &str| json!({"id":id,"title":"P","entry_url":url});
+    rejected("foreign", json!({"extensions":{"panels":[panel("evil","https://evil.example/p")]}}), "untrusted-origin").await;
+    rejected("suffix-only", json!({"extensions":{"panels":[panel("x","https://test.example/p")]}}), "untrusted-origin").await;
+    rejected("lookalike", json!({"extensions":{"panels":[panel("x","https://crm.test.example.attacker.net/p")]}}), "untrusted-origin").await;
+    rejected("http", json!({"extensions":{"panels":[panel("x","http://crm.test.example/p")]}}), "untrusted-origin").await;
+    rejected("bad-id", json!({"extensions":{"panels":[panel("Bad_ID","https://crm.test.example/p")]}}), "invalid-panel-decl:id").await;
+    rejected("dup", json!({"extensions":{"panels":[panel("a","https://crm.test.example/p"),panel("a","https://crm.test.example/q")]}}), "invalid-panel-decl:id").await;
+    rejected("unknown-session", json!({"extensions":{"panels":[panel("crm","https://crm.test.example/p"),{"id":"a","title":"A","entry_url":"https://crm.test.example/p","scope":{"sessions":["nope"]}}]}}), "unknown-session").await;
+    rejected("unknown-ref", json!({"default_session":{"panels":["ghost"]}}), "unknown-panel:ghost").await;
+    rejected("display-http", json!({"display":{"links":[{"title":"x","url":"http://docs.test.example/"}]}}), "invalid-display-link").await;
+    rejected("display-member", json!({"display":{"featured_members":[guest()]}}), "invalid-display-member").await;
+    rejected("hook-bad-service", json!({"default_session":{"hooks":[{"point":"post","service":"ftp://x","on_unavailable":"deny","timeout_ms":1000}]}}), "invalid-hook-service").await;
+    let many: Vec<Value> = (0..9).map(|i| panel(&format!("p{i}"), "https://crm.test.example/p")).collect();
+    rejected("too-many", json!({"extensions":{"panels":many}}), "too-many").await;
+
+    let applied = call(&c, &owner(), "group.apply_config", json!({"expected_revision":revision,"idempotency_key":"hooks","patch":{"extensions":{"panels":[panel("crm","https://crm.test.example/p")]},"session_templates":{"support":{"rules":{"hooks":[{"point":"join","service":"https://crm.test.example/hook","on_unavailable":"native_only","timeout_ms":1000}]}}}}}))
+        .await
+        .unwrap();
+    assert_eq!(applied["hook_secrets"][0]["scope"], "template:support");
+    let secret = applied["hook_secrets"][0]["secret"].as_str().unwrap().to_string();
+    assert_eq!(secret.len(), 43);
+    revision = applied["revision"].as_str().unwrap().to_string();
+    let config = call(&c, &owner(), "group.get_config", json!({})).await.unwrap();
+    assert!(config["session_templates"]["support"]["rules"]["hooks"][0].get("secret").is_none());
+    assert_eq!(config["extensions"]["panels"].as_array().unwrap().len(), 1);
+    let events = call(&c, &owner(), "group.list_events", json!({})).await.unwrap();
+    assert!(events.to_string().contains("entity.config_changed") && !events.to_string().contains(&secret));
+    let stored = c.groups.load(&group()).await.unwrap().unwrap();
+    assert_eq!(stored.configuration["session_templates"]["support"]["rules"]["hooks"][0]["secret"], json!(secret));
+    // Tickets uses the template's hook; rotating through the Session reaches the template.
+    let rotated = call(&c, &owner(), "group.rotate_hook_secret", json!({"session_id":"tickets","index":0}))
+        .await
+        .unwrap();
+    assert_ne!(rotated["secret"], json!(secret));
+    assert_ne!(rotated["revision"], json!(revision));
+    // A Session override gets its own secret, shown once in the update result.
+    let session = c.groups.load(&group()).await.unwrap().unwrap().sessions["plain"].revision.clone();
+    let updated = call(&c, &owner(), "group.update_session", json!({"session_id":"plain","expected_revision":session,"rule_overrides":{"hooks":[{"point":"read","service":"https://crm.test.example/read","on_unavailable":"native_only","timeout_ms":1000}]}}))
+        .await
+        .unwrap();
+    assert_eq!(updated["hook_secrets"][0]["scope"], "session:plain");
+    let rotated = call(&c, &owner(), "group.rotate_hook_secret", json!({"session_id":"plain","index":0}))
+        .await
+        .unwrap();
+    assert_eq!(rotated["revision"].as_str().unwrap().len(), 36);
+    assert_ne!(rotated["secret"], updated["hook_secrets"][0]["secret"]);
+    let sessions = c.group_sessions(&actor(owner()), &group()).await.unwrap();
+    assert!(!sessions.to_string().contains(rotated["secret"].as_str().unwrap()));
 }

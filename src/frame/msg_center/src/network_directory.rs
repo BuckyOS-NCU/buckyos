@@ -23,6 +23,8 @@ pub enum DirectoryError {
     NotFound(String),
     /// No answer right now; worth retrying.
     Unavailable(String),
+    /// The name service did not answer in time; worth retrying.
+    Timeout,
 }
 
 impl std::fmt::Display for DirectoryError {
@@ -30,6 +32,7 @@ impl std::fmt::Display for DirectoryError {
         match self {
             Self::NotFound(reason) => write!(f, "not found: {reason}"),
             Self::Unavailable(reason) => write!(f, "unavailable: {reason}"),
+            Self::Timeout => f.write_str("timeout"),
         }
     }
 }
@@ -100,11 +103,14 @@ pub(crate) fn profile_from_document(did: &DID, doc: &Value) -> DidProfile {
         _ => LookupKind::Unknown,
     };
     let zone = match kind {
-        LookupKind::User => doc
+        LookupKind::User => match doc
             .get("binded_zone_list")
             .and_then(Value::as_array)
             .and_then(|zones| zones.first())
-            .and_then(zone_host),
+        {
+            Some(zone) => zone_host(zone),
+            None => Some(host_of(did)),
+        },
         LookupKind::Zone => Some(host_of(did)),
         LookupKind::Group => doc.get("host").and_then(zone_host),
         _ => doc
@@ -128,18 +134,20 @@ impl NameServiceDirectory {
                 Ok(Err(name_lib::NSError::NotFound(reason))) => Err(DirectoryError::NotFound(reason)),
                 // Key-class DIDs (`did:dev`) and malformed ones have no document to wait for.
                 Ok(Err(name_lib::NSError::InvalidDID(reason))) => Err(DirectoryError::NotFound(reason)),
+                Ok(Err(name_lib::NSError::DeadlineExceeded(_))) | Err(_) => Err(DirectoryError::Timeout),
                 Ok(Err(error)) => Err(DirectoryError::Unavailable(error.to_string())),
-                Err(_) => Err(DirectoryError::Unavailable("timeout".into())),
             }
         };
         // The owner document first; a name service that timed out is not
         // asked a second time.
         let doc = match resolve(Some(name_lib::DidDocType::Owner)).await {
             Ok(doc) => doc,
-            Err(DirectoryError::Unavailable(reason)) if reason == "timeout" => {
-                return Err(DirectoryError::Unavailable(reason))
-            }
-            Err(_) => resolve(None).await?,
+            Err(DirectoryError::Timeout) => return Err(DirectoryError::Timeout),
+            Err(_) => match resolve(Some(name_lib::DidDocType::Device)).await {
+                Ok(doc) => doc,
+                Err(DirectoryError::Timeout) => return Err(DirectoryError::Timeout),
+                Err(_) => resolve(None).await?,
+            },
         };
         let doc = doc
             .to_json_value()
@@ -154,7 +162,9 @@ impl NetworkDirectory for NameServiceDirectory {
         let key = did.to_string();
         if let Some((answer, at)) = self.cache.lock().unwrap().get(&key) {
             let ttl = match answer {
-                Err(DirectoryError::Unavailable(_)) => DIRECTORY_UNAVAILABLE_TTL,
+                Err(DirectoryError::Unavailable(_) | DirectoryError::Timeout) => {
+                    DIRECTORY_UNAVAILABLE_TTL
+                }
                 _ => DIRECTORY_CACHE_TTL,
             };
             if at.elapsed() < ttl {
@@ -287,5 +297,30 @@ mod tests {
         );
         assert_eq!(profile.kind, LookupKind::Device);
         assert_eq!(profile.zone.as_deref(), Some("alice.example"));
+    }
+
+    #[test]
+    fn self_hosted_owners_route_to_their_own_zone() {
+        let alice = DID::new("bns", "alice");
+        for doc in [
+            json!({"id":"did:bns:alice","@context":"https://www.buckyos.org/ns/owner"}),
+            json!({"id":"did:bns:alice","binded_zone_list":[]}),
+        ] {
+            let profile = profile_from_document(&alice, &doc);
+            assert_eq!(profile.kind, LookupKind::User);
+            assert_eq!(profile.zone, Some(host_of(&alice)));
+        }
+    }
+
+    #[test]
+    fn a_declared_zone_must_be_valid_and_takes_precedence() {
+        let alice = DID::new("bns", "alice");
+        let profile = profile_from_document(
+            &alice,
+            &json!({"binded_zone_list":["did:web:charlie.me", "did:web:other.me"]}),
+        );
+        assert_eq!(profile.zone.as_deref(), Some("charlie.me"));
+        let profile = profile_from_document(&alice, &json!({"binded_zone_list":[null]}));
+        assert_eq!(profile.zone, None);
     }
 }
