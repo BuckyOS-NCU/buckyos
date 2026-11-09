@@ -20,7 +20,7 @@
 //!     [--root-dir <path>]      # 选填,探索根目录,默认 PWD
 //!     [--work-dir <path>]      # 选填,LocalLLMContext 工作目录,
 //!                              #   默认 $TMPDIR/llm_explore-<ts>-<desc>
-//!     [--model <alias>]        # 选填,LLM 模型 alias,默认 llm.summary
+//!     [--model <alias>]        # 选填,LLM 模型 alias,默认 llm.summarize
 //! ```
 //!
 //! ## 输出契约
@@ -52,7 +52,7 @@ use crate::{
 };
 
 const TOOL_NAME: &str = "llm_explore";
-const DEFAULT_MODEL_ALIAS: &str = "llm.summary";
+const DEFAULT_MODEL_ALIAS: &str = crate::llm_compress::SUMMARIZE_MODEL_ALIAS;
 const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 16;
 
 /// 钉在每个 llm_explore run 上的 system prompt。
@@ -254,6 +254,8 @@ fn build_outcome_result(
             (
                 AgentToolResult {
                     agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+                    hints: Vec::new(),
+                    dedup: None,
                     tool: Some(TOOL_NAME.to_string()),
                     cmd_name: None,
                     status: AgentToolStatus::Success,
@@ -268,6 +270,7 @@ fn build_outcome_result(
                     return_code: Some(0),
                     partial_output: None,
                     output: Some(content),
+                    images: Vec::new(),
                 },
                 CLI_EXIT_SUCCESS,
             )
@@ -291,6 +294,8 @@ fn build_outcome_result(
             (
                 AgentToolResult {
                     agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+                    hints: Vec::new(),
+                    dedup: None,
                     tool: Some(TOOL_NAME.to_string()),
                     cmd_name: None,
                     status: AgentToolStatus::Error,
@@ -309,6 +314,7 @@ fn build_outcome_result(
                     return_code: None,
                     partial_output: None,
                     output: None,
+                    images: Vec::new(),
                 },
                 CLI_EXIT_SUCCESS,
             )
@@ -330,6 +336,8 @@ fn build_outcome_result(
             (
                 AgentToolResult {
                     agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+                    hints: Vec::new(),
+                    dedup: None,
                     tool: Some(TOOL_NAME.to_string()),
                     cmd_name: None,
                     status: AgentToolStatus::Error,
@@ -344,6 +352,7 @@ fn build_outcome_result(
                     return_code: None,
                     partial_output: None,
                     output: None,
+                    images: Vec::new(),
                 },
                 CLI_EXIT_ERROR,
             )
@@ -373,6 +382,8 @@ fn build_error_result(work_dir: Option<&Path>, opts: &CliOpts, message: &str) ->
     details.insert("error".into(), Value::String(message.to_string()));
     AgentToolResult {
         agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+        hints: Vec::new(),
+        dedup: None,
         tool: Some(TOOL_NAME.to_string()),
         cmd_name: None,
         status: AgentToolStatus::Error,
@@ -387,6 +398,7 @@ fn build_error_result(work_dir: Option<&Path>, opts: &CliOpts, message: &str) ->
         return_code: None,
         partial_output: None,
         output: None,
+        images: Vec::new(),
     }
 }
 
@@ -405,7 +417,7 @@ Options:
                          tools (read_file/write_file/edit_file/exec) work here.
   --work-dir <path>      Runs directory for the xllm run record and snapshots.
                          Default: $TMPDIR/llm_explore-<ts>-<sanitized-description>.
-  --model <alias>        AICC model alias (default: llm.summary).
+  --model <alias>        AICC model alias (default: llm.summarize).
   -h, --help             Show this help.
 "#;
 

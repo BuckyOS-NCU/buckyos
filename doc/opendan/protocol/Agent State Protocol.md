@@ -4,6 +4,8 @@
 
 2026-10-11：增加 Goals（§9，`state/goals/`）、登记表 `goal_id`、查询 `goal_id`、kRPC `goals.*`。只是加法。
 
+2026-11-02：登记表 `status.retry_not_before_ms`（可重试错误的退避期，Session Directory Protocol §7“run 的预算”）。只是加法。
+
 2026-10-11：增加 Runtime 登记（§10，`state/runtimes/`，kRPC `runtimes.*`）；behavior 增加 `[tool]`（§7）。只是加法；Workspace 位置的 `runtime_id` 由 `local` 改称 `container`，旧记录照常读。
 
 ## 1. AgentRoot 布局
@@ -15,6 +17,7 @@
   sessions/<sid>/                           session 目录的默认位置（可选）
   state/
     sessions/<sid>.json                     登记表（全部 session，无论目录在哪）
+    sessions/.ids/                         身份键到短 session_id 的持久预留映射
     sessions/.unreachable/<sid>             巡检标记（目录不可达）
     perception/<sid>.jsonl                  感知
     perception/<sid>.jsonl.lock             感知文件短锁（追加与清理互斥）
@@ -22,7 +25,7 @@
     artifacts/<aid>/versions/v-<sid>.json   各 work session 的贡献
     goals/<goal_id>/                        Goal（§9）：goal.json revisions/ changes.jsonl state.json
                                             activations.jsonl epochs/<n>/state.json schedule.json .lock
-  memory/  notebook/  attention_signals/    认知（agent_tool 实现与其内部锁）
+  memory/  notebook/                        认知（agent_tool 实现与其内部锁）
   state/workspaces/                         Known Workspace 登记（项目目录可在 AgentRoot 外）
   state/runtimes/<runtime_id>.json          Runtime 登记（§10）
   .locks/memory_consolidation.lease  .locks/artifact/<aid>.lease  .locks/workspaces.lock  .locks/runtimes.lock
@@ -37,14 +40,17 @@
   "created_by": { "principal": "app:app2@alice", "via": "app" }, "idempotency_key": null, "route_key": null,
   "driver": { "principal": "app:app2@alice" },
   "location": "/abs/path/<sid>", "location_rev": 0,
-  "input_queue": "app2::alice::opendan.session.<sid>", "wake_event": "/opendan/<agent_id>/session/<sid>/input",
+  "input_queue": "app2::alice::opendan.session.<H(agent_did,sid)>", "wake_event": "/opendan/<agent_id>/session/<sid>/input",
   "agent_access": "full | status_only", "origin": null, "workspace": null, "artifact_id": null,
-  "objective": "…", "scope": { "paths": [], "objects": [] },
+  "objective": "…", "title": "…",          // title 可缺省：session_config 的 session.title
+  "scope": { "paths": [], "objects": [] },
   "goal_id": "g-…",                          // Goal Session 的 Goal，或创建 Work 的 Goal（session.goal / origin.goal）
   "status": { "rev": 17, "run_state": "…", "outcome": null, "acceptance": "…", "one_line_status": "…",
               "report_brief": "≤500 字", "pending_decision": null,
-              "waiting_for": "input | tool | event | children",   // 仅 run_state = waiting 时；父据此区分“子在等输入”
+              "needs_input": false,   // run_state = waiting 且只有别人的输入能推动它（没有在跟的 task / 子 Session，不是 Goal Session）；父据此区分“子在等回答”
               "turn_open": false,
+              "paused": false,        // control(pause) 之后、resume 之前：不再推理（缺省省略）
+              "retry_not_before_ms": 0,   // 可重试错误的退避期：此刻之前不推理（state.json `retry.not_before_ms` 的投影，缺省省略）；宿主据此不去驱动退避中的子 Session
               "activity": { "summary": "…", "touching": [], "heartbeat_ms": 0 },
               "last_runner": { "runner_id": "…", "host": "…", "pid": 0, "lock_epoch": 0, "at_ms": 0 },
               "last_error": null, "updated_at_ms": 0 } }
@@ -68,7 +74,7 @@
 
 ```jsonc
 // state/perception/<sid>.jsonl，单写者 = 该 session 的驱动者（或组件阶段的模拟 Session），seq 严格递增
-{"seq":31,"at_ms":0,"session_id":"…","kind":"run_digest|observation|task_outcome|task_discarded",
+{"seq":31,"at_ms":0,"session_id":"…","kind":"observation",   // 旧文件可能还有 run_digest|task_outcome|task_discarded，只读、不作材料
  "source":"session","tags":[],"objects":[],"summary":"…","payload":{…},"refs":{"worklog_seq":316},
  // Memory 需求 A.5 的扩展字段（缺省省略）
  "idempotency_key":"A/e31/observation-1","content_digest":"…",
@@ -84,7 +90,7 @@
 - 追加幂等：跳过 `seq ≤` 文件最后一条的记录（反向读最后一行得到）；带 `idempotency_key` 的记录按键去重：同键同内容（`content_digest`）是重放，同键不同内容报冲突。正文清理后键与摘要仍在，重放不会让材料复活。
 - 文件级短锁 `state/perception/<sid>.jsonl.lock`：追加（driver 仍须持 Session lease）与整理清理都在短锁内进行。清理以“写新文件 → fsync → rename”替换原文件，只把已终局处置记录的正文换成 `cleared` 标记，保留 `seq`、键、摘要、`scope`、`source_ref` 与 `<sid>:<seq>` 身份；`seq` 不变。读取不取锁，忽略未以换行结束的尾部。
 - 可见性：`scope.subjects` 由宿主按写入 Session 的绑定补齐（模型只能在授权主体集合内收窄）；读者的每个授权主体集合必须包含记录的全部主体才可见。
-- 自动记录：每次 run 结束写 `run_digest`，payload `{run_id, turn, turn_status}`：`turn` 是该 run 结束时所属的 Turn，`turn_status`（`completed | failed | budget_exhausted | stopped`）只在这次 run 结束同时关闭了 Turn 时有值，否则为 null（例如 `WAIT_USER_MSG` 未交付答复、fork 子 process 返回；drive 补发缺失记录时也为 null）。它按 run 结束生成，不代表 Turn 完成；普通切换与 fork / independent 挂起不写。finished 追加 `task_outcome`；discard 追加 `task_discarded`（保留来源）；`perception` 类型输入并入 `observation`。`state.perception_seq` 在提交中预留，追加在提交之后，缺失的由下次 drive 补发。这三种 Runtime 记录只进入整理批次，不出现在其它 Session 的变化里。
+- 没有自动记录（2026-11-08 起）：Runtime 不再在 run 结束、finished 或 discard 时写 `run_digest` / `task_outcome` / `task_discarded`，进度由 Task / Goal 承载；感知只来自 `ctl perceive`（`perception` 类型输入并入 `observation`）。`state.perception_seq` 由驱动者在写入后推进，不再预留与补发，seq 允许有缺口。旧文件中残留的这三种 kind 仍可按引用读取，但不进入整理批次、不出现在任何 Session 的变化里，也不触发整理 Goal。
 - **待处理集合**：由 Memory 提交日志中的逐条处置计算（未处置 = 新增；`deferred` 且到期 = 待处置；已终局但正文未清 = 待重试清理），不按字节游标跳过暂缓材料。见 Memory 组件 `pending_work` / `begin`。
 - **写入口**：Session 的 `ctl perceive` 控制输入由驱动者经 `Memory::record_perception` 写入：驱动者分配 `seq`、按 Session 绑定主体（UI 取对话 peer，Work 取 Agent 的 owner，Goal Session 取 Goal 的 owner，有 Workspace 绑定时附 `workspace:<id>`，grants 另含 Agent 自身）、绑定来源事件（`--source` 给出的本 Session 输入 key，否则这条控制输入本身、`actor_kind = agent`）与时区锚点，控制输入的 key 是幂等键。Goal 的 `extensions.opendan.records_perception = false`（整理 Goal）时该输入被拒绝（`input_rejected`），Runtime 记录也不写。
 - **防回声**：Goal 带 `memory_consolidation` 能力的 Goal Session（各 epoch）的记录不成为材料；没有字节游标。
@@ -93,7 +99,7 @@
 
 Memory Graph（`memory/`，schema 4.0：认知另带 `stability = stable | contextual | volatile`、`last_evidence_at`（独立证据时间，新建整理认知必填，修订不续期）、`review_at`（结构化复核日期）；`created_at` 是 `first_occasion` 时间的读取投影；召回淡出按稳定度 365 / 30 / 1 天一分、上限 20 分，`explicit` 不淡出；旧主版本根目录拒绝打开，不迁移）由 `agent_tool::agent_memory` 实现：`.meta/occasions.jsonl` 是追加写的提交真相源，一次整理提交是一条 occasion（图操作 + 逐条处置 + 幂等键 + `produced_by` + 真实 `actor_session_id` + 整理 lease 的 epoch）；读路径不取写锁。两层的统一门面是 `libopendan::memory::Memory`（感知写入、`query_topic` / `query` / 按引用读取、`changes_since`、`pending_work` / `due_reviews`、整理与清理）；topic 与观察进度（`ObservationState`）归 Session 保存，Memory 不登记订阅。认知只在 `memory_consolidation` lease 下经 `Consolidator::commit` 改变：该 lease 由 Goal 带 `memory_consolidation` 能力的 Goal Session 的 drive 全程持有，其宿主工具 `memory_consolidation_begin / commit` 是唯一写路径（§9.7）；普通 Session 只能写感知和读取，`agent-memory` CLI 在 Session shell 内拒绝写。
 
-`recall_hints`（runner 的旧门面）没有 tag 时返回空列表（未触发），存储不可读时返回错误；`notebook_append` 与 `notebook/`、`attention_signals/` 是待退役的旧调用方，S 阶段移除。非 Rust 实现通过 `agent_tool agent-memory …` CLI 访问 Graph。
+`recall_hints`（runner 的旧门面）没有 tag 时返回空列表（未触发），存储不可读时返回错误；`notebook_append` 与 `notebook/` 是待退役的旧调用方，S 阶段移除（`attention_signals/` 已于 2026-11-01 退役，旧目录不再被读写）。非 Rust 实现通过 `agent_tool agent-memory …` CLI 访问 Graph。
 
 ## 6. 产物列表（只登记与指向）
 
@@ -126,20 +132,19 @@ next = ["do", "review"]            # 可切换 / 可调用的目标：冻结闭�
 [prompt]
 mode = "behavior"                  # function_call | behavior；缺省用会话的 loop_model
 system = "… {{ session.id }} …"    # system 模板；变量：identity.* behavior.{name,objective,mode} session.{id,kind,objective,driver,scope,parent} workspace.id
-on_init = "…"                      # 三类受控输入与半订阅快照的模板（缺省内建）
+on_init = "…"                      # 三类受控输入的模板（缺省内建）；变量 background_context 是本批变化的背景行，不引用则半订阅不可见
 on_input = "…"
 on_context_switch = "…"
-semi_subscription_snapshot = "…"
 
 [input]                            # 消费策略（缺省用会话的）
 mode = "batch"                     # single | batch
 media = "reference"                # reference | inline
-background = "batch"               # batch | after_tools：after_tools 时每批工具结果后宿主追加变化的 TodoList / 子 Session 行（<<background_context>>）
 
 [capabilities]
 tool_whitelist = ["group:bash", "behavior:analyze_intent", "report"]   # → tools.tools；`group:<内置工具组>` → {groupname}，其余 → {name}（运行环境提供的工具）；`behavior:<name>` 是该 behavior 的 [tool] 函数
 action_whitelist = ["shell"]       # → tools.actions
 call_intent = false                # true（只用于 function_call）：每个原生调用必须带非空 `intent`，宿主加入 schema、执行前校验、交给工具前去掉
+workspace = "read_only"            # 以它为入口的 Session 对 Workspace 的访问（缺省：创建者给的）；只读的 Session 不取写者租约、不阻挡写它的子 Session
 
 [budget]
 max_tool_iterations = 16           # → max_tool_iterations
@@ -168,7 +173,7 @@ task = "{{args.request}}"          # 子 context 的 task 模板，只能引用 
 
 `[model] / [capabilities] / [budget] / prompt.mode` 叠加为该 behavior 的 run 的有效 `.llm_context`（只产生 `model / loop_model / max_tool_iterations / max_tokens / tools` 这几个键），结果进 run.json `config`，xllm 接手时不需要理解 behavior。`prompt.llm_context` 里的 `prompt / groups / runs_dir` 在宿主装配下无效，冻结时拒绝。
 
-Session 模板的覆盖在 `agent.toml`：`[session.<class>]` 的 `turns = "one" | "unbounded" | <n>`、`wait_user_msg`（`allowed | finish_failed | finish_completed | end_turn`）、`input = "none" | "queue"`、`observe`、`load_hints`、`default_behavior`、`max_process_depth`、`max_sub_sessions`、`max_session_depth`；内建 class 为 `work / ui / self_check / goal`，其它 class 必须在这里声明。`goal` 类另有 `min_interval_secs`、`[session.goal.budget.activation|period]`（§9.4）与 `[session.goal.maintenance] enabled / decision / behavior`（§9.7）。
+Session 模板的覆盖在 `agent.toml`：`[session.<class>]` 的 `turns = "one" | "unbounded" | <n>`、`wait_user_msg`（`allowed | finish_failed | finish_completed | end_turn`）、`input = "none" | "queue"`、`tick_secs`、`observe`、`load_hints`、`default_behavior`、`max_process_depth`、`max_sub_sessions`、`max_session_depth`；内建 class 为 `work / ui / self_check / goal`，其它 class 必须在这里声明。`goal` 类另有 `min_interval_secs`、`[session.goal.budget.activation|period]`（§9.4）与 `[session.goal.maintenance] enabled / decision / behavior`（§9.7）。
 
 定位（不是协议）：`connect(agent_did, who)` 依次取进程内注册的实现、`$OPENDAN_AGENT_ROOT` 或 `~/.opendan/agents.toml`（`"<did>" = "<agent_root>"`）指向的 AgentRoot、`$OPENDAN_AGENT_STATE_URL` 的 kRPC 服务（服务端随 OpenDAN 改造提供）。
 
@@ -212,7 +217,7 @@ Goal 是 Agent State 中的持久对象，是唯一的真相；它的 Goal Sessi
 
 ### 9.2 Goal Session 与 epoch
 
-- 同一时刻一个 Goal 只有一个当前 epoch；Goal Session 的 sid = `goal-H("goal", agent_did, goal_id, epoch)`（`ids::goal_session_id`），幂等键 `goal:<goal_id>:<epoch>`，`kind = goal`、`class = goal`、驱动者为宿主身份、**没有 parent**，目录默认 `<agent_root>/sessions/`。登记表条目带 `goal_id`。
+- 同一时刻一个 Goal 只有一个当前 epoch；Goal Session 用 `goal-H("goal", agent_did, goal_id, epoch)` 身份键（`ids::goal_session_key`）在 Agent State 预留 `goal-YYYYMMDD-N` 短 sid，写进 Goal 定义后再创建 Session，重试沿用该预留 ID。幂等键为 `goal:<goal_id>:<epoch>`，`kind = goal`、`class = goal`、驱动者为宿主身份、**没有 parent**，目录默认 `<agent_root>/sessions/<sid>/`。登记表条目带 `goal_id`。
 - 由宿主按 Goal 列表补建（reconcile）：创建 Goal 只写 Goal；`create_session` 拒绝不经宿主创建 Goal Session，`create_sub_session` 拒绝 `goal` 类子 Session。
 - **reopen**（achieved / archived → active）与 **restart**（active / paused，开全新上下文）都在 `epochs[]` 追加新 epoch 并改 `session`；旧 Session 由其状态闸门在下一个提交点结束（restart：以 stopped 结束，`end = restarted`，**不停止 Work**）。宿主在旧 epoch 的 Session 结束且其 Goal State 全部发布后：`end_epoch` 记录结束时间；`prepare_epoch(n)` 把当前 `state.json` 存档到 `epochs/<旧 n>/state.json`，按新 epoch 的 `keep` 写出新的初始 state（`all`：整体保留；`facts`：只保留 `active_works / absorbed / recent_works / usage / goal_revision_seen`，skills 回到 `initial_skills`），再创建新 Session。各步幂等，中途崩溃由下一次 reconcile 补完。
 - reopen 默认 `keep = all`（`fresh_state` → `facts`），restart 默认 `facts`（`carry_state` → `all`）。restart / reopen 不重置周期用量。
@@ -254,28 +259,37 @@ Goal Session 派生的 Work 的 `origin.goal = {goal_id, revision, epoch, activa
 
 ## 10. Runtimes `state/runtimes/<runtime_id>.json`
 
-Agent 的 Session 与 Workspace 能用哪些 Runtime。登记只说明“有这个 Runtime、本宿主现在能不能用、Workspace 建议放在哪”；在其中执行是 `agent_tool::runtime` 的事。schema：`schema/runtime_record.schema.json`。
+Agent 的 Session 与 Workspace 能用哪些 Runtime。记录（版本 4，2026-11-04，[runtime 工作模型 TODO](../../../notepads/opendan-agent-runtime-lifecycle-todo.md) §1）回答四件事：怎么连（`connector`）、机器能做什么（`caps`）、本 Agent 在它上面被允许做什么（`grant`）、Agent 用过它没有（`usage`）；在其中执行是 `agent_tool::runtime` 的事。schema：`schema/runtime_record.schema.json`。
 
 ```json
-{ "version": 3, "runtime_id": "container", "kind": "container | host_native | remote_node | remote_ssh",
-  "name": "Agent container", "description": "…", "runtime_host": "<native_host_id()>",
-  "exec": { "kind": "native" },            // agent_tool RuntimeConfig；null = 未启用 / 还没有执行器
-  "roots": ["<agent_root>/workspaces", "/home/<owner>"],
-  "capabilities": { "network": true, "os": "linux" },
+{ "version": 4, "runtime_id": "private", "name": "Private runtime", "desc": "一句话，给人和模型看",
+  "runtime_host": "<native_host_id()>",
+  "connector": { "type": "native" }
+             | { "type": "node_executor", "node_did": "did:dev:…", "profile_id": "agent-…" }        // 节点
+             | { "type": "node_executor", "executor_id": "<id>", "profile_id": "" }                   // daemon URL 设备（form B），profile 到达时解析
+             | { "type": "ssh", "host": "…", "user": null, "port": null, "identity_file": null },
+  "enabled": true,                           // owner settings 里的开关；关掉的记录保留并说明原因
+  "caps": { "os": "linux | macos | windows", "arch": "x86_64", "shell": "bash | pwsh | …", "desktop": false, "identity_mode": "current_user",
+            "baseline": "standard | extended",                     // 登记者声明（Q5），决定其上 Session 的 cmd_skills
+            "baseline_check": { "checked_at_ms": 0, "missing": [], "ok": true, "error": null },   // 标准工具核验，只作提示
+            "tools_check": { "checked_at_ms": 0, "present": ["ffmpeg"], "missing": [], "error": null } },   // `check --commands` / skill 安装核验过的命令
+  "grant": { "ops": ["exec", "read", "write", "…"],   // 执行器授予的操作，探测前为空（空 = 未知，不据此拒绝）
+             "roots": ["/home/owner"],                // 执行器强制的权限边界（私有为空 = 不限）；Agent 目录按目录约定定位，不记 home
+             "computer": "none | observe | control", "install": "none | agent_bin | system", "workspace": true,
+             "expires_at_ms": null },                 // daemon URL 的期限 / owner 给的期限；到期 → runtime_unavailable
   "availability": "available | runtime_unavailable | permission_denied",
-  "builtin": true, "default": false, "computer": "none | observe | control",
-  "baseline": "standard | extended",       // 登记者声明（Q5）：决定其上 Session 的 cmd_skills
-  "platform": { "os": "linux | macos | windows", "arch": "x86_64", "shell": "bash | pwsh | …" },
-  "baseline_check": { "checked_at_ms": 0, "missing": [], "ok": true, "error": null },  // 只作提示
-  "revision": 1, "registered_by": "…", "registered_at_ms": 0, "updated_at_ms": 0,
-  "checked_at_ms": 0, "last_error": null }
+  "builtin": true, "default": false,          // default = owner 的 default_runtime_id：owner 说“我电脑”指的机器、owner 给的绝对路径在哪解释；不再决定 chat 跑在哪
+  "lifecycle": "active | retired",            // retired：被撤回 / 到期 / unregister，永久保留，不参与候选
+  "usage": { "sessions_total": 0, "last_used_at_ms": null, "last_session_id": null, "workspaces": 0, "skill_commands": [] },
+  "revision": 1, "registered_by": "…", "registered_at_ms": 0, "updated_at_ms": 0, "checked_at_ms": 0, "last_error": null }
 ```
 
-- **内建 = 系统配置的投影**（2026-10-23）：宿主（Loader）启动时及 owner 改动 AgentSettings 后幂等补建 `container`（Agent 进程自己所在的环境，`exec = {kind: native}`）和 `AgentSettings.runtimes` 里的每个 runtime：`host`（owner 的桌面节点，`kind = host_native`）与其它节点（`kind = remote_node`），启用时 `exec = {kind: remote_node, remote_node: {node_did, profile_id: agent-<hash>}}`（profile 由 scheduler 从节点 `owner_agents` 策略派生），关闭时 `exec = null`、`capabilities.enabled = false`。`default` 标记 owner 的 `default_runtime_id`；`computer` 是 owner 给该 runtime 的 ComputerUse。settings 里没有 `host` 时仍补一个 `exec = null` 的占位说明原因。Agent Service 原生运行时（zone owner 的 Agent 默认 runtime 是节点 `host`，node_daemon 以 `OPENDAN_SERVICE_MODE=native` 启动 Loader，见 `doc/app_service/rust_app_loader.md` §9.3.1）没有 Agent 容器：`container` 记录 `exec = null`、`capabilities = {native_service: true}`、不是 `default`，宿主环境不被当作 `exec: native` 的 runtime。补建不覆盖 owner 改过的容器 `name / description / roots`；节点 runtime 的 roots 来自节点 `describe`（profile roots）。内建记录不能取消登记。
-- **基线**（2026-10-25，primary-runtime TODO §2）：`baseline` 是登记者的声明——容器声明 `extended`（aios 镜像：标准工具 + 工具链与媒体工具），节点 runtime 取 owner 在 `AgentSettings.runtimes[id].baseline` 的声明（缺省 `standard`），`register` 的请求自带。`check` 在可用时核验标准工具（清单见 libopendan `baseline.rs` / `xagent runtime baseline`；容器查本进程 PATH 与程序目录，节点经执行器跑 `command -v` / PowerShell `Get-Command`），结果写 `baseline_check`：`missing` 为缺的命令，`error` 为检查本身没能完成的原因。它只是提示，从不改变 `baseline`。Loader 在投影（启动、settings 变化）后台对每个可用 runtime 做一次 check。版本 2 的记录读取失败，内建记录由宿主重写。
-- **可用性**：`observe` 按配置判断——`exec` 为空 → `runtime_unavailable`（未启用 / 无执行器）、`container` 登记在别的宿主上 → `runtime_unavailable`；`container` 带 `native_service` → `runtime_unavailable`（原因：Agent Service 原生运行，没有容器，用 host）；节点 runtime 配置齐全即 `available`。`check` 对节点 runtime 另做真实探测（login + describe），失败写 `last_error`，成功时把节点 roots、os、identity_mode、desktop readiness 写进记录。
-- **写**：`register`（owner 添加，同参数重试幂等，已存在的 id 拒绝）、`update`（CAS `expected_revision`，只改 `name / description / roots`）、`check`、`unregister`（CAS，内建拒绝）；`.locks/runtimes.lock` 互斥。`ensure_builtin` 只给宿主，kRPC 拒绝。
-- **id**：小写字母、数字、`-`、`_`；`local` 保留为 `container` 的旧名，`lookup("local")` 返回 `container`。
-- **使用者**：Workspace 位置的 `runtime_id` 是 `container`（旧记录的 `local`）或一个 `available` 的节点 runtime，目标侧目录操作经该 runtime 的执行器完成（[Agent Workspace Protocol](<Agent Workspace Protocol.md>)）；Session 创建时在 `api::freeze_runtime` 统一选择并冻结 session-runtime（显式 > 继承 > `default`；Workspace 不参与，它的 runtime 可与 session-runtime 不同），`create-worksession --runtime <id>` / Todo 的 `--runtime` 要求已登记且 `available`，否则拒绝。
-- kRPC（宿主 opendan 另有）：`runtimes.settings`（owner 的选择：`runtimes`、`default_runtime_id`）、`runtimes.settings_set {runtime_id, enabled?, computer?, baseline?, default?}`（只改已有条目的启停 / ComputerUse / 声明的基线 / 默认，不新增目标；新增目标是 control-panel `agent.update` / `agent.runtime_directory` 的事）。
-- kRPC：`runtimes.list`、`runtimes.lookup {runtime_id}`；写：`runtimes.register {request}`、`runtimes.update {runtime_id, request}`、`runtimes.check {runtime_id}`、`runtimes.unregister {runtime_id, expected_revision}`（署名为服务端看到的调用方）。
+- **私有 runtime 永远在**（`private`，别名 `container` / `local`，`lookup` 按别名解析）：Agent Service 进程自己的环境——aios 容器，或原生运行（zone owner 的 Agent 在节点 `host` 上、Desktop Lite）时的宿主进程环境。`connector: native`、恒 `available`、`grant` 全部、`workspace = true`、`install = system`；容器声明 `extended`，原生时取 owner 对 `host` 的声明。它一定拥有 `$BUCKYOS_ROOT` 布局（`bin/`、`data/home/<owner>/agents/<agent_id>`、`instance/`、`tools/`），Loader 启动时核验，缺了记为部署错误而不是“不可用”。
+- **内建 = 系统配置的投影**：宿主（Loader）启动时及 owner 改动 AgentSettings 后幂等补建 `private` 与 `AgentSettings.runtimes` 里的每个 runtime：节点（`host` 与其它 `node-*`）为 `connector: node_executor {node_did, profile_id: agent-<hash>}`（profile 由 scheduler 从节点 `owner_agents` 策略派生），daemon URL 设备（`AgentRuntimeTarget::Executor`）为 `connector: node_executor {executor_id, profile_id}`（到达时经 control panel 的在线列表取路由，`expires_at_ms` 来自它）。`enabled` 投影 settings 的开关；`grant.computer` 是 owner 给的 ComputerUse，`grant.install / workspace / roots / expires_at_ms` 来自 `AgentRuntimeSettings.grant`（control panel 算好交集写进 settings，这里只读；缺省 `host` 可建 workspace、其它节点不可）。settings 里没有 `host` 时仍补一个 `enabled = false` 的占位说明原因。补建不覆盖 owner 改过的私有 runtime `name`；节点上学来的 `roots / ops / 平台` 在 connector 不变时保留。内建记录不能取消登记。
+- **caps 与 grant 不合并**：caps 是探出来的事实（`check` 学来；`baseline` 是声明），grant 是人给的授权；范围取交集。`roots` 只是边界：Agent 在节点上的目录是 `<账户 home>/.opendan/<agent_id>`（home 由执行器 `describe` 报告，必须在 roots 内，否则绑定拒绝），私有 runtime 上是 `<owner home>/agents/<agent_id>`。
+- **可用性**：`observe` 按记录判断——`retired` / `enabled = false` / grant 到期 → `runtime_unavailable`（附原因）；私有记录登记在别的宿主 → `runtime_unavailable`，否则 `available`；节点配置齐全即 `available`；ssh → 本 runner 尚不能承载。`check {runtime_id, commands?}` 对节点另做真实探测（login + describe），失败写 `last_error`，成功时把执行器的 roots（owner 未缩窄时）、`ops`、平台、`identity_mode`、desktop 写进记录，再核验标准工具（`caps.baseline_check`）与 `commands`（`caps.tools_check`）。`register` 后立刻 check 一次；Loader 在投影后台对每个可用 runtime 做一次 check。
+- **写**：`register`（owner / 开发添加 ssh 等，`grant.roots` 必填，同参数重试幂等，已存在的 id 拒绝）、`update`（CAS `expected_revision`，只改 `name / desc / roots`）、`check`、`unregister`（CAS，内建拒绝；**语义是 retire**：记录改 `lifecycle: retired` 永久保留）、`note_usage {runtime_id, event}`（`session {session_id}` / `workspace` / `skill_command {name}`，`freeze_runtime` 等处调用）；`.locks/runtimes.lock` 互斥。`ensure_builtin` 只给宿主，kRPC 拒绝。
+- **id**：小写字母、数字、`-`、`_`；`container`、`local` 保留为 `private` 的旧名。列表里私有记录永远在最前。
+- **使用者**：Workspace 位置的 `runtime_id` 是 `private`（旧记录的 `container` / `local`）或一个可用且 `grant.workspace` 的节点 runtime（[Agent Workspace Protocol](<Agent Workspace Protocol.md>)）；Session 创建时 `api::freeze_runtime` 选择并冻结工作 runtime（UI / chat 恒私有；其它：显式 > 继承 > 私有；owner 的 `default` 不参与），`create-worksession --runtime <id>` / Todo 的 `--runtime` 要求已登记、`active`、`enabled`、`available`，只读 grant 不承载会写的 work，否则拒绝不回退。Agent 级原语 `runtime_exec(runtime_id, command, cwd, timeout)` / `runtime_put(runtime_id, local, remote_dir)`（libopendan `runtime/mod.rs`）在 Session 之外对任一可用 runtime 执行命令 / 放文件，记录在 `state/runtime_ops/<op_id>.json`；`agent-session run` 走它。
+- kRPC（宿主 opendan 另有）：`runtimes.settings`（owner 的选择：`runtimes`、`default_runtime_id`）、`runtimes.settings_set {runtime_id, enabled?, computer?, baseline?, default?, grant?}`（只改已有条目，不新增目标；新增目标是 control-panel `agent.update` / `agent.runtime_directory` 的事）。
+- kRPC：`runtimes.list`、`runtimes.lookup {runtime_id}`；写：`runtimes.register {request}`、`runtimes.update {runtime_id, request}`、`runtimes.check {runtime_id, commands?}`、`runtimes.unregister {runtime_id, expected_revision}`、`runtimes.note_usage {runtime_id, event}`（署名为服务端看到的调用方）。

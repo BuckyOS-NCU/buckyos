@@ -102,6 +102,27 @@ impl MessageCenter {
         })
     }
 
+    /// The actor of a request from outside the group's local kRPC surface. The actor is the
+    /// session's subject: a member of another Zone signs in at this Zone's verify-hub
+    /// (跨Zone登录断言契约 §5); no header names it.
+    pub(crate) async fn federated_group_actor(&self, ctx: &RPCContext) -> Result<GroupActor> {
+        let caller = self
+            .caller_identity(ctx)
+            .await?
+            .ok_or_else(|| denied("unauthenticated"))?;
+        let mut actor = self.group_actor(ctx).await?;
+        if actor.did.method == "msgtunnel" {
+            return Err(denied("shadow-endpoint-local-only"));
+        }
+        // An account of this Zone keeps its real client: a restricted session
+        // must not pass `allowed_clients` as an unverified remote.
+        if !(caller.restricted() && !caller.external) {
+            actor.remote = true;
+            actor.client = None;
+        }
+        Ok(actor)
+    }
+
     /// `group.*` kRPC; opened to restricted sessions (Session Only guests),
     /// whom the group and Session ACLs then decide on. A restricted visitor
     /// sees one D-4 reason for a group or Session that is missing or not
@@ -334,16 +355,29 @@ impl MessageCenter {
                     invitations.push(item);
                 }
             }
+            invitations.extend(self.remote_group_invitations(&actor.did).await?);
             let joined = self.joined_groups(&actor.did).await?;
             return Ok(
                 json!({"items":groups,"invitations":invitations,"session_invitations":session_invitations,"joined":joined}),
             );
         }
         let group: DID = field(&p, "group_did")?;
+        if !actor.remote && matches!(method, "group.accept_invitation" | "group.get_doc")
+            && self.groups.load(&group).await?.is_none()
+        {
+            return if method == "group.accept_invitation" {
+                self.accept_remote_group_invitation(&group, &actor, &p, &ctx).await
+            } else {
+                self.remote_group_doc(&actor.did, &group).await
+            };
+        }
         if method == "group.submit_guest_request" {
             self.require_guest_entry_method(&ctx, &group).await?;
         }
         if method == "group.sync_joined" {
+            if let Some(value) = self.sync_remote_group(&actor.did, &group).await? {
+                return Ok(value);
+            }
             let route = self
                 .cyfs_dispatch
                 .read()
@@ -484,7 +518,9 @@ impl MessageCenter {
             }
             _ => {}
         }
-        if let Some(key) = optional::<String>(&p, "idempotency_key")? {
+        if let Some(key) = optional::<String>(&p, "idempotency_key")?
+            .filter(|_| method != "group.accept_invitation")
+        {
             if let Some(saved) = self.groups.load(&group).await?.and_then(|g| {
                 g.operations
                     .get(&format!("{}|{}|{}", actor.did.to_string(), method, key))
@@ -535,6 +571,7 @@ impl MessageCenter {
         }
         let op_key = key
             .as_ref()
+            .filter(|_| method != "group.accept_invitation")
             .map(|key| format!("{}|{}|{}", authenticated_did.to_string(), method, key));
         if let Some(saved) = op_key.as_ref().and_then(|k| tx.state.operations.get(k)) {
             if saved.request != p {
@@ -542,6 +579,7 @@ impl MessageCenter {
             }
             return Ok(saved.result.clone());
         }
+        let shown = crate::buckets::display_files(&tx.state).ok();
         let result = self
             .mutate_group(&mut tx, &actor, method, &p, attestation)
             .await?;
@@ -554,9 +592,17 @@ impl MessageCenter {
                 },
             );
         }
+        let display = crate::buckets::display_files(&tx.state)?;
+        let display_changed = shown.as_ref() != Some(&display);
+        if display_changed {
+            self.bind_display_files(&group, &display).await?;
+        }
         tx.commit().await?;
+        if display_changed {
+            self.unbind_display_files(&group, &display).await;
+        }
         Self::publish_event(
-            format!("/msg_center/group/{}/changed", group.to_string()),
+            buckyos_api::group_changed_event_id(&group),
             json!({"group_did":group}),
         );
         Ok(result)
@@ -667,7 +713,7 @@ impl MessageCenter {
 
     /// A zone Agent takes part in groups only while its `allow_group` setting
     /// is on; other members are not restricted here.
-    async fn require_group_enabled_agent(&self, d: &DID) -> Result<()> {
+    pub(crate) async fn require_group_enabled_agent(&self, d: &DID) -> Result<()> {
         if d.method == "msgtunnel" || !self.is_local_recipient(d) {
             return Ok(());
         }
@@ -885,9 +931,11 @@ impl MessageCenter {
             .execute(&mut *tx.tx)
             .await
             .map_err(db_error)?;
+        self.bind_display_files(&did, &crate::buckets::display_files(&tx.state)?)
+            .await?;
         tx.commit().await?;
         Self::publish_event(
-            format!("/msg_center/group/{}/changed", did.to_string()),
+            buckyos_api::group_changed_event_id(&did),
             json!({"group_did":did}),
         );
         self.register_local_recipients([did]);
@@ -1070,7 +1118,7 @@ impl MessageCenter {
             group.clone(),
             MailboxKind::GroupInbox,
             msg,
-            RecipientState::Unread,
+            Self::inbound_initial_state(msg),
             None,
             vec![format!("session_seq:{session_seq}")],
             "group-inbox",
@@ -1140,7 +1188,7 @@ impl MessageCenter {
                         did.clone(),
                         MailboxKind::Inbox,
                         msg,
-                        RecipientState::Unread,
+                        Self::inbound_initial_state(msg),
                         None,
                         vec![
                             format!("group:{}", group.to_string()),
@@ -1350,6 +1398,9 @@ impl MessageCenter {
             .insert(d.to_string(), r);
         Ok(())
     }
+    /// The group itself telling someone about their place in it: a join request to approve, a
+    /// rejection, a removal, an offered ownership. It comes from the group, whoever acted, so
+    /// only a block of the group itself stops it; `by` names the one who acted.
     async fn notify_group_member(
         &self,
         tx: &mut GroupTransaction<'_>,
@@ -1358,8 +1409,35 @@ impl MessageCenter {
         action: &str,
         data: Value,
     ) -> Result<()> {
-        let msg = MsgObject {
-            from: a.did.clone(),
+        let group = tx.state.group_did.clone();
+        let mut msg = Self::group_notice(tx, &group, d, action, json!({"by":a.did,"data":data}))?;
+        msg.to_session = Some(session_key(&group, None)?);
+        self.deliver_group_notice(tx, &msg, d).await
+    }
+    /// An invitation: a person asks someone who is not in the group yet, so that someone's
+    /// policy towards the person decides.
+    async fn notify_invitee(
+        &self,
+        tx: &mut GroupTransaction<'_>,
+        a: &GroupActor,
+        d: &DID,
+        action: &str,
+        data: Value,
+    ) -> Result<()> {
+        let msg = Self::group_notice(tx, &a.did, d, action, json!({"data":data}))?;
+        self.deliver_group_notice(tx, &msg, d).await
+    }
+    fn group_notice(
+        tx: &GroupTransaction<'_>,
+        from: &DID,
+        d: &DID,
+        action: &str,
+        mut data: Value,
+    ) -> Result<MsgObject> {
+        data["group_did"] = json!(tx.state.group_did);
+        data["action"] = json!(action);
+        Ok(MsgObject {
+            from: from.clone(),
             to: vec![d.clone()],
             kind: MsgObjKind::Operation,
             created_at_ms: Self::now_ms(),
@@ -1368,45 +1446,55 @@ impl MessageCenter {
                 format: Some(MsgContentFormat::TextPlain),
                 content: action.into(),
                 machine: Some(MachineContent {
-                    intent: Some("buckyos.group_invitation".into()),
-                    data: serde_json::from_value(
-                        json!({"group_did":tx.state.group_did,"action":action,"data":data}),
-                    )
-                    .map_err(db_error)?,
+                    intent: Some(GROUP_NOTICE_INTENT.into()),
+                    data: serde_json::from_value(data).map_err(db_error)?,
                 }),
                 ..Default::default()
             },
             ..Default::default()
-        };
-        tx.object(&msg, None).await?;
+        })
+    }
+    async fn deliver_group_notice(
+        &self,
+        tx: &mut GroupTransaction<'_>,
+        msg: &MsgObject,
+        d: &DID,
+    ) -> Result<()> {
+        tx.object(msg, None).await?;
         if self.lacks_personal_inbox(d).await {
             // No personal inbox (Limited): the invitation waits in the group
             // (`group.list_by_member`), nothing is delivered.
             return Ok(());
         }
         if self.is_local_recipient(d) {
+            let from_group = msg.from == tx.state.group_did;
             let access = self
                 .contact_mgr
-                .peek_access_permission(&a.did, None, Some(d))
+                .peek_access_permission(&msg.from, None, Some(d))
                 .await?;
             if access.target_box == "DROP" {
                 return Ok(());
             }
-            let kind = if access.target_box == "REQUEST_BOX" {
+            let kind = if access.target_box == "REQUEST_BOX" && !from_group {
                 MailboxKind::RequestBox
             } else {
                 MailboxKind::Inbox
             };
+            let tags = if from_group {
+                vec![format!("group:{}", msg.from.to_string())]
+            } else {
+                vec![]
+            };
             let record = Self::build_mailbox_record(
                 d.clone(),
                 kind,
-                &msg,
+                msg,
                 RecipientState::Unread,
                 None,
-                vec![],
+                tags,
                 "group-notification",
             )?;
-            tx.mailbox(&record, &msg).await?;
+            tx.mailbox(&record, msg).await?;
         } else {
             let id = msg.gen_obj_id().0;
             let envelope = self
@@ -1506,7 +1594,7 @@ impl MessageCenter {
             if recipient != d {
                 data["member_did"] = json!(d);
             }
-            self.notify_group_member(tx, a, &recipient, "invite", data)
+            self.notify_invitee(tx, a, &recipient, "invite", data)
                 .await?;
         }
         Ok(json!({"invite_id":id,"member_did":d,"expires_at_ms":expires,"state":state}))
@@ -1528,23 +1616,23 @@ impl MessageCenter {
         if !automatic {
             tx.state.check_client(a)?;
         }
-        let prior = tx.state.members.get(&a.did.to_string()).cloned();
-        if prior.as_ref().is_some_and(|m| {
-            matches!(
-                m.state,
-                MemberStatus::Active | MemberStatus::PendingAdminApproval
-            )
-        }) {
-            return Err(invalid("member-already-participating"));
-        }
-        let invite = prior
-            .as_ref()
-            .filter(|m| {
-                m.state == MemberStatus::Invited
-                    && m.expires_at_ms.is_none_or(|t| t > Self::now_ms())
-                    && m.invitation_id.as_deref() == Some(invitation_id)
-            })
+        let invite = tx
+            .state
+            .members
+            .get(&a.did.to_string())
+            .filter(|m| m.invitation_id.as_deref() == Some(invitation_id))
             .ok_or_else(|| denied("invitation-mismatch"))?;
+        match invite.state {
+            MemberStatus::Active | MemberStatus::PendingAdminApproval => return encoded(invite),
+            MemberStatus::Expired => return Err(denied("invitation-expired")),
+            MemberStatus::Revoked => return Err(denied("invitation-revoked")),
+            MemberStatus::Invited => {
+                if invite.expires_at_ms.is_some_and(|t| t <= Self::now_ms()) {
+                    return Err(denied("invitation-expired"));
+                }
+            }
+            _ => return Err(denied("invitation-mismatch")),
+        }
         let approval = !invite
             .invited_by
             .as_ref()
@@ -1554,7 +1642,10 @@ impl MessageCenter {
         if !automatic {
             Self::rate(&mut tx.state, &a.did, "join", false)?;
         }
-        self.join_group(tx, a, role, approval, invited_by).await
+        self.join_group(tx, a, role, approval, invited_by).await?;
+        let accepted = tx.state.members.get_mut(&a.did.to_string()).unwrap();
+        accepted.invitation_id = Some(invitation_id.to_owned());
+        encoded(accepted)
     }
     /// Join by own request or by invite link. Links count as prior admin
     /// approval unless they require it; plain requests follow `join_policy`.
@@ -1973,6 +2064,10 @@ impl MessageCenter {
                 if tx.state.role(&d).is_none() || tx.state.blocked(&d) {
                     return Err(missing());
                 }
+                // The owner's Zone is the host: another Zone's member as owner would move the group.
+                if !self.is_hosted_identity(&d) {
+                    return Err(denied("owner-must-be-in-the-host-zone"));
+                }
                 let transfer = OwnerTransfer {
                     member_did: d.clone(),
                     transfer_id: revision(),
@@ -2018,6 +2113,9 @@ impl MessageCenter {
                     .ok_or_else(|| denied("transfer-mismatch"))?;
                 if tx.state.role(&a.did).is_none() || tx.state.blocked(&a.did) {
                     return Err(missing());
+                }
+                if a.remote || !self.is_hosted_identity(&a.did) {
+                    return Err(denied("owner-must-be-in-the-host-zone"));
                 }
                 tx.state.check_client(a)?;
                 let previous = tx.state.owner.clone();
@@ -2422,7 +2520,7 @@ impl MessageCenter {
                     .insert(d.to_string(), r.clone());
                 self.group_event(tx, a, Some(sid), "session.guest_invited", None, json!([]))
                     .await?;
-                self.notify_group_member(tx,a,&d,"session_invite",json!({"session_id":sid,"profile":tx.state.config()?.profile,"title":tx.state.sessions[sid].shared_state.get("title")})).await?;
+                self.notify_invitee(tx,a,&d,"session_invite",json!({"session_id":sid,"profile":tx.state.config()?.profile,"title":tx.state.sessions[sid].shared_state.get("title")})).await?;
                 encoded(r)
             }
             "group.accept_session_invitation" => {
@@ -3085,7 +3183,8 @@ impl MessageCenter {
             .groups
             .save_cursor(group, &a.did, position, Self::now_ms())
             .await?;
-        Ok(json!({"items":items,"next_token":token,"limited":limited}))
+        let member = g.members.get(&a.did.to_string()).map(|member| json!({"state":member.state,"epoch":member.epoch}));
+        Ok(json!({"items":items,"next_token":token,"limited":limited,"member":member}))
     }
     async fn audit_group_read(
         &self,
@@ -3184,13 +3283,23 @@ impl MessageCenter {
         }
         let group = msg.to[0].clone();
         let id = msg.gen_obj_id().0;
-        // Held before the group transaction locks the database; a rejected
-        // message drops its holds below.
-        self.retain_attachments(&id, &msg).await?;
+        // Bound before the group transaction locks the database; a message
+        // that is not accepted gives its keys up below.
+        let arrival = if a.remote {
+            crate::buckets::Arrival::Remote
+        } else {
+            crate::buckets::Arrival::Local
+        };
+        self.bind_attachments(&id, &msg, arrival).await?;
         let mut tx = self.groups.begin(&group).await?;
         let key = format!("message:{}", id.to_string());
         if let Some(saved) = tx.state.operations.get(&key) {
-            return serde_json::from_value(saved.result.clone()).map_err(db_error);
+            let saved: DispatchResult = serde_json::from_value(saved.result.clone()).map_err(db_error)?;
+            drop(tx);
+            if !saved.ok {
+                self.unbind_attachments(&id, &msg).await;
+            }
+            return Ok(saved);
         }
         let result = self
             .accept_group_message_tx(&mut tx, a, &msg, jwt.as_deref())
@@ -3225,14 +3334,14 @@ impl MessageCenter {
             },
         );
         tx.commit().await?;
-        if result.ok {
-            self.confirm_attachments(&id).await;
-        } else {
-            self.drop_unaccepted_attachments(&id).await;
+        if !result.ok {
+            self.unbind_attachments(&id, &msg).await;
+        } else if a.remote {
+            self.fetch_accepted_attachments(&id, &msg);
         }
         if let Some(group) = &result.delivered_group {
             Self::publish_event(
-                format!("/msg_center/group/{}/changed", group.to_string()),
+                buckyos_api::group_changed_event_id(&group),
                 json!({"group_did":group}),
             );
         }
@@ -3258,7 +3367,7 @@ impl MessageCenter {
             return Err(invalid("message-too-large"));
         }
         if let Some(jwt) = jwt {
-            let signed = crate::cyfs_dispatch::verify_signed_message(jwt)
+            let signed = crate::cyfs_dispatch::verify_signed_message_with(jwt, self)
                 .await
                 .map_err(|(_, reason)| denied(reason))?;
             if signed.msg != *msg {
@@ -3454,40 +3563,6 @@ impl MessageCenter {
 }
 
 impl MessageCenter {
-    pub(crate) async fn authorize_attachment(
-        &self,
-        ctx: &RPCContext,
-        id: &ObjId,
-        context_path: Option<&str>,
-    ) -> Result<()> {
-        if let Some(path) = context_path {
-            let actor = self.group_actor(ctx).await?;
-            return self.authorize_group_attachment(&actor, id, path).await;
-        }
-        let actor = self.group_actor(ctx).await?;
-        use sqlx::Row;
-        let sql = self
-            .msg_box_db
-            .render_sql("SELECT msg_id FROM msg_refs WHERE owner=?");
-        for row in sqlx::query(&sql)
-            .bind(actor.did.to_string())
-            .fetch_all(self.msg_box_db.pool())
-            .await
-            .map_err(db_error)?
-        {
-            let raw: String = row.try_get("msg_id").map_err(db_error)?;
-            let msg_id = ObjId::new(&raw).map_err(db_error)?;
-            if self.authorize_message(ctx, &msg_id).await.is_err() {
-                continue;
-            }
-            if let Ok(message) = self.load_message(&msg_id).await {
-                if Self::message_references(&message, id) {
-                    return Ok(());
-                }
-            }
-        }
-        Err(missing())
-    }
     /// An object of a hosted group Session by its context
     /// (`<session address>/<msg_id>`): the message itself, or an object that
     /// message references. The Session is readable and the message is in the
@@ -3517,6 +3592,41 @@ impl MessageCenter {
             return Err(missing());
         }
         Ok(())
+    }
+    /// The `attachments` key of display file `id` once the caller may read
+    /// the hosted group Session at `session` and its display shows `id`.
+    pub(crate) async fn authorize_display_file(
+        &self,
+        actor: &GroupActor,
+        id: &ObjId,
+        session: &str,
+    ) -> Result<String> {
+        let address = MailboxAddress::try_from(session.to_string()).map_err(|_| missing())?;
+        let g = self
+            .groups
+            .load(address.owner())
+            .await?
+            .filter(|g| g.lifecycle != "deleted")
+            .ok_or_else(missing)?;
+        g.check_client(actor)?;
+        let sid = address.session_id();
+        g.require_session(actor, sid, true)?;
+        if !self
+            .run_group_hooks(&g, actor, sid, "read", true, None)
+            .await
+            .unwrap_or(false)
+        {
+            return Err(missing());
+        }
+        let shown = g.rules(sid)?.display.over(&g.config()?.display).files;
+        if !shown.iter().any(|f| &f.obj_id == id) {
+            return Err(missing());
+        }
+        Ok(format!(
+            "{}{}",
+            crate::buckets::display_prefix(&g.group_did)?,
+            id.to_string()
+        ))
     }
     pub(crate) async fn authorize_group_attachment(
         &self,

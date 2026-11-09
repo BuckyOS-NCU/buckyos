@@ -10,7 +10,7 @@ use crate::acl::{
     compute_permission, summarize_task, trim_task, Principal, TaskPermission,
     SYSTEM_ROLE_ZONE_TRUSTED,
 };
-use crate::json_schema::validate_json_schema;
+use buckyos_api::validate_json_schema;
 use crate::task_store::{now_ms, CreateTaskArgs, MutationOutcome, TaskStore};
 use ::kRPC::*;
 use async_trait::async_trait;
@@ -2460,7 +2460,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                     name: "run tree".into(),
                     schema_id: WORKFLOW_RUN_TREE_TASK_SCHEMA_ID.to_string(),
                     schema_version: None,
-                    input: json!({"request": {"run_id": "r1"}}),
+                    input: json!({"request": {"workflow_id": "w1"}}),
                     executor: CreateTaskExecutor::SelfApp {
                         app_instance_id: None,
                     },
@@ -3613,7 +3613,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
     /// The Task Center runs as `control-panel`, so every relation in the
     /// preset — all keyed on the exact `{user_id, app_id}` — misses tasks the
-    /// user's own agent created. RBAC's `obj://task/{user}` is what closes it.
+    /// user's own agent created. RBAC's `obj://taskmgr/users/{user}` is what closes it.
     #[tokio::test(flavor = "current_thread")]
     async fn control_panel_sees_tasks_created_by_the_users_own_agent() {
         let _guard = ENFORCER_LOCK.get_or_init(Default::default).lock().await;

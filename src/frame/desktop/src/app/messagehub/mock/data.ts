@@ -4,11 +4,8 @@ import type {
   EntityDetail,
 } from '../types'
 import { InMemoryConversationMessageReader } from '../conversation/history/data-source'
-import type {
-  MessageDeliveryStatus,
-  MessageObject,
-  MsgContent,
-} from '../protocol/msgobj'
+import type { ndn } from 'buckyos'
+import type { MessageDeliveryStatus, MessageObject } from '../protocol/msgobj'
 
 /* ── Entities ── */
 
@@ -424,6 +421,14 @@ const seedSessions: Record<string, Pick<Session, 'id' | 'entityId' | 'title' | '
       lastActiveAt: Date.now() - 3 * 3600_000,
       unreadCount: 0,
     },
+    {
+      id: 'session-coder-work',
+      entityId: 'agent-coder',
+      title: 'Work Sessions',
+      type: 'chat',
+      lastActiveAt: Date.now() - 2 * 60_000,
+      unreadCount: 0,
+    },
   ],
   'person-alice': [
     {
@@ -617,6 +622,12 @@ export const MOCK_AGENT_TASKS = {
   answered: 'task-turn-notes',
   /** Only ever carried by an edit, so it must never be read. */
   hijack: 'task-turn-hijack',
+  /** UI Turns of `session-coder-work` that created work sessions (`mock/worksessions.ts`). */
+  workSimple: 'task-turn-work-builds',
+  workPlan: 'task-turn-work-docs',
+  workDone: 'task-turn-work-notes',
+  /** Still analysing the request: no sub-task, no work session yet. */
+  workAnalyze: 'task-turn-work-deploy',
 } as const
 
 /**
@@ -626,8 +637,8 @@ export const MOCK_AGENT_TASKS = {
  */
 function agentTaskSeeds(sessionId: string): MessageObject[] {
   const you = (id: string, content: string, minutesAgo: number) => createChatMessage({ id, from: participantDids.you, to: [participantDids.codeAssistant], senderName: 'You', content, createdAtMs: Date.now() - minutesAgo * 60_000, deliveryStatus: 'read', sessionId })
-  const agent = (id: string, content: MsgContent, minutesAgo: number, extra: Partial<MessageObject>): MessageObject => ({ ...createChatMessage({ id, from: participantDids.codeAssistant, to: [participantDids.you], senderName: 'CodeAssistant', content: content.content ?? '', createdAtMs: Date.now() - minutesAgo * 60_000, sessionId, contentOverride: content }), ...extra })
-  const placeholder: MsgContent = { format: 'text/plain', content: 'Got it, working on it…' }
+  const agent = (id: string, content: ndn.MsgContent, minutesAgo: number, extra: Partial<MessageObject>): MessageObject => ({ ...createChatMessage({ id, from: participantDids.codeAssistant, to: [participantDids.you], senderName: 'CodeAssistant', content: content.content ?? '', createdAtMs: Date.now() - minutesAgo * 60_000, sessionId, contentOverride: content }), ...extra })
+  const placeholder: ndn.MsgContent = { format: 'text/plain', content: 'Got it, working on it…' }
   return [
     you('msg-ct-1', 'Summarize yesterday\'s build failures.', 50),
     agent('msg-ct-2', placeholder, 49, { agent_task: { task_id: MOCK_AGENT_TASKS.done } }),
@@ -649,6 +660,26 @@ function agentTaskSeeds(sessionId: string): MessageObject[] {
 }
 
 /**
+ * Agent Turns that created work sessions: the bubble shows their cards
+ * (`mock/worksessions.ts`) instead of the Turn's task area. The last Turn is
+ * still analysing the request and keeps the task area.
+ */
+function agentWorkSeeds(sessionId: string): MessageObject[] {
+  const you = (id: string, content: string, minutesAgo: number) => createChatMessage({ id, from: participantDids.you, to: [participantDids.codeAssistant], senderName: 'You', content, createdAtMs: Date.now() - minutesAgo * 60_000, deliveryStatus: 'read', sessionId })
+  const agent = (id: string, content: string, minutesAgo: number, taskId: string): MessageObject => ({ ...createChatMessage({ id, from: participantDids.codeAssistant, to: [participantDids.you], senderName: 'CodeAssistant', content, createdAtMs: Date.now() - minutesAgo * 60_000, sessionId }), agent_task: { task_id: taskId } })
+  return [
+    you('msg-cw-1', 'Audit the 2.3 release notes section by section.', 71),
+    agent('msg-cw-2', 'I planned the audit as one Todo per section.', 70, MOCK_AGENT_TASKS.workDone),
+    you('msg-cw-3', 'Rewrite the llm_context design doc against the current source.', 7),
+    agent('msg-cw-4', 'I made a plan for the rewrite; the Todos run one after another.', 6.4, MOCK_AGENT_TASKS.workPlan),
+    you('msg-cw-5', 'Run both slow builds in parallel and tell me when they finish.', 4.5),
+    agent('msg-cw-6', 'I started a work session for the two builds.', 4.3, MOCK_AGENT_TASKS.workSimple),
+    you('msg-cw-7', 'Clean up the deploy scripts.', 1),
+    agent('msg-cw-8', 'Got it, working on it…', 1, MOCK_AGENT_TASKS.workAnalyze),
+  ]
+}
+
+/**
  * An Agent Turn that asks the user (`agent_ask`): each question is a
  * `thread` reply to the Turn's placeholder, and so is each answer. The
  * questions and answers fold under the placeholder; the final edit replies.
@@ -656,8 +687,8 @@ function agentTaskSeeds(sessionId: string): MessageObject[] {
 function agentAskSeeds(sessionId: string, done: boolean): MessageObject[] {
   const minutes = (value: number) => Date.now() - value * 60_000
   const you = (id: string, content: string, at: number, extra: Partial<MessageObject> = {}): MessageObject => ({ ...createChatMessage({ id, from: participantDids.you, to: [participantDids.codeAssistant], senderName: 'You', content, createdAtMs: at, deliveryStatus: 'read', sessionId }), ...extra })
-  const agent = (id: string, content: MsgContent, at: number, extra: Partial<MessageObject> = {}): MessageObject => ({ ...createChatMessage({ id, from: participantDids.codeAssistant, to: [participantDids.you], senderName: 'CodeAssistant', content: content.content ?? '', createdAtMs: at, sessionId, contentOverride: content }), ...extra })
-  const text = (content: string): MsgContent => ({ format: 'text/plain', content })
+  const agent = (id: string, content: ndn.MsgContent, at: number, extra: Partial<MessageObject> = {}): MessageObject => ({ ...createChatMessage({ id, from: participantDids.codeAssistant, to: [participantDids.you], senderName: 'CodeAssistant', content: content.content ?? '', createdAtMs: at, sessionId, contentOverride: content }), ...extra })
+  const text = (content: string): ndn.MsgContent => ({ format: 'text/plain', content })
   const placeholder = text('Got it, working on it…')
   if (!done) {
     const anchor = 'msg-qa-2'
@@ -689,6 +720,7 @@ export const mockMessageSeeds: Record<string, readonly MessageObject[]> = {
   'session-coder-task': agentTaskSeeds('session-coder-task'),
   'session-coder-ask': agentAskSeeds('session-coder-ask', false),
   'session-coder-qa': agentAskSeeds('session-coder-qa', true),
+  'session-coder-work': agentWorkSeeds('session-coder-work'),
   'session-coder-1': [
     createChatMessage({
       id: 'msg-c1-1',
@@ -996,7 +1028,7 @@ function createChatMessage({
   deliveryStatus?: MessageDeliveryStatus
   kind?: 'chat' | 'group_msg'
   sessionId: string
-  contentOverride?: MsgContent
+  contentOverride?: ndn.MsgContent
 }): MessageObject {
   return {
     from,

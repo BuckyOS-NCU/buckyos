@@ -1,5 +1,5 @@
 //! Process level acceptance of the `xagent` executable (xAgent §8, §10):
-//! exit codes, one JSON document on stdout, state on disk. The LLM is an
+//! exit codes, readable lists or JSON on stdout, state on disk. The LLM is an
 //! OpenAI compatible mock served by the test.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -102,6 +102,11 @@ fn say(text: &str) -> Result<Value, u16> {
     Ok(json!({ "role": "assistant", "content": text }))
 }
 
+/// The final report that ends a work session.
+fn end_report(id: &str, report: &str) -> Result<Value, u16> {
+    call_report(id, json!({ "report": report, "is_end": true }))
+}
+
 fn call_shell(id: &str, command: &str) -> Result<Value, u16> {
     Ok(json!({ "role": "assistant", "content": null, "tool_calls": [{
         "id": id, "type": "function",
@@ -186,6 +191,12 @@ impl Cli {
         parse(out)
     }
 
+    fn text(&self, args: &[&str]) -> String {
+        let out = self.command(args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
     fn sessions(&self) -> String {
         self.root.join("sessions").display().to_string()
     }
@@ -229,7 +240,7 @@ fn new_no_run_then_run_a_work_session_without_a_queue() {
         // G3: a session is not worded as a one-shot task.
         assert!(system_of(req).contains("You are running inside an Agent Session"));
         assert!(!system_of(req).contains("one-shot task runner"));
-        say("milk")
+        end_report("r1", "milk")
     });
     let lc = llm.llm_context(json!({}));
     let sd = cli.create(&["--objective", "summarize the note", "--llm-context", &lc, "--msg", "the note: buy milk"]);
@@ -308,7 +319,7 @@ fn ui_session_waits_for_input_and_control_is_separate() {
     // Nothing to do yet: no Turn is made up.
     let (code, v, _) = cli.run(&["run", &sid, "--poll-ms", "50"]);
     assert_eq!((code, v["kind"].as_str()), (3, Some("turn_open")), "{v}");
-    assert_eq!(v["waiting_for"]["kind"], "input", "the bootstrap Turn waits for input: {v}");
+    assert_eq!(v["needs_input"], true, "the bootstrap Turn waits for input: {v}");
 
     let (code, v, err) = cli.run(&["run", &sid, "--msg", "pick a color for me", "--poll-ms", "50"]);
     assert_eq!((code, v["kind"].as_str()), (3, Some("turn_open")), "{v} {err}");
@@ -366,25 +377,36 @@ fn ui_session_waits_for_input_and_control_is_separate() {
 }
 
 /// E21 / E5: a sub session created by the layer ② tool through `shell`
-/// (`agent-session create-worksession --wait`). The parent run is suspended
-/// on `session:<sid>`, the same process drives the child, and its end is
-/// the call's tool result.
+/// (`agent-session create-worksession`; there is no `--wait`). A session is
+/// followed outside the loop: the reply closes the parent's Turn and keeps
+/// the run, the same process drives the child, and its end opens the kept
+/// run's next Turn.
 #[test]
-fn a_sub_session_is_created_and_waited_for_through_the_shell_tool() {
+fn a_sub_session_is_created_and_followed_through_the_shell_tool() {
     let cli = Cli::new();
     let llm = MockLlm::start(|req, _| {
         if system_of(req).contains("compute the answer") {
-            return say("forty-two");
+            return end_report("c1", "forty-two");
         }
-        match tool_result(req, "w1") {
-            Some(r) => {
-                assert!(r.contains("forty-two"), "{r}");
-                say("the child said forty-two")
-            }
-            None => call_shell(
-                "w1",
-                "agent-session create-worksession --objective 'compute the answer' --msg 'be brief' --wait",
+        if last_user(req).contains("forty-two") {
+            return end_report("p1", "the child said forty-two");
+        }
+        match (tool_result(req, "w0"), tool_result(req, "w1")) {
+            (None, _) => call_shell(
+                "w0",
+                "agent-session create-worksession --title 'The answer' --objective 'compute the answer' --msg 'be brief' --wait",
             ),
+            (Some(r), None) => {
+                assert!(r.contains("there is no --wait") && r.contains("comes back to you as input"), "{r}");
+                call_shell(
+                    "w1",
+                    "agent-session create-worksession --title 'The answer' --objective 'compute the answer' --msg 'be brief'",
+                )
+            }
+            (_, Some(r)) => {
+                assert!(r.contains("\"status\": \"created\""), "{r}");
+                say("waiting for the child")
+            }
         }
     });
     let lc = llm.llm_context(json!({}));
@@ -395,31 +417,51 @@ fn a_sub_session_is_created_and_waited_for_through_the_shell_tool() {
     ]);
     assert_eq!(code, 0, "{v}\n{err}");
     assert_eq!(v["kind"], "turn_closed");
-    assert_eq!(v["answer"], "the child said forty-two");
+    assert_eq!(v["answer"], "waiting for the child");
     assert!(v.get("children").is_none(), "{v}");
     let sd = SessionDir::open(v["path"].as_str().unwrap()).unwrap();
-    assert!(sd.runtime_bin_dir().join("agent-session").is_file());
+    // The child's end opens the parent's next Turn.
+    let (code, v, err) = cli.run(&["run", sd.sid(), "--poll-ms", "50"]);
+    assert_eq!(code, 0, "{v}\n{err}");
+    assert_eq!((v["kind"].as_str(), v["turn"].as_u64()), (Some("turn_closed"), Some(2)), "{v}");
+    assert_eq!(v["answer"], "the child said forty-two");
+    assert!(sd
+        .runtime_bin_dir()
+        .join(libopendan::runtime::bin_overlay::entry_name("agent-session"))
+        .is_file());
 
-    let (code, list, _) = cli.run(&["sessions", "--children", "--of", sd.sid()]);
+    let (code, list, _) = cli.run(&["sessions", "--json", "--children", "--of", sd.sid()]);
     assert_eq!(code, 0);
     let children = list.as_array().unwrap();
     assert_eq!(children.len(), 1, "{list}");
     assert_eq!(children[0]["run_state"], "finished");
     let child = children[0]["session_id"].as_str().unwrap();
+    assert_eq!(children[0]["parent"], sd.sid());
+    assert!(children[0].get("needs_input").is_some());
+    assert!(children[0].get("pending_decision").is_some());
+    let text = cli.text(&["sessions", "--children", "--of", sd.sid()]);
+    assert!(text.starts_with("Sessions (1):\n"), "{text}");
+    assert!(text.contains(child) && text.contains("finished") && text.contains("compute the answer"), "{text}");
+    let text = cli.text(&["sessions", "--children", "--active", "--of", sd.sid()]);
+    assert!(text.starts_with("Sessions (0):\n") && text.contains("(none)"), "{text}");
+    let (code, active, err) = cli.run(&["sessions", "--json", "--active", "--children", "--of", sd.sid()]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(active, json!([]));
     let (_, st, _) = cli.run(&["status", child, "--report"]);
+    assert_eq!(st["entry"]["title"], "The answer");
     let origin = &st["entry"]["origin"];
     assert_eq!(origin["parent_session"], sd.sid());
     assert_eq!(origin["report"], "final");
     assert!(origin["created_by_call"].as_str().unwrap().ends_with("/w1"), "{origin}");
     assert!(st["report"].as_str().unwrap().contains("forty-two"));
-    // One call, one result, no event for the same end.
+    // One call, one result; the end came as one input event.
     let results: Vec<_> = worklog(&sd)
         .into_iter()
         .filter(|e| matches!(&e.body, WorklogBody::ActionResult { call_id, .. } if call_id == "w1"))
         .collect();
     assert_eq!(results.len(), 1);
     assert!(sd.state().unwrap().is_finished());
-    assert_eq!(llm.count(), 3);
+    assert_eq!(llm.count(), 5);
 }
 
 /// E1: a run stopped by xagent is finished by xllm from the run directory
@@ -487,11 +529,19 @@ fn xllm_takes_over_the_live_run_and_xagent_commits_its_end() {
     );
     assert!(sd.state().unwrap().live_run.is_some(), "the session has not committed it yet");
 
+    // A work session ends only with an explicit final report, which a run
+    // taken over by xllm cannot submit: its plain end fails the session —
+    // committed once, like any end.
     let (code, v, err) = cli.run(&["run", &sid, "--poll-ms", "50"]);
-    assert_eq!(code, 0, "{v} {err}");
-    assert_eq!((v["kind"].as_str(), v["answer"].as_str()), (Some("turn_closed"), Some("taken over")));
+    assert_eq!(code, 1, "{v} {err}");
+    assert_eq!(
+        (v["kind"].as_str(), v["status"].as_str(), v["answer"].as_str()),
+        (Some("turn_closed"), Some("failed"), Some("taken over")),
+        "{v}"
+    );
     let st = sd.state().unwrap();
-    assert_eq!((st.turn_seq, st.turns_completed), (1, 1));
+    assert_eq!(st.last_error.as_ref().unwrap()["kind"], "missing_end_report");
+    assert_eq!((st.turn_seq, st.turns_completed), (1, 0));
     let wl = worklog(&sd);
     assert_eq!(wl.iter().filter(|e| e.body.kind() == "turn_started").count(), 1);
     assert_eq!(wl.iter().filter(|e| e.body.kind() == "turn_ended").count(), 1);
@@ -599,17 +649,27 @@ fn workspace_commands_preserve_identity_and_create_fixed_session_bindings() {
     let (code, retry, err) = cli.run(&args);
     assert_eq!(code, 0, "{err}");
     assert_eq!(retry["workspace_id"], id);
+    let text = cli.text(&["workspace", "list", "--active", "--text", "Project", "--runtime", "container"]);
+    assert!(text.starts_with("Workspaces (1):\n"), "{text}");
+    assert!(text.contains(id) && text.contains("Project") && text.contains(path), "{text}");
+    let (code, listed, err) = cli.run(&[
+        "workspace", "list", "--json", "--active", "--text", "Project", "--runtime", "container",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(listed, json!([created]));
+    let text = cli.text(&["workspace", "list", "--text", "unmatched-name"]);
+    assert!(text.starts_with("Workspaces (0):\n") && text.contains("(none)"), "{text}");
     let sd = cli.create(&["--objective", "work in project", "--workspace", id]);
     let cfg = sd.config().unwrap();
     assert_eq!(cfg.workspace.as_ref().unwrap().workspace_id, id);
     assert_eq!(
         cfg.workspace_binding.as_ref().unwrap().location.directory,
-        directory
+        std::fs::canonicalize(&directory).unwrap()
     );
     std::fs::write(directory.join("result.txt"), "retained").unwrap();
     let (code, _, err) = cli.run(&["workspace", "set-runtime", "local", "unavailable"]);
     assert_eq!(code, 0, "{err}");
-    let (code, listed, err) = cli.run(&["workspace", "list"]);
+    let (code, listed, err) = cli.run(&["workspace", "list", "--json"]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(listed.as_array().unwrap().len(), 1);
     assert_eq!(listed[0]["availability"], "runtime_unavailable");
@@ -621,6 +681,41 @@ fn workspace_commands_preserve_identity_and_create_fixed_session_bindings() {
         std::fs::read_to_string(directory.join("result.txt")).unwrap(),
         "retained"
     );
+}
+
+#[test]
+fn run_keeps_the_words_of_a_command_apart() {
+    use libopendan::state::{AgentStateClient, FsAgentStateClient};
+    let cli = Cli::new();
+    let state = FsAgentStateClient::open(cli.root.join("agent_root"), AGENT, None, None).unwrap();
+    let builtin = builtin_runtimes(&Default::default(), AGENT, &PrivateRuntimeInfo::default());
+    tokio::runtime::Runtime::new().unwrap().block_on(state.runtimes().ensure_builtin(&builtin, WHO)).unwrap();
+    let directory = cli.root.join("project");
+    let (code, created, err) = cli.run(&[
+        "workspace", "create", "--directory", directory.to_str().unwrap(), "--name", "Project", "--key", "project-1",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let sd = cli.create(&["--objective", "work in project", "--workspace", created["workspace_id"].as_str().unwrap()]);
+    let run = |words: &[&str]| {
+        let mut args = vec!["run", "--runtime", "workspace", "--"];
+        args.extend_from_slice(words);
+        parse(cli.command(&args).env("OPENDAN_SESSION_ID", sd.sid()).output().unwrap())
+    };
+
+    // Several words are a command and its arguments.
+    let (code, op, err) = run(&["sh", "-c", "printf '[%s]' \"$0\"; echo second", "it's a $word"]);
+    assert_eq!(code, 0, "{op} {err}");
+    assert_eq!(op["stdout"], "[it's a $word]second\n");
+    let (_, op, _) = run(&["printf", "[%s]", "a b", ""]);
+    assert_eq!(op["stdout"], "[a b][]");
+
+    // One word is a command line of that shell.
+    let (code, op, err) = run(&["echo first | tr a-z A-Z; echo second"]);
+    assert_eq!(code, 0, "{op} {err}");
+    assert_eq!(op["stdout"], "FIRST\nsecond\n");
+
+    let (code, _, err) = run(&[" "]);
+    assert_eq!(code, 2, "{err}");
 }
 
 #[test]
@@ -647,14 +742,164 @@ fn workspace_import_and_unregister_never_delete_project_files() {
     assert_ne!(code, 0);
     let (code, _, err) = cli.run(&["workspace", "unregister", id, "--expected-revision", &rev]);
     assert_eq!(code, 0, "{err}");
-    let (code, list, err) = cli.run(&["workspace", "list"]);
+    let (code, list, err) = cli.run(&["workspace", "list", "--json"]);
     assert_eq!(code, 0, "{err}");
     assert!(list.as_array().unwrap().is_empty());
+    let text = cli.text(&["workspace", "list"]);
+    assert!(text.starts_with("Workspaces (0):\n") && text.contains("(none)"), "{text}");
     assert!(directory.join(WORKSPACE_METADATA_FILE).is_file());
     assert_eq!(
         std::fs::read_to_string(directory.join("README.md")).unwrap(),
         "user content"
     );
+}
+
+#[test]
+fn runtime_lists_are_readable_and_json_preserves_records_and_filters() {
+    let cli = Cli::new();
+    for (args, title) in [
+        (vec!["workspace", "list"], "Workspaces"),
+        (vec!["runtime", "list"], "Runtimes"),
+        (vec!["sessions"], "Sessions"),
+    ] {
+        let text = cli.text(&args);
+        assert!(text.starts_with(&format!("{title} (0):\n")) && text.contains("(none)"), "{text}");
+        let mut json_args = args;
+        json_args.push("--json");
+        let (code, list, err) = cli.run(&json_args);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(list, json!([]));
+    }
+
+    // The private runtime is the host's projection, never registered by hand;
+    // a registration needs a connector and at least one granted root.
+    let (code, _, err) = cli.run(&["runtime", "register", "local-box", "--kind", "container", "--name", "Local box"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("--connector"), "{err}");
+    let (code, _, err) = cli.run(&["runtime", "register", "remote-box", "--connector", "ssh", "--host", "studio", "--name", "Remote box"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("root"), "{err}");
+    let (code, remote, err) = cli.run(&[
+        "runtime", "register", "remote-box", "--connector", "ssh", "--host", "studio", "--user", "owner",
+        "--name", "Remote box", "--desc", "the studio workstation", "--root", "/srv/studio", "--baseline", "extended",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(remote["connector"]["type"], "ssh");
+    assert_eq!(remote["grant"]["roots"], json!(["/srv/studio"]));
+    assert_eq!(remote["caps"]["baseline"], "extended");
+    assert_eq!(remote["lifecycle"], "active");
+    let text = cli.text(&["runtime", "list"]);
+    assert!(text.starts_with("Runtimes (1):\n"), "{text}");
+    assert!(text.contains("remote-box: Remote box") && text.contains("ssh") && text.contains("/srv/studio"), "{text}");
+    assert!(text.contains("extended") && text.contains("runtime_unavailable") && text.contains("the studio workstation"), "{text}");
+    let (code, all, err) = cli.run(&["runtime", "list", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(all, json!([remote]));
+
+    // An ssh runtime cannot host sessions yet: nothing is available.
+    let text = cli.text(&["runtime", "list", "--available"]);
+    assert!(text.starts_with("Runtimes (0):\n") && text.contains("(none)"), "{text}");
+    let (code, available, err) = cli.run(&["runtime", "list", "--json", "--available"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(available, json!([]));
+
+    // Unregistering retires the record: it stays, listed with its history.
+    let revision = remote["revision"].to_string();
+    let (code, retired, err) = cli.run(&["runtime", "unregister", "remote-box", "--expected-revision", &revision]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(retired["lifecycle"], "retired");
+    let text = cli.text(&["runtime", "list"]);
+    assert!(text.starts_with("Runtimes (1):\n") && text.contains("retired"), "{text}");
+    let (code, available, err) = cli.run(&["runtime", "list", "--json", "--available"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(available, json!([]));
+}
+
+/// `runtime baseline`: what a level lists, and what a check says of this
+/// machine: where each command is, who provides it, and exit 1 when the level
+/// is not met.
+#[cfg(unix)]
+#[test]
+fn runtime_baseline_checks_a_level_against_this_machine() {
+    use std::os::unix::fs::PermissionsExt;
+    let cli = Cli::new();
+    let (code, listed, err) = cli.run(&["runtime", "baseline", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(listed.as_array().unwrap().iter().any(|t| t["name"] == "xagent"));
+    let (code, listed, err) = cli.run(&["runtime", "baseline", "--json", "--level", "extended"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(listed["standard"].as_array().unwrap().iter().any(|t| t["name"] == "xagent"));
+    assert!(listed["extended"].as_array().unwrap().iter().any(|t| t["id"] == "imagemagick" && t["commands"][0]["name"] == "magick"));
+    assert!(cli.text(&["runtime", "baseline", "--level", "extended"]).contains("ffmpeg"));
+    assert!(!cli.text(&["runtime", "baseline"]).contains("ffmpeg"));
+    let (code, _, err) = cli.run(&["runtime", "baseline", "--level", "huge"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("--level"), "{err}");
+
+    let root = cli.root.join("buckyos");
+    let entries = root.join("bin/agent-tools");
+    let tools_bin = root.join("tools/bin");
+    let system = cli.root.join("system");
+    let tool = |dir: &Path, name: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let standard = cli.run(&["runtime", "baseline", "--json"]).1;
+    for t in standard.as_array().unwrap() {
+        tool(&entries, t["name"].as_str().unwrap());
+    }
+    tool(&tools_bin, "ffmpeg");
+    let extended = cli.run(&["runtime", "baseline", "--json", "--level", "extended"]).1;
+    for t in extended["extended"].as_array().unwrap() {
+        for c in t["commands"].as_array().unwrap() {
+            if !["ffmpeg", "pandoc"].contains(&c["name"].as_str().unwrap()) {
+                tool(&system, c["name"].as_str().unwrap());
+            }
+        }
+    }
+    let path = std::env::join_paths([&tools_bin, &entries, &system]).unwrap();
+    let check = |level: &str| {
+        let out = cli
+            .command(&["runtime", "baseline", "--check", "--level", level])
+            .env("PATH", &path)
+            .env("BUCKYOS_ROOT", &root)
+            .output()
+            .unwrap();
+        parse(out)
+    };
+
+    let (code, report, _) = check("standard");
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(report["baseline"], "standard");
+    assert_eq!(report["resolved"]["xagent"]["provided_by"], "buckyos_root");
+    assert_eq!(report["resolved"]["ffmpeg"]["provided_by"], "exttools");
+    assert_eq!(report["resolved"]["python3"]["provided_by"], "system");
+    assert_eq!(report["ext"]["status"], "partial");
+
+    let (code, report, _) = check("extended");
+    assert_eq!(code, 1, "pandoc is missing: {report}");
+    assert_eq!(report["missing"], json!(["pandoc"]));
+    assert_eq!(report["ok"], false);
+
+    tool(&system, "pandoc");
+    let (code, report, _) = check("extended");
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(report["ext"]["status"], "system", "the machine provides them: still extended");
+
+    // The user's `xagent` is on PATH and the installed entry is gone.
+    std::fs::remove_file(entries.join("xagent")).unwrap();
+    tool(&system, "xagent");
+    let (code, report, _) = check("standard");
+    assert_eq!(code, 1, "{report}");
+    assert_eq!(report["unmanaged"], json!(["xagent"]));
+    assert_eq!(report["resolved"]["xagent"]["provided_by"], "system");
+
+    // A development build's helpers beside the program serve, and say so.
+    std::fs::remove_file(system.join("xagent")).unwrap();
+    let (code, report, _) = check("standard");
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(report["resolved"]["xagent"]["provided_by"], "dev");
 }
 
 fn call_report(id: &str, args: Value) -> Result<Value, u16> {
@@ -754,42 +999,6 @@ fn goals_from_the_command_line() {
 
 /// `ask-user` prints the pending result the `shell` tool forwards; it only
 /// runs as a call of a session's run and checks its options.
-#[test]
-fn ask_user_prints_a_pending_question() {
-    let cli = Cli::new();
-    let ask = |args: &[&str], env: bool| {
-        let mut c = cli.command(&[&["ask-user"], args].concat());
-        if env {
-            c.env("OPENDAN_SESSION_ID", "ui-1").env(agent_tool::llm_bash::ENV_CALL_ID, "c9");
-        }
-        parse(c.output().unwrap())
-    };
-    let (code, _, err) = ask(&["which one?"], false);
-    assert_eq!(code, 2, "{err}");
-    let (code, v, err) = ask(&["which one?", "--option", "a=docs/", "--option", "b=everything", "--allow-text"], true);
-    assert_eq!(code, 0, "{err}");
-    assert_eq!(v["status"], "pending");
-    assert_eq!(v["task_id"], "userinput:c9");
-    assert_eq!(v["tool"], "ask-user");
-    let request: UserInputRequest = serde_json::from_value(v["detail"].clone()).unwrap();
-    assert_eq!(request.question, "which one?");
-    assert_eq!(request.input.kind, UserInputKind::Choice);
-    assert_eq!(request.input.options[1].label, "everything");
-    assert!(request.input.allow_text);
-    let (code, v, _) = ask(&["free text?"], true);
-    assert_eq!((code, v["detail"]["input"]["kind"].as_str()), (0, Some("text")));
-    for bad in [
-        vec!["q", "--option", "a=only one"],
-        vec!["q", "--option", "a=x", "--option", "a=y"],
-        vec!["q", "--option", "no-label"],
-        vec!["q", "--allow-text"],
-        vec!["  "],
-    ] {
-        let (code, _, err) = ask(&bad, true);
-        assert_eq!(code, 2, "{bad:?}: {err}");
-    }
-}
-
 /// A skill PIKG as `buckyos pikg pack` writes it: APPDOC.json (app_type
 /// `agent_skills`), PACKAGE_META.json and the `agent_skills.tar.gz` payload.
 fn skill_pikg(path: &Path, files: &[(&str, &str, u32)]) {
@@ -881,7 +1090,7 @@ fn skills_are_installed_listed_chosen_and_removed() {
 
     let parent = cli.create(&["--objective", "parent work"]);
     let create = |extra: &[&str]| {
-        let mut args = vec!["create-worksession", "--objective", "child", "--report", "none"];
+        let mut args = vec!["create-worksession", "--title", "child", "--objective", "child", "--report", "none"];
         args.extend_from_slice(extra);
         let out = cli.command(&args).env("OPENDAN_SESSION_ID", parent.sid()).output().unwrap();
         parse(out)
@@ -910,4 +1119,81 @@ fn skills_are_installed_listed_chosen_and_removed() {
     std::fs::write(cli.root.join("bad.pikg"), "not a zip").unwrap();
     let (code, _, err) = cli.run(&["skill", "install", cli.root.join("bad.pikg").to_str().unwrap()]);
     assert_eq!(code, 2, "{err}");
+}
+
+/// `create-worksession --title` is required like `--objective`, and kept
+/// on one line within 60 chars (TODO messagehub-worksession-ui §3.7).
+#[test]
+fn create_worksession_requires_a_title_and_cuts_it() {
+    let cli = Cli::new();
+    let parent = cli.create(&["--objective", "parent work"]);
+    let create = |args: &[&str]| {
+        let mut all = vec!["create-worksession", "--objective", "child", "--report", "none"];
+        all.extend_from_slice(args);
+        parse(cli.command(&all).env("OPENDAN_SESSION_ID", parent.sid()).output().unwrap())
+    };
+    let (code, _, err) = create(&["--key", "k1"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("missing --title"), "{err}");
+    let (code, _, err) = create(&["--title", "  ", "--key", "k2"]);
+    assert_eq!(code, 2, "{err}");
+    let long = format!("Build\n {}", "x".repeat(80));
+    let (code, v, err) = create(&["--title", &long, "--key", "k3"]);
+    assert_eq!(code, 0, "{v} {err}");
+    let child = SessionDir::open(v["path"].as_str().unwrap()).unwrap();
+    let title = child.config().unwrap().session.title.unwrap();
+    assert_eq!(title.chars().count(), 60, "{title}");
+    assert!(title.starts_with("Build xxx") && title.ends_with('…'), "{title}");
+    let (_, st, _) = cli.run(&["status", child.sid()]);
+    assert_eq!(st["entry"]["title"], title.as_str());
+}
+
+/// On Windows the session's `agent-session` is the `xagent` program itself:
+/// PowerShell, `cmd`, `Start-Process` (which would hand a script to its file
+/// association) and a direct process start all run it with its words intact.
+#[cfg(windows)]
+#[test]
+fn windows_agent_session_is_a_program_every_caller_runs() {
+    use libopendan::runtime::bin_overlay::{prepare, verify, BinPlan};
+    use std::os::windows::process::CommandExt;
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let bin = dir.path().join("bin");
+    let plan = BinPlan { session_cli: Some(PathBuf::from(env!("CARGO_BIN_EXE_xagent"))), ..Default::default() };
+    prepare(&bin, &plan).unwrap();
+    verify(&bin, &plan).unwrap();
+    assert!(bin.join("agent-session.exe").is_file());
+    assert!(!bin.join("agent-session.ps1").exists() && !bin.join("agent-session").exists());
+    let path = format!("{};{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let target = |how: &str| dir.path().join(format!("out {how} & 'q' 中文"));
+    let psq = |p: PathBuf| p.display().to_string().replace('\'', "''");
+
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $c = Get-Command agent-session\n\
+         if ($c.CommandType -ne 'Application' -or -not $c.Source.EndsWith('agent-session.exe')) {{ throw \"resolved to $($c.Source)\" }}\n\
+         agent-session schema '{}' | Out-Null\n\
+         if ($LASTEXITCODE -ne 0) {{ exit 3 }}\n\
+         $p = Start-Process agent-session -ArgumentList 'schema', '\"{}\"' -WindowStyle Hidden -Wait -PassThru\n\
+         exit $p.ExitCode\n",
+        psq(target("ps")),
+        psq(target("start")),
+    );
+    let out = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("cmd.exe")
+        .raw_arg(format!("/d /c agent-session schema \"{}\"", target("cmd").display()))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let out = Command::new("agent-session").arg("schema").arg(target("direct")).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    for how in ["ps", "start", "cmd", "direct"] {
+        let written = std::fs::read_dir(target(how)).map(|d| d.count()).unwrap_or(0);
+        assert!(written > 0, "`{how}` did not run agent-session with its argument");
+    }
 }

@@ -1,3 +1,5 @@
+import { createCustomRulesDraft, parseProviderRulesFile, ruleObject } from '../../../api/custom_provider_rules'
+import { parseProviderAdvancedRules, toProviderInstanceRules } from '../../../api/provider_model_selection'
 import type {
   AIStatus,
   ApiNamespace,
@@ -206,6 +208,9 @@ export class MockDataStore {
         provider_profile_id: providerType,
         protocol_adapter_id: draft.protocol_adapter_id ?? 'mock-adapter',
         provider_origin: 'user_config',
+        provider_rules_id: draft.provider_rules_id,
+        instance_rules: toProviderInstanceRules(draft),
+        discovered_model_ids: [...new Set(models.map((model) => model.provider_model_id))],
         auth_mode: draft.api_key ? 'api_key' : undefined,
         credential_configured: Boolean(draft.api_key),
         base_url: draft.base_url,
@@ -258,6 +263,18 @@ export class MockDataStore {
   }
 
   refreshProviderModels(): void {
+    this.notify()
+  }
+
+  updateProviderRules(id: string, draft: Partial<WizardDraft>): void {
+    const provider = this.providers.get(id)
+    if (!provider) return
+    const file = draft.rules_config_json ? parseProviderRulesFile(draft.rules_config_json, createCustomRulesDraft(provider.config)) : undefined
+    this.providers.set(id, { ...provider, config: { ...provider.config,
+      provider_rules_id: file?.provider_rules_id || draft.provider_rules_id || undefined,
+      rules_catalog: file ? ruleObject(file.instance_rules.catalog) : provider.config.rules_catalog,
+      instance_rules: file?.instance_rules ?? { ...provider.config.instance_rules, ...parseProviderAdvancedRules(draft) },
+    } })
     this.notify()
   }
 
@@ -350,11 +367,11 @@ export class MockDataStore {
     }
   }
 
-  getUsageSummary(): UsageSummary {
-    return this.usageSummary
+  getUsageSummary(events?: UsageEvent[]): UsageSummary {
+    return events ? this.computeUsageSummary(events) : this.usageSummary
   }
 
-  private computeUsageSummary(): UsageSummary {
+  private computeUsageSummary(events = this.usageEvents): UsageSummary {
     const now = new Date()
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime()
@@ -380,7 +397,7 @@ export class MockDataStore {
     let todayTokens = 0
     let monthTokens = 0
 
-    for (const evt of this.usageEvents) {
+    for (const evt of events) {
       const tokens = evt.token_equivalent ?? (evt.tokens_in ?? 0) + (evt.tokens_out ?? 0)
       const ts = new Date(evt.timestamp).getTime()
       const namespace = namespaceFromApiType(evt.api_type)
@@ -416,11 +433,11 @@ export class MockDataStore {
     }
   }
 
-  getUsageTrend(): UsageTrendPoint[] {
-    return this.usageTrend
+  getUsageTrend(events?: UsageEvent[]): UsageTrendPoint[] {
+    return events ? this.computeUsageTrend(events) : this.usageTrend
   }
 
-  private computeUsageTrend(): UsageTrendPoint[] {
+  private computeUsageTrend(events = this.usageEvents): UsageTrendPoint[] {
     const now = Date.now()
     const day = 24 * 60 * 60 * 1000
     const points: UsageTrendPoint[] = []
@@ -431,7 +448,7 @@ export class MockDataStore {
       let tokens = 0
       const financeTotals = new Map<string, number>()
 
-      for (const evt of this.usageEvents) {
+      for (const evt of events) {
         const ts = new Date(evt.timestamp).getTime()
         if (ts >= dayStart && ts < dayEnd) {
           tokens += evt.token_equivalent ?? (evt.tokens_in ?? 0) + (evt.tokens_out ?? 0)

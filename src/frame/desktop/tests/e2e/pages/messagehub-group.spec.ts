@@ -62,6 +62,7 @@ test('a group is created from picked contacts and opens on its own conversation'
   const aliceRow = invite.getByTestId('people-picker-row').filter({ hasText: 'Alice Chen' })
   await expect(aliceRow).toContainText('Member')
   await expect(aliceRow.getByRole('button', { name: 'Alice Chen', exact: true })).toHaveCount(0)
+  await expect(invite.getByTestId('people-picker-row').filter({ hasText: 'Bob Zhang' }).getByRole('button', { name: 'Bob Zhang', exact: true })).toHaveCount(1)
   await invite.getByRole('button', { name: 'Dave Li', exact: true }).click()
   await invite.getByRole('button', { name: 'Invite', exact: true }).click()
   await expect(invite).toHaveCount(0)
@@ -126,6 +127,13 @@ test('an invitation card joins the group and opens it; an admin manages the seed
   await page.getByRole('dialog', { name: 'Remove from group' }).getByRole('button', { name: 'Remove from group' }).click()
   await expect(panel.locator('li', { hasText: 'Dave Li' })).toHaveCount(0)
   expect(await page.evaluate(({ context, group }) => window.__messageHubMock.group(context, group)?.members?.find(member => member.did === 'did:buckyos:entity:person-dave')?.state, { context: OWN, group: TEAM })).toBe('removed')
+
+  await expect(panel.locator(`li[data-member-did="${ERIN}"]`)).toContainText('Waiting for approval')
+  await expect(panel.locator(`li[data-member-did="${ERIN}"]`).getByRole('button', { name: /^Cancel invitation/ })).toHaveCount(0)
+  await panel.getByRole('button', { name: 'Cancel invitation: DocWriter' }).click()
+  await page.getByRole('dialog', { name: 'Cancel invitation' }).getByRole('button', { name: 'Cancel invitation' }).click()
+  await expect(panel.locator('li', { hasText: 'DocWriter' })).toHaveCount(0)
+  expect(await page.evaluate(({ context, group }) => window.__messageHubMock.group(context, group)?.members?.find(member => member.did === 'did:buckyos:entity:agent-writer')?.state, { context: OWN, group: TEAM })).toBe('revoked')
 })
 
 test('group creation is a full-height sheet-friendly dialog on a phone', async ({ page }) => {
@@ -148,14 +156,16 @@ const DAVE = 'did:buckyos:entity:person-dave'
 const BOOK = 'did:buckyos:group:book-club'
 const ERIN = 'did:buckyos:person:erin'
 
-test('notification cards: an auto-accepted invite shows joined, a join request is approved, an owner transfer is accepted', async ({ page }) => {
+test('notification cards: an invite comes from the inviter; a join request and an owner transfer come from the group', async ({ page }) => {
   await openHub(page, ALICE)
   const invite = page.locator('[data-testid="group-notice"][data-action="invite"]')
   await expect(invite).toHaveAttribute('data-state', 'joined')
   await expect(invite).toContainText('Joined')
   await expect(invite.getByRole('button', { name: 'Join group' })).toHaveCount(0)
   await expect(invite).toContainText('Role: Admin')
+  await expect(page.locator('[data-testid="group-notice"][data-action="owner_transfer"]')).toHaveCount(0)
 
+  await openHub(page, TEAM)
   const approval = page.locator('[data-testid="group-notice"][data-action="pending_approval"]')
   await expect(approval).toContainText('asked to join')
   await approval.getByRole('button', { name: 'Approve' }).click()
@@ -163,12 +173,11 @@ test('notification cards: an auto-accepted invite shows joined, a join request i
   expect(await page.evaluate(({ context, group, member }) => window.__messageHubMock.group(context, group)?.members?.find(item => item.did === member)?.state, { context: OWN, group: TEAM, member: ERIN })).toBe('active')
 
   const transfer = page.locator('[data-testid="group-notice"][data-action="owner_transfer"]')
-  await expect(transfer).toContainText('offers you ownership of')
+  await expect(transfer).toContainText('Alice Chen offers you ownership of')
   await page.screenshot({ path: 'test-results/messagehub-group-notices.png' })
   await transfer.getByRole('button', { name: 'Accept ownership' }).click()
   await expect(transfer).toContainText('You are now the group owner')
   expect(await page.evaluate(({ context, group }) => window.__messageHubMock.group(context, group)?.myRole, { context: OWN, group: TEAM })).toBe('owner')
-  await expect(page.getByTestId('action-message').last()).toHaveCount(0)
 })
 
 test('the owner changes roles, mutes a member, edits the profile and issues an invite link', async ({ page }) => {
@@ -226,6 +235,42 @@ test('Join group in the + menu previews the group; an unknown token is rejected,
   await expect(page.getByRole('button', { name: 'Entity details: Book Club' }).last()).toBeVisible()
   await expect(page.getByTestId('action-message').last()).toHaveText('You joined')
   expect(await page.evaluate(({ context, group }) => window.__messageHubMock.group(context, group)?.myRole, { context: OWN, group: BOOK })).toBe('member')
+})
+
+test('an accepted invitation awaiting sync offers retry without claiming the group is ready', async ({ page }) => {
+  await openHub(page, BOB)
+  await page.evaluate(() => {
+    const store = window.__messageHubMock
+    const originalView = store.groupInvitation.bind(store)
+    const originalAccept = store.acceptGroupInvitation.bind(store)
+    let syncing = false
+    let firstAttempt = true
+    Object.assign(store, {
+      groupInvitation: (...args: Parameters<typeof originalView>) => {
+        const view = originalView(...args)
+        return syncing ? { ...view, state: 'syncing' } : view
+      },
+      acceptGroupInvitation: async (...args: Parameters<typeof originalAccept>) => {
+        if (firstAttempt) {
+          firstAttempt = false
+          syncing = true
+          throw Error('group-sync-pending')
+        }
+        await originalAccept(...args)
+        syncing = false
+      },
+    })
+  })
+  const card = page.getByTestId('group-notice')
+  await card.getByRole('button', { name: 'Join group' }).click()
+  await expect(card).toHaveAttribute('data-state', 'syncing')
+  await expect(card).toContainText('Accepted, waiting for group sync')
+  await expect(card.getByRole('alert')).toContainText('you can safely retry')
+  await expect(card.getByRole('button', { name: 'Open', exact: true })).toHaveCount(0)
+  await card.getByRole('button', { name: 'Retry', exact: true }).click()
+  await expect(card).toHaveAttribute('data-state', 'joined')
+  await expect(card.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
+  await expect(card.getByRole('alert')).toHaveCount(0)
 })
 
 test('session guests: the invite card is accepted, the owner accepts for an agent, and guest sessions are badged', async ({ page }) => {

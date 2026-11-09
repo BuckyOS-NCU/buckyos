@@ -116,6 +116,7 @@ pub fn open_stage(state: &Arc<AppState>, caller: &Caller, ws_id: &str, run_id: &
         location: params.get("location").cloned().unwrap_or(json!({})),
         request: request.clone(),
         catalog: super::builtin_catalog(),
+        controls: super::controls_catalog(),
         map_budget_chars: state.wish.config.map_budget_chars,
         materialize: kind != StageKind::Analyze && program != super::PROGRAM_MOCK,
     };
@@ -394,6 +395,10 @@ fn input_lines(stage: &Stage) -> String {
         if let Some(r) = meta["rows"].as_u64() {
             l.push_str(&format!(", {}", aiworkspace_store::wish::profile::count(r, "row", "rows")));
         }
+        if let Some(k) = meta["control"].as_str() {
+            let what = if meta["node"] == json!(true) { format!("a node of a {k} with its branch") } else { format!("a {k}") };
+            l.push_str(&format!(", {what} ({}) as a Markdown outline in outline.md", aiworkspace_store::wish::profile::count(meta["nodes"].as_u64().unwrap_or(0), "node", "nodes")));
+        }
         if let Some(v) = meta.get("view").filter(|v| v.is_object()) {
             l.push_str(&format!(", read through view {} ({})", v["handle"].as_str().unwrap_or(""), v["summary"].as_str().unwrap_or("")));
         } else if let Some(s) = &i.selector {
@@ -430,6 +435,7 @@ fn collector_for(stage: &Stage, program_only: bool) -> WsResult<Collector> {
         checks_def: a.get("checks").and_then(Value::as_array).cloned().unwrap_or_default(),
         prev_bindings: aiworkspace_core::wish::current_results(&stage.wish.payload).into_iter().collect(),
         inputs: stage.input_infos()?,
+        composites: stage.composite_defs()?,
         workdir: stage.workdir.clone(),
         program_only,
         ..Default::default()
@@ -586,8 +592,8 @@ fn fill_candidate(c: &mut Value, ev: &Value, executor: &str, st: &Arc<StageState
     c["simulated"] = json!(executor == "mock");
 }
 
-/// Files the results reference, and the program source, become staged assets (content addressed;
-/// re-staged at application).
+/// Files the results reference, and the program source, become staged assets (content addressed; bound
+/// again at application). The run keeps their object ids and bindings, not the paths in its work folder.
 async fn stage_files(state: &Arc<AppState>, caller: &Caller, ws_id: &str, cand: &mut Value) -> WsResult<()> {
     let mut paths: Vec<(String, PathBuf)> = Vec::new();
     for (i, r) in cand["results"].as_array().into_iter().flatten().enumerate() {
@@ -606,16 +612,24 @@ async fn stage_files(state: &Arc<AppState>, caller: &Caller, ws_id: &str, cand: 
         let mut out = Vec::new();
         for (k, p) in paths {
             let bytes = std::fs::read(&p).map_err(|e| WsError::io(format!("{}: {e}", p.display())))?;
-            out.push((k, ws.stage_asset(&c, &bytes)?["object_id"].clone()));
+            out.push((k, ws.stage_asset(&c, &bytes)?));
         }
         Ok(out)
     })
     .await?;
-    for (k, obj) in staged {
-        if k == "program" {
-            cand["program"]["object_id"] = obj;
+    for (k, staged) in staged {
+        let target = if k == "program" {
+            &mut cand["program"]
         } else if let Some(i) = k.strip_prefix('r').and_then(|n| n.parse::<usize>().ok()) {
-            cand["results"][i]["file"]["object_id"] = obj;
+            &mut cand["results"][i]["file"]
+        } else {
+            continue;
+        };
+        for field in ["object_id", "key", "version"] {
+            target[field] = staged[field].clone();
+        }
+        if let Some(o) = target.as_object_mut() {
+            o.remove("path");
         }
     }
     Ok(())
@@ -771,6 +785,19 @@ fn mock_results(st: &Arc<StageState>, provided: &Value) -> WsResult<Vec<Value>> 
                 if v.get("views").is_none() {
                     v["views"] = json!([{ "renderer": "sample.video" }]);
                 }
+            }
+            "control" => {
+                // checked like the model's: the tree and its bounds, `under` against this run's inputs
+                let stage = st.stage.lock().unwrap();
+                let collector = Collector { contract: json!({ "results": [], "dynamic": true }), inputs: stage.input_infos()?, composites: stage.composite_defs()?, ..Default::default() };
+                drop(stage);
+                let mut raw = json!({ "name": name, "type": "control", "title": v["title"] });
+                for k in ["kind", "config", "children", "under", "def", "slots"] {
+                    if let Some(x) = c.get(k) {
+                        raw[k] = x.clone();
+                    }
+                }
+                v = collector.normalize(&raw, "direct").map_err(|e| WsError::invalid_op(format!("Result {name}: {}", e.join("; "))))?;
             }
             t => return Err(WsError::invalid_op(format!("Mock result type {t} is not supported"))),
         }

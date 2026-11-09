@@ -1,23 +1,34 @@
 //! Authenticated object access for MessageHub attachments:
 //!
-//!   GET /kapi/msg-center/objects/{obj_id}          → named object JSON
-//!   GET /kapi/msg-center/objects/{obj_id}/content  → FileObject bytes
+//!   GET /kapi/msg-center/objects/{obj_id}?context_path=…          → named object JSON
+//!   GET /kapi/msg-center/objects/{obj_id}/content?context_path=…  → FileObject bytes
 //!
-//! The zone gateway has no CYFS download route yet, so the message center
-//! exposes the objects referenced by messages (`refs[].target.obj_id`,
-//! `cyfs://<obj_id>` hints) to authenticated zone principals. The caller must
-//! present a verified session token (`Authorization: Bearer` or `?token=`).
+//! msg-center reads its zone `attachments` bucket on behalf of the members of
+//! a conversation. `context_path` (`[<session address>/]<msg_id>`) names the
+//! message the attachment is read through: the caller must be able to read
+//! that message, and its binding (`<session>/<msg_id>/<n>`) must hold the
+//! object. Without `context_path` the message is the newest one of the
+//! caller's own mailboxes that references the object (an Agent's, for the App
+//! an Agent runs as), so an Agent reads an attachment by its object id alone;
+//! restricted sessions always name the message. A hosted group's message
+//! objects come through the same route, and the files its displays show with
+//! `context_path=<session address>/_display` (the caller reads that Session,
+//! its display shows the file, and `<group address>/_display/<obj_id>` holds
+//! it). The caller presents a verified session token (`Authorization: Bearer`
+//! or `?token=`). What another Zone's message references is not bound yet the
+//! first time: see `remote_attachment.rs` for what a read answers then.
 
 use crate::msg_center::MessageCenter;
+use crate::remote_attachment::RemoteAttachment;
 use buckyos_api::{
-    get_buckyos_api_runtime, AccessDenial, DenyReason, SessionScope, ACCESS_DENIED_ERROR_CODE,
-    MSG_CENTER_SERVICE_NAME,
+    AccessDenial, DenyReason, SessionScope, ACCESS_DENIED_ERROR_CODE, MSG_CENTER_SERVICE_NAME,
 };
 use buckyos_http_server::ServerError;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use kRPC::RPCContext;
+use named_store::NamedDataMgr;
 use ndn_lib::{load_named_obj, FileObject, ObjId};
 use tokio::io::AsyncReadExt;
 
@@ -26,7 +37,10 @@ type Body = BoxBody<Bytes, ServerError>;
 pub(crate) const OBJECTS_PATH: &str = "/kapi/msg-center/objects/";
 /// Attachments are chat-sized; larger objects are refused instead of being
 /// buffered in memory.
-const MAX_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+/// How many of the newest messages of each of the caller's mailboxes a read
+/// without `context_path` looks through; older ones are read by naming them.
+const OWN_MESSAGES_SEARCHED: usize = 1000;
 
 fn text_response(status: StatusCode, message: &str) -> Response<Body> {
     Response::builder()
@@ -39,6 +53,41 @@ fn text_response(status: StatusCode, message: &str) -> Response<Body> {
                 .boxed(),
         )
         .unwrap()
+}
+
+fn retry_later(message: &str, seconds: u64) -> Response<Body> {
+    let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, message);
+    response.headers_mut().insert("retry-after", http::HeaderValue::from(seconds));
+    response
+}
+
+/// A read of an attachment that is not here. Desktop tells these apart by status and body.
+fn remote_answer(outcome: RemoteAttachment) -> Response<Body> {
+    let retry_after = outcome.retry_after_secs().unwrap_or_default();
+    match outcome {
+        RemoteAttachment::Bound | RemoteAttachment::NotRemote | RemoteAttachment::Refused => text_response(StatusCode::NOT_FOUND, "not-found"),
+        RemoteAttachment::TooLarge => text_response(StatusCode::PAYLOAD_TOO_LARGE, "file is too large for inline download"),
+        RemoteAttachment::Directory => text_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, "attachment-directory-unsupported"),
+        RemoteAttachment::AwaitingAcceptance => text_response(StatusCode::FORBIDDEN, "attachment-awaiting-acceptance"),
+        RemoteAttachment::Corrupt => text_response(StatusCode::BAD_GATEWAY, "attachment-verification-failed"),
+        RemoteAttachment::Fetching => retry_later("attachment-fetching", retry_after),
+        RemoteAttachment::Unreachable => retry_later("attachment-source-unreachable", retry_after),
+    }
+}
+
+/// A named object's JSON, kept here.
+fn object_response(body: String) -> Response<Body> {
+    bytes_response(StatusCode::OK, "application/json; charset=utf-8", body.into_bytes())
+}
+
+/// An object another Zone described: its bytes are not here, so a card must not ask for them,
+/// and the answer changes once they are.
+fn remote_object_response(body: String) -> Response<Body> {
+    let mut response = object_response(body);
+    let headers = response.headers_mut();
+    headers.insert("x-attachment-remote", http::HeaderValue::from_static("1"));
+    headers.insert("cache-control", http::HeaderValue::from_static("no-store"));
+    response
 }
 
 fn bytes_response(status: StatusCode, content_type: &str, body: Vec<u8>) -> Response<Body> {
@@ -87,19 +136,6 @@ fn percent_decode(value: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
-}
-
-fn percent_encode_filename(name: &str) -> String {
-    let mut out = String::new();
-    for byte in name.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    out
 }
 
 pub(crate) fn guess_mime(name: &str) -> &'static str {
@@ -180,7 +216,39 @@ async fn serve_object(center: &MessageCenter, req: &Request<Body>) -> Option<Res
             return Some(text_response(StatusCode::UNAUTHORIZED, "unauthenticated"));
         }
     };
-    let context = query_param(req.uri().query().unwrap_or(""), "context_path");
+    let query = req.uri().query().unwrap_or("");
+    let context = query_param(query, "context_path");
+    let inner_path = query_param(query, "inner_path");
+
+    if let Some(session) = context.as_deref().and_then(crate::buckets::display_context) {
+        if !caller.restricted()
+            && center
+                .authorize_resource(&ctx, "obj://msg-center/objects", "read")
+                .await
+                .is_err()
+        {
+            return Some(text_response(StatusCode::FORBIDDEN, "object access denied"));
+        }
+        let actor = center.group_actor(&ctx).await.ok();
+        let key = match &actor {
+            Some(actor) => center.authorize_display_file(actor, &obj_id, session).await.ok(),
+            None => None,
+        };
+        if let Some(key) = key {
+            return Some(bound_key_response(center, &key, &obj_id, want_content, inner_path).await);
+        }
+        // A group joined from here: its host has the file and the say.
+        if let Some(actor) = actor.as_ref().filter(|_| !caller.restricted()) {
+            if let Some(fetch) = center.joined_display_file(actor, &obj_id, session).await {
+                return Some(joined_display_response(center, fetch, &obj_id, want_content, inner_path).await);
+            }
+        }
+        return Some(if caller.restricted() {
+            grant_missing(&caller.user_id)
+        } else {
+            text_response(StatusCode::NOT_FOUND, "not-found")
+        });
+    }
 
     // A restricted session (Session Only guest) has no objects grant: it
     // reads a Session message, or an object one references, only through
@@ -193,13 +261,14 @@ async fn serve_object(center: &MessageCenter, req: &Request<Body>) -> Option<Res
                 .is_ok(),
             None => false,
         };
-        if !authorized {
+        let msg_id = context.as_deref().map(crate::buckets::context_msg_id);
+        let (true, Some(Ok(msg_id))) = (authorized, msg_id) else {
             return Some(grant_missing(&caller.user_id));
-        }
+        };
         if let Ok(Some((_, body, jwt))) = center.groups.object(&obj_id).await {
             return Some(group_message_response(body, jwt));
         }
-        return Some(fetch_authorized_object_path(&obj_id, want_content, query_param(req.uri().query().unwrap_or(""), "inner_path")).await);
+        return Some(bound_attachment_response(center, &ctx, &msg_id, &obj_id, want_content, inner_path).await);
     }
 
     if center
@@ -216,14 +285,18 @@ async fn serve_object(center: &MessageCenter, req: &Request<Body>) -> Option<Res
         }
         return Some(group_message_response(body, jwt));
     }
-    if center
-        .authorize_attachment(&ctx, &obj_id, context.as_deref())
-        .await
-        .is_err()
-    {
+    let msg_id = match context {
+        Some(context) => center.authorize_attachment(&ctx, &obj_id, &context).await.ok(),
+        None => center
+            .own_message_referencing(&ctx, &obj_id, OWN_MESSAGES_SEARCHED)
+            .await
+            .ok()
+            .flatten(),
+    };
+    let Some(msg_id) = msg_id else {
         return Some(text_response(StatusCode::NOT_FOUND, "not-found"));
-    }
-    Some(fetch_authorized_object_path(&obj_id, want_content, query_param(req.uri().query().unwrap_or(""), "inner_path")).await)
+    };
+    Some(bound_attachment_response(center, &ctx, &msg_id, &obj_id, want_content, inner_path).await)
 }
 
 /// A stored group message: its signed form when it has one.
@@ -266,19 +339,95 @@ fn denial_response(status: StatusCode, denial: AccessDenial) -> Response<Body> {
         .unwrap()
 }
 
-pub(crate) async fn fetch_authorized_object(obj_id: &ObjId, want_content: bool) -> Response<Body> {
-    fetch_authorized_object_path(obj_id, want_content, None).await
+/// Attachment `id` of message `msg_id`, the caller already authorized for
+/// that message: served once the message's binding in `attachments` holds it.
+/// Without a binding, `content` fetches it and a description asks the source only.
+pub(crate) async fn bound_attachment_response(
+    center: &MessageCenter,
+    ctx: &RPCContext,
+    msg_id: &ObjId,
+    id: &ObjId,
+    want_content: bool,
+    inner_path: Option<String>,
+) -> Response<Body> {
+    let buckets = match center.open_buckets().await {
+        Ok(Some(buckets)) => buckets,
+        _ => return text_response(StatusCode::SERVICE_UNAVAILABLE, "bucket service unavailable"),
+    };
+    match center.bound_attachment(&buckets, msg_id, id).await {
+        Ok(Some(_)) => fetch_object_path(&buckets.store, id, want_content, inner_path).await,
+        Ok(None) => {
+            let reader = center.message_reader(ctx, msg_id).await;
+            if !want_content {
+                return match center.describe_remote_attachment(msg_id, id, reader.as_ref()).await {
+                    Ok(body) => remote_object_response(body),
+                    Err(outcome) => remote_answer(outcome),
+                };
+            }
+            match center.ensure_remote_attachment(&buckets, msg_id, id, reader.as_ref()).await {
+                RemoteAttachment::Bound => fetch_object_path(&buckets.store, id, want_content, inner_path).await,
+                outcome => remote_answer(outcome),
+            }
+        }
+        Err(error) => {
+            log::warn!("attachment {} of {} not checked: {}", id.to_string(), msg_id.to_string(), error);
+            text_response(StatusCode::SERVICE_UNAVAILABLE, "bucket service unavailable")
+        }
+    }
 }
 
-async fn fetch_authorized_object_path(root: &ObjId, want_content: bool, inner_path: Option<String>) -> Response<Body> {
-    let runtime = match get_buckyos_api_runtime() {
-        Ok(runtime) => runtime,
-        Err(_) => return text_response(StatusCode::SERVICE_UNAVAILABLE, "named store unavailable"),
+/// A display file of a group joined from here: once fetched it is read like a hosted one.
+async fn joined_display_response(
+    center: &MessageCenter,
+    fetch: crate::remote_attachment::Fetch,
+    id: &ObjId,
+    want_content: bool,
+    inner_path: Option<String>,
+) -> Response<Body> {
+    let buckets = match center.open_buckets().await {
+        Ok(Some(buckets)) => buckets,
+        _ => return text_response(StatusCode::SERVICE_UNAVAILABLE, "bucket service unavailable"),
     };
-    let named_store = match runtime.get_local_named_store().await {
-        Ok(store) => store,
-        Err(_) => return text_response(StatusCode::SERVICE_UNAVAILABLE, "named store unavailable"),
+    match MessageCenter::key_holds(&buckets, &fetch.key, id).await {
+        Ok(true) => fetch_object_path(&buckets.store, id, want_content, inner_path).await,
+        Ok(false) if want_content => match center.ensure_display_file(&buckets, fetch).await {
+            RemoteAttachment::Bound => fetch_object_path(&buckets.store, id, want_content, inner_path).await,
+            outcome => remote_answer(outcome),
+        },
+        Ok(false) => match center.describe_fetch(fetch).await {
+            Ok(body) => remote_object_response(body),
+            Err(outcome) => remote_answer(outcome),
+        },
+        Err(error) => {
+            log::warn!("display file {} not checked: {}", id.to_string(), error);
+            text_response(StatusCode::SERVICE_UNAVAILABLE, "bucket service unavailable")
+        }
+    }
+}
+
+/// Object `id` once `key` of `attachments` holds it.
+async fn bound_key_response(
+    center: &MessageCenter,
+    key: &str,
+    id: &ObjId,
+    want_content: bool,
+    inner_path: Option<String>,
+) -> Response<Body> {
+    let buckets = match center.open_buckets().await {
+        Ok(Some(buckets)) => buckets,
+        _ => return text_response(StatusCode::SERVICE_UNAVAILABLE, "bucket service unavailable"),
     };
+    match MessageCenter::key_holds(&buckets, key, id).await {
+        Ok(true) => fetch_object_path(&buckets.store, id, want_content, inner_path).await,
+        Ok(false) => text_response(StatusCode::NOT_FOUND, "not-found"),
+        Err(error) => {
+            log::warn!("{key} not checked: {error}");
+            text_response(StatusCode::SERVICE_UNAVAILABLE, "bucket service unavailable")
+        }
+    }
+}
+
+async fn fetch_object_path(named_store: &NamedDataMgr, root: &ObjId, want_content: bool, inner_path: Option<String>) -> Response<Body> {
     let mut obj_id = root.clone();
     if let Some(path) = inner_path {
         for name in path.split('/') {
@@ -293,23 +442,12 @@ async fn fetch_authorized_object_path(root: &ObjId, want_content: bool, inner_pa
     }
     let obj_str = match named_store.get_object(&obj_id).await {
         Ok(value) => value,
-        Err(error) => {
-            let message = error.to_string();
-            let status = if message.contains("NotFound") || message.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            return text_response(status, "object unavailable");
-        }
+        Err(ndn_lib::NdnError::NotFound(_)) => return text_response(StatusCode::NOT_FOUND, "object unavailable"),
+        Err(_) => return text_response(StatusCode::BAD_GATEWAY, "object unavailable"),
     };
 
     if !want_content {
-        return bytes_response(
-            StatusCode::OK,
-            "application/json; charset=utf-8",
-            obj_str.into_bytes(),
-        );
+        return object_response(obj_str);
     }
 
     if !obj_id.is_file_object() {
@@ -345,7 +483,7 @@ async fn fetch_authorized_object_path(root: &ObjId, want_content: bool, inner_pa
     let name = file_obj.content_obj.name.clone();
     let mime = file_obj
         .meta
-        .get("mime_type")
+        .get("mime")
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
         .unwrap_or_else(|| guess_mime(&name).to_string());
@@ -355,11 +493,7 @@ async fn fetch_authorized_object_path(root: &ObjId, want_content: bool, inner_pa
         name
     };
     let mut response = bytes_response(StatusCode::OK, &mime, data);
-    if let Ok(value) = http::HeaderValue::from_str(&format!(
-        "inline; filename*=UTF-8''{}",
-        percent_encode_filename(&disposition_name)
-    )) {
-        response.headers_mut().insert("content-disposition", value);
-    }
+    // The attachment route shares the Desktop origin: an attachment never runs here (D24).
+    ndn_lib::apply_content_policy(response.headers_mut(), &mime, Some(&disposition_name), false);
     response
 }

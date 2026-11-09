@@ -79,16 +79,15 @@ AiccServerHandler<T: AiccHandler>
 | runtime | `RuntimeBackend`, `RuntimeFactory`, `ModelRegistryAssembler` | 组装 Provider、catalog、模型注册表并发布不可变 snapshot |
 | provider | `ProviderDiscovery` | 获取一个 Provider Instance 的动态库存 |
 | provider | `CredentialResolver`, `DynamicLoginCredentialResolver` | 将受保护凭据解析到最小使用范围 |
-| provider | `ProviderQuotaObserver` | 读取 Provider 配额事实 |
 | provider | `ProviderInventoryStore` | 原子保存/读取实例 inventory LKGS |
 | protocol | `OperationCodec` | immediate/stream 请求编码和响应解码 |
 | protocol | `NativeTaskCodec` | submit/status/result/cancel 原生任务协议 |
 | protocol | `ProtocolAdapterPlugin` | 向 `CodecRegistry` 原子注册 descriptor 与 codec |
-| protocol | `ArtifactDownloadProtocol` | Adapter 级 URL artifact 下载请求/响应协议；默认实现可复用，特殊协议按 adapter 覆写 |
+| protocol | `ArtifactDownloadProtocol` | URL artifact 下载请求/响应协议；目前所有 adapter 共用默认实现 |
 | execution | `ExecutionStore`, `TaskManagerPort`, `ProviderExecutionPort`, `UsageCompletionPort` | 幂等执行、TaskMgr 桥接、Provider 执行和一次性用量入账 |
 | resource | `ResourceAuthorizer`, `ResourceStore`, `UrlResourceFetcher` | `ResourceRef` 鉴权、物化和 artifact 写入 |
 
-本地 Named Object 只有在 `services/aicc/settings.public_named_object_base_url` 显式配置公网 HTTPS 下载入口时才能转成 Provider URL。未配置时，`UrlOrBytes` codec 读取对象字节，`UrlOnly` codec 返回资源不可用；不得根据 Zone hostname 推导一个未经部署确认的 `/ndn/` URL。
+未登记为 tenant/user 私有的 Named Object，只有在 `services/aicc/settings.public_named_object_base_url` 显式配置无需用户鉴权的公网 HTTPS 下载入口时才能转成 Provider URL。AICC 登记的私有 Named Object 必须校验 tenant/user 并读取为字节。AICC 登记的 Provider 结果 URL 必须先校验 tenant/user。三种协议输入形态分别处理：`BytesOnly` 在首次 Provider 调用前立即下载 URL；`UrlOrBytes` 首次直传原 URL，被 Provider 明确拒绝后允许恰好一次字节重试；`UrlOnly` 首次直传原 URL，明确拒绝后仅在已配置公网 Named Object 下载入口时下载内容、写入有 owner 记录的 Named Object，并用公网 NDN URL 重试，否则保留原失败且不重试。任何 native task 重提得到的新远端 task id 都必须替换同一 BuckyOS task 的绑定。`UrlOnly` 遇到 Base64 或必须转成私有字节的 Named Object 时仍明确失败，不得根据 Zone hostname 推导一个未经部署确认的 `/ndn/` URL。
 
 禁止创建同时承担路由、发现、wire 编解码和生命周期的“大 Provider trait”。跨层调用必须经过上表端口或不可变数据对象。
 
@@ -133,9 +132,13 @@ public DTO / AiccCall
 
 编码器接收 canonical request、已解析参数、已物化资源、endpoint、credential 和 limits。凭据不得进入 Debug、route trace、task data 或用户响应。
 
+`OperationCodec::continuation_request` 可依据官方协议从响应生成一次必要的无副作用续轮请求和该轮 usage；默认不续轮。执行端保留原任务、凭据、资源与取消边界，限制为一次续轮并合并 usage。当前仅用于 OpenAI computer-use 的 screenshot 握手，不执行调用方环境中的动作，也不将 Provider 异步协议降级为同步。
+
 ### 4.3 URL artifact 下载
 
-`open_artifact_url_reader(url, artifact_id?)` 的职责链冻结为：service 按精确 URL 查询持久来源并校验 tenant/可选 artifact id，找到原 ProviderInstance，ProviderInstance 解析自己的 credential，再按 `protocol_adapter_id` 调用 `CodecRegistry` 的 artifact 下载协议。默认 `ArtifactDownloadProtocol` 只允许与 Provider base URL 同 origin 的 HTTP(S) URL，使用 Provider credential 发起 GET，并返回有大小上限的异步 byte stream。
+`open_artifact_url_reader(url, artifact_id?)` 的职责链冻结为：service 按精确 URL 查询持久来源并校验 tenant/user/可选 artifact id，找到原 ProviderInstance，ProviderInstance 解析自己的 credential，再按 `protocol_adapter_id` 调用 `CodecRegistry` 的 artifact 下载协议。默认 `ArtifactDownloadProtocol` 对与 Provider 当前 base URL 同 origin 的 HTTP(S) URL 使用 Provider credential；对允许的跨域公网 HTTPS URL 不附带 Provider credential，并返回有大小上限的异步 byte stream。
+
+内部资源初次物化和 URL fallback 下载已登记的 Provider URL 时复用该 reader，与对调用方提供的下载接口使用同一来源查询、授权及 Adapter 下载协议，不根据单独存储的 endpoint 快照另选下载分支。只有未登记的普通输入 URL 才使用通用 URL fetcher。输入透传判断保留同 ProviderInstance 优先及跨域公开 URL 优先规则，来源配置通过已存的 `provider_instance_name` 读取；`BytesOnly` 对所有已登记 Provider URL 都先下载字节。此处仅收敛 AICC 内部实现，不改变公共 DTO、CLI 或 Agent 调用方式。
 
 Adapter 默认复用该实现。只有认证 header、URL 变换、请求 method 或响应 envelope 确实不同的协议，才注册自定义 `ArtifactDownloadProtocol`；不得为每个 Provider 品牌复制下载函数。未登记 URL 不进入 Adapter，AICC 不按 host 猜测 Provider。
 
@@ -158,8 +161,10 @@ resource_invalid, no_provider_available, no_candidate_model,
 fallback_not_allowed, provider_start_failed, provider_error,
 unsupported_operation, unsupported_execution_mode, timeout, budget_exceeded,
 policy_denied, idempotency_conflict, settings_revision_conflict, cancelled,
-internal_error
+internal_error, context_length_exceeded
 ```
+
+`context_length_exceeded`：请求放不进模型的上下文窗口，来自 Provider 的结构化码（OpenAI 兼容接口的 `error.code = context_length_exceeded`，adapter 归为 `ProtocolErrorKind::ContextLengthExceeded`）或路由层（有候选仅因 `context_length_insufficient` 被过滤）。`retriable = false`，补救是缩小输入；调用方按码分支（xllm 归为 `ProviderFailure::ContextLimit`）。额度与资源策略的拒绝码见 [AICC Token 额度](aicc_token_quota.md) §6。
 
 请求/schema/模型名错误映射为 `ParseRequestError`，权限错误映射为 `NoPermission`，其它业务错误映射为 `ReasonError`，其 body 为序列化后的 `AiccError`。调用方应优先用 `AiccError::from_krpc_error` 解码，不能按 message 文本分支。
 

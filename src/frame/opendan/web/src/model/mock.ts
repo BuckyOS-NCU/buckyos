@@ -20,7 +20,7 @@ import type {
 const WHO = 'app:jarvis@devtest'
 const AGENT = 'did:bns:jarvis.devtest'
 const OWNER = 'did:bns:devtest'
-const ROOT = '/opt/buckyos/data/home/devtest/.local/share/jarvis/agents/jarvis'
+const ROOT = '/opt/buckyos/data/home/devtest/agents/jarvis.test.buckyos.io'
 const now = Date.now()
 const ago = (seconds: number) => now - seconds * 1000
 
@@ -116,7 +116,7 @@ const config = (sid: string, behavior: string, behaviors: string[]) => ({
 
 const buildFixtures = () => {
   const ui = entry(UI, 'ui', 'ui.direct', 'Talk with devtest', {
-    waiting_for: 'input',
+    needs_input: true,
     one_line_status: 'Waiting for the next message',
     updated_at_ms: ago(45),
   }, {
@@ -183,7 +183,7 @@ const buildFixtures = () => {
     hosted(UI, 'ui.direct', { reason: 'ui' }),
     hosted(WORK_RUNNING, 'work.default', {
       drives: 3,
-      last_result: { kind: 'turn_open', rev: 30, turn: 2, waiting_for: { kind: 'tool', refs: ['task-55'] } },
+      last_result: { kind: 'turn_open', rev: 30, turn: 2, needs_input: false },
       last_result_at_ms: ago(60),
       reason: 'input',
     }),
@@ -231,7 +231,6 @@ const buildFixtures = () => {
   const details: Record<string, Omit<SessionDetail, 'entry' | 'worklog' | 'children' | 'hosted'>> = {
     [UI]: {
       state: state(ui, {
-        waiting_for: { kind: 'input' },
         current_behavior: 'ui_chat',
         reply: { tunnel: 'msg_center', to: 'did:bns:devtest' },
         outbox: [
@@ -242,7 +241,7 @@ const buildFixtures = () => {
       }),
       report: '',
       config: config(UI, 'ui_chat', ['ui_chat']),
-      binding: { schema: 'opendan.binding/4', target: { kind: 'native' }, runtime_id: 'rt-native-01', kind: 'native', workdir: `${ROOT}/sessions/${UI}/work`, bound_at_ms: ago(86000), bound_by: WHO },
+      binding: { schema: 'opendan.binding/6', target: { kind: 'native' }, runtime_id: 'private', connector: 'native', workdir: `${ROOT}/sessions/${UI}/work`, bound_at_ms: ago(86000), bound_by: WHO },
       statistics: { input_tokens: 48210, output_tokens: 3922, total_tokens: 52132, rounds: 11, rounds_failed: 0, rounds_interrupted: 0, turns: 3 },
       runs: ['run-0001', 'run-0002', 'run-0003'],
       lease_holder: null,
@@ -252,7 +251,6 @@ const buildFixtures = () => {
         turn_seq: 2,
         turns_completed: 1,
         open_turn: { index: 2, run_id: 'run-0002', input_seq: 3, inputs: ['queue#3'], at_ms: ago(120) },
-        waiting_for: { kind: 'tool', refs: ['task-55'], deadline_ms: now + 600000 },
         current_behavior: 'work_do',
         process_entry: 'work_do',
         process_stack: [
@@ -272,7 +270,7 @@ const buildFixtures = () => {
       }),
       report: '# Weekly downloads\n\n- 14 files, 3 archives\n- (in progress)\n',
       config: config(WORK_RUNNING, 'work_plan', ['work_plan', 'work_do', 'work_report']),
-      binding: { schema: 'opendan.binding/4', target: { node_did: 'did:web:pc.test.buckyos.io', profile_id: 'agent-3f9c1a07b2e4', workdir: '/home/devtest/Downloads' }, runtime_id: 'rt-node-07', kind: 'remote_node', workdir: '/home/devtest/Downloads', bound_at_ms: ago(370), bound_by: WHO },
+      binding: { schema: 'opendan.binding/6', target: { node_did: 'did:web:pc.test.buckyos.io', profile_id: 'agent-3f9c1a07b2e4', workdir: '/home/devtest/Downloads' }, runtime_id: 'rt-node-07', connector: 'node_executor', workdir: '/home/devtest/Downloads', bound_at_ms: ago(370), bound_by: WHO },
       statistics: { input_tokens: 9120, output_tokens: 801, total_tokens: 9921, rounds: 4, rounds_failed: 0, rounds_interrupted: 1, turns: 1 },
       runs: ['run-0001', 'run-0002'],
       lease_holder: { resource: `session:${WORK_RUNNING}`, epoch: 5, holder: { runner_id: 'rn-51c2', principal: WHO, host: 'ood1', pid: 4411 }, acquired_at_ms: ago(120), released_at_ms: null },
@@ -560,7 +558,7 @@ const buildGoalFixtures = (): GoalFixture[] => {
 
 const delay = () => new Promise((resolve) => window.setTimeout(resolve, 60))
 
-export const createMockDataModel = (): OpenDanDataModel => {
+export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => {
   const fx = buildFixtures()
   const goals = buildGoalFixtures()
   const goalEntries: RegistryEntry[] = goals.flatMap((g) =>
@@ -568,7 +566,6 @@ export const createMockDataModel = (): OpenDanDataModel => {
       entry(ep.sid, 'goal', 'goal', g.def.title, {
         run_state: ep.end ? 'finished' : 'waiting',
         outcome: ep.end ? 'succeeded' : undefined,
-        waiting_for: ep.end ? undefined : 'event',
         one_line_status: ep.end ? `Epoch ${ep.epoch} ended: ${ep.end}` : `Epoch ${ep.epoch}: waiting for the next activation`,
         updated_at_ms: g.def.updated_at_ms,
       }, { created_by: { principal: g.def.created_by.principal, via: g.def.created_by.via }, input_queue: `opendan/${ep.sid}/input` }),
@@ -599,7 +596,7 @@ export const createMockDataModel = (): OpenDanDataModel => {
     g.state.updated_at_ms = Date.now()
     if (keep === 'facts') Object.assign(g.state, { distance: undefined, pending: undefined, questions: undefined, last_activation: undefined })
     if (g.schedule.gate) g.schedule.gate.status = 'unknown'
-    goalEntries.push(entry(sid, 'goal', 'goal', g.def.title, { run_state: 'waiting', waiting_for: 'event', one_line_status: `Epoch ${epoch}: waiting for the next activation` }, { input_queue: `opendan/${sid}/input` }))
+    goalEntries.push(entry(sid, 'goal', 'goal', g.def.title, { run_state: 'waiting', one_line_status: `Epoch ${epoch}: waiting for the next activation` }, { input_queue: `opendan/${sid}/input` }))
     goalChange(g, start, { epoch, reason })
     return structuredClone(g.def)
   }
@@ -637,25 +634,28 @@ export const createMockDataModel = (): OpenDanDataModel => {
       source_session: null, conflict: null, last_error: 'Directory does not exist; locate the moved workspace to restore access.',
     },
   ]
+  const allOps = ['open_stream', 'describe', 'exec', 'read', 'write', 'edit', 'mkdir', 'stat', 'rename', 'remove', 'computer_inspect', 'computer_observe', 'computer_act', 'query', 'cancel']
   const runtimes: KnownRuntime[] = [
     {
-      version: 1, runtime_id: 'container', kind: 'container', name: 'Agent container',
-      description: "The environment the agent itself runs in; commands run directly. It is the agent's container: paths here are not the owner's host paths.",
-      runtime_host: 'mock-host', exec: { kind: 'native' }, roots: [`${ROOT}/workspaces`, '/home/devtest'],
-      capabilities: { network: true, os: 'linux' }, availability: 'available', builtin: true, default: false, computer: 'none',
-      baseline: 'extended', platform: { os: 'linux', arch: 'x86_64', shell: 'bash' },
-      baseline_check: { checked_at_ms: ago(60), missing: [], ok: true },
+      version: 4, runtime_id: 'private', name: 'Private runtime',
+      desc: "Your own environment: the agent's container. Commands run directly; paths here are not the owner's host paths.",
+      runtime_host: 'mock-host', connector: { type: 'native' }, enabled: true,
+      caps: { os: 'linux', arch: 'x86_64', shell: 'bash', desktop: false, baseline: 'extended', baseline_check: { checked_at_ms: ago(60), level: 'extended', missing: ['pandoc'], ok: false, ext: { status: 'partial', missing: ['pandoc'], system: ['ffmpeg', 'python3'] } } },
+      grant: { ops: allOps, roots: [], computer: 'none', install: 'system', workspace: true },
+      availability: 'available', builtin: true, default: false, lifecycle: 'active',
+      usage: { sessions_total: 12, last_used_at_ms: ago(300), last_session_id: UI, workspaces: 2, skill_commands: [] },
       revision: 1, registered_by: 'app:jarvis@devtest', registered_at_ms: ago(86400), updated_at_ms: ago(86400),
       checked_at_ms: ago(60), last_error: null,
     },
     {
-      version: 2, runtime_id: 'host', kind: 'host_native', name: 'Host machine',
-      description: "Node `desktop` (did:dev:mock): the owner's machine, where the owner's own files and tools are; commands and files go through its node executor.",
-      runtime_host: 'mock-host', exec: { kind: 'remote_node', remote_node: { node_did: 'did:dev:mock', profile_id: 'agent-0123456789ab' } },
-      roots: ['/Users/devtest'], capabilities: { enabled: true, node_id: 'desktop', os: 'macos', computer: 'observe' },
-      availability: 'available', builtin: true, default: true, computer: 'observe',
-      baseline: 'standard', platform: { os: 'macos', arch: 'aarch64', shell: 'zsh' },
-      baseline_check: { checked_at_ms: ago(60), missing: ['aicc-tool', 'gen_image'], ok: false },
+      version: 4, runtime_id: 'host', name: "Owner's desktop",
+      desc: "The owner's own machine (node `desktop`), shared with the owner: the owner's files and tools are here; commands and files go through its node executor.",
+      runtime_host: 'mock-host', connector: { type: 'node_executor', node_did: 'did:dev:mock', profile_id: 'agent-0123456789ab' }, enabled: true,
+      caps: { os: 'macos', arch: 'aarch64', shell: 'zsh', desktop: true, identity_mode: 'current_user', baseline: 'standard',
+        baseline_check: { checked_at_ms: ago(60), level: 'standard', missing: ['aicc-tool', 'gen_image'], ok: false, ext: { status: 'partial', missing: ['pandoc', 'tesseract'], system: ['ffmpeg'] } } },
+      grant: { ops: allOps.filter((op) => op !== 'computer_act'), roots: ['/Users/devtest'], computer: 'observe', install: 'none', workspace: true },
+      availability: 'available', builtin: true, default: true, lifecycle: 'active',
+      usage: { sessions_total: 1, last_used_at_ms: ago(370), last_session_id: WORK_RUNNING, workspaces: 1, skill_commands: [] },
       revision: 3, registered_by: 'app:jarvis@devtest', registered_at_ms: ago(86400), updated_at_ms: ago(600),
       checked_at_ms: ago(60), last_error: null,
     },
@@ -664,7 +664,17 @@ export const createMockDataModel = (): OpenDanDataModel => {
     runtimes: { host: { enabled: true, computer: 'observe', target: { kind: 'node', node_id: 'desktop', node_did: 'did:dev:mock' } } },
     default_runtime_id: 'host',
   }
-  const availableRuntimeIds = () => runtimes.filter((r) => r.availability === 'available').map((r) => r.runtime_id).concat('local')
+  if (nativeRuntime) {
+    const runtime = runtimes[0]
+    runtime.connector = { type: 'native', aliases: ['host'] }
+    runtime.name = "Owner's computer"
+    runtime.desc = 'Private and owner default share this native runtime. Shell and files execute locally; desktop operations use local IPC.'
+    runtime.default = true
+    runtime.caps = { ...runtimes[1].caps, baseline_check: { checked_at_ms: ago(60), level: 'standard', missing: [], ok: true, ext: { status: 'ok', missing: [], system: [] } } }
+    runtime.grant.computer = 'observe'
+    runtimes.splice(1)
+  }
+  const availableRuntimeIds = () => runtimes.filter((r) => r.availability === 'available').map((r) => r.runtime_id).concat('local', 'container')
   const findWorkspace = (workspaceId: string) => {
     const workspace = workspaces.find((record) => record.workspace_id === workspaceId)
     if (!workspace) throw new OpenDanError('not_found', `workspace ${workspaceId} is not registered`)
@@ -829,11 +839,20 @@ export const createMockDataModel = (): OpenDanDataModel => {
       return structuredClone(workspace)
     },
 
+    runtimeExtTools: async (runtimeId) => ({
+      runtime_id: runtimeId,
+      tools_root: '/opt/buckyos/tools',
+      managed_by: runtimeId === 'private' ? 'node_volume' : 'node',
+      packages: { 'ext-core': { version: '1.1.0', origin: 'seed', commands: { ffmpeg: 'ffmpeg version 9.0.2' } } },
+    }),
     checkRuntime: async (runtimeId) => {
       await delay()
       const runtime = runtimes.find((r) => r.runtime_id === runtimeId)
       if (!runtime) throw new OpenDanError('not_found', `runtime ${runtimeId} is not registered`)
       runtime.checked_at_ms = Date.now()
+      if (runtime.runtime_id === 'private') {
+        runtime.caps.baseline_check = { checked_at_ms: Date.now(), level: 'extended', missing: [], ok: true, ext: { status: 'system', missing: [], system: ['ffmpeg', 'python3'] } }
+      }
       return structuredClone(runtime)
     },
 
@@ -844,25 +863,28 @@ export const createMockDataModel = (): OpenDanDataModel => {
 
     setRuntimeSetting: async (patch) => {
       await delay()
-      const entry = runtimeSettings.runtimes[patch.runtime_id]
-      if (patch.runtime_id !== 'container' && !entry) throw new OpenDanError('invalid_argument', `runtime ${patch.runtime_id} is not one of this agent's runtimes`)
+      const record = runtimes.find((r) => r.runtime_id === patch.runtime_id)
+      const settingId = record?.connector.type === 'native' ? (record.connector.aliases?.[0] ?? 'container') : patch.runtime_id
+      const entry = runtimeSettings.runtimes[settingId]
+      if (settingId !== 'container' && !entry) throw new OpenDanError('invalid_argument', `runtime ${patch.runtime_id} is not one of this agent's runtimes`)
       if (entry) {
         if (patch.enabled !== undefined) entry.enabled = patch.enabled
         if (patch.computer) entry.computer = patch.computer
         if (patch.baseline !== undefined) entry.baseline = patch.baseline
       }
-      if (patch.default === true) runtimeSettings.default_runtime_id = patch.runtime_id
-      if (patch.default === false && runtimeSettings.default_runtime_id === patch.runtime_id) runtimeSettings.default_runtime_id = 'container'
+      const asSetting = (id: string) => (id === 'private' ? (nativeRuntime ? 'host' : 'container') : id)
+      if (patch.default === true) runtimeSettings.default_runtime_id = asSetting(patch.runtime_id)
+      if (patch.default === false && runtimeSettings.default_runtime_id === asSetting(patch.runtime_id)) runtimeSettings.default_runtime_id = 'container'
       if (runtimeSettings.default_runtime_id !== 'container' && !runtimeSettings.runtimes[runtimeSettings.default_runtime_id]?.enabled) runtimeSettings.default_runtime_id = 'container'
       for (const r of runtimes) {
-        const chosen = runtimeSettings.runtimes[r.runtime_id]
-        r.default = runtimeSettings.default_runtime_id === r.runtime_id
+        const chosen = runtimeSettings.runtimes[asSetting(r.runtime_id)]
+        r.default = runtimeSettings.default_runtime_id === asSetting(r.runtime_id)
         if (chosen) {
-          r.computer = chosen.computer
-          r.baseline = chosen.baseline ?? 'standard'
+          r.grant.computer = chosen.computer
+          r.caps.baseline = chosen.baseline ?? 'standard'
+          r.enabled = chosen.enabled
           r.availability = chosen.enabled ? 'available' : 'runtime_unavailable'
           r.last_error = chosen.enabled ? null : 'the `host` runtime is not enabled for this agent'
-          r.exec = chosen.enabled ? r.exec ?? { kind: 'remote_node' } : null
         }
       }
       return structuredClone(runtimeSettings)
@@ -936,9 +958,9 @@ export const createMockDataModel = (): OpenDanDataModel => {
       inputIndex += 1
       log(sid, { t: 'control_applied', input: { src: 'queue', index: inputIndex, kind: 'control' }, command: 'stop', detail: reason ? { reason } : undefined })
       if (e.status.run_state !== 'finished') {
-        commit(e, { run_state: 'finished', outcome: 'stopped', waiting_for: undefined, turn_open: false, one_line_status: reason ? `Stopped: ${reason}` : 'Stopped' })
+        commit(e, { run_state: 'finished', outcome: 'stopped', needs_input: false, turn_open: false, one_line_status: reason ? `Stopped: ${reason}` : 'Stopped' })
         const st = fx.details[sid]?.state
-        if (st) Object.assign(st, { open_turn: undefined, waiting_for: undefined, stop_requested: true })
+        if (st) Object.assign(st, { open_turn: undefined, wait_children: undefined, stop_requested: true })
       }
       return { index: inputIndex }
     },

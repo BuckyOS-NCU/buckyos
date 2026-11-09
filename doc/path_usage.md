@@ -14,7 +14,8 @@
 /config/* =>  buckyos的system_config : 只读,扩展的system config配置读取,遵循system_config配置。写入需要通过SDK API
     /config/boot/config => buckyos的system_config的/boot/config
 /home/$username/ => cyfs://$zone_id/home/$username : 用户home目录，根据配置通常是只读或不可访问, 
-/home/$username/.local/share/$appid => cyfs://$zone_id/home/$username/.local/share/$appid ：app有读写权限的永久数据区，谨慎写入。会在app卸载时用户可选删除
+/home/$username/.local/share/$appid => cyfs://$zone_id/home/$username/.local/share/$appid ：app有读写权限的永久数据区，谨慎写入。会在app卸载时用户可选删除。新开发的 App 不在这里保存业务数据，改用声明的应用对象桶（见下文「数据放在哪里」）
+/home/$username/Apps/<App>/<桶>/ 、/home/$username/Collected/<App>/<桶>/ ：nfs-server 把用户 `documents` / `collected` 档的数据桶只读投影到这里（不是真实目录；删除文件 = 在桶里解绑）
 /mnt/alice.bns.did/pub/ => cyfs://alice.bns.did/pub/ ：buckyos支持的internet filesystem,由另一个zone配置权限
 /srv/library/ => cyfs://$zone_id/srv/library/ : zone级别的库数据，对zone外不可见，zone内默认所有用户都有读写权限，但是只对自己创建的文件有删除权限
 /srv/publish/ => cyfs://$zone_id/srv/publish/ : zone级别的分享数据，通常只读
@@ -39,7 +40,7 @@ Rust 服务和备份脚本支持 `BUCKYOS_SECURITY_ROOT`；显式目标目录的
 
 ```
 /opt/buckyos/instance => 每个 app instance 私有 Docker volume,读写+可执行
-/opt/buckyos/tools    => 节点共享 ExtTool volume,只读+可执行
+/opt/buckyos/tools    => 节点共享工具卷 buckyos-tools,只读+可执行(Linux 上就是 $buckyos_root/tools)
 ```
 
 Agent 容器另有两组只读 bind mount(普通 script 容器没有):
@@ -59,24 +60,42 @@ Agent 容器另有两组只读 bind mount(普通 script 容器没有):
 - `/opt/buckyos/instance/tools/bin`: App 私有 runtime bin 视图
 - `/opt/buckyos/instance/tools/<agent_id>/<session_id>`: OpenDAN Agent Session Exec Bin
 
-/opt/buckyos/tools 是 ExtTool 共享只读卷,常见结构:
+/opt/buckyos/tools 是节点共享工具卷的只读视图,结构与宿主机 `$BUCKYOS_ROOT/tools` 相同。只有 node_daemon 的 reconciler 写它(`buckyos_api::ext_tools_install`),见 [PIKG 格式 §5.1](pikg/format.md):
 
-- `/opt/buckyos/tools/store`: 系统/平台提供的可执行工具集合
-- `/opt/buckyos/tools/deno-cache`: 预热 deno cache lower
-- `/opt/buckyos/tools/uv-cache`: 预热 uv cache lower
+- `tools/bin/<launcher>`: 已启用扩展包的工具入口,从自身位置定位 `store/`;BuckyOS 发起的进程排在标准入口之前(host 上由 Node Executor 前置,容器由 `entrypoint.sh` 前置)
+- `tools/store/<pkg_id>`: 指向 `versions/` 当前版本的指针(符号链接,Windows 上是 junction)
+- `tools/versions/<pkg_id>/<version>-<digest12>/`: 解开的 payload,一旦写好不再改动;保留当前和上一个版本,回退不用下载
+- `tools/installs/<pkg_id>.json`: 安装事实(版本、摘要、来源 seed/desired、命令版本),Agent 从这里读
+- `tools/current.json`: 已激活版本总表
+- `tools/staging/`、`tools/journal.json`、`tools/.lock`: 安装过程用,校验与 smoke 通过才会进入 `versions/`
+- `tools/deno-cache`、`tools/uv-cache`: 种子镜像预热的缓存 lower(只有带种子镜像的节点有)
+- `tools/seed/`: 种子镜像带的 ext-core payload,解包后删除
+
+Agent 自己的工具缓存(`DENO_DIR`、`UV_CACHE_DIR`、`UV_PYTHON_INSTALL_DIR`、`NPM_CONFIG_CACHE`、`NPM_CONFIG_PREFIX`、`PIP_CACHE_DIR`,以及 `llm_understand_media` 展开长文档目录的 `LLM_UNDERSTAND_MEDIA_CATALOG_DIR`)不进 `tools/`,`HOME` 不改:
+
+| 形态 | 位置 |
+| --- | --- |
+| 容器 | `/opt/buckyos/instance/{deno-cache,uv-cache,uv-python,npm-cache,npm-prefix,pip-cache,media-catalog}` |
+| 原生私有 runtime(Desktop Lite) | `<AgentRoot>/.cache/{同上}` |
+| 节点 runtime(host) | `<账户 home>/.opendan/<agent_id>/cache/{同上}` |
+
+`media-catalog/<源文件对象 id>/` 是转换结果(workflow 步骤缓存)的本地展开,随时可删,下次调用按路径里的对象 id 重建;总量超过 `LLM_UNDERSTAND_MEDIA_CATALOG_MAX_BYTES`(默认 5 GiB)时工具按最近使用时间删旧的。没有这个变量时(单独运行 helper)退到系统临时目录。
 
 应用不能把运行时生成物写入 `/opt/buckyos/tools`;需要写入且可执行的内容放到 `/opt/buckyos/instance`。
 `/home/$username/.local/share/$appid` 仍是 app 的永久 user/app data,host 上对应
 `$buckyos_root/data/home/$username/.local/share/$appid`,不用于承载 session-bin 或依赖缓存 upper。
-OpenDAN 在该 App 数据目录下继续按 AgentId 隔离 AgentRootFS：
-`/home/$username/.local/share/$appid/agents/$agent_id`。
+OpenDAN 的 AgentRootFS 独立放在 owner home 的 `agents/` 下，按 AgentId 隔离：
+`/home/$username/agents/$agent_id`。
+目录名是完整 AgentId（例如 `xiaobai.test.buckyos.io`），不使用含冒号的 `did:web:...` 或短名。
+Agent 的 `BUCKYOS_DATA_DIR` 直接指向 AgentRootFS，模板、Session、记忆、工作区和已安装技能都在其中。
+当前开发版本直接使用新目录，不自动迁移或读取旧的 `.local/share/<app_id>/agents/<agent_id>`；旧目录不会因此删除。
 
 Agent 创建向导的 `permission_mode` 默认 `read_write`，可选 `read_only`。对应用户 home 的读写 / 只读挂载；AgentRoot 始终可读写，用户选择只读仍可保存 Session、记忆、工作区和技能。实际 Docker Worker 路径带 `/opt/buckyos/data` 前缀：
 
 | 目录 | 容器路径 | 宿主路径 | Agent 权限 |
 | --- | --- | --- | --- |
 | Owner home | `/opt/buckyos/data/home/<owner>/` | `$BUCKYOS_ROOT/data/home/<owner>/` | `permission_mode` 为 `read_write` 时读写，`read_only` 时只读 |
-| AgentRoot | `/opt/buckyos/data/home/<owner>/.local/share/<agent_id>/agents/<agent_id>/` | `$BUCKYOS_ROOT/data/home/<owner>/.local/share/<agent_id>/agents/<agent_id>/` | 始终读写 |
+| AgentRoot | `/opt/buckyos/data/home/<owner>/agents/<agent_id>/` | `$BUCKYOS_ROOT/data/home/<owner>/agents/<agent_id>/` | 始终读写 |
 | Agent 私有 storage | `/opt/buckyos/storage/` | `$BUCKYOS_ROOT/storage/apps/<runtime_key>/` | 始终读写，`runtime_key` 为 AppInstanceId 派生的目录键 |
 
 Agent 的 storage 不挂载宿主全局 `storage/`；其他 Worker 的既有 storage 映射不变。`BUCKYOS_ROOT` 本身可为符号链接，其下 Agent 使用的 home、App 数据、日志与私有 storage 挂载根不能经符号链接重定向。模板声明不能把只读 Owner home 重新开放为可写目录。API 访问还需经过用户与 runtime App 两侧的授权校验。`debug_jarvis.sh` / `opendan --dev` 直接运行在宿主进程环境中，文件访问受宿主进程权限约束，不提供 Docker 的只读挂载隔离。
@@ -93,6 +112,25 @@ cyfs://$this_zone_id/ => $buckyos_root/data/下
 桌面安装支持的和当前host-node的Home目录的融合，是通过link实现的，比如建立一个软链接
 $buckyos_root/data/home/$username/Documents => c:/users/alice/Documents
 
+## 数据放在哪里（服务与 App 通用）
+
+业务数据不再由进程自己在数据目录里写文件：结构化记录进 RDB instance，对象本体进 named store，保留意图用应用对象桶表达
+（`doc/arch/应用对象桶 Bucket 设计.md`，改造指南 `notepads/done/bucket-migration-todo.md`）。每个要落盘的数据项先回答四问：
+
+| 问 | 答案 | 去处 |
+| --- | --- | --- |
+| 是结构化业务记录、要按字段查询吗 | 是 | `buckyos-api::rdb_mgr` 的 RDB instance；表里存 ObjId 或 `(bucket_id, key, version)`，不存本机路径。系统服务一个 instance，多用户靠 `owner` 列 |
+| 是一个不可变的对象本体（消息、动态、包、便签、快照）吗 | 是 | named store `put_object` + `object` 桶绑定 |
+| 是非结构化字节（上传文件、图片、产物、导入目录）吗 | 是 | named store（上传链路 / `put_file`）+ `data` 桶绑定 |
+| 必须有文件系统语义吗（用户文件夹、可执行、被外部程序按路径打开、Agent 工作目录） | 是 | 文件系统，并在持久数据格式文档里写明理由 |
+
+- 写进 named store 的每一处都要回答“谁 pin”：某个桶，或处理期间持有的短期 Lease（≤24h）。ObjId 本身不带保留、不带读权。
+- 桶在包里声明：App 写 `dapp_meta/app.json` 的 `install_config.buckets`，系统服务写 scheduler `system_config_builder.rs` 里的 `spec_config.buckets`；
+  bucket_id 为 `user/<appid>/<user>/<name>` 或 `zone/<appid>/_/<name>`。
+- 读取一律 URL 化：浏览器 `/bucket/v1/<bucket_id>/<key>`，Agent / CLI `obj://bucket/<bucket_id>/<key>`。
+- 仍然使用目录的只有：`/tmp/buckyos/<svc>` 与 cache 分区里可重建的派生物、处理期间的临时文件、用户文件夹（Desktop、Downloads、Files 里的用户目录）、
+  Agent 的电脑（AgentRoot、Session 工作目录、`runs/`）、内核层（system-config、`security/`、kmsg 队列）和传统应用的兼容数据目录。
+
 ## 系统服务视角(kernel/frame service)
 
 服务通常需要通过buckyos-base的API把逻辑path映射到本机path(host-node-path)
@@ -101,6 +139,9 @@ $buckyos_root/data/home/$username/Documents => c:/users/alice/Documents
 
 
 ### 服务常用的目录
+
+业务数据进 RDB 与桶（见上节），下面的目录只剩临时数据与可重建的 cache；新服务不得在这些目录下自建 `objects/`、`chunks/` 之类的内容寻址存储，
+也不按路径打开 SQLite（经 `rdb_mgr`），RPC 与 RDB 里不保存本机路径。
 
 /config/services/$service_name/* :服务保存配置的在system_config
 $buckyos_service_data => cyfs://$zone_id/var/$service_name/ => $buckyos_root/data/var/$service_name : 服务有读写权限,系统卸载的时候会删除

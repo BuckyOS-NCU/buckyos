@@ -188,7 +188,7 @@ RecordObject、Cell、Container、AssetRef、Annotation 的 payload 都是“一
 
 | 标识 | 生成方 | 格式 | 说明 |
 | --- | --- | --- | --- |
-| `workspace_id` | 后台（创建/Fork/导入为新实例时） | `ws_` + 26 位小写 base32（130 bit 随机） | 恢复同一 Workspace 时沿用包内 ID |
+| `workspace_id` | 后台（创建/Fork/导入为新实例时） | `ws_` + `YYMM`（创建的 UTC 年月）+ 4 位 base36 `[0-9a-z]`（如 `ws_2611a0b3`；每月 36⁴ 个，随机起点、已占用则 +1，2026-11-01 由 26 位 base32 改短） | 恢复同一 Workspace 时沿用包内 ID；去掉 `ws_` 即子域标签 `aiws-2611a0b3.<zone>`。ID 不再是密钥：需要“持链接者可看”的保密语义时在链接后加长参数，不动域名 |
 | `entity_id`、`record_id`、`field_id`、`option_id`、`block_id` | **调用方**（客户端、Agent、Mock），以支持离线创建 | `^[a-z0-9][a-z0-9_-]{0,63}$` | 建议默认生成 20 位小写 base32（100 bit 随机）；fixtures 可用可读 ID 如 `tasks` |
 | `commit_id` | 后台 | `cm_` + 26 位 base32 | 与 `seq` 一一对应；对外引用用 `commit_id`，排序和追赶用 `seq` |
 | `idempotency_key` | 调用方 | 1–128 字节可见 ASCII | 作用域见 §2.6 |
@@ -998,6 +998,7 @@ pub fn diff_blocks(base: &Ast, target: &Ast) -> Vec<BlockOp>;              // �
 | `select` | string | 必须是该字段现有的 `option_id` |
 | `multi_select` | array of string | 元素须为现有 `option_id`；去重；规范顺序为 `option_id` 字节序（显示顺序按字段的 options 顺序，与存储顺序无关） |
 | `object_ref` | object | §2.4 引用结构；字段可声明 `target_types`（允许的目标 `type_id` 列表）；目标须存在且未删除 |
+| `currency` | object `{ amount, currency }` | 1.1 新增（表格数据导入 TODO §6）。字段必须声明默认币种 `currency`（ISO 4217 三位大写字母），`scale` 可选（0–18，缺省 2）。输入为该对象（`amount` 是 decimal 字串或 JSON number），或裸 decimal 字串 / number（取字段默认币种）；`amount` 按 `decimal` 规则规范化到字段 `scale`。规范形式 `{ "amount": "500.00", "currency": "CNY" }`：**币种总是显式落库**，改字段默认币种（`table.update_field` 的 `currency`）不改变已有值。不接受 `"$12"`、`"USD 12"` 这类带符号文本（符号与别名由导入层和编辑器解析）。排序按 (币种, 金额)；`lt/lte/gt/gte` 只命中与右值同币种的值，`eq/ne/in` 需同币种；不支持 `unique`，不能分组 |
 
 `date` 与 `datetime` 之间没有隐式转换。`number` 与 `decimal` 之间没有隐式转换。JSON number 中的大整数限制与 canonical 编码一致：ndn-lib 使用的 `serde_jcs` 对超过 2^53 的整数按原样输出，与 JS 端按双精度格式化的结果不同，所以在值层面直接禁止。
 
@@ -1079,7 +1080,7 @@ pub fn diff_blocks(base: &Ast, target: &Ast) -> Vec<BlockOp>;              // �
   "on_failure": "reject" }
 ```
 
-第一期必须实现的转换：`text → date`、`text → number`、`text → decimal(scale)`、`number → decimal(scale)`、`select → text`（值变为选项的 `label`）。其他组合返回 `INVALID_OPERATION`（子码 `MIGRATION_UNSUPPORTED`）。
+第一期必须实现的转换：`text → date`、`text → number`、`text → decimal(scale)`、`number → decimal(scale)`、`select → text`（值变为选项的 `label`）。1.1 为 `currency` 增加：`number → currency`、`decimal → currency`（补目标默认币种）、`currency → decimal`（丢币种）、`currency → text`（`"USD 12.00"`）、`currency → currency`（改 `scale`，币种不变）。其他组合返回 `INVALID_OPERATION`（子码 `MIGRATION_UNSUPPORTED`）。
 
 - 转换函数是 `core` 中的纯函数，严格解析：`text → date` 只接受 `YYYY-MM-DD`；`text → number/decimal` 只接受 §3.4.2 的规范输入语法（允许首尾 ASCII 空白）。不猜测本地化格式。
 - **预检**：对迁移操作调用 `prepare`，返回报告 `{ total, convertible, failing: { count, sample: [ { record_id, value } ≤100 ] }, unset }`，不修改任何状态。
@@ -1265,6 +1266,7 @@ Filter := { "op": "and" | "or", "args": [Filter, ...] }      // args 1..32 个
 - `object_id` 是 FileObject 的 ObjectId。【裁决】在 JSON 中一律使用 `类型:十六进制` 形式，这是 ndn-lib `ObjId` 的 serde 形式；base32 形式只出现在 URL 中。
 - `media_type`、`size` 由后台在登记时从已校验的内容得出，不采信客户端声明（客户端声明只作为 `file_name` 的来源）。
 - 替换图片 = `set_keys` 改 `object_id`（及随之变化的元数据），旧内容因历史引用继续保留。
+- 多媒体（2026-10-26）：另有 `poster`（描绘内容的图片资产）、`duration_ms`、`page_count`，见《BuckyOS AI Workspace 多媒体对象》§6。
 
 **上传与登记流程**（资产准备不在 Commit 的 ACID 范围内，顺序是“先有已验证内容，再提交引用”）：
 

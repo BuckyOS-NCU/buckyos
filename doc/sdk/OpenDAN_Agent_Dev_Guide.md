@@ -50,7 +50,7 @@ MCP 和进程内 host tool 也遵循同一方向：优先由 CLI 客户端或宿
 - 需要当前 run 的内存状态或控制权时，通过宿主桥接访问。CLI 是接口形态，不要求所有后端状态都存在于 CLI 子进程中。
 - 桥接必须保留调用所属的 run、call 身份，以及存在时的 Session 身份；由拥有状态的执行器校验请求、提交变更和处理恢复，CLI 不直接改写驱动者持锁维护的状态。
 
-当前 `shell` 已支持识别简单命令 stdout 中的 `AgentToolResult` 并转发；含管道等 shell 运算符的复合命令不走同一结构化直传路径。依赖 `Pending` 等控制语义时，应使用直接的 CLI 调用，见 [ShellTool 实现](../../src/frame/agent_tool/src/llm_bash.rs)。
+当前 `shell` 已支持识别简单命令 stdout 中的 `AgentToolResult` 并转发；含管道等 shell 运算符的复合命令不走同一结构化直传路径。依赖 `pending` + `task_id`（工作转成 task，由 runtime 在等待预算内等、到期返回“仍在运行”）等控制语义时，应使用直接的 CLI 调用，见 [ShellTool 实现](../../src/frame/agent_tool/src/llm_bash.rs)。shell 命令的环境里有 `XLLM_RUN_ID` / `XLLM_CALL_ID`，命令可以用它们导出幂等键，同一次调用重跑时找回已创建的任务而不是再建一个。
 
 ### 2.3 访问 BuckyOS 的工具：TypeScript + buckyos-websdk
 
@@ -66,12 +66,12 @@ xllm 等 runtime 层能力保留 Rust 实现。Agent 派生的脚本写到 `$OPE
 
 ### 2.4 cmd_skills：随 Session 冻结的命令手册
 
-cmd_skill 是一类事的命令手册（`cmd_skills/<name>.md`，front matter 写 `name` / `description` / `requires` / `baseline` / `platforms`）加可选的命令（`tools/<name>/bin`）。它是捷径不是规定：手册写“可以这样做、这样做更快更稳”，Agent 有更合适的做法时可以不用。
+cmd_skill 是一类事的命令手册（`cmd_skills/<name>.md`，front matter 写 `name` / `description` / `requires` / `baseline` / `platforms` / `commands`）加可选的命令（`tools/<name>/bin`）。它是捷径不是规定：手册写“可以这样做、这样做更快更稳”，Agent 有更合适的做法时可以不用。`commands: ffmpeg, ffprobe` 只写手册依赖的命令名：系统据此告诉 owner 缺什么、启用哪个扩展包能补上（`buckyos skill status`），缺命令永远不阻止安装或使用，用户自己装的同名命令同样算有。
 
-- 适用环境：`baseline: standard | extended`（缺省 standard）说明手册在哪种 session-runtime 上有效——standard 只用标准环境的命令（清单见 `xagent runtime baseline`：`agent-session`、`llm_understand_media`、`agent_tool xllm`、`xagent`、`buckyos`、`aicc-tool` 及其媒体命令），用到 ffmpeg、ImageMagick、构建工具链等第三方工具的写 `extended`；`platforms: linux, macos, windows`（逗号分隔，缺省全部）。`requires` 仍是给人读的说明，具体工具名写在正文，由 Agent 运行时自查。这两个字段不是这几个固定词时安装被拒。
+- 适用环境：`baseline: standard | extended`（缺省 standard）说明手册在哪种 session-runtime 上有效——standard 只用标准环境的命令（清单见 `xagent runtime baseline`：`agent-session`、`llm_understand_media`、`agent_tool xllm`、`xagent`、`buckyos`、`aicc-tool` 及其媒体命令），用到 ffmpeg、ImageMagick 等扩展工具（`xagent runtime baseline --level extended`）的写 `extended`，构建工具链等清单外的依赖也写 `extended` 并在正文说明；`platforms: linux, macos, windows`（逗号分隔，缺省全部）。`requires` 仍是给人读的说明，具体工具名写在正文，由 Agent 运行时自查。这两个字段不是这几个固定词时安装被拒。
 - 生效：Session 创建冻结 cmd_skills 时按其 session-runtime 声明的基线与平台过滤（Workspace 的 runtime 不参与）；不满足的手册不注入，在 `## Commands` 末尾列出原因。Work / Todo 显式点名的手册不满足时直接拒绝创建（Todo 留在 pending 并记下原因）；继承来的在子 Session 的 runtime 上重新解析。容器声明为 extended，节点 runtime 由 owner 在 Agent 设置里声明（缺省 standard）。
 
-- 选择：Work 在创建时选定，最多 8 个（`agent-session create-worksession --cmd-skill <name>`，可重复），由意图分析、Goal、PLAN/DO 从 `agent-session skill list` 中挑选；未指定时子 Work 继承父 Work 的选择，UI 的 `ui_core` 与 Goal 的 goal_skills 不会自动注入 Work。UI Session 用 `agent.toml [session.<class>] default_cmd_skills`。
+- 选择：Work 在创建时选定，最多 8 个（`agent-session create-worksession --cmd-skill <name>`，可重复），由意图分析、Goal、plan session（Todo 的 `--skill`）从 `agent-session skill list` 中挑选；未指定时子 Work 继承父 Work 的选择，UI 的 `ui_core` 与 Goal 的 goal_skills 不会自动注入 Work。UI Session 用 `agent.toml [session.<class>] default_cmd_skills`。
 - 装配：选中的手册按顺序整篇进入系统段末尾的 `## Commands`，随 Session 冻结；运行中不切换、不追加，安装 / 更新 / 删除只影响之后创建的 Session。
 - 安装：skill 包是 `app_type = agent_skills` 的 PIKG（`buckyos pikg init --kind agent-skills`），`agent_skills` 子包内分 `cmd_skills/`、`goal_skills/`、`tools/`。用户用 `buckyos skill install <x.pikg> --agent <agent_id>`（opendan kRPC `skills.install`），Agent 用 `agent-session skill install <x.pikg | dir>`；安装记录在 `.meta/skills.json`，Agent 模板升级不覆盖、不删除已安装的 skill。Agent 模板也可以在自己的 PIKG 里带 `agent_skills` 子包，随模板同步。
 - 维护：手册是对应功能的交付物，改 CLI / 协议 / 运行路径时同步更新，见仓库根 `AGENTS.md` 的“cmd_skills 联动维护”。
@@ -87,25 +87,26 @@ cmd_skill 是一类事的命令手册（`cmd_skills/<name>.md`，front matter �
 - 查询、等待和取消当前 runtime 管理的 task。
 - 按需发现执行环境中的命令和用法。
 
-这些能力不应以 `agent-session`、SessionRunner 或在线 BuckyOS task-mgr 为前提。需要上层状态的 CLI 可以依赖对应宿主，但通用 runtime task 的 CLI 入口应由 xllm/runtime 层提供。
+这些能力不应以 `agent-session`、libopendan 的 Session runner（`runner::drive`）或在线 BuckyOS task-mgr 为前提。需要上层状态的 CLI 可以依赖对应宿主，但通用 runtime task 的 CLI 入口应由 xllm/runtime 层提供。
 
 ### 3.2 当前 wait_task 的语义
 
-**当前实现：独立 xllm 已允许模型调用 `wait_task`。** 启用工具、选择内置 `bash` 组且 `shell.mode = auto` 时，会同时注册 `wait_task`、`get_task_state`、`cancel_task`。默认 shell 模式为 `auto`。
+**当前实现：独立 xllm 已允许模型调用 `wait_task`。** loop 里不等待，任何等待都是 task：工具在调用内只等 runtime 的等待预算（`.llm_context` 的 `runtime.task_wait_ms`，缺省 30 秒、上限 30 分钟），到期仍未完成就返回一条普通结果“task X 仍在运行”。启用工具、选择内置 `bash` 组且预算小于 shell 命令超时（`timeout_ms`）时，会同时注册 `wait_task`、`get_task_state`、`cancel_task`。
 
 | 情况 | 行为 |
 |---|---|
-| `auto` 模式下 `shell` 命令在 `wait_ms` 内完成 | 直接返回结果 |
-| `auto` 模式等待到期，命令仍未完成 | 返回 task ID 和已有输出，模型可继续查询或等待 |
+| `shell` 命令在等待预算内完成 | 直接返回结果 |
+| 等待到期，命令仍未完成（有 task 管理器时） | 命令转成 task，返回 task ID 和已有输出，模型可继续查询或等待 |
+| 等待预算不小于命令超时 | shell 在调用内等命令结束，不注册 task 工具 |
 | 独立 xllm 调用 `wait_task` | 默认等 30 秒，单次工具内等待上限 30 分钟，同时受 run deadline 和打断约束；完成则返回结果，否则返回当时状态 |
-| `allow_deferred = false` | 在调用内等待，不把当前 run 挂起交给上层；不表示禁用 `wait_task` |
-| 宿主允许 deferred，且请求等待超过工具内上限 | `wait_task` 可以返回 `Pending`，由宿主承担后续等待和恢复 |
+| 独立 xllm 的模型停下时 task 仍在运行 | run 停为 `paused`；`xllm --resume [--run <id>] [message]` 把消息作为新输入注入同一快照并续跑 |
+| 在 Agent Session 中 | 结果的提示说明 task 的结束会作为输入回来、不必等待；Session 在 loop 之外跟进 task，结束时以 `<<task_result>>` 输入交回同一个 run（[Session Input Protocol](<../opendan/protocol/Session Input Protocol.md>) §9） |
 
-工具内等待、宿主持久挂起是两个层次。独立 xllm 无须依赖上层 Session 就能等待 task；支持等待也不自动承诺 task 在执行器退出后继续运行或可恢复。对 `wait_task` 而言，等待到期或取消等待不等于取消 task；停止任务应通过显式取消请求完成，不支持取消时应明确返回这一结果。
+调用内等待与 Session 在 loop 之外跟进是两个层次。独立 xllm 无须依赖上层 Session 就能等待 task；支持等待也不自动承诺 task 在执行器退出后继续运行或可恢复。对 `wait_task` 而言，等待到期或取消等待不等于取消 task；停止任务应通过显式取消请求完成，不支持取消时应明确返回这一结果。
 
 ### 3.3 task 能力 CLI 化的目标
 
-目标是让模型通过稳定的 shell 入口调用任务命令。**已实现**（2026-10-17，[先行 TODO](../../notepads/llm-context-chat-prompt-prereq-todo.md) P3）：在 Agent Session 中是
+目标是让模型通过稳定的 shell 入口调用任务命令。**已实现**（2026-10-17，[先行 TODO](../../notepads/done/llm-context-chat-prompt-prereq-todo.md) P3）：在 Agent Session 中是
 
 ```xml
 <actions>
@@ -118,7 +119,7 @@ cmd_skill 是一类事的命令手册（`cmd_skills/<name>.md`，front matter �
 
 命令必须连接当前 xllm/runtime 的同一个 task resolver，复用状态、输出、等待和取消语义。不能简单把 `get_task_state` 别名到现有 `check_task`：后者查询 BuckyOS task-mgr，不覆盖当前 runtime 的 `local:` task；现有同名 CLI `cancel_task` 也有这一差别。
 
-SessionRunner 可以为这个基础层增加宿主任务解析、进程外等待和持久恢复。桥接入口不应反向要求独立 xllm 先创建 Session。
+libopendan 的 Session runner 可以为这个基础层增加宿主任务解析、在 loop 之外跟进 task（结束作为输入交回）和持久恢复。桥接入口不应反向要求独立 xllm 先创建 Session。
 
 实现 CLI 入口并验证等价性之后，再安排模型工具/action 集合的一次性收敛；不能先移除 task 工具而让长命令失去跟进入口。
 
@@ -130,7 +131,7 @@ SessionRunner 可以为这个基础层增加宿主任务解析、进程外等待
 |---|---|---|
 | runtime task 查询、等待、取消 | 同一 resolver、task 身份、等待上限、打断与结果读取 | 模型已有工具；缺少等价 CLI 桥 |
 | `report` / `<report end="true">` | 提交报告、固化产物；最终报告还需校验未完成工作、完成当前上下文并停止执行后续调用 | 没有提交当前 run 报告的 CLI；写出 `report.md` 不等于提交 |
-| `call_behavior` | 当前 Session 内的子 context 调用栈、fork 历史、调用身份、挂起与结果回填 | 没有等价 CLI；`create-worksession` 创建独立子 Session，不能替代 fork / create_sub_context |
+| `call_behavior` | 当前 Session 内的子 context 调用栈、fork 历史、调用身份、登记后在本段结束时交接、结果以 `<process_result>` 输入交回 | 没有等价 CLI；`create-worksession` 创建独立子 Session，不能替代 fork / create_sub_context |
 | `next_behavior` / `WAIT_USER_MSG` | 在规定的提交点切换、等待或关闭 Turn，遵循当前 Session 策略 | 当前属于回复协议字段，没有等价 CLI |
 | MCP / 自定义 host tool | 后端调用、错误和结果语义；需要时关联当前 run | 默认 CLI 尚无通用动态接入桥 |
 
@@ -138,7 +139,7 @@ SessionRunner 可以为这个基础层增加宿主任务解析、进程外等待
 
 控制请求还需定义幂等、checkpoint、恢复和同一批次中后续调用的处理。本文不新增控制命令名称，也不要求立即撤掉现有稳定控制协议。
 
-已有可复用的例子是 `agent-session create-worksession --wait` 和 `agent-session wait <sid>`：CLI 返回带 `session:<sid>` 的 `Pending` 结果，shell 转发给宿主处理。因此，“需要挂起”本身也不构成 CLI 化障碍。见 [xagent 实现](../../src/frame/lib_opendan/src/bin/xagent.rs)。
+子 Session 不需要等：它的结束（或需要回答）作为下一条输入回来（`agent-session wait` 与 `create-worksession --wait` 已删除）。向用户提问是可复用的例子：websdk 的 `ask_user`（`src/tools/buckyos-agent/commands/ask_user.ts`）发一条 `input` 通知，返回该通知任务的 pending 结果，回答就是任务结果。因此，“需要等待”本身也不构成 CLI 化障碍：等待就是一个 task。见 [xagent 实现](../../src/frame/lib_opendan/src/bin/xagent.rs)。
 
 ## 5. 当前配置：用于理解存量实现
 
@@ -155,7 +156,7 @@ tool_whitelist = []
 action_whitelist = ["group:bash"]
 ```
 
-当前 Jarvis 的 plan / do 使用这类配置，且在 Agent 的基础 `[llm_context.tools]` 中设置 `enabled = true`。
+Jarvis 已不再有 behavior loop 的 Session（2026-11-02 删除 `plan` / `do`）：Work 的缺省 behavior 是 `plan_simple`（原生 function call，`tool_whitelist = ["group:bash", "report"]`、`call_intent = true`、`workspace = "read_only"`），其 Todo 由 `work_simple` / `explore` 的 work session 执行；Agent 的基础 `[llm_context.tools]` 设置 `enabled = true`。上面的 `mode = "behavior"` 写法仍被支持，用于理解 behavior loop 的配置。
 
 | 字段或写法 | 当前含义 |
 |---|---|
@@ -163,9 +164,10 @@ action_whitelist = ["group:bash"]
 | `action_whitelist` | 映射到 `tools.actions`，作为 behavior XML action 暴露 |
 | 不写某个 whitelist | 保留 Session 中对应的基础配置 |
 | 显式 `[]` | 清空对应列表，不补回默认组 |
-| `group:bash` | 唯一内置组：`shell`、`read_file`、`write_file`、`edit_file`；auto 模式另加三个 task 工具 |
+| `group:bash` | 唯一内置组：`shell`、`read_file`、`write_file`、`edit_file`；等待预算小于命令超时时另加三个 task 工具 |
 | 普通名称 | 查询宿主注册的具名工具，不是在内置组中挑选同名成员 |
 | `call_intent = true` | 只用于 function_call：宿主给每个原生函数的 schema 加 required 的 `intent`，执行前校验（缺失 / 空白 / 非字符串 → 可修正错误，调用不执行），交给工具前去掉，原始参数保留在快照与 worklog；Jarvis `plan_simple` 使用 |
+| `workspace = "read_only"` | 以它为入口的 Session 只读 Workspace：绑定为只读、不取写者租约、不阻挡写它的子 Session；文件工具本来只写工作目录，shell 不受限（提示词约束）；Jarvis `plan_simple` 使用 |
 
 因此，上述配置的实际效果是无原生 tools，整个 bash 组作为 actions 提供，包含 task 工具。**这是当前实现与 CLI 优先目标之间的差距，不能据此继续把所有新能力展开成 action。**
 
@@ -179,9 +181,9 @@ action_whitelist = ["group:bash"]
 
 ### 6.1 已具备的基础
 
-- `agent_tool` CLI 已覆盖文件读写、搜索、对象访问、todo、memory、notebook、attention 相关能力；另有模型调用和媒体分析子命令。
+- `agent_tool` CLI 已覆盖文件读写、搜索、对象访问、todo、memory、notebook 相关能力；另有模型调用和媒体分析子命令。
 - `agent-session` 已提供子 Session 创建、等待、输入投递，以及 `ctl subscribe/unsubscribe` 等控制命令。事件订阅不能再仅因涉及 Session 状态就被视为必须保留独立 action。
-- shell 已有结构化结果转发；CLI 发起子 Session 等待已有实际路径。
+- shell 已有结构化结果转发；CLI 发起的子 Session 等待与向用户提问（`ask_user`）都已是 task 路径。
 
 ### 6.2 尚需收敛的地方
 
@@ -204,7 +206,7 @@ action_whitelist = ["group:bash"]
 | 内容 | 入口 |
 |---|---|
 | xllm 工具来源、提示词与结果装配 | [xllm.rs](../../src/frame/agent_tool/src/xllm.rs) |
-| runtime task 工具与 resolver | [tasks.rs](../../src/frame/agent_tool/src/tasks.rs) |
+| runtime task 工具与 resolver | [task_model.rs](../../src/frame/agent_tool/src/task_model.rs)（task 模型、等待预算、“仍在运行”结果）、[tasks.rs](../../src/frame/agent_tool/src/tasks.rs) |
 | shell 执行与 CLI 结果转发 | [llm_bash.rs](../../src/frame/agent_tool/src/llm_bash.rs) |
 | Agent CLI 命令与分发 | [agent_tool_cli_dev](../../src/frame/agent_tool_cli_dev/src/lib.rs) |
 | Session CLI | [xagent.rs](../../src/frame/lib_opendan/src/bin/xagent.rs) |

@@ -13,6 +13,7 @@
 pub mod access;
 pub mod acl;
 pub mod auth;
+pub mod bucket;
 pub mod config;
 pub mod copy;
 pub mod containers;
@@ -22,7 +23,10 @@ pub mod fsutil;
 pub mod handle;
 pub mod mutate;
 pub mod namespace;
+pub mod obj_provider;
 pub mod ndm;
+pub mod ndn;
+pub mod preview;
 pub mod reconciler;
 pub mod search;
 pub mod server;

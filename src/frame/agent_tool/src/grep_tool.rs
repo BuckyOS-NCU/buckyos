@@ -110,6 +110,10 @@ pub struct GrepOutput {
 
 #[async_trait]
 impl TypedTool for GrepTool {
+    fn idempotent(&self) -> bool {
+        true
+    }
+
     type Args = GrepArgs;
     type Output = GrepOutput;
 
@@ -461,7 +465,7 @@ async fn run_ripgrep(
 
     rg_args.push(display_search_arg(root_dir, search_path));
 
-    let output = Command::new("rg")
+    let output = buckyos_api::hide_child_console_async(&mut Command::new("rg"))
         .current_dir(root_dir)
         .args(&rg_args)
         .stdout(Stdio::piped())
@@ -758,7 +762,7 @@ mod tests {
         std_fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").expect("write");
         std_fs::write(dir.path().join("src/app.ts"), "function main() {}\n").expect("write");
 
-        let tool = TypedToolHandle::with_null_host(GrepTool::new(FileToolConfig::new(dir.path())));
+        let tool = TypedToolHandle::new(GrepTool::new(FileToolConfig::new(dir.path())));
         let result = AgentTool::call(
             &tool,
             &ctx(),
@@ -780,7 +784,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         std_fs::write(dir.path().join("notes.txt"), "alpha\nbeta\ngamma\n").expect("write");
 
-        let tool = TypedToolHandle::with_null_host(GrepTool::new(FileToolConfig::new(dir.path())));
+        let tool = TypedToolHandle::new(GrepTool::new(FileToolConfig::new(dir.path())));
         let result = AgentTool::call(
             &tool,
             &ctx(),
@@ -805,7 +809,7 @@ mod tests {
         std_fs::write(dir.path().join("one.txt"), "hit\nhit\n").expect("write");
         std_fs::write(dir.path().join("two.txt"), "hit\n").expect("write");
 
-        let tool = TypedToolHandle::with_null_host(GrepTool::new(FileToolConfig::new(dir.path())));
+        let tool = TypedToolHandle::new(GrepTool::new(FileToolConfig::new(dir.path())));
         let result = AgentTool::call(
             &tool,
             &ctx(),

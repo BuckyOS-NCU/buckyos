@@ -36,13 +36,20 @@ pub struct SessionStatus {
     pub report_brief: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_decision: Option<Value>,
-    /// What a waiting session waits for (a parent tells "needs input" from
-    /// "waits for a tool / its own sub sessions").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub waiting_for: Option<super::state::WaitingKind>,
+    /// It waits and only someone's input can move it (a parent tells "asks
+    /// for an answer" from "waits for its own tasks / sub sessions").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_input: bool,
     /// A Turn is open (work in progress, or waiting inside it).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub turn_open: bool,
+    /// Paused (`control(pause)`): it infers no more until resumed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
+    /// Backing off after retryable errors: it infers again from then on
+    /// (epoch ms; [`super::state::SessionState::retry`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_not_before_ms: Option<u64>,
     #[serde(default)]
     pub activity: Activity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,8 +81,10 @@ impl SessionStatus {
             one_line_status: String::new(),
             report_brief: String::new(),
             pending_decision: None,
-            waiting_for: None,
+            needs_input: false,
             turn_open: false,
+            paused: false,
+            retry_not_before_ms: None,
             activity: Activity::default(),
             last_runner: None,
             last_error: None,
@@ -116,6 +125,8 @@ pub struct RegistryEntry {
     pub artifact_id: Option<String>,
     #[serde(default)]
     pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Initial activity declaration copied from the session scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<super::config::Scope>,
@@ -133,16 +144,19 @@ pub struct RegistryEntry {
 
 /// One line of `state/perception/<sid>.jsonl` (Memory requirements A.5).
 ///
-/// Runtime records (`run_digest`, `task_outcome`, `task_discarded`) only feed
-/// consolidation; `observation` records are what Sessions write. After a
-/// consolidation disposes a record, cleanup keeps the line with its identity,
-/// key, source and `cleared` marker and drops the body.
+/// Sessions write `observation` records (`ctl perceive`). The Runtime kinds
+/// (`run_digest`, `task_outcome`, `task_discarded`) are no longer written
+/// (2026-11-08): progress stays in the Task / Goal; lines of those kinds in
+/// existing files are still parsed but are neither material nor changes.
+/// After a consolidation disposes a record, cleanup keeps the line with its
+/// identity, key, source and `cleared` marker and drops the body.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PerceptionRecord {
     pub seq: u64,
     pub at_ms: u64,
     pub session_id: String,
-    /// `run_digest | observation | task_outcome | task_discarded`.
+    /// `observation`; legacy files also hold `run_digest | task_outcome |
+    /// task_discarded`.
     pub kind: String,
     /// `session | self`.
     #[serde(default = "session_source")]
@@ -242,7 +256,8 @@ impl PerceptionRecord {
         format!("{}:{}", self.session_id, self.seq)
     }
 
-    /// Written by the Runtime, not observed by a Session (A.9).
+    /// A legacy Runtime record (no longer written): not observed by a
+    /// Session, never material nor a change (A.9).
     pub fn is_runtime(&self) -> bool {
         matches!(self.kind.as_str(), "run_digest" | "task_outcome" | "task_discarded")
     }

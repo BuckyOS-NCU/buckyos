@@ -13,7 +13,7 @@
 //! versions) and the Agent-level locks depend on flock and stay with the
 //! processes that see the AgentRoot.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -110,7 +110,8 @@ fn out<T: Serialize>(v: T) -> Result<Value> {
 pub fn is_write(method: &str) -> bool {
     matches!(
         method,
-        "sessions.register"
+        "sessions.reserve_id"
+            | "sessions.register"
             | "sessions.post_input"
             | "sessions.verify"
             | "cognition.notebook_append"
@@ -126,7 +127,9 @@ pub fn is_write(method: &str) -> bool {
             | "runtimes.register"
             | "runtimes.update"
             | "runtimes.check"
+            | "runtimes.ext_tools_check"
             | "runtimes.unregister"
+            | "runtimes.note_usage"
             | "goals.create"
             | "goals.revise"
             | "goals.set_status"
@@ -170,6 +173,18 @@ pub async fn serve_call(
             "agent_did": agent.agent_did(),
             "agent_id": agent.agent_id(),
         })),
+        "sessions.reserve_id" => match (
+            arg::<SessionKind>(params, "kind"),
+            arg::<String>(params, "key"),
+            arg::<Option<PathBuf>>(params, "parent_dir"),
+        ) {
+            (Ok(kind), Ok(key), Ok(parent)) => agent
+                .sessions()
+                .reserve_id(kind, &key, parent.as_deref())
+                .await
+                .and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
         "sessions.register" => match arg::<RegistryEntry>(params, "entry") {
             Ok(entry) if entry.created_by.principal != who => Err(OpenDanError::InvalidArgument(
                 format!("entry.created_by is {}, the caller is {who}", entry.created_by.principal),
@@ -310,11 +325,30 @@ pub async fn serve_call(
             (Err(e), _) | (_, Err(e)) => Err(e),
         },
         "runtimes.check" => match arg::<String>(params, "runtime_id") {
-            Ok(id) => agent.runtimes().check(&id).await.and_then(out),
+            Ok(id) => {
+                let commands: Vec<String> = params
+                    .get("commands")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| OpenDanError::InvalidArgument(format!("param `commands`: {e}")))
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let full = params.get("full").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                agent.runtimes().check(&id, &commands, full).await.and_then(out)
+            }
+            Err(e) => Err(e),
+        },
+        "runtimes.ext_tools" | "runtimes.ext_tools_check" => match arg::<String>(params, "runtime_id") {
+            Ok(id) => agent.runtimes().ext_tools(&id, method == "runtimes.ext_tools_check").await.and_then(out),
             Err(e) => Err(e),
         },
         "runtimes.unregister" => match (arg::<String>(params, "runtime_id"), arg::<u64>(params, "expected_revision")) {
             (Ok(id), Ok(revision)) => agent.runtimes().unregister(&id, revision, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "runtimes.note_usage" => match (arg::<String>(params, "runtime_id"), arg::<RuntimeUsageEvent>(params, "event")) {
+            (Ok(id), Ok(event)) => agent.runtimes().note_usage(&id, &event).await.and_then(out),
             (Err(e), _) | (_, Err(e)) => Err(e),
         },
         "workspaces.set_runtime_available" => match (arg::<String>(params, "runtime_id"), arg::<bool>(params, "available")) {
@@ -588,6 +622,19 @@ impl KrpcAgentStateClient {
 
 #[async_trait]
 impl SessionRegistry for KrpcAgentStateClient {
+    async fn reserve_id(
+        &self,
+        kind: SessionKind,
+        key: &str,
+        parent_dir: Option<&Path>,
+    ) -> Result<String> {
+        self.call(
+            "sessions.reserve_id",
+            json!({ "kind": kind, "key": key, "parent_dir": parent_dir }),
+        )
+        .await
+    }
+
     async fn register(&self, entry: RegistryEntry, _who: &str) -> Result<RegistryEntry> {
         self.call("sessions.register", json!({ "entry": entry })).await
     }
@@ -707,6 +754,9 @@ impl BehaviorCatalog for KrpcAgentStateClient {
     }
     async fn skills(&self, kind: Option<SkillKind>) -> Result<Vec<SkillMeta>> {
         self.call("skills.list", json!({ "kind": kind })).await
+    }
+    async fn skills_status(&self, runtime_id: Option<&str>) -> Result<serde_json::Value> {
+        self.call("skills.status", json!({ "runtime_id": runtime_id })).await
     }
     async fn install_skills(
         &self,
@@ -894,15 +944,21 @@ impl RuntimeRegistry for KrpcAgentStateClient {
     async fn update(&self, runtime_id: &str, request: &RuntimeUpdate, _who: &str) -> Result<RuntimeRecord> {
         self.call("runtimes.update", json!({ "runtime_id": runtime_id, "request": request })).await
     }
-    async fn check(&self, runtime_id: &str) -> Result<RuntimeRecord> {
-        self.call("runtimes.check", json!({ "runtime_id": runtime_id })).await
+    async fn check(&self, runtime_id: &str, commands: &[String], full: bool) -> Result<RuntimeRecord> {
+        self.call("runtimes.check", json!({ "runtime_id": runtime_id, "commands": commands, "full": full })).await
     }
-    async fn unregister(&self, runtime_id: &str, expected_revision: u64, _who: &str) -> Result<()> {
+    async fn ext_tools(&self, runtime_id: &str, smoke: bool) -> Result<serde_json::Value> {
+        self.call(if smoke { "runtimes.ext_tools_check" } else { "runtimes.ext_tools" }, json!({ "runtime_id": runtime_id })).await
+    }
+    async fn unregister(&self, runtime_id: &str, expected_revision: u64, _who: &str) -> Result<RuntimeRecord> {
         self.call(
             "runtimes.unregister",
             json!({ "runtime_id": runtime_id, "expected_revision": expected_revision }),
         )
         .await
+    }
+    async fn note_usage(&self, runtime_id: &str, event: &RuntimeUsageEvent) -> Result<()> {
+        self.call("runtimes.note_usage", json!({ "runtime_id": runtime_id, "event": event })).await
     }
     async fn ensure_builtin(&self, _builtin: &[RuntimeRegister], _who: &str) -> Result<Vec<RuntimeRecord>> {
         Err(OpenDanError::Forbidden(

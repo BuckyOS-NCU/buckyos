@@ -7,7 +7,7 @@
 import type { Locator, Page } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { mainMenu, openCanvas, setCanvasMode, test, expect, type Api } from './fixtures'
+import { mainMenu, openCanvas, openWorkspacePage, setCanvasMode, test, expect, type Api } from './fixtures'
 
 const ALICE = 'tok-alice'
 const BOB = 'tok-bob'
@@ -399,10 +399,7 @@ test('P3-10 a share export leaves the speaker notes out; captions and paths trav
   // the package itself, through the API
   const exported = await api.rpc(ALICE, 'doc.export', { workspace_id: ws.workspace_id, mode: 'share', self_contained: true })
   expect(exported.manifest.notes_included).toBe(false)
-  const zip = await fetch(`${api.base}/export/${ws.workspace_id}/${exported.export_id}`, { headers: { authorization: `Bearer ${ALICE}` } })
-  const begin = await api.rpc(ALICE, 'ws.begin_import', {})
-  await fetch(`${api.base}/upload/${begin.upload_id}`, { method: 'PUT', headers: { authorization: `Bearer ${ALICE}` }, body: Buffer.from(await zip.arrayBuffer()) })
-  const imported = await api.rpc(ALICE, 'ws.import', { upload_id: begin.upload_id, semantics: 'new' })
+  const imported = await api.importPackage(ALICE, await api.download(exported.download), 'new')
   expect(imported.ok, JSON.stringify(imported)).toBe(true)
   const copy = imported.workspace_id
   expect((await pathOf(api, copy)).steps.length).toBe(5)
@@ -553,7 +550,21 @@ test('P3-14 a read-only show: turning pages, zoom, pointer and ink write nothing
   await page.mouse.up()
   await expect(page.getByTestId('aiws-stage-ink')).toHaveAttribute('data-strokes', '1')
   await shot(page, 'p3-14-ink')
+  // the marks stay with their page when the show moves on and comes back
+  await page.keyboard.press('ArrowLeft')
+  await onStep(page, 's1')
+  await page.keyboard.press('ArrowRight')
+  await onStep(page, 's2')
+  await expect(page.getByTestId('aiws-stage-ink')).toHaveAttribute('data-strokes', '1')
+  // undo takes the last stroke, clear the rest
+  await page.mouse.move(600, 600)
+  await page.mouse.down()
+  await page.mouse.move(700, 640, { steps: 6 })
+  await page.mouse.up()
+  await expect(page.getByTestId('aiws-stage-ink')).toHaveAttribute('data-strokes', '2')
   await page.getByTestId('aiws-show-ink-undo').click()
+  await expect(page.getByTestId('aiws-stage-ink')).toHaveAttribute('data-strokes', '1')
+  await page.getByTestId('aiws-show-ink-clear').click()
   await expect(page.getByTestId('aiws-stage-ink')).toHaveAttribute('data-strokes', '0')
   await page.getByTestId('aiws-show-exit').click()
   await expect(page.getByTestId('aiws-show')).toHaveCount(0)
@@ -566,9 +577,7 @@ test('P3-14 a read-only show: turning pages, zoom, pointer and ink write nothing
 test('P3-15 the prompter link: no login, notes, page turns, several prompters, a reloaded stage, dead after the show', async ({ page, browser, api }) => {
   const ws = await showWorkspace(api, `p3-15 ${Date.now()}`)
   // the stage runs in a tab of its own (its address survives a reload)
-  await page.addInitScript((value) => window.localStorage.setItem('aiworkspace.dev', JSON.stringify({ token: value })), ALICE)
-  await page.goto(`/workspace/${ws.workspace_id}`)
-  await expect(page.getByTestId('aiws-workspace')).toBeVisible({ timeout: 30_000 })
+  await openWorkspacePage(page, ALICE, ws.workspace_id)
   await startShow(page)
   await onStep(page, 's1')
   await page.getByTestId('aiws-show-link').click()

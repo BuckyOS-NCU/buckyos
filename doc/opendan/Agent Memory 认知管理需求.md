@@ -6,7 +6,7 @@
 
 **目标读者：系统架构负责人、Agent Memory / 整理 Goal 开发者、Session SDK 开发者**
 
-**关联文档：[《Agent Session SDK 化核心需求》](<Agent Session SDK化核心需求.md>)、[《OpenDAN Agent Session 架构设计》](<OpenDAN Agent Session架构设计.md>)、[多 Session 模拟 TODO](../../notepads/agent-memory-multi-session-simulation-todo.md)**
+**关联文档：[《Agent Session SDK 化核心需求》](<Agent Session SDK化核心需求.md>)、[《OpenDAN Agent Session 架构设计》](<OpenDAN Agent Session架构设计.md>)、[多 Session 模拟 TODO](../../notepads/done/agent-memory-multi-session-simulation-todo.md)**
 
 ## 1. 文档定位与核心问题
 
@@ -1261,7 +1261,7 @@ Work 结束后，用户再提修改，由 UI 基于有效产物形成新 Task、
 
 用户在修改里顺带表达长期偏好时（“这次改深灰，以后这个项目都别用亮色背景”），UI 除了追加修订，再写一条项目范围的感知。修订保证这次送达，感知供以后的任务召回，两者互不依赖。一次性调整不自动成为新任务的长期偏好（E-09）。
 
-Memory 一侧的边界场景见 [组件模拟 TODO §3.11](../../notepads/agent-memory-multi-session-simulation-todo.md#311-场景六-运行中-work-的修改不经过-memory)。
+Memory 一侧的边界场景见 [组件模拟 TODO §3.11](../../notepads/done/agent-memory-multi-session-simulation-todo.md#311-场景六-运行中-work-的修改不经过-memory)。
 
 ## 10. 可验收场景
 
@@ -1349,7 +1349,7 @@ Memory 一侧的边界场景见 [组件模拟 TODO §3.11](../../notepads/agent-
 | 阶段 | 内容 | 需求 | 验收 |
 |---|---|---|---|
 | 原则 | 所有阶段、所有使用方都遵守的边界 | M-01、M-02、M-30—M-34 | B-40—B-43，从 Session 接入阶段起验收 |
-| C 组件 | Memory 组件的数据、写入、查询、topic、半订阅、整理提交与清理；Session 用模拟客户端，整理决策预设，见[组件模拟 TODO](../../notepads/agent-memory-multi-session-simulation-todo.md) | M-04、M-05、M-07、M-10、M-15—M-17、M-19、M-20、M-23—M-25、M-29 | B-02—B-07、B-09、B-12、B-13、B-15—B-18、B-20、B-22—B-24、B-27—B-31、B-34、B-44、B-45、B-47、B-48、B-50、B-51；其中需要判断的场景用预设决策，只验证机制 |
+| C 组件 | Memory 组件的数据、写入、查询、topic、半订阅、整理提交与清理；Session 用模拟客户端，整理决策预设，见[组件模拟 TODO](../../notepads/done/agent-memory-multi-session-simulation-todo.md) | M-04、M-05、M-07、M-10、M-15—M-17、M-19、M-20、M-23—M-25、M-29 | B-02—B-07、B-09、B-12、B-13、B-15—B-18、B-20、B-22—B-24、B-27—B-31、B-34、B-44、B-45、B-47、B-48、B-50、B-51；其中需要判断的场景用预设决策，只验证机制 |
 | S Session 接入 | 默认写入入口、推理前观察、Task 修订、召回装配、整理 Goal 调度、任务失效联动、DID Object 访问 | M-03、M-08、M-09、M-12、M-13、M-18、M-21、M-22、M-26、M-27 | B-01、B-08、B-10、B-11、B-14、B-19、B-21、B-25、B-26、B-32、B-33、B-35—B-39、B-46（情境锚点由 Runtime 提供）；B-10、B-11、B-14、B-21、B-26、B-32 的组件部分先在 C 阶段用 fixture 验证 |
 | Q 模型质量 | 真实模型的写入筛选与认知综合质量，按 §10.3 的带标签样例评估 | M-06、M-11、M-14 | 用真实模型复验 B-04、B-05、B-20、B-28—B-31、B-34、B-46（按锚点解读）、B-49，以及 §10.1 的评估重点 |
 | 待决 | 依赖尚未确定的语义 | M-28 | — |
@@ -1420,16 +1420,16 @@ Memory 一侧的边界场景见 [组件模拟 TODO §3.11](../../notepads/agent-
 
 ## 附录 A：Memory 组件接口与数据模型
 
-本附录继承旧《Agent Memory Module — Memory Graph 核心组件规格 v2.10》（`Agent元能力/Agent Memory v2.md`，下称 v2.10）中仍然成立的接口设计，并按本文正文调整，读者不必再看 v2.10。“现状”按组件阶段（C）实施后的代码（2026-10-10）描述：Graph 在 `agent_tool/src/agent_memory/`（schema 3.0），两层的统一门面在 `lib_opendan/src/memory/`；仍要在 S 阶段接线的部分保留附录 B 的编号（TD-xx）。组件的可运行例子与测试见[组件模拟 TODO](../../notepads/agent-memory-multi-session-simulation-todo.md) §8。
+本附录继承旧《Agent Memory Module — Memory Graph 核心组件规格 v2.10》（`Agent元能力/Agent Memory v2.md`，下称 v2.10）中仍然成立的接口设计，并按本文正文调整，读者不必再看 v2.10。“现状”按组件阶段（C）实施后的代码（2026-10-10）描述：Graph 在 `agent_tool/src/agent_memory/`（schema 3.0），两层的统一门面在 `lib_opendan/src/memory/`；仍要在 S 阶段接线的部分保留附录 B 的编号（TD-xx）。组件的可运行例子与测试见[组件模拟 TODO](../../notepads/done/agent-memory-multi-session-simulation-todo.md) §8。
 
 ### A.1 分层与现有实现
 
 | 层 | 存什么 | 谁写 | 现有实现 |
 |---|---|---|---|
-| 感知层 | 未整理材料（§4） | 任何授权 Session（M-32）：Runtime 自动写运行摘要，模型经 `agent-session ctl perceive` 写观察 | lib_opendan `state/perception.rs`，按 Session 分文件 `<agent_root>/state/perception/<sid>.jsonl`；A.5 字段、幂等键、文件级短锁与清理已实现；库级写入口 `Memory::record_perception`（`ctl perceive` 经它写入，2026-10-23） |
+| 感知层 | 未整理材料（§4） | 任何授权 Session（M-32）：模型经 `agent-session ctl perceive` 写观察；Runtime 不写自动记录（2026-11-08 删除） | lib_opendan `state/perception.rs`，按 Session 分文件 `<agent_root>/state/perception/<sid>.jsonl`；A.5 字段、幂等键、文件级短锁与清理已实现；库级写入口 `Memory::record_perception`（`ctl perceive` 经它写入，2026-10-23） |
 | 认知层（Memory Graph） | 整理后的认知：对象、别名、证据观察、认知条目、关系，以及 occasion 提交日志 | 只有 Memory 整理 Goal（M-32）：组件门面只给持整理 lease 的 `Consolidator` 提交；`agent-memory` CLI 的写命令在 Session shell 内拒绝（TD-02，2026-10-23） | agent_tool `agent_memory/` 与 `agent-memory` CLI，根目录 `<agent_root>/memory`，schema 4.0（`stability` / `last_evidence_at` / `review_at`，`created_at` 为 `first_occasion` 投影；旧主版本拒绝打开，不迁移） |
 | 召回 | 从两层取线索，按预算装配进上下文（§6） | — | 组件：`Memory::query_topic` / `query` / `read_*` / `changes_since`（两层、可见性、范围、纠正兜底、分池预算）；runner 仍经 `FsCognition::recall_hints` 只传 tag，以 `<hints>` 注入（S 阶段改接） |
-| 运行元数据 | 锁、整理游标与处置状态；topic、观察进度与已读认知归 Session（A.9） | 组件自身；观察状态由 Session 保存 | 处置写在提交日志里，待处理集合由处置计算；`ObservationState` 由 Session 持久化（组件阶段为模拟 Session 的目录）；runner 的字节游标与 attention signal 管线仍在，S 阶段退役（TD-03、TD-20） |
+| 运行元数据 | 锁、整理游标与处置状态；topic、观察进度与已读认知归 Session（A.9） | 组件自身；观察状态由 Session 保存 | 处置写在提交日志里，待处理集合由处置计算；`ObservationState` 由 Session 持久化（组件阶段为模拟 Session 的目录）；runner 的字节游标（2026-10-23）与 attention signal 管线（2026-11-01）均已退役（TD-19、TD-20） |
 
 v2.10 的术语与本文对照：
 
@@ -1706,7 +1706,7 @@ interface PerceptionRecord {
   seq: number;                // 每个 Session 内严格递增，重复 seq 视为重放并丢弃
   at_ms: number;
   session_id: string;
-  kind: "run_digest" | "observation" | "task_outcome" | "task_discarded";
+  kind: "observation";       // 旧文件可能还有 run_digest | task_outcome | task_discarded：只读、不作材料（2026-11-08）
   source: "session" | "self";
   tags?: string[];
   objects?: string[];
@@ -1718,7 +1718,7 @@ interface PerceptionRecord {
 
 为满足 §4.2 新增的字段（已实现，TD-16）：`idempotency_key`、`content_digest`（清理后仍保留，用来识别同键不同内容）、`scope`（`subjects` 即主体引用，加对象与例外）、`suggested_kind`（含 `correction`）、`memory_intent`、`cites`（召回回声与纠正引用的认知，E-15、§4.3）、`anchors`（时区、语言区域、位置、意图锚点）、`occurred_at`、`source_ref`（事件引用、`task_ref`/`goal_ref`、`actor_kind`）、`mentions`（原始提及与组件附上的可见候选）、`backfilled`（补写标记）、`cleared`（清理后的处置标记）。
 
-写入入口：Runtime 在运行结束时自动写 `run_digest`、`task_outcome`，任务放弃时写 `task_discarded`；模型经 `agent-session ctl perceive <text> [--kind] [--tag]` 写观察，“你记一下”也走这里（M-01）。追加要求持有 Session lease。组件库入口 `Memory::record_perception(caller, session_lease, input)` 由宿主绑定身份、授权主体、来源事件和记录策略：“不记忆”策略直接跳过、不写入；来源事件经宿主核验，Runtime 附加的 Memory 块不能作为来源；`cites` 必须指向可见的认知；回执返回 `<sid>:<seq>`、同范围已有认知引用（读不到 Graph 时省略）和提及候选。`ctl perceive` 已接线（2026-10-23）：`--subject / --object / --cite / --source / --occurred-at / --suggest / --intent | --explicit / --mention`，驱动者分配 seq、绑定主体（UI 取对话 peer，Work 取 owner，Goal 取 Goal owner，Workspace 绑定附 `workspace:<id>`）、来源与时区锚点，控制输入 key 为幂等键；仍待：`catch_up` 合成的运行摘要设置 `backfilled`（TD-16）。
+写入入口：模型经 `agent-session ctl perceive <text> [--kind] [--tag]` 写观察，“你记一下”也走这里（M-01）。Runtime 自动记录（`run_digest`、`task_outcome`、`task_discarded`）已于 2026-11-08 删除：它们只是 Task / Goal 已有的进度状态，demo 上 105/123 条被整理丢弃，却让整理 Goal 为此激活；写入口现在拒绝这三种 kind，旧文件中的残留行只读、不计材料。追加要求持有 Session lease。组件库入口 `Memory::record_perception(caller, session_lease, input)` 由宿主绑定身份、授权主体、来源事件和记录策略：“不记忆”策略直接跳过、不写入；来源事件经宿主核验，Runtime 附加的 Memory 块不能作为来源；`cites` 必须指向可见的认知；回执返回 `<sid>:<seq>`、同范围已有认知引用（读不到 Graph 时省略）和提及候选。`ctl perceive` 已接线（2026-10-23）：`--subject / --object / --cite / --source / --occurred-at / --suggest / --intent | --explicit / --mention`，驱动者分配 seq、绑定主体（UI 取对话 peer，Work 取 owner，Goal 取 Goal owner，Workspace 绑定附 `workspace:<id>`）、来源与时区锚点，控制输入 key 为幂等键。`catch_up` 不再补发任何感知记录（TD-16 的 `backfilled` 项随自动记录一起作废）。
 
 整理读取：组件按逐条处置状态计算待处理集合（未处置、到期暂缓、已终局待清理），排除整理自身的 Session，同一来源事件的一轮表达整体进入同一批次；排除按“Goal 带 `memory_consolidation` 能力的 Goal Session”判定（跨 epoch），字节偏移游标已删除（2026-10-23）。
 
@@ -1867,7 +1867,7 @@ Session 侧的库函数（组件提供实现，状态由 Session 保存）：
 
 - **快速路径**：快照与当前版本相同就直接返回空变化。判断只看 `occasions.jsonl` 和各感知文件的末行 `seq`，不打开 Graph、不取写锁、不 replay（TD-21）。每次推理前都会调用，这条路径必须便宜。
 - **已读修订提示只由整理提交触发**（M-21）。整理前的纠正只在召回和查询视图里派生“待复核”（§4.3）：topic 仍命中的 Session 经范围匹配看到纠正感知；话题已转走的 Session 在再次召回该认知时由兜底获得，`read_set` 不为它产生提示。
-- **运行摘要不做变化提示**：Runtime 自动写的 `run_digest`、`task_outcome`、`task_discarded` 只进入整理批次，可按引用读取，不出现在其他 Session 的 `changes_since` 里；Session 进度留在 Task/Goal（M-31、B-26）。
+- **运行摘要已删除**：Runtime 不再写 `run_digest`、`task_outcome`、`task_discarded`（2026-11-08）；旧文件中的残留行可按引用读取，但既不进入整理批次，也不出现在任何 Session 的 `changes_since` 里；Session 进度留在 Task/Goal（M-31、B-26）。
 - **时效**：快照不随时间变化；返回缓存或判定“未变化”时，仍检查 `valid_until`、暂缓 `deadline` 等时效条件。
 - **重启**：Session 重开后从保存的 `ObservationState` 继续；Memory 一侧没有需要恢复的订阅状态。
 
@@ -1889,7 +1889,7 @@ Session 侧的库函数（组件提供实现，状态由 Session 保存）：
 - `cli` = [agent_tool_cli_dev/src/lib.rs](../../src/frame/agent_tool_cli_dev/src/lib.rs)
 - `lo` = [lib_opendan/src/](../../src/frame/lib_opendan/src/)
 
-组件阶段的实施顺序与模拟例子见[组件模拟 TODO](../../notepads/agent-memory-multi-session-simulation-todo.md) T01—T04；本清单列出全部调整。P0 是边界和正确性问题，P1 补齐能力，P2 是性能与健壮性。每项完成时同步更新附录 A 的“现状”。
+组件阶段的实施顺序与模拟例子见[组件模拟 TODO](../../notepads/done/agent-memory-multi-session-simulation-todo.md) T01—T04；本清单列出全部调整。P0 是边界和正确性问题，P1 补齐能力，P2 是性能与健壮性。每项完成时同步更新附录 A 的“现状”。
 
 ### P0：边界与正确性
 
@@ -1980,6 +1980,7 @@ Session 侧的库函数（组件提供实现，状态由 Session 保存）：
 - 现状：`PerceptionRecord` 只有 A.5 所列字段；`agent-session ctl perceive` 只接受文本、kind 与 tag，objects 恒为空；`catch_up`（`lo/runner/drive.rs`）为缺失 seq 合成运行摘要，原始 kind 与内容丢失。
 - 改为：按 A.5 增加字段（含 `idempotency_key` 及其冲突规则）与对应的 CLI 参数（对象、主体、`--memory-intent`、`--kind correction`、`--cites`）；Runtime 补齐锚点与来源事件；补写记录标明是补写。
 - 进度（2026-10-10，组件阶段）：组件完成：A.5 字段、幂等键规则、库级写入口与来源核验。S 待办：`ctl perceive` 参数（对象、主体、`--memory-intent`、`--kind correction`、`--cites`）、Runtime 补齐锚点与来源事件、`catch_up` 合成记录置 `backfilled`。
+- 2026-11-08：Runtime 自动记录与 `catch_up` 补发一并删除，`backfilled` 项作废；写入口拒绝 `run_digest` / `task_outcome` / `task_discarded`。
 
 **TD-17 CLI 返回值与对象匹配**（A.7）
 - 现状：`observe add` 不返回新 id，behavior 只能按 `obs_<seq>_00` 猜测（`self_improve_set_memory.toml`）；`object upsert` 不返回对象 id 与 created/updated/ambiguous；不传 `--object` 时不按名字或别名匹配已有对象，总是新建；`--evidence` 不是必填；只支持一个别名。
@@ -2001,6 +2002,7 @@ Session 侧的库函数（组件提供实现，状态由 Session 保存）：
 - 现状：`agent_tool/src/agent_attention_signal.rs`（SQLite，Stage1 扫描与 `ListPendingAttentionSignals` 等 CLI）与 `lo` 的感知流并行；`self_improve_signals.toml`、`self_improve_set_memory.toml` 走前者。
 - 改为：以 `lo` 的感知流为唯一入口；attention signal 中仍有价值的部分（事后回扫、合法性校验、泛指类型词过滤）按 M-11、§4.5 并入；退役旧管线与两份 behavior。
 - 进度（2026-10-10，组件阶段）：组件完成：新路径只用感知流。S 待办：迁移并退役 attention signal SQLite/CLI 与 `self_improve_signals`、`self_improve_set_memory` behavior；事后回扫是否采用仍待决。
+- 进度（2026-11-01，退役）：两份 self_improve behavior 已随 TD-19（2026-10-23）删除；`agent_attention_signal.rs`（SQLite、Stage1 扫描、`Discover*` 工具）与 `agent_tool_cli_dev` 的 8 个 CLI（`BeginAttentionSignalExtraction`、`CompleteAttentionSignalExtraction`、`Discover{Event,ObjectObservation,Relationship,SkillCoverageGap}`、`ListPendingAttentionSignals`、`MarkAttentionSignalConsumed`）已删除，感知流是唯一入口。“仍有价值的部分”不搬代码：泛指类型词过滤已是 §4.5 的提示词规则；合法性校验针对旧 signal 结构，新感知流有自己的来源校验，不并入；事后回扫仍是 M-11 待决。旧数据 `<agent_root>/attention_signals/` 不迁移、不自动删除，没有新路径读它（见 `notepads/done/attention-signal-retirement-todo.md`）。
 
 ### P2：性能与健壮性
 
@@ -2013,7 +2015,7 @@ Session 侧的库函数（组件提供实现，状态由 Session 保存）：
 **TD-22 增量写入，查询走索引**
 - 现状：每次写入都全量 replay、重写全部 canonical 文件与 graph 快照、`rm -rf index/` 后重建、删除 SQLite 后重建；path 索引与 SQLite 都不参与查询。
 - 改为：增量更新派生物；召回走 SQLite 或索引；保留“派生物可随时重建”的性质。
-- 进度（2026-10-10，组件阶段）：未完成（P2）：每次提交仍全量 replay 与重建派生物；基线见[组件模拟 TODO](../../notepads/agent-memory-multi-session-simulation-todo.md) §8.3。
+- 进度（2026-10-10，组件阶段）：未完成（P2）：每次提交仍全量 replay 与重建派生物；基线见[组件模拟 TODO](../../notepads/done/agent-memory-multi-session-simulation-todo.md) §8.3。
 
 **TD-23 compact 的快照要被 replay 使用**
 - 现状：`compact` 写 `.meta/state.jsonl`，但 replay 只读归档与当前日志，从不读快照；没有归档清单。

@@ -17,8 +17,8 @@ fn state(path: &Path) -> FsAgentStateClient {
     FsAgentStateClient::open(path.join("agent"), "did:test:agent", None, None).unwrap()
 }
 
-fn builtin(path: &Path) -> Vec<RuntimeRegister> {
-    builtin_runtimes(vec![path.join("workspaces")], "", &Default::default(), "did:test:agent", false)
+fn builtin(_path: &Path) -> Vec<RuntimeRegister> {
+    builtin_runtimes(&Default::default(), "did:test:agent", &PrivateRuntimeInfo::default())
 }
 
 /// V01 / V02: the host creates the built-in runtimes once; what the owner
@@ -29,17 +29,18 @@ async fn builtin_runtimes_are_created_once_and_kept() {
     let temp = tempfile::tempdir().unwrap();
     let state = state(temp.path());
     let r = state.runtimes().ensure_builtin(&builtin(temp.path()), "host").await.unwrap();
-    assert_eq!(r.iter().map(|r| r.runtime_id.as_str()).collect::<Vec<_>>(), ["container", "host"]);
+    assert_eq!(r.iter().map(|r| r.runtime_id.as_str()).collect::<Vec<_>>(), ["private", "host"]);
     let container = &r[0];
     assert_eq!((container.availability, container.builtin), (RuntimeAvailability::Available, true));
-    assert_eq!(container.exec, Some(json!({ "kind": "native" })));
+    assert_eq!(container.exec(), Some(json!({ "kind": "native" })));
+    assert!(container.connector.is_native() && container.grant.workspace && !container.grant.read_only());
     assert_eq!(container.registered_by, "host");
     let host = &r[1];
     assert_eq!(host.availability, RuntimeAvailability::RuntimeUnavailable);
-    assert!(host.exec.is_none() && host.last_error.as_deref().unwrap().contains("not enabled"));
+    assert!(host.exec().is_none() && host.last_error.as_deref().unwrap().contains("not enabled"));
     assert!(r[0].default && !host.default);
 
-    // The owner renames the container; a restart keeps it and adds nothing.
+    // The owner renames the private runtime; a restart keeps it and adds nothing.
     let renamed = state
         .runtimes()
         .update(
@@ -58,12 +59,13 @@ async fn builtin_runtimes_are_created_once_and_kept() {
     assert_eq!(again[0].name, "My box");
     assert_eq!(again[0].revision, renamed.revision, "nothing changed");
     assert_eq!(state.runtimes().list().await.unwrap().len(), 2);
-    // `local` is the container's former name.
+    // `local` and `container` are the private runtime's former names.
     assert_eq!(state.runtimes().lookup("local").await.unwrap().unwrap().name, "My box");
+    assert_eq!(state.runtimes().lookup("container").await.unwrap().unwrap().runtime_id, "private");
 
     let stale = state
         .runtimes()
-        .update("container", &RuntimeUpdate { expected_revision: 1, ..Default::default() }, "owner")
+        .update("private", &RuntimeUpdate { expected_revision: 1, ..Default::default() }, "owner")
         .await
         .unwrap_err();
     assert!(stale.to_string().contains("revision_conflict"), "{stale}");
@@ -76,26 +78,72 @@ async fn builtin_runtimes_are_created_once_and_kept() {
 
     let added = RuntimeRegister {
         runtime_id: "studio".into(),
-        kind: RuntimeKind::RemoteSsh,
+        connector: RuntimeConnector::Ssh { host: "studio".into(), user: None, port: None, identity_file: None },
         name: "Studio workstation".into(),
-        description: String::new(),
-        exec: Some(json!({ "kind": "remote_ssh", "host": "studio" })),
-        roots: vec![],
-        capabilities: json!({}),
+        desc: String::new(),
+        enabled: true,
         default: false,
-        computer: Default::default(),
         baseline: buckyos_api::RuntimeBaseline::Standard,
+        grant: RuntimeGrant { roots: vec!["/srv/studio".into()], ..Default::default() },
     };
+    // A registration without a root is refused (R-K5).
+    let rootless = RuntimeRegister { grant: RuntimeGrant::default(), ..added.clone() };
+    assert!(state.runtimes().register(&rootless, "owner").await.unwrap_err().to_string().contains("root"));
     let studio = state.runtimes().register(&added, "owner").await.unwrap();
     assert_eq!(studio, state.runtimes().register(&added, "owner").await.unwrap(), "idempotent");
     assert!(!studio.builtin);
     assert_eq!(studio.availability, RuntimeAvailability::RuntimeUnavailable);
+    assert!(studio.checked_at_ms.is_some(), "checked at once");
     let mut other = added.clone();
     other.name = "else".into();
     assert!(state.runtimes().register(&other, "owner").await.is_err());
     assert!(state.runtimes().register(&RuntimeRegister { runtime_id: "local".into(), ..added.clone() }, "owner").await.is_err());
-    state.runtimes().unregister("studio", studio.revision, "owner").await.unwrap();
-    assert!(state.runtimes().lookup("studio").await.unwrap().is_none());
+    // Unregistering retires the record: it stays with its history.
+    let retired = state.runtimes().unregister("studio", studio.revision, "owner").await.unwrap();
+    assert_eq!(retired.lifecycle, RuntimeLifecycle::Retired);
+    assert!(!retired.usable());
+    let kept = state.runtimes().lookup("studio").await.unwrap().unwrap();
+    assert_eq!(kept.lifecycle, RuntimeLifecycle::Retired);
+    assert!(kept.last_error.as_deref().unwrap().contains("retired"));
+}
+
+/// The private runtime's check: the Agent's own commands come first, a named
+/// command only reports its path until a full check runs it, and the
+/// declaration stays what the host declared.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_private_runtime_says_who_provides_a_command() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let state = state(temp.path());
+    state.runtimes().ensure_builtin(&builtin(temp.path()), "host").await.unwrap();
+    let skill_bin = temp.path().join("agent/tools/lint/bin");
+    std::fs::create_dir_all(&skill_bin).unwrap();
+    for (name, body) in [("real-tool", "echo 'real-tool 9.9'"), ("stub-tool", "echo 'not bundled' >&2; exit 127")] {
+        let path = skill_bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let asked: Vec<String> = ["real-tool", "stub-tool", "sh", "no-such-tool-xyz"].iter().map(|c| c.to_string()).collect();
+
+    let quick = state.runtimes().check("private", &asked, false).await.unwrap();
+    let tools = quick.caps.tools_check.unwrap();
+    assert_eq!(tools.present, ["real-tool", "stub-tool", "sh"], "{:?}", tools.error);
+    assert_eq!(tools.missing, ["no-such-tool-xyz"]);
+    assert_eq!(tools.resolved["real-tool"].provided_by, ProvidedBy::Agent);
+    assert_eq!(tools.resolved["real-tool"].version, None);
+    assert_eq!(tools.resolved["sh"].provided_by, ProvidedBy::System);
+    let check = quick.caps.baseline_check.unwrap();
+    assert_eq!(check.level, buckyos_api::RuntimeBaseline::Extended, "the container's private runtime is declared extended");
+    assert!(check.ext.is_some() && check.error.is_none(), "{check:?}");
+
+    let full = state.runtimes().check("private", &asked, true).await.unwrap();
+    let tools = full.caps.tools_check.unwrap();
+    assert_eq!(tools.present, ["real-tool", "sh"], "{:?}", tools.error);
+    assert_eq!(tools.missing, ["stub-tool", "no-such-tool-xyz"], "a stub is not the tool");
+    assert_eq!(tools.resolved["real-tool"].version.as_deref(), Some("real-tool 9.9"));
+    assert!(tools.resolved["stub-tool"].stub);
+    assert_eq!(full.caps.baseline, buckyos_api::RuntimeBaseline::Extended, "a check never changes the declaration");
 }
 
 struct Loopback(Arc<FsAgentStateClient>);
@@ -120,37 +168,50 @@ async fn runtimes_over_krpc() {
     let all = client.runtimes().list().await.unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(client.runtimes().lookup("host").await.unwrap().unwrap(), all[1]);
-    let checked = client.runtimes().check("container").await.unwrap();
-    assert_eq!(checked.availability, RuntimeAvailability::Available);
+    let checked = client.runtimes().check("container", &[], false).await.unwrap();
+    assert_eq!((checked.runtime_id.as_str(), checked.availability), ("private", RuntimeAvailability::Available));
+    mock_node(&["/lab"], "/lab/home");
     let added = client
         .runtimes()
         .register(
             &RuntimeRegister {
                 runtime_id: "lab".into(),
-                kind: RuntimeKind::HostNative,
+                connector: RuntimeConnector::node("did:dev:lab", "did:test:agent"),
                 name: "Lab".into(),
-                description: String::new(),
-                exec: None,
-                roots: vec![],
-                capabilities: json!({}),
+                desc: String::new(),
+                enabled: true,
                 default: false,
-                computer: Default::default(),
                 baseline: buckyos_api::RuntimeBaseline::Standard,
+                grant: RuntimeGrant { roots: vec!["/lab".into()], ..Default::default() },
             },
             "forged",
         )
         .await
         .unwrap();
     assert_eq!(added.registered_by, "caller");
+    assert_eq!(added.availability, RuntimeAvailability::Available, "{:?}", added.last_error);
+    assert!(added.grant.ops.contains(&buckyos_api::ExecutorOp::Exec), "ops learned at the check");
+    assert_eq!(added.caps.platform.os, "linux");
+    // `check --commands` verifies named commands (`tools_check`); the mock
+    // node runs nothing, so the check says why.
+    let verified = client.runtimes().check("lab", &["ffmpeg".into()], false).await.unwrap();
+    assert!(verified.caps.tools_check.unwrap().error.is_some());
+    client
+        .runtimes()
+        .note_usage("lab", &RuntimeUsageEvent::Session { session_id: "work-1".into() })
+        .await
+        .unwrap();
+    let used = client.runtimes().lookup("lab").await.unwrap().unwrap();
+    assert_eq!((used.usage.sessions_total, used.usage.last_session_id.as_deref()), (1, Some("work-1")));
     assert!(client.runtimes().ensure_builtin(&builtin(temp.path()), "x").await.is_err());
-    for m in ["register", "update", "check", "unregister"] {
+    for m in ["register", "update", "check", "unregister", "note_usage"] {
         assert!(libopendan::state::krpc::is_write(&format!("runtimes.{m}")));
     }
     assert!(!libopendan::state::krpc::is_write("runtimes.list"));
 }
 
-/// V04: workspaces live in the container runtime (`local` still read);
-/// the host runtime cannot hold one yet and says why.
+/// V04: workspaces live in the private runtime (`container` / `local` still
+/// read); the host runtime cannot hold one yet and says why.
 #[tokio::test]
 async fn workspaces_follow_the_runtime_registry() {
     let temp = tempfile::tempdir().unwrap();
@@ -273,8 +334,8 @@ impl agent_tool::runtime::node::NodeExecutorConnector for LateNode {
 
 /// A node runtime whose executor was not up yet when the agent checked it
 /// (node_daemon opens it after the agent's container starts) is asked again
-/// by the next session that needs it, at most every RUNTIME_RECHECK_MS:
-/// sessions are not refused forever after a transient failure.
+/// by the next session or command that needs it, at most every
+/// RUNTIME_RECHECK_MS: nothing is refused forever after a transient failure.
 #[tokio::test]
 async fn a_node_runtime_refused_at_start_is_used_once_its_executor_answers() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -294,24 +355,28 @@ async fn a_node_runtime_refused_at_start_is_used_once_its_executor_answers() {
                 node_did: "did:web:ood1.test.buckyos.io".into(),
             },
             baseline: None,
+            grant: None,
         },
     );
     settings.default_runtime_id = Some("host".into());
-    let registers = builtin_runtimes(vec![env.root.join("workspaces")], "", &settings, AGENT, false);
+    let registers = builtin_runtimes(&settings, AGENT, &PrivateRuntimeInfo::default());
     agent.runtimes().ensure_builtin(&registers, APP).await.unwrap();
-    let checked = agent.runtimes().check("host").await.unwrap();
+    let checked = agent.runtimes().check("host", &[], false).await.unwrap();
     assert_eq!(checked.availability, RuntimeAvailability::RuntimeUnavailable);
     assert!(checked.last_error.unwrap_or_default().contains("early eof"));
     let tries = connects.load(Ordering::SeqCst);
-    // Within the recheck interval the earlier answer stands.
+    // Within the recheck interval the earlier answer stands. The owner's
+    // default never places work by itself: the work names the host.
     let spec = || {
         let mut s = work_spec("on the host");
-        s.runtime.requirement.runtime_id = None;
+        s.runtime.requirement.runtime_id = Some("host".into());
         s
     };
     let refused = libopendan::api::create_session(&env.app_dir, spec(), agent.as_ref(), APP, env.channels().as_ref())
         .await
         .unwrap_err();
+    assert!(refused.to_string().contains("not available"), "{refused}");
+    let refused = libopendan::runtime::usable_runtime(agent.as_ref(), "host").await.unwrap_err();
     assert!(refused.to_string().contains("not available"), "{refused}");
     assert_eq!(connects.load(Ordering::SeqCst), tries, "not asked again right away");
     // The executor comes up; after the interval the next session asks again.
@@ -323,13 +388,33 @@ async fn a_node_runtime_refused_at_start_is_used_once_its_executor_answers() {
     let record = agent.runtimes().lookup("host").await.unwrap().unwrap();
     assert_eq!(record.availability, RuntimeAvailability::Available);
     assert!(connects.load(Ordering::SeqCst) > tries);
+
+    // `agent-session run` and `copy` get the same second chance.
+    up.store(false, Ordering::SeqCst);
+    let checked = agent.runtimes().check("host", &[], false).await.unwrap();
+    assert_eq!(checked.availability, RuntimeAvailability::RuntimeUnavailable);
+    up.store(true, Ordering::SeqCst);
+    let mut cfg = sd.config().unwrap();
+    cfg.session.policy.runtime_view = RuntimeView::Chat;
+    let tries = connects.load(Ordering::SeqCst);
+    let view = libopendan::runtime::runtimes_view(agent.as_ref(), &cfg).await;
+    assert_eq!(view["owner_default"]["available"], false);
+    assert_eq!(connects.load(Ordering::SeqCst), tries);
+    tokio::time::sleep(std::time::Duration::from_millis(libopendan::api::RUNTIME_RECHECK_MS + 200)).await;
+    let view = libopendan::runtime::runtimes_view(agent.as_ref(), &cfg).await;
+    assert_eq!(view["owner_default"]["available"], true);
+    assert_eq!(view["owner_default"]["os"], "linux");
+    assert!(view["owner_default"].get("error").is_none());
+    let usable = libopendan::runtime::usable_runtime(agent.as_ref(), "host").await.unwrap();
+    assert_eq!(usable.availability, RuntimeAvailability::Available);
 }
 
-/// An Agent Service run natively on its host has no container: the
-/// `container` runtime has no executor (with the reason), `host` is the
-/// default; back in its container, `container` is usable again.
+/// An Agent Service run natively on its host (Desktop Lite) still has its
+/// private runtime — the process's own environment, always usable — while
+/// `host` stays the owner's default; back in its container nothing changes
+/// for the private runtime but its description and baseline.
 #[tokio::test]
-async fn a_natively_run_agent_service_has_no_container_runtime() {
+async fn a_natively_run_agent_service_keeps_its_private_runtime() {
     let temp = tempfile::tempdir().unwrap();
     let state = state(temp.path());
     let mut settings = buckyos_api::AgentSettings::default();
@@ -339,21 +424,112 @@ async fn a_natively_run_agent_service_has_no_container_runtime() {
             enabled: true,
             computer: Default::default(),
             target: buckyos_api::AgentRuntimeTarget::Node { node_id: "ood1".into(), node_did: "did:web:ood1.test.buckyos.io".into() },
-            baseline: None,
+            baseline: Some(buckyos_api::RuntimeBaseline::Extended),
+            grant: None,
         },
     );
     settings.default_runtime_id = Some("host".into());
-    let project = |native: bool| builtin_runtimes(vec![temp.path().join("workspaces")], "", &settings, "did:test:agent", native);
+    for native_node_did in [None, Some("did:web:another-node".into())] {
+        let separate = builtin_runtimes(&settings, "did:test:agent", &PrivateRuntimeInfo {
+            native_service: true, native_node_did, ..Default::default()
+        });
+        assert_eq!(separate.len(), 2);
+        assert!(separate[1].connector.is_node());
+        assert!(!separate[0].default);
+    }
+    let project = |native: bool| {
+        builtin_runtimes(&settings, "did:test:agent", &PrivateRuntimeInfo { native_service: native, native_node_did: Some("did:web:ood1.test.buckyos.io".into()), note: String::new(), ..Default::default() })
+    };
     state.runtimes().ensure_builtin(&project(false), "host").await.unwrap();
-    let container = state.runtimes().lookup("container").await.unwrap().unwrap();
-    assert_eq!(container.availability, RuntimeAvailability::Available);
+    let private = state.runtimes().lookup("private").await.unwrap().unwrap();
+    assert_eq!(private.availability, RuntimeAvailability::Available);
+    assert_eq!(private.caps.baseline, buckyos_api::RuntimeBaseline::Extended);
     state.runtimes().ensure_builtin(&project(true), "host").await.unwrap();
-    let container = state.runtimes().lookup("container").await.unwrap().unwrap();
-    assert_eq!(container.availability, RuntimeAvailability::RuntimeUnavailable);
-    assert!(container.exec.is_none() && !container.default);
-    assert!(container.last_error.unwrap_or_default().contains("runs natively"));
-    assert!(state.runtimes().lookup("host").await.unwrap().unwrap().default);
+    let private = state.runtimes().lookup("private").await.unwrap().unwrap();
+    assert_eq!(private.availability, RuntimeAvailability::Available, "{:?}", private.last_error);
+    assert_eq!(private.exec(), Some(json!({ "kind": "native" })));
+    assert!(private.default && private.desc.contains("natively"));
+    assert_eq!(state.runtimes().list().await.unwrap().len(), 1);
+    assert_eq!(private.caps.baseline, buckyos_api::RuntimeBaseline::Extended, "the host's declaration");
+    let host = state.runtimes().lookup("host").await.unwrap().unwrap();
+    assert!(host.default && host.grant.workspace);
+    assert_eq!(host.runtime_id, "private");
+    assert_eq!(host, private);
     state.runtimes().ensure_builtin(&project(false), "host").await.unwrap();
-    let container = state.runtimes().lookup("container").await.unwrap().unwrap();
-    assert_eq!(container.availability, RuntimeAvailability::Available);
+    let private = state.runtimes().lookup("private").await.unwrap().unwrap();
+    assert!(private.availability == RuntimeAvailability::Available && !private.desc.contains("natively"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_alias_checks_and_executes_managed_tools_without_an_executor() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let old_root = std::env::var_os("BUCKYOS_ROOT");
+    std::env::set_var("BUCKYOS_ROOT", &root);
+    let tool_dir = root.join("bin/agent-tools");
+    std::fs::create_dir_all(&tool_dir).unwrap();
+    let tool = tool_dir.join("native-regression-tool");
+    std::fs::write(&tool, "#!/bin/sh\nprintf native-managed-tool").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let state = state(&root);
+    let mut builtins = builtin(&root);
+    builtins.truncate(1);
+    builtins[0].default = true;
+    builtins[0].connector = RuntimeConnector::Native {
+        aliases: vec!["host".into()],
+        computer: Some(agent_tool::runtime::computer::NativeComputerConfig {
+            endpoint: root.join("missing.sock").display().to_string(),
+            node_did: "did:web:test".into(),
+            profile_id: "agent-test".into(), access: buckyos_api::ComputerAccess::Control,
+        }),
+    };
+    state.runtimes().ensure_builtin(&builtins, "node").await.unwrap();
+    let checked = state.runtimes().check("host", &["native-regression-tool".into()], false).await.unwrap();
+    assert!(checked.usable());
+    assert_eq!(checked.runtime_id, "private");
+    assert!(checked.caps.desktop_error.is_some());
+    assert_eq!(checked.caps.tools_check.unwrap().resolved["native-regression-tool"].path, tool.display().to_string());
+    let ran = libopendan::runtime::runtime_exec(&state, "host", "native-regression-tool", None, 10_000, None).await.unwrap();
+    assert_eq!(ran.runtime_id, "private");
+    assert_eq!((ran.exit_code, ran.stdout.as_str()), (0, "native-managed-tool"));
+    match old_root { Some(value) => std::env::set_var("BUCKYOS_ROOT", value), None => std::env::remove_var("BUCKYOS_ROOT") }
+}
+
+/// A desktop found unavailable is probed again once its check is older than
+/// the recheck interval: what a probe saw while the executor still waited for
+/// its first authorization is not what later sessions are told.
+#[tokio::test]
+async fn a_desktop_found_unavailable_is_probed_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = state(temp.path());
+    let mut builtins = builtin(temp.path());
+    builtins.truncate(1);
+    builtins[0].default = true;
+    builtins[0].connector = RuntimeConnector::Native {
+        aliases: vec!["host".into()],
+        computer: Some(agent_tool::runtime::computer::NativeComputerConfig {
+            endpoint: temp.path().join("missing.sock").display().to_string(),
+            node_did: "did:web:test".into(),
+            profile_id: "agent-test".into(),
+            access: buckyos_api::ComputerAccess::Control,
+        }),
+    };
+    state.runtimes().ensure_builtin(&builtins, "node").await.unwrap();
+    let live = state.runtimes().check("private", &[], false).await.unwrap().caps.desktop_error.expect("no executor answers");
+
+    let file = state.layout().runtimes_dir().join("private.json");
+    let stale = "local computer IPC: the executor has no valid authorization snapshot";
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    stored["caps"]["desktop_error"] = json!(stale);
+    std::fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
+    let kept = libopendan::runtime::lookup_rechecked(&state, "private").await.unwrap().unwrap();
+    assert_eq!(kept.caps.desktop_error.as_deref(), Some(stale), "checked moments ago");
+
+    stored["checked_at_ms"] = json!(1);
+    std::fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
+    let again = libopendan::runtime::lookup_rechecked(&state, "private").await.unwrap().unwrap();
+    assert_eq!(again.caps.desktop_error, Some(live));
+    assert!(again.checked_at_ms.unwrap() > 1);
 }

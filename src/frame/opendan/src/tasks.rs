@@ -18,7 +18,7 @@ use buckyos_api::{
     TaskWaitReason, TaskWaitReasonKind, OPENDAN_AGENT_TURN_TASK_SCHEMA_ID,
 };
 use agent_tool::xllm::XllmDeps;
-use agent_tool::{ShellTaskManager, ZoneShellTaskBackend, ZoneShellTasks};
+use agent_tool::{ZoneTaskMgrBackend, ZoneTaskResolver};
 use libopendan::host::Supervisor;
 use libopendan::protocol::*;
 use libopendan::runner::{TurnTaskEnd, TurnTaskOpen, TurnTaskSink, TurnTaskStatus};
@@ -273,22 +273,17 @@ impl TaskService for ZoneTaskService {
     }
 }
 
-/// xllm deps of a zone host: `shell` commands that outlive their wait are
-/// tasks of the zone's TaskMgr (`tool.shell/v1`), answered for by any
-/// process of the host; the process's own task manager is the fallback
-/// when TaskMgr cannot be reached.
-pub fn zone_xllm_deps(agent_did: &str, owner_user: Option<String>) -> XllmDeps {
+/// xllm deps of a zone host: `shell` commands that outlive their wait stay
+/// tasks of this process (`local:`, handed to the OS when the Loader
+/// ends); tasks a krpc tool started in the zone's TaskMgr (`t-`, e.g.
+/// `ask_user`) are read from TaskMgr. `read` reads object URLs through the
+/// Zone's Providers with the agent's session.
+pub fn zone_xllm_deps() -> XllmDeps {
     let mut deps = XllmDeps::default();
-    let shell_tasks = ZoneShellTasks::new(
-        Arc::new(ZoneShellTaskBackend),
-        agent_did,
-        owner_user,
-        deps.local_tasks.clone(),
-    );
-    deps.buckyos_tasks = shell_tasks.resolver(None);
-    deps.shell_tasks = Some(shell_tasks);
+    deps.buckyos_tasks = Some(ZoneTaskResolver::new(Arc::new(ZoneTaskMgrBackend)));
     deps.node_executor = agent_tool::runtime::node::SocksNodeConnector::from_buckyos_runtime()
         .map(|c| c as Arc<dyn agent_tool::runtime::node::NodeExecutorConnector>);
+    deps.url_reader = Some(Arc::new(agent_did_object_lib::ObjectUrlReader::builtin()));
     deps
 }
 
@@ -306,27 +301,28 @@ pub struct TurnTasks {
     pub owner: Option<String>,
 }
 
-fn wait_reason(w: &WaitingFor, message: &str) -> TaskWaitReason {
-    // A question asked through a notification: the user's human task.
-    if w.kind == WaitingKind::Input && !w.human_tasks.is_empty() {
-        return TaskWaitReason {
-            kind: TaskWaitReasonKind::HumanInput,
-            code: Some("ask_user".to_string()),
-            related_task_id: w.human_tasks.first().cloned(),
-            message: Some(message.to_string()),
-        };
-    }
-    let (kind, code) = match w.kind {
-        WaitingKind::Children => (TaskWaitReasonKind::ChildTask, "sub_sessions"),
-        WaitingKind::Tool => (TaskWaitReasonKind::Dependency, "tool"),
-        WaitingKind::Event => (TaskWaitReasonKind::External, "event"),
-        WaitingKind::Input => (TaskWaitReasonKind::Other, "input"),
+/// Why a waiting Turn waits, in TaskMgr's terms, from what the session
+/// follows.
+fn wait_reason(status: &TurnTaskStatus) -> TaskWaitReason {
+    let (kind, code) = if !status.children.is_empty() {
+        (TaskWaitReasonKind::ChildTask, "sub_sessions")
+    } else if !status.tasks.is_empty() {
+        (TaskWaitReasonKind::Dependency, "tool")
+    } else if status.needs_input {
+        (TaskWaitReasonKind::Other, "input")
+    } else {
+        (TaskWaitReasonKind::External, "event")
     };
     TaskWaitReason {
         kind,
         code: Some(code.to_string()),
-        related_task_id: None,
-        message: Some(message.to_string()),
+        // The task the Turn waits for (a question's human task included).
+        related_task_id: status
+            .tasks
+            .first()
+            .filter(|_| status.children.is_empty())
+            .cloned(),
+        message: Some(status.message.clone()),
     }
 }
 
@@ -347,7 +343,10 @@ impl TurnTaskSink for TurnTasks {
                     "inputs": turn.inputs,
                 }),
                 parent_id: turn.parent_task.clone(),
-                idempotency_key: format!("agent_turn:{}:{}", turn.session_id, turn.turn),
+                idempotency_key: format!(
+                    "agent_turn:{}:{}:{}",
+                    turn.agent_did, turn.session_id, turn.turn
+                ),
                 grant_user: self.owner.clone(),
             })
             .await?;
@@ -355,12 +354,8 @@ impl TurnTaskSink for TurnTasks {
     }
 
     async fn update(&self, task_id: &str, status: &TurnTaskStatus) -> Result<(), String> {
-        match (&status.waiting_for, status.run_state) {
-            (Some(w), RunState::Waiting) => {
-                self.tasks
-                    .waiting(task_id, wait_reason(w, &status.message))
-                    .await
-            }
+        match status.run_state {
+            RunState::Waiting => self.tasks.waiting(task_id, wait_reason(status)).await,
             _ => {
                 self.tasks
                     .running(

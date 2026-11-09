@@ -192,91 +192,71 @@ JSON 调度形态：
 
 ## 2. `read`
 
-v2 Behavior 协议的 `<read uri="..."/>` 规范读取工具。读取目标必定是结构化数据，返回内容必定是 LLM 可处理的文本。当前仅实现 `file://` scheme，bare path 等价于 `file://`，其他 scheme 返回 `InvalidArgs`。
+Session 工具组 `bash_core` 的读取工具（`src/read_tool.rs`），`read_file` 的超集：文件、内容对象与 URL 用同一个 `read`，窗口参数在三类目标上含义相同。目标按 `uri` 区分（URL 规则见 [key url.md](../key%20url.md)）：
+
+| `uri` | 读什么 |
+| --- | --- |
+| 路径（相对工作目录或其下的绝对路径）、`file:///abs`、`file://localhost/abs` | 本 runtime 的文件，规则同 `read_file`（工作目录策略、文本检查） |
+| `cyfile:…` 等 ObjId、`cyfs://<objid>/` | Zone 的对象存储；消息附件经 msg-center 读 |
+| `obj://<服务名或 agent-id>/…` | BuckyOS 对象：返回对象说明——身份、Profile 声明的属性 / 动作 / 事件，以及摘要属性的值 |
+| `cyfs:///<path>` | Zone 文件 `$BUCKYOS_ROOT/data/<path>`：本机有挂载时直接读（Agent 容器挂着 owner 家目录与 AgentRoot），否则读它的 DFS 对象 |
+| `https://…` / `http://…` | 能发现 Card 的按对象读，否则按网页读；本 Zone 主机名经节点网关访问 |
+| `file://<device_id>/…` | 路径在 Zone data 下时即对应的 Zone 文件；其他设备的其余文件经该设备的 node executor 读，尚未接通，返回不支持 |
+
+URL 由宿主注入的对象解析器读（OpenDAN 用 `agent-did-object-lib` 的 `ObjectUrlReader`，带 Agent 自己的 session，只发给本 Zone 的源），再按文件同样的窗口截取。没有解析器的 runtime 对 URL 报 `InvalidArgs`。
 
 ### Prompt
 
-- `description`: `Read structured data by uri and return LLM-readable text.`
-- `args_schema`:
-  ```json
-  {
-    "type": "object",
-    "properties": {
-      "uri":    { "type": "string",  "description": "Structured data target to read. Bare paths default to file reads." },
-      "offset": { "type": "integer", "minimum": 0, "description": "Line offset to start reading at; defaults to 0." },
-      "limit":  { "type": "integer", "minimum": 1, "description": "Max lines to read." }
-    },
-    "required": ["uri"]
-  }
-  ```
-- `usage`: `read uri="<path-or-uri>" [offset=<line>] [limit=<lines>]`
+`args_schema`（以源码为准）：
 
-`offset` 是 0-based 行位置，`limit` 是行数。原 token limit 不再是本函数参数，而是 session 属性 `read_token_limit`，默认 20K；返回内容超过该预算时会设置 `detail.token_truncated = true`。同 session + 同窗口的重复 read，命中"未变化"短路时 `detail.unchanged = true` 且 `content` 替换为 `和上一次read相比没有变化`，状态文件落在系统临时目录。
+```json
+{
+  "type": "object",
+  "properties": {
+    "uri":         { "type": "string", "description": "Path, file:// URI, object id (cyfile:…) or URL (obj://, cyfs://, https://)." },
+    "property":    { "type": "string", "description": "For an object URL: a property its description declares, read instead of the description." },
+    "range":       { "type": "string", "description": "1-based line range, e.g. \"120-200\", \"120:+20\", \"-50:$\"." },
+    "first_chunk": { "type": "string", "description": "Start at the first occurrence of this text." },
+    "offset":      { "type": "integer", "minimum": 0, "description": "0-based line to start at (instead of range)." },
+    "limit":       { "type": "integer", "minimum": 1, "description": "Lines to read from offset (instead of range)." }
+  },
+  "required": ["uri"]
+}
+```
+
+给了 `range` 时以它为准，否则用 `offset` / `limit` 分页；空字符串等同于没给（严格 schema 的模型会把每个字段都填上）。返回内容受 Session 的 `read_token_limit` 约束。
 
 ### Bash 支持
 
-`CallingConventions::ALL`。
-
-### CLI 命令解释 + 常用例子
+`CallingConventions::ALL`；CLI 首个不是 `key=value` 的参数即 `uri`。shell 里 `read` 是 bash 内建命令，用 `agent_tool read …`。
 
 ```bash
-# bare path
-read src/foo.rs
-
-# 显式 URI
-read uri=file:///workspace/demo.txt
-
-# 分段读：先头 200 行
-read src/big.log offset=0 limit=200
-
-# 翻下一页
-read src/big.log offset=200 limit=200
+agent_tool read src/foo.rs range=1-50
+agent_tool read obj://msg-center/owners/did:bns:alice/sessions
+agent_tool read obj://msg-center/owners/did:bns:alice/sessions property=recent range=1-40
+agent_tool read cyfs:///home/alice/Desktop/notes.md first_chunk="## TODO"
 ```
 
-XML action 形态：
+XML action 形态：`<read uri="obj://aiworkspace/ws_1/entities/e_1" property="content"/>`。
 
-```xml
-<read uri="src/foo.rs" offset="0" limit="200"/>
-```
+### 输出
 
-### 输出示例
+`detail` 与 `read_file` 相同（`content`、`line_range`、`start_line` / `end_line`、`line_count`、`bytes`、`matched`）；本机 runtime 下 Zone data 里的文件另有 `detail.cyfs_url`（`cyfs:///<path>`，跨上下文引用它，`write_file` / `edit_file` 的结果同样带）；读 URL 时另有 `detail.object`：规范 URL、对象 DID、实际访问的源、内容类型、版本与路由。对象说明的样子：
 
-```json
-{
-  "agent_tool_protocol": "1",
-  "status": "success",
-  "cmd_name": "read",
-  "cmd_args": "file:///workspace/demo.txt offset=0 limit=200",
-  "title": "read file:///workspace/demo.txt => read 50 lines (EOF)",
-  "summary": "read 50 lines at offset 0 of 50 (EOF)",
-  "detail": {
-    "uri": "file:///workspace/demo.txt",
-    "scheme": "file",
-    "path": "/workspace/demo.txt",
-    "content": "...",
-    "offset": 0,
-    "limit": 200,
-    "lines_read": 50,
-    "total_lines": 50,
-    "eof": true,
-    "unchanged": false,
-    "token_limit": 20480,
-    "token_truncated": false
-  }
-}
-```
-
-未变化时：
-
-```json
-{
-  "agent_tool_protocol": "1",
-  "status": "success",
-  "cmd_name": "read",
-  "title": "read src/foo.rs => read 0 lines",
-  "output": "和上一次read相比没有变化",
-  "detail": { "content": "和上一次read相比没有变化", "lines_read": 0, "unchanged": true, "eof": false, "offset": 0, "limit": 200, "total_lines": 50 }
-}
+```text
+Object: obj://msg-center/owners/did:bns:alice/sessions
+Object DID: did:web:test.buckyos.io:msg-center:owners:did%3Abns%3Aalice:sessions
+Title: Message sessions
+Description: Every session of one mailbox owner, newest activity first. Rows link to the session objects.
+Properties:
+- recent: The 20 most recently updated sessions
+Actions:
+- query: List the owner's sessions (risk: read_only)
+Events:
+- inbox: A record of the INBOX box changed
+Summary:
+- recent:
+{ …JSON… }
 ```
 
 ---
@@ -613,21 +593,21 @@ Grep 'panic!' output_mode=content head_limit=50 offset=50
 
 ## 8. `agent-session todo`
 
-Work Session 的 TodoList（[Agent TodoList](<Agent TodoList.md>)）。不是 prompt-visible 工具：PLAN 在 shell 里调用 Session Bin 的 `agent-session`（= `xagent`），Session 由 `$OPENDAN_SESSION_ID` 给出。执行者（DO、探索子 Session）不调用它写父列表；结果由宿主依据已提交状态回写。
+plan session 的 TodoList（[Agent TodoList](<Agent TodoList.md>)）。不是 prompt-visible 工具：plan 在 shell 里调用 Session Bin 的 `agent-session`（= `xagent`），Session 由 `$OPENDAN_SESSION_ID` 给出。执行者（Todo 的 work session）不写 plan 的列表；结果由宿主依据已提交状态回写，就绪的 Todo 由宿主自动派发。
 
 ```text
-todo add <title> --content <t> [--accept <criterion>]... [--scope <t>] [--evidence <t>]... [--skill <s>]... [--after <todo_id>]...
-todo explore <title> --content <t> [同上] [--behavior <b>] [--class <c>]   # 建 Todo 并派发为探索子 Session
-todo dispatch <todo_id>                                                  # 派发已有的 pending Todo
+todo add <title> --content <t> [--accept <criterion>]... [--scope <t>] [--evidence <t>]... [--skill <s>]... [--after <todo_id>|none]...
+todo explore <title> --content <t> [同上]                                 # 只读调查，缺省无依赖
+todo update <todo_id> --reason <t> [--content <t>] [--accept <c>]... [--clear-accept] [--scope <t>] [--evidence <t>]... [--after <id>|none]...
+todo pause|resume|stop <todo_id> --reason <t>
 todo list [--json] | todo show <todo_id> [--report]
-todo review <todo_id> (--accept | --reject | --need-evidence) --reason <t> [--followup <todo_id>]...
 todo cancel <todo_id> --reason <t> | todo clean --reason <t> | todo retry <todo_id> --reason <t>
 ```
 
-- 串行 Todo 由 `next_behavior = do`（Todo 执行器）执行：宿主选第一个就绪的串行 Todo，把正文作为 `<sub_task>` 交给 DO。
-- `explore` / `dispatch` 的结果：`{todo_id, attempt, child_sid, dispatched: true}`；被并发上限拒绝时 `{dispatched: false, reason}`、退出码 3，Todo 保持 pending。
-- `list` 默认输出 PLAN 视图 `<todo_list rev>`；`show --report` 输出最新 attempt 的完整报告。
-- `review` 对探索 attempt 同时写子 Session 的 acceptance（accept → accepted，reject → discarded）；退出码 5 = Review 已记录、acceptance 未写入，重跑同一 Review。
+- `add` 不带 `--after` 时依赖上一个 Todo；前置都 `completed` 时宿主立刻派发。改列表的命令输出带 `scheduled: [{result: dispatched | held | blocked, …}]`。
+- `update` 改运行中的 Todo 时，它的 work session 以 `todo:<id>` / `updated` 事件收到完整的新任务；`after / runtime / workspace / skill` 只在没有 attempt 在跑时可改。
+- `list` 默认输出视图 `<todo_list rev>`；`show --report` 输出最新 attempt 的完整报告。
+- 没有 `dispatch` / `review` / `wait`：验证用一条 `todo explore … --after <id>`。
 - owner 侧只读：`xagent todo list <sid> [--json]`、`xagent todo show <todo_id> --session <sid> [--report]`。
 - 环境：`OPENDAN_SESSION_ID`、`OPENDAN_AGENT_DID`、`OPENDAN_AGENT_ROOT`、`LIBOPENDAN_WHO`、`LIBOPENDAN_MAX_CHILDREN`（宿主的并发上限）。
 - 列表在 `<SessionDir>/.opendan_agent_session/todos.json`（`opendan.todo_list/1`）。旧的 `todo current / done / finish` 与 `delegateTask` 已删除。

@@ -1,7 +1,7 @@
 //! "Agent shares its results": after a user task (a Work created by intent
 //! analysis under a UI session) ends with a final report, the agent posts a
 //! privacy-free note about how it was done to its own HomeStation, so other
-//! agents can learn from it (notepads/agent-homestation-auto-share-todo.md
+//! agents can learn from it (notepads/done/agent-homestation-auto-share-todo.md
 //! §5).
 //!
 //! A host gives a [`ShareHost`]: in a zone it is the HomeStation's
@@ -163,6 +163,33 @@ fn public_link(link: Option<ShareLink>) -> Option<ShareLink> {
     Some(ShareLink { url: url.to_string(), title, summary: link.summary.trim().chars().take(280).collect() })
 }
 
+fn composed_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["share", "reason", "text", "tags", "link"],
+        "properties": {
+            "share": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "text": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "link": {"anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["url", "title", "summary"],
+                    "properties": {
+                        "url": {"type": "string"},
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"}
+                    }
+                }
+            ]}
+        }
+    })
+}
+
 fn parse_composed(text: &str) -> Result<Composed> {
     let trimmed = text.trim();
     let body = trimmed
@@ -192,7 +219,7 @@ pub async fn compose(
         temperature: None,
         max_completion_tokens: Some(1024),
         force_json: true,
-        json_schema: None,
+        json_schema: Some(composed_schema()),
         provider_options: None,
         disable_capabilities: vec![
             buckyos_api::features::WEB_SEARCH.to_string(),
@@ -287,7 +314,7 @@ impl ShareHost for ZoneShare {
                     "id": a.obj_id,
                     "kind": attachment_kind(mime),
                     "name": a.name,
-                    "status": "ready",
+                    "status": "uploaded",
                     "object": a.obj_id,
                 })),
                 Err(e) => {

@@ -1,3 +1,4 @@
+import { createCustomRulesDraft, parseProviderRulesFile, toProviderRuleOptions, type ProviderRuleOptions } from './custom_provider_rules'
 import { buckyos, getActiveSessionToken } from 'buckyos'
 import { isMockRuntime } from '../runtime'
 import type { ModelCatalog } from '../app/ai-center/datamodel/model-catalog'
@@ -16,9 +17,10 @@ import type {
 } from '../app/ai-center/datamodel/routing'
 import { normalizeFinanceTotals } from '../app/ai-center/datamodel/transforms'
 import { toAiccRpcCallOptions } from './aicc_rpc_options'
-import { toProviderInstanceRules } from './provider_model_selection'
+import { parseProviderAdvancedRules, toProviderInstanceRules } from './provider_model_selection'
 import type {
   AIStatus,
+  FilteredProviderCapability,
   ApiNamespace,
   ApiType,
   KnownProviderProfile,
@@ -197,6 +199,17 @@ const MOCK_PROVIDER_SETUP_CATALOG: ProviderSetupCatalog = {
       ? 'catalog-only'
       : `${provider_profile_id}-models`,
     provider_rules_id: provider_profile_id,
+    rules_catalog: {
+      format: 'buckyos.aicc.provider-rules-catalog', schema_version: 1, schema_revision: 1,
+      revision_seq: 1, provider_profile_id, models: [], patterns: [{ match: '*',
+        ...(provider_profile_id === 'openrouter' ? { operations: { llm: 'responses.create' } } : {}),
+      }],
+      model_driver_overrides: provider_profile_id === 'deepseek'
+        ? { 'deepseek-flash': 'deepseek/deepseek-v4.1-flash' } : {},
+    },
+    model_driver_overrides: provider_profile_id === 'deepseek'
+      ? { 'deepseek-flash': 'deepseek/deepseek-v4.1-flash' }
+      : {} as Record<string, string>,
     ui_hints: isDoubaoProfile(provider_profile_id)
       ? {
         setup_group: doubaoSetupGroup(provider_profile_id),
@@ -230,9 +243,10 @@ const MOCK_PROVIDER_SETUP_CATALOG: ProviderSetupCatalog = {
           : {},
   })),
   protocol_families: [
-    { protocol_family_id: 'openai', display_name: 'OpenAI compatible' },
-    { protocol_family_id: 'claude', display_name: 'Claude compatible' },
-    { protocol_family_id: 'gemini', display_name: 'Gemini compatible' },
+    { protocol_family_id: 'openai', protocol_adapter_id: 'openai-chat-completions', display_name: 'OpenAI Chat Completions' },
+    { protocol_family_id: 'openai', protocol_adapter_id: 'openai-responses', display_name: 'OpenAI Responses' },
+    { protocol_family_id: 'claude', protocol_adapter_id: 'claude-messages', display_name: 'Claude compatible' },
+    { protocol_family_id: 'gemini', protocol_adapter_id: 'gemini-interactions', display_name: 'Gemini compatible' },
   ],
 }
 
@@ -290,6 +304,7 @@ interface RawLogicalRouteItem {
 
 interface RawLogicalDefinition {
   path?: unknown
+  kind?: unknown
   api_type?: unknown
   min_line?: unknown
   fallback?: unknown
@@ -316,6 +331,11 @@ interface RawUsageAggregate {
 }
 
 interface RawProviderInstanceView {
+  discovered_model_ids?: unknown
+  rules_catalog?: unknown
+  resolved_model_rules?: unknown
+  provider_rules_id?: unknown
+  instance_rules?: unknown
   provider_instance_name?: unknown
   provider_type?: unknown
   provider_profile_id?: unknown
@@ -356,6 +376,7 @@ interface RawUsageBucketedRow {
 interface RawUsageEvent {
   event_id?: unknown
   tenant_id?: unknown
+  user_id?: unknown
   caller_app_id?: unknown
   task_id?: unknown
   capability?: unknown
@@ -387,16 +408,20 @@ interface RawTraceQueryResponse {
 interface AiccDataProvider {
   fetchSnapshot(): Promise<StoreSnapshot>
   fetchProviderSetupCatalog(): Promise<ProviderSetupCatalog>
+  fetchProviderRuleOptions(): Promise<ProviderRuleOptions>
+  previewProviderRules(provider: ProviderView, catalog: Record<string, unknown>, modelIds: string[]): Promise<Record<string, Record<string, unknown>>>
   fetchModelCatalog(): Promise<ModelCatalog>
   addProvider(draft: WizardDraft): Promise<void>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
   updateProviderKey(provider: ProviderView, apiKey: string): Promise<void>
+  updateProviderRules(provider: ProviderView, draft: Partial<WizardDraft>): Promise<void>
   setProviderEnabled(provider: ProviderView, enabled: boolean): Promise<void>
   setProviderWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
   getUsageSummary(): UsageSummary
   getUsageTrend(granularity?: string): UsageTrendPoint[]
+  queryUsageOverview(scope: UsageScope): Promise<UsageOverview>
   queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage>
   fetchRoutingWorkspace(): Promise<RoutingWorkspace>
   getRoutingState(): Promise<RoutingState>
@@ -414,13 +439,17 @@ export interface AICCMgr {
   getSnapshotVersion(): number
   refresh(): Promise<void>
   fetchProviderSetupCatalog(): Promise<ProviderSetupCatalog>
+  fetchProviderRuleOptions(): Promise<ProviderRuleOptions>
+  previewProviderRules(provider: ProviderView, catalog: Record<string, unknown>, modelIds: string[]): Promise<Record<string, Record<string, unknown>>>
   fetchModelCatalog(): Promise<ModelCatalog>
   getUsageSummary(): UsageSummary
   getUsageTrend(granularity?: string): UsageTrendPoint[]
+  queryUsageOverview(scope: UsageScope): Promise<UsageOverview>
   addProvider(draft: WizardDraft): Promise<ProviderView>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
   updateProviderKey(provider: ProviderView, apiKey: string): Promise<void>
+  updateProviderRules(provider: ProviderView, draft: Partial<WizardDraft>): Promise<void>
   setProviderEnabled(provider: ProviderView, enabled: boolean): Promise<void>
   setProviderRoutingWeight(providerInstanceName: string, weight: number): Promise<void>
   validateConnection(draft: WizardDraft): Promise<ValidationResult>
@@ -461,8 +490,28 @@ export interface UsageTimeRange {
   endTimeMs: number
 }
 
+export interface UsageScope {
+  zoneWide?: boolean
+  userId?: string
+}
+
+export interface UserUsageSummary {
+  user_id: string
+  total_tokens: number
+  total_requests: number
+  finance_totals: UsageSummary['finance_totals']
+  finance_complete: boolean
+}
+
+export interface UsageOverview {
+  summary: UsageSummary
+  trend: UsageTrendPoint[]
+  users: UserUsageSummary[]
+}
+
 export interface UsageEventsQuery {
   timeRange: UsageTimeRange
+  scope?: UsageScope
   filters?: {
     providerModels?: string[]
     providerModelQuery?: string
@@ -557,12 +606,24 @@ export class AICCModelStore implements AICCMgr {
     return this.provider.fetchProviderSetupCatalog()
   }
 
+  previewProviderRules(provider: ProviderView, catalog: Record<string, unknown>, modelIds: string[]): Promise<Record<string, Record<string, unknown>>> {
+    return this.provider.previewProviderRules(provider, catalog, modelIds)
+  }
+
+  fetchProviderRuleOptions(): Promise<ProviderRuleOptions> {
+    return this.provider.fetchProviderRuleOptions()
+  }
+
   getUsageSummary(): UsageSummary {
     return this.provider.getUsageSummary()
   }
 
   getUsageTrend(granularity = 'day'): UsageTrendPoint[] {
     return this.provider.getUsageTrend(granularity)
+  }
+
+  queryUsageOverview(scope: UsageScope): Promise<UsageOverview> {
+    return this.provider.queryUsageOverview(scope)
   }
 
   async addProvider(draft: WizardDraft): Promise<ProviderView> {
@@ -589,6 +650,16 @@ export class AICCModelStore implements AICCMgr {
 
   async refreshProviderModels(id: string): Promise<void> {
     await this.provider.refreshProviderModels(id)
+    await this.refresh()
+  }
+
+  async updateProviderRules(provider: ProviderView, draft: Partial<WizardDraft>): Promise<void> {
+    try {
+      await this.provider.updateProviderRules(provider, draft)
+    } catch (error) {
+      if (isSettingsRevisionConflict(error)) await this.refresh()
+      throw error
+    }
     await this.refresh()
   }
 
@@ -707,6 +778,34 @@ class MockAiccProvider implements AiccDataProvider {
     return mockModelCatalog(this.store.getSnapshot())
   }
 
+  async previewProviderRules(_provider: ProviderView, catalog: Record<string, unknown>, modelIds: string[]): Promise<Record<string, Record<string, unknown>>> {
+    const metadata = await this.fetchProviderRuleOptions()
+    const aliases = asRecord(catalog.model_driver_overrides)
+    const wildcard = (Array.isArray(catalog.patterns) ? catalog.patterns : []).map(asRecord).find((rule) => rule.match === '*')
+    return Object.fromEntries(modelIds.map((id) => {
+      const model = metadata.models.find((model) => model.target === (aliases[id] ?? id) || model.id === id)
+      const rule = (Array.isArray(catalog.models) ? catalog.models : []).map(asRecord).find((rule) => rule.id === id) ?? wildcard
+      return [id, { rule, variants: (Array.isArray(catalog.variants) ? catalog.variants : []).map(asRecord).filter((variant) => asRecord(variant.match).provider_model_id === id),
+        model_driver: model?.driver, origin_model_id: model?.id,
+        model_metadata: model ? { api_types: model.apiTypes, llm: { supported_efforts: model.efforts }, direct_only: model.directOnly } : undefined,
+      }]
+    }))
+  }
+
+  async fetchProviderRuleOptions(): Promise<ProviderRuleOptions> {
+    const [catalog, routing] = await Promise.all([this.fetchModelCatalog(), this.fetchRoutingWorkspace()])
+    const adapter = (id: string, defaults: Record<string, string>) => ({
+      protocol_adapter_id: id, default_operations: defaults,
+      operations: Object.entries(defaults).map(([api_type, operation_id]) => ({ operation_id, api_types: [api_type] })),
+    })
+    return toProviderRuleOptions(catalog, routing.directories, [
+      adapter('openai-responses', { llm: 'responses.create', 'image.txt2img': 'images.generate' }),
+      adapter('openai-chat-completions', { llm: 'chat.completions' }),
+      adapter('claude-messages', { llm: 'messages.create' }),
+      adapter('gemini-interactions', { llm: 'interactions.create' }),
+    ])
+  }
+
   async fetchProviderSetupCatalog(): Promise<ProviderSetupCatalog> {
     return MOCK_PROVIDER_SETUP_CATALOG
   }
@@ -721,6 +820,10 @@ class MockAiccProvider implements AiccDataProvider {
 
   async refreshProviderModels(): Promise<void> {
     this.store.refreshProviderModels()
+  }
+
+  async updateProviderRules(provider: ProviderView, draft: Partial<WizardDraft>): Promise<void> {
+    this.store.updateProviderRules(provider.config.id, draft)
   }
 
   async updateProviderKey(provider: ProviderView): Promise<void> {
@@ -747,8 +850,46 @@ class MockAiccProvider implements AiccDataProvider {
     return this.store.getUsageTrend()
   }
 
+  private async scopedUsageEvents(scope: UsageScope): Promise<StoreSnapshot['usageEvents']> {
+    const { mockCurrentAccount } = await import('./control_panel_mock')
+    const account = mockCurrentAccount()
+    if (!account) throw new Error('usage query requires an account')
+    if (scope.zoneWide && account.user_type !== 'admin' && account.user_type !== 'root') {
+      throw new Error('only an administrator may query usage of the whole Zone')
+    }
+    return this.store.getSnapshot().usageEvents.filter((event) =>
+      (scope.zoneWide || event.tenant_id === account.user_id)
+      && (!scope.userId || (event.user_id ?? event.tenant_id) === scope.userId),
+    )
+  }
+
+  async queryUsageOverview(scope: UsageScope): Promise<UsageOverview> {
+    const scopedEvents = await this.scopedUsageEvents(scope)
+    const timeRange = localTrailingDaysRange(30)
+    const events = scopedEvents.filter((event) => usageEventMatchesQuery(event, { timeRange, limit: 0 }))
+    const summary = this.store.getUsageSummary(events)
+    const current = this.store.getUsageSummary(scopedEvents)
+    summary.today_tokens = current.today_tokens
+    summary.this_month_tokens = current.this_month_tokens
+    const users = new Map<string, StoreSnapshot['usageEvents']>()
+    for (const event of events) {
+      const userId = event.user_id ?? event.tenant_id
+      const userEvents = users.get(userId) ?? []
+      userEvents.push(event)
+      users.set(userId, userEvents)
+    }
+    return {
+      summary,
+      trend: this.store.getUsageTrend(events),
+      users: Array.from(users, ([user_id, userEvents]) => {
+        const usage = this.store.getUsageSummary(userEvents)
+        return { user_id, total_tokens: usage.total_tokens, total_requests: usage.total_requests, finance_totals: usage.finance_totals, finance_complete: usage.finance_complete }
+      }).sort((left, right) => right.total_tokens - left.total_tokens),
+    }
+  }
+
   async queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage> {
-    const events = this.store.getSnapshot().usageEvents
+    const events = await this.scopedUsageEvents(params.scope ?? {})
     const filtered = events
       .filter((event) => usageEventMatchesQuery(event, params))
       .sort((left, right) => new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime())
@@ -889,6 +1030,21 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     return response.catalog
   }
 
+  async previewProviderRules(provider: ProviderView, catalog: Record<string, unknown>, modelIds: string[]): Promise<Record<string, Record<string, unknown>>> {
+    const response = await this.call<{ resolved_model_rules: Record<string, Record<string, unknown>> }>('provider.preview_rules', {
+      provider_instance_name: provider.config.provider_instance_name, rules_catalog: catalog, model_ids: modelIds,
+    }, { requireSession: true })
+    return response.resolved_model_rules
+  }
+
+  async fetchProviderRuleOptions(): Promise<ProviderRuleOptions> {
+    const [models, adapters] = await Promise.all([
+      this.call<{ catalog: ModelCatalog; logical_definitions?: unknown[] }>('models.list', {}),
+      this.call<RawProtocolAdapterListResponse>('protocol_adapter.list', {}),
+    ])
+    return toProviderRuleOptions(models.catalog, models.logical_definitions ?? [], adapters.adapters ?? [])
+  }
+
   async fetchProviderSetupCatalog(): Promise<ProviderSetupCatalog> {
     const [catalog, adapters] = await Promise.all([
       this.call<RawProviderCatalogResponse>('provider.catalog', {}),
@@ -934,6 +1090,18 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     }
   }
 
+  async updateProviderRules(provider: ProviderView, draft: Partial<WizardDraft>): Promise<void> {
+    const file = draft.rules_config_json ? parseProviderRulesFile(draft.rules_config_json, createCustomRulesDraft(provider.config)) : undefined
+    const result = await this.callProviderUpdate({
+      provider_instance_name: provider.config.provider_instance_name,
+      settings_revision: draft.rules_settings_revision ?? this.settingsRevision,
+      provider_rules_id: file?.provider_rules_id ?? draft.provider_rules_id?.trim() ?? provider.config.provider_rules_id ?? '',
+      instance_rules: file?.instance_rules ?? { ...provider.config.instance_rules, ...parseProviderAdvancedRules(draft) },
+    })
+    if (result.ok !== true) throw new Error('Could not apply provider rules')
+    this.settingsRevision = asNumber(result.settings_revision, this.settingsRevision)
+  }
+
   async updateProviderKey(provider: ProviderView, apiKey: string): Promise<void> {
     const result = await this.callProviderUpdate({
       provider_instance_name: provider.config.provider_instance_name,
@@ -972,6 +1140,12 @@ class BuckyOSAiccProvider implements AiccDataProvider {
       base_url_reachable: asBoolean(result.base_url_reachable, false),
       auth_valid: asBoolean(result.auth_valid, false),
       models_discovered: toStringArray(result.models_discovered),
+      models_recognized: toStringArray(result.models_recognized),
+      filtered_capabilities: toFilteredCapabilities(result.filtered_capabilities),
+      unmatched_models: Array.isArray(result.unmatched_models) ? result.unmatched_models : [],
+      unavailable_presets: Array.isArray(result.unavailable_presets) ? result.unavailable_presets : [],
+      routing_candidates: Object.fromEntries(Object.entries(asRecord(result.routing_candidates)).map(([path, models]) => [path, toStringArray(models)])),
+      warnings: toStringArray(result.warnings),
       balance_available: asBoolean(result.balance_available, false),
       errors: toStringArray(result.errors),
       error_details: toValidationErrorDetails(result.error_details, result.errors),
@@ -987,10 +1161,45 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     return this.usageTrend
   }
 
+  async queryUsageOverview(scope: UsageScope): Promise<UsageOverview> {
+    const dashboardRange = localTrailingDaysRange(30)
+    const query = (timeRange: UsageTimeRange, extra: Record<string, unknown> = {}) => this.queryUsage({
+      time_range: toRawTimeRange(timeRange),
+      zone_wide: scope.zoneWide === true,
+      filters: scope.userId ? { user_ids: [scope.userId] } : {},
+      output_mode: 'summary',
+      ...extra,
+    })
+    const [byModel, byCapability, byApp, trend, today, thisMonth, byUser] = await Promise.all([
+      query(dashboardRange, { group_by: ['provider_model'] }),
+      query(dashboardRange, { group_by: ['capability'] }),
+      query(dashboardRange, { group_by: ['caller_app_id'] }),
+      query(dashboardRange, { time_bucket: 'day' }),
+      query(localTodayRange()),
+      query(localCurrentMonthRange()),
+      query(dashboardRange, { group_by: ['user_id'] }),
+    ])
+    return {
+      summary: toUsageSummary({ byModel, byCapability, byApp, today, thisMonth }),
+      trend: toUsageTrend(trend),
+      users: groupedRows(byUser).map((row) => ({
+        user_id: asNonEmptyString(row.group?.user_id, ''),
+        total_tokens: aggregateTokens(row.aggregate),
+        total_requests: asNumber(row.aggregate?.total_requests, 0),
+        finance_totals: normalizeFinanceTotals(row.aggregate?.finance_totals),
+        finance_complete: asBoolean(row.aggregate?.finance_complete, true),
+      })).sort((left, right) => right.total_tokens - left.total_tokens),
+    }
+  }
+
   async queryUsageEvents(params: UsageEventsQuery): Promise<UsageEventsPage> {
     const response = await this.queryUsage({
       time_range: toRawTimeRange(params.timeRange),
-      filters: toRawUsageFilters(params.filters),
+      zone_wide: params.scope?.zoneWide === true,
+      filters: {
+        ...toRawUsageFilters(params.filters),
+        ...(params.scope?.userId ? { user_ids: [params.scope.userId] } : {}),
+      },
       output_mode: 'events',
       limit: params.limit,
       cursor: params.cursor,
@@ -1240,9 +1449,10 @@ function toProviderWritePayload(draft: WizardDraft): Record<string, unknown> {
   return {
     provider_instance_name: draft.provider_instance_name ?? defaultProviderInstanceName(providerType, draft.display_name),
     provider_type: 'cloud_api',
+    provider_rules_id: draft.provider_rules_id?.trim() || undefined,
     provider_profile_id: providerType,
     protocol_family_id: providerType === 'custom' ? draft.protocol_family_id : undefined,
-    protocol_adapter_id: providerType === 'custom' ? undefined : draft.protocol_adapter_id,
+    protocol_adapter_id: draft.protocol_adapter_id,
     base_url: draft.base_url.trim(),
     operation_base_urls: Object.fromEntries(
       Object.entries(draft.operation_base_urls)
@@ -1375,6 +1585,7 @@ function toUsageEvents(raw: RawUsageQueryResponse): StoreSnapshot['usageEvents']
       requested_model: asNonEmptyString(event.request_model, providerModel || 'unknown-model'),
       api_type: capabilityToApiType(asNonEmptyString(event.capability, 'llm')),
       tenant_id: asNonEmptyString(event.tenant_id, 'default'),
+      user_id: asOptionalString(event.user_id),
       app_id: asOptionalString(event.caller_app_id),
       session_id: asOptionalString(event.task_id),
       tokens_in: tokensIn,
@@ -1882,7 +2093,25 @@ function toStoreSnapshot(
   usageEvents: StoreSnapshot['usageEvents'] = [],
   routeTraces: RouteTrace[] = [],
 ): StoreSnapshot {
-  const rawModels = Array.isArray(directory.models) ? directory.models : []
+  const familyPaths = new Set((directory.logical_definitions ?? [])
+    .filter((definition) => definition.kind === 'family')
+    .map((definition) => asOptionalString(definition.path)))
+  const familyMounts = new Map<string, string[]>()
+  for (const [path, items] of Object.entries(directory.directory ?? {})) {
+    if (!familyPaths.has(path)) continue
+    for (const item of items) {
+      const target = asOptionalString(item.target)
+      if (!target?.includes('@')) continue
+      const mounts = familyMounts.get(target) ?? []
+      if (!mounts.includes(path)) mounts.push(path)
+      familyMounts.set(target, mounts)
+    }
+  }
+  const rawModels = (Array.isArray(directory.models) ? directory.models : []).map((model) =>
+    toApiTypes(model.api_types).includes('llm')
+      ? { ...model, logical_mounts: familyMounts.get(asNonEmptyString(model.exact_model, '')) ?? [] }
+      : model,
+  )
   const cloudProviders = (Array.isArray(providerList.providers) ? providerList.providers : [])
     .map((provider) => toProviderView(provider, rawModels))
   const localModels: LocalModel[] = []
@@ -1908,6 +2137,20 @@ function toStoreSnapshot(
     aiStatus: computeAIStatus(cloudProviders, localModels, routingView),
     settingsRevision: asNumber(providerList.settings_revision, 0),
   }
+}
+
+function toFilteredCapabilities(raw: unknown): FilteredProviderCapability[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((value) => {
+    const item = asRecord(value)
+    return {
+      provider_model_id: asNonEmptyString(item.provider_model_id, ''),
+      protocol_adapter_id: asNonEmptyString(item.protocol_adapter_id, ''),
+      api_type: asNonEmptyString(item.api_type, ''),
+      operation_id: asOptionalString(item.operation_id) ?? null,
+      reason: asNonEmptyString(item.reason, ''),
+    }
+  })
 }
 
 function toProviderView(raw: RawProviderInstanceView, allModels: RawModelMetadata[]): ProviderView {
@@ -1944,6 +2187,11 @@ function toProviderView(raw: RawProviderInstanceView, allModels: RawModelMetadat
     provider_profile_id: profile,
     protocol_adapter_id: adapter,
     provider_origin: 'system_config',
+    provider_rules_id: asOptionalString(raw.provider_rules_id),
+    instance_rules: asRecord(raw.instance_rules),
+    discovered_model_ids: toStringArray(raw.discovered_model_ids),
+    rules_catalog: isRecord(raw.rules_catalog) ? raw.rules_catalog : undefined,
+    resolved_model_rules: asRecord(raw.resolved_model_rules) as Record<string, Record<string, unknown>>,
     auth_mode: normalizeAuthMode(asRecord(raw.auth).mode),
     credential_configured: asBoolean(asRecord(raw.auth).configured, false),
     base_url: asNonEmptyString(raw.base_url, ''),
@@ -1978,6 +2226,7 @@ function toProviderView(raw: RawProviderInstanceView, allModels: RawModelMetadat
       protocol_adapter_id: adapter,
       provider_origin: config.provider_origin,
       inventory_revision: asOptionalString(rawInventory.revision),
+      filtered_capabilities: toFilteredCapabilities(rawInventory.filtered_capabilities),
       models,
     },
     status,
@@ -2537,6 +2786,8 @@ function toProviderSetupCatalog(
         protocol_adapter_id: asNonEmptyString(entry.protocol_adapter_id, ''),
         discovery_behavior_id: asNonEmptyString(entry.discovery_behavior_id, ''),
         provider_rules_id: asOptionalString(entry.provider_rules_id),
+        model_driver_overrides: asStringRecord(entry.model_driver_overrides),
+        rules_catalog: isRecord(entry.rules_catalog) ? entry.rules_catalog : undefined,
         ui_hints: asRecord(entry.ui_hints),
         setup_group: toProviderSetupGroup(entry.ui_hints),
         endpoint_hints: toProviderEndpointHints(entry.ui_hints),
@@ -2545,20 +2796,26 @@ function toProviderSetupCatalog(
       }
     })
     .filter((item): item is NonNullable<typeof item> => item !== null)
-  const families = new Set<string>()
-  for (const item of Array.isArray(adapters.adapters) ? adapters.adapters : []) {
-    const adapter = asRecord(item)
-    if (adapter.custom_provider_selectable !== true) continue
-    const family = asOptionalString(adapter.protocol_family_id)
-    if (family) families.add(family)
-  }
+  const protocol_families = (Array.isArray(adapters.adapters) ? adapters.adapters : [])
+    .map(asRecord)
+    .filter((adapter) => adapter.custom_provider_selectable === true)
+    .map((adapter) => {
+      const protocol_adapter_id = asNonEmptyString(adapter.protocol_adapter_id, '')
+      return {
+        protocol_family_id: asNonEmptyString(adapter.protocol_family_id, ''),
+        protocol_adapter_id,
+        display_name: protocol_adapter_id === 'openai-chat-completions'
+          ? 'OpenAI Chat Completions'
+          : protocol_adapter_id === 'openai-responses'
+            ? 'OpenAI Responses'
+            : labelFromPath(protocol_adapter_id),
+      }
+    })
+    .sort((a, b) => a.display_name.localeCompare(b.display_name))
   return {
     catalog_revision: asNumber(catalog.catalog_revision, 0),
     providers: sortProviderProfiles(providers),
-    protocol_families: Array.from(families).sort().map((protocol_family_id) => ({
-      protocol_family_id,
-      display_name: `${labelFromPath(protocol_family_id)} compatible`,
-    })),
+    protocol_families,
   }
 }
 

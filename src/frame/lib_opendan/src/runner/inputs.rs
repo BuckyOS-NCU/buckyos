@@ -10,7 +10,7 @@
 //! | `msg` | candidate of a controlled input batch |
 //! | `event`, active subscription | candidate (accepted: its routing is kept) |
 //! | `event`, semi subscription | merged into `pending_events`, consumed |
-//! | `event` of a suspended call's task | consumed; only wakes the wait |
+//! | `event` of a task the session follows | consumed; its end is queried |
 //! | `event` without a valid subscription | consumed, `event_dropped` |
 //!
 //! Everything consumed here is committed to state.json before the input
@@ -135,8 +135,8 @@ pub(super) fn reject(
 pub struct Routed {
     /// msg and accepted Input events, in consumption order; still queued.
     pub candidates: Vec<FetchedInput>,
-    /// A notification for a task a suspended call waits for arrived: query
-    /// the task now instead of at the next poll.
+    /// A notification for a task the session follows arrived: query the
+    /// task now instead of at the next poll.
     pub task_notified: bool,
 }
 
@@ -173,6 +173,20 @@ pub async fn stop_queued(sh: &Shared) -> bool {
     fetched.iter().any(|m| {
         matches!(m.control(), Some(ControlCommand::Stop { .. }))
             && !s.state.recent_keys.contains(&m.key)
+    })
+}
+
+/// An update of the Todo this work session executes is queued and not
+/// taken in yet.
+pub(super) async fn todo_update_queued(sh: &Shared) -> bool {
+    let Ok(fetched) = fetch_inputs(sh).await else {
+        return false;
+    };
+    let s = sh.session.lock().await;
+    fetched.iter().any(|m| {
+        !s.state.source(&m.src).is_consumed(m.index)
+            && !s.state.recent_keys.contains(&m.key)
+            && matches!(&m.input, Ok(SessionInput::Event(ev)) if ev.source.kind == crate::todos::TODO_EVENT_SOURCE)
     })
 }
 
@@ -226,6 +240,7 @@ async fn poll_session_subscriptions(sh: &Shared, s: &mut Session) -> Result<bool
             summary: text,
             data_ref: None,
             terminal,
+            call_id: None,
         };
         let key = format!("session:{session_ref}@{}", e.status.rev);
         merge_pending_event(
@@ -245,18 +260,13 @@ async fn poll_session_subscriptions(sh: &Shared, s: &mut Session) -> Result<bool
 }
 
 /// One routing pass (drive start, every loop iteration, every checkpoint
-/// boundary). `in_run`: a run is executing. `pending_tasks`: task ids the
-/// suspended calls of the live run wait for.
-pub async fn route_inputs(sh: &Shared, in_run: bool, pending_tasks: &[String]) -> Result<Routed> {
+/// boundary). `in_run`: a run is executing.
+pub async fn route_inputs(sh: &Shared, in_run: bool) -> Result<Routed> {
     // A large future (controls, decide, perception): kept off the stack.
-    Box::pin(route_inputs_inner(sh, in_run, pending_tasks)).await
+    Box::pin(route_inputs_inner(sh, in_run)).await
 }
 
-async fn route_inputs_inner(
-    sh: &Shared,
-    in_run: bool,
-    pending_tasks: &[String],
-) -> Result<Routed> {
+async fn route_inputs_inner(sh: &Shared, in_run: bool) -> Result<Routed> {
     let fetched = fetch_inputs(sh).await?;
     let mut routed = Routed::default();
     let mut s = sh.session.lock().await;
@@ -308,16 +318,29 @@ async fn route_inputs_inner(
                     routed.candidates.push(m);
                     continue;
                 }
-                // The result dependency of a suspended call is matched by
-                // task id, separately from ordinary subscriptions: the
-                // notification only triggers a query, the result is filled
-                // as the call's tool result.
-                if ev.source.kind == "task" && pending_tasks.contains(&ev.source.id) {
+                // What the plan tells the work session of its Todo (an
+                // update) is its input: the queue exists for it.
+                if ev.source.kind == crate::todos::TODO_EVENT_SOURCE
+                    && s.config
+                        .session
+                        .origin
+                        .as_ref()
+                        .is_some_and(|o| o.parent_session.is_some())
+                {
+                    s.state.source_mut(&m.src).accepted.insert(m.index);
+                    routed.candidates.push(m);
+                    changed = true;
+                    continue;
+                }
+                // A task the session follows is matched by task id,
+                // separately from ordinary subscriptions: the notification
+                // only triggers a query; its end comes in as a task result.
+                if ev.source.kind == "task" && s.state.watched_tasks.contains(&ev.source.id) {
                     s.state.source_mut(&m.src).mark(m.index);
                     s.state.recent_keys.push(&m.key);
                     bodies.push(WorklogBody::EventDropped {
                         input: m.input_ref(),
-                        reason: "pending_call".into(),
+                        reason: "watched_task".into(),
                     });
                     routed.task_notified = true;
                     changed = true;
@@ -381,6 +404,43 @@ async fn route_inputs_inner(
     Ok(routed)
 }
 
+/// Reason of the pause a session hands down to its sub sessions.
+fn parent_pause_reason(sid: &str) -> String {
+    format!("parent session {sid} was paused")
+}
+
+/// A pause reaches the sub sessions that are not finished (those with a
+/// queue); a resume only those this session's pause paused.
+async fn cascade_pause(sh: &Shared, sid: &str, key: &str, pause: bool) {
+    let Ok(children) = sh.agent().sessions().children_of(&[sid.to_string()]).await else {
+        return;
+    };
+    let reason = parent_pause_reason(sid);
+    for e in children {
+        if e.status.run_state == RunState::Finished || e.input_queue.is_none() {
+            continue;
+        }
+        let command = if pause {
+            ControlCommand::Pause { reason: Some(reason.clone()) }
+        } else {
+            let by_parent = e.status.paused
+                && crate::session::SessionDir::open(&e.location)
+                    .and_then(|d| d.state())
+                    .ok()
+                    .and_then(|st| st.paused)
+                    .is_some_and(|p| p.reason.as_deref() == Some(reason.as_str()));
+            if !by_parent {
+                continue;
+            }
+            ControlCommand::Resume { reason: Some(format!("parent session {sid} was resumed")) }
+        };
+        let input = PostedInput::control(&sh.deps.who, format!("{}:parent:{key}", command.name()), command);
+        if let Err(err) = sh.agent().sessions().post_input(&e.session_id, &input).await {
+            log::warn!("cannot {} sub session {}: {err}", input.input.type_name(), e.session_id);
+        }
+    }
+}
+
 /// Apply one control command. `true`: consumed; `false`: it stays queued
 /// (a `decide` that cannot be applied yet).
 async fn apply_control(
@@ -417,6 +477,43 @@ async fn apply_control(
                     "applied": applied,
                 }),
             });
+        }
+        ControlCommand::Pause { reason } => {
+            let applied = !finished && s.state.paused.is_none();
+            if applied {
+                s.state.paused = Some(Paused {
+                    at_ms: crate::now_ms(),
+                    reason: reason.clone(),
+                    by: m.from.clone(),
+                    in_run: false,
+                });
+                s.state.resume_run = false;
+                super::turn_task::note_live_line(s, None, None);
+            }
+            bodies.push(WorklogBody::ControlApplied {
+                input: m.input_ref(),
+                command: "pause".into(),
+                detail: json!({ "reason": reason, "from": m.from, "applied": applied }),
+            });
+            if applied {
+                cascade_pause(sh, s.sid(), &m.key, true).await;
+            }
+        }
+        ControlCommand::Resume { reason } => {
+            let paused = s.state.paused.take();
+            let applied = paused.is_some();
+            if paused.is_some_and(|p| p.in_run) {
+                s.state.resume_run = true;
+            }
+            bodies.push(WorklogBody::ControlApplied {
+                input: m.input_ref(),
+                command: "resume".into(),
+                detail: json!({ "reason": reason, "from": m.from, "applied": applied }),
+            });
+            if applied {
+                super::turn_task::note_live_line(s, None, None);
+                cascade_pause(sh, s.sid(), &m.key, false).await;
+            }
         }
         ControlCommand::GoalSkills { add, remove } => {
             match super::goal::apply_skills_control(&mut s.state, add, remove) {
@@ -632,32 +729,8 @@ pub(super) async fn apply_decide(
         by: if by.is_empty() { m.from.clone() } else { by.to_string() },
         report,
     };
-    if decision == "discard" {
-        // Appended after the commit by the caller's commit; perception after.
-        let seq = s.state.perception_seq + 1;
-        s.state.perception_seq = seq;
-        let rec = PerceptionRecord {
-            seq,
-            at_ms: crate::now_ms(),
-            session_id: sid.clone(),
-            kind: "task_discarded".into(),
-            source: "session".into(),
-            tags: s.state.topic.tags.clone(),
-            objects: s
-                .config
-                .artifact_id
-                .iter()
-                .map(|a| format!("artifact:{a}"))
-                .collect(),
-            summary: format!("work session {sid} was discarded"),
-            payload: json!({ "session": sid, "artifact_version": version.as_ref().map(|v| v.ver.clone()) }),
-            refs: Value::Null,
-            ..Default::default()
-        };
-        if let Err(e) = sh.agent().perception().append(&sh.lease, &sid, vec![rec]).await {
-            log::warn!("task_discarded perception of {sid}: {e}");
-        }
-    }
+    // A discarded task leaves no Runtime perception: the decision is in the
+    // worklog and the Task object.
     Ok(Some(body))
 }
 

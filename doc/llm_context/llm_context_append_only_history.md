@@ -23,7 +23,7 @@ OpenDAN 的 behavior loop 会把 `StepRecord` 渲染成 `AiMessage` 后交给底
 | `LLMContextSnapshot` | llm_context；当前实现由 libopendan 持久化在 `runs/<run_id>/snapshots/` | 恢复执行的机器状态：request、`accumulated`、usage、工具迭代额度、挂起与续派状态（`suspended` / `tool_batch` / `action_step`）、behavior 的 `steps` / `last_step` / 编号游标、宿主元数据 `host` | 只服务于本 run 的恢复和接手；不承担长期历史展示 |
 | inner transcript | 快照内：behavior 模式 `accumulated` 中 `request.input` 之后的消息 | 进行中 Step 的内层原生工具 Loop（tool_use 与已得结果），让挂起的 Step 不重放工具地续跑；`RewrittenSteps` 原样保留它 | Step 完成即清空，不进入 `StepRecord`，也不写入 worklog |
 | `StepRecord` | 快照内 `steps` / `last_step` | 一个已完成的行为决策及其 action 结果，是 behavior prompt 的历史单元；身份 `(run_id, step_index)` | run 内只追加；完成后由宿主 flush 进 worklog（按 `step_index` 去重）；新 run 的历史从 worklog 重建（按目标 behavior 的 `inherit` 选择）；子 context 例外：`create_sub_context`（`inherit: steps`）与 `fork` 的子 run 由 `derive_child` / `fork_snapshot` 从调用方快照继承 steps，继承的部分不由子 run 写入 worklog |
-| Session worklog | libopendan `.opendan_agent_session/worklog.jsonl` | 严格只追加的 Session 历史：输入批次（`turn_started` / `input_batch` / `user_message`）、function call 的 `assistant_message`、behavior 的 `step`、`action_result`、`outcome`、`turn_ended`、`compaction` 等；用于审计、展示，并经 `summary.json` 重建下一个 run 的 `<session_history>` | 长期；压缩只写 `summary.json` 和 `compaction` 条目，不改已写记录 |
+| Session worklog | libopendan `.opendan_agent_session/worklog.jsonl` | 严格只追加的 Session 历史：输入批次（`turn_started` / `input_batch` / `user_message`）、function call 的 `assistant_message`、behavior 的 `step`、`action_result`、`outcome`、`turn_ended`、`compaction` 等；用于审计、展示，并经 `summary.json` 重建下一个 run 的会话历史消息 | 长期；压缩只写 `summary.json` 和 `compaction` 条目，不改已写记录 |
 
 - Snapshot 不应该承担长期历史展示职责；Session worklog 也不应该被 `llm_context` 当作恢复执行状态读取。需要从完整历史重建上下文时，由 Session 层读取 worklog / summary 后生成新的 input，`llm_context` 不理解 worklog。
 - function call run 的 flush 单位是消息（每个 Round 的 assistant response 记为 `assistant_message`，工具结果记为 `action_result`）；behavior run 的 flush 单位是已完成的 `StepRecord`，inner transcript 不写入 worklog。
@@ -86,7 +86,7 @@ traditional loop 的主线比较简单，和目标一致：
 - traditional `build_inference_request` 直接把 `state.accumulated.clone()` 交给 provider。
 - provider 返回 tool call 时，loop 先 append assistant message，再 append tool result message。
 - provider 返回 final answer 时，`finish_done` append final assistant message。
-- `InferenceHook` 只拿 `&LLMContextSnapshot`，按接口约束不能直接修改 waist 状态；`CheckpointHook` 的注入只在推理边界（behavior 模式为 Step 边界）追加消息，不改旧 prefix。
+- `CheckpointHook` 只拿 `&LLMContextSnapshot`，不能直接修改 waist 状态；它唯一能放进上下文的是注入（`Injection`），只在推理边界（behavior 模式为 Step 边界）追加消息，进历史也进快照，不改旧 prefix。
 
 这些路径可以作为目标模型：`llm_context` 不理解 session 历史，只维护一次推理过程的输入、输出和恢复点。
 
@@ -94,9 +94,9 @@ traditional loop 的主线比较简单，和目标一致：
 
 behavior mode 当前把较多 session/agent 语义带进了 `LLMContextSnapshot`：
 
-- `LLMContextState` 里有 `steps`、`history_summaries`、`history_inputs`、`last_step`、`last_report`、`next_step_index`、`next_action_id`。
+- `LLMContextState` 里有 `steps`、`history_summaries`、`last_step`、`last_report`、`next_step_index`、`next_action_id`。
 - `build_inner_request` 在每个 Step 开始内层推理时调用 `renderer.render_history(state.steps, ...)`，再渲染 `last_step` 并接上 inner transcript，说明 behavior history 仍在 `llm_context` 内物化成 prompt。
-- `snapshot_overrides` 位于 `llm_context` crate 内，可以替换 system/user message、清空 step/history state、移动 hot tail。它现在只定位为“从同一个 run 自己的快照改 request 侧参数重建”；context 之间的交接不在已有历史上替换 system，改由 `context_derive`（`derive_child` / `fork_snapshot`）派生子快照。`RequestOverrides.system_messages` / `user_messages` 只为旧 opendan Runtime 保留。
+- context 之间的交接不在已有历史上替换 system，由 `context_derive`（`derive_child` / `fork_snapshot`）在 waist 内派生子快照；继承边界、分叉点、编号延续这些规则也在 waist 内。
 - message-level rewrite 与 behavior-step history 的双轨语义已由 `ResumeFill::RewrittenSteps` 收口：behavior 模式的 `ContextLimitReached` 只接受 `RewrittenSteps`（同时替换 `request.input` / `history_summaries` / `steps` / `last_step`），`RewrittenHistory` 只用于 function call 模式。
 
 这些不是马上必须删除的 bug，但它们是复杂度来源。按“LLMContext 越简单越可靠”的目标，后续应逐步把这些上移到 session 层。
@@ -118,7 +118,7 @@ behavior mode 当前把较多 session/agent 语义带进了 `LLMContextSnapshot`
 - run 快照先 fsync 再发布到 `runs/<run_id>/snapshots/`，`state.json` 是会话提交点，worklog 追加先于它写入。
 - run 结束、交接挂起（`switch_context` 的 Parked 帧、子 context 调用方的 Caller 帧）、上下文上限重写前，都先按 flush 游标把未写入的历史追加进 worklog，再继续。
 - 交接点（run.json 的 `handover`）随快照先落盘，再提交 `state.json`；崩溃后由 reconcile（`redo_transfer`）恰好补交一次，state 用 `handover_at_ms` 记住已提交的交接。
-- 已返回的子 context（`process_done`）的记录留在 worklog 供审计，但重建 `<session_history>` 时被排除，只渲染它的 `process_done` 结果（`runner/history.rs`），避免子过程的完整内容混进其它 context 的输入。压缩输入做同样的过滤，但压缩只识别被压缩片段内的 `process_done`：切点把子 run 的记录与它的 `process_done` 分开时，切点之前的那部分仍会进入摘要。
+- 已返回的子 context（`process_done`）的记录留在 worklog 供审计，但重建会话历史时被排除，只渲染它的 `process_done` 结果（`runner/history.rs`），避免子过程的完整内容混进其它 context 的输入。压缩一次读入整段未压缩范围，输入做同样的过滤；压缩发生时仍在运行的子 context，其记录会进入摘要。
 - 上下文上限在 Session 层重写（上面的 history epoch），不在 waist 内。
 
 旧 opendan Runtime（待下一阶段 opendan 重构接入）也有同方向的边界：
@@ -147,7 +147,7 @@ behavior mode 当前把较多 session/agent 语义带进了 `LLMContextSnapshot`
 1. 移除 `XmlStepRenderer` 的 recency-based compact 逻辑。（已完成）
 2. 移除 `LLMContextDeps.history_compressor` 及 behavior loop 内部自动 compressor 入口。（已完成）
 3. 保持 `llm_context` 推理期间 append-only，不在内部修改旧 message / old step。
-4. 宿主 Session 层负责 context-limit 重写、历史压缩和手动压缩，并在压缩后持久化 snapshot：当前实现是 libopendan `SessionRunner`；旧 opendan Runtime 的 `llm_message_compress` 等待下一阶段 opendan 重构接入。
+4. 宿主 Session 层负责 context-limit 重写、历史压缩和手动压缩，并在压缩后持久化 snapshot：当前实现是 libopendan `runner::drive`；旧 opendan Runtime 的 `llm_message_compress` 等待下一阶段 opendan 重构接入。
 5. 后续如果要压缩 `StepRecord` 维度历史，应在 session 层实现为显式状态改写（`RewrittenSteps`），而不是在 renderer 或 loop 内自动发生。
 
 ## 后续简化路线
@@ -156,7 +156,7 @@ behavior mode 当前把较多 session/agent 语义带进了 `LLMContextSnapshot`
 
 1. `LLMContextRequest.input` 是本次推理的完整输入前缀。
 2. `LLMContextState.accumulated` 是 append-only 的运行中 transcript。
-3. `LLMContextSnapshot` 只保存恢复执行必要的 request、accumulated、挂起与续派状态（`suspended` / `tool_batch` / `action_step`）、工具迭代额度等预算计数、usage、abort/task id 等机器状态。
+3. `LLMContextSnapshot` 只保存恢复执行必要的 request、accumulated、挂起与续派状态（`suspended` / `tool_batch` / `action_step`）、工具迭代额度等预算计数、usage 等机器状态；任务 id 不进 waist 状态，调用变成了哪个任务由 Runtime 按 call_id 找回。
 4. behavior 的 `StepRecord`、report、behavior switch、process stack、Session worklog 的增量 flush 都由 Session 层管理。
 5. session 层在启动或恢复一次 LLMContext 前，把自己维护的 history/step/summary 明确物化成 `AiMessage`，作为新的稳定 input。
 
@@ -166,7 +166,7 @@ behavior mode 当前把较多 session/agent 语义带进了 `LLMContextSnapshot`
 
 - behavior mode 现在仍由 `llm_context::build_inner_request` 调 `render_history`，所以 StepRecord prompt 物化还没有完全上移到 session 层。
 - libopendan 的上下文上限重写把 steps 整体折叠进 input，不做 StepRecord 维度的细粒度压缩；旧 opendan Runtime 的 `llm_message_compress` 主要压缩 `state.accumulated`，behavior prompt 的 token 主要来自 `steps/last_step` 时仍可能压不下来（待下一阶段 opendan 重构接入）。
-- `snapshot_overrides` 仍在 `llm_context` crate 内，其中替换 system / user message 的部分只有旧 opendan Runtime 在用；libopendan 的交接不使用它，子 context 由 `context_derive` 的 `derive_child` / `fork_snapshot` 构造。派生规则（继承边界、分叉点、编号延续）目前也在 waist 内，长期看应评估哪些可以迁到 Session 层，减少 waist 对 agent 语义的认知。
+- 子 context 由 `context_derive` 的 `derive_child` / `fork_snapshot` 构造，派生规则（继承边界、分叉点、编号延续）目前在 waist 内，长期看应评估哪些可以迁到 Session 层，减少 waist 对 agent 语义的认知。
 
 ## 判断标准
 

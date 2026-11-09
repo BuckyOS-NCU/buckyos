@@ -313,7 +313,7 @@
 //    - 优先使用进程环境变量 `BUCKYOS_ROOT`。
 //    - macOS 其次读当前用户 LaunchAgent plist 里的 `BUCKYOS_ROOT`（自定义根）。
 //    - macOS/Linux 默认 `/opt/buckyos`。
-//    - Windows 依次 fallback 到 `%APPDATA%\buckyos`、`%USERPROFILE%\buckyos`、`C:\buckyos`。
+//    - Windows 默认 `C:\buckyos`。
 // 2. 检查 `$BUCKYOS_ROOT/etc/node_identity.json` 判断 activated / activation pending。
 // 3. 如果未激活：
 //    - 检查 node_daemon 进程。
@@ -1160,19 +1160,7 @@ pub fn resolve_buckyos_root() -> PathBuf {
         }
     }
     match NodePlatform::current() {
-        NodePlatform::Windows => {
-            if let Ok(appdata) = std::env::var("APPDATA") {
-                if !appdata.is_empty() {
-                    return PathBuf::from(appdata).join("buckyos");
-                }
-            }
-            if let Ok(profile) = std::env::var("USERPROFILE") {
-                if !profile.is_empty() {
-                    return PathBuf::from(profile).join("buckyos");
-                }
-            }
-            PathBuf::from("C:\\buckyos")
-        }
+        NodePlatform::Windows => PathBuf::from(r"C:\buckyos"),
         _ => PathBuf::from("/opt/buckyos"),
     }
 }
@@ -3377,7 +3365,11 @@ fn blackbox_stop(req: &NodeStopRequest, host: &NodeHostControlState, report: &mu
         req.blackbox_policy,
         NodeBlackboxStopPolicy::IncludeManagedContainers | NodeBlackboxStopPolicy::FullRuntime
     );
-    if want_containers {
+    if want_containers && !product_runs_containers(&host.buckyos_root) {
+        report
+            .actions
+            .push("this product edition runs no containers; docker is not touched".to_string());
+    } else if want_containers {
         let mut targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if let Some(snap) = &snapshot {
             for name in snap.app_service_container_names() {
@@ -3434,6 +3426,19 @@ fn blackbox_stop(req: &NodeStopRequest, host: &NodeHostControlState, report: &mu
             let _ = kill_process_by_name(alias);
         }
         let _ = host; // suppress unused on some configs
+    }
+}
+
+/// Whether the installation's product runs containers at all
+/// (`etc/product.json`, the full edition when absent): BuckyOS Desktop Lite
+/// never calls docker, not even to clean up.
+fn product_runs_containers(buckyos_root: &Path) -> bool {
+    match std::fs::read_to_string(buckyos_root.join("etc").join("product.json")) {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|profile| profile.pointer("/capabilities/container").and_then(|v| v.as_bool()))
+            .unwrap_or(false),
+        Err(_) => true,
     }
 }
 

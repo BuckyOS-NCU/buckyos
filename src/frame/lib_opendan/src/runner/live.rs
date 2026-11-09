@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent_tool::exec_tracking::{materialize_unresolved, HostRunInfo};
+use agent_tool::exec_tracking::{in_flight_call, HostRunInfo};
 use agent_tool::llm_bash::RunBinding;
 use agent_tool::xllm::{
     create_run_llm, hosted_waist_deps, rebuild_toolset, EffectiveConfig, LoopModel, RunRecord,
@@ -16,11 +16,9 @@ use agent_tool::xllm::{
 use buckyos_api::{AiContent, AiMessage, AiRole};
 use llm_context::deps::{Injection, LLMContextDeps, LlmClient};
 use llm_context::error::{LLMComputeError, ProviderFailure};
-use llm_context::observation::Observation;
 use llm_context::outcome::{LLMContextOutcome, ResumeFill};
-use llm_context::request::ContextOwnerRef;
-use llm_context::state::{LLMContextSnapshot, Suspension};
-use llm_context::tasks::{task_state_observation, RunningTaskResolver, TaskState};
+use llm_context::state::LLMContextSnapshot;
+use agent_tool::task_model::RunningTaskResolver;
 use llm_context::LLMContext;
 use serde_json::{json, Value};
 
@@ -30,16 +28,20 @@ use crate::runtime::SessionEnv;
 use crate::session::runs::RunHandle;
 
 use super::flush::{run_history_entries, FlushMarks};
-use super::history::{build_history, compact_for_limit, LlmSummarizer, Summarizer};
+use super::history::{
+    build_chat_history, build_history, compact_for_limit, HistoryShape, LimitLine, Summarizer,
+};
+use agent_tool::llm_compress::CompressReport;
 use super::hook::{scope_touching, SessionCheckpointHook};
 use super::inputs::confirm_inputs;
 use super::receipts::{
     apply_receipt, host_meta_of, positions_of, snapshot_host_meta, with_host_meta,
 };
-use super::shared::{commit_and_report, counted, LiveCtx, Opened, Shared, WaitingRun};
-use super::tools::{BehaviorTool, SessionToolManager, SUB_CONTEXT_TASK_PREFIX};
+use super::shared::{commit_and_report, counted, LiveCtx, Shared};
+use super::tools::{BehaviorTool, SessionToolManager};
 
-/// Mid-run compactions in a row before a context-limit run is paused.
+/// Mid-run compactions in a row (no successful inference between them)
+/// before a context-limit run is paused.
 const MAX_LIMIT_COMPACTIONS: u32 = 3;
 
 /// Remove an unreferenced run: lock, then delete. Processes a run's
@@ -102,6 +104,8 @@ async fn xllm_deps_for(
     x.runtime_env = env.env.iter().cloned().collect();
     x.runtime_path_prefix = env.path_layers.clone();
     x.skip_workdir_lock = true;
+    // Hints shown once per session, dedup keys of this drive.
+    x.hint_ledger = Some(sh.hints.clone());
     if x.host_protocol == agent_tool::xllm::HostProtocolFlavor::OneShot {
         // A session is not a one-shot task: whether the agent may wait for
         // the user is the session's rule (`session.policy.wait_user_msg`).
@@ -129,22 +133,9 @@ async fn xllm_deps_for(
         x.task_cli = Some(UI_TASK_CLI.to_string());
         x.shell_note = Some(UI_SHELL_NOTE.to_string());
     }
-    // Suspended calls waiting for a sub session (`session:<sid>`) are
-    // answered from the registry; other task ids go to the host's resolver.
-    // A `shell` command handed over as a task belongs to this session and
-    // hangs under the task of its Turn.
-    // The Turn opens inside the run, after this: its task is looked up
-    // from the committed state when a command is handed over.
-    let dir = sh.dir.clone();
-    x.shell_task_context = agent_tool::ShellTaskContext {
-        session_id: Some(sh.dir.sid().to_string()),
-        parent_task: Some(Arc::new(move || {
-            dir.state()
-                .ok()
-                .and_then(|s| s.open_turn_task().map(|t| t.task_id.clone()))
-        })),
-        run: None,
-    };
+    // Sub sessions (`session:<sid>`) are answered from the registry; other
+    // task ids (`t-`) go to the host's resolver. `shell` commands that
+    // outlive their wait stay tasks of this process (`local:`).
     x.buckyos_tasks = Some(host_task_resolver(sh));
     let mut functions = std::collections::BTreeSet::new();
     if let Some(tool) = BehaviorTool::any(&behaviors, depth, max_depth) {
@@ -179,17 +170,10 @@ async fn xllm_deps_for(
 }
 
 /// The resolver of the tasks a host answers for: sub sessions
-/// (`session:<sid>`), then the host's `shell` task manager scoped to this
-/// session (its `active()` lists this session's tasks), else whatever
-/// resolver the host injected.
+/// (`session:<sid>`), else the resolver the host injected (TaskMgr `t-`
+/// tasks of krpc tools).
 pub(super) fn host_task_resolver(sh: &Arc<Shared>) -> Arc<dyn RunningTaskResolver> {
-    let inner = sh
-        .deps
-        .xllm
-        .shell_tasks
-        .as_ref()
-        .and_then(|m| m.resolver(Some(sh.dir.sid())))
-        .or_else(|| sh.deps.xllm.buckyos_tasks.clone());
+    let inner = sh.deps.xllm.buckyos_tasks.clone();
     Arc::new(super::children::SessionTaskResolver::new(
         sh.deps.agent.clone(),
         inner,
@@ -227,7 +211,6 @@ fn checkpoint_deps(
     *sh.tasks.lock().expect("tasks") = Some(resolver.clone());
     hosted_waist_deps(cfg, llm, Arc::new(tools))
         .with_checkpoint_hook(hook)
-        .with_tasks(resolver.clone())
         // Only consulted for a run with a reply contract (`[reply]`).
         .with_output_validator(Arc::new(super::reports::ReplyValidator {
             sh: sh.clone(),
@@ -265,6 +248,8 @@ pub(super) async fn new_run_context(
     binding: &Binding,
     env: &SessionEnv,
 ) -> Result<LiveCtx> {
+    // A new context: no result of an earlier one is in it.
+    sh.hints.clear_dedup();
     let (cfg, new) = {
         let s = sh.session.lock().await;
         let cfg = s.config.clone();
@@ -388,8 +373,8 @@ async fn fork_run_context(
         compactions: 0,
         pid: std::process::id(),
         host_commit_pending: None,
-        inflight: Vec::new(),
         handover: None,
+        hints_once: Vec::new(),
         ..parent_record
     };
     if let Some(host) = record.host.as_mut() {
@@ -453,6 +438,7 @@ async fn fork_run_context(
         rounds,
         summary_llm: llm,
         resolver,
+        waited: false,
     })
 }
 
@@ -485,6 +471,65 @@ fn session_env_check(sh: &Shared, env: &SessionEnv) -> Result<Value> {
         json!({"runtime": sh.deps.runtime.descriptor(), "env": values, "env_refs": refs,
         "path_prefix": env.path_layers, "bin_dir": sh.dir.runtime_bin_dir(), "bin_manifest": manifest}),
     )
+}
+
+/// Model of a run whose `llm_context` names none (xllm's default for the
+/// buckyos provider).
+const DEFAULT_MODEL_ALIAS: &str = "llm.chat";
+
+/// How long a new run waits for the window of its model.
+const WINDOW_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `context_window` of a new run (work context budget TODO §3.1): an
+/// explicit value (agent / session / behavior `llm_context`) stays;
+/// otherwise the window of the model its alias routes to
+/// (`RunnerDeps.context_windows`), else `options.default_context_window`,
+/// at most `options.max_context_window` (none by default: the window
+/// follows the model, compaction TODO W1). A failed lookup only warns. xllm
+/// derives the compaction trigger from it.
+async fn resolve_context_window(sh: &Shared, llm_ctx: &mut Value) {
+    if llm_ctx.get("context_window").is_some_and(|v| !v.is_null()) {
+        return;
+    }
+    let model = llm_ctx
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_MODEL_ALIAS)
+        .to_string();
+    let mut window = None;
+    if let Some(source) = &sh.deps.context_windows {
+        match tokio::time::timeout(WINDOW_LOOKUP_TIMEOUT, source.context_window(&model)).await {
+            Ok(Ok(w)) => window = w,
+            Ok(Err(error)) => log::warn!(
+                "opendan.context.window.lookup_failed {}",
+                json!({ "session_id": sh.dir.sid(), "model": model, "error": error })
+            ),
+            Err(_) => log::warn!(
+                "opendan.context.window.lookup_failed {}",
+                json!({ "session_id": sh.dir.sid(), "model": model, "error": "timed out" })
+            ),
+        }
+    }
+    let Some(mut window) = window.or(sh.deps.options.default_context_window) else {
+        return;
+    };
+    if let Some(max) = sh.deps.options.max_context_window {
+        window = window.min(max);
+    }
+    // The completion reserve must fit in the window (llm_context refuses
+    // the request otherwise).
+    let reserve = llm_ctx
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if u64::from(window) <= reserve {
+        log::warn!(
+            "opendan.context.window.too_small {}",
+            json!({ "session_id": sh.dir.sid(), "model": model, "window": window, "max_tokens": reserve })
+        );
+        return;
+    }
+    llm_ctx["context_window"] = json!(window);
 }
 
 /// A run with its own system and configuration: the session's first run, a
@@ -541,8 +586,6 @@ async fn own_run_context(
             intro.push_str(" Every function call of this context carries `intent` in its arguments: one short sentence saying why you make the call now and what you expect from it. A call without it is not executed.");
         }
     }
-    let background_after_tools = cfg.input_config(new.entry.as_ref()).1.background
-        == InputBackground::AfterTools;
     let explicit_report = cfg.session.policy.completion == CompletionPolicy::ExplicitReport;
     let enabled = llm_ctx.pointer("/tools/enabled").and_then(Value::as_bool);
     if function_call && explicit_report && enabled == Some(false) {
@@ -590,6 +633,7 @@ async fn own_run_context(
         llm_ctx["json_schema"] = r.schema.clone();
     }
     llm_ctx["runtime"] = serde_json::to_value(sh.deps.runtime.config()).unwrap();
+    resolve_context_window(sh, &mut llm_ctx).await;
     let hosted = XllmTask::prepare_hosted(
         sh.dir.path(),
         &llm_ctx,
@@ -608,22 +652,32 @@ async fn own_run_context(
         .prompt
         .history_budget_tokens
         .unwrap_or(sh.deps.options.history_budget_tokens);
-    let summarizer: Arc<dyn Summarizer> = match &sh.deps.summarizer {
-        Some(s) => s.clone(),
-        None => Arc::new(LlmSummarizer {
-            llm: llm.clone(),
-            model: hosted.config.model.clone(),
-        }),
+    let summarizer = Summarizer {
+        llm: sh.deps.summarizer.clone().unwrap_or_else(|| llm.clone()),
+        model: hosted.config.summary_model(),
     };
     // The session history is a view selected by the target's entry
     // (`inherit: recent_dialogue`), never attached implicitly.
     let history = if inherit == InheritMode::RecentDialogue {
         let mut s = sh.session.lock().await;
-        build_history(&mut s, &sh.lease, Some(summarizer.as_ref()), budget)
-            .await?
-            .0
+        if cfg.session.kind == SessionKind::Ui
+            && function_call
+            && new.child.is_none()
+            && new.depth == 0
+            && s.state.open_turn.is_none()
+            && s.state.process_stack.is_empty()
+        {
+            build_chat_history(&mut s, &sh.lease, &summarizer, budget).await?
+        } else {
+            let shape = if function_call {
+                HistoryShape::Native
+            } else {
+                HistoryShape::Text
+            };
+            build_history(&mut s, &sh.lease, Some(&summarizer), shape, budget).await?
+        }
     } else {
-        None
+        Vec::new()
     };
     let runs = sh.dir.runs();
     let (run_id, lock) = runs.create_locked()?;
@@ -634,7 +688,7 @@ async fn own_run_context(
         HostRunInfo {
             assembled_by: "libopendan".into(),
             session_id: Some(sid.clone()),
-            runtime_kind: Some(binding.kind.clone()),
+            runtime_kind: Some(binding.connector.clone()),
             runtime_id: Some(binding.runtime_id.clone()),
             env_check: session_env_check(sh, env)?,
             extra: {
@@ -647,9 +701,6 @@ async fn own_run_context(
                 }
                 if call_intent {
                     extra.insert(super::tools::EXTRA_CALL_INTENT.into(), json!(true));
-                }
-                if background_after_tools {
-                    extra.insert(super::observe::EXTRA_BACKGROUND.into(), json!("after_tools"));
                 }
                 if extra.is_empty() {
                     Value::Null
@@ -676,24 +727,26 @@ async fn own_run_context(
         sh.current_tool.clone(),
     );
     let mut input = vec![AiMessage::text(AiRole::System, system_prompt)];
-    if let Some(h) = history {
-        input.push(h);
-    }
+    input.extend(history);
     let behavior_name = new.behavior.clone();
     let mut request = agent_tool::xllm::hosted_request(
         &config,
-        ContextOwnerRef::Agent {
-            session_id: sid.clone(),
-        },
+        json!({ "kind": "agent", "session_id": sid }),
         &run_id,
         &cfg.session.objective,
         &behavior_name,
         input.clone(),
     );
-    // A call may suspend the run (`PendingTool`): on a sub context, or on
-    // a task this session waits for outside the context and fills in on
-    // resume (串行等待).
-    request.tool_policy.allow_deferred = true;
+    // Out of tool iterations, the run can still end (work context budget
+    // TODO §3.2): its wrap-up tools.
+    request.tool_policy.wrap_up_tools = super::budget::wrap_up_tools(
+        frozen_budget
+            .as_ref()
+            .and_then(|(b, _)| b.wrap_up_tools.as_ref()),
+        explicit_report,
+        function_call,
+        &request.tool_policy.whitelist,
+    );
     // The frozen behavior's budget for the whole run (the limits xllm reads
     // from `.llm_context` were laid over the config already).
     if let Some((budget, model)) = frozen_budget {
@@ -769,254 +822,8 @@ async fn own_run_context(
         rounds,
         summary_llm: llm,
         resolver,
+        waited: false,
     })
-}
-
-/// Whether a suspended call's wait is over: the task ended (or its state is
-/// unknown), or `until_ms` passed — the call is then answered with the
-/// task's state at this moment.
-fn wait_over(state: &TaskState, until_ms: Option<u64>) -> bool {
-    !matches!(state, TaskState::Running { .. }) || until_ms.is_some_and(|t| crate::now_ms() >= t)
-}
-
-/// Results for every suspended call of `snapshot`, or `None` while a task
-/// is still being waited for. One query path for notifications, the
-/// fallback poll, the drive entry and a take-over. `force`: answer with the
-/// current state whatever it is (stop). `answer`: the user's answer to the
-/// call that asked (the first one; a call waiting for the user is never
-/// over without it).
-async fn pending_results(
-    snapshot: &LLMContextSnapshot,
-    resolver: &dyn RunningTaskResolver,
-    returned: Option<&Value>,
-    force: bool,
-    answer: Option<&(String, Observation)>,
-    notified: &[(String, Observation)],
-) -> Option<Vec<(String, Observation)>> {
-    let returned_call = returned
-        .and_then(|r| r.get("call_id"))
-        .and_then(Value::as_str);
-    let mut results = Vec::new();
-    for p in snapshot.state.pending_calls() {
-        let call_id = p.call.call_id.as_str();
-        if returned_call == Some(call_id) {
-            results.push((
-                call_id.to_string(),
-                sub_result_observation(call_id, returned.unwrap_or(&Value::Null)),
-            ));
-            continue;
-        }
-        if super::ask::is_user_input(&p.task_id) {
-            if let Some((_, o)) = notified.iter().find(|(c, _)| c == call_id) {
-                results.push((call_id.to_string(), o.clone()));
-                continue;
-            }
-            match answer {
-                Some((asked, o)) if asked == call_id => results.push((call_id.to_string(), o.clone())),
-                Some(_) => results.push((
-                    call_id.to_string(),
-                    super::ask::unanswered(call_id, "another question of this batch took the user's answer; ask one question at a time"),
-                )),
-                None if force => results.push((
-                    call_id.to_string(),
-                    super::ask::unanswered(call_id, "the user did not answer: the turn was stopped"),
-                )),
-                None => return None,
-            }
-            continue;
-        }
-        let state = if p.task_id.starts_with(SUB_CONTEXT_TASK_PREFIX) {
-            // A sub context call that never ran (it was not the only
-            // suspended call of its batch).
-            TaskState::Unknown {
-                reason: "the sub context was not started; call it again by itself".into(),
-            }
-        } else {
-            resolver.state(&p.task_id).await
-        };
-        if !force && !wait_over(&state, p.until_ms) {
-            return None;
-        }
-        results.push((
-            call_id.to_string(),
-            task_state_observation(call_id, &p.task_id, &state),
-        ));
-    }
-    Some(results)
-}
-
-/// Fill the suspended calls of a waiting run when their wait is over and
-/// resume the same run (the open Turn continues); polling a task that still
-/// runs needs no inference. `force` (stop): cancellable tasks are cancelled
-/// and every call is answered now.
-pub(super) async fn try_fill(
-    sh: &Arc<Shared>,
-    w: WaitingRun,
-    force: bool,
-) -> Result<std::result::Result<LiveCtx, WaitingRun>> {
-    Box::pin(fill(sh, w, force, None)).await
-}
-
-/// The user's message `m` answers the question the run waits for: it is
-/// that call's tool result, consumed by an input receipt of its own (no
-/// message enters the context besides the result). `Err(w)`: the run still
-/// waits for another task of its batch; `m` stays queued.
-pub(super) async fn fill_answer(
-    sh: &Arc<Shared>,
-    w: WaitingRun,
-    m: FetchedInput,
-) -> Result<std::result::Result<LiveCtx, WaitingRun>> {
-    Box::pin(fill(sh, w, false, Some(m))).await
-}
-
-async fn fill(
-    sh: &Arc<Shared>,
-    w: WaitingRun,
-    force: bool,
-    answer: Option<FetchedInput>,
-) -> Result<std::result::Result<LiveCtx, WaitingRun>> {
-    if force {
-        for p in w.snapshot.state.pending_calls() {
-            if !p.task_id.starts_with(SUB_CONTEXT_TASK_PREFIX)
-                && !super::ask::is_user_input(&p.task_id)
-            {
-                let _ = w.resolver.cancel(&p.task_id).await;
-            }
-        }
-    }
-    let (returned, answered) = {
-        let s = sh.session.lock().await;
-        let answered = answer.as_ref().and_then(|m| {
-            let call_id = super::ask::user_calls(&w.snapshot).into_iter().next()?;
-            let a = super::ask::answer_of(&s.state, &call_id, m);
-            Some((call_id.clone(), super::ask::answer_observation(&call_id, &a)))
-        });
-        (s.state.process_result.clone(), answered)
-    };
-    let notified = super::ask::notify_answers(sh, &w.run, &w.snapshot, force).await;
-    let Some(results) = pending_results(
-        &w.snapshot,
-        w.resolver.as_ref(),
-        returned.as_ref(),
-        force,
-        answered.as_ref(),
-        &notified,
-    )
-    .await
-    else {
-        return Ok(Err(w));
-    };
-    let run_id = w.run.run_id().to_string();
-    let waited = w.task_ids();
-    let ctx = LLMContext::resume(
-        w.snapshot,
-        ResumeFill::ToolResults { results },
-        w.deps.clone(),
-    )
-    .map_err(|e| {
-        OpenDanError::blocked(format!("snapshot cannot be resumed: {e}"), Some(&run_id))
-    })?;
-    let mut ctx = ctx;
-    match (answer, answered) {
-        (Some(m), Some((call_id, _))) => {
-            Box::pin(commit_answer(sh, &mut ctx, &w.run, &m, &call_id)).await?;
-        }
-        _ => {
-            // The results are in the run before anything runs on.
-            w.run
-                .checkpoint_with_results(&ctx.snapshot(), Some(RunStatus::Running))?;
-            crate::fault::point("pending_tool:after_fill");
-            let marked = super::children::mark_waited(sh, &waited).await?;
-            {
-                let mut s = sh.session.lock().await;
-                if s.state.run_state == RunState::Waiting || marked {
-                    if s.state.run_state == RunState::Waiting {
-                        s.state.run_state = RunState::Running;
-                        s.state.waiting_for = None;
-                    }
-                    s.commit_state(&sh.lease)?;
-                }
-            }
-            // A sub session's state that answered a call is in the TodoList
-            // before the run infers again (`todo show --report`, `todo
-            // review` work right away); after a crash here the drive's
-            // start synchronizes it.
-            if waited
-                .iter()
-                .any(|t| t.starts_with(super::children::SESSION_TASK_PREFIX))
-            {
-                if let Err(e) = super::todos::sync(sh).await {
-                    log::warn!("todo sync of {}: {e}", sh.dir.sid());
-                }
-            }
-        }
-    }
-    *sh.interrupt.lock().expect("interrupt") = Some(ctx.interrupt_handle());
-    Ok(Ok(LiveCtx {
-        behavior: w.behavior,
-        ctx,
-        run: w.run,
-        ready: true,
-        filled: true,
-        deps: w.deps,
-        rounds: w.rounds,
-        summary_llm: w.summary_llm,
-        resolver: w.resolver,
-    }))
-}
-
-/// The answer's result and the receipt consuming its message, in one
-/// published snapshot; then state, the gate and the input source (§8.3).
-/// The receipt joins the open Turn and injects nothing.
-async fn commit_answer(
-    sh: &Arc<Shared>,
-    ctx: &mut LLMContext,
-    run: &RunHandle,
-    m: &FetchedInput,
-    call_id: &str,
-) -> Result<()> {
-    let mut s = sh.session.lock().await;
-    let run_id = run.run_id().to_string();
-    let applied = s
-        .state
-        .live_run
-        .as_ref()
-        .filter(|l| l.run_id == run_id)
-        .map(|l| l.applied_input_seq)
-        .unwrap_or(0);
-    let mut extra = std::collections::BTreeMap::new();
-    extra.insert("user_input".to_string(), json!(call_id));
-    let receipt = InputReceipt {
-        run_id: run_id.clone(),
-        input_seq: applied + 1,
-        turn: match &s.state.open_turn {
-            Some(t) => t.index,
-            None => s.state.turn_seq + 1,
-        },
-        opens_turn: s.state.open_turn.is_none(),
-        hook: HOOK_ON_INPUT.to_string(),
-        inputs: vec![m.input_ref()],
-        events: Vec::new(),
-        reply: None,
-        parts: Vec::new(),
-        bootstrap: false,
-        after_step: ctx.snapshot().state.next_step_index,
-        extra,
-        at_ms: crate::now_ms(),
-    };
-    let mut meta = host_meta_of(ctx.host_meta());
-    meta.input_receipts.push(receipt.clone());
-    let host = with_host_meta(ctx.host_meta(), &meta);
-    ctx.set_host_meta(Some(host));
-    run.publish_input_checkpoint(&ctx.snapshot(), receipt.input_seq)?;
-    crate::fault::point("user_input:after_input_checkpoint");
-    apply_receipt(&mut s.state, &receipt)?;
-    s.state.activity.heartbeat_ms = crate::now_ms();
-    commit_and_report(sh, &mut s).await?;
-    crate::fault::point("user_input:after_state_commit");
-    run.complete_host_commit()?;
-    confirm_inputs(&sh.sources, &s.state).await;
-    Ok(())
 }
 
 /// Resume the live run (§8.6): receipts reconciled by `reconcile_runs`.
@@ -1025,7 +832,7 @@ pub(super) async fn resume_live_run(
     run: RunHandle,
     snapshot: LLMContextSnapshot,
     env: &SessionEnv,
-) -> Result<Opened> {
+) -> Result<LiveCtx> {
     let record = run.record();
     let run_id = record.run_id.clone();
     let depth = sh.session.lock().await.state.call_depth();
@@ -1046,72 +853,41 @@ pub(super) async fn resume_live_run(
         .map_err(|e| blocked(format!("cannot create the run's provider: {e}")))?;
     let behavior = record.config.loop_model == LoopModel::Behavior;
     let mut snapshot = snapshot;
-    // In-flight actions without a persisted result → explicit "interrupted,
-    // result unknown", worded by the runtime from what it can read (long-tool
-    // TODO §3.2); persisted before any further inference. No process is
-    // verified or stopped.
-    // A call the snapshot is suspended on is not interrupted: it waits for
-    // its task and is answered by the fill below.
-    let suspended_calls: Vec<String> = snapshot
-        .state
-        .pending_calls()
-        .iter()
-        .map(|p| p.call.call_id.clone())
-        .collect();
-    let interrupted: Vec<_> = record
-        .inflight
-        .iter()
-        .filter(|a| !suspended_calls.contains(&a.call_id))
-        .cloned()
-        .collect();
-    if !interrupted.is_empty() {
+    // The first call without a result may have been started by the
+    // previous executor: the runtime's tool manager answers it by its call
+    // id when the waist dispatches it again — the task it became, or "result
+    // unknown" with what the runtime can read — never a blind replay (freeze
+    // TODO F12). No process is verified or stopped.
+    if let Some(call) = in_flight_call(&snapshot) {
         let binding = RunBinding {
             run_id: run_id.clone(),
             run_dir: Some(sh.dir.runs().dir().join(&run_id)),
         };
-        let mut reasons = std::collections::HashMap::new();
-        for action in &interrupted {
-            reasons.insert(
-                action.call_id.clone(),
-                sh.deps.runtime.describe_interrupted(&binding, action).await,
-            );
-        }
-        materialize_unresolved(&mut snapshot, &interrupted, behavior, &reasons);
-        run.checkpoint_with_results(&snapshot, None)?;
+        let reason = sh.deps.runtime.describe_interrupted(&binding, &call).await;
+        manager.set_recovering(&call.call_id, reason);
     }
-    // Suspended on tool calls (`PendingTool`). A sub context call gets the
-    // child's hand-back; any other call waits for a task this runner must
-    // be able to ask about — a task of a task manager it cannot reach is
-    // not taken over (the run is kept as it is). A task it can ask about
-    // but that is gone (an in-process task of a previous process) is
-    // answered `Unknown` by the resolver and filled as such: never
-    // `RecoveryBlocked`, never silently re-created.
     let returned = sh.session.lock().await.state.process_result.clone();
-    let returned_call = returned
-        .as_ref()
-        .and_then(|r| r.get("call_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let suspended_on_tools = matches!(
-        snapshot.state.suspended,
-        Some(Suspension::PendingTool { .. })
-    );
-    if suspended_on_tools {
-        for p in snapshot.state.pending_calls() {
-            if returned_call.as_deref() == Some(p.call.call_id.as_str())
-                || p.task_id.starts_with(SUB_CONTEXT_TASK_PREFIX)
-                || super::ask::is_user_input(&p.task_id)
-            {
-                continue;
-            }
-            if !resolver.can_resolve(&p.task_id) {
-                return Err(blocked(format!(
-                    "the run waits for task {} of call {}, which this runner cannot resolve",
-                    p.task_id, p.call.call_id
-                )));
-            }
+    {
+        // A multi-Turn Work Session's run reopened for its next Turn: every
+        // Turn has the run's whole tool budget (simple Work Session TODO
+        // Q11).
+        let s = sh.session.lock().await;
+        if s.state.open_turn.is_none()
+            && !snapshot.state.has_continuation()
+            && super::outcome::multi_turn_work(&s.config)
+        {
+            super::budget::refill(&mut snapshot);
         }
     }
+    // The wallclock budget measures one continuous stretch of running, as
+    // xllm's own resume does: time between Turns, waiting for tasks or sub
+    // sessions and a host that was down are not charged (work context
+    // budget TODO §3.4). A run paused at the context limit restarts its
+    // clock when the rewrite resumes it (suspended time is not charged).
+    snapshot.state.started_at_ms = match &snapshot.state.suspended {
+        Some(suspension) => suspension.at_ms,
+        None => crate::now_ms(),
+    };
     if behavior {
         // Back from a sub context: continue its action / step numbering.
         if let Some(r) = &returned {
@@ -1143,38 +919,8 @@ pub(super) async fn resume_live_run(
         rounds.clone(),
         &resolver,
     );
-    if suspended_on_tools {
-        let w = WaitingRun {
-            run,
-            snapshot,
-            behavior,
-            deps,
-            rounds,
-            summary_llm: llm,
-            resolver,
-        };
-        let opened = match try_fill(sh, w, false).await? {
-            Ok(lc) => {
-                crate::fault::point("sub_return:after_fill");
-                Opened::Ctx(lc)
-            }
-            Err(w) => Opened::Waiting(w),
-        };
-        if returned_call.is_some() && matches!(opened, Opened::Ctx(_)) {
-            // Delivered (now, or before a crash): the hand-back is consumed.
-            let mut s = sh.session.lock().await;
-            s.state.process_result = None;
-            s.commit_state(&sh.lease)?;
-        }
-        if let Opened::Ctx(lc) = &opened {
-            lc.run.set_status(RunStatus::Running, None)?;
-        }
-        return Ok(opened);
-    }
-    let ctx = if matches!(
-        snapshot.state.suspended,
-        Some(Suspension::ContextLimit { .. })
-    ) {
+    let in_progress = snapshot.state.has_continuation();
+    let ctx = if snapshot.state.suspended.is_some() {
         // Paused at the context limit (compactions exhausted, or the
         // rewrite did not complete): compact again before running on.
         rewrite_for_limit(sh, &run, snapshot, behavior, &deps, &llm, 1).await?
@@ -1182,48 +928,63 @@ pub(super) async fn resume_live_run(
         LLMContext::resume(snapshot, ResumeFill::ResumeFromMidRun, deps.clone())
             .map_err(|e| blocked(format!("snapshot cannot be resumed: {e}")))?
     };
-    if returned_call.is_some() {
-        // Delivered before a crash: the hand-back is consumed.
-        let mut s = sh.session.lock().await;
-        s.state.process_result = None;
-        s.commit_state(&sh.lease)?;
-    }
     *sh.interrupt.lock().expect("interrupt") = Some(ctx.interrupt_handle());
     if let Some(report) = super::reports::final_report(&run)? {
         if let ReportSource::Tool { call_id } = &report.source {
-            if agent_tool::exec_tracking::persisted_outcome_ids(&ctx.snapshot()).contains(call_id) {
+            if super::reports::has_result(&ctx.snapshot(), call_id) {
                 ctx.interrupt_handle()
                     .finish("resume accepted final report");
             }
         }
     }
     run.set_status(RunStatus::Running, None)?;
-    Ok(Opened::Ctx(LiveCtx {
+    Ok(LiveCtx {
         behavior,
         ctx,
         run,
         ready: true,
-        // In-flight calls answered as interrupted leave the run in the
-        // middle of its tool batch: that batch continues before any input
-        // batch can be placed (like answered suspended calls).
-        filled: !interrupted.is_empty(),
+        // A tool batch / step in progress continues before any input batch
+        // can be placed.
+        filled: in_progress,
         deps,
         rounds,
         summary_llm: llm,
         resolver,
-    }))
+        waited: false,
+    })
+}
+
+/// A run kept in memory while the drive waited for its input starts a new
+/// stretch of running (the wait is not charged to its wallclock budget, as
+/// for a run resumed from its snapshot).
+pub(super) fn restart_clock(sh: &Shared, mut lc: LiveCtx) -> Result<LiveCtx> {
+    if !std::mem::take(&mut lc.waited) {
+        return Ok(lc);
+    }
+    let mut snapshot = lc.ctx.snapshot();
+    if snapshot.state.suspended.is_some() {
+        return Ok(lc);
+    }
+    snapshot.state.started_at_ms = crate::now_ms();
+    lc.ctx = LLMContext::resume(snapshot, ResumeFill::ResumeFromMidRun, lc.deps.clone())
+        .map_err(|e| OpenDanError::blocked(format!("restart clock: {e}"), Some(lc.run.run_id())))?;
+    *sh.interrupt.lock().expect("interrupt") = Some(lc.ctx.interrupt_handle());
+    Ok(lc)
 }
 
 /// Run the live context: one run segment of the drive loop, ending in one
 /// outcome. A context-limit suspension is compacted and the context runs on
 /// (another `run()` call in the same segment), at most
-/// [`MAX_LIMIT_COMPACTIONS`] times in a row; the last one goes to
-/// `handle_context_outcome`, which pauses the run.
+/// [`MAX_LIMIT_COMPACTIONS`] times in a row: a successful inference after a
+/// rewrite starts the count anew (compaction TODO C3); the one over the
+/// limit goes to `handle_context_outcome`, which pauses the run. A top-level run out of
+/// time / tokens runs on in its wrap-up ([`super::budget::wrap_up`]).
 pub(super) async fn run_compacting(
     sh: &Arc<Shared>,
     lc: &mut LiveCtx,
 ) -> Result<LLMContextOutcome> {
     let mut attempt = 0;
+    let mut successes = lc.rounds.successes();
     loop {
         let outcome = lc.ctx.run().await;
         // `input.media = inline` and the provider refused the request (the
@@ -1245,12 +1006,24 @@ pub(super) async fn run_compacting(
                 continue;
             }
         }
+        // Out of time / tokens: the top-level run ends its work in a
+        // wrap-up before the budget fails it (once per Turn).
+        if let LLMContextOutcome::BudgetExhausted { which, .. } = &outcome {
+            if let Some(ctx) = super::budget::wrap_up(sh, lc, *which).await? {
+                lc.ctx = ctx;
+                *sh.interrupt.lock().expect("interrupt") = Some(lc.ctx.interrupt_handle());
+                continue;
+            }
+        }
         let LLMContextOutcome::ContextLimitReached {
             snapshot, which, ..
         } = &outcome
         else {
             return Ok(outcome);
         };
+        if lc.rounds.successes() != successes {
+            attempt = 0;
+        }
         if attempt >= MAX_LIMIT_COMPACTIONS {
             log::warn!(
                 "opendan.context.rewrite.paused {}",
@@ -1276,6 +1049,7 @@ pub(super) async fn run_compacting(
             attempt,
         )
         .await?;
+        successes = lc.rounds.successes();
         *sh.interrupt.lock().expect("interrupt") = Some(lc.ctx.interrupt_handle());
     }
 }
@@ -1357,9 +1131,11 @@ fn degrade_inline_media(sh: &Arc<Shared>, lc: &LiveCtx) -> Result<Option<LLMCont
 /// 1. the run's history so far is flushed to the worklog, closed by a
 ///    `context_rewritten` outcome entry, and state commits the flush marks
 ///    (nothing of the run lives only in the snapshot);
-/// 2. the session history is compacted (summary.json) so that at most
-///    `budget >> attempt` tokens of raw records remain, and the history
-///    message is rebuilt;
+/// 2. the session history is rebuilt from the worklog within
+///    `history_budget >> (attempt − 1)` — `history_budget` is what
+///    `context_target_ratio` of the window leaves after the system prefix,
+///    never less than `history_budget_tokens` ([`LimitLine`]) — and
+///    compressed by llm_compress when it does not fit (summary.json);
 /// 3. the context resumes with system + history as its new input
 ///    (`RewrittenHistory` / `RewrittenSteps`) in a new history epoch, and the
 ///    rewritten snapshot is published before anything runs on.
@@ -1378,9 +1154,11 @@ async fn rewrite_for_limit(
     summary_llm: &Arc<dyn LlmClient>,
     attempt: u32,
 ) -> Result<LLMContext> {
+    // Results shown before are no longer in the history.
+    sh.hints.clear_dedup();
     let started = Instant::now();
     let (reason, estimated_tokens) = match snapshot.state.suspended.as_ref() {
-        Some(Suspension::ContextLimit {
+        Some(llm_context::Suspension {
             which,
             estimated_tokens,
             ..
@@ -1403,7 +1181,7 @@ async fn rewrite_for_limit(
     let result =
         rewrite_for_limit_inner(sh, run, snapshot, behavior, deps, summary_llm, attempt).await;
     match &result {
-        Ok(ctx) => log::info!(
+        Ok((ctx, history_tokens, report)) => log::info!(
             "opendan.context.rewrite.completed {}",
             json!({
                 "session_id": sh.dir.sid(),
@@ -1411,6 +1189,10 @@ async fn rewrite_for_limit(
                 "attempt": attempt,
                 "history_epoch_before": epoch_before,
                 "history_epoch_after": host_meta_of(ctx.host_meta()).history_epoch,
+                "history_tokens_after": history_tokens,
+                "summarized": report.as_ref().is_some_and(|r| r.strategy == "llm"),
+                "summary_tokens": report.as_ref().map(|r| r.summary_tokens),
+                "summary_calls": report.as_ref().map(|r| r.summary_calls),
                 "elapsed_ms": started.elapsed().as_millis(),
             })
         ),
@@ -1425,7 +1207,31 @@ async fn rewrite_for_limit(
             })
         ),
     }
-    result
+    result.map(|(ctx, _, _)| ctx)
+}
+
+/// Estimated tokens of what a rewrite keeps as it is: the system messages
+/// at the head of the run's input and the tool schemas it offers (the
+/// waist's own estimator).
+pub(super) fn prefix_tokens(snapshot: &LLMContextSnapshot, deps: &LLMContextDeps) -> u64 {
+    let system: Vec<AiMessage> = snapshot
+        .request
+        .input
+        .iter()
+        .take_while(|m| m.role == AiRole::System)
+        .cloned()
+        .collect();
+    let tokenizer = deps.tokenizer.as_ref();
+    let tools: u64 =
+        llm_context::deps::resolve_tool_specs(&snapshot.request.tool_policy, deps.tools.as_ref())
+            .iter()
+            .map(|spec| {
+                u64::from(tokenizer.count_tokens(&spec.name))
+                    + u64::from(tokenizer.count_tokens(&spec.description))
+                    + u64::from(tokenizer.count_tokens(&spec.args_schema.to_string()))
+            })
+            .sum();
+    llm_context::context_window::estimate_messages(tokenizer, &system) + tools
 }
 
 async fn rewrite_for_limit_inner(
@@ -1436,16 +1242,17 @@ async fn rewrite_for_limit_inner(
     deps: &LLMContextDeps,
     summary_llm: &Arc<dyn LlmClient>,
     attempt: u32,
-) -> Result<LLMContext> {
+) -> Result<(LLMContext, u64, Option<CompressReport>)> {
     let run_id = run.run_id().to_string();
-    let summarizer: Arc<dyn Summarizer> = match &sh.deps.summarizer {
-        Some(s) => s.clone(),
-        None => Arc::new(LlmSummarizer {
-            llm: summary_llm.clone(),
-            model: run.record().config.model.clone(),
-        }),
+    let summarizer = Summarizer {
+        llm: sh
+            .deps
+            .summarizer
+            .clone()
+            .unwrap_or_else(|| summary_llm.clone()),
+        model: run.record().config.summary_model(),
     };
-    let (history, turn) = {
+    let ((history, report), turn) = {
         let mut s = sh.session.lock().await;
         let live = s
             .state
@@ -1473,17 +1280,50 @@ async fn rewrite_for_limit_inner(
         }
         s.commit_state(&sh.lease)?;
         crate::fault::point("context_limit:after_flush");
-        let budget = s
+        let floor = s
             .config
             .prompt
             .history_budget_tokens
             .unwrap_or(sh.deps.options.history_budget_tokens);
-        let keep = budget >> attempt.min(8);
+        let ratio = s
+            .config
+            .prompt
+            .context_target_ratio
+            .unwrap_or(sh.deps.options.context_target_ratio);
+        let line = LimitLine::new(
+            snapshot.request.budget.context_window_tokens,
+            ratio,
+            prefix_tokens(&snapshot, deps),
+            floor,
+        );
+        let mut budget = line.history_budget >> attempt.saturating_sub(1).min(8);
+        // The provider refused this size, whatever the estimate says: the
+        // rebuilt history is at most half of what was refused.
+        if matches!(
+            snapshot.state.suspended.as_ref().map(|s| s.which),
+            Some(llm_context::ContextLimitKind::ProviderRefused)
+        ) {
+            let refused: Vec<AiMessage> = snapshot
+                .state
+                .accumulated
+                .iter()
+                .skip_while(|m| m.role == AiRole::System)
+                .cloned()
+                .collect();
+            let half = super::history::estimate(&refused) / 2;
+            budget = budget.min(half.min(u64::from(u32::MAX)) as u32);
+        }
+        let shape = if behavior {
+            HistoryShape::Text
+        } else {
+            HistoryShape::Native
+        };
         let history =
-            compact_for_limit(&mut s, &sh.lease, summarizer.as_ref(), budget, keep).await?;
+            compact_for_limit(&mut s, &sh.lease, &summarizer, shape, &line, budget).await?;
         crate::fault::point("context_limit:after_compact");
         (history, turn)
     };
+    let history_tokens = super::history::estimate(&history);
     let mut input: Vec<AiMessage> = snapshot
         .request
         .input
@@ -1517,22 +1357,21 @@ async fn rewrite_for_limit_inner(
     let host = with_host_meta(ctx.host_meta(), &meta);
     ctx.set_host_meta(Some(host));
     run.checkpoint_with_results(&ctx.snapshot(), Some(RunStatus::Running))?;
+    run.count_compaction()?;
     crate::fault::point("context_limit:after_publish");
-    Ok(ctx)
+    Ok((ctx, history_tokens, report))
 }
 
 /// Open the run `state.live_run` points to (a caller resumed after its sub
 /// context returned, or a parked context re-entered).
-pub(super) async fn open_state_live_run(sh: &Arc<Shared>, env: &SessionEnv) -> Result<Opened> {
-    let (run_id, tool_return) = {
+pub(super) async fn open_state_live_run(sh: &Arc<Shared>, env: &SessionEnv) -> Result<LiveCtx> {
+    let run_id = {
         let s = sh.session.lock().await;
-        let run_id = s
-            .state
+        s.state
             .live_run
             .as_ref()
             .map(|l| l.run_id.clone())
-            .ok_or_else(|| OpenDanError::Other("no live run to open".into()))?;
-        (run_id, s.state.tool_return_pending())
+            .ok_or_else(|| OpenDanError::Other("no live run to open".into()))?
     };
     let runs = sh.dir.runs();
     let lock = runs
@@ -1545,12 +1384,9 @@ pub(super) async fn open_state_live_run(sh: &Arc<Shared>, env: &SessionEnv) -> R
         .ok_or_else(|| OpenDanError::blocked("suspended run has no snapshot", Some(&run_id)))?;
     let run = RunHandle::new(runs.store().clone(), record, lock);
     let mut opened = resume_live_run(sh, run, snapshot, env).await?;
-    // Resumed on purpose: the hand-over batch brings the input. A caller
-    // back from a tool-triggered sub context got its tool result instead
-    // and runs on by itself.
-    if let Opened::Ctx(lc) = &mut opened {
-        lc.ready = tool_return;
-    }
+    // Resumed on purpose: the next input batch (a hand-over batch, a task
+    // result, a message) brings the input; a batch in progress runs on.
+    opened.ready = opened.filled;
     Ok(opened)
 }
 
@@ -1619,8 +1455,9 @@ pub(super) async fn suspend_run(
     s.state.current_behavior = Some(next_behavior.to_string());
     s.state.internal_continuation = Some(next_behavior.to_string());
     s.state.run_state = RunState::Ready;
-    s.state.waiting_for = None;
+    s.state.wait_children.clear();
     s.state.last_error = None;
+    s.state.retry = None;
     // SWITCH_CONTEXT: re-enter the target's own parked run when it exists.
     if switch {
         if let Some(pos) = s
@@ -1634,51 +1471,6 @@ pub(super) async fn suspend_run(
         }
     }
     commit_and_report(sh, &mut s).await
-}
-
-/// Tool result a caller gets for its `call_behavior` call from the sub
-/// context's hand-back (`state.process_result`).
-fn sub_result_observation(call_id: &str, r: &Value) -> Observation {
-    let text = |k: &str| {
-        r.get(k)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    match r.get("status").and_then(Value::as_str).unwrap_or("ok") {
-        "failed" => Observation::Error {
-            call_id: call_id.to_string(),
-            message: format!(
-                "sub context `{}` failed: {}",
-                text("behavior"),
-                text("result")
-            ),
-            tool_result: None,
-        },
-        status => {
-            let content = if status == "needs_user_input" {
-                json!({
-                    "status": "needs_user_input",
-                    "behavior": text("behavior"),
-                    "question": text("result"),
-                    "note": "the sub context cannot ask the user; ask the user yourself and call it again with the answer",
-                })
-                .to_string()
-            } else if let Some(submission) = r.get("submission") {
-                json!({"status": status, "behavior": text("behavior"), "submission": submission})
-                    .to_string()
-            } else {
-                text("result")
-            };
-            Observation::Success {
-                call_id: call_id.to_string(),
-                bytes: content.len(),
-                content: Value::String(content),
-                truncated: false,
-                tool_result: None,
-            }
-        }
-    }
 }
 
 /// A suspended process becomes the live run again.
@@ -1702,11 +1494,8 @@ pub(super) struct InputBatch<'a> {
     pub hook: &'a str,
     /// msg / Input events this batch consumes, in consumption order.
     pub picked: &'a [FetchedInput],
-    /// The semi-subscription snapshot message and the state versions it
-    /// shows (injected before the controlled input).
-    pub snapshot: Option<(String, Vec<EventReceipt>)>,
-    /// Chat format (UI sessions): `background_shown` after this batch and
-    /// the state versions its background lines show (no snapshot message).
+    /// `background_shown` after this batch and the semi-subscription
+    /// versions its input message shows (as background lines).
     pub background: Option<(std::collections::BTreeMap<String, String>, Vec<EventReceipt>)>,
     /// The controlled input message: template output and media blocks.
     pub text: String,
@@ -1718,13 +1507,13 @@ pub(super) struct InputBatch<'a> {
     pub todo_rev: Option<u64>,
 }
 
-/// Commit one input batch (§8.3): its 1–2 messages + receipt in one
-/// snapshot → run.json gate → state.json → clear gate → confirm inputs. No
-/// inference before the gate is clear, nothing dequeued before the commit.
-/// The batch opens a new logical Turn when none is open (D1); otherwise it
-/// joins the open one (hand-over, supplementary input); the snapshot
-/// message never counts as a Turn by itself. Committing a batch never
-/// completes a Turn.
+/// Commit one input batch (§8.3): its input message (after a Goal
+/// Activation's header) + receipt in one snapshot → run.json gate →
+/// state.json → clear gate → confirm inputs. No inference before the gate
+/// is clear, nothing dequeued before the commit. The batch opens a new
+/// logical Turn when none is open (D1); otherwise it joins the open one
+/// (hand-over, supplementary input). Committing a batch never completes a
+/// Turn.
 pub(super) async fn commit_input_batch(
     sh: &Arc<Shared>,
     lc: &mut LiveCtx,
@@ -1748,11 +1537,20 @@ pub(super) async fn commit_input_batch(
         }
     }
     let opens_turn = s.state.open_turn.is_none();
-    // What the Turn is about, for its task: the first message of the batch.
+    // What the Turn is about, for its task: the first message of the batch,
+    // else the update of the Todo this session executes.
     let mut title = batch
         .picked
         .iter()
-        .find_map(|m| m.msg().map(|msg| msg.msg.content.content.clone()));
+        .find_map(|m| m.msg().map(|msg| msg.msg.content.content.clone()))
+        .or_else(|| {
+            batch.picked.iter().find_map(|m| match &m.input {
+                Ok(SessionInput::Event(ev)) if ev.source.kind == crate::todos::TODO_EVENT_SOURCE => {
+                    Some(ev.summary.clone())
+                }
+                _ => None,
+            })
+        });
     let goal = batch.goal.filter(|_| opens_turn);
     if let Some(g) = &goal {
         let reasons: Vec<&str> = g
@@ -1823,11 +1621,6 @@ pub(super) async fn commit_input_batch(
         messages.push(AiMessage::text(AiRole::User, g.text.clone()));
         part_texts.push((PART_GOAL, g.text.clone()));
     }
-    if let Some((text, shown)) = batch.snapshot {
-        messages.push(AiMessage::text(AiRole::User, text.clone()));
-        part_texts.push((PART_SNAPSHOT, text));
-        events = shown;
-    }
     let mut input_msg = AiMessage::text(AiRole::User, batch.text.clone());
     input_msg.content.extend(batch.media);
     messages.push(input_msg);
@@ -1884,7 +1677,7 @@ pub(super) async fn commit_input_batch(
         s.state.process_result = None;
     }
     s.state.run_state = RunState::Running;
-    s.state.waiting_for = None;
+    s.state.wait_children.clear();
     s.state.last_error = None;
     if s.state.current_behavior.is_none() {
         s.state.current_behavior = s.config.prompt.behavior.clone();
@@ -1899,6 +1692,7 @@ pub(super) async fn commit_input_batch(
         }
     }
     s.state.activity.heartbeat_ms = crate::now_ms();
+    super::turn_task::note_live_line(&mut s, None, None);
     commit_and_report(sh, &mut s).await?; // ③
     crate::fault::point("input_batch:after_state_commit");
     lc.run.complete_host_commit()?; // ④
@@ -1906,6 +1700,7 @@ pub(super) async fn commit_input_batch(
     confirm_inputs(&sh.sources, &s.state).await; // ⑤
     drop(s);
     *sh.current_tool.lock().expect("current tool") = None;
+    *sh.current_intent.lock().expect("current intent") = None;
     super::turn_task::ensure_turn_task(sh, title).await;
     Ok(())
 }

@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
 buckyos-api = { path = "../../kernel/buckyos-api" }
+buckyos-kit = { workspace = true }
 name-lib = { workspace = true }
 llm_context = { path = "../llm_context" }
 ndn-lib = { workspace = true }
@@ -27,8 +28,8 @@ hex = { workspace = true }
 blake3 = { workspace = true }
 fs2 = { workspace = true }
 percent-encoding = { workspace = true }
+upon = { workspace = true }
 serde_yaml = "0.9"
-image = { version = "0.25.5", default-features = false, features = ["jpeg", "png", "webp", "bmp"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

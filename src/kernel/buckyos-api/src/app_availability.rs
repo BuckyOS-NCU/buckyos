@@ -26,6 +26,12 @@ pub const TOKEN_PRINCIPAL_KIND_AGENT: &str = "agent";
 /// this Zone (External). The principal kind stays `user`, so a service that
 /// does not know External looks the account up, finds none and refuses.
 pub const TOKEN_EXTERNAL_CLAIM: &str = "external";
+/// DID of the Zone whose verify-hub signed the token; services refuse tokens of other Zones.
+pub const TOKEN_ZONE_CLAIM: &str = "zone";
+/// Device that vouched for a cross-Zone login (`auth_method=cross_zone_assertion`).
+pub const TOKEN_SRC_DEVICE_CLAIM: &str = "src_device";
+/// App the cross-Zone caller declared in its assertion; informational.
+pub const TOKEN_SRC_APP_CLAIM: &str = "src_app";
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -72,7 +78,10 @@ pub struct ValidatedTokenClaims {
     pub target: AuthTarget,
 }
 
-const SYSTEM_LOGIN_TARGETS: &[&str] = &["control-panel", "kernel", "system-config"];
+const SYSTEM_LOGIN_TARGETS: &[&str] = &["control-panel", "kernel", "system-config", "aiworkspace"];
+/// System services a Control Panel user session may be delegated to without a password (the Desktop opening a
+/// page on the service's own origin): AI Workspace pages live on `aiws-<id>.<zone>` (内核架构改进 D21).
+const SYSTEM_DELEGATION_TARGETS: &[&str] = &["aiworkspace"];
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -198,6 +207,11 @@ pub fn is_system_login_target(service_id: &str) -> bool {
     SYSTEM_LOGIN_TARGETS.contains(&service_id) || find_system_builtin_app(service_id).is_some()
 }
 
+/// Whether `delegate_user_session` may issue a `System(service_id)` session from a Control Panel user session.
+pub fn is_system_delegation_target(service_id: &str) -> bool {
+    SYSTEM_DELEGATION_TARGETS.contains(&service_id)
+}
+
 pub fn bind_token_principal_kind(token: &mut RPCSessionToken, principal_kind: TokenPrincipalKind) {
     token.extra.insert(
         TOKEN_PRINCIPAL_KIND_CLAIM.to_string(),
@@ -228,6 +242,20 @@ pub fn bind_token_external(token: &mut RPCSessionToken) {
         TOKEN_EXTERNAL_CLAIM.to_string(),
         serde_json::Value::Bool(true),
     );
+}
+
+pub fn bind_token_zone(token: &mut RPCSessionToken, zone: &str) {
+    token.extra.insert(
+        TOKEN_ZONE_CLAIM.to_string(),
+        serde_json::Value::String(zone.to_string()),
+    );
+}
+
+pub fn token_zone(token: &RPCSessionToken) -> Option<&str> {
+    token
+        .extra
+        .get(TOKEN_ZONE_CLAIM)
+        .and_then(serde_json::Value::as_str)
 }
 
 pub fn token_is_external(token: &RPCSessionToken) -> bool {

@@ -12,12 +12,12 @@ use buckyos_api::{
     AiccSchedulerProfileWeights, ApiType, Capability, Feature, ModelDisable, ModelRequirement,
     Money,
 };
-#[allow(unused_imports)]
 pub(crate) use policy::{
-    policy_engine_for_route, resolve_effective_routing_policy, scheduler_profile_for_route_profile,
-    CallerIdentity, EffectiveRoutingPolicy, PolicyEngine, QuotaLookup, QuotaSnapshot,
+    policy_engine_for_route, CallerIdentity, PolicyEngine, QuotaLookup, QuotaSnapshot,
     QuotaSourceFactory, QuotaTruthPort,
 };
+#[cfg(test)]
+use policy::{resolve_effective_routing_policy, scheduler_profile_for_route_profile};
 use policy::{
     CandidatePolicyInput, CredentialScope, LocalityPreference, PolicyReason, ProviderPrivacy,
     ProviderTrustView, ProviderType, QuotaSource, RequestPolicyInput,
@@ -56,10 +56,7 @@ pub(crate) struct CandidateRuntimeState {
     pub trust: Option<ProviderTrustView>,
     pub credential_scope: CredentialScope,
     pub estimated_cost: Option<Money>,
-    pub p50_latency_ms: Option<f64>,
     pub p95_latency_ms: Option<f64>,
-    pub error_rate_5m: Option<f64>,
-    pub recent_failures: u32,
     pub cache_hit_probability: Option<f64>,
 }
 
@@ -320,14 +317,17 @@ impl fmt::Display for RoutingError {
                 write!(
                     formatter,
                     "no candidate for {model}{}",
-                    format_filtered_candidates(filtered)
+                    if filtered.is_empty() {
+                        "; no executable route: check model identity, channel presets and task/specification admission".to_owned()
+                    } else {
+                        format_filtered_candidates(filtered)
+                    }
                 )
             }
             Self::FallbackNotAllowed(model) => {
                 write!(formatter, "fallback is not allowed for {model}")
             }
             Self::InvalidFallback(reason) => write!(formatter, "invalid fallback: {reason}"),
-            Self::FallbackLoop(model) => write!(formatter, "fallback loop at {model}"),
             Self::FallbackDepthExceeded(limit) => {
                 write!(formatter, "fallback depth exceeds {limit}")
             }
@@ -377,6 +377,29 @@ fn format_filtered_candidates(candidates: &[FilteredCandidateTrace]) -> String {
 }
 
 impl Error for RoutingError {}
+
+/// Filter reason of a candidate whose context window cannot hold the request.
+pub(crate) const CONTEXT_LENGTH_INSUFFICIENT: &str = "context_length_insufficient";
+
+impl RoutingError {
+    /// The request does not fit: some candidate was filtered only because its
+    /// context window cannot hold it, so a smaller request can route.
+    pub(crate) fn is_context_length_insufficient(&self) -> bool {
+        let only_context = |reasons: &[FilterReasonTrace]| {
+            !reasons.is_empty()
+                && reasons
+                    .iter()
+                    .all(|reason| reason.code == CONTEXT_LENGTH_INSUFFICIENT)
+        };
+        match self {
+            Self::ExactModelUnavailable { reasons, .. } => only_context(reasons),
+            Self::NoCandidate { filtered, .. } => filtered
+                .iter()
+                .any(|candidate| only_context(&candidate.reasons)),
+            _ => false,
+        }
+    }
+}
 
 impl From<ModelRegistryError> for RoutingError {
     fn from(value: ModelRegistryError) -> Self {
@@ -907,7 +930,7 @@ fn hard_filter_model(
             .unwrap_or_default();
         if available < required {
             reasons.push(filter_reason(
-                "context_length_insufficient",
+                CONTEXT_LENGTH_INSUFFICIENT,
                 format!("model context length is below {required}"),
             ));
         }
@@ -936,7 +959,7 @@ fn hard_filter_model(
             .unwrap_or_default();
         if available < required {
             reasons.push(filter_reason(
-                "context_length_insufficient",
+                CONTEXT_LENGTH_INSUFFICIENT,
                 format!("model context length is below estimated request size {required}"),
             ));
         }
@@ -1495,8 +1518,8 @@ mod tests {
         RoutePolicyProfile,
     };
     use policy::{
-        EffectiveRoutingPolicy, PolicyError, ProviderTrustLevel, ProviderTypeSource, QuotaLookup,
-        QuotaSnapshot, QuotaSourceError, RoutingPolicyLayers, RoutingPolicyPatch,
+        EffectiveRoutingPolicy, PolicyError, PolicyScope, ProviderTrustLevel, QuotaLookup,
+        QuotaSnapshot, QuotaSourceError, RoutingPolicyPatch,
     };
     use serde_json::json;
 
@@ -1708,7 +1731,6 @@ mod tests {
     fn trust(provider_type: ProviderType) -> ProviderTrustView {
         ProviderTrustView {
             provider_type,
-            provider_type_source: ProviderTypeSource::SystemConfig,
             provider_type_revision: "rev-1".into(),
             asserted_at_ms: 1,
             trust_level: ProviderTrustLevel::Verified,
@@ -1735,10 +1757,7 @@ mod tests {
                 tenant_id: "tenant".into(),
             },
             estimated_cost: Some(Money::new(cost, "USD")),
-            p50_latency_ms: Some(latency),
             p95_latency_ms: Some(latency),
-            error_rate_5m: Some(0.0),
-            recent_failures: 0,
             cache_hit_probability: None,
         }
     }
@@ -1766,14 +1785,8 @@ mod tests {
     }
 
     fn engine(patch: &RoutingPolicyPatch) -> PolicyEngine<OpenQuota> {
-        let effective = EffectiveRoutingPolicy::merge(RoutingPolicyLayers {
-            system: Some(patch),
-            user: None,
-            app: None,
-            session: None,
-            request: None,
-        })
-        .unwrap();
+        let effective =
+            EffectiveRoutingPolicy::merge_ordered([(PolicyScope::Directory, patch)]).unwrap();
         PolicyEngine::new(effective, OpenQuota).unwrap()
     }
 
@@ -2114,10 +2127,7 @@ mod tests {
         assert_eq!(selected(&runtime), "cheap@cloud-a");
         let cheap = runtime.get_mut("cheap@cloud-a").unwrap();
         cheap.health = ProviderHealthStatus::Degraded;
-        cheap.p50_latency_ms = Some(9_000.0);
         cheap.p95_latency_ms = Some(9_000.0);
-        cheap.error_rate_5m = Some(0.9);
-        cheap.recent_failures = 9;
         assert_eq!(selected(&runtime), "cheap@cloud-a");
     }
 
@@ -2697,6 +2707,15 @@ mod tests {
                     .iter()
                     .all(|candidate| candidate.origin_model_id == model));
             }
+            // No window holds the request: the caller is told to shrink it.
+            request.estimated_input_tokens = Some(u64::from(u32::MAX));
+            let error = router.route(&request).unwrap_err();
+            assert!(
+                matches!(error, RoutingError::NoCandidate { .. })
+                    && error.is_context_length_insufficient(),
+                "{error}"
+            );
+            request.estimated_input_tokens = Some(1_000);
             for instance in registry
                 .model_views()
                 .into_iter()
@@ -2706,12 +2725,19 @@ mod tests {
                 request.estimated_output_tokens = Some(128_000);
                 assert!(router.route(&request).is_ok(), "{}", request.model);
                 request.estimated_output_tokens = Some(128_001);
-                assert!(router.route(&request).is_err(), "{}", request.model);
+                // A shorter input does not fix an output budget over the limit.
+                let error = router.route(&request).unwrap_err();
+                assert!(!error.is_context_length_insufficient(), "{error}");
                 request.estimated_output_tokens = Some(8_192);
                 request.estimated_input_tokens = Some(context - 8_192);
                 assert!(router.route(&request).is_ok(), "{}", request.model);
                 request.estimated_input_tokens = Some(context - 8_192 + 1);
-                assert!(router.route(&request).is_err(), "{}", request.model);
+                let error = router.route(&request).unwrap_err();
+                assert!(
+                    matches!(error, RoutingError::ExactModelUnavailable { .. })
+                        && error.is_context_length_insufficient(),
+                    "{error}"
+                );
                 request.estimated_input_tokens = Some(1_000);
             }
         }

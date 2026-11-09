@@ -118,7 +118,11 @@ derived protocol_adapter_id
 
 同一个历史 API 代际只实现一份共享 Adapter。Provider 没有额外差异时，Provider Profile 或 Instance 直接保存这个 Adapter ID。确有渠道差异时，先用 `.provider.json` 的 operation、provider options、request rules、能力收窄及其它受限声明表达；只有不同 wire envelope、流事件状态机、签名/动态认证算法、任务生命周期或无法声明化的错误语义，才建立独立派生 Adapter，并用 `base_adapter_id` 指向共享历史 Adapter。多个派生 Adapter 可以引用同一个历史 Adapter，各自只实现剩余的最小逻辑差异，不复制历史 wire protocol，也不在代码中保存可由 Provider Rules 表达的参数表。
 
-Provider Profile/Rules 必须在路由前得到一个确定的 Adapter 和 operation。内置 Provider 的默认选择由 Known Provider catalog 和 `.provider.json` 固定；用户添加 `custom` Provider 时只选择或识别 OpenAI、Claude、Gemini 等协议族，不选择 API 代际。接入测试只枚举无 `base_adapter_id` 且声明 `probe_path` 的协议族级 Adapter，按“官方新接口优先、运行时已注册的历史接口其次”的 `probe_priority` 顺序发送带认证的空 JSON 探测，成功识别后把 resolved `protocol_adapter_id` 固化到 Provider Instance。只有 `404/405/501` 继续下一候选；其它 4xx 证明接口存在，认证、限流、网络和 5xx 直接报告，不能被误判成历史接口需求。运行时只使用已固化 Adapter，不重新探测，也不在一次调用中静默切换新旧 Adapter。
+Provider Profile/Rules 必须在路由前得到一个确定的 Adapter 和 operation。内置 Provider 的默认选择由 Known Provider catalog 和 `.provider.json` 固定；用户添加 `custom` Provider 时必须显式选择 `protocol_adapter_id`，同时提交所属 `protocol_family_id`。OpenAI Chat Completions 与 Responses 是独立选项。接入验证不发送协议探测请求，不枚举候选 Adapter；运行时只使用已固化 Adapter，不在一次调用中切换新旧 Adapter。
+
+实例没有 Provider Rules 时，inventory 先按 discovery 的 `remote_methods` 和 Adapter binding 的 `default_priority` 选择 operation。若仍有多个候选，且当前 Adapter 与该协议族 Known Provider 的默认 Adapter 完全一致，则按 `origin_model_id` 查询其 Provider Rules，用 `operations` 中属于当前候选集的映射消除歧义。例如 OpenAI 协议下 GPT 的图像能力使用 `responses.create`，独立图像模型使用 `images.generate` / `images.edit`；没有有效映射时仍报告歧义。
+
+相同条件下，LLM 的思考强度预设也使用该默认 Provider Rules 中明确匹配模型的 variant 映射。inventory 只注册模型声明支持、且未被 discovery 禁用的预设；请求转换复用同一映射，将 `reasoning-medium` 等内部 variant 转为协议参数，远端 `model` 仍使用原始 `provider_model_id`。显式 Provider Rules 优先，缺少映射的预设仍不可用，不静默改换强度。默认映射不继承官方价格、普通参数改写、非 LLM variant、能力限制或准入规则。
 
 一个 Provider 需要多套 protocol client 时，不把实例字段扩成无约束的 Adapter 数组。
 Adapter 是该 Provider 的可执行协议边界，可以注册多个按 operation 分派的
@@ -216,6 +220,12 @@ Model Driver v2 声明精确模型 ID、API/能力、LLM 规格和 supported_eff
 | `reported_cost` | 自报实际费用的 currency 和 `total_request_cost` 语义 |
 
 native 使用 base；其他预设为 `reasoning-{effort}`，包括 minimal 和 thinking。模型侧不再重复定义 variants。非法 exact/cached 预设被拒绝；无映射的合法 effort 进入 unavailable_presets。调用参数不能覆盖已选定预设。
+
+模型支持哪些思考强度由 Model Driver 的 `supported_efforts` 决定；相同协议参数映射不应在 Provider Rules 中重复维护模型支持名单。SN 的 OpenAI、GLM、Kimi、Qwen 模型使用 Responses 参数映射，再与模型声明的强度及 discovery 限制求交：档位预设使用同名 `reasoning.effort`，GLM/Qwen 的 `thinking` 使用 `reasoning.enabled=true`，不能将 `thinking` 作为 effort 字符串。新模型只需更新 Model Driver 并被 SN 发现即可关联已有强度映射；API Token 与设备登录使用相同规则，不影响思考强度。
+
+SN 的 GLM/Kimi/Qwen 转发配置见 [sn-business release 配置](https://github.com/buckyos/sn-business/blob/main/CD/cluster_config/release/apps.ts)，其 reasoning 参数契约见 [OpenRouter Responses OpenAPI](https://openrouter.ai/openapi.json) 的 `ReasoningConfig`。
+
+LLM 通过 `规格 -> 家族预设 -> exact model` 动态挂载，原始 `logical_mounts` 为空不代表缺少 driver。排查任务无候选时先检查 Provider inventory 的 `unmatched_models` 与 `unavailable_presets`，再核对 `models.list` 的 `catalog`、`directory` 和 `routing.preview`。模型已匹配但预设报告 `missing_channel_mapping` 时，应补渠道协议映射，不能手工把 base model 塞进 `llm.chat` / `llm.code` / `llm.plan` 绕过规格。
 
 ### 3.3 fal 的临时模型归属
 
@@ -656,3 +666,10 @@ DeepSeek 官方旧 V4 Flash 调用名已重定向，V4.1 metadata 尚未接入�
 本地 JSON input/state+question 到 32000 bytes。目录 context 改变需重新核验。
 渠道价格只取 OpenRouter discovery，缺失为 unknown；零输出价保留为零。
 不配置静态 Jev 库存、不新增 `include_alpha`、实例或 TypeSafe key。
+
+### 实例目录与逐模型思考档位覆盖
+
+Custom Provider 的 instance_rules.catalog 保存完整的本格式目录，按实例隔离编译，不能修改内置 Provider 的共享预制规则。思考档位统一使用既有 variants 数组，逐模型规则通过 match.provider_model_id 限定；编辑时用既有 not 条件从共享规则中排除目标模型，并添加该模型启用的档位。全部关闭则只排除、不添加，不能生成另一份 model_variants 文件字段。详情页预览及导入导出直接使用本 `*.provider.json` 格式，不增加外层包装。可选 `server_default_routes` 按端点模型 ID 指定非空的具体 LLM 任务数组；实例显式用途设置优先，模型启停使用 `models[].exclude`。详细流程见 [管理面](aicc-mgr.md#custom-provider-实例规则编辑)。
+
+
+自定义 Provider 的思考档位只来自显式绑定规则或实例 variants，不再从协议族对应的内置规则自动补齐。supported_efforts 是可配置范围，不表示渠道已经支持；provider_options 显式为空对象时仍算已配置。未配置 effort 不发布、不允许直接调用。基础模型 native 行为不创建 reasoning 变体。

@@ -178,7 +178,7 @@ export function createMockShareService(): ShareService {
   insert(describe('/home/devtest/Pictures/Trip'), 'link', { created_at: t0 - 25 * DAY, expires_at: null, access: 'password', has_password: true }, seriesFor('trip', 25, 0.8))
   insert(describe('/home/devtest/Videos/demo.mp4'), 'link', { created_at: t0 - 40 * DAY, expires_at: t0 - 10 * DAY, status: 'expired', retained: false, stopped_at: t0 - 10 * DAY }, seriesFor('demo', 30, 0.5))
   insert(describe('/home/devtest/Documents/notes.txt'), 'link', { created_at: t0 - 8 * DAY, expires_at: t0 + 20 * DAY, status: 'stopped', stopped_at: t0 - 3 * DAY, retained: false, revision: 2 }, seriesFor('notes', 5, 0.3))
-  insert(describe('/home/devtest/Pictures/sunset.jpg'), 'app_delivery', { created_at: t0 - 2 * DAY, target_app: 'homestation', delivery_state: 'confirmed', handoff_at: t0 - 2 * DAY, reported_at: (t0 - 2 * DAY + 40) * 1000, business_ref: { entry: 'cyfs://example.zone/home/devtest/posts/@/p1' } })
+  insert(describe('/home/devtest/Pictures/sunset.jpg'), 'app_delivery', { created_at: t0 - 2 * DAY, target_app: 'homestation', delivery_state: 'confirmed', handoff_at: t0 - 2 * DAY, reported_at: (t0 - 2 * DAY + 40) * 1000, business_ref: { entry: 'https://example.zone/home/devtest/posts/@/p1' } })
   insert(describe('/home/devtest/Documents/contract.pdf'), 'app_delivery', { created_at: t0 - 1 * DAY, target_app: 'messagehub', delivery_state: 'handed_off', handoff_at: t0 - DAY })
 
   const find = (id: string) => {
@@ -293,7 +293,7 @@ export function createMockShareService(): ShareService {
       const related = rec.info.related_share_id ? shares.get(rec.info.related_share_id) : undefined
       return {
         ...view(rec),
-        retention: [{ obj_id: rec.info.obj_id, pin_owner: `share:${id}`, pinned_at: rec.info.created_at, released_at: rec.info.retained ? null : rec.info.stopped_at ?? now() }],
+        retention: rec.info.retained ? [{ bucket_id: 'zone/nfs-server/_/shares', key: id, obj_id: rec.info.obj_id, version: 1, bound_at: rec.info.created_at }] : [],
         audit: [...rec.audit].reverse(),
         related: related ? view(related) : undefined,
       }

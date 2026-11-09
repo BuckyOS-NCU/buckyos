@@ -10,7 +10,7 @@
 
 - [OpenDAN Agent Session 架构设计](<../doc/opendan/OpenDAN Agent Session架构设计.md>)，重点 §7、§8.1、§9.2、§11、§12。
 - [Agent Memory 认知管理需求](<../doc/opendan/Agent Memory 认知管理需求.md>)，重点 M-15—M-17、M-20、M-30—M-34、§5.6—§5.9、附录 A/B。
-- [Goal Session TODO](opendan-goal-session-todo.md) §9.2、[Memory 多 Session 模拟 TODO](agent-memory-multi-session-simulation-todo.md)。本文细化默认整理 Goal，并补充潜在 Goal、计划任务发现和可选 decision 预检；生产 workflow 接入仍是独立依赖。
+- [Goal Session TODO](done/opendan-goal-session-todo.md) §9.2、[Memory 多 Session 模拟 TODO](done/agent-memory-multi-session-simulation-todo.md)。本文细化默认整理 Goal，并补充潜在 Goal、计划任务发现和可选 decision 预检；生产 workflow 接入仍是独立依赖。
 
 ## 0. 本次设计结论
 
@@ -161,7 +161,7 @@ fade = min(age_days / days_per_point[stability], max_penalty)
 - receipt 含 epoch/Activation/来源版本，但候选及业务动作的逻辑去重身份跨 epoch 保持。当前 `prepare_epoch` 仅迁移已发布 GoalState，不能假定它会自动带走旧 Session 的 receipt：新 epoch 在 begin/cleanup 前必须沿旧 epoch Session 引用恢复未完成 receipt，或读取事先可靠发布的恢复指针。覆盖 Memory 成功但候选/GoalState 未发布即 restart 的窗口；旧 epoch 不得继续写。
 - `cleanup()` 会扫描所有终局处置材料，启动恢复、独立清理重试和 sweep 也必须遵守候选发布屏障；有未完成 receipt 时先恢复，不能由另一个机械清理入口提前删正文。
 - `report` 请求结束时校验已打开批次的处理情况：有材料却无有效提交，应明确 `failed/needs_info` 或记录未完成原因，不能虚报 acted。已 commit 后报告失败也不得撤销处置或重复产生认知。
-- 防回声覆盖写入和读取两端：整理 Goal 不写自动 `run_digest/task_outcome` 或模型自述感知；按 builtin goal 身份跨 epoch 过滤旧自身材料。当前只排除 `SelfImprove` kind 的逻辑必须替换。其他 Goal 的真实独立观察仍允许进入感知。
+- 防回声覆盖写入和读取两端：整理 Goal 不写模型自述感知（自动 `run_digest/task_outcome` 已于 2026-11-08 对所有 Session 删除，见 agent-memory-capture-retain-weight-todo §6 TR）；按 builtin goal 身份跨 epoch 过滤旧自身材料。当前只排除 `SelfImprove` kind 的逻辑必须替换。其他 Goal 的真实独立观察仍允许进入感知。
 
 **落点决定（工具注册、lease 时机、批次持久化）**
 
@@ -332,7 +332,7 @@ T01–T07 合在一起等于 Memory S 阶段加 Goal 发现加 workflow 加 deci
 - [x] 按 §4 增加宿主工具、批次上下文上限、receipt、提交/候选发布/清理恢复；游标已删除，report 不再推进任何整理状态。
 - [x] 整理 lease 按业务能力绑定，补跨 epoch 排除、自身感知禁写及丢锁拒绝（`StaleLease` → receipt `failed` + `last_error`，不自动修锁）。
 - [x] 在默认 Goal 完整接通后删除对应 `create_self_improve_session/perception_window/旧 cursor` 写链、SelfImprove 模板及 Jarvis 两个旧 behavior；同步协议/CLI/WebUI 中的引用。保留有效测试场景并迁到 Goal，不以兼容分支维持双写。**本次删除的明确清单**：`SessionKind::SelfImprove` 与 `si-` 前缀、`api.rs::create_self_improve_session`、`drive.rs` 的 `self_improve` kind lease 分支（改为 §4.1 的能力判定）、`outcome.rs` 的 `perception_window` 与游标提交、`state/cognition.rs::commit_consolidation`、`state/perception.rs` 的 `.cursor.json/backlog/commit_cursor` 与 kRPC `perception.cursor/perception.backlog`、`[loader.self_improve]`（opendan `config.rs` 的 deny_unknown_fields 结构与 Jarvis `agent.toml` 同时删）、`tests/self_improve.rs`（幂等/防回声/锁场景迁入 `goal_session.rs` 或 `memory_sessions.rs`）、Jarvis `self_improve_signals.toml` / `self_improve_set_memory.toml`、WebUI `SessionKind` 中的 `self_improve`、`CONSOLIDATION_LEASE` 改名。
-- [ ] **本次不删**：`SessionKind::SelfCheck`、`self_check.toml`、`[loader.self_check]`、`_self_check_timer`、Notebook（`cognition.notebook_append`、`agent_notebook.rs`、`agent-notebook` CLI）、`agent_attention_signal.rs`。它们属于 Goal TODO §9.3 与 Memory TD-09/TD-20 的退役项，目前没有独立 TODO；本文新增代码不得依赖它们，退役时再另立 TODO。
+- [ ] **本次不删**：`SessionKind::SelfCheck`、`self_check.toml`、`[loader.self_check]`、`_self_check_timer`、Notebook（`cognition.notebook_append`、`agent_notebook.rs`、`agent-notebook` CLI）、~~`agent_attention_signal.rs`~~（2026-11-01 已按 `notepads/done/attention-signal-retirement-todo.md` 退役，TD-20）。它们属于 Goal TODO §9.3 与 Memory TD-09 的退役项，目前没有独立 TODO；本文新增代码不得依赖它们，退役时再另立 TODO。
 
 ### T04 — 默认播种与自适应检查
 
@@ -429,7 +429,7 @@ Mock/虚拟时钟用于确定性和崩溃测试；集成验收另外验证真实
 | 默认预算 | activation 120000 tokens / 4 runs；period 86400 s / 1200000 tokens / 48 activations / `max_works = 0`（§2 建议的 32000 / 200000 在 DV 实测中不够：一轮重发整个上下文约 9k tokens，begin → commit → report 至少三轮，首次 DV 四轮 41k 即耗尽；见 §11.6）；`min_interval_secs = 60`；Activation 的 token 上限取 `min(activation 上限, 周期剩余)`（`runner/goal.rs::opening`）。 |
 | lease | `CONSOLIDATION_LEASE = "memory_consolidation"`（`.locks/memory_consolidation.lease`），`drive_inner` 按 `GoalCaps.consolidation` 持有（`runner/consolidation.rs::load_caps`），Busy 不开 Activation。 |
 | 工具 | `memory_consolidation_begin {limit?}` / `memory_consolidation_commit {operation_id, summary, operations[], dispositions[], tags?, abandon?, reason?}`：`SessionToolManager::call_tool` 按名字拦截（`tools.rs`），stub spec 只在有能力时进 `x.host_tools` 与 `tools.tools`（`live.rs`）。`report` 的 `acted/created_work` 在有未提交批次时被拒（`reports.rs` → `consolidation::check_final_report`）。 |
-| 感知入口 | `ControlCommand::Perceive{kind, summary, tags, objects, subjects, cites, source, occurred_at, suggested_kind, memory_intent, mentions}`；`xagent ctl perceive <text> [--kind] [--tag]... [--object]... [--subject]... [--cite]... [--source <input key>] [--occurred-at] [--suggest] [--intent \| --explicit] [--mention]...`；驱动者经 `Memory::record_perception`（`runner/consolidation.rs::perceive`）：seq 由 `state.perception_seq` 分配，幂等键 = 控制输入 key，主体 UI=`channels.outbound.to`、Work=`session.owner`、Goal=Goal owner（都没有时 Agent DID），Workspace 绑定附 `workspace:<id>`，grants 另含 Agent；来源 = `--source` 的输入 key 或该控制输入 id（`actor_kind = agent`）；`records_perception = false` 的 Goal Session 拒绝（`input_rejected`），其 `run_digest/task_outcome` 也不写。 |
+| 感知入口 | `ControlCommand::Perceive{kind, summary, tags, objects, subjects, cites, source, occurred_at, suggested_kind, memory_intent, mentions}`；`xagent ctl perceive <text> [--kind] [--tag]... [--object]... [--subject]... [--cite]... [--source <input key>] [--occurred-at] [--suggest] [--intent \| --explicit] [--mention]...`；驱动者经 `Memory::record_perception`（`runner/consolidation.rs::perceive`）：seq 由 `state.perception_seq` 分配，幂等键 = 控制输入 key，主体 UI=`channels.outbound.to`、Work=`session.owner`、Goal=Goal owner（都没有时 Agent DID），Workspace 绑定附 `workspace:<id>`，grants 另含 Agent；来源 = `--source` 的输入 key 或该控制输入 id（`actor_kind = agent`）；`records_perception = false` 的 Goal Session 拒绝（`input_rejected`）。Runtime 自动 `run_digest/task_outcome/task_discarded` 已于 2026-11-08 对所有 Session 删除。 |
 | 删除 | `SessionKind::SelfImprove`、`si-` 前缀、`api::create_self_improve_session`、`drive.rs` 的 self_improve lease 分支、`outcome.rs` 的 `perception_window*` 与游标提交、`state/cognition.rs::commit_consolidation` 与 `ConsolidationBatch`、`state/perception.rs` 的 `.cursor.json/Backlog/BacklogItem/cursor/backlog/read/commit_cursor`、kRPC `perception.cursor/backlog/read`、`PerceptionCursor` 协议类型与 schema、`[loader.self_improve]`、`tests/self_improve.rs`（场景迁入 `tests/memory_maintenance.rs`）、Jarvis `self_improve_signals.toml` / `self_improve_set_memory.toml`、assembler 的 `<perceptions>` 块。未删（按 T03）：`SelfCheck`、Notebook、attention signal。 |
 
 ### 11.2 与 §0–§7 不同或补充的决定
@@ -461,7 +461,7 @@ Mock/虚拟时钟用于确定性和崩溃测试；集成验收另外验证真实
 
 - 真实可运行（单元 / 集成测试 + §11.6 的宿主侧 DV）：默认 Goal 的播种、gate、Activation 内的 `begin/commit`、receipt 恢复、`ctl perceive` 写入、`agent-memory` 写门、schema 4.0 字段与淡出、WebUI Goals 页。
 - **未验证**：容器形态（`./build_aios --local-test` 后的 aios 镜像里的 opendan / WebUI）——本次 DV 用 `debug_jarvis.sh` 宿主进程验证，容器仍是改动前镜像；WebUI 经 zone 网关登录后的 `goals.set_status/reopen/restart` 权限；`goals.activate` 以外的真实 30 分钟定时 Activation 只观察到 gate 决策（见 §11.6 步骤 4），未等到一次由定时 fire 触发的真实整理。
-- 仍 blocked / 未做：P1（候选发现、确认、`questions` 候选关联的运行逻辑；类型已冻结）、P2（workflow 幂等合同与落地、`opendan.command`、decision 预检 `auto`、`resume_gate`）；T02 第二条（recall/observe 接线）另立 TODO；TD-16 `backfilled`；Memory TODO §8.5 的 Notebook / attention signal 退役。
+- 仍 blocked / 未做：P1（候选发现、确认、`questions` 候选关联的运行逻辑；类型已冻结）、P2（workflow 幂等合同与落地、`opendan.command`、decision 预检 `auto`、`resume_gate`）；T02 第二条（recall/observe 接线）另立 TODO；TD-16 `backfilled`；Memory TODO §8.5 的 Notebook 退役（attention signal 已于 2026-11-01 退役，见 `notepads/done/attention-signal-retirement-todo.md`）。
 ### 11.6 DV 记录（2026-10-23，`xiaobai.test.buckyos.io`，`./debug_jarvis.sh devtest --agent xiaobai.test.buckyos.io`，kRPC `http://127.0.0.1:10048/kapi/opendan`）
 
 证据：`notepads/evidence/jarvis-default-goal-session/2026-10-23/`（schedule.json、goal_state.json、activations.jsonl、memory_occasions.jsonl、perception_ui_after_cleanup.jsonl、agent_memory_load.txt、goal_session_tool_calls.txt、webui_home.png、webui_goal.png）。

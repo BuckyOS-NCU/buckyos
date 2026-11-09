@@ -609,7 +609,6 @@ fn rewrite_execution_namespace(
                 })),
             })
         }
-        ProtocolExecution::NativeTask(task) => ProtocolExecution::NativeTask(task),
     }
 }
 
@@ -740,7 +739,7 @@ mod tests {
                     // (`tts.unidirectional`, `asr.recognize.flash`,
                     // `asr.recognize.submit`).
                     DOUBAO_RESPONSES_ADAPTER_ID => 7,
-                    QWEN_RESPONSES_ADAPTER_ID => 5,
+                    QWEN_RESPONSES_ADAPTER_ID => 6,
                     _ => 3,
                 };
                 assert_eq!(descriptor.operations.len(), expected_operations);

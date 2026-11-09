@@ -20,10 +20,10 @@ extended = standard + 该 runtime 已准备的第三方工具、语言环境或�
 
 两种基线都描述 **Session 执行端具备什么能力**，与执行端的位置和操作系统分别记录：
 
-- `container`、`host_native`、`remote_node` 等说明执行位置；`standard`、`extended` 说明环境基线。节点上的 runtime 同样可以是 `extended`。
+- `connector`（`native` 私有 runtime、`node_executor` 节点或 daemon 设备、`ssh`）说明执行位置；`standard`、`extended` 说明环境基线。节点上的 runtime 同样可以是 `extended`。
 - `platform` 说明操作系统、架构和 shell。`extended` 不会让 Windows 自动具备 Linux 命令或脚本语法。
 - Workspace 说明材料和项目文件所在的 runtime 与目录，不决定 Session 的基线。只用来存放 Workspace 的机器不必安装完整 Agent 工具集。
-- 一个 Session 创建时冻结自己的 runtime、基线和平台。选择顺序为显式 `--runtime`、继承父 Session、Agent 默认；修改默认 runtime 或其声明不会自动改变已有 Session。
+- 一个 Session 创建时冻结自己的工作 runtime、基线和平台。chat（UI）Session 恒为私有 runtime；其它 Session 的选择顺序为显式 `--runtime`、继承父 Session、私有 runtime（owner 的默认 runtime 不参与，它只说明 owner 的机器在哪，见 [runtime 工作模型 TODO](../../notepads/opendan-agent-runtime-lifecycle-todo.md) §0.3）；修改默认 runtime 或其声明不会自动改变已有 Session。
 
 当前系统对 aios 容器声明 `extended`；host/节点 runtime 取 owner 的声明，缺省 `standard`。**声明为 extended 不表示装齐所有开发软件，也不表示必须挂载 ExtTool 卷。** 当前 aios 的实际附加工具见 §3。
 
@@ -104,7 +104,7 @@ Deno 是当前标准 TS 工具的运行依赖，但 `deno` 这个命令名不在
 | `extend_video` | 请求视频延展；实际支持受 provider 能力和输入条件限制。 |
 | `upscale_video` | 视频放大、增强。 |
 
-**音视频的 AICC 命令属于标准环境；本地音视频加工软件属于扩展工具。** 例如 `gen_video` 在标准清单中，而 `ffmpeg`、`ffprobe` 不在。完整视频制作手册需要剪辑、合成和验收，所以 `aigc_video` 声明 `baseline: extended`。
+**音视频的 AICC 命令属于标准环境；本地音视频加工软件属于扩展工具。** 例如 `gen_video` 在标准清单中，而 `ffmpeg`、`ffprobe` 不在。`aigc_audio` 和 `aigc_video` 均声明 `baseline: standard`，可在标准环境调用 Zone 模型生成音视频；剪辑、合成及本地媒体检查步骤再核验所需的 `ffmpeg`、`ffprobe` 或 ImageMagick。缺少这些加工工具不表示 Zone 没有生成模型。
 
 命令可启动表示执行端有对应接口，不保证当前 Zone 已配置所需 provider、模型、额度和资源访问权限。模型不支持某操作、额度不足或服务暂时不可达，都应报告实际结果，不据此修改环境基线。
 
@@ -120,10 +120,12 @@ Deno 是当前标准 TS 工具的运行依赖，但 `deno` 这个命令名不在
 | --- | --- | --- |
 | Agent 核心程序 | `/opt/buckyos/bin/opendan/` 下的程序及多入口；Session helper 由 `.runtime/bin` 装配 | `$BUCKYOS_ROOT/bin/agent-tools/` 下指向 `opendan` 的多入口；节点执行器将该目录前置到 PATH |
 | buckyos-agent 源码 | `/opt/buckyos/bin/opendan/buckyos-agent/` | `$BUCKYOS_ROOT/libexec/buckyos-agent/` |
-| AICC 命令入口 | `/usr/local/bin/aicc-tool` 及各命令链接 | `bin/agent-tools/` 内的同名入口，启动 buckyos-agent |
+| AICC 命令入口 | `/opt/buckyos/bin/agent-tools/aicc-tool` 及各命令链接 | `bin/agent-tools/` 内的同名入口，启动 buckyos-agent |
 | BuckyOS Tool/SDK | 宿主只读挂载到 `/opt/buckyos/libexec/buckyos-tool/`，由容器 launcher 调用 | `$BUCKYOS_ROOT/libexec/buckyos-tool/`，系统 CLI 为 `bin/buckyos` 或 `bin/buckyos.cmd` |
 | Deno | 镜像内 Deno | `$BUCKYOS_ROOT/libexec/buckyos-tool/runtime/deno`，Windows 为 `deno.exe` |
 | Session 上下文 | 通过 Session 环境和 AgentRoot 访问 | libopendan 在 Session 工作目录写入 `.opendan/session.json` 与 `.opendan/session.token`，helper 经 kRPC 访问 AgentService |
+
+核心层的检查看命中路径：标准命令必须来自 `$BUCKYOS_ROOT`（或开发态程序旁，记 `provided_by: dev`）。用户 PATH 里同名的 `xagent` 记 `provided_by: system`，算标准层不完整（`baseline_check.unmanaged`），因为它的依赖不是钉死的那一份。
 
 host 入口由 `opendan install-agent-tools` 布置：Unix 使用符号链接，Windows 使用硬链接或复制。Node Executor 不依靠复制控制侧的 `OPENDAN_*` 环境来获得 Session 身份。机制见 [Agent State Protocol](<protocol/Agent State Protocol.md>) 和 [OpenDAN README](../../src/frame/opendan/README.md)。
 
@@ -131,41 +133,31 @@ host 入口由 `opendan install-agent-tools` 布置：Unix 使用符号链接，
 
 ### 3.1 扩展工具按实际能力准备
 
-`extended` 必须保留 §2 的全部能力，然后为目标任务准备额外工具。当前实现没有与 `STANDARD_TOOLS` 对应的统一 `EXTENDED_TOOLS` 清单，也没有“声明 extended 即安装工具”的流程。
+`extended` = §2 的全部能力 + `EXTENDED_TOOLS`（[`baseline.rs`](../../src/frame/lib_opendan/src/baseline.rs)，就是扩展包 `ext-core` 的 `provides`，单测绑定）。工具分三档：
 
-准备扩展环境时，应明确提供哪些工具、版本、执行路径和任务能力；cmd_skill 用 `baseline: extended` 表示需要扩展环境，并在 `requires` 或正文中列出具体依赖。运行任务前仍需核验这些依赖。音频环境可以有 `ffmpeg` 而没有 Rust；开发环境可以有 Rust 而没有 ImageMagick，这两者都不能只凭 `extended` 声明运行对方的任务。
-
-### 3.2 当前 aios 提供的附加工具
-
-下面是当前 [`build_aios`](../../build_aios) 明确安装的软件及常用入口。它描述默认 aios 的附加能力，不是对所有 Windows、macOS、Linux 扩展环境强制要求同一套软件。
-
-| 能力 | 常用命令 | 当前 aios 的来源与边界 |
+| 档 | 内容 | 判定 |
 | --- | --- | --- |
-| Shell | `bash` | 镜像安装；host 使用其目标平台的 shell。 |
-| 网络与版本管理 | `curl`、`git` | 镜像安装；远端服务身份和仓库访问权限另行检查。 |
-| JSON、目录与文件传输 | `jq`、`tree`、`rsync` | 镜像安装。 |
-| 解包、压缩 | `unzip`、`xz` | 镜像安装 `unzip`、`xz-utils`。 |
-| Python | `python3`、`uv` | Python 解释器及依赖管理；项目依赖仍需按项目安装，不保证 `python` 或 `pip` 别名。 |
-| JavaScript | `node`、`npm`、`npx` | Node 分发包；不因此保证 `pnpm` 或任意 npm 工具已安装。 |
-| TypeScript | `deno` | 镜像安装，并用于标准 AICC 工具和脚本；项目模块及权限按脚本声明。 |
-| 音视频加工 | `ffmpeg`、`ffprobe` | 镜像安装 ffmpeg；用于转码、裁剪、拼接、合成和媒体信息检查。 |
-| 图像加工 | ImageMagick：`convert`、`identify`、`compare` | 镜像安装 ImageMagick；其它平台可能使用 `magick` 入口，应按实际版本调整调用。 |
-| PDF 处理 | Poppler：`pdftotext`、`pdftoppm`、`pdfinfo` 等 | 镜像安装 `poppler-utils`；这些是包的常用入口，标准基线检查不逐项验证它们。 |
-| 本地 OCR | `tesseract` | 镜像安装 `tesseract-ocr`；任务语言所需的数据包须单独确认。 |
+| 核心 | `EXTENDED_TOOLS` 里标 `core` 的工具：`ffmpeg ffprobe`、`magick convert identify compare`、`pdftotext pdftoppm pdfinfo`、`tesseract`、`pandoc`、`python3 uv`、`node npm npx deno`、`git curl jq tree unzip xz` | 声明 `extended` 时缺任何一个，`baseline_check` 失败 |
+| 推荐 | `EXTENDED_TOOLS` 里标 `recommended` 的工具（首版没有，T0 决定） | 缺了只在 `ext` 状态里报，不否定 `extended` |
+| 可选 | FreeCAD、编译工具链、Docker、pnpm、字体、额外 OCR 数据等，各自成扩展包 | 不改变 baseline，skill 自己核验 |
 
-以上是构建配置提供的软件范围，不是所有编解码器、字体、语言包或插件均已具备的保证。例如中文字幕需要可用的中文字库，Python 项目需要自己的依赖环境。软件版本以 `build_aios` 和实际运行端的版本输出为准。
+检查按声明选集合，但总是一起查扩展层，所以声明 `standard` 的 runtime 也能看到它实际有什么：`caps.baseline_check.ext` 的 `status` 是 `ok`（全部来自扩展包）、`system`（齐全，部分是机器自己的）、`partial`（缺一些）、`none`。扩展层的检查是宽的：机器碰巧有 ffmpeg 也算有，只是 `resolved` 里记 `provided_by: system`。后台检查只记路径；`xagent runtime check <id> --full` 才运行工具，记版本，并把退出 126 / 127 的占位入口计为缺失。
 
-### 3.3 ExtTool 提供的工具
+检查不改声明，安装也不改声明：扩展包是系统管理员在 Zone 级启用、由每个节点的 node_daemon 安装的（`buckyos ext-tools`，Desktop “设置 > 扩展工具”），`extended` 仍是 owner 对某个 runtime 的声明。Agent 只读安装事实：`xagent runtime ext-tools status|check <id>`。音频环境可以有 `ffmpeg` 而没有 Rust，这类差异在可选档：cmd_skill 用 `baseline: extended` 表示需要核心扩展工具，其它依赖在 `requires` 或正文中列出并在运行前核验。
 
-ExtTool 是额外工具的分发方式之一。容器通过只读卷获得 `/opt/buckyos/tools/`，入口脚本将其 `bin/` 加入 PATH；它不改变 `extended ⊇ standard` 的关系，也不代替标准 Agent 命令的安装。
+### 3.2 aios 镜像自带的软件
 
-| 工具 | 常用入口 | 可用条件 |
-| --- | --- | --- |
-| Pandoc | `pandoc`、`pandoc-lua`、`pandoc-server` | 当前默认 ExtTool 构建安装这些入口；需要实际挂载对应版本的工具卷。Pandoc 不直接装在 aios 基础镜像内。 |
-| FreeCAD CLI | `freecadcmd` | 构建 ExtTool 时提供 FreeCAD AppImage 才有真实程序。默认只有返回错误的占位入口，不能因 `command -v freecadcmd` 成功就认为 FreeCAD 可用。 |
-| Python/Deno 依赖缓存 | 没有统一的业务命令入口 | ExtTool 预热下载缓存，不能据此认定依赖已安装进每个 Session 的解释器或项目环境。 |
+工作镜像只带不属于扩展包的东西（[`build_aios`](../../build_aios)）：`bash`、`rsync`（Linux 特有，不在 `EXTENDED_TOOLS` 里）、`ca-certificates`，规划中 `ext-office` 那组（LibreOffice headless、字体、locale），以及标准层自己的 Deno（`/opt/buckyos/bin/opendan/deno`，标准命令和入口脚本按绝对路径用它，排在 PATH 上扩展层之后）。其它命令都来自 §3.3。
 
-来源：[ExtTool Dockerfile](../../publish/exttool/Dockerfile)、[Pandoc 安装脚本](../../publish/exttool/install_pandoc.sh)、[FreeCAD 安装脚本](../../publish/exttool/install_freecad.sh)、[容器入口脚本](../../publish/aios/entrypoint.sh)。
+### 3.3 扩展包提供的工具
+
+容器通过只读卷 `buckyos-tools` 获得 `/opt/buckyos/tools/`，入口脚本将其 `bin/` 排到 PATH 最前；host 上 Node Executor 把 `$BUCKYOS_ROOT/tools/bin` 排在 `bin/agent-tools` 之前。Linux 上卷就是 `$BUCKYOS_ROOT/tools`，宿主与容器用同一份文件。它不改变 `extended ⊇ standard` 的关系，也不代替标准 Agent 命令的安装：没有包可以提供标准层的同名命令。
+
+`ext-core`（[`publish/exttool/ext-core`](../../publish/exttool/ext-core)）是第一个包，五个平台各一个自包含 payload，launcher 只指 `store/` 内的文件，不回退 PATH。命令、来源与场景的唯一事实来源是 [paios容器需求.md §6.4](../app_service/paios容器需求.md) 表 B。包格式（`app_type=ext_tools`）见 [PIKG 格式 §5.1](../pikg/format.md)。
+
+软件版本以 `xagent runtime ext-tools status` 和实际运行端的版本输出为准。保证的是命令存在、无网络 smoke 通过，不是所有编解码器、字体、语言包都具备：`tesseract` 只带 `eng`、`osd`；中文字幕需要可用的中文字库；Python 项目需要自己的依赖环境（`uv` 管理，解释器落到 Agent 的缓存，见 [path_usage.md](../path_usage.md)）。Windows PowerShell 5.1 里 `curl`、`compare` 是别名，要写 `curl.cmd`、`magick compare`。
+
+种子镜像（`paios/exttool`）另外带预热的 `uv-cache`、`deno-cache`：不能据此认定依赖已装进每个 Session 的项目环境。FreeCAD 不在默认镜像里，要用 `FREECAD_APPIMAGE_URL_*` 单独构建，之后成为 `ext-cad` 包（§6.4 表 C）。
 
 ### 3.4 开发与构建任务的额外要求
 
@@ -200,7 +192,7 @@ requires: ffmpeg, ffprobe and ImageMagick; use the installed platform's command 
 
 ### 4.1 Jarvis cmd_skills 对照表
 
-下表逐项对应 [Jarvis 的 cmd_skills 源码目录](../../src/apps/jarvis_agent/agent/cmd_skills/)：当前共 12 个手册，8 个声明 `standard`，4 个声明 `extended`。它们均未声明 `platforms`，因此当前元数据不限制平台；具体脚本语法、路径和第三方软件仍需适配执行端。
+下表逐项对应 [Jarvis 的 cmd_skills 源码目录](../../src/apps/jarvis_agent/agent/cmd_skills/)：当前共 12 个手册，10 个声明 `standard`，2 个声明 `extended`。它们均未声明 `platforms`，因此当前元数据不限制平台；具体脚本语法、路径和第三方软件仍需适配执行端。
 
 表中的“可选”表示环境基线允许选择该手册，不表示自动注入，也不表示服务、权限和具体工具已全部就绪。“不可选”表示基线不匹配；即使标准环境碰巧装了某个扩展工具，也仍按声明的基线匹配。
 
@@ -214,14 +206,14 @@ requires: ffmpeg, ffprobe and ImageMagick; use the installed platform's command 
 | [aiworkspace_run](../../src/apps/jarvis_agent/agent/cmd_skills/aiworkspace_run.md) | `standard` | 可选 | 可选 | `buckyos aiws` 的 `run-claim`、`run-files`、`run-program`、`run-tool`、`run-heartbeat`、`run-report`；Deno 程序宿主 | owner 已将 hosted execution 配置给该 Agent，并提供有效 run/claim 上下文。示例使用 `jq`，但它不在标准清单；可改用 Deno 处理 JSON。项目程序的其它依赖单独准备。 |
 | [aiworkspace_template_dev](../../src/apps/jarvis_agent/agent/cmd_skills/aiworkspace_template_dev.md) | `standard` | 可选 | 可选 | `buckyos aiws info/read/query`；Deno + websdk 的 `getAiWorkspaceClient()` | 创建、写入、分享、发布或运行各步骤需要对应 Workspace capability；写操作主要通过 SDK/kRPC 完成，不应假定每个方法都有 CLI 子命令。 |
 | [aigc_image](../../src/apps/jarvis_agent/agent/cmd_skills/aigc_image.md) | `standard` | 可选 | 可选 | `gen_image`、`edit_image`、`inpaint_image`、`upscale_image`、`remove_bg`；`llm_understand_media` | 需要所用图像方法的 provider 与资源读取权限；`convert`、`identify`、`compare` 是手册中的可选 ImageMagick 加工/检查步骤，不属于标准要求。 |
-| [aigc_audio](../../src/apps/jarvis_agent/agent/cmd_skills/aigc_audio.md) | `extended` | 不可选 | 可选 | `text_to_speech`、`speech_to_text`、`gen_music`、`enhance_audio`；`ffmpeg`、`ffprobe` | 除标准 AICC 命令外，必须准备 `ffmpeg`、`ffprobe`；需要相应音频 provider 和资源读取权限。编码器等按输出格式检查。 |
-| [aigc_video](../../src/apps/jarvis_agent/agent/cmd_skills/aigc_video.md) | `extended` | 不可选 | 可选 | `gen_video`、`edit_video`、`extend_video`、`upscale_video`；`ffmpeg`、`ffprobe`、ImageMagick | 必须准备音视频加工及图像工具，并有相应视频 provider 和资源读取权限；字幕字体、编码器等按任务检查。 |
+| [aigc_audio](../../src/apps/jarvis_agent/agent/cmd_skills/aigc_audio.md) | `standard` | 可选 | 可选 | `text_to_speech`、`speech_to_text`、`gen_music`、`enhance_audio`；按步骤使用 `ffmpeg`、`ffprobe` | 生成需要相应音频 provider 和资源读取权限；转码、拼接、解码及媒体信息检查步骤分别核验 `ffmpeg`、`ffprobe`，编码器按输出格式检查。 |
+| [aigc_video](../../src/apps/jarvis_agent/agent/cmd_skills/aigc_video.md) | `standard` | 可选 | 可选 | `gen_video`、`edit_video`、`extend_video`、`upscale_video`；按步骤使用 `ffmpeg`、`ffprobe`、ImageMagick | 生成需要相应视频 provider 和资源读取权限；剪辑、合成、抽帧及本地媒体检查步骤再核验音视频或图像工具，字幕字体、编码器按任务检查。 |
 | [buckyos_app_dev](../../src/apps/jarvis_agent/agent/cmd_skills/buckyos_app_dev.md) | `extended` | 不可选 | 可选 | `buckyos pikg`、`buckyos app`；按项目使用 Node/Deno/Python 及构建命令 | 按 App 类型准备语言、包管理器和项目依赖；Docker App 另需 Docker 环境。安装需要 control-panel 接受的身份；aios 不自带 Docker。 |
 | [buckyos_dev_release](../../src/apps/jarvis_agent/agent/cmd_skills/buckyos_dev_release.md) | `extended` | 不可选 | 可选 | `buckyos pikg`、`buckyos app`；系统构建/发布脚本及任务所需的 `uv`、`cargo`、`pnpm`、`docker` 等 | 需要相应源码、目标平台工具链和发布/安装身份。默认 aios 只有部分运行工具，不能直接承担所有系统构建和镜像发布步骤。 |
 
 三个 `aigc_*` 手册还共同使用标准命令 `ai_provider`、`resume_aicc_task` 等进行模型发现和任务跟进；读取已存储的生成结果走 Zone NDM proxy，当前要求 `read_write` Agent。表中涉及的 Deno 可以使用 Tool 自带运行时，host 上不保证 PATH 有 `deno`，见 §2.1 和 §2.4。
 
-这个对照展示的是手册的最低声明基线：**已扩展环境可以选择全部 12 个手册，包含标准环境可选的全部 8 个**；实际执行仍逐项满足最后一列的条件。例如，aios 的媒体工具可以满足音视频加工依赖，但其 `extended` 声明不补齐 Rust、pnpm、Docker 等开发工具。
+这个对照展示的是手册的最低声明基线：**已扩展环境可以选择全部 12 个手册，包含标准环境可选的全部 10 个**；实际执行仍逐项满足最后一列的条件。例如，aios 的媒体工具可以满足音视频加工依赖，但其 `extended` 声明不补齐 Rust、pnpm、Docker 等开发工具。
 
 ### 4.2 Session 中的选择与冻结
 
@@ -248,12 +240,14 @@ Session 创建时按自己的 runtime 声明过滤并冻结手册；Workspace �
 以下命令只查看或检查环境：
 
 ```sh
-# 查看当前程序版本的标准清单，不要求 Agent State 上下文
+# 查看当前程序版本的清单，不要求 Agent State 上下文
 xagent runtime baseline
 xagent runtime baseline --json
+xagent runtime baseline --level extended
 
-# 检查当前执行端 PATH；缺少命令时退出码为 1
+# 检查当前执行端 PATH，输出每个命令的路径与来源；缺命令或标准命令不来自 $BUCKYOS_ROOT 时退出码为 1
 xagent runtime baseline --check
+xagent runtime baseline --check --level extended
 
 # 在 Session 中检查自己所在的执行端；节点上此命令也在本地检查
 agent-session runtime baseline --check
@@ -262,9 +256,12 @@ agent-session runtime baseline --check
 agent-session runtime list --available
 agent-session runtime check host
 agent-session runtime get host
+
+# 运行扩展工具和点名的命令：记版本，占位入口（退出 126 / 127）计为缺失
+xagent runtime check host --commands ffmpeg,pandoc --full
 ```
 
-最后两条的 `host` 应替换为实际登记的 runtime ID。`runtime baseline --check` 检查命令所在机器；`runtime check <id>` 通过登记信息检查目标，两者不能混用。
+最后三条的 `host` 应替换为实际登记的 runtime ID。`runtime baseline --check` 检查命令所在机器；`runtime check <id>` 通过登记信息检查目标，两者不能混用。plan 全表每行多一段 `ext: ok | partial(missing …) | none | system`。
 
 镜像构建或 Session helper 尚未装配的同机环境可使用 `xagent runtime baseline --check --overlay`：它以 `xagent`、`agent_tool` 的存在替代检查后续由 Session overlay 提供的 `agent-session`、`llm_understand_media`。这只适用于会提供该 overlay 的环境；独立节点需要实际部署完整入口。
 

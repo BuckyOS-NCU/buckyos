@@ -5,9 +5,9 @@
 
 import { createContext, useContext, useSyncExternalStore } from 'react'
 import type { AiwsClient } from '../../api/client'
-import type { EntityEnvelope } from '../../api/types'
+import type { EntityEnvelope, WorkspaceInfo } from '../../api/types'
 import { localizedLabels } from '../../i18n'
-import { workspaceUrl } from '../../links'
+import { workspacePageUrl, WORKSPACE_ROUTE, zoneOrigin } from '../../links'
 import { useUserState } from '../../state/hooks'
 import { CANVAS_MODES, type CanvasMode } from '../blocks/registry'
 import type { OfflineActions } from '../WorkspaceView'
@@ -31,6 +31,11 @@ export type DialogRequest =
   | { kind: 'import' }
   | { kind: 'help' }
   | { kind: 'mock' }
+  /** Workspace controls (扩展控件 P0): definitions, builds, library, export. */
+  | { kind: 'extensions'; defId?: string }
+  /** Export → Save as template… (扩展控件 P3, Q32). */
+  | { kind: 'save-template' }
+  | { kind: 'delete-surface'; surface: EntityEnvelope }
 
 /** Personal layout preferences (user work state, `ui:*`); "restore default layout" clears them. */
 export interface LayoutPrefs { objectToolbar: boolean; viewToolbar: boolean; grid: boolean }
@@ -85,7 +90,8 @@ export interface ShellApi {
   setPref: (key: keyof LayoutPrefs, value: boolean) => void
   resetLayout: () => void
   size: SizeClass
-  /** A phone (§16): the canvas only, in view mode, with one toolbar; nothing about it is written to the shared work state. */
+  /** A phone (§16): the canvas only, with one toolbar — a free canvas in view mode, a flow page in edit mode (§16.5);
+   * nothing about it is written to the shared work state. */
   phone: boolean
   /** The Mock processing panel and other developer tools are shown (dev server or dev override). */
   devTools: boolean
@@ -111,11 +117,12 @@ export interface ShellApi {
 
 export const ShellContext = createContext<ShellApi | null>(null)
 
-/** The canvas sub-mode (user work state `canvas:mode`); a phone always views (§16) and leaves the stored mode alone. */
+/** The canvas sub-mode (user work state `canvas:mode`); a phone views a free canvas and edits a flow page (§16.5),
+ * and leaves the stored mode alone. */
 export function useCanvasMode(): CanvasMode {
-  const phone = useContext(ShellContext)?.phone ?? false
+  const shell = useContext(ShellContext)
   const state = useUserState<CanvasMode>('canvas:mode')
-  if (phone) return 'view'
+  if (shell?.phone) return shell.activeSurface && shell.activeSurface.layout?.mode !== 'free' ? 'edit' : 'view'
   return state && CANVAS_MODES.includes(state) ? state : 'edit'
 }
 
@@ -126,9 +133,11 @@ export const ZOOM_PRESETS = [25, 50, 75, 100, 150, 200]
 export const PUBLIC_SUBJECT = 'public'
 export const PUBLIC_LINK_CAPABILITIES = ['read', 'comment'] as const
 
-/** An access link (§8.3): it names the workspace and Surface, carries no credential and grants nothing. */
-export function shareLink(workspaceId: string, surfaceId: string | null): string {
-  return workspaceUrl(workspaceId, { surfaceId })
+/** An access link (§8.3): it names the workspace and Surface, carries no credential and grants nothing — the
+ * Workspace's own origin `aiws-<id>.<zone>/<workspace>/<surface>?id=` (T4-8). A deployment without a host has no
+ * page of the workspace to link to: the list is named instead. */
+export function shareLink(info: WorkspaceInfo, surface: EntityEnvelope | null): string {
+  return workspacePageUrl(info.public_base, info.title, surface ? { id: surface.entity_id, title: surface.title ?? surface.name ?? '' } : null) ?? `${zoneOrigin()}${WORKSPACE_ROUTE}`
 }
 
 export function useShell(): ShellApi {

@@ -1,7 +1,10 @@
-//! A small network of real HomeStations: each has its own key, database, chunk folder and
-//! HTTP listener; they reach each other only through the protocol paths.
+//! A small network of real HomeStations: each zone has its own key, database, nfs-server
+//! (named store and buckets) and HTTP listener; they reach each other only through the
+//! protocol paths.
 
 #![allow(dead_code)]
+
+pub mod nfs;
 
 use homestation::contacts::ContactInfo;
 use homestation::directory::{StaticDirectory, StaticIdentity};
@@ -10,7 +13,6 @@ use homestation::settings::{CollectorRef, UserSettings};
 use homestation::standalone::{build, StandaloneConfig};
 use homestation::Station;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -32,7 +34,9 @@ pub struct Node {
     pub contacts: Arc<homestation::contacts::StaticContacts>,
     /// The zone's user list as its host reads it.
     pub users: Arc<homestation::users::StaticUsers>,
-    _dir: Option<TempDir>,
+    /// The zone's nfs-server.
+    pub nfs: String,
+    _dir: Option<Arc<TempDir>>,
 }
 
 impl Node {
@@ -129,7 +133,8 @@ impl Net {
         let collector_refs: Vec<CollectorRef> = collectors.iter().map(|c| CollectorRef { did: did_of(c), name: format!("{c} index") }).collect();
         let mut nodes = Vec::new();
         for ((name, (listener, port)), pem) in names.iter().zip(listeners).zip(keys) {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = Arc::new(tempfile::tempdir().unwrap());
+            let nfs = nfs::start_nfs_server(&dir.path().join("nfs")).await;
             let token = format!("tok-{name}");
             let mut settings = UserSettings::default();
             settings.profile.name = name.to_string();
@@ -143,6 +148,7 @@ impl Net {
                 "owner_name": name,
                 "user": name,
                 "zone": format!("{name}.test"),
+                "nfs_server": nfs,
                 "private_key_pem": pem,
                 "collector": collectors.contains(name),
                 "spider": spider.contains(name),
@@ -175,7 +181,7 @@ impl Net {
             }
             let mut cfg: StandaloneConfig = serde_json::from_value(raw).unwrap();
             cfg.directory = directory.clone();
-            let standalone = build(cfg, dir.path(), None, None).unwrap();
+            let standalone = build(cfg, &dir.path().join("hs"), None, None).unwrap();
             let state = standalone.state.clone();
             let serve_state = state.clone();
             let handle = tokio::spawn(async move {
@@ -197,7 +203,8 @@ impl Net {
                     station: standalone.host.station(u).await.unwrap().unwrap(),
                     contacts: standalone.user_contacts[*u].clone(),
                     users: standalone.users.clone(),
-                    _dir: None,
+                    nfs: nfs.clone(),
+                    _dir: Some(dir.clone()),
                 });
             }
             nodes.push(Node {
@@ -215,6 +222,7 @@ impl Net {
                 station: standalone.station,
                 contacts: standalone.contacts,
                 users: standalone.users,
+                nfs,
                 _dir: Some(dir),
             });
         }
@@ -271,12 +279,23 @@ impl Net {
         (status, response.text().await.unwrap(), headers)
     }
 
-    /// A reader proof as `reader` for `target`'s zone.
-    pub fn proof(&self, reader: &str, target: &str) -> String {
+    /// `Authorization` of `reader` at `target`'s zone: its zone's key signs it in there by a
+    /// cross-zone assertion (跨Zone登录断言契约), as the reader's own station would.
+    pub async fn proof(&self, reader: &str, target: &str) -> String {
         let node = self.n(reader);
         let signer = homestation::sign::Signer::from_pem(node.pem.as_bytes(), format!("{}#main_key", node.signer)).unwrap();
-        let proof = homestation::auth::make_reader_proof(&signer, &did_of(reader), &self.n(target).zone).unwrap();
-        format!("DID {proof}")
+        let zone = &self.n(target).zone;
+        let assertion = buckyos_api::sign_cross_zone_assertion(
+            &signer.device_signer().unwrap(),
+            &name_lib::DID::from_str(&did_of(reader)).unwrap(),
+            &name_lib::DID::new("web", zone),
+            &buckyos_api::AuthTarget::from_canonical_key("system:homestation").unwrap(),
+            None,
+        )
+        .unwrap();
+        let body = json!({ "method": buckyos_api::CROSS_ZONE_LOGIN_METHOD, "params": { "assertion": assertion }, "sys": [1] });
+        let answer: Value = self.http.post(format!("{}/kapi/verify-hub", self.n(target).base)).json(&body).send().await.unwrap().json().await.unwrap();
+        format!("Bearer {}", answer["result"]["session_token"].as_str().unwrap_or("refused"))
     }
 }
 
@@ -292,8 +311,4 @@ pub async fn publish(net: &Net, name: &str, key: &str, input: Value) -> Value {
     let task = net.rpc(name, "publish.create", json!({ "key": key, "input": input })).await;
     assert_eq!(task["stage"], "published", "{task}");
     task
-}
-
-pub fn map_of(value: &Value) -> HashMap<String, Value> {
-    serde_json::from_value(value.clone()).unwrap_or_default()
 }

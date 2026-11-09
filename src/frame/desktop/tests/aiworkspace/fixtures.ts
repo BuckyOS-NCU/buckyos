@@ -1,5 +1,5 @@
 import { expect, test as base, type Page } from '@playwright/test'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const BACKEND_FIXTURE = resolve('../aiworkspace/fixtures/project-workspace/commits.json')
@@ -17,14 +17,44 @@ export const SPEC_LOCALE = 'zh-CN'
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Json = any
 
-/** Direct kRPC access to the backend under test — what the assertions "through the API" use. */
+/** Direct kRPC access to the backend under test — what the assertions "through the API" use. Uploads and downloads go
+ * through the standalone nfs-server's `/bucket/v1` data plane, as the Desktop's NDM uploads and bucket URLs do. */
 export class Api {
   private seq = 1
   readonly base: string
+  readonly nfs: string
   constructor() {
     const backend = process.env.AIWS_E2E_BACKEND
     if (!backend) throw new Error('AIWS_E2E_BACKEND is not set: run with --config=playwright.aiworkspace.config.ts')
     this.base = `${backend}/kapi/aiworkspace`
+    this.nfs = `http://127.0.0.1:${process.env.AIWS_E2E_NDM_PORT}`
+  }
+
+  /** Bytes bound into the token's user's own bucket `name` (what a browser upload with `bind` leaves). */
+  async bind(token: string, name: 'assets' | 'exports', key: string, bytes: Uint8Array | ArrayBuffer): Promise<{ bucket_id: string; key: string }> {
+    const bucket_id = `user/aiworkspace/${token.replace(/^tok-/, '')}/${name}`
+    const put = await fetch(`${this.nfs}/bucket/v1/${bucket_id}/${key}`, { method: 'PUT', body: bytes as BodyInit })
+    expect(put.ok, await put.clone().text()).toBe(true)
+    return { bucket_id, key }
+  }
+
+  /** An asset upload: bound by the uploader, taken over by the service (`asset.import_object`). */
+  async uploadAsset(token: string, workspaceId: string, bytes: Uint8Array): Promise<Json> {
+    const bound = await this.bind(token, 'assets', `upload/${Math.random().toString(36).slice(2)}`, bytes)
+    return this.rpc(token, 'asset.import_object', { workspace_id: workspaceId, ...bound })
+  }
+
+  /** A download a result names (`doc.export` / `replica.bootstrap` → `download`), read with its token. */
+  async download(download: Json): Promise<ArrayBuffer> {
+    const response = await fetch(`${this.nfs}/bucket/v1/${download.bucket_id}/${download.key}?token=${encodeURIComponent(download.token)}`)
+    expect(response.ok).toBe(true)
+    return response.arrayBuffer()
+  }
+
+  /** `ws.import` of a package the token's user bound into its own `exports` bucket. */
+  async importPackage(token: string, pkg: ArrayBuffer, semantics: 'new' | 'restore', replace = false): Promise<Json> {
+    const bound = await this.bind(token, 'exports', `import/${Math.random().toString(36).slice(2)}.bcanvas`, pkg)
+    return this.rpc(token, 'ws.import', { ...bound, semantics, ...(replace ? { replace: true } : {}) })
   }
 
   async rpc(token: string, method: string, params: Json): Promise<Json> {
@@ -44,11 +74,7 @@ export class Api {
     const fixture = JSON.parse(readFileSync(BACKEND_FIXTURE, 'utf8')) as Json
     let text = JSON.stringify(fixture.commits)
     for (const asset of fixture.assets) {
-      const bytes = Buffer.from(asset.base64, 'base64')
-      const begin = await this.rpc(token, 'asset.begin_upload', { workspace_id: ws.workspace_id, size: bytes.length })
-      const put = await fetch(`${this.base}/upload/${begin.upload_id}`, { method: 'PUT', headers: { authorization: `Bearer ${token}` }, body: bytes })
-      expect(put.ok).toBe(true)
-      const done = await this.rpc(token, 'asset.finish_upload', { workspace_id: ws.workspace_id, upload_id: begin.upload_id })
+      const done = await this.uploadAsset(token, ws.workspace_id, Buffer.from(asset.base64, 'base64'))
       text = text.split(asset.placeholder).join(done.object_id)
     }
     const commits = JSON.parse(text) as Json[]
@@ -94,10 +120,49 @@ export class Api {
     return (await this.rpc(token, 'ws.get_info', { workspace_id: workspaceId })).head_seq
   }
 
+  /** `ext.build` of a control from files given as text or JSON (or a folder of `doc/workspace/hello-controls`). */
+  async build(token: string, workspaceId: string, files: Record<string, unknown> | string, extra: Json = {}): Promise<Json> {
+    const list = typeof files === 'string'
+      ? readdirSync(resolve('../../../doc/workspace/hello-controls/controls', files)).map((name) => ({ name, base64: readFileSync(resolve('../../../doc/workspace/hello-controls/controls', files, name)).toString('base64') }))
+      : Object.entries(files).map(([name, v]) => ({ name, base64: Buffer.from(typeof v === 'string' ? v : JSON.stringify(v), 'utf8').toString('base64') }))
+    const built = await this.rpc(token, 'ext.build', { workspace_id: workspaceId, files: list, ...extra })
+    expect(built.status, JSON.stringify(built)).toBe('accepted')
+    return built
+  }
+
+  /** A workspace with one free canvas `free` (its content folder `free-content`). */
+  async freeCanvas(token: string, title: string): Promise<{ workspace_id: string; epoch: string }> {
+    const ws = await this.rpc(token, 'ws.create', { title }) as { workspace_id: string; epoch: string }
+    const made = await this.commit(token, ws, [
+      { op: 'entity.create', entity_id: 'free-content', type_id: 'buckyos.container', parent_id: 'canvas-content', order_key: 'a', payload: { kind: 'folder', system: 'surface_content', surface_id: 'free', title: 'Free' } },
+      { op: 'entity.create', entity_id: 'free', type_id: 'buckyos.container', parent_id: 'surfaces', order_key: 'a', payload: { kind: 'surface', layout: { mode: 'free' }, title: 'Free', content_folder_id: 'free-content' } },
+    ])
+    expect(made.status, JSON.stringify(made)).toBe('accepted')
+    return ws
+  }
+
   /** The runs of a wish, newest first (`proc.list`). */
   async runs(token: string, workspaceId: string, wishId: string): Promise<Record<string, Json>[]> {
     return (await this.rpc(token, 'proc.list', { workspace_id: workspaceId, wish_id: wishId, limit: 5 })).runs as Record<string, Json>[]
   }
+}
+
+/** A workspace's own origin on the dev server (T4-8): `http://aiws-<label>.localhost:<port>`. */
+export function workspaceOrigin(workspaceId: string, port: string | number = process.env.AIWS_E2E_WEB_PORT ?? ''): string {
+  return `http://aiws-${workspaceId.replace(/^ws_/, '')}.localhost:${port}`
+}
+
+/** A workspace page: the service ignores the first segment and, with `id`, the second (links.ts). */
+export function workspacePage(workspaceId: string, surfaceId?: string | null, port?: string | number): string {
+  return surfaceId ? `${workspaceOrigin(workspaceId, port)}/w/s?id=${encodeURIComponent(surfaceId)}` : `${workspaceOrigin(workspaceId, port)}/w`
+}
+
+/** Open a workspace page on its own origin as `token` (`{ guest: true }` for nobody), in the specs' language, and
+ * wait for the workspace. */
+export async function openWorkspacePage(page: Page, who: string | { guest: true }, workspaceId: string, surfaceId?: string | null, port?: string | number) {
+  await asUser(page, who)
+  await page.goto(workspacePage(workspaceId, surfaceId, port))
+  await expect(page.getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', workspaceId, { timeout: 30_000 })
 }
 
 /** Open the Desktop shell and the AI Workspace app in it, talking to the standalone backend as `token`, and
@@ -105,7 +170,9 @@ export class Api {
 export async function openApp(page: Page, token: string) {
   // keeps what an earlier init script put there (the local executor spec adds its model endpoint)
   await page.addInitScript((value) => { let prev: Record<string, unknown> = {}; try { prev = JSON.parse(window.localStorage.getItem('aiworkspace.dev') ?? '{}') as Record<string, unknown> } catch { prev = {} }; window.localStorage.setItem('aiworkspace.dev', JSON.stringify({ ...prev, token: value })) }, token)
-  await page.goto('/?scenario=normal')
+  // the mock Desktop loads its scenario state after the first paint and resets the windows then: an icon clicked
+  // before that is lost, so the click waits for the loading to settle
+  await page.goto('/?scenario=normal', { waitUntil: 'networkidle' })
   await page.getByTestId('desktop-app-aiworkspace').click()
   // the window opens maximised: the canvas has the room the specs' coordinates assume
   await page.getByTestId('window-aiworkspace').getByRole('button', { name: /^(Maximize|最大化)$/ }).click()
@@ -127,7 +194,11 @@ export async function backToList(page: Page): Promise<string | null> {
 /** Open the main menu and click through items by test id (an item with a submenu opens it on click). */
 export async function mainMenu(page: Page, ...testIds: string[]) {
   await page.getByTestId('aiws-main-menu').click()
-  for (const id of testIds) await page.getByTestId(id).click()
+  for (const id of testIds) {
+    const item = page.getByTestId(id)
+    if (await item.getAttribute('aria-haspopup') === 'menu') await item.hover()
+    else await item.click()
+  }
 }
 
 /** Main menu → 关闭工作区 (the leave check passes when nothing is unsaved). */
@@ -206,11 +277,25 @@ export async function hooks(page: Page): Promise<{ commits: number; canvas: { bl
   })
 }
 
+/** Talk to the backend as `who` (`{ guest: true }` for nobody) in the specs' language, on every origin this page visits
+ * (a workspace's own origin starts with an empty storage). */
+export async function asUser(page: Page, who: string | { guest: true }) {
+  await page.addInitScript(({ who, localeKey, locale }) => {
+    window.localStorage.setItem('aiworkspace.dev', JSON.stringify(typeof who === 'string' ? { token: who } : who))
+    window.localStorage.setItem(localeKey, locale)
+  }, { who, localeKey: LOCALE_STORAGE_KEY, locale: SPEC_LOCALE })
+}
+
 export const test = base.extend<{ api: Api }>({
   api: async ({}, use) => { await use(new Api()) },
+  // the specs' language on every origin, the workspace origins `aiws-<label>.localhost` included
+  context: async ({ context }, use) => {
+    await context.addInitScript(({ localeKey, locale }) => { if (!window.localStorage.getItem(localeKey)) window.localStorage.setItem(localeKey, locale) }, { localeKey: LOCALE_STORAGE_KEY, locale: SPEC_LOCALE })
+    await use(context)
+  },
   storageState: async ({}, use) => {
     const ports = [process.env.AIWS_E2E_WEB_PORT, process.env.AIWS_E2E_PREVIEW_PORT].filter(Boolean)
-    await use({ cookies: [], origins: ports.map((port) => ({ origin: `http://127.0.0.1:${port}`, localStorage: [{ name: LOCALE_STORAGE_KEY, value: SPEC_LOCALE }] })) })
+    await use({ cookies: [], origins: ports.map((port) => ({ origin: `http://localhost:${port}`, localStorage: [{ name: LOCALE_STORAGE_KEY, value: SPEC_LOCALE }] })) })
   },
 })
 export { expect }

@@ -1,7 +1,10 @@
 /* Wire types of the aiworkspace service (see src/frame/aiworkspace/README.md and the detailed design §2–§5).
  * Only what the Desktop app reads is typed; unknown keys are preserved as `unknown`. */
 
-export const PROTOCOL_VERSION = '1.0'
+import type { StoredPlacement } from '@controls/placement'
+import type { Composition } from '@controls/composite'
+
+export const PROTOCOL_VERSION = '1.1'
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
 
@@ -53,8 +56,10 @@ export interface WorkspaceInfo extends WorkspaceSummary {
 
 /** Where a sourced entity's content comes from (内核架构改进 D12); such an entity is read-only for people and Blocks. */
 export interface EntitySource {
-  kind: 'url' | 'workspace'
+  kind: 'url' | 'workspace' | 'session'
   mode: 'live' | 'fixed'
+  /** A session feed (第四期规划 §5.3): which of the seven. */
+  feed?: SessionFeed | null
   url?: string | null
   workspace_id?: string | null
   entity_id?: string | null
@@ -62,6 +67,9 @@ export interface EntitySource {
   refresh?: { interval_s: number } | null
   auth_mode?: 'none' | 'hosted'
 }
+
+/** The feeds of a presentation session (第四期规划 §5.3, Q19): Tables a Block binds to, written by the session. */
+export type SessionFeed = 'participants' | 'stage' | 'tasks' | 'my_responses' | 'responses' | 'results' | 'reactions'
 
 /** A published data entity (D26): its link is the URL projection of the reference. */
 export interface Publication { entity_id: string; name: string; path: string; url?: string; reference: Reference; published_at: string; published_by: string; referrers: number; current?: boolean }
@@ -104,9 +112,13 @@ export const SYSTEM_IDS: ReadonlySet<string> = new Set([ROOT_ID, DATA_ID, SURFAC
 /** Free-layout placement relative to the parent container; stacking order is the sibling `order_key`. */
 /** `rotation`: degrees clockwise about the centre, `[0, 360)`, absent = 0 (标准对象的交互改进 §7.1). */
 export interface Placement { x: number; y: number; w: number; h: number; rotation?: number }
+/** A placement as stored (脑图方案 §5.1): inside a control a component may be `"auto"`, computed when shown. Read laid-out
+ * rectangles for geometry; only a Block outside any control has a plain `Placement`. */
+export type { StoredPlacement, Axis } from '@controls/placement'
 
-/** Container kinds of phase two: `folder` (data tree), `surface`, `group` (BlockTree); `root` / `data` / `surfaces` are system nodes. */
-export type ContainerKind = 'root' | 'data' | 'surfaces' | 'folder' | 'surface' | 'group'
+/** Container kinds of phase two: `folder` (data tree), `surface`, `group` (BlockTree); `root` / `data` / `surfaces` are system nodes;
+ * a Block-control's kind is its control id (`mindmap`, 脑图方案 §6.2). */
+export type ContainerKind = 'root' | 'data' | 'surfaces' | 'folder' | 'surface' | 'group' | 'mindmap'
 
 /** Generation dependency record of a result entity (phase two §7.3). */
 export interface DerivedInput {
@@ -152,7 +164,9 @@ export interface EntityEnvelope {
   name: string | null
   title?: string | null
   kind?: ContainerKind | string
-  layout?: { mode: 'flow' | 'free' } | null
+  layout?: { mode: 'flow' | 'free' | 'tree' } | null
+  /** A control's attributes (outline only; a Surface's `config` is not projected). */
+  config?: Record<string, Json> | null
   /** Folders: `canvas_content` (the area), `surface_content` (one Surface's folder) or `shows` (presentation paths). */
   system?: 'canvas_content' | 'surface_content' | 'shows' | null
   /** A content folder's Surface; a Surface's content folder. */
@@ -164,9 +178,11 @@ export interface EntityEnvelope {
   locked?: boolean | null
   /** A connector's geometry keys as the outline projects them (连接线实现方案 §9.2; `config` is not projected). */
   connector?: ConnectorProjection | null
+  /** An ink segment's logical stroke (手写笔 TODO D0): the segments of one stroke act as one. */
+  ink_stroke?: string | null
   parent_id?: string
   order_key?: string
-  placement?: Placement
+  placement?: StoredPlacement
   scope: string
   deleted: boolean
   content_rev: number
@@ -183,12 +199,30 @@ export interface EntityEnvelope {
   view_version?: number | null
   source_id?: string | null
   def_id?: string | null
+  /** A Block's role name inside its control (R22) and a mind map node's layout hints (`config.side`, `config.branch_color`). */
+  slot?: string | null
+  side?: 'left' | 'right' | null
+  branch_color?: string | null
   /** Wishes / definitions / annotations / assets (outline only). */
   executor?: string | null
   /** Set on a sourced entity (D12). */
   source?: EntitySource | null
   output_mode?: string | null
   def_kind?: string | null
+  /** A control definition's identity `<author_did>#<name>`, manifest version, build revision, package and source
+   * snapshot directory (扩展控件 P0; outline only). */
+  ident?: string | null
+  manifest_version?: number | null
+  def_version?: number | null
+  provenance_pkg?: string | null
+  source_dir_id?: string | null
+  /** The identities a definition builds on, a composite's composition and its config defaults (扩展控件 P1). */
+  deps?: string[] | null
+  composition?: Composition | null
+  config_defaults?: Record<string, Json> | null
+  /** The events a definition declares and the events an instance binds (扩展控件 P2; outline only). */
+  def_events?: string[] | null
+  on_events?: string[] | null
   target_id?: string | null
   annotation_kind?: string | null
   media_type?: string | null
@@ -235,7 +269,7 @@ export interface Reference {
   workspace_id?: string
 }
 
-export type FieldType = 'text' | 'number' | 'decimal' | 'date' | 'datetime' | 'boolean' | 'select' | 'multi_select' | 'object_ref'
+export type FieldType = 'text' | 'number' | 'decimal' | 'date' | 'datetime' | 'boolean' | 'select' | 'multi_select' | 'object_ref' | 'currency'
 
 export interface OptionDef { option_id: string; label: string }
 
@@ -248,6 +282,8 @@ export interface FieldDef {
   unique?: boolean
   scale?: number
   options?: OptionDef[]
+  /** A currency field's default currency (ISO 4217); its values are `{ amount, currency }`. */
+  currency?: string
   description?: string
   maintained_by?: 'human' | 'program'
   order_key?: string
@@ -303,6 +339,8 @@ export interface CellPayload {
   def_ref?: Reference
   /** Named data bindings (`aiws` v2): `source_ref` is the binding called `source`. */
   bindings?: Record<string, { entity_id: string; selector?: Selector }>
+  /** What a control instance does when its definition raises an event (扩展控件 P2, Q26). */
+  on?: EventBindings
   /** Connector keys (only with `view.type = connector`). */
   start?: ConnectorEnd | null
   end?: ConnectorEnd | null
@@ -312,12 +350,14 @@ export interface CellPayload {
   label?: ConnectorProjection['label']
   /** Presentation properties (第三期规划 §4.1, §10.2). */
   presentation?: PresentationProps
+  /** A Block's role name inside its control (R22). */
+  slot?: string
 }
 
 export type WishExecutor = 'mock' | 'xllm' | 'agent-work-session'
 /** A wish input: what is read (`entity`, a saved table view, a table query) and the stable name programs use (许愿格 §4.1). */
 export interface WishInput { entity_id: string; selector?: Selector; version?: { mode: 'follow' | 'fixed'; rev?: number; hash?: string }; label?: string; name?: string; appended_by?: string }
-export type WishResultType = 'richtext' | 'record' | 'table' | 'table_columns' | 'image' | 'asset' | 'html' | 'video'
+export type WishResultType = 'richtext' | 'record' | 'table' | 'table_columns' | 'image' | 'asset' | 'html' | 'video' | 'control'
 export interface WishView { renderer: string; config?: Record<string, Json>; title?: string; size?: { w: number; h: number } }
 export interface WishContractResult { name: string; type: WishResultType; title?: string; approach: 'program' | 'direct'; key?: string[]; target?: string; views?: WishView[]; description?: string; fields?: string[] }
 export interface WishCheckDef { id: string; kind: 'program' | 'review'; text: string }
@@ -404,6 +444,8 @@ export interface WishResult {
   markdown?: string
   file?: { media_type: string; size: number; image?: { width: number; height: number }; object_id?: string; file_name?: string }
   html?: { html: string; css?: string; js?: string; bindings?: Record<string, string> }
+  /** A Block-control instance (a mind map, 脑图 TODO M3): its tree; `under` names the input node it grows. */
+  control?: { kind: string; config?: Record<string, Json>; nodes: { text: string; children: unknown[] }[]; under?: string }
 }
 export interface WishCheckResult { id: string; kind: 'program' | 'review'; text: string; status: 'passed' | 'failed' | 'not_run' | 'review'; detail?: Json; self_assessment?: Json }
 export interface WishCandidate {
@@ -495,7 +537,7 @@ export interface WishChoices { results?: Record<string, 'keep' | 'replace' | 'ne
 export interface BlockDefPayload {
   def_id: string
   version?: number
-  kind: 'declarative' | 'html'
+  kind: 'declarative' | 'html' | 'composite'
   title?: string
   description?: string
   accepts?: string[]
@@ -506,6 +548,93 @@ export interface BlockDefPayload {
   config_schema?: Json
   actions?: Json
   inspector?: Json
+  /** Extension controls (扩展控件 P0, src/frame/aiworkspace/README.md “Extension controls”). */
+  ident?: { author_did: string; name: string }
+  manifest_version?: number
+  source_dir?: { entity_id: string }
+  bindings?: Record<string, ControlBinding>
+  catalog?: { group?: string; icon?: string; description?: string }
+  agent?: string
+  provenance?: { pkg_id?: string; version?: string; digest?: string }
+  /** P1: the definitions it builds on, and a composite's checked composition.json. */
+  deps?: { ident: string; entity_id: string }[]
+  composition?: Composition
+  /** P2 (Q26): the events the control raises (a composite's re-raise a child's, `from`). */
+  events?: Record<string, ControlEvent>
+}
+
+/** An event a control declares (`component.json` `events`, a composite's `composition.json` `events`). */
+export interface ControlEvent {
+  title?: string
+  description?: string
+  params?: Record<string, { type: 'string' | 'number' | 'boolean' | 'object' | 'entity'; required?: boolean; description?: string }>
+  from?: { slot: string; event: string }
+}
+
+/** One handler of an instance's `on` (Q26). Strings may hold `{{event.<param>}}` / `{{config.<key>}}`. */
+export type EventHandler =
+  | { kind: 'write'; target: string; what: 'recordSet' | 'upsert' | 'setMarkdown'; args?: Record<string, Json> }
+  | { kind: 'wish'; wish_id: string; inputs?: Json }
+  | { kind: 'open'; target?: string }
+  | { kind: 'notify'; text: string }
+export type EventBindings = Record<string, EventHandler | EventHandler[]>
+
+/** A named data input a control declares (its instances bind it in the Cell's `bindings`). */
+export interface ControlBinding { accepts?: string[]; required?: boolean; title?: string; description?: string }
+
+/** One problem of a control's source (`ext.build`'s `BUILD_FAILED.data.diagnostics`). */
+export interface BuildDiagnostic { file: string; line?: number; col?: number; severity: 'error' | 'warning'; message: string; code?: string; instances?: { entity_id: string; title?: string | null }[]; dependents?: { ident: string; def_entity_id: string }[] }
+
+/** `ext.build` / `ext.import`: one entry per control. */
+export interface ExtControlResult {
+  ident: string; def_entity_id: string; dir_entity_id?: string; action: 'created' | 'rebuilt' | 'unchanged' | 'satisfied' | 'upgraded'; version?: number; def_rev?: number; dir_rev?: number
+  build?: { input_digest: string; builder_version: string; built_at: string }
+  /** `ext.upgrade` (扩展控件 P2, Q30): the package versions, and the instances a migration rewrote. */
+  from?: string | null; to?: string | null; migrated?: string[]
+}
+export interface ExtBuildResult extends Partial<ExtControlResult> {
+  status: 'accepted' | 'unchanged' | 'checked'; commit_id?: string; seq?: number; unchanged?: boolean; controls: ExtControlResult[]; diagnostics: BuildDiagnostic[]
+  /** A dry run: the operations a migration would write per instance. */
+  plan?: { instance: string; ops: Operation[] }[]
+}
+/** A migration of an upgrade that narrows the contract instances rely on (`schemas/migration.schema.json`). */
+export interface ExtMigration {
+  config?: { rename?: Record<string, string>; drop?: string[]; fill?: Record<string, Json> }
+  bindings?: { rename?: Record<string, string>; drop?: string[]; fill?: Record<string, { entity_id: string }> }
+  slots?: { rename?: Record<string, string>; move?: Record<string, string> }
+  events?: { rename?: Record<string, string>; drop?: string[] }
+}
+/** A Workspace template of a library package (P3, Q32). */
+export interface TemplateParam { type: 'string' | 'number' | 'boolean'; title?: string; default?: Json }
+export interface LibraryTemplate { id: string; title: string; description?: string | null; params?: Record<string, TemplateParam>; requires?: { host_api?: Record<string, number>; controls?: string[] } }
+/** What `ext.export_template` / `ext.pack { templates }` take for one template. */
+export interface TemplateSpec { surfaces: string[]; data?: string[]; template: { id: string; title: string; description?: string; params?: Record<string, TemplateParam>; reset?: { tables: string[] } } }
+export interface ExtExportResult {
+  manifest: { manifest_version: number; purpose: 'aiws'; host_api?: Record<string, number>; controls: { ident: string; name: string; kind: string; version: number; digest: string; dir: string; title?: string; deps?: string[] }[]; workspace_templates: Json[] }
+  controls: { entity_id: string; ident: string; kind: string; version: number; def_rev: number; dir_rev: number; built: boolean; digest: string; dir: string; files: { name: string; obj_id?: string; size: number; text?: string }[] }[]
+  files: { path: string; obj_id?: string; size: number; text?: string }[]
+}
+export interface LibraryControl { ident: string; name: string; kind: string; version: number; digest: string; dir: string; title?: string | null; description?: string | null; catalog?: Record<string, Json> | null; deps?: string[]; needs_newer?: boolean }
+/** `ext.pack` (扩展控件 P1): the unsigned .pikg the service wrote into the caller's `exports` bucket. */
+export interface ExtPackResult {
+  bucket_id: string
+  key: string
+  obj_id: string
+  size: number
+  digest: string
+  app_doc_object_id: string
+  app_did: string
+  pkg_id: string
+  version: string
+  payload_digest: string
+  tar_digest: string
+  download: { bucket_id: string; key: string; version: number; obj_id: string; token: string }
+}
+export interface LibraryPackage {
+  pkg_id: string; version: string; title: string; author: string; mode: string; installed_at: string; controls: LibraryControl[]
+  /** Q33: a package newer than this service reads is listed, marked, and cannot be imported. */
+  manifest_version?: number | null; needs_newer?: boolean
+  templates?: LibraryTemplate[]
 }
 
 export type FreshnessStatus = 'current' | 'stale' | 'upstream_stale' | 'unavailable' | 'unknown' | 'none'
@@ -591,10 +720,14 @@ export interface Subject { subject: string; kind: 'user' | 'agent' | string }
 
 export interface KeyedContent<P> { payload: P; key_revs: Record<string, number>; diagnostics?: Diagnostic[] }
 
-export interface RecordPropDef { key: string; name: string; type: FieldType; required?: boolean; nullable?: boolean; scale?: number; options?: OptionDef[] }
+export interface RecordPropDef { key: string; name: string; type: FieldType; required?: boolean; nullable?: boolean; scale?: number; currency?: string; options?: OptionDef[] }
 export interface RecordContent { schema: { properties: RecordPropDef[] }; props: Record<string, Json>; key_revs: Record<string, number> }
 
-export interface AssetPayload { object_id: string; media_type?: string; size?: number; file_name?: string; image?: { width: number; height: number } }
+/** `poster`: an image asset picturing the content (a video frame, a PDF's first page, a cover; 多媒体对象 §3). */
+export interface AssetPayload {
+  object_id: string; media_type?: string; size?: number; file_name?: string; image?: { width: number; height: number }
+  poster?: string; duration_ms?: number; page_count?: number
+}
 export interface AssetContent extends KeyedContent<AssetPayload> { availability: 'available' | 'missing' | 'corrupt' }
 
 /** A position inside an annotation's target: a built-in kind (`richtext_text`) or an application's `<app>/<name>`. */
@@ -758,7 +891,13 @@ export interface RunView {
   inputs: unknown[]
 }
 
-export interface ExportResult { export_id: string; manifest: { export_mode: string; content_root: string; self_contained: boolean; missing: unknown[]; excluded_entities: number; [key: string]: unknown } }
+/** A file the service put into the owner's `exports` bucket (7 days) and the read token for that key alone. */
+export interface BucketDownload { bucket_id: string; key: string; version: number; obj_id: string; token: string }
+/** Where an upload is bound (`ndm` finalize `auto_bind`): the caller's own bucket of this service. */
+export interface BucketBinding { bucket_id: string; key: string }
+export interface StagedAsset { object_id: string; media_type: string; size: number; bucket_id: string; key: string; version: number }
+
+export interface ExportResult { export_id: string; download: BucketDownload; manifest: { export_mode: string; content_root: string; self_contained: boolean; missing: unknown[]; excluded_entities: number; [key: string]: unknown } }
 
 /** `via_entry`: the share entry whose join wrote the row. Subjects: a principal (user id, External DID), `public`,
  * `*` (unrestricted accounts), `group:<id>`, `contact:<owner_did>#<tag>`. */

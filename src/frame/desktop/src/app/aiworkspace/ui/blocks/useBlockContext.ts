@@ -1,8 +1,10 @@
 import { useCallback, useContext, useMemo, useSyncExternalStore } from 'react'
+import { num } from '@controls/placement'
 import type { BlockDefRead, CellPayload, EntityEnvelope, KeyedContent } from '../../api/types'
 import { aiwsT } from '../../i18n'
 import { useEntity, useLoad, useReadOnlyReason, useStore, useVersion, useWorkspaceUi } from '../../state/hooks'
 import { useAiwsText } from '../../useAiwsText'
+import { RunModeContext } from '../../state/runMode'
 import { EditorToolbarContext } from './editorToolbar'
 import { blockRegistry, modePolicy, type BlockDefinition, type CanvasMode, type DataState, type RenderContext, type Resolution, type ToolbarItem } from './registry'
 
@@ -73,12 +75,19 @@ export function useBlockContext(options: BlockContextOptions) {
   }, [payload, source?.type_id, documentDefinition, definitionRead.error, definitionRead.data?.degraded, defId, registryVersion, t])
   const readOnlyNow = useReadOnlyReason()
   const toolbarSink = useContext(EditorToolbarContext)
+  const runMode = useContext(RunModeContext)
   const pointerType = usePointerType()
-  if (!cell || !payload) return { context: null, resolution, error: read.error, registryVersion }
+  if (!cell || !payload) return { cell, context: null, resolution, error: read.error, registryVersion }
   const dataState = dataStateOf(payload, source)
   const policy = modePolicy(mode)
   // on stage only the Blocks marked "operable on stage" take input (第三期规划 §10.2)
   const editable = policy.editContent && (mode !== 'show' || payload.presentation?.live === true)
+  // run mode (Q27): the canvas runs its Blocks (on stage only the operable ones). An HTML Block runs code: it mounts in
+  // run mode (view mode included, within the `html` budget) or by "Run once" while editing — never on a stage that does
+  // not run (a public session, a replay: its snapshot only)
+  const interactive = runMode.interactive && depth === 0 && (mode !== 'show' || payload.presentation?.live === true)
+  const html = Boolean(resolution?.ok && resolution.definition.cost.html)
+  const activatable = depth === 0 && (html ? interactive || (editable && mode !== 'show') : editable)
   const readOnlyReason = readOnlyNow ? readOnlyNow
     : depth > 0 ? t('aiworkspace.blocks.readOnly.embedded')
       : !policy.writes ? mode === 'view' ? t('aiworkspace.blocks.readOnly.viewMode') : t('aiworkspace.blocks.readOnly.pathEdit')
@@ -88,9 +97,9 @@ export function useBlockContext(options: BlockContextOptions) {
             : source && !source.capabilities.some((c) => c === 'update' || c === 'append') ? t('aiworkspace.blocks.readOnly.noDataPermission') : null
   const context: RenderContext = {
     cell, payload, keyRevs: current.content.key_revs, source, definition: resolution?.ok ? resolution.definition : MISSING_DEF, documentDefinition, depth,
-    mode, view, selected: Boolean(options.selected), hovered: Boolean(options.hovered), editorActive: Boolean(options.editorActive) && editable && depth === 0,
-    capabilities: cell.capabilities, readOnlyReason, dataState, size: options.size ?? { w: cell.placement?.w ?? 320, h: cell.placement?.h ?? 200 }, zoom: options.zoom ?? 1,
-    activateEditor: () => { if (editable && depth === 0 && resolution?.ok) options.onActivate?.() },
+    mode, view, selected: Boolean(options.selected), hovered: Boolean(options.hovered), editorActive: Boolean(options.editorActive) && activatable, interactive,
+    capabilities: cell.capabilities, readOnlyReason, dataState, size: options.size ?? { w: num(cell.placement?.w) ?? 320, h: num(cell.placement?.h) ?? 200 }, zoom: options.zoom ?? 1,
+    activateEditor: () => { if (activatable && resolution?.ok) options.onActivate?.() },
     deactivateEditor: () => options.onDeactivate?.(), openEntity: ui.openEntity,
     setEditorToolbar: (items: ToolbarItem[] | null) => toolbarSink?.set(`block:${cellId}`, items), pointerType,
     annotate: ui.annotate, showAnnotations: ui.showAnnotations,
@@ -98,5 +107,5 @@ export function useBlockContext(options: BlockContextOptions) {
   const availableResolution: Resolution | null = dataState === 'missing' || dataState === 'unreadable' || dataState === 'degraded'
     ? { ok: false, reason: 'data_unavailable', detail: t(dataState === 'missing' ? 'aiworkspace.blocks.data.missing' : dataState === 'unreadable' ? 'aiworkspace.blocks.data.unreadable' : 'aiworkspace.blocks.data.degraded') }
     : resolution
-  return { context, resolution: availableResolution, error: read.error, registryVersion }
+  return { cell, context, resolution: availableResolution, error: read.error, registryVersion }
 }

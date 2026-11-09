@@ -7,7 +7,7 @@ use common::*;
 use serde_json::{json, Value};
 
 async fn upload_text(net: &Net, name: &str, file: &str, text: &str) -> String {
-    net.n(name).station.store_file(file, "text/markdown", text.as_bytes().to_vec(), Value::Null).await.unwrap().0
+    net.n(name).station.store_file(&format!("uploads/{file}"), file, "text/markdown", text.as_bytes().to_vec(), Value::Null).await.unwrap().0
 }
 
 /// A57–A62, E20–E22: identity and content targets without any Feed entry, paths bound to a
@@ -49,7 +49,7 @@ async fn evaluation_targets_and_binding() {
     // An entry path resolves to its current version; after an edit the old result is not the
     // path's result any more (A59); a withdrawn path is a state, not a judgement (A62).
     let post = publish(&net, "alice", "path-1", text_input("garden plan v1", public())).await;
-    let path = format!("cyfs://{}/home/alice/feed/@/{}", alice.zone, post["entry"].as_str().unwrap().rsplit('/').next().unwrap());
+    let path = format!("https://{}/home/alice/feed/@/{}", alice.zone, post["entry"].as_str().unwrap().rsplit('/').next().unwrap());
     let r1 = net.rpc("bob", "eval.evaluate", json!({ "request": { "target": { "kind": "content", "object_path": path }, "dimensions": ["topic"] } })).await;
     assert_eq!(r1["target"]["object_id"], post["objId"]);
     assert_eq!(r1["resolution"]["head_seq"], 1);
@@ -124,7 +124,7 @@ async fn consumption_proofs() {
     let stored: Value = brand
         .station
         .db
-        .call(move |c| Ok(serde_json::from_str(&c.query_row("SELECT body FROM objects WHERE obj_id=?1", [proof_id], |r| r.get::<_, String>(0))?)?))
+        .call(move |c| Ok(serde_json::from_str(&c.query_row("SELECT body FROM objects WHERE obj_id=?1 AND owner=?2", [proof_id.as_str(), c.owner], |r| r.get::<_, String>(0))?)?))
         .await
         .unwrap();
     assert_eq!(stored["action"], "video_complete");
@@ -177,6 +177,6 @@ async fn permission_boundaries() {
     let (status, body, _) = net.get(&format!("{}/profile", alice.home), None).await;
     assert_eq!(status, 200);
     let profile: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(profile["stream"], format!("cyfs://{}/home/alice/feed", alice.zone));
-    assert_eq!(profile["inbox"], format!("cyfs://{}/home/alice/inbox", alice.zone));
+    assert_eq!(profile["stream"], format!("https://{}/home/alice/feed", alice.zone));
+    assert_eq!(profile["inbox"], format!("https://{}/home/alice/inbox", alice.zone));
 }

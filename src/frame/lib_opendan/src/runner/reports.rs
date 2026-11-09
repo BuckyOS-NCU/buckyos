@@ -34,12 +34,27 @@ pub(super) struct ReportArgs {
     pub is_end: bool,
 }
 
+/// An object leaving a session as the host keeps it: its id and the
+/// `obj://bucket/...` binding that retains it (`None`: no bucket keeps it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    pub obj_id: ObjId,
+    pub url: Option<String>,
+}
+
 /// The host's object store: report artifacts leave a session as named
 /// objects. A file artifact is put in when its report is accepted.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
-    /// Put the file at `path` in as an object named `name`.
-    async fn put_file(&self, path: &Path, name: &str) -> std::result::Result<ObjId, String>;
+    /// Put the file at `path` in as an object named `name`; `Ok` means the
+    /// host retains it.
+    async fn put_file(&self, path: &Path, name: &str) -> std::result::Result<StoredObject, String>;
+
+    /// Retain what an `obj://bucket/...` reference binds, the way `put_file`
+    /// retains a file.
+    async fn retain_url(&self, url: &str) -> std::result::Result<StoredObject, String> {
+        Err(format!("`{url}` cannot be attached: the host keeps no bucket objects"))
+    }
 
     /// The name an object carries (a file object's name), when known.
     async fn name_of(&self, obj_id: &ObjId) -> Option<String> {
@@ -57,6 +72,11 @@ fn artifact_obj_id(artifact: &str) -> Option<ObjId> {
     ObjId::new(artifact).ok()
 }
 
+/// An artifact given as a bucket object (`obj://bucket/<bucket_id>/<key>`).
+pub(super) fn is_bucket_url(artifact: &str) -> bool {
+    buckyos_api::parse_bucket_obj_url(artifact).is_some()
+}
+
 pub(super) struct ReportTool;
 
 #[async_trait]
@@ -64,7 +84,7 @@ impl AgentTool for ReportTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: TOOL_REPORT.into(),
-            description: "Submit a progress report, or finish this context with is_end=true. Final reports require all tasks and child work to be settled. Accepted completion skips remaining calls in the batch. Artifacts are explicit files relative to the work directory, or object ids (e.g. `cyfile:…` from another report); the host delivers them with the final report as attachments. Result is optional application JSON. Reports are delivered by the host, not sent as messages by this tool.".into(),
+            description: "Submit a progress report, or finish this context with is_end=true. Final reports require all tasks and child work to be settled. Accepted completion skips remaining calls in the batch. Artifacts are explicit files relative to the work directory, bucket objects (`obj://bucket/…` a command returned) or object ids (e.g. `cyfile:…` from another report); the host keeps them in the agent's `artifacts` bucket and delivers them with the final report as attachments. Result is optional application JSON. Reports are delivered by the host, not sent as messages by this tool.".into(),
             args_schema: json!({"type":"object", "additionalProperties":false, "properties": {
                 "report":{"type":"string","minLength":1},
                 "artifacts":{"type":"array","items":{"type":"string"}},
@@ -117,14 +137,18 @@ fn remote_artifact_path(sh: &Shared, name: &str) -> Result<String> {
 
 async fn remote_artifact_target(sh: &Shared, cfg: &SessionConfig) -> Result<RemoteNodeTarget> {
     let frozen = cfg.runtime.frozen.as_ref().ok_or_else(|| invalid("missing frozen runtime"))?;
-    let config = crate::runtime::node_config_of(
-        &frozen.runtime_id,
-        frozen.exec.as_ref().ok_or_else(|| invalid("missing frozen node executor"))?,
-    )?;
+    let config = crate::runtime::node_config_of(&frozen.runtime_id, &frozen.exec())?;
+    let (connector, config) = match sh.deps.xllm.node_executor.clone() {
+        Some(connector) => (connector, config),
+        None => {
+            let (connector, config, _) = crate::runtime::connector_for(&frozen.runtime_id, &config).await?;
+            (connector, config)
+        }
+    };
     let node = config.remote_node.ok_or_else(|| invalid("missing node executor configuration"))?;
     let target = RemoteNodeTarget::open(
-        sh.deps.xllm.node_executor.clone().unwrap_or_else(crate::runtime::node_connector),
-        node.node_did.as_deref().unwrap_or_default(),
+        connector,
+        node.connect_target().unwrap_or_default(),
         node.profile_id.as_deref().unwrap_or_default(),
         &frozen.runtime_id,
         sh.dir.state_dir().join("runtime_ops"),
@@ -170,7 +194,7 @@ pub(super) async fn validate(sh: &Shared, run: &RunHandle, args: &ReportArgs) ->
         if !seen.insert(path) {
             return Err(invalid("duplicate artifact path"));
         }
-        if artifact_obj_id(path).is_some() {
+        if artifact_obj_id(path).is_some() || is_bucket_url(path) {
             continue;
         }
         let cfg = sh.session.lock().await.config.clone();
@@ -185,33 +209,56 @@ pub(super) async fn validate(sh: &Shared, run: &RunHandle, args: &ReportArgs) ->
         return Ok(());
     }
     let child = super::outcome::call_site_of(sh, run.run_id()).await.0;
+    // Sub sessions (`session:`) are settled by the check below. A task the
+    // run handed work to counts until it ended (its end may already have
+    // come back as input); one nobody can answer for, until that unknown
+    // end was delivered.
+    let resolver = sh.tasks.lock().expect("tasks").clone();
+    let recent = sh.session.lock().await.state.recent_keys.clone();
+    let mut running = Vec::new();
+    for t in run.noted_tasks() {
+        if t.starts_with(super::children::SESSION_TASK_PREFIX) {
+            continue;
+        }
+        let ended = match &resolver {
+            Some(r) => match r.state(&t).await {
+                agent_tool::TaskState::Finished(_) => true,
+                agent_tool::TaskState::Running { .. } => false,
+                agent_tool::TaskState::Unknown { .. } => {
+                    recent.contains(&super::receipts::internal_task_key(&t))
+                }
+            },
+            None => false,
+        };
+        if !ended {
+            running.push(t);
+        }
+    }
     let s = sh.session.lock().await;
     if s.state.stop_requested || sh.deps.stop.requested() || s.state.run_state == RunState::Finished
     {
         return Err(invalid("session stop or completion already requested"));
     }
-    if !run.noted_tasks().is_empty() || (!child && !s.state.watched_tasks.is_empty()) {
-        return Err(invalid(
-            "cannot finish while tasks are still active; wait for their results",
-        ));
-    }
-    let goal = super::goal::is_goal(&s.config);
-    drop(s);
-    // A Goal Activation ends while its Work runs on: the Work's end is a
-    // later Activation's input.
-    if !child && !goal && !super::children::unsettled_children(sh).await?.is_empty() {
-        return Err(invalid("cannot finish while child sessions are unsettled"));
-    }
-    // The session's result rests on its TodoList: every Todo converged
-    // (executed and reviewed, or cancelled with a reason).
-    if !child && !goal {
-        let open = super::todos::unconverged(sh);
-        if !open.is_empty() {
-            return Err(invalid(format!(
-                "cannot finish while the todo list has not converged: {}. Review results with `agent-session todo review`, cancel what will not be done with `agent-session todo cancel <id> --reason <why>`.",
-                open.join("; ")
-            )));
+    if !child {
+        for t in &s.state.watched_tasks {
+            if !running.contains(t) {
+                running.push(t.clone());
+            }
         }
+    }
+    if !running.is_empty() {
+        return Err(invalid(format!(
+            "cannot finish while tasks you started are still active ({}): their ends come back to you as `<<task_result>>`; reply to close this Turn meanwhile, or cancel what you no longer need",
+            running.join(", ")
+        )));
+    }
+    drop(s);
+    // The Todo this work session executes changed while it worked: the
+    // change comes first (its event opens the next Turn).
+    if !child && super::inputs::todo_update_queued(sh).await {
+        return Err(invalid(
+            "your Todo was updated while you worked and the update waits as your next input: do not finish yet. Reply with one sentence on where things stand (no final report); that ends this Turn and the update opens the next one",
+        ));
     }
     Ok(())
 }
@@ -289,8 +336,10 @@ pub(super) async fn submit(
 }
 
 /// Artifacts leaving the session under `id` (a report, a structured reply):
-/// an object id as it is; a file of the work directory copied to a stable
-/// place (`state/reports/<id>/…`) and put into the host's object store.
+/// an object id as it is; a bucket object retained by the host's store; a
+/// file of the work directory copied to a stable place
+/// (`state/reports/<id>/…`) and put into the host's object store, the copy
+/// removed once a bucket retains it.
 pub(super) async fn store_artifacts(
     sh: &Shared,
     id: &str,
@@ -306,6 +355,26 @@ pub(super) async fn store_artifacts(
                 reference: String::new(),
                 digest: String::new(),
                 obj_id: Some(obj_id.to_string()),
+                url: None,
+            });
+            continue;
+        }
+        if is_bucket_url(path) {
+            let store = sh
+                .deps
+                .objects
+                .as_ref()
+                .ok_or_else(|| invalid(format!("artifact {path}: the host has no object store")))?;
+            let stored = store
+                .retain_url(path)
+                .await
+                .map_err(|e| OpenDanError::Artifact(format!("artifact {path} could not be attached: {e}")))?;
+            artifacts.push(ReportArtifact {
+                path: path.clone(),
+                reference: String::new(),
+                digest: String::new(),
+                obj_id: Some(stored.obj_id.to_string()),
+                url: stored.url,
             });
             continue;
         }
@@ -343,11 +412,20 @@ pub(super) async fn store_artifacts(
             reference,
             digest,
             obj_id: None,
+            url: None,
         };
         if let Some(store) = &sh.deps.objects {
-            artifact.obj_id = Some(store.put_file(&stable, artifact.name()).await
-                .map_err(|e| invalid(format!("artifact {path} could not be attached: {e}")))?
-                .to_string());
+            let stored = store
+                .put_file(&stable, artifact.name())
+                .await
+                .map_err(|e| OpenDanError::Artifact(format!("artifact {path} could not be attached: {e}")))?;
+            artifact.obj_id = Some(stored.obj_id.to_string());
+            artifact.url = stored.url;
+            if artifact.url.is_some() {
+                if let Err(e) = std::fs::remove_file(&stable) {
+                    log::warn!("artifact {path}: stable copy {} not removed: {e}", stable.display());
+                }
+            }
         }
         artifacts.push(artifact);
     }
@@ -383,13 +461,13 @@ impl llm_context::OutputValidator for ReplyValidator {
                 if !seen.insert(path) {
                     return Err(format!("artifact `{path}` is listed twice"));
                 }
-                if artifact_obj_id(path).is_none() {
+                if artifact_obj_id(path).is_none() && !is_bucket_url(path) {
                     if cfg.runtime.is_node() {
                         remote_artifact_path(&self.sh, path).map_err(|e| e.to_string())?;
                         continue;
                     }
                     artifact_bytes(Path::new(&workdir), path).map_err(|e| {
-                        format!("{e}; an artifact is a file you made (path relative to your working directory, created first) or an object id")
+                        format!("{e}; an artifact is a file you made (path relative to your working directory, created first), an `obj://bucket/…` a command returned, or an object id")
                     })?;
                 }
             }
@@ -401,15 +479,15 @@ impl llm_context::OutputValidator for ReplyValidator {
             .and_then(|r| r.get("asks_field"))
             .and_then(Value::as_str)
         {
-            let asked = extra
-                .and_then(|x| x.get("asks"))
-                .and_then(Value::as_object)
-                .map(|a| a.len())
-                .unwrap_or(0);
+            let asked = self
+                .run
+                .latest_snapshot()
+                .map_err(|e| e.to_string())?
+                .map_or(0, |snapshot| questions_asked(&snapshot));
             let listed = reply.get(field).and_then(Value::as_array).map_or(0, Vec::len);
             if listed != asked {
                 return Err(format!(
-                    "`{field}` must list every question you asked the user with ask-user in this context, one entry each with the user's answer: you asked {asked}, it lists {listed}"
+                    "`{field}` must list every question you asked the user with ask_user in this context, one entry each with the user's answer: you asked {asked}, it lists {listed}"
                 ));
             }
         }
@@ -469,16 +547,67 @@ pub(super) async fn call(
                 bytes: content.to_string().len(),
                 content,
                 truncated: false,
-                tool_result: None,
+                host: None,
+                images: Vec::new(),
             })
         }
-        Err(OpenDanError::InvalidArgument(message)) => Ok(Observation::Error {
+        Err(OpenDanError::InvalidArgument(message) | OpenDanError::Artifact(message)) => Ok(Observation::Error {
             call_id: call.call_id.clone(),
             message,
-            tool_result: None,
+            host: None,
         }),
         Err(e) => Err(e),
     }
+}
+
+/// The questions this context asked the user: its `ask_user` commands
+/// (native `shell` calls and `shell` actions).
+fn questions_asked(snapshot: &LLMContextSnapshot) -> usize {
+    let asks = |args: &std::collections::HashMap<String, Value>| {
+        args.get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| c.trim_start().starts_with("ask_user "))
+    };
+    let st = &snapshot.state;
+    let native = st
+        .accumulated
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter(|c| {
+            matches!(c, buckyos_api::AiContent::ToolUse { name, args, .. }
+                if name == agent_tool::TOOL_SHELL && asks(args))
+        })
+        .count();
+    let actions = st
+        .steps
+        .iter()
+        .chain(st.last_step.iter())
+        .chain(st.action_step.iter().map(|a| &a.step))
+        .flat_map(|s| s.actions.iter())
+        .filter(|a| a.name == agent_tool::TOOL_SHELL && asks(&a.args))
+        .count();
+    native + actions
+}
+
+/// Whether `snapshot` holds a result for the call `call_id` (a native tool
+/// result or an action result of a behavior step).
+pub(super) fn has_result(snapshot: &LLMContextSnapshot, call_id: &str) -> bool {
+    let st = &snapshot.state;
+    st.accumulated.iter().any(|m| {
+        m.content.iter().any(|c| {
+            matches!(c, buckyos_api::AiContent::ToolResult { call_id: id, .. } if id == call_id)
+        })
+    }) || st
+        .steps
+        .iter()
+        .chain(st.last_step.iter())
+        .chain(st.action_step.iter().map(|a| &a.step))
+        .any(|step| {
+            step.actions
+                .iter()
+                .take(step.action_results.len())
+                .any(|a| a.call_id == call_id)
+        })
 }
 
 pub(super) async fn sync_xml(
@@ -509,6 +638,8 @@ pub(super) async fn sync_xml(
             continue;
         }
         if let Some(report) = &step.self_report {
+            let (artifacts, result) =
+                agent_tool::xllm::split_report_result(step.report_result.as_ref());
             submit(
                 sh,
                 run,
@@ -517,8 +648,8 @@ pub(super) async fn sync_xml(
                 },
                 ReportArgs {
                     report: report.clone(),
-                    artifacts: step.report_artifacts.clone(),
-                    result: step.report_result.clone(),
+                    artifacts,
+                    result,
                     is_end: step.report_end,
                 },
             )

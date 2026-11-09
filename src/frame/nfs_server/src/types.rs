@@ -67,7 +67,6 @@ pub struct ExtRecord {
     #[serde(default)]
     pub critical: bool,
     #[serde(default)]
-    #[allow(dead_code)]
     pub payload: Value,
 }
 
@@ -169,7 +168,8 @@ impl Capabilities {
 }
 
 /// Session-level features this server implements and advertises in `hello`.
-/// Not advertised (not implemented): frozen-subtree, search.semantic, repr,
+/// `repr` is added while ffmpeg/ffprobe are found (preview/tools.rs). Not
+/// advertised (not implemented): frozen-subtree, search.semantic,
 /// search.stream, get_tree, publish_dir.
 pub const SERVER_FEATURES: &[&str] = &[
     "view",

@@ -30,6 +30,7 @@ pub mod host;
 pub mod ids;
 pub mod lock;
 pub mod memory;
+pub mod msg_parser;
 pub mod notify;
 pub mod protocol;
 pub mod runner;
@@ -42,6 +43,7 @@ pub mod state;
 pub mod template;
 pub mod todos;
 pub mod transfer;
+pub mod work_card;
 pub mod xagent_cli;
 
 pub use api::{

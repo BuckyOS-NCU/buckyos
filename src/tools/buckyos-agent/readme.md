@@ -16,6 +16,45 @@ buckyos-agent tools 是用 TypeScript 编写、运行在 Deno 环境下的 Bucky
 
 2. aicc命令组
 
+## 表格数据导入 `import_table`
+
+`commands/import_table.ts`：把 CSV / TSV / xlsx / SQLite 文件导入 AI Workspace 成为 TableSource，推断规则与 Desktop
+导入向导相同（共享模块 `src/frame/aiworkspace/import-table/`，deno.json 里的 `@table/`；宿主副本与 aios 镜像里随命令
+放在 `vendor/frame/aiworkspace/`，由 `buckyos-build.py` 的 `_prepare_agent_tools` 与 `build_aios` 复制）。先
+`import_table <file> --dry-run` 看计划（字段、类型、行数、报告），再去掉 `--dry-run` 带 `--workspace` 提交。
+
+## Office 文档导入 `import_office`
+
+`commands/import_office.ts`：把 .docx / .pptx 导入 AI Workspace 成为可编辑内容，转换器与 Desktop 的导入对话框相同
+（共享模块 `src/frame/aiworkspace/import-office/`，deno.json 里的 `@office/`；它还引用 import-drawio / import-pdf /
+import-table 的部件，四个模块一起由 `_prepare_agent_tools` 与 `build_aios` 复制到 `vendor/frame/aiworkspace/`）。docx →
+新的流式页（富文本 Block + 图片 Block，原文件放最后），pptx → 新的自由画布（每张幻灯片一页 + 放映路径）。Deno 没有
+canvas、不连 LibreOffice：裁剪保留整图、图表 / EMF 等成占位框或略去，都写进报告。先 `--dry-run` 看计划再提交。
+
+## 向用户提问 `ask_user`
+
+`commands/ask_user.ts`（逻辑在 `lib/ask.ts`）：向 Agent 所服务的用户提一个问题，是一次标准的异步工具调用。
+
+```bash
+ask_user "<question>" [--option <id>=<label>]... [--allow-text] [--expires <seconds>]
+```
+
+- 不带 `--option` 是文字问题；带 `--option` 是选择题（至少两个，id 与 label 各自不重复、非空），`--allow-text`
+  只能和 `--option` 一起用（也可以用文字回答）。`--expires` 默认 10800 秒（3 小时）。
+- 发一条 System Notify 的 `input` 通知（msg-center `notify.send`，`level: timely`）。msg-center 为它建一个 Zone
+  TaskMgr 任务（`human.input/v1`），回答就是任务结果。stdout 一行 AgentToolResult：`status: "pending"`、`task_id` =
+  通知的任务（`t-…`）、`pending_reason: "user_input"`，`detail` 带 `notify_id`、`question`、`options`、
+  `expires_at_ms`、`url`。命令不等待；runtime 在预算内等该任务，之后 Agent Session 自己跟进、回答以 `<<task_result>>` 输入回来（xllm 单跑时模型用 `wait_task` / `get_task_state` 跟进）。
+- 收件人：会话 token 的 `sub`。Agent 的工具拿到的是其 App 的 verify-hub 会话（`principal_kind: app`），`sub` 就是 App
+  实例的 owner（verify-hub 只签发这样的 token，msg-center 也只允许它通知这个用户）；token 读不出用户（如 `agent`
+  主体）时报错，不猜。
+- 幂等：`idempotency_key = ask:$XLLM_RUN_ID:$XLLM_CALL_ID`（两者由 `shell` 工具注入，缺一个就报错：要作为单独一条
+  shell 命令运行）。msg-center 按“调用方 + 键”去重，崩溃后重跑同一调用找回的是已发出的那条通知；它已关闭时直接返回
+  终态：已回答为 success（`output` 是选项的 label 和/或文字，`detail.answer` 带 `option/label/text`），
+  dismissed / canceled / expired 为 error。
+- 退出码：0 已提问（pending）或已回答；1 参数错误或不在 run 的工具调用里；2 发送失败、找不到收件人、被拒绝或撤销；
+  4 已过期。
+
 ## AICC Agent CLI Tools
 
 实现见 `aicc-tool.ts` + `commands/*.ts`，需求文档：[`doc/aicc/aicc_agent_cli_tools.md`](../../../doc/aicc/aicc_agent_cli_tools.md)。
@@ -31,7 +70,7 @@ Agent 应当能直接读 `commands/*.ts` 学到怎么调 AICC，然后自己写�
 2) 按 SDK 类型构造 canonical method request
 3) initRuntime() 拿到登录后的 BuckyOS 会话
 4) 逻辑模型先 route.resolve，再调用 typed inference；文生图直接调用 Helper
-5) 从 typed response 把产物拉回本地（或读取文本）
+5) 把产物交到本 Agent 的 artifacts 桶（命令返回 obj://bucket/...；给了输出路径才另存本地），或读取文本
 6) emit() 一行 AgentToolResult JSON 给上游
 ```
 
@@ -44,8 +83,10 @@ Agent 应当能直接读 `commands/*.ts` 学到怎么调 AICC，然后自己写�
 |---|---|
 | `lib/runtime.ts` | `initRuntime()` — 登录 BuckyOS |
 | `lib/aicc.ts` | `callAicc()` canonical 路由与 typed inference + task-manager 轮询；`textToImage()`、`commonPolicyOptions()`、`describeFailure()` |
-| `lib/io.ts` | `resolveInputResource()` 把字符串映射成 ResourceRef；`pickArtifact()`、`saveArtifactToPath()` 落盘 artifact；`suffixPathByMime()` |
-| `lib/cli.ts` | `parseArgvOrExit()`、`requireString/flagInt/flagFloat/flagBool`、`COMMON_OPTIONS_HELP`、`bailArgError()` |
+| `lib/io.ts` | `resolveInputResource()` 把字符串映射成 ResourceRef；`pickArtifact()`；`deliverArtifact()` 把产物交到 artifacts 桶（可选另存本地）；`saveResourceToPath()` / `saveBucketObjectToPath()` 落盘；`suffixPathByMime()` |
+| `lib/bucket.ts` | 本 Agent 的桶：`uploadNamed()`（字节直传 `artifacts` 或 `scratch`，≤32 MiB 走 `PUT /bucket/v1`，更大走 NDM 上传 + `bind`）、`copyToArtifacts()`（`bucket.copy`）、`readBucketObject()`、`obj://bucket/...` 解析 |
+| `lib/cli.ts` | `parseArgvOrExit()`、`requireString/flagInt/flagFloat/flagBool`、`takeRepeatedFlags()`（可重复的 `--x v`）、`COMMON_OPTIONS_HELP`、`bailArgError()` |
+| `lib/ask.ts` | `ask_user` 的部件：`askUser()` 发 `input` 通知并把通知状态映射成 AgentToolResult；`askRecipient()` 从会话 token 取收件人 |
 | `lib/result.ts` | AgentToolResult builders + `emit/emitAndExit`、各种 `bail*` 错误收敛、退出码常量 |
 | `lib/types.ts` | Agent 输出类型，以及从发布版 `buckyos` SDK 派生的 AICC response / `ResourceRef` 视图 |
 
@@ -126,9 +167,10 @@ CLI 始终将 `AgentToolResult` JSON 写到 stdout（与 `src/frame/agent_tool` 
 
 ### 输入/输出处理
 
-- 输入文件：本地路径 → base64；`http(s)://...` → URL；`named_object:<obj_id>` → NamedObject
-- 输出 artifact：`named_object` 走 `ndm_proxy.openReader` 拉取并落盘；URL/base64 直接写文件
-- 资源落盘：`materialize_resource named_object:<obj_id> <output_path>`；目标文件已存在时拒绝覆盖
+- 输入文件：本地路径 → base64；`http(s)://...` → URL；`named_object:<obj_id>` → NamedObject；`obj://bucket/<bucket_id>/<key>` → 它绑定的 NamedObject
+- 输出 artifact：一律进本 Agent 的 `artifacts` 桶（`user/<agent app>/<owner>/artifacts`，`documents` 档，归用户、备份），结果 `detail.files[].url` 是 `obj://bucket/...`，直接列进报告的 artifacts。AICC 已存进它的 `outputs` 桶（`user/aicc/<owner>/outputs`，7 天）的结果用 `bucket.copy` 复制过来，不再传字节；URL/base64/raw PCM 读出字节后上传一次
+- 中间文件：`uploadNamed(runtime, bytes, name, { bucket: "scratch" })` 进 `scratch` 桶（`temp`，7 天）
+- 资源落盘：`materialize_resource obj://bucket/... | named_object:<obj_id> <output_path>`（本地工具需要路径时的显式降级）；目标文件已存在时拒绝覆盖
 
 ### 环境变量
 

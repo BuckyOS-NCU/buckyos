@@ -144,7 +144,7 @@ impl NotifyTasksSlot {
         self.0.read().unwrap().clone()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn set(&self, tasks: Arc<dyn NotifyTasks>) {
         *self.0.write().unwrap() = tasks;
     }
@@ -423,6 +423,7 @@ impl NotifyCaller {
 
 impl MessageCenter {
     /// The sender of home records and the zone host of notification links.
+    #[cfg(test)]
     pub fn set_notify_identity(&self, sender: DID, zone_host: Option<String>) {
         *self.notify_identity.write().unwrap() = Some((sender, zone_host));
     }
@@ -440,14 +441,14 @@ impl MessageCenter {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn set_notify_tasks(&self, tasks: Arc<dyn NotifyTasks>) {
         self.notify_tasks.set(tasks);
     }
 
     /// The Agent an App is, when the App is the constructed App of a zone
     /// Agent of `owner` (AppId = AgentId).
-    async fn agent_of_app(&self, app_id: &str, owner: Option<&DID>) -> Option<DID> {
+    pub(crate) async fn agent_of_app(&self, app_id: &str, owner: Option<&DID>) -> Option<DID> {
         let did = AgentId::parse(app_id).ok()?.agent_did();
         let agent_owner = self.token_verifier.get().agent_owner(&did).await.ok()??;
         (owner.is_none() || owner == Some(&agent_owner)).then_some(did)
@@ -963,7 +964,8 @@ impl MessageCenter {
     ) -> Result<MailboxRecord> {
         let msg = self.with_state_write(|s| Ok(Self::ensure_message(s, msg)))?;
         let (msg_id, msg_json) = msg.gen_obj_id();
-        Self::store_message(&msg_id, &msg_json).await?;
+        self.store_message(&msg_id, &msg_json, &msg, crate::buckets::Arrival::Local)
+            .await?;
         let record = Self::build_mailbox_record(
             owner.clone(),
             MailboxKind::Inbox,

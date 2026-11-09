@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use llm_context::msg_parser::{
+use crate::msg_parser::{
     ai_message_to_msg_object_with_base_validated_async, AttachmentValidator, LocalFileResolver,
     MsgEgressOptions,
 };
@@ -25,7 +25,7 @@ use crate::error::{OpenDanError, Result};
 use crate::protocol::*;
 use crate::session::Session;
 
-use super::reports::ObjectStore;
+use super::reports::{ObjectStore, StoredObject};
 use super::shared::{commit_and_report, Shared};
 
 /// The Turn a reply is produced for.
@@ -101,14 +101,6 @@ pub trait OutboundSink: Send + Sync {
     ) -> Option<MsgObject> {
         let _ = (cfg, base, turn);
         None
-    }
-
-    /// A question to the user (`agent_ask`) about to be queued, on the
-    /// reply envelope with its relation and meta set; the host may add
-    /// what its channel needs (e.g. who is addressed in a group).
-    async fn question(&self, cfg: &SessionConfig, msg: MsgObject) -> MsgObject {
-        let _ = cfg;
-        msg
     }
 
     async fn send(&self, sid: &str, record: &OutboundRecord) -> SendResult;
@@ -228,112 +220,6 @@ async fn push_placeholder(sh: &Shared, s: &mut Session, force: bool) -> bool {
     true
 }
 
-fn question_key(sid: &str, turn: u64, call_id: &str) -> String {
-    format!("{sid}:{turn}:ask:{call_id}")
-}
-
-/// Called inside the commit that makes the session wait for the user's
-/// answer to `call_id`: the open Turn's placeholder is made sure of first
-/// (the anchor of the questions, sent now whatever its delay), then the
-/// question joins the outbox as a `thread` message on it. Without a
-/// placeholder (a channel that cannot edit) the question is a message of
-/// its own. Nothing is queued without a reply path.
-pub(super) async fn queue_question(
-    sh: &Shared,
-    s: &mut Session,
-    call_id: &str,
-    ask: &UserInputRequest,
-) {
-    let Some(sink) = sh.deps.outbound.clone() else {
-        return;
-    };
-    let turn = s.state.current_turn();
-    let key = question_key(s.sid(), turn, call_id);
-    if s.state.outbox.iter().any(|e| e.key == key) {
-        return;
-    }
-    push_placeholder(sh, s, true).await;
-    let Some((route, mut msg)) = reply_base(s) else {
-        return;
-    };
-    let anchor = s
-        .state
-        .turn_tasks
-        .iter()
-        .find(|b| b.turn == turn && b.closed.is_none())
-        .and_then(|b| b.placeholder.clone());
-    msg.content.content = ask.text();
-    msg.meta.insert(
-        AGENT_ASK_META.to_string(),
-        json!({
-            "anchor": anchor.clone().unwrap_or_default(),
-            "call_id": call_id,
-            "turn": turn,
-            "input": ask.input,
-        }),
-    );
-    if let Some(target) = anchor.as_deref().and_then(|a| ObjId::new(a).ok()) {
-        msg.relates_to = Some(MsgRelation::new(MsgRelType::Thread, target));
-    }
-    let msg = sink.question(&s.config, msg).await;
-    let mismatch = binding_mismatch(s, &route);
-    if let Some(m) = &mismatch {
-        log::error!("session {}: {m}", s.sid());
-    }
-    s.state.outbox.push(OutboxEntry {
-        key,
-        msg,
-        turn,
-        purpose: OutboxPurpose::Question,
-        status: if mismatch.is_some() {
-            OutboxStatus::Failed
-        } else {
-            OutboxStatus::Pending
-        },
-        msg_id: None,
-        deliveries: Vec::new(),
-        error: mismatch,
-        attempts: 0,
-        updated_at_ms: crate::now_ms(),
-    });
-    trim(&mut s.state.outbox);
-}
-
-/// Ids the questions of `turn` were sent as (and their anchor): a message
-/// replying to one of them answers a question.
-pub(super) fn question_targets(state: &SessionState, turn: u64) -> Vec<String> {
-    let mut ids: Vec<String> = state
-        .turn_tasks
-        .iter()
-        .filter(|b| b.turn == turn)
-        .filter_map(|b| b.placeholder.clone())
-        .collect();
-    for e in state
-        .outbox
-        .iter()
-        .filter(|e| e.turn == turn && e.purpose == OutboxPurpose::Question)
-    {
-        ids.push(e.msg_id.clone().unwrap_or_else(|| msg_key(&e.msg)));
-    }
-    ids
-}
-
-/// Questions of `turn` not sent yet follow their anchor: the id the
-/// placeholder was sent as, or none (they become messages of their own).
-fn retarget_questions(state: &mut SessionState, turn: u64, anchor: Option<&str>) {
-    let target = anchor.and_then(|id| ObjId::new(id).ok());
-    for e in state.outbox.iter_mut().filter(|e| {
-        e.turn == turn && e.purpose == OutboxPurpose::Question && e.status == OutboxStatus::Pending
-    }) {
-        e.msg.relates_to = target
-            .clone()
-            .map(|t| MsgRelation::new(MsgRelType::Thread, t));
-        if let Some(ask) = e.msg.meta.get_mut(AGENT_ASK_META) {
-            ask["anchor"] = json!(anchor.unwrap_or_default());
-        }
-    }
-}
-
 /// The placeholder of `turn` the reply has to replace. A placeholder that
 /// was never handed to the sink is withdrawn instead: the reply then leaves
 /// as a message of its own.
@@ -360,7 +246,6 @@ fn take_placeholder(s: &mut Session, turn: u64) -> Option<ObjId> {
         if let Some(b) = s.state.turn_tasks.iter_mut().find(|b| b.turn == turn) {
             b.placeholder = None;
         }
-        retarget_questions(&mut s.state, turn, None);
         return None;
     }
     ObjId::new(&anchor).ok()
@@ -379,19 +264,23 @@ fn closing_text(status: TurnStatus) -> &'static str {
 struct AllowAll;
 impl AttachmentValidator for AllowAll {}
 
-/// `<attachment path=…>` of an answer: the file is put in the host's
-/// object store (a relative path is taken in the work directory).
+/// `<attachment path=…>` of an answer: the file (a relative path is taken
+/// in the work directory) or the `obj://bucket/...` object is retained by
+/// the host's object store; `urls` remembers the bindings for the refs.
 struct AnswerFiles<'a> {
     objects: Option<&'a dyn ObjectStore>,
     workdir: Option<&'a Path>,
+    urls: std::sync::Mutex<Vec<(ObjId, String)>>,
 }
 
-#[async_trait]
-impl LocalFileResolver for AnswerFiles<'_> {
-    async fn resolve(&self, path: &str) -> std::result::Result<ObjId, String> {
+impl AnswerFiles<'_> {
+    async fn store(&self, path: &str) -> std::result::Result<StoredObject, String> {
         let Some(objects) = self.objects else {
             return Err(format!("local file `{path}` cannot be attached: the host has no object store"));
         };
+        if super::reports::is_bucket_url(path) {
+            return objects.retain_url(path).await;
+        }
         let path = Path::new(path);
         let file = match self.workdir {
             _ if path.is_absolute() => path.to_path_buf(),
@@ -406,10 +295,33 @@ impl LocalFileResolver for AnswerFiles<'_> {
     }
 }
 
+#[async_trait]
+impl LocalFileResolver for AnswerFiles<'_> {
+    async fn resolve(&self, path: &str) -> std::result::Result<ObjId, String> {
+        let stored = self.store(path).await?;
+        if let Some(url) = stored.url {
+            self.urls.lock().unwrap_or_else(|p| p.into_inner()).push((stored.obj_id.clone(), url));
+        }
+        Ok(stored.obj_id)
+    }
+}
+
+/// A data ref of `obj_id` carries the bucket binding that retains it.
+fn hint_bucket_urls(msg: &mut MsgObject, urls: &[(ObjId, String)]) {
+    for item in &mut msg.content.refs {
+        if let RefTarget::DataObj { obj_id, uri_hint } = &mut item.target {
+            if uri_hint.is_none() {
+                *uri_hint = urls.iter().find(|(id, _)| id == obj_id).map(|(_, url)| url.clone());
+            }
+        }
+    }
+}
+
 /// Fill `base` with the reply: its answer (text, `<attachment>` tags as
-/// refs, local files put in `objects`) and the final report's artifacts as
-/// object refs. An artifact without an object is named in the text. `None`
-/// when there is neither text nor an attachment.
+/// refs, local files and bucket objects retained by `objects`) and the final
+/// report's artifacts as object refs, each with its `obj://bucket/...`
+/// binding as the ref's `uri_hint`. An artifact without an object is named
+/// in the text. `None` when there is neither text nor an attachment.
 pub async fn compose_reply(
     base: MsgObject,
     reply: &TurnReply,
@@ -426,8 +338,9 @@ pub async fn compose_reply(
         let files = AnswerFiles {
             objects,
             workdir: reply.workdir.as_deref(),
+            urls: Default::default(),
         };
-        ai_message_to_msg_object_with_base_validated_async(
+        let mut msg = ai_message_to_msg_object_with_base_validated_async(
             &message,
             base,
             &AllowAll,
@@ -435,16 +348,18 @@ pub async fn compose_reply(
             &files,
         )
         .await
-        .map_err(|e| OpenDanError::InvalidArgument(format!("reply cannot be converted: {e}")))?
+        .map_err(|e| OpenDanError::InvalidArgument(format!("reply cannot be converted: {e}")))?;
+        hint_bucket_urls(&mut msg, &files.urls.into_inner().unwrap_or_else(|p| p.into_inner()));
+        msg
     };
     for a in &reply.artifacts {
         let Some(id) = &a.obj_id else { continue };
         let obj_id = ObjId::new(id)
             .map_err(|e| OpenDanError::InvalidArgument(format!("artifact {id}: {e}")))?;
-        // A file is shown by its name; a forwarded object by the name it
-        // carries, when the store knows it.
+        // A file or bucket object is shown by its name; a forwarded object
+        // by the name it carries, when the store knows it.
         let label = match objects {
-            _ if !a.reference.is_empty() => Some(a.name().to_string()),
+            _ if !a.reference.is_empty() || a.url.is_some() => Some(a.name().to_string()),
             Some(store) => store.name_of(&obj_id).await,
             None => None,
         };
@@ -452,7 +367,7 @@ pub async fn compose_reply(
             role: RefRole::Input,
             target: RefTarget::DataObj {
                 obj_id,
-                uri_hint: None,
+                uri_hint: a.url.clone(),
             },
             label,
         });
@@ -566,7 +481,6 @@ fn placeholder_settled(state: &mut SessionState, turn: u64, sent_as: Option<&str
     if let Some(b) = state.turn_tasks.iter_mut().find(|b| b.turn == turn) {
         b.placeholder = sent_as.map(str::to_string);
     }
-    retarget_questions(state, turn, sent_as);
     let Some(edit) = state.outbox.iter_mut().find(|e| {
         e.turn == turn && e.purpose == OutboxPurpose::FinalEdit && e.status == OutboxStatus::Pending
     }) else {
@@ -620,22 +534,23 @@ pub(super) async fn flush_outbox(sh: &Arc<Shared>) {
     let _one = sh.flush.lock().await;
     let mut changed = false;
     loop {
-        let next = {
-            let s = sh.session.lock().await;
-            s.state
+        let entry = {
+            let mut s = sh.session.lock().await;
+            let Some(e) = s
+                .state
                 .outbox
-                .iter()
+                .iter_mut()
                 .find(|e| e.status == OutboxStatus::Pending)
-                .cloned()
+            else {
+                break;
+            };
+            if e.attempts > 0 && crate::now_ms() < e.updated_at_ms + retry_after_ms(e.attempts) {
+                break;
+            }
+            e.attempts += 1;
+            e.updated_at_ms = crate::now_ms();
+            e.clone()
         };
-        let Some(entry) = next else {
-            break;
-        };
-        if entry.attempts > 0
-            && crate::now_ms() < entry.updated_at_ms + retry_after_ms(entry.attempts)
-        {
-            break;
-        }
         let result = sink
             .send(
                 &sid,
@@ -650,7 +565,6 @@ pub(super) async fn flush_outbox(sh: &Arc<Shared>) {
         let Some(e) = s.state.outbox.iter_mut().find(|e| e.key == entry.key) else {
             break;
         };
-        e.attempts += 1;
         e.updated_at_ms = crate::now_ms();
         changed = true;
         let mut retry = false;

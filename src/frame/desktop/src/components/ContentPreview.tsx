@@ -80,6 +80,7 @@ import {
   extensionRefField,
   isAbortError,
   isBlobRef,
+  isBucketObjectRef,
   isCyfsPathRef,
   isObjectIdRef,
   PreviewError,
@@ -94,6 +95,7 @@ import {
   type PreviewReadRef,
   type PreviewReadyInfo,
   type PreviewResult,
+  type PreviewRuntimeProfile,
   type PreviewSessionContext,
   type PreviewStatus,
   type PreviewUIMode,
@@ -135,6 +137,11 @@ export interface ContentPreviewProps {
   /** Prefetch ±1 neighbours once the current item is ready (§11.7). */
   prefetchAdjacent?: boolean
   autoFocus?: boolean
+  /** `inline`: hosted in a small surface of another UI (a canvas Block) — no toolbar, edge navigation or info panel;
+   * the renderer's own controls (media controls, PDF viewer) stay and a sound gets a compact stage. */
+  variant?: 'default' | 'inline'
+  /** Audio and video start playing once ready (the host acts on an explicit "play"). */
+  autoPlay?: boolean
   className?: string
   style?: CSSProperties
   'data-testid'?: string
@@ -209,6 +216,7 @@ function formatDuration(seconds: number | undefined): string {
 function sourceLabel(ref: ContentRef): string {
   if (isCyfsPathRef(ref)) return ref.path.startsWith('cyfs://') ? ref.path : `cyfs://${ref.path.startsWith('/') ? '' : '/'}${ref.path}`
   if (isObjectIdRef(ref)) return ref.objectId
+  if (isBucketObjectRef(ref)) return ref.url
   if (isBlobRef(ref)) return ref.value.name ?? 'blob'
   return extensionRefField(ref, 'reference') ?? ref.kind
 }
@@ -239,6 +247,41 @@ function errorStateFrom(err: unknown, contentLabel?: string): PreviewErrorState 
 
 function unsupportedState(reason: PreviewUnsupportedReason, contentLabel: string, detail?: string): PreviewErrorState {
   return { kind: 'unsupported', code: `UNSUPPORTED_${reason.toUpperCase().replace(/-/g, '_')}`, message: detail ?? '', retryable: false, contentLabel }
+}
+
+/**
+ * A renderer could not show the bytes and no Pipeline result replaced them.
+ * `<img onError>` cannot tell an unknown format from damage, so an image only
+ * counts as damaged when this Runtime decodes its (byte-confirmed) type
+ * natively; media errors tell the two apart themselves. An image format the
+ * Runtime lacks is never reported as corrupted (preview iPhone media TODO §3).
+ */
+function renderFailureState(
+  failure: RenderFailure | undefined,
+  classification: MediaClassification,
+  runtime: PreviewRuntimeProfile,
+  t: TranslateFn,
+): PreviewErrorState | null {
+  const contentLabel = contentLabelOf(classification)
+  const renderer = classification.rendererType
+  if (failure === 'network') {
+    return { kind: 'error', code: 'NETWORK', message: t('preview.error.networkBody', 'The content could not be loaded'), retryable: true, contentLabel }
+  }
+  if (failure === 'runtime') {
+    return { kind: 'unsupported', code: 'RUNTIME_UNSUPPORTED', message: t('preview.error.runtimeBody', 'This Runtime cannot display the content'), retryable: false, contentLabel }
+  }
+  const corrupted: PreviewErrorState = { kind: 'corrupted', code: 'CORRUPTED', message: t('preview.error.corruptedBody', 'The content could not be decoded and may be damaged'), retryable: false, contentLabel }
+  if (renderer === 'image' || renderer === 'svg') {
+    if (failure && classification.confirmed && runtime.imageMediaTypes.includes(classification.mediaType)) return corrupted
+    return { kind: 'unsupported', code: 'UNSUPPORTED_ENCODING', message: t('preview.error.imageFormatBody', 'This browser does not support this image format'), retryable: false, contentLabel }
+  }
+  if (renderer === 'video' || renderer === 'audio') {
+    // MEDIA_ERR_DECODE: the codec is supported (else SRC_NOT_SUPPORTED) yet the stream failed.
+    return failure === 'corrupted'
+      ? corrupted
+      : { kind: 'unsupported', code: 'UNSUPPORTED_ENCODING', message: t('preview.error.encodingBody', 'This browser does not support this audio or video encoding'), retryable: false, contentLabel }
+  }
+  return failure ? corrupted : null
 }
 
 function useReducedMotion(): boolean {
@@ -356,10 +399,13 @@ export function ContentPreview(props: ContentPreviewProps) {
     allowExport = true,
     prefetchAdjacent = true,
     autoFocus = false,
+    variant = 'default',
+    autoPlay = false,
     className,
     style,
     ref,
   } = props
+  const inline = variant === 'inline'
   const { t } = useI18n()
   const reducedMotion = useReducedMotion()
   // Latest props for async work and event emitters (never read during render).
@@ -475,8 +521,8 @@ export function ContentPreview(props: ContentPreviewProps) {
             resolved = { ...resolved, size: probe.totalLength }
           }
         } catch (probeErr) {
-          if (probeErr instanceof PreviewError && (probeErr.code === 'PERMISSION_DENIED' || probeErr.code === 'NOT_FOUND')) throw probeErr
-          // A failed probe is not fatal: fall back to hints.
+          // The server answering with an error is the answer; an unreachable probe falls back to hints.
+          if (probeErr instanceof PreviewError && (probeErr.code === 'PERMISSION_DENIED' || probeErr.code === 'NOT_FOUND' || probeErr.status !== undefined)) throw probeErr
         }
         if (signal.aborted) return
         classification = classifyMedia({
@@ -526,21 +572,20 @@ export function ContentPreview(props: ContentPreviewProps) {
         }
         const retry = retryContextRef.current?.key === itemRef.id ? retryContextRef.current : null
         retryContextRef.current = null
+        // A video that just failed to play here is not playable whatever canPlayType said.
+        const pipelineRuntime = skipDirect && classification.rendererType === 'video' ? { ...runtime, videoCodecs: { ...runtime.videoCodecs, hevc: false } } : runtime
         let state = await provider.ensurePreviewWork({
           source: resolved,
-          runtimeProfile: runtime,
+          runtimeProfile: pipelineRuntime,
           targetProfile,
+          mediaType: classification.mediaType,
           options: { signal, retry: !!retry, expectedAttemptId: retry?.expectedAttemptId },
         })
         if (signal.aborted) return
         if ('kind' in state) {
-          const failure = skipDirect
-          const label = contentLabelOf(classification)
-          if (failure === 'corrupted' || (failure && classification.confirmed)) {
-            update({ phase: 'error', resolved, classification, error: { kind: 'corrupted', code: 'CORRUPTED', message: t('preview.error.corruptedBody', 'The content could not be decoded and may be damaged'), retryable: false, contentLabel: label } })
-          } else {
-            update({ phase: 'error', resolved, classification, error: unsupportedState(state.reason, label, state.detail) })
-          }
+          const browserLimited = !!skipDirect || (direct.ok === false && direct.reason === 'runtime-unsupported')
+          const failed = browserLimited && state.reason === 'no-pipeline' ? renderFailureState(skipDirect, classification, runtime, t) : null
+          update({ phase: 'error', resolved, classification, error: failed ?? unsupportedState(state.reason, contentLabelOf(classification), state.detail) })
           return
         }
         const startedAt = Date.now()
@@ -602,13 +647,14 @@ export function ContentPreview(props: ContentPreviewProps) {
         setFallbackNonce((n) => n + 1)
         return
       }
-      const label = state?.classification ? contentLabelOf(state.classification) : undefined
-      const err: PreviewErrorState =
-        failure === 'network'
-          ? { kind: 'error', code: 'NETWORK', message: t('preview.error.networkBody', 'The content could not be loaded'), retryable: true, contentLabel: label }
-          : failure === 'runtime'
-            ? { kind: 'unsupported', code: 'RUNTIME_UNSUPPORTED', message: t('preview.error.runtimeBody', 'This Runtime cannot display the content'), retryable: false, contentLabel: label }
-            : { kind: 'corrupted', code: 'CORRUPTED', message: t('preview.error.corruptedBody', 'The content could not be decoded and may be damaged'), retryable: false, contentLabel: label }
+      const classification = state?.classification
+      const shown = classification && state?.result ? { ...classification, rendererType: state.result.resultType, mediaType: state.result.mediaType } : classification
+      const err: PreviewErrorState = (shown ? renderFailureState(failure, shown, detectRuntimeProfile(), t) : null) ?? {
+        kind: 'corrupted',
+        code: 'CORRUPTED',
+        message: t('preview.error.corruptedBody', 'The content could not be decoded and may be damaged'),
+        retryable: false,
+      }
       setLoad((prev) => (prev && prev.key === loadKey ? { ...prev, phase: 'error', error: err } : prev))
     },
     [item, loadKey, t],
@@ -833,7 +879,8 @@ export function ContentPreview(props: ContentPreviewProps) {
   }, [current?.classification?.mediaType, current?.resolved, current?.result?.mediaType, invokeAction, itemInfo, latest])
 
   const downloadCurrent = useCallback(() => {
-    const readRef = current?.result?.readRef ?? current?.resolved?.readRef
+    // "Download original": the source's bytes, never a Pipeline result.
+    const readRef = current?.resolved?.readRef ?? current?.result?.readRef
     if (!readRef || !capabilities.export) return
     invokeAction('download')
     const anchor = document.createElement('a')
@@ -912,7 +959,7 @@ export function ContentPreview(props: ContentPreviewProps) {
       requestExit()
       return
     }
-    if (inField) return
+    if (inField || target.closest('video, audio')) return
     showUi()
     const isMedia = rendererType === 'audio' || rendererType === 'video'
     switch (event.key) {
@@ -983,7 +1030,7 @@ export function ContentPreview(props: ContentPreviewProps) {
     if (key === 'r' && !mod && capabilities.rotate) {
       rotate()
       event.preventDefault()
-    } else if (key === 'i' && !mod) {
+    } else if (key === 'i' && !mod && !inline) {
       setInfoOpen((v) => !v)
       event.preventDefault()
     } else if (key === 'f' && mod && capabilities.search) {
@@ -1013,6 +1060,7 @@ export function ContentPreview(props: ContentPreviewProps) {
       data-testid={props['data-testid'] ?? 'content-preview'}
       data-status={status}
       data-renderer={rendererType ?? ''}
+      data-via={current?.via ?? ''}
       data-item-index={index}
       data-item-count={sessionCount}
       data-degraded={current?.degraded ? 'true' : 'false'}
@@ -1043,6 +1091,8 @@ export function ContentPreview(props: ContentPreviewProps) {
               displayName={displayName}
               fitMode={fitMode}
               uiMode={uiMode}
+              compact={inline}
+              autoPlay={autoPlay}
               reducedMotion={reducedMotion}
               fontScale={fontScale}
               find={{ open: findOpen, query: findQuery, active: findActive, onCount: setFindCount }}
@@ -1068,7 +1118,7 @@ export function ContentPreview(props: ContentPreviewProps) {
             error={error}
             contentLabel={contentLabel}
             t={t}
-            onRetry={error.retryable ? retry : undefined}
+            onRetry={error.retryable || error.kind === 'permission-denied' || error.kind === 'not-found' ? retry : undefined}
             onOpenWith={capabilities.openWith ? requestOpenWith : undefined}
             onDownload={allowExport && current?.resolved && error.kind !== 'permission-denied' && error.kind !== 'not-found' ? downloadCurrent : undefined}
             onInfo={error.kind !== 'permission-denied' && current?.resolved ? () => setInfoOpen(true) : undefined}
@@ -1076,7 +1126,7 @@ export function ContentPreview(props: ContentPreviewProps) {
         ) : null}
 
         {/* Session edge navigation */}
-        {sessionCount > 1 && uiMode !== 'silent' ? (
+        {sessionCount > 1 && uiMode !== 'silent' && !inline ? (
           <>
             <EdgeNav side="left" visible={showToolbar} disabled={!canPrev} onClick={() => step(-1)} label={t('preview.action.previous', 'Previous')} transition={transition} />
             <EdgeNav side="right" visible={showToolbar} disabled={!canNext} onClick={() => step(1)} label={t('preview.action.next', 'Next')} transition={transition} />
@@ -1084,7 +1134,7 @@ export function ContentPreview(props: ContentPreviewProps) {
         ) : null}
 
         {/* Toolbar (§10.8) */}
-        {uiMode !== 'silent' ? (
+        {uiMode !== 'silent' && !inline ? (
           <div
             data-testid="content-preview-toolbar"
             role="toolbar"
@@ -1257,7 +1307,7 @@ export function ContentPreview(props: ContentPreviewProps) {
       </div>
 
       {/* Info panel (§10.6) */}
-      {infoOpen ? (
+      {infoOpen && !inline ? (
         <InfoPanel
           displayName={displayName}
           item={itemInfo}
@@ -1654,6 +1704,8 @@ function RendererSwitch({
   displayName,
   fitMode,
   uiMode,
+  compact,
+  autoPlay,
   reducedMotion,
   fontScale,
   find,
@@ -1671,6 +1723,8 @@ function RendererSwitch({
   displayName: string
   fitMode: PreviewFitMode
   uiMode: PreviewUIMode
+  compact: boolean
+  autoPlay: boolean
   reducedMotion: boolean
   fontScale: number
   find: FindState
@@ -1713,6 +1767,8 @@ function RendererSwitch({
           mediaType={result.mediaType}
           title={displayName}
           uiMode={uiMode}
+          compact={compact}
+          autoPlay={autoPlay}
           onRendered={onRendered}
           onFailure={onFailure}
           onActivity={onActivity}
@@ -2151,6 +2207,8 @@ function MediaRenderer({
   mediaType,
   title,
   uiMode,
+  compact,
+  autoPlay,
   onRendered,
   onFailure,
   onActivity,
@@ -2161,6 +2219,8 @@ function MediaRenderer({
   mediaType: string
   title: string
   uiMode: PreviewUIMode
+  compact: boolean
+  autoPlay: boolean
   onRendered: (media?: LoadState['media']) => void
   onFailure: (failure: RenderFailure) => void
   onActivity: () => void
@@ -2197,6 +2257,10 @@ function MediaRenderer({
     const el = elementRef.current
     if (!el) return
     const video = el as HTMLVideoElement
+    if (kind === 'video' && !video.videoWidth && !video.videoHeight) {
+      onFailure('unsupported-encoding')
+      return
+    }
     onRendered({ width: video.videoWidth || undefined, height: video.videoHeight || undefined, durationSeconds: Number.isFinite(el.duration) ? el.duration : undefined })
   }
   if (!url) return null
@@ -2211,6 +2275,7 @@ function MediaRenderer({
           src={url}
           title={title}
           controls={showControls}
+          autoPlay={autoPlay}
           playsInline
           preload="metadata"
           className="max-h-full max-w-full"
@@ -2230,6 +2295,27 @@ function MediaRenderer({
       </div>
     )
   }
+  if (compact) {
+    return (
+      <div className="absolute inset-0 flex flex-col items-stretch justify-center gap-1 px-2" data-testid="content-preview-audio-stage">
+        <div className="truncate px-1 text-[12px] font-medium">{title}</div>
+        <audio
+          ref={(el) => {
+            elementRef.current = el
+          }}
+          src={url}
+          title={title}
+          controls={showControls}
+          autoPlay={autoPlay}
+          preload="metadata"
+          className="w-full"
+          data-testid="content-preview-audio"
+          onLoadedMetadata={handleMetadata}
+          onError={handleError}
+        />
+      </div>
+    )
+  }
   return (
     <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 p-6" data-testid="content-preview-audio-stage">
       <div className="flex h-28 w-28 items-center justify-center rounded-[36px] bg-[color:color-mix(in_srgb,var(--cp-accent-soft)_30%,var(--cp-surface))] text-[color:var(--cp-accent)]">
@@ -2242,6 +2328,7 @@ function MediaRenderer({
         }}
         src={url}
         controls={showControls}
+        autoPlay={autoPlay}
         preload="metadata"
         className="w-full max-w-md"
         data-testid="content-preview-audio"

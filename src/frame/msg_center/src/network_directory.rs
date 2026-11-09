@@ -4,8 +4,7 @@
 //! Zone-custody signature rule (G3) compares Zones with it.
 
 use async_trait::async_trait;
-use buckyos_api::LookupKind;
-use jsonwebtoken::EncodingKey;
+use buckyos_api::{CrossZoneClient, CustodyResolver, DeviceSigner, LookupKind, NameServiceResolver};
 use name_lib::DID;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -15,7 +14,7 @@ use std::time::{Duration, Instant};
 const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(600);
 /// A name service that does not answer is asked again only after this.
 const DIRECTORY_UNAVAILABLE_TTL: Duration = Duration::from_secs(30);
-const DIRECTORY_TIMEOUT: Duration = Duration::from_secs(3);
+const DIRECTORY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectoryError {
@@ -63,7 +62,9 @@ pub struct NameServiceDirectory {
 }
 
 fn host_of(did: &DID) -> String {
-    did.to_host_name().trim_end_matches('.').to_ascii_lowercase()
+    did.to_host_name()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 fn zone_host(value: &Value) -> Option<String> {
@@ -87,7 +88,10 @@ pub(crate) fn profile_from_document(did: &DID, doc: &Value) -> DidProfile {
         .or_else(|| doc.get("type"))
         .or_else(|| doc.get("doc_type"))
         .and_then(Value::as_str);
-    let context = doc.get("@context").map(Value::to_string).unwrap_or_default();
+    let context = doc
+        .get("@context")
+        .map(Value::to_string)
+        .unwrap_or_default();
     let kind = match declared {
         Some("user" | "owner") => LookupKind::User,
         Some("agent") => LookupKind::Agent,
@@ -118,10 +122,20 @@ pub(crate) fn profile_from_document(did: &DID, doc: &Value) -> DidProfile {
             .or_else(|| doc.get("zone"))
             .and_then(zone_host),
     };
+    let profile = if kind == LookupKind::Group {
+        doc.get("profile")
+            .filter(|value| value.is_object())
+            .unwrap_or(doc)
+    } else {
+        doc
+    };
     DidProfile {
         kind,
-        name: text(doc, &["display_name", "full_name", "displayName", "name"]),
-        avatar: text(doc, &["avatar", "icon"]),
+        name: text(
+            profile,
+            &["display_name", "full_name", "displayName", "name"],
+        ),
+        avatar: text(profile, &["avatar", "icon"]),
         zone,
     }
 }
@@ -129,30 +143,73 @@ pub(crate) fn profile_from_document(did: &DID, doc: &Value) -> DidProfile {
 impl NameServiceDirectory {
     async fn fetch(did: &DID) -> Result<DidProfile, DirectoryError> {
         let resolve = |doc_type| async move {
-            match tokio::time::timeout(DIRECTORY_TIMEOUT, name_client::resolve_did(did, doc_type)).await {
+            match tokio::time::timeout(DIRECTORY_TIMEOUT, name_client::resolve_did(did, doc_type))
+                .await
+            {
                 Ok(Ok(doc)) => Ok(doc),
-                Ok(Err(name_lib::NSError::NotFound(reason))) => Err(DirectoryError::NotFound(reason)),
+                Ok(Err(name_lib::NSError::NotFound(reason))) => {
+                    Err(DirectoryError::NotFound(reason))
+                }
                 // Key-class DIDs (`did:dev`) and malformed ones have no document to wait for.
-                Ok(Err(name_lib::NSError::InvalidDID(reason))) => Err(DirectoryError::NotFound(reason)),
-                Ok(Err(name_lib::NSError::DeadlineExceeded(_))) | Err(_) => Err(DirectoryError::Timeout),
+                Ok(Err(name_lib::NSError::InvalidDID(reason))) => {
+                    Err(DirectoryError::NotFound(reason))
+                }
+                Ok(Err(name_lib::NSError::DeadlineExceeded(_))) | Err(_) => {
+                    Err(DirectoryError::Timeout)
+                }
                 Ok(Err(error)) => Err(DirectoryError::Unavailable(error.to_string())),
             }
         };
-        // The owner document first; a name service that timed out is not
-        // asked a second time.
-        let doc = match resolve(Some(name_lib::DidDocType::Owner)).await {
-            Ok(doc) => doc,
-            Err(DirectoryError::Timeout) => return Err(DirectoryError::Timeout),
-            Err(_) => match resolve(Some(name_lib::DidDocType::Device)).await {
-                Ok(doc) => doc,
-                Err(DirectoryError::Timeout) => return Err(DirectoryError::Timeout),
-                Err(_) => resolve(None).await?,
-            },
+        Self::fetch_with_resolver(did, resolve).await
+    }
+
+    async fn fetch_with_resolver<F, Fut>(
+        did: &DID,
+        mut resolve: F,
+    ) -> Result<DidProfile, DirectoryError>
+    where
+        F: FnMut(Option<name_lib::DidDocType>) -> Fut,
+        Fut: std::future::Future<Output = Result<name_lib::EncodedDocument, DirectoryError>>,
+    {
+        let profile = |doc: name_lib::EncodedDocument| {
+            let doc = doc
+                .to_json_value()
+                .map_err(|error| DirectoryError::NotFound(error.to_string()))?;
+            Ok(profile_from_document(did, &doc))
         };
-        let doc = doc
-            .to_json_value()
-            .map_err(|error| DirectoryError::NotFound(error.to_string()))?;
-        Ok(profile_from_document(did, &doc))
+        // A child name (`g1.alice`) usually publishes one document type: its did.json
+        // answers in one query. A Zone answer still asks for the owner it may host.
+        let mut default = None;
+        if did.upper_did().is_some() {
+            match resolve(None).await.and_then(profile) {
+                Ok(found) if found.kind != LookupKind::Zone => return Ok(found),
+                Err(DirectoryError::Timeout) => return Err(DirectoryError::Timeout),
+                answer => default = Some(answer),
+            }
+        }
+        for doc_type in [name_lib::DidDocType::Owner, name_lib::DidDocType::Device] {
+            match resolve(Some(doc_type)).await {
+                Ok(doc) => return profile(doc),
+                Err(DirectoryError::Timeout) => return Err(DirectoryError::Timeout),
+                Err(_) => {}
+            }
+        }
+        let default = match default {
+            Some(answer) => answer,
+            None => resolve(None).await.and_then(profile),
+        };
+        let default_error = match default {
+            Ok(found) => return Ok(found),
+            Err(DirectoryError::Timeout) => return Err(DirectoryError::Timeout),
+            Err(error) => error,
+        };
+        let doc = resolve(Some(name_lib::DidDocType::custom("group")))
+            .await
+            .map_err(|error| match (&error, &default_error) {
+                (DirectoryError::NotFound(_), DirectoryError::Unavailable(_)) => default_error,
+                _ => error,
+            })?;
+        profile(doc)
     }
 }
 
@@ -206,23 +263,16 @@ impl std::fmt::Debug for DirectorySlot {
 }
 
 /// The OOD device key msg-center signs native messages of its Zone's users
-/// with (Zone custody, `Message Center.md` §4.5).
-#[derive(Clone)]
-pub struct ZoneSigner {
-    pub key: EncodingKey,
-    /// `<device_did>#<fragment>` written into the JWT header.
-    pub kid: String,
-}
-
+/// with (Zone custody, `Message Center.md` §4.5): the runtime's device signer.
 #[derive(Default)]
-pub struct ZoneSignerSlot(RwLock<Option<ZoneSigner>>);
+pub struct ZoneSignerSlot(RwLock<Option<DeviceSigner>>);
 
 impl ZoneSignerSlot {
-    pub(crate) fn get(&self) -> Option<ZoneSigner> {
+    pub(crate) fn get(&self) -> Option<DeviceSigner> {
         self.0.read().unwrap().clone()
     }
 
-    pub(crate) fn set(&self, signer: ZoneSigner) {
+    pub(crate) fn set(&self, signer: DeviceSigner) {
         *self.0.write().unwrap() = Some(signer);
     }
 }
@@ -230,6 +280,52 @@ impl ZoneSignerSlot {
 impl std::fmt::Debug for ZoneSignerSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ZoneSignerSlot")
+    }
+}
+
+/// Where signing keys and custody facts come from: the name service.
+pub struct CustodySlot(RwLock<Arc<dyn CustodyResolver>>);
+
+impl CustodySlot {
+    pub(crate) fn get(&self) -> Arc<dyn CustodyResolver> {
+        self.0.read().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set(&self, resolver: Arc<dyn CustodyResolver>) {
+        *self.0.write().unwrap() = resolver;
+    }
+}
+
+impl Default for CustodySlot {
+    fn default() -> Self {
+        Self(RwLock::new(Arc::new(NameServiceResolver)))
+    }
+}
+
+impl std::fmt::Debug for CustodySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CustodySlot")
+    }
+}
+
+/// The client into other Zones; none until the device key is loaded.
+#[derive(Default)]
+pub struct CrossZoneSlot(RwLock<Option<Arc<CrossZoneClient>>>);
+
+impl CrossZoneSlot {
+    pub(crate) fn get(&self) -> Option<Arc<CrossZoneClient>> {
+        self.0.read().unwrap().clone()
+    }
+
+    pub(crate) fn set(&self, client: Arc<CrossZoneClient>) {
+        *self.0.write().unwrap() = Some(client);
+    }
+}
+
+impl std::fmt::Debug for CrossZoneSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CrossZoneSlot")
     }
 }
 
@@ -277,7 +373,144 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use name_lib::{DidDocType, EncodedDocument};
     use serde_json::json;
+
+    fn group_doc(did: &DID) -> EncodedDocument {
+        EncodedDocument::JsonLd(json!({
+            "id": did,
+            "entity_type": "group",
+            "host": "did:web:host.example",
+            "profile": {"name": "Club", "avatar": "https://host.example/club.png"}
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_child_did_is_answered_by_its_did_json_in_one_query() {
+        let did = DID::new("web", "club.host.example");
+        let mut requested = Vec::new();
+        let profile = NameServiceDirectory::fetch_with_resolver(&did, |doc_type| {
+            requested.push(doc_type.clone());
+            std::future::ready(if doc_type.is_none() {
+                Ok(group_doc(&did))
+            } else {
+                Err(DirectoryError::Timeout)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(requested, vec![None]);
+        assert_eq!(profile.kind, LookupKind::Group);
+        assert_eq!(profile.zone.as_deref(), Some("host.example"));
+    }
+
+    #[tokio::test]
+    async fn a_child_without_did_json_still_discovers_its_typed_document() {
+        let did = DID::new("web", "club.host.example");
+        let mut requested = Vec::new();
+        let profile = NameServiceDirectory::fetch_with_resolver(&did, |doc_type| {
+            requested.push(doc_type.clone());
+            std::future::ready(if doc_type == Some(DidDocType::custom("group")) {
+                Ok(group_doc(&did))
+            } else {
+                Err(DirectoryError::NotFound("not published".into()))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            requested,
+            vec![
+                None,
+                Some(DidDocType::Owner),
+                Some(DidDocType::Device),
+                Some(DidDocType::custom("group")),
+            ]
+        );
+        assert_eq!(profile.kind, LookupKind::Group);
+        assert_eq!(profile.name.as_deref(), Some("Club"));
+        assert_eq!(
+            profile.avatar.as_deref(),
+            Some("https://host.example/club.png")
+        );
+        assert_eq!(profile.zone.as_deref(), Some("host.example"));
+    }
+
+    #[tokio::test]
+    async fn owner_document_keeps_precedence_over_other_document_types() {
+        let did = DID::new("web", "owner.example");
+        let mut requested = Vec::new();
+        let profile = NameServiceDirectory::fetch_with_resolver(&did, |doc_type| {
+            requested.push(doc_type);
+            std::future::ready(Ok(EncodedDocument::JsonLd(json!({
+                "id": did, "entity_type": "owner", "name": "Owner"
+            }))))
+        })
+        .await
+        .unwrap();
+        assert_eq!(requested, vec![Some(DidDocType::Owner)]);
+        assert_eq!(profile.kind, LookupKind::User);
+        assert_eq!(profile.name.as_deref(), Some("Owner"));
+    }
+
+    #[tokio::test]
+    async fn missing_typed_documents_still_allow_default_document_resolution() {
+        let did = DID::new("web", "zone.example");
+        let mut requested = Vec::new();
+        let profile = NameServiceDirectory::fetch_with_resolver(&did, |doc_type| {
+            requested.push(doc_type.clone());
+            std::future::ready(if doc_type.is_none() {
+                Ok(EncodedDocument::JsonLd(
+                    json!({"id": did, "entity_type": "zone"}),
+                ))
+            } else {
+                Err(DirectoryError::NotFound("not published".into()))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(requested.last(), Some(&None));
+        assert_eq!(requested.len(), 3);
+        assert_eq!(profile.kind, LookupKind::Zone);
+        assert_eq!(profile.zone.as_deref(), Some("zone.example"));
+    }
+
+    #[tokio::test]
+    async fn a_timeout_stops_document_type_fallback() {
+        let did = DID::new("web", "unavailable.example");
+        for timeout_at in 0..4 {
+            let mut calls = 0;
+            let result = NameServiceDirectory::fetch_with_resolver(&did, |_| {
+                let error = if calls == timeout_at {
+                    DirectoryError::Timeout
+                } else {
+                    DirectoryError::NotFound("not published".into())
+                };
+                calls += 1;
+                std::future::ready(Err(error))
+            })
+            .await;
+            assert_eq!(result.unwrap_err(), DirectoryError::Timeout);
+            assert_eq!(calls, timeout_at + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_group_does_not_hide_unavailable_default_document() {
+        let did = DID::new("web", "unavailable.example");
+        let result = NameServiceDirectory::fetch_with_resolver(&did, |doc_type| {
+            std::future::ready(Err(if doc_type.is_none() {
+                DirectoryError::Unavailable("default endpoint unavailable".into())
+            } else {
+                DirectoryError::NotFound("not published".into())
+            }))
+        })
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            DirectoryError::Unavailable("default endpoint unavailable".into())
+        );
+    }
 
     #[test]
     fn documents_describe_kind_name_and_zone() {

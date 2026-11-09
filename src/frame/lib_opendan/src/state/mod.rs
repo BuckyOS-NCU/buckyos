@@ -46,12 +46,18 @@ pub use goals::{
     GoalStatusChange, GoalStore,
 };
 pub use krpc::{KrpcAgentStateClient, KrpcTransport, StateTransport};
-pub use perception::{run_digest, PERCEPTION_LOCK_TIMEOUT};
+pub use perception::PERCEPTION_LOCK_TIMEOUT;
 
 /// Session registry (session mgr, §6.2). The only entry point to discover
 /// every session of an agent, wherever its directory lives.
 #[async_trait]
 pub trait SessionRegistry: Send + Sync {
+    async fn reserve_id(
+        &self,
+        kind: SessionKind,
+        key: &str,
+        parent_dir: Option<&Path>,
+    ) -> Result<String>;
     /// Called once by the creator; idempotent for the same identity.
     async fn register(&self, entry: RegistryEntry, who: &str) -> Result<RegistryEntry>;
     /// Driver only, after every commit; ignored unless `status.rev` is newer.
@@ -167,15 +173,25 @@ pub trait WorkspaceManager: Send + Sync {
 #[async_trait]
 pub trait RuntimeRegistry: Send + Sync {
     async fn list(&self) -> Result<Vec<RuntimeRecord>>;
-    /// `local` is read as `container`.
+    /// `container` / `local` are read as `private`.
     async fn lookup(&self, runtime_id: &str) -> Result<Option<RuntimeRecord>>;
-    /// A runtime an owner adds (idempotent for the same registration).
+    /// A runtime an owner adds (idempotent for the same registration);
+    /// checked at once.
     async fn register(&self, request: &RuntimeRegister, who: &str) -> Result<RuntimeRecord>;
     async fn update(&self, runtime_id: &str, request: &RuntimeUpdate, who: &str) -> Result<RuntimeRecord>;
-    /// Whether this host can use it now (writes the observation).
-    async fn check(&self, runtime_id: &str) -> Result<RuntimeRecord>;
-    /// Built-in runtimes are refused.
-    async fn unregister(&self, runtime_id: &str, expected_revision: u64, who: &str) -> Result<()>;
+    /// Whether this host can use it now (writes the observation), whether
+    /// the tools of its declared baseline are there, and whether `commands`
+    /// exist on it (`caps.tools_check`). `full` also runs the extended tools
+    /// and `commands`, for their versions and to find stubs.
+    async fn check(&self, runtime_id: &str, commands: &[String], full: bool) -> Result<RuntimeRecord>;
+    /// What is installed under the runtime's `tools/` as its node's reconciler recorded it; `smoke`: and what each
+    /// package's smoke says now.
+    async fn ext_tools(&self, runtime_id: &str, smoke: bool) -> Result<serde_json::Value>;
+    /// Retire a registration: it stays with its usage, never a candidate
+    /// again. Built-in runtimes are refused.
+    async fn unregister(&self, runtime_id: &str, expected_revision: u64, who: &str) -> Result<RuntimeRecord>;
+    /// Note one use of a runtime in its `usage`.
+    async fn note_usage(&self, runtime_id: &str, event: &RuntimeUsageEvent) -> Result<()>;
     /// Host: the built-in runtimes, created when missing; what an owner
     /// changed of them is kept.
     async fn ensure_builtin(&self, builtin: &[RuntimeRegister], who: &str) -> Result<Vec<RuntimeRecord>>;

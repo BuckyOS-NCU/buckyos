@@ -42,6 +42,7 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
             patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
             patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
             patch.object(module, "_prepare_agent_tools", return_value=0) as agent_tools,
+            patch.object(module, "_prepare_ext_tools", return_value=1),
             patch.object(module.subprocess, "run", return_value=completed) as run,
         ):
             result = module.main(["--skip-web", "-s", "scheduler"])
@@ -61,6 +62,7 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
             patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
             patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
             patch.object(module, "_prepare_agent_tools", return_value=0),
+            patch.object(module, "_prepare_ext_tools", return_value=0),
             patch.object(module.subprocess, "run", return_value=module.subprocess.CompletedProcess([], 0)) as run,
         ):
             self.assertEqual(module.main(["-s", "node_daemon"]), 0)
@@ -79,13 +81,21 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
             (source / "commands").mkdir(parents=True)
             (source / "aicc-tool.ts").write_text("// entry\n", encoding="utf-8")
             (source / "commands" / "gen_image.ts").write_text("// cmd\n", encoding="utf-8")
-            (source / "deno.json").write_text('{"imports": {"buckyos": "../../rootfs/x.mjs"}}', encoding="utf-8")
+            (source / "deno.json").write_text('{"imports": {"buckyos": "../../rootfs/x.mjs", "@table/": "../../frame/aiworkspace/import-table/"}}', encoding="utf-8")
+            src_root = Path(temporary) / "tree"
+            (src_root / "frame" / "aiworkspace" / "import-table").mkdir(parents=True)
+            (src_root / "frame" / "aiworkspace" / "import-table" / "mod.ts").write_text("// shared\n", encoding="utf-8")
+            (src_root / "frame" / "aiworkspace" / "import-table" / "mod_test.ts").write_text("// test\n", encoding="utf-8")
             target = Path(temporary) / "rootfs" / "libexec" / "buckyos-agent"
             target.mkdir(parents=True)
             (target / "stale.ts").write_text("old", encoding="utf-8")
-            self.assertEqual(module._prepare_agent_tools(source, target), 0)
+            self.assertEqual(module._prepare_agent_tools(source, target, src_root), 0)
             config = module.json.loads((target / "deno.json").read_text(encoding="utf-8"))
             self.assertEqual(config["imports"]["buckyos"], "../buckyos-tool/dist/node.mjs")
+            # shared modules travel beside the commands, tests left out
+            self.assertEqual(config["imports"]["@table/"], "./vendor/frame/aiworkspace/import-table/")
+            self.assertTrue((target / "vendor" / "frame" / "aiworkspace" / "import-table" / "mod.ts").is_file())
+            self.assertFalse((target / "vendor" / "frame" / "aiworkspace" / "import-table" / "mod_test.ts").exists())
             self.assertTrue((target / "commands" / "gen_image.ts").is_file())
             self.assertFalse((target / "stale.ts").exists())
             self.assertEqual(module._prepare_agent_tools(Path(temporary) / "missing", target), 2)
@@ -235,6 +245,14 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
             result = module.main([])
 
         self.assertEqual(result, 127)
+
+    def test_a_release_build_does_not_fetch_the_ext_core_seed(self) -> None:
+        module = _load_build_script()
+        with patch.object(module.subprocess, "run") as run:
+            self.assertEqual(module._prepare_ext_tools({"BUCKYOS_EXT_TOOLS_SKIP": "1"}), 0)
+            run.assert_not_called()
+            module._prepare_ext_tools({})
+            run.assert_called_once()
 
 
 if __name__ == "__main__":

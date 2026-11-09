@@ -23,7 +23,7 @@ use libopendan::state::krpc::{KrpcTransport, StateTransport};
 use libopendan::state::{connect, AgentStateClient, ConnectOptions, StateLocator};
 use libopendan::{OpenDanError, SessionDir, SessionTemplate};
 use llm_context::deps::{LlmClient, LlmInferenceRequest};
-use llm_context::error::{LLMComputeError, ProviderFailure, RefusalKind};
+use llm_context::error::{LLMComputeError, ProviderFailure};
 use name_lib::DID;
 use ndn_lib::{MsgObjKind, MsgObject, ObjId};
 use opendan::loader::{Loader, LoaderEnv, SpecRef};
@@ -42,7 +42,7 @@ struct Llm {
     /// Calls that fail before the script answers.
     failures: AtomicUsize,
     /// What the failing calls are: a provider error, or this policy refusal.
-    refusal: std::sync::Mutex<Option<RefusalKind>>,
+    refusal: std::sync::Mutex<Option<&'static str>>,
     script: Box<dyn Fn(&LlmInferenceRequest, usize) -> String + Send + Sync>,
 }
 
@@ -64,7 +64,9 @@ impl LlmClient for Llm {
             self.failures.fetch_sub(1, Ordering::SeqCst);
             let refusal = *self.refusal.lock().unwrap();
             return Err(LLMComputeError::Provider {
-                failure: refusal.map(ProviderFailure::Refused).unwrap_or(ProviderFailure::Unknown),
+                failure: refusal
+                    .map(|code| ProviderFailure::Refused { code: code.to_string() })
+                    .unwrap_or(ProviderFailure::Unknown),
                 message: "provider refused the request".into(),
             });
         }
@@ -510,6 +512,7 @@ impl World {
             xllm: XllmDeps::default().with_llm(llm),
             session_cli: None,
             session_helpers: Vec::new(),
+            context_windows: None,
             options: RunnerOptions {
                 poll_interval: Duration::from_millis(50),
                 max_wait: Duration::from_millis(300),
@@ -584,15 +587,22 @@ async fn registered_sessions_are_hosted_and_recovered() {
     let before = new_work(fs_agent(&w).as_ref(), &w, "left from an earlier process").await;
     assert_eq!(before.state().unwrap().run_state, RunState::Created);
 
-    let loader = w.start(Llm::new(|_, _| "done".into())).await;
+    // A work session ends with its explicit final report.
+    let loader = w.start(Llm::new(|_, _| r#"CALL:report {"report": "done", "is_end": true}"#.into())).await;
     until("recovered session finishes", || finished(&before)).await;
     let later = new_work(loader.agent.as_ref(), &w, "created while hosting").await;
     until("new session finishes", || finished(&later)).await;
     assert_eq!(later.state().unwrap().outcome, Some(Outcome::Succeeded));
-    let hosted = loader.supervisor.status();
+    // The drive that finished a session returns after its last commit.
     for sd in [&before, &later] {
-        let h = hosted.iter().find(|h| h.session_id == sd.sid()).unwrap();
-        assert!(h.drives >= 1, "{h:?}");
+        until("the finishing drive is counted", || {
+            loader
+                .supervisor
+                .status()
+                .iter()
+                .any(|h| h.session_id == sd.sid() && h.drives >= 1)
+        })
+        .await;
     }
     // Sessions of another driver are left alone.
     let mut spec = work_spec("someone else's", "go");
@@ -616,6 +626,86 @@ async fn rpc(port: u16, method: &str, params: Value) -> libopendan::Result<Value
     KrpcTransport::new(&format!("http://127.0.0.1:{port}{SERVICE_PATH}"), None)
         .call(method, params)
         .await
+}
+
+/// `session.work_cards` over kRPC (TODO messagehub-worksession-ui §3.5):
+/// only the work the given Turn created, a plan with its TodoList and the
+/// card of a bound Todo; `session.worklog` without a Turn is the whole
+/// session in commit order (§3.8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn work_cards_and_the_continuous_worklog_over_krpc() {
+    let w = World::new();
+    let port = free_port();
+    let loader = Loader::start(w.env(Llm::new(|_, _| "done".into()), port).await).await.unwrap();
+    let parent = new_work(loader.agent.as_ref(), &w, "the conversation").await;
+    until("the parent finishes", || finished(&parent)).await;
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+    // Work of other drivers: left alone by this loader, still shown.
+    let child = |parent: &str, task: &str, title: &str, class: &str| {
+        let mut spec = work_spec(&format!("objective of {title}"), "go");
+        spec.driver = Some("app:other@alice".into());
+        spec.title = Some(title.into());
+        spec.class = class.into();
+        spec.origin = Some(Origin {
+            parent_session: Some(parent.to_string()),
+            parent_task: Some(task.into()),
+            ..Default::default()
+        });
+        spec
+    };
+    let mut created = Vec::new();
+    for (task, title, class) in [("t-ui-1", "Simple", "work"), ("t-ui-2", "Elsewhere", "work"), ("t-ui-1", "Plan", "plan_simple")] {
+        created.push(
+            create_session(&w.root.join("sessions"), child(parent.sid(), task, title, class), loader.agent.as_ref(), WHO, w.channels().as_ref())
+                .await
+                .unwrap(),
+        );
+    }
+    let plan = &created[2];
+    let todo = create_session(&w.root.join("sessions"), child(plan.sid(), "t-plan-1", "Survey", "work"), loader.agent.as_ref(), WHO, w.channels().as_ref())
+        .await
+        .unwrap();
+    let list = json!({
+        "schema": "opendan.todo_list/1", "next_seq": 3, "rev": 2,
+        "todos": [
+            { "todo_id": "T01", "seq": 1, "rev": 1, "status": "running", "mode": "serial", "title": "Survey",
+              "content": "x", "created_at_ms": 1, "updated_at_ms": 1,
+              "attempts": [{ "attempt": 1, "mode": "serial", "child_sid": todo.sid(), "status": "running", "started_at_ms": 1 }] },
+            { "todo_id": "T02", "seq": 2, "rev": 1, "status": "pending", "mode": "serial", "title": "Verify",
+              "content": "x", "created_at_ms": 1, "updated_at_ms": 1 }
+        ]
+    });
+    std::fs::write(plan.state_dir().join("todos.json"), list.to_string()).unwrap();
+
+    let cards = rpc(port, "session.work_cards", json!({ "sid": parent.sid(), "task_id": "t-ui-1" })).await.unwrap();
+    assert_eq!((cards["agent_did"].as_str(), cards["task_id"].as_str()), (Some(AGENT), Some("t-ui-1")));
+    let sessions = cards["sessions"].as_array().unwrap();
+    let titles: Vec<&str> = sessions.iter().map(|c| c["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, ["Simple", "Plan"]);
+    assert_eq!((sessions[0]["shape"].as_str(), sessions[0]["state"].as_str()), (Some("simple"), Some("queued")));
+    assert_eq!(sessions[1]["shape"], "plan");
+    let todos = &sessions[1]["todos"];
+    assert_eq!((todos["total"].as_u64(), todos["done"].as_u64()), (Some(2), Some(0)));
+    assert_eq!(todos["items"][0]["card"]["session_id"], todo.sid());
+    assert_eq!(todos["items"][0]["card"]["title"], "Survey");
+    assert!(todos["items"][1]["card"].is_null());
+    assert_eq!(cards["complete"], false);
+    let err = rpc(port, "session.work_cards", json!({ "sid": parent.sid() })).await.unwrap_err();
+    assert!(matches!(err, OpenDanError::InvalidArgument(_)), "{err:?}");
+
+    // The whole worklog of a finished session: across Turns, records
+    // without a Turn included, no Turn task.
+    let log = rpc(port, "session.worklog", json!({ "sid": parent.sid() })).await.unwrap();
+    assert!(log["turn"].is_null() && log["task_id"].is_null(), "{log}");
+    assert_eq!(log["complete"], true);
+    let entries = log["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["t"], "created");
+    assert!(entries.iter().any(|e| e["t"] == "turn_ended"));
+    let seqs: Vec<u64> = entries.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] + 1 == w[1]), "{seqs:?}");
+    let running = rpc(port, "session.worklog", json!({ "sid": created[0].sid() })).await.unwrap();
+    assert_eq!(running["complete"], false);
+    loader.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -659,6 +749,11 @@ async fn web_api_routes_metadata_and_rpc_with_the_same_access_policy() {
                 assert!(result.unwrap_err().to_string().contains("a session token is required"));
             } else {
                 assert_eq!(result.unwrap()["agent_did"], AGENT);
+            }
+            if app_id.is_some() {
+                let cards = KrpcTransport::new(&format!("http://127.0.0.1:{port}{path}"), None)
+                    .call("session.work_cards", json!({ "sid": "s", "task_id": "t" })).await;
+                assert!(cards.unwrap_err().to_string().contains("a session token is required"));
             }
         }
         loader.shutdown().await;
@@ -939,6 +1034,18 @@ async fn inbox_messages_are_answered_along_the_same_conversation() {
         .unwrap()
         .to_string();
     let entry = ui_entry(loader.agent.as_ref(), &route).expect("ui session of the inbox");
+    let (date, number) = entry.session_id.strip_prefix("ui-").unwrap().split_once('-').unwrap();
+    assert_eq!(date.len(), 8);
+    assert!(date.bytes().all(|b| b.is_ascii_digit()));
+    assert!(number.parse::<u64>().unwrap() > 0);
+    assert_eq!(
+        loader.agent.sessions().reserve_id(
+            SessionKind::Ui,
+            &opendan::ui::ui_session_key(AGENT, &route, 0),
+            None,
+        ).await.unwrap(),
+        entry.session_id,
+    );
     assert_eq!(entry.driver.principal, WHO);
     assert!(key.starts_with(&format!("{}:1:", entry.session_id)), "{key}");
     let sd = SessionDir::open(&entry.location).unwrap();
@@ -1032,7 +1139,7 @@ async fn a_quota_refusal_tells_the_owner_where_to_look() {
     )
     .unwrap();
     let llm = Llm::new(|_, _| "fine now".to_string());
-    *llm.refusal.lock().unwrap() = Some(RefusalKind::QuotaExhausted);
+    *llm.refusal.lock().unwrap() = Some(agent_tool::xllm::REFUSED_QUOTA_EXHAUSTED);
     llm.failures.store(1, Ordering::SeqCst);
     let loader = w.start(llm.clone()).await;
     let session = format!("dm:{BOB}");
@@ -1180,7 +1287,7 @@ async fn a_sub_session_reports_through_its_ui_parent() {
         if u.contains("there are 3 files") {
             "the work session says: 3 files".to_string()
         } else if u.contains("count the files") {
-            "there are 3 files".to_string()
+            r#"CALL:report {"report": "there are 3 files", "is_end": true}"#.to_string()
         } else {
             "on it".to_string()
         }
@@ -1295,22 +1402,25 @@ async fn the_jarvis_package_loads_and_answers() {
     let loader = Loader::start(env).await.unwrap();
     assert_eq!(loader.config.language, "zh");
     assert_eq!(loader.config.llm_context["provider"]["type"], "buckyos");
-    for name in ["chat_route", "plan", "do", "work_simple", "goal", "plan_simple"] {
+    for name in ["chat_route", "work_simple", "explore", "goal", "plan_simple"] {
         let b = loader.agent.behaviors().get(name).await.unwrap().unwrap();
         assert!(b.prompt.system.is_some(), "{name}");
     }
+    for gone in ["plan", "do"] {
+        assert!(loader.agent.behaviors().get(gone).await.unwrap().is_none(), "no behavior loop `{gone}`");
+    }
     // plan_simple: native function calls with an intent on every call and
-    // the background after tool results; its session class ends with an
-    // explicit report.
+    // inputs that place the background; it only reads its workspace.
     let plan_simple = loader.agent.behaviors().get("plan_simple").await.unwrap().unwrap();
+    assert_eq!(plan_simple.capabilities.workspace, Some(libopendan::protocol::WorkspaceAccess::ReadOnly));
     let entry = plan_simple.to_entry("plan_simple", &loader.config.llm_context, true).unwrap();
     assert!(entry.call_intent);
-    assert_eq!(entry.input.unwrap().background, libopendan::protocol::InputBackground::AfterTools);
+    assert!(entry.prompt.on_input.as_deref().unwrap().contains("{{ background_context }}"));
     assert!(loader.agent.behaviors().get("task_route").await.unwrap().is_none());
     // Intent analysis: a fork of the UI context offered as a named function.
     let analyze = loader.agent.behaviors().get("analyze_intent").await.unwrap().unwrap();
     assert!(analyze.prompt.system.is_none() && analyze.model.preferred.is_none());
-    assert!(analyze.prompt.on_context_switch.as_deref().unwrap().contains("agent-session ask-user"));
+    assert!(analyze.prompt.on_context_switch.as_deref().unwrap().contains("ask_user"));
     let entry = analyze.to_entry("analyze_intent", &loader.config.llm_context, false).unwrap();
     assert_eq!(entry.mode, libopendan::protocol::ContextMode::Fork);
     assert_eq!(entry.tool.as_ref().unwrap().function_name("analyze_intent"), "try_analyze_user_intent");
@@ -1326,7 +1436,7 @@ async fn the_jarvis_package_loads_and_answers() {
     assert_eq!(
         ids,
         [
-            ("container", libopendan::protocol::RuntimeAvailability::Available),
+            ("private", libopendan::protocol::RuntimeAvailability::Available),
             ("host", libopendan::protocol::RuntimeAvailability::RuntimeUnavailable)
         ]
     );
@@ -1381,9 +1491,9 @@ async fn the_jarvis_package_loads_and_answers() {
     assert_eq!(frozen.cmd_skills.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["ui_core"]);
     assert_eq!(cfg.session.owner.as_deref(), Some(BOB));
     assert!(cfg.session.objective.starts_with("The long-lived conversation of this agent"), "{}", cfg.session.objective);
-    // A work session of the package starts in plan and can hand over to do.
+    // A work session of the package is a plan session by default.
     let template = SessionTemplate::load("work", loader.agent.agent_root()).unwrap();
-    assert_eq!(template.default_behavior.as_deref(), Some("plan"));
+    assert_eq!(template.default_behavior.as_deref(), Some("plan_simple"));
     loader.shutdown().await;
 }
 
@@ -1842,7 +1952,7 @@ async fn a_turn_is_a_task_and_a_slow_reply_replaces_its_placeholder() {
     assert_eq!(task.new.name, "a slow question");
     assert_eq!(task.new.parent_id, None);
     assert_eq!(task.new.grant_user.as_deref(), Some("alice"));
-    assert_eq!(task.new.idempotency_key, format!("agent_turn:{}:1", entry.session_id));
+    assert_eq!(task.new.idempotency_key, format!("agent_turn:{AGENT}:{}:1", entry.session_id));
     assert_eq!(task.new.input["session_id"], json!(entry.session_id));
     assert_eq!(task.new.input["turn"], json!(1));
     assert_eq!(task.message, "answer 0");
@@ -1893,7 +2003,7 @@ async fn sub_sessions_are_child_tasks_of_the_turn_that_created_them() {
             }
             "two workers started".to_string()
         } else if u.contains("part ") {
-            "part done".to_string()
+            r#"CALL:report {"report": "part done", "is_end": true}"#.to_string()
         } else {
             "noted".to_string()
         }
@@ -2114,204 +2224,6 @@ async fn goals_are_hosted_and_a_canceled_activation_keeps_the_goal() {
     loader.shutdown().await;
 }
 
-// Intent analysis: asking the user from a fork (TODO V16) ------------------
-
-const ANALYZE_TOML: &str = r#"
-[meta]
-name = "analyze"
-[entry]
-mode = "fork"
-[tool]
-name = "try_analyze"
-description = "Analyze the request."
-task = "{{args.request}}"
-[tool.parameters]
-type = "object"
-required = ["request"]
-[tool.parameters.properties.request]
-type = "string"
-[prompt]
-on_context_switch = "ANALYZE: {{handover.sub_task.task}}"
-"#;
-
-const CHAT_TOML: &str = r#"
-[meta]
-name = "chat"
-next = ["analyze"]
-[prompt]
-mode = "function_call"
-system = "chat with the owner"
-[capabilities]
-tool_whitelist = ["group:bash", "behavior:analyze", "report"]
-"#;
-
-/// The answer `ask-user` would print (the command itself is tested with
-/// libopendan; this host has no `agent-session`).
-fn ask_command(question: &str, input: Value) -> String {
-    let out = json!({
-        "agent_tool_protocol": "1", "tool": "ask-user", "status": "pending",
-        "task_id": "userinput:%s", "summary": "waiting for the answer",
-        "detail": { "question": question, "input": input },
-    });
-    format!("TOOL:printf '{}' \"$XLLM_CALL_ID\"", out)
-}
-
-fn qa_world() -> World {
-    let w = World::with_tasks();
-    std::fs::create_dir_all(w.root.join("behaviors")).unwrap();
-    std::fs::write(w.root.join("behaviors/analyze.toml"), ANALYZE_TOML).unwrap();
-    std::fs::write(w.root.join("behaviors/chat.toml"), CHAT_TOML).unwrap();
-    std::fs::write(
-        w.root.join("agent.toml"),
-        format!("[loader]\nplaceholder_delay_ms = 60000\n{AGENT_TOML}\n[session.ui]\ndefault_behavior = \"chat\"\n"),
-    )
-    .unwrap();
-    w
-}
-
-fn thread_reply(text: &str, target: &MsgObject, machine: Option<Value>) -> MsgObject {
-    let mut m = chat(BOB, text);
-    m.relates_to = Some(ndn_lib::MsgRelation::new(
-        ndn_lib::MsgRelType::Thread,
-        ObjId::new(&msg_key(target)).unwrap(),
-    ));
-    m.content.machine = machine.map(|v| serde_json::from_value(v).unwrap());
-    m
-}
-
-/// V16: the user gets the placeholder P at once, the question Q as a thread
-/// message on P carrying `agent_ask`, answers on P, and the Turn's result R
-/// as the edit of P — one Turn, one task, which waits for the answer in
-/// between.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_question_and_its_answer_stay_in_the_turn() {
-    let w = qa_world();
-    let tasks = w.tasks.clone().unwrap();
-    let llm = Llm::new(|req, n| match n {
-        0 => r#"CALL:try_analyze {"request":"tidy up the docs"}"#.to_string(),
-        1 => {
-            assert!(last_user(req).contains("ANALYZE: tidy up the docs"), "{}", last_user(req));
-            ask_command(
-                "docs/ or everything?",
-                json!({ "kind": "choice", "options": [ { "id": "a", "label": "docs/" }, { "id": "b", "label": "everything" } ] }),
-            )
-        }
-        2 => {
-            let all: String = req.messages.iter().map(|m| serde_json::to_string(m).unwrap()).collect();
-            assert!(all.contains(r#"\"option\":\"a\""#) && all.contains(r#"\"in_reply_to_question\":true"#), "{all}");
-            r#"REPORT:{"report":"created work for docs/","result":{"outcome":"work_created"},"is_end":true}"#.to_string()
-        }
-        3 => {
-            let all: String = req.messages.iter().map(|m| serde_json::to_string(m).unwrap()).collect();
-            assert!(all.contains("work_created"), "{all}");
-            "Started: tidying docs/.".to_string()
-        }
-        _ => panic!("unexpected call {n}"),
-    });
-    let loader = w.start(llm.clone()).await;
-    let session = format!("dm:{BOB}");
-    w.mail.deliver(&session, chat(BOB, "please tidy up the docs"));
-    until("placeholder and question", || w.mail.sent().len() == 2).await;
-    let sent = w.mail.sent();
-    let (p, q) = (&sent[0].1, &sent[1].1);
-    assert_eq!(p.content.content, "(working)");
-    let task_id = agent_task_of(p).expect("P carries the Turn's task");
-    let rel = q.relates_to.as_ref().expect("Q is a thread message on P");
-    assert_eq!((rel.rel.clone(), rel.target.to_string()), (ndn_lib::MsgRelType::Thread, msg_key(p)));
-    assert_eq!(q.meta["agent_ask"]["anchor"], msg_key(p).as_str());
-    assert_eq!(q.meta["agent_ask"]["input"]["kind"], "choice");
-    assert!(q.content.content.starts_with("docs/ or everything?\n1. docs/"), "{}", q.content.content);
-    assert!(q.mentions.is_none(), "a direct chat mentions nobody");
-    until("task waits for the answer", || {
-        tasks.all().iter().any(|t| t.id == task_id && t.state == "waiting" && t.message.contains("answer"))
-    })
-    .await;
-
-    w.mail.deliver(
-        &session,
-        thread_reply("docs/", p, Some(json!({ "intent": "agent_ask.answer", "data": { "call_id": "c1", "option": "a" } }))),
-    );
-    until("result", || w.mail.sent().len() == 3).await;
-    let r = &w.mail.sent()[2].1;
-    assert_eq!(r.content.content, "Started: tidying docs/.");
-    let rel = r.relates_to.as_ref().expect("R edits P");
-    assert_eq!((rel.rel.clone(), rel.target.to_string()), (ndn_lib::MsgRelType::Edit, msg_key(p)));
-    until("task closed", || tasks.all().iter().any(|t| t.id == task_id && t.state == "succeeded")).await;
-    assert_eq!(tasks.all().len(), 1, "one Turn, one task");
-    let route = MailboxAddress::new(parse_did(AGENT).unwrap(), Some(session)).unwrap().to_string();
-    let entry = ui_entry(loader.agent.as_ref(), &route).unwrap();
-    let st = SessionDir::open(&entry.location).unwrap().state().unwrap();
-    assert_eq!((st.turn_seq, st.turns_completed), (1, 1));
-    assert_eq!(llm.calls.load(Ordering::SeqCst), 4);
-    loader.shutdown().await;
-}
-
-/// In a group the question is addressed to the owner (MessageHub locks the
-/// composer of the members a question mentions).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_question_in_a_group_mentions_the_owner() {
-    let w = qa_world();
-    let mut settings = w.settings.clone();
-    settings.allow_group = true;
-    let w = World { settings, ..w };
-    let llm = Llm::new(|_req, n| match n {
-        0 => r#"CALL:try_analyze {"request":"plan the trip"}"#.to_string(),
-        1 => ask_command("which weekend?", json!({ "kind": "text" })),
-        _ => "ok".to_string(),
-    });
-    let loader = w.start(llm).await;
-    let group = "did:bns:hikers";
-    w.mail.deliver(group, group_msg(BOB, group, "@jarvis plan the trip", true));
-    until("question", || w.mail.sent().iter().any(|(_, m)| m.meta.contains_key("agent_ask"))).await;
-    let q = w.mail.sent().into_iter().map(|(_, m)| m).find(|m| m.meta.contains_key("agent_ask")).unwrap();
-    assert_eq!(q.kind, MsgObjKind::GroupMsg);
-    assert_eq!(q.mentions.as_ref().unwrap().dids, vec![parse_did(BOB).unwrap()]);
-    loader.shutdown().await;
-}
-
-/// Notify TODO V07 / V08 through the Loader: a Work's question is an
-/// `input` notification, the Turn's task waits for the user (HumanInput on
-/// the notification's task), the answer continues the Work.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_work_question_is_a_notification_and_its_answer_continues_the_work() {
-    use libopendan::notify::{LocalNotify, NotifyAnswer, NotifyHost, NotifyListReq};
-    let mut w = World::with_tasks();
-    let local = Arc::new(LocalNotify::enable(&w.root, AGENT).unwrap());
-    w.notify = Some(local.clone());
-    let tasks = w.tasks.clone().unwrap();
-    let llm = Llm::new(|req, n| match n {
-        0 => ask_command(
-            "Postgres or SQLite?",
-            json!({ "kind": "choice", "options": [ { "id": "pg", "label": "Postgres" }, { "id": "lite", "label": "SQLite" } ] }),
-        ),
-        1 => {
-            let all: String = req.messages.iter().map(|m| serde_json::to_string(m).unwrap()).collect();
-            assert!(all.contains(r#"\"option\":\"pg\""#) && all.contains(r#"\"via\":\"notification\""#), "{all}");
-            "migrated to Postgres".to_string()
-        }
-        _ => panic!("unexpected call {n}"),
-    });
-    let loader = w.start(llm.clone()).await;
-    let sd = new_work(loader.agent.as_ref(), &w, "migrate the notes").await;
-    let pending = || futures_block(local.list(NotifyListReq::default())).unwrap();
-    until("the question", || pending().len() == 1).await;
-    let v = pending().remove(0);
-    let human = v.task_id.clone().unwrap();
-    until("the Turn waits for the user", || {
-        tasks.waits.lock().unwrap().iter().any(|(_, r)| {
-            r.kind == buckyos_api::TaskWaitReasonKind::HumanInput
-                && r.related_task_id.as_deref() == Some(human.as_str())
-                && r.code.as_deref() == Some("ask_user")
-        })
-    })
-    .await;
-    local.answer(&v.notify_id, NotifyAnswer::option("pg"), None).await.unwrap();
-    until("the work finishes", || finished(&sd)).await;
-    assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
-    assert!(sd.report().unwrap().contains("migrated to Postgres"));
-    loader.shutdown().await;
-}
-
 /// Notify TODO V16 through the Loader: the record msg-center writes into
 /// the agent's own inbox when a copy of its notification reached a
 /// conversation becomes a `_notify` observation of that conversation's UI
@@ -2457,7 +2369,18 @@ async fn a_session_process_elsewhere_reaches_its_session_through_the_service() {
     let out = helper(&["sessions"], None);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains(sd.sid()));
-    let out = helper(&["todo", "add", "from the node", "--content", "-"], Some("the Todo's text"));
+    let out = helper(
+        &[
+            "todo",
+            "add",
+            "from the node",
+            "--content",
+            "-",
+            "--queue-dir",
+            w.queue.to_str().unwrap(),
+        ],
+        Some("the Todo's text"),
+    );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let list = libopendan::todos::store_of(&sd).load().unwrap().render_view();
     assert!(list.contains("from the node"), "{list}");
@@ -2465,14 +2388,9 @@ async fn a_session_process_elsewhere_reaches_its_session_through_the_service() {
     let renewed = std::fs::read_to_string(workdir.join(CONTEXT_DIR).join(TOKEN_FILE)).unwrap();
     assert!(libopendan::session_context::token_expiry(&renewed).unwrap() > soon);
 
-    // Tasks of a run that is not in progress here; ask-user answers for the
-    // call it belongs to without asking the service.
+    // Tasks of a run that is not in progress here.
     let out = helper(&["task", "state", "t-1"], None);
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
-    let out = helper(&["ask-user", "Which database?"], None);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let asked: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(asked["task_id"], "userinput:call-7");
 
     // A token of another agent's key, an expired one: refused.
     let stranger = TokenKey::load_or_create(&w.root.join("elsewhere")).unwrap();

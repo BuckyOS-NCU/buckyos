@@ -1,12 +1,13 @@
 use crate::{gateway_etc_dir, ControlPanelServer, PrincipalSession, RpcAuthPrincipal};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult, RPCSessionToken};
 use buckyos_api::{
-    get_buckyos_api_runtime, is_system_login_target, token_auth_method, token_session_ceiling,
+    get_buckyos_api_runtime, is_aiworkspace_host_label, is_system_delegation_target,
+    is_system_login_target, token_auth_method, token_session_ceiling,
     validate_verify_hub_token_claims, zone_document_hostname, AccessDenial, AppId, AppInstanceId,
     AuthTarget, BuckyOSRuntime, ControlPanelClient, CurrentIdentity, DelegateUserSessionResult,
     DenyReason, LoginByPasswordResponse, SessionCeiling, SessionScope, SystemServiceId, TokenPair,
     TokenPrincipalKind, TokenUse, UserSettings, UserState, UserType,
-    CONTROL_PANEL_SERVICE_UNIQUE_ID,
+    AIWORKSPACE_GATEWAY_APP_KEY, CONTROL_PANEL_SERVICE_UNIQUE_ID,
 };
 use buckyos_http_server::{server_err, ServerError, ServerErrorCode, ServerResult, StreamInfo};
 use buckyos_kit::buckyos_get_unix_timestamp;
@@ -35,7 +36,7 @@ struct AuthLoginResponse {
 
 /// Control Panel methods a restricted Limited session (scope `account_self`)
 /// reaches; each acts on the caller's own account only. `desktop.api` stands
-/// for the desktop state, Desktop folder and wallpaper HTTP API.
+/// for the desktop state and Desktop folder HTTP API.
 const ACCOUNT_SELF_METHODS: [&str; 12] = [
     "auth.invite.set_password",
     PREPARE_APP_LAUNCH_METHOD,
@@ -68,8 +69,24 @@ enum AppLaunchResult {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct PrepareAppLaunchParams {
-    app_instance_id: String,
+    /// The App instance the page belongs to — or, for a page of a system service on its own origin (an AI
+    /// Workspace on `aiws-<id>.<zone>`), `service_id` instead.
+    #[serde(default)]
+    app_instance_id: Option<String>,
+    #[serde(default)]
+    service_id: Option<String>,
     redirect_url: String,
+}
+
+impl PrepareAppLaunchParams {
+    /// What the caller asked to be signed into, for the log.
+    fn target_name(&self) -> String {
+        match (&self.app_instance_id, &self.service_id) {
+            (Some(app), _) => app.clone(),
+            (None, Some(service)) => format!("system:{service}"),
+            (None, None) => String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +114,53 @@ enum PendingSsoLookupResult {
 }
 
 impl ControlPanelServer {
+    pub(super) async fn handle_auth_describe_target(
+        &self,
+        req: RPCRequest,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let redirect_url = Self::require_param_str(&req, "redirect_url")?;
+        let runtime = get_buckyos_api_runtime()?;
+        let resolved = Self::resolve_sso_auth_target(
+            &redirect_url,
+            Self::sso_zone_host(runtime)?.as_str(),
+            !runtime.force_https,
+            runtime.node_gateway_port,
+        )?;
+        let display_name = match &resolved.auth_target {
+            AuthTarget::App { app_instance_id } => {
+                let client = runtime.get_system_config_client().await?;
+                let key = buckyos_api::user_app_spec_key(
+                    app_instance_id.owner_user_id(),
+                    app_instance_id.app_id(),
+                );
+                let spec = match client.get(&key).await {
+                    Ok(value) => Some(serde_json::from_str::<buckyos_api::AppServiceSpec>(&value.value)
+                        .map_err(|error| RPCErrors::ReasonError(error.to_string()))?),
+                    Err(buckyos_api::SystemConfigError::KeyNotFound(_)) => None,
+                    Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
+                };
+                spec.map(|spec| spec.app_doc.show_name)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| app_instance_id.app_id().to_string())
+            }
+            AuthTarget::System { service_id } => match service_id.as_str() {
+                "control-panel" => "Desktop".to_string(),
+                "aiworkspace" => "AI Workspace".to_string(),
+                "msg-center" => "Message Hub".to_string(),
+                _ => buckyos_api::find_system_builtin_app(service_id.as_str())
+                    .map(|app| app.show_name.to_string())
+                    .unwrap_or_else(|| service_id.to_string()),
+            },
+        };
+        Ok(RPCResponse::new(
+            RPCResult::Success(json!({
+                "target": resolved.auth_target,
+                "display_name": display_name,
+            })),
+            req.seq,
+        ))
+    }
+
     //这个不是kapi,只能在当前域名内调用
     pub(super) async fn handle_auth_login(
         &self,
@@ -205,9 +269,9 @@ impl ControlPanelServer {
             .prepare_app_launch(principal.username.as_str(), &source_token, &params)
             .await?;
         info!(
-            "prepare_app_launch user='{}' app_instance_id='{}' status={}",
+            "prepare_app_launch user='{}' target='{}' status={}",
             principal.username,
-            params.app_instance_id,
+            params.target_name(),
             Self::app_launch_status_name(&result)
         );
         Ok(Self::app_launch_response(result, req.seq))
@@ -245,9 +309,7 @@ impl ControlPanelServer {
             !runtime.force_https,
             runtime.node_gateway_port,
         );
-        let Some(resolved) =
-            Self::resolve_app_launch_target(params.app_instance_id.as_str(), resolved)?
-        else {
+        let Some(resolved) = Self::resolve_app_launch_target(params, resolved)? else {
             return Ok(AppLaunchResult::InvalidTarget);
         };
         let verify_hub_client = runtime.get_verify_hub_client().await?;
@@ -281,10 +343,11 @@ impl ControlPanelServer {
         })
     }
 
-    /// `None` when the URL is not this Zone's Gateway route of exactly the requested App
-    /// instance; route lookups that fail for other reasons stay errors.
+    /// `None` when the URL is not this Zone's Gateway route of exactly the requested target — the App
+    /// instance, or a system service that may be delegated to (AI Workspace pages on their own origin);
+    /// route lookups that fail for other reasons stay errors.
     fn resolve_app_launch_target(
-        app_instance_id: &str,
+        params: &PrepareAppLaunchParams,
         resolved: Result<ResolvedSsoAuthTarget, RPCErrors>,
     ) -> Result<Option<ResolvedSsoAuthTarget>, RPCErrors> {
         let resolved = match resolved {
@@ -292,10 +355,20 @@ impl ControlPanelServer {
             Err(RPCErrors::ParseRequestError(_) | RPCErrors::NoPermission(_)) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let Ok(app_instance_id) = app_instance_id.parse::<AppInstanceId>() else {
-            return Ok(None);
+        let expected = match (&params.app_instance_id, &params.service_id) {
+            (Some(app_instance_id), _) => match app_instance_id.parse::<AppInstanceId>() {
+                Ok(app_instance_id) => AuthTarget::app(app_instance_id),
+                Err(_) => return Ok(None),
+            },
+            (None, Some(service_id)) => match service_id.parse::<SystemServiceId>() {
+                Ok(service_id) if is_system_delegation_target(service_id.as_str()) => {
+                    AuthTarget::system(service_id)
+                }
+                _ => return Ok(None),
+            },
+            (None, None) => return Ok(None),
         };
-        Ok((resolved.auth_target == AuthTarget::app(app_instance_id)).then_some(resolved))
+        Ok((resolved.auth_target == expected).then_some(resolved))
     }
 
     fn validate_delegated_token_pair(
@@ -804,14 +877,6 @@ impl ControlPanelServer {
             .and_then(|value| Self::normalize_session_token(Some(value)))
     }
 
-    /// The Gateway SSO session cookie (host-only, renewed by `/sso_refresh`): what a browser page signed in
-    /// at the Zone root carries on plain loads it cannot add headers to, such as an image.
-    pub(super) fn extract_http_sso_session_cookie(
-        req: &http::Request<BoxBody<Bytes, ServerError>>,
-    ) -> Option<String> {
-        Self::extract_http_cookie(req, GATEWAY_SSO_SESSION_COOKIE)
-    }
-
     /// Subjects of the SSO session and refresh cookies the browser already holds,
     /// read without verification or expiry checks: they only ever refuse a delivery.
     pub(crate) fn sso_cookie_subjects(
@@ -1104,6 +1169,7 @@ impl ControlPanelServer {
             method,
             "auth.login"
                 | "auth.sso_config"
+                | "auth.describe_target"
                 | "auth.entry.describe"
                 | "auth.register"
                 | "auth.invite.describe"
@@ -1295,6 +1361,13 @@ impl ControlPanelServer {
                     "redirect_url host does not resolve to an app".to_string(),
                 )
             })?;
+        // `aiws-<workspace id>.<zone>`: every AI Workspace's own origin; the gateway folds these hosts onto
+        // the one `aiws` service entry (boot_gateway.yaml get_app_info_from_req), so does the SSO route.
+        let app_key = if is_aiworkspace_host_label(&app_key) {
+            AIWORKSPACE_GATEWAY_APP_KEY.to_string()
+        } else {
+            app_key
+        };
         Ok((url, app_key, false))
     }
 
@@ -1925,6 +1998,17 @@ mod tests {
         format!("{}.{}.signature", header, payload)
     }
 
+    #[test]
+    fn login_requester_uses_route_identity_on_custom_domains() {
+        let runtime = sso_runtime("streetycat-ood.cc.cd");
+        let root = resolve_sso_test_target(&runtime, "https://streetycat-ood.cc.cd/").unwrap();
+        assert_eq!(root.auth_target, AuthTarget::system("control-panel".parse().unwrap()));
+        let app = resolve_sso_test_target(&runtime, "https://files.streetycat-ood.cc.cd/").unwrap();
+        assert_eq!(app.auth_target, AuthTarget::app("filebrowser@alice".parse().unwrap()));
+        assert!(resolve_sso_test_target(&runtime, "https://unknown.streetycat-ood.cc.cd/").is_err());
+        assert!(ControlPanelServer::is_public_rpc_method("auth.describe_target"));
+    }
+
     fn gateway_info() -> Value {
         json!({
             "app_info": {
@@ -1934,9 +2018,51 @@ mod tests {
                     "app_id": "filebrowser",
                     "app_instance_id": "filebrowser@alice",
                     "app_owner_user_id": "alice"
-                }
+                },
+                "aiws": {"service_id": "aiworkspace", "selector": {"ood1": {"port": 4120, "weight": 1}}}
             }
         })
+    }
+
+    #[test]
+    fn workspace_hosts_fold_onto_the_aiws_service_route() {
+        let (url, key, root) = ControlPanelServer::parse_sso_redirect_url(
+            "https://aiws-pxmyr26jfiyascwlkxwfy5nfn2.example.test/orders/overview?id=sf1",
+            "example.test",
+            false,
+            3180,
+        )
+        .unwrap();
+        assert_eq!(key, "aiws");
+        assert!(!root);
+        let resolved = ControlPanelServer::resolve_sso_auth_target_from_gateway_info(&url, &key, root, &gateway_info()).unwrap();
+        assert_eq!(resolved.auth_target, AuthTarget::system("aiworkspace".parse().unwrap()));
+        assert_eq!(resolved.canonical_origin, "https://aiws-pxmyr26jfiyascwlkxwfy5nfn2.example.test");
+        // `aiws` itself and look-alikes are ordinary app keys (hosts are case-insensitive: `aiws-AB` is `aiws-ab`)
+        for host in ["aiws.example.test", "aiws-.example.test", "aiws-a_b.example.test", "xaiws-1.example.test"] {
+            let parsed = ControlPanelServer::parse_sso_redirect_url(&format!("https://{host}/"), "example.test", false, 3180);
+            assert!(parsed.as_ref().map(|(_, key, _)| key != "aiws" || host == "aiws.example.test").unwrap_or(true), "{host}: {parsed:?}");
+        }
+        assert_eq!(ControlPanelServer::parse_sso_redirect_url("https://aiws-AB1.example.test/", "example.test", false, 3180).unwrap().1, "aiws");
+    }
+
+    #[test]
+    fn app_launch_targets_are_the_requested_app_or_a_delegable_service() {
+        let aiws = resolved(AuthTarget::system("aiworkspace".parse().unwrap()), "https://aiws-x1.example.test", "https://aiws-x1.example.test/w/s?id=1");
+        let files = resolved(AuthTarget::app("filebrowser@alice".parse().unwrap()), "https://files.example.test", "https://files.example.test/");
+        let params = |app: Option<&str>, service: Option<&str>| PrepareAppLaunchParams {
+            app_instance_id: app.map(str::to_string),
+            service_id: service.map(str::to_string),
+            redirect_url: String::new(),
+        };
+        assert!(ControlPanelServer::resolve_app_launch_target(&params(None, Some("aiworkspace")), Ok(aiws.clone())).unwrap().is_some());
+        assert!(ControlPanelServer::resolve_app_launch_target(&params(Some("filebrowser@alice"), None), Ok(files.clone())).unwrap().is_some());
+        // the wrong kind, a non-delegable service, nothing asked, or a route that does not resolve
+        assert!(ControlPanelServer::resolve_app_launch_target(&params(Some("filebrowser@alice"), None), Ok(aiws.clone())).unwrap().is_none());
+        assert!(ControlPanelServer::resolve_app_launch_target(&params(None, Some("aiworkspace")), Ok(files.clone())).unwrap().is_none());
+        assert!(ControlPanelServer::resolve_app_launch_target(&params(None, Some("control-panel")), Ok(resolved(AuthTarget::system("control-panel".parse().unwrap()), "https://example.test", "https://example.test/"))).unwrap().is_none());
+        assert!(ControlPanelServer::resolve_app_launch_target(&params(None, None), Ok(aiws.clone())).unwrap().is_none());
+        assert!(ControlPanelServer::resolve_app_launch_target(&params(None, Some("aiworkspace")), Err(RPCErrors::ParseRequestError("x".into()))).unwrap().is_none());
     }
 
     fn resolved(target: AuthTarget, origin: &str, redirect_url: &str) -> ResolvedSsoAuthTarget {
@@ -2005,7 +2131,11 @@ mod tests {
         let runtime = sso_runtime("wugren021.web3.buckyos.ai");
         let launch = |instance: &str, url: &str| {
             ControlPanelServer::resolve_app_launch_target(
-                instance,
+                &PrepareAppLaunchParams {
+                    app_instance_id: Some(instance.to_string()),
+                    service_id: None,
+                    redirect_url: url.to_string(),
+                },
                 resolve_sso_test_target(&runtime, url),
             )
         };
@@ -2058,7 +2188,11 @@ mod tests {
         }
         assert!(matches!(
             ControlPanelServer::resolve_app_launch_target(
-                "filebrowser@alice",
+                &PrepareAppLaunchParams {
+                    app_instance_id: Some("filebrowser@alice".to_string()),
+                    service_id: None,
+                    redirect_url: String::new(),
+                },
                 Err(RPCErrors::ReasonError(
                     "gateway info unreadable".to_string()
                 )),

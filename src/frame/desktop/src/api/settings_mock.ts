@@ -1,6 +1,7 @@
 /* Mock-runtime answers for the Settings app's control-panel reads (`?scenario=empty` gives a
  * freshly activated single-node Zone). Shapes follow the Rust handlers in control_panel. */
 
+import type { bucket } from 'buckyos'
 import type {
   BuckyOSDevConfig,
   BuckyOSInfo,
@@ -10,6 +11,7 @@ import type {
   ZoneDevice,
   ZoneDevicesResponse,
   ZoneOverviewResponse,
+  StorageOverview,
 } from './settings.ts'
 
 const GB = 1024 ** 3
@@ -220,6 +222,62 @@ function gatewayFile(name: unknown): GatewayFileResponse {
   return { name: key, path: `/opt/buckyos/etc/${key}`, sizeBytes: content.length, modifiedAt: new Date().toISOString(), content }
 }
 
+const MB = 1024 ** 2
+
+function mockBucket(
+  appid: string,
+  name: string,
+  data_policy: bucket.DataPolicy,
+  unique_bytes: number,
+  key_count: number,
+  orphaned = false,
+): bucket.BucketInfo {
+  return {
+    bucket_id: `user/${appid}/alice/${name}`,
+    kind: 'data',
+    data_policy,
+    scope: 'user',
+    appid,
+    owner: 'alice',
+    name,
+    versioning: data_policy === 'documents' || data_policy === 'collected',
+    unique_bytes: Math.round(unique_bytes),
+    key_bytes: Math.round(unique_bytes),
+    key_count,
+    version_count: key_count,
+    snapshot_only_bytes: 0,
+    ...(orphaned ? { orphaned_at: Date.now() - 6 * 86_400_000 } : {}),
+    created_at: Date.now() - 30 * 86_400_000,
+  }
+}
+
+let storageBuckets: bucket.BucketInfo[] | null = null
+
+function mockBuckets(): bucket.BucketInfo[] {
+  storageBuckets ??=
+    scenario() === 'empty'
+      ? []
+      : [
+          mockBucket('control-panel', 'wallpapers', 'app_data', 9.4 * MB, 2),
+          mockBucket('jarvis.alice.web3.buckyos.ai', 'artifacts', 'documents', 412 * MB, 38),
+          mockBucket('jarvis.alice.web3.buckyos.ai', 'scratch', 'temp', 56 * MB, 11),
+          mockBucket('aicc', 'outputs', 'temp', 23 * MB, 7),
+          mockBucket('msg-center', 'collected', 'collected', 1.2 * GB, 214),
+          mockBucket('notes.alice.bns.did', 'notes', 'documents', 3.1 * MB, 64, true),
+          mockBucket('notes.alice.bns.did', 'index', 'app_data', 18 * MB, 1, true),
+        ]
+  return storageBuckets
+}
+
+export function mockStorageOverview(): StorageOverview {
+  return { user: 'alice', buckets: mockBuckets().map((item) => ({ ...item })) }
+}
+
+export function deleteMockStorageBucket(bucketId: string): { deleted: boolean } {
+  storageBuckets = mockBuckets().filter((item) => item.bucket_id !== bucketId)
+  return { deleted: true }
+}
+
 const executorDevices = new Map<string, Record<string, unknown>>()
 
 const LOG_SERVICES = ['control-panel', 'cyfs-gateway', 'msg-center', 'node-daemon', 'scheduler', 'system-config', 'task-manager']
@@ -254,6 +312,13 @@ function handle(method: string, params: Record<string, unknown>): unknown {
     case 'system.dev_mode.set':
       devConfig = { ...devConfig, enabled: params.enabled === true, ...(params.enabled === true ? { enabled_at: nowSecs(), enabled_by: 'alice' } : {}) }
       return { ...devConfig }
+    case 'ext_tools.status':
+      return extToolsStatus()
+    case 'ext_tools.plan':
+      return extToolsPlan(String(params.id), params.enabled === true)
+    case 'ext_tools.set_desired':
+      extToolsDesired[String(params.id)] = { version: extToolsCatalog[String(params.id)]?.manifest.version ?? '', enabled: params.enabled === true }
+      return { ok: true, plan: extToolsPlan(String(params.id), params.enabled === true) }
     case 'zone.devices.list':
       return devicesResponse()
     case 'zone.certificates.list':
@@ -285,5 +350,36 @@ export async function callMockSettings<T>(
     return { data: handle(method, params) as T, error: null }
   } catch (error) {
     return { data: null, error }
+  }
+}
+
+const extToolsCatalog: Record<string, { manifest: { id: string; version: string; desc: string; requires: Array<{ id: string; version: string }>; provides: Array<{ command: string }>; platforms: string[] }; pikg_digest: string; content_id: string }> = {
+  'ext-media': {
+    manifest: { id: 'ext-media', version: '1.2.0', desc: 'Audio and video editing', requires: [{ id: 'ext-core', version: '>=1.0' }], provides: [{ command: 'ffmpeg' }, { command: 'ffprobe' }], platforms: ['linux-x86_64'] },
+    pikg_digest: 'sha256:0',
+    content_id: 'file:0',
+  },
+}
+const extToolsDesired: Record<string, { version: string; enabled: boolean }> = {}
+
+function extToolsPlan(id: string, enabled: boolean) {
+  if (!enabled) return { enable: [], disable: [id], errors: [] }
+  return { enable: extToolsCatalog[id] ? [extToolsCatalog[id]] : [], disable: [], errors: extToolsCatalog[id] ? [] : [`${id} is not in the Repo`] }
+}
+
+function extToolsStatus() {
+  const active = (version: string) => ({ version, stage: 'active' as const })
+  return {
+    nodes: [{ id: 'ood1', platform: 'linux-x86_64', containers: true }],
+    packages: [
+      { id: 'ext-core', latest: null, versions: null, desired: null, nodes: { ood1: active('1.1.0') }, skills: { ffmpeg: ['aigc_video'] } },
+      {
+        id: 'ext-media',
+        latest: extToolsCatalog['ext-media'],
+        versions: ['1.2.0'],
+        desired: extToolsDesired['ext-media'] ?? null,
+        nodes: extToolsDesired['ext-media']?.enabled ? { ood1: active('1.2.0') } : null,
+      },
+    ],
   }
 }

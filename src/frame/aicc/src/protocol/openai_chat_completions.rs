@@ -542,7 +542,14 @@ fn encode_image_url(source: &ResourceRef, context: &CodecContext) -> ProtocolRes
         return Ok(url.to_string());
     }
     match source {
-        ResourceRef::Url { url, .. } => Ok(url.clone()),
+        ResourceRef::Url { url, .. } => match context.materialized_resource(source) {
+            Ok(resource) => Ok(format!(
+                "data:{};base64,{}",
+                resource.mime,
+                STANDARD.encode(&resource.bytes)
+            )),
+            Err(_) => Ok(url.clone()),
+        },
         ResourceRef::Base64 { mime, data_base64 } => {
             Ok(format!("data:{mime};base64,{data_base64}"))
         }
@@ -701,14 +708,6 @@ fn encode_tools(request: &LlmChatInvokeRequest) -> ProtocolResultValue<Value> {
 fn encode_response_format(format: &LlmResponseFormat) -> ProtocolResultValue<Value> {
     match format.format_type {
         LlmResponseFormatType::Text => Ok(json!({"type": "text"})),
-        LlmResponseFormatType::Json | LlmResponseFormatType::JsonObject => {
-            if format.json_schema.is_some() {
-                return Err(ProtocolError::invalid_request(
-                    "json_object response format must not include json_schema",
-                ));
-            }
-            Ok(json!({"type": "json_object"}))
-        }
         LlmResponseFormatType::JsonSchema => {
             let schema = format.json_schema.as_ref().ok_or_else(|| {
                 ProtocolError::invalid_request("json_schema response format requires a schema")
@@ -1189,7 +1188,10 @@ fn decode_error_response(response: HttpResponse) -> ProtocolError {
         || provider_message.to_string(),
         |label| format!("OpenAI {label}: {provider_message}"),
     );
-    let kind = super::protocol_error_kind_from_http_status(response.status);
+    let kind = super::openai_error_kind(
+        provider_code.as_deref(),
+        super::protocol_error_kind_from_http_status(response.status),
+    );
     ProtocolError::new(kind, message)
         .with_provider_code(provider_code)
         .with_request_id(Some(response.request_id))
@@ -1332,16 +1334,17 @@ fn apply_stream_chunk(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("Chat Completions stream failed");
-        let label = error
-            .get("code")
-            .or_else(|| error.get("type"))
-            .and_then(Value::as_str);
-        return Err(ProtocolError::new(
-            ProtocolErrorKind::Transport,
-            label.map_or_else(
-                || message.to_string(),
-                |label| format!("OpenAI {label}: {message}"),
-            ),
+        let code = error.get("code").and_then(Value::as_str);
+        let label = code.or_else(|| error.get("type").and_then(Value::as_str));
+        let message = label.map_or_else(
+            || message.to_string(),
+            |label| format!("OpenAI {label}: {message}"),
+        );
+        let kind = super::openai_error_kind(code, ProtocolErrorKind::Transport);
+        // Only the context code changes how AICC treats the failure.
+        return Err(ProtocolError::new(kind, message).with_provider_code(
+            code.filter(|_| kind == ProtocolErrorKind::ContextLengthExceeded)
+                .map(str::to_string),
         ));
     }
     let extensions = dialect.transform_stream_chunk(object)?;
@@ -2308,6 +2311,56 @@ mod tests {
         assert!(error.message.contains("rate_limit"));
         assert_eq!(error.request_id.as_deref(), Some("request-rate"));
         assert_eq!(error.retry_after, Some(Duration::from_secs(3)));
+    }
+
+    #[tokio::test]
+    async fn context_length_code_maps_to_its_own_kind_in_responses_and_streams() {
+        let response = ProtocolContractHarness::default()
+            .response(
+                StatusCode::BAD_REQUEST,
+                &[],
+                Bytes::from_static(
+                    br#"{"error":{"message":"maximum context length is 128000 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+                ),
+                "request-context",
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        let error = codec().decode(response).await.unwrap_err();
+        assert_eq!(error.kind, ProtocolErrorKind::ContextLengthExceeded);
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+        let public: buckyos_api::AiccError = error.into();
+        assert_eq!(
+            public.code,
+            buckyos_api::AiccErrorCode::ContextLengthExceeded
+        );
+        assert!(!public.retriable);
+
+        let mut state = ChatCompletionStreamState::default();
+        let error = apply_stream_chunk(
+            r#"{"error":{"message":"too long","code":"context_length_exceeded"}}"#,
+            &mut state,
+            &StandardChatCompletionsDialect,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ProtocolErrorKind::ContextLengthExceeded);
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+        // Other in-stream errors keep the transport kind; a message that
+        // merely mentions the context is not guessed.
+        let error = apply_stream_chunk(
+            r#"{"error":{"message":"maximum context length exceeded","code":"server_error"}}"#,
+            &mut state,
+            &StandardChatCompletionsDialect,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ProtocolErrorKind::Transport);
+        assert_eq!(error.provider_code, None);
     }
 
     #[tokio::test]

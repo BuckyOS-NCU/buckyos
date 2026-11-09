@@ -1,5 +1,5 @@
 import { fetchCurrentAccount } from '../../../api/account.ts'
-import { userTypeCanCreateAgents } from '../../../api/user_type.ts'
+import { parseUserType, userTypeCanCreateAgents } from '../../../api/user_type.ts'
 import { fetchAppList } from '../../../api/app_mgr.ts'
 import {
   fetchAgentList,
@@ -40,7 +40,7 @@ function accountDetail(account: AccountInfo): UserDetail {
   return {
     user_id: account.user_id,
     show_name: account.user_name || account.user_id,
-    user_type: account.user_type || 'user',
+    user_type: account.user_type || '',
     state: 'active',
     res_pool_id: '',
     profile: {
@@ -89,6 +89,7 @@ export async function fetchUsersAgentsSnapshot(): Promise<UsersAgentsSnapshot> {
   ])
   const viewerType = accountInfo?.user_type || String(selfResult.data?.user_type ?? '')
   const viewerIsAdmin = isPrivilegedUserType(viewerType)
+  if (!usersResult.data) throw usersResult.error ?? new Error('user.list failed')
   const userGroups = await loadUserGroups(viewerIsAdmin)
 
   const targetUserIds = appListTargetUserIds(
@@ -158,6 +159,7 @@ export async function fetchMockUsersAgentsSnapshot(): Promise<UsersAgentsSnapsho
     fetchUserList(),
   ])
   const viewerIsAdmin = isPrivilegedUserType(account?.user_type)
+  if (!usersResult.data) throw usersResult.error ?? new Error('user.list failed')
   const userGroups = await loadUserGroups(viewerIsAdmin)
   const listed = new Map((usersResult.data?.users ?? []).map((user) => [user.user_id, user]))
   const now = new Date().toISOString()
@@ -170,14 +172,17 @@ export async function fetchMockUsersAgentsSnapshot(): Promise<UsersAgentsSnapsho
     self: {
       ...base.self,
       id: account?.user_id ?? base.self.id,
+      role: parseUserType(selfResult.data?.user_type ?? account?.user_type) ?? 'unknown',
       socialAccounts: toSocialAccounts(contact.bindings),
       ...(avatarUrl ? { avatarUrl } : {}),
       ...(typeof profile.bio === 'string' ? { bio: profile.bio } : {}),
     },
     agents: (agentsResult.data?.agents ?? []).map(toAgentEntity),
-    localUsers: base.localUsers
-      .filter((user) => user.id !== (account?.user_id ?? base.self.id))
-      .map((user) => withAccountFacts(user, listed.get(user.id), now)),
+    localUsers: toVisibleLocalUserEntities(usersResult.data.users, new Map(), account?.user_id ?? base.self.id, now)
+      .map((user) => {
+        const seed = base.localUsers.find((item) => item.id === user.id)
+        return seed ? { ...withAccountFacts(seed, listed.get(user.id), now), status: user.status, isOnline: user.isOnline } : user
+      }),
     canCreateAgents: userTypeCanCreateAgents(account?.user_type),
     viewerIsAdmin,
     userGroups,
@@ -189,6 +194,7 @@ export function createEmptyUsersAgentsSnapshot(): UsersAgentsSnapshot {
   const self: UsersAgentsSnapshot['self'] = {
     id: 'self',
     kind: 'self',
+    role: 'unknown',
     displayName: 'Current User',
     socialAccounts: [],
     createdAt,

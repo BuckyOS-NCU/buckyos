@@ -30,12 +30,19 @@ pub struct AppState {
     pub scan_state: std::sync::Mutex<crate::reconciler::ScanState>,
     pub share: crate::share::ShareMgr,
     pub ndm: crate::ndm::NdmMgr,
+    pub buckets: crate::bucket::BucketHost,
+    pub preview: crate::preview::PreviewMgr,
+    pub ndn_egress: Arc<crate::ndn::EgressLimit>,
+    pub ambient: crate::ndn::ambient::AmbientFetches,
 }
 
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
-    pub fn new(config: ServerConfig) -> NfsResult<SharedState> {
+    pub fn new(mut config: ServerConfig) -> NfsResult<SharedState> {
+        if !matches!(config.auth, crate::config::AuthMode::Runtime) {
+            crate::share::declare_bucket(&mut config);
+        }
         std::fs::create_dir_all(&config.data_dir)?;
         for root in &config.exports {
             if !root.path.is_dir() {
@@ -56,6 +63,10 @@ impl AppState {
         if matches!(config.auth, crate::config::AuthMode::Runtime) {
             seed_default_acls(&config, &db, &acls)?;
         }
+        let preview = config.preview_tool_dirs.clone().map(crate::preview::PreviewMgr::with_dirs).unwrap_or_default();
+        if crate::share::ShareMgr::store_configured(&config) {
+            preview.refresh();
+        }
         Ok(Arc::new(AppState {
             handles: HandleCodec::new(handle_key),
             watch_key: rand::random(),
@@ -70,6 +81,10 @@ impl AppState {
             zone_owner: std::sync::RwLock::new(None),
             share,
             ndm,
+            buckets: Default::default(),
+            preview,
+            ndn_egress: crate::ndn::EgressLimit::new(config.ndn_anonymous_bytes_per_sec),
+            ambient: Default::default(),
             db,
             config,
         }))

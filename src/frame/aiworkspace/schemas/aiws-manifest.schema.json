@@ -1,0 +1,138 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "buckyos.ai-workspace/aiws-manifest/3",
+ "title": "aiws-manifest.json: the controls of a bundle or of an `aiws` PIKG payload (Q13)",
+ "description": "Root of an exported bundle and of the `aiws` sub-package of a .pikg: the manifest plus controls/<dir>/<file>. `digest` is `sha256:` over the canonical JSON [[file name, sha256 hex of its bytes], …] sorted by name, recomputed by every installer. `workspace_templates` (manifest_version 3, P3) lists Workspace templates carried as snapshots under templates/<id>/ (template.schema.json). A package export carries the def_dep closure of the chosen controls (deduplicated, P1); every `deps` entry names a control of the same manifest.",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "manifest_version",
+  "purpose",
+  "controls",
+  "workspace_templates"
+ ],
+ "properties": {
+  "manifest_version": {
+   "type": "integer",
+   "minimum": 1,
+   "maximum": 3
+  },
+  "purpose": {
+   "const": "aiws"
+  },
+  "host_api": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "html": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "declarative": {
+     "type": "integer",
+     "minimum": 1
+    }
+   }
+  },
+  "controls": {
+   "type": "array",
+   "maxItems": 256,
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "ident",
+     "name",
+     "kind",
+     "version",
+     "digest",
+     "dir"
+    ],
+    "properties": {
+     "ident": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^did:[a-z0-9]+:[^/#\\s]+#[a-z0-9][a-z0-9._-]{0,63}$"
+     },
+     "name": {
+      "$ref": "#/$defs/name"
+     },
+     "kind": {
+      "enum": [
+       "declarative",
+       "html",
+       "composite"
+      ]
+     },
+     "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "the definition's build revision at export"
+     },
+     "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+     },
+     "dir": {
+      "type": "string",
+      "pattern": "^controls/[a-z0-9][a-z0-9._-]{0,70}/$"
+     },
+     "title": {
+      "type": "string",
+      "maxLength": 256
+     },
+     "description": {
+      "type": "string",
+      "maxLength": 4000
+     },
+     "catalog": {
+      "$ref": "#/$defs/catalog"
+     },
+     "deps": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+       "type": "string",
+       "maxLength": 128,
+       "pattern": "^did:[a-z0-9]+:[^/#\\s]+#[a-z0-9][a-z0-9._-]{0,63}$"
+      },
+      "description": "identities this control builds on; each must be another control of the same bundle (an installer refuses an open closure: LIBRARY_PACKAGE_INVALID)"
+     }
+    }
+   }
+  },
+  "workspace_templates": {
+   "type": "array",
+   "maxItems": 32,
+   "items": {
+    "$ref": "template.schema.json"
+   },
+   "description": "Workspace templates (P3, Q32): snapshots under templates/<id>/; empty unless manifest_version is 3"
+  }
+ },
+ "$defs": {
+  "name": {
+   "type": "string",
+   "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+   "description": "A renderer id; also the definition's def_id."
+  },
+  "catalog": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "group": {
+     "type": "string",
+     "maxLength": 64
+    },
+    "icon": {
+     "type": "string",
+     "pattern": "^[a-z][a-z0-9-]{0,31}$"
+    },
+    "description": {
+     "type": "string",
+     "maxLength": 1000
+    }
+   }
+  }
+ }
+}

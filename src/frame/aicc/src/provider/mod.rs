@@ -4,8 +4,6 @@ mod runtime;
 
 #[cfg(test)]
 pub(crate) use crate::protocol::{claude_messages_adapter, register_sn_openai_adapter};
-#[cfg(test)]
-pub(crate) use builtin::openai_catalog_files;
 pub(crate) use builtin::{
     builtin_provider_codecs, builtin_provider_registry, resolve_sn_provider_instance_with_config,
     BuiltinProviderRequest, SnCredentialBroker, SnProviderInstanceInput,
@@ -16,8 +14,10 @@ pub(crate) use inventory::{
     ProviderConnectionContract, ProviderConnectionInput, ProviderDiscovery,
     ProviderDiscoverySnapshot, ProviderFieldMode, ProviderFieldSchema, ProviderHealthState,
     ProviderInstanceConfig, ProviderInventorySnapshot, ProviderQuotaObservation,
-    ProviderQuotaObservationState, ResolvedProviderConnection, StaticCredentialResolver,
+    ProviderQuotaObservationState, StaticCredentialResolver,
 };
+#[cfg(test)]
+pub(crate) use inventory::ResolvedProviderConnection;
 use runtime::ProviderRuntime;
 pub(crate) use runtime::ProviderRuntimeManager;
 
@@ -434,6 +434,7 @@ impl ProviderDraftValidationError {
 
 #[derive(Clone)]
 pub(crate) struct ProviderDraftConfig {
+    pub instance_rules: Option<buckyos_api::ProviderInstanceRules>,
     pub provider_instance_name: String,
     pub provider_profile_id: String,
     pub protocol_adapter_id: String,
@@ -467,11 +468,7 @@ impl fmt::Debug for ProviderDraftConfig {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderDraftNegotiation {
-    pub provider_profile_id: String,
     pub protocol_adapter_id: String,
-    pub auth_mode: ProviderAuthMode,
-    pub connection: ResolvedProviderConnection,
-    pub catalog_revision_seq: u64,
     pub inventory: Arc<ProviderInventorySnapshot>,
 }
 
@@ -613,18 +610,32 @@ fn validate_discovery(discovery: &ProviderDiscoverySnapshot) -> ProviderResult<(
     Ok(())
 }
 
-fn resolve_operation(
+pub(crate) fn resolve_operation(
     adapter: &crate::protocol::AdapterDescriptor,
     overrides: &BTreeMap<String, String>,
     remote_methods: Option<&BTreeSet<String>>,
     api_type: ApiType,
     api_type_name: &str,
+    default_operation: Option<&str>,
 ) -> ProviderResult<Option<String>> {
     if let Some(operation) = overrides
         .get(api_type.typed_method())
         .or_else(|| overrides.get(api_type_name))
     {
         return Ok(Some(operation.clone()));
+    }
+    if let Some(default) = default_operation {
+        if !adapter.operations.get(default).is_some_and(|operation| {
+            operation
+                .bindings
+                .iter()
+                .any(|binding| binding.api_type == api_type)
+        }) {
+            return Err(ProviderError::Inventory(format!(
+                "adapter {:?} default operation {default:?} does not support api_type {api_type_name}",
+                adapter.protocol_adapter_id
+            )));
+        }
     }
     let matching = adapter
         .operations
@@ -680,6 +691,13 @@ fn resolve_operation(
             .filter(|(_, priority)| *priority == highest_priority)
             .collect::<Vec<_>>()
     };
+    if matching.len() > 1 {
+        if let Some(operation) = default_operation
+            .filter(|default| matching.iter().any(|(operation, _)| operation == default))
+        {
+            return Ok(Some(operation.to_owned()));
+        }
+    }
     match matching.as_slice() {
         [] => Ok(None),
         [(operation, _)] => Ok(Some(operation.clone())),
@@ -706,6 +724,18 @@ fn retain_supported_features(
         adapter_features.contains(name)
             && discovery_features.is_none_or(|features| features.contains(name))
     });
+}
+
+fn instance_rules_fingerprint(config: &ProviderInstanceConfig) -> String {
+    let bytes = serde_json::to_vec(&(
+        &config.provider_rules_id,
+        &config.instance_rules,
+        &config.region,
+        &config.workspace,
+        &config.account,
+    ))
+    .expect("instance rules serialize");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn model_list_fingerprint(models: &[DiscoveredModel]) -> String {

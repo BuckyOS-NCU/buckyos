@@ -21,6 +21,7 @@ pub(crate) struct ProviderFieldSchema {
 }
 
 impl ProviderFieldSchema {
+    #[cfg(test)]
     pub(crate) fn unsupported() -> Self {
         Self {
             mode: ProviderFieldMode::Unsupported,
@@ -37,6 +38,7 @@ impl ProviderFieldSchema {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn optional_with_default(default_value: impl Into<String>) -> Self {
         Self {
             mode: ProviderFieldMode::Optional,
@@ -53,6 +55,7 @@ impl ProviderFieldSchema {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_allowed_values(
         mut self,
         values: impl IntoIterator<Item = impl Into<String>>,
@@ -273,6 +276,25 @@ impl ProviderInstanceConfig {
                 operation_base_url,
             )?;
         }
+        if let Some(rules) = &self.instance_rules {
+            for (model, routes) in &rules.server_default_routes {
+                validate_nonempty("server default model", model)?;
+                if model.contains(['*', '?', '@', ':']) || model.chars().any(char::is_whitespace) {
+                    return Err(ProviderError::InvalidConfiguration(
+                        "server defaults require explicit physical model IDs".into(),
+                    ));
+                }
+                if routes.is_empty()
+                    || routes
+                        .iter()
+                        .any(|route| !route.starts_with("llm.") || route.contains([':', '@', '/']))
+                {
+                    return Err(ProviderError::InvalidConfiguration(
+                        "server defaults require explicit LLM task paths".into(),
+                    ));
+                }
+            }
+        }
         if let Some(provider_rules_id) = &self.provider_rules_id {
             validate_id("provider_rules_id", provider_rules_id)?;
         }
@@ -339,20 +361,6 @@ pub(crate) struct DiscoveryContext<'a> {
     pub credential: &'a ResolvedCredential,
 }
 
-pub(crate) struct ProviderQuotaContext<'a> {
-    pub profile: &'a ProviderProfile,
-    pub instance: &'a ProviderInstanceConfig,
-    pub credential: &'a ResolvedCredential,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ProviderQuotaLevel {
-    Normal,
-    NearLimit,
-    Exhausted,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderQuotaObservationState {
@@ -365,15 +373,6 @@ pub(crate) enum ProviderQuotaObservationState {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProviderQuotaReading {
-    pub state: ProviderQuotaLevel,
-    pub remaining_request_units: Option<u64>,
-    pub remaining_cost_usd: Option<AiCost>,
-    pub reset_at_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ProviderQuotaObservation {
     pub state: ProviderQuotaObservationState,
     pub remaining_request_units: Option<u64>,
@@ -381,16 +380,6 @@ pub(crate) struct ProviderQuotaObservation {
     pub reset_at_ms: Option<i64>,
     pub observed_at_ms: i64,
     pub source: String,
-}
-
-#[async_trait]
-pub(crate) trait ProviderQuotaObserver: Send + Sync {
-    fn source(&self) -> &'static str;
-
-    async fn observe(
-        &self,
-        context: &ProviderQuotaContext<'_>,
-    ) -> ProviderResult<ProviderQuotaReading>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -616,6 +605,10 @@ pub(crate) struct InventoryPricing {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProviderInventoryModel {
+    #[serde(default)]
+    pub variant_rules: Vec<crate::catalog::ProviderVariantRule>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub server_default_routes: BTreeSet<String>,
     pub inventory_source: String,
     pub provider_model_id: String,
     pub model_uid: String,
@@ -649,6 +642,10 @@ pub(crate) struct ProviderInventoryModel {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProviderInventorySnapshot {
+    #[serde(default)]
+    pub instance_rules_fingerprint: String,
+    #[serde(default)]
+    pub discovered_model_ids: BTreeSet<String>,
     pub schema_version: u32,
     pub provider_instance_name: String,
     pub provider_profile_id: String,
@@ -660,6 +657,7 @@ pub(crate) struct ProviderInventorySnapshot {
     pub discovered_at_ms: i64,
     pub health: ProviderHealthState,
     pub models: Vec<ProviderInventoryModel>,
+    pub filtered_capabilities: Vec<buckyos_api::FilteredProviderCapability>,
     pub unmatched_models: Vec<UnmatchedInventoryModel>,
     pub unavailable_presets: Vec<UnavailablePreset>,
 }
@@ -693,6 +691,10 @@ impl ProviderInventorySnapshot {
                     canonical_fields: model.canonical_fields.clone(),
                     attributes: BTreeMap::from([
                         ("model_uid".into(), Value::String(model.model_uid.clone())),
+                        (
+                            "server_default_routes".into(),
+                            serde_json::json!(model.server_default_routes),
+                        ),
                         (
                             "pricing".into(),
                             model
@@ -736,6 +738,7 @@ pub(crate) struct UnavailablePreset {
 pub(crate) struct InventoryBuilder;
 
 impl InventoryBuilder {
+    #[cfg(test)]
     pub(crate) fn build(
         profile: &ProviderProfile,
         instance: &ProviderInstanceConfig,
@@ -763,6 +766,19 @@ impl InventoryBuilder {
             .as_deref()
             .unwrap_or(&profile.provider_profile_id);
         let rules = catalog.provider_rules(rules_id);
+        if instance.provider_rules_id.is_some() && rules.is_none() {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "unknown provider_rules_id: {rules_id}"
+            )));
+        }
+        let default_rules_id = if rules.is_none() {
+            catalog.protocol_default_rules_id(
+                &adapter.protocol_family_id,
+                &adapter.protocol_adapter_id,
+            )
+        } else {
+            None
+        };
         let instance_rules = instance.instance_rules.clone().unwrap_or_default();
         let enabled_static_models = instance_rules.enabled_inventory_models.as_ref();
         if let (Some(enabled), Some(rules)) = (enabled_static_models, rules) {
@@ -871,8 +887,14 @@ impl InventoryBuilder {
                 }
             }
         }
+        let discovered_model_ids = discovery
+            .models
+            .iter()
+            .map(|model| model.provider_model_id.clone())
+            .collect();
         let fingerprint = model_list_fingerprint(&discovery.models);
         let mut models = Vec::new();
+        let mut filtered_capabilities = Vec::new();
         let mut unmatched_models = Vec::new();
         let mut unavailable_presets = Vec::new();
 
@@ -1002,7 +1024,11 @@ impl InventoryBuilder {
             {
                 pricing = None;
             }
-            if let Some(value) = discovered.pricing.clone() {
+            if let Some(value) = discovered
+                .pricing
+                .clone()
+                .filter(|_| instance_rules.catalog.is_none() || pricing.is_none())
+            {
                 pricing = Some(InventoryPricing {
                     source: PricingSource::Discovery,
                     value,
@@ -1019,9 +1045,17 @@ impl InventoryBuilder {
                 static_api_types.retain(|api_type| discovered_api_types.contains(api_type));
             }
 
+            let default_operations = default_rules_id
+                .map(|id| catalog.resolve_provider_rule(id, &origin_model_id, &dimensions))
+                .transpose()
+                .map_err(|error| ProviderError::Inventory(error.to_string()))?
+                .flatten()
+                .map(|rule| rule.action.operations)
+                .unwrap_or_default();
             let mut api_types = Vec::new();
             let mut operations = BTreeMap::new();
             let mut adapter_features = BTreeSet::new();
+            let filtered_start = filtered_capabilities.len();
             for api_type_name in static_api_types {
                 let api_type = parse_api_type(&api_type_name)?;
                 let operation_id = resolve_operation(
@@ -1030,6 +1064,10 @@ impl InventoryBuilder {
                     discovered.remote_methods.as_ref(),
                     api_type,
                     &api_type_name,
+                    default_operations
+                        .get(api_type.typed_method())
+                        .or_else(|| default_operations.get(&api_type_name))
+                        .map(String::as_str),
                 )
                 .map_err(|error| {
                     ProviderError::Inventory(format!(
@@ -1038,6 +1076,13 @@ impl InventoryBuilder {
                     ))
                 })?;
                 let Some(operation_id) = operation_id else {
+                    filtered_capabilities.push(buckyos_api::FilteredProviderCapability {
+                        provider_model_id: discovered.provider_model_id.clone(),
+                        protocol_adapter_id: instance.protocol_adapter_id.clone(),
+                        api_type: api_type_name,
+                        operation_id: None,
+                        reason: "unsupported_api_type".into(),
+                    });
                     continue;
                 };
                 if discovered.remote_methods.as_ref().is_some_and(|methods| {
@@ -1047,9 +1092,24 @@ impl InventoryBuilder {
                 }) {
                     continue;
                 }
-                let descriptor = codecs
-                    .operation_descriptor(&instance.protocol_adapter_id, &operation_id, api_type)
-                    .map_err(|error| ProviderError::Inventory(error.to_string()))?;
+                let descriptor = match codecs.operation_descriptor(
+                    &instance.protocol_adapter_id,
+                    &operation_id,
+                    api_type,
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(error) if error.kind == ProtocolErrorKind::UnsupportedOperation => {
+                        filtered_capabilities.push(buckyos_api::FilteredProviderCapability {
+                            provider_model_id: discovered.provider_model_id.clone(),
+                            protocol_adapter_id: instance.protocol_adapter_id.clone(),
+                            api_type: api_type_name,
+                            operation_id: Some(operation_id),
+                            reason: "unregistered_binding".into(),
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(ProviderError::Inventory(error.to_string())),
+                };
                 let binding = descriptor
                     .binding(api_type)
                     .map_err(|error| ProviderError::Inventory(error.to_string()))?;
@@ -1089,21 +1149,26 @@ impl InventoryBuilder {
             )
             .map_err(|error| ProviderError::Inventory(error.to_string()))?
             .as_stable_string();
-            let mut variants = if catalog.provider_rules(rules_id).is_none() {
-                Vec::new()
-            } else {
+            let llm = catalog.llm_model(&model_driver_id, &origin_model_id);
+            let variant_rules_id = rules
+                .map(|_| rules_id)
+                .or_else(|| default_rules_id.filter(|_| instance.provider_profile_id != "custom" && llm.is_some()));
+            let mut variant_rules = if let Some(rules_id) = variant_rules_id {
                 catalog
                     .executable_variants(rules_id, &model_driver_id, &origin_model_id, &dimensions)
                     .map_err(|error| ProviderError::Inventory(error.to_string()))?
                     .into_iter()
                     .filter(|variant| variant.model_driver == model_driver_id)
-                    .map(|variant| InventoryModelVariant {
-                        name: variant.variant.clone(),
-                        logical_mounts: Vec::new(),
-                    })
+                    .cloned()
                     .collect::<Vec<_>>()
+            } else {
+                Vec::new()
             };
-            if let Some(llm) = catalog.llm_model(&model_driver_id, &origin_model_id) {
+            let mut variants = variant_rules.iter().map(|variant| InventoryModelVariant {
+                name: variant.variant.clone(),
+                logical_mounts: Vec::new(),
+            }).collect::<Vec<_>>();
+            if let Some(llm) = llm {
                 variants.retain(|variant| {
                     (!discovered.unsupported_features.contains("reasoning")
                         || variant.name == "reasoning-none")
@@ -1127,6 +1192,7 @@ impl InventoryBuilder {
             }
             variants.sort_by(|left, right| left.name.cmp(&right.name));
             variants.dedup_by(|left, right| left.name == right.name);
+            variant_rules.retain(|rule| variants.iter().any(|variant| variant.name == rule.variant));
             let inventory_source = if static_models.contains(&discovered.provider_model_id) {
                 "static_supplement"
             } else if profile.discovery_mode == DiscoveryMode::CatalogOnly {
@@ -1137,7 +1203,30 @@ impl InventoryBuilder {
                 "discovery"
             }
             .to_owned();
+            let mut server_default_routes = instance_rules
+                .server_default_routes
+                .get(&discovered.provider_model_id)
+                .or_else(|| {
+                    rules.and_then(|rules| rules.server_default_routes.get(&discovered.provider_model_id))
+                })
+                .cloned()
+                .unwrap_or_default();
+            if !api_types.contains(&ApiType::Llm)
+                && filtered_capabilities[filtered_start..]
+                    .iter()
+                    .any(|item| item.api_type == "llm")
+            {
+                server_default_routes.clear();
+            }
+            if !server_default_routes.is_empty() && !api_types.contains(&ApiType::Llm) {
+                return Err(ProviderError::InvalidConfiguration(format!(
+                    "server defaults require a recognized LLM: {}",
+                    discovered.provider_model_id
+                )));
+            }
             models.push(ProviderInventoryModel {
+                variant_rules,
+                server_default_routes,
                 inventory_source,
                 provider_model_id: discovered.provider_model_id,
                 model_uid,
@@ -1160,6 +1249,8 @@ impl InventoryBuilder {
         }
         models.sort_by(|left, right| left.provider_model_id.cmp(&right.provider_model_id));
         Ok(ProviderInventorySnapshot {
+            instance_rules_fingerprint: instance_rules_fingerprint(instance),
+            discovered_model_ids,
             schema_version: INVENTORY_SCHEMA_VERSION,
             provider_instance_name: instance.provider_instance_name.clone(),
             provider_profile_id: profile.provider_profile_id.clone(),
@@ -1170,6 +1261,7 @@ impl InventoryBuilder {
             discovered_at_ms: discovery.discovered_at_ms,
             health: discovery.health,
             models,
+            filtered_capabilities,
             unmatched_models,
             unavailable_presets,
         })

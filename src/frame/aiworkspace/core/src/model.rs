@@ -30,6 +30,12 @@ pub const TYPE_SHOW_PATH: &str = "buckyos.show-path";
 /// directories — isomorphic with the cyfs-ndn DirObject it materializes to. A value-type container: a
 /// member name is a version cell, renaming is remove + add. Not the data tree's `container(kind=folder)`.
 pub const TYPE_DIR: &str = "buckyos.dir";
+/// A task of a presentation session (第四期规划 §5.2, Q07): what participants are asked to answer, by whom, how many.
+pub const TYPE_TASK: &str = "buckyos.task";
+/// One participant's answer to a task (participant scope, Q07).
+pub const TYPE_RESPONSE: &str = "buckyos.response";
+/// A result the presenter published for a task (§4: a version made public on purpose, not the raw answers).
+pub const TYPE_RESULT: &str = "buckyos.result";
 pub const ROOT_ID: &str = "root";
 /// System nodes of the two trees (phase two §4): the data tree root, the Surface collection and the
 /// canvas content area (a system folder under `data` holding one folder per Surface).
@@ -38,16 +44,40 @@ pub const SURFACES_ID: &str = "surfaces";
 pub const CANVAS_CONTENT_ID: &str = "canvas-content";
 /// System folder under `data` holding the presentation paths and Viewports (third phase §6.2).
 pub const SHOWS_ID: &str = "shows";
+/// System folder under `data` holding a session's feeds, tasks, responses and results (第四期规划 §5.3, Q20). It is
+/// not one of the seq-0 nodes: the internal operation `system.ensure` creates it the first time it is needed.
+pub const SESSION_ID: &str = "session";
 pub const SCOPE_SHARED: &str = "shared";
+/// Readable by the presenters and managers of a session Workspace only (第四期规划 §4: notes, all responses).
+pub const SCOPE_PRESENTER: &str = "presenter";
+/// `participant:<principal>`: that participant's own data, also readable by presenters (Q07).
+pub const PARTICIPANT_PREFIX: &str = "participant:";
 pub const POLICY_OPEN: &str = "open";
 pub const POLICY_LOCK: &str = "lock_required";
 /// Reserved key of `key_revs` holding `source.members_rev`.
 pub const MEMBERS_KEY: &str = "#members";
 pub const FORMAT_VERSION: &str = "1.0";
-pub const PROTOCOL_VERSION: &str = "1.0";
+/// 1.1: Block-controls (`mindmap` containers, `"auto"` placement components, Blocks under Blocks inside a control,
+/// `slot`; 脑图方案 R12). A minor version only adds: requests of an older minor are still accepted.
+pub const PROTOCOL_VERSION: &str = "1.1";
+
+/// Requests speaking `version` are understood: the same major version, a minor not newer than ours.
+pub fn supports_protocol(version: &str) -> bool {
+    let split = |v: &str| v.split_once('.').and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)));
+    match (split(version), split(PROTOCOL_VERSION)) {
+        (Some((major, minor)), Some((our_major, our_minor))) => major == our_major && minor <= our_minor,
+        _ => false,
+    }
+}
 
 pub fn is_known_type(t: &str) -> bool {
-    matches!(t, TYPE_CONTAINER | TYPE_RECORD | TYPE_RICHTEXT | TYPE_TABLE | TYPE_CELL | TYPE_ASSET | TYPE_ANNOTATION | TYPE_WISH | TYPE_BLOCK_DEF | TYPE_VIEWPORT | TYPE_SHOW_PATH | TYPE_DIR)
+    matches!(t, TYPE_CONTAINER | TYPE_RECORD | TYPE_RICHTEXT | TYPE_TABLE | TYPE_CELL | TYPE_ASSET | TYPE_ANNOTATION | TYPE_WISH | TYPE_BLOCK_DEF | TYPE_VIEWPORT | TYPE_SHOW_PATH | TYPE_DIR | TYPE_TASK | TYPE_RESPONSE | TYPE_RESULT)
+}
+
+/// The session entity types: they live only in the `session` system folder and are written only by the session
+/// service (origin `session`).
+pub fn is_session_type(t: &str) -> bool {
+    matches!(t, TYPE_TASK | TYPE_RESPONSE | TYPE_RESULT)
 }
 
 /// The business Schema versions this build understands of a built-in type (内核架构改进 D01). An entity of
@@ -69,7 +99,7 @@ pub fn is_data_type(t: &str) -> bool {
 
 /// Fixed entities every Workspace has; they cannot be created, deleted, moved or renamed by operations.
 pub fn is_system_id(id: &str) -> bool {
-    matches!(id, ROOT_ID | DATA_ID | SURFACES_ID | CANVAS_CONTENT_ID | SHOWS_ID)
+    matches!(id, ROOT_ID | DATA_ID | SURFACES_ID | CANVAS_CONTENT_ID | SHOWS_ID | SESSION_ID)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +150,10 @@ impl EntityRow {
     }
     pub fn owner(&self) -> Option<&str> {
         self.scope.strip_prefix("user:")
+    }
+    /// The participant a `participant:` scoped entity belongs to.
+    pub fn participant(&self) -> Option<&str> {
+        self.scope.strip_prefix(PARTICIPANT_PREFIX)
     }
 }
 
@@ -199,7 +233,7 @@ impl RefEdge {
     }
     /// The frozen reference catalogue (内核架构改进 D05, §5.2): every kind names its version selection
     /// (`live` follows the target, `fixed` names a content) and its integrity (`strong` keeps the target
-    /// alive, `weak` may dangle). `REF_KINDS` is what `schemas/references.json` and the README mirror.
+    /// alive, `weak` may dangle). `REF_KINDS` is what the README (“References”) mirrors.
     pub const KINDS: &'static [(&'static str, &'static str, &'static str, &'static str)] = REF_KINDS;
 
     pub fn mode(&self) -> &'static str {
@@ -227,6 +261,8 @@ pub const REF_KINDS: &[(&str, &str, &str, &str)] = &[
     ("def", "live", "strong", "a Block uses this Block definition"),
     ("asset", "fixed", "strong", "an AssetRef or a directory member names this content object"),
     ("member", "live", "strong", "a resource directory holds this child directory"),
+    ("def_source", "live", "strong", "a Block definition's build source snapshot (a resource directory; extension controls P0)"),
+    ("def_dep", "live", "strong", "a control definition builds on this definition (deps; extension controls P1)"),
     ("object_link", "live", "weak", "an inline link in a rich text (dead when the target goes)"),
     ("input", "live", "weak", "a wish reads this entity"),
     ("derived", "fixed", "weak", "a result was generated from this version of the entity"),
@@ -539,7 +575,7 @@ impl MemStore {
     }
 }
 
-fn system_container(id: &str, kind: &str, name: Option<&str>, title: Option<&str>) -> EntityRow {
+pub fn system_container(id: &str, kind: &str, name: Option<&str>, title: Option<&str>) -> EntityRow {
     let mut payload = Map::new();
     payload.insert("kind".into(), Value::String(kind.into()));
     if let Some(t) = title {
@@ -550,6 +586,9 @@ fn system_container(id: &str, kind: &str, name: Option<&str>, title: Option<&str
     }
     if id == SHOWS_ID {
         payload.insert("system".into(), Value::String("shows".into()));
+    }
+    if id == SESSION_ID {
+        payload.insert("system".into(), Value::String("session".into()));
     }
     let mut key_revs = BTreeMap::new();
     for k in payload.keys() {

@@ -1,6 +1,7 @@
 mod agent_daemon;
 mod agent_mgr;
 mod agent_runtimes;
+mod aiws_pkg;
 mod app_install_deployer;
 mod app_login;
 mod app_install_driver;
@@ -13,18 +14,20 @@ mod app_mutation;
 mod app_package_namespace;
 mod app_servcie_mgr;
 mod app_staging;
+mod ext_tools_mgr;
+mod buckets;
 mod cluster_mgr;
 mod dashboard;
 mod desktop_folder;
-mod desktop_wallpaper;
 mod diagnostic_mgr;
 mod download_mgr;
 mod exclusive_invite;
 mod federation;
 mod image_data_url;
 mod ndn_download;
-mod pikg;
+use buckyos_api::pikg;
 mod pre_install_reconciler;
+mod product;
 mod redaction;
 mod sso_entry;
 mod sso_identity;
@@ -162,6 +165,7 @@ impl RpcAuthPrincipal {
                     | "agent.runtime_directory"
                     | "system.overview"
                     | "system.buckyos_info.get"
+                    | "system.product.get"
                     | "system.dev_mode.get"
                     | "system.status"
                     | "system.metrics"
@@ -180,6 +184,9 @@ impl RpcAuthPrincipal {
                     | "apps.staging.status"
                     | "apps.install.status"
                     | "apps.upgrade.check"
+                    | "ext_tools.catalog"
+                    | "ext_tools.status"
+                    | "ext_tools.plan"
                     | "zone.overview"
                     | "zone.devices.list"
                     | "zone.certificates.list"
@@ -189,7 +196,6 @@ impl RpcAuthPrincipal {
                     | "container.overview"
                     | "desktop.session.list"
                     | "desktop.state.get"
-                    | "desktop.wallpaper.get"
             )
         {
             return Err(RPCErrors::NoPermission(format!(
@@ -240,7 +246,6 @@ mod agent_permission_tests {
             "desktop.session.delete",
             "desktop.state.set",
             "desktop.state.delete",
-            "desktop.wallpaper.write",
             "future.read",
         ] {
             assert!(
@@ -265,7 +270,6 @@ mod agent_permission_tests {
             "gateway.file.get",
             "desktop.session.list",
             "desktop.state.get",
-            "desktop.wallpaper.get",
         ] {
             assert!(
                 read_only.require_agent_permission(method).is_ok(),
@@ -1238,6 +1242,7 @@ impl ControlPanelServer {
             "ui.locale.set" => Box::pin(self.handle_ui_locale_set(req)),
             // Auth
             "auth.login" => Box::pin(self.handle_auth_login(req)),
+            "auth.describe_target" => Box::pin(self.handle_auth_describe_target(req)),
             sys_auth_backend::PREPARE_APP_LAUNCH_METHOD => {
                 Box::pin(self.handle_auth_prepare_app_launch(req, principal))
             }
@@ -1344,6 +1349,7 @@ impl ControlPanelServer {
             "ui.dashboard" => Box::pin(self.handle_dashboard(req)),
             "system.overview" => Box::pin(self.handle_system_overview(req)),
             "system.buckyos_info.get" => Box::pin(self.handle_buckyos_info_get(req)),
+            "system.product.get" => Box::pin(self.handle_system_product_get(req)),
             "system.dev_mode.get" => Box::pin(self.handle_dev_mode_get(req)),
             "system.dev_mode.set" => Box::pin(self.handle_dev_mode_set(req, principal)),
             "system.status" => Box::pin(self.handle_system_status(req)),
@@ -1375,6 +1381,11 @@ impl ControlPanelServer {
             "system.update.apply" => Box::pin(self.handle_unimplemented(req, "Apply update")),
 
             //AppMgr
+            "ext_tools.catalog" => Box::pin(self.handle_ext_tools_catalog(req)),
+            "ext_tools.status" => Box::pin(self.handle_ext_tools_status(req)),
+            "ext_tools.plan" => Box::pin(self.handle_ext_tools_plan(req)),
+            "ext_tools.set_desired" => Box::pin(self.handle_ext_tools_set_desired(req, principal)),
+            "ext_tools.import" => Box::pin(self.handle_ext_tools_import(req, principal)),
             "apps.list" => Box::pin(self.handle_apps_list(req, principal)),
             "apps.details" => Box::pin(self.handle_app_detials(req, principal)),
             "apps.status" => Box::pin(self.handle_apps_status(req, principal)),
@@ -1519,6 +1530,12 @@ pub async fn start_control_panel_service() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("register control-panel runtime failed: {}", err))?;
 
     let control_panel_server = ControlPanelServer::new();
+    // Every product rule below (install admission, the Agent run slot,
+    // `system.product.get`) reads `system/product`: publish it first.
+    product::publish_installed_product().await.map_err(|error| {
+        log::error!("publish product profile failed: {:?}", error);
+        error
+    })?;
     // Agent 运行时 App 的本地 AppDoc 授权只在内存中，恢复安装任务前先重新注册。
     agent_mgr::register_agent_runtime_authorities().await;
     // 启动安装任务恢复循环；正常路径由业务 RPC 直接执行，TaskManager

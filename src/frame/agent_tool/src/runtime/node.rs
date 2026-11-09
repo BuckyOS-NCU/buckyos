@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use base64::Engine;
 use buckyos_api::{
-    encode_executor_control, encode_executor_data, executor_content_hash, is_forbidden_env_name,
+    AiToolCall, encode_executor_control, encode_executor_data, executor_content_hash, is_forbidden_env_name,
     read_executor_frame, ExecutorChannel, ExecutorClientInfo, ExecutorClientMessage,
     ExecutorDataFrame, ExecutorDescribeOk, ExecutorDescribeRequest, ExecutorEdit,
     ExecutorEditRequest, ExecutorError, ExecutorErrorCode, ExecutorExecRequest, ExecutorFrame,
@@ -26,7 +26,7 @@ use buckyos_api::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 
 use super::files::{
@@ -37,14 +37,14 @@ use super::{
     AgentRuntime, Capabilities, RuntimeConfig, RuntimeDescriptor, RuntimeInfo,
     RuntimeOpenCtx, CURRENT_TOOL_CALL,
 };
-use crate::exec_tracking::{unresolved_reason, InflightAction};
+use crate::exec_tracking::unresolved_reason;
 use crate::llm_bash::{
     sanitize_call_id, BashRunOutput, BashRunRequest, BashRunner, CommandHandle, CommandProgress,
     RunBinding, RunBindingSlot, OUTPUT_TAIL_BYTES, TOOL_SHELL,
 };
 use crate::xllm::{EffectiveTools, ToolsConfig, XllmDeps, XllmError, XllmToolManager};
 use crate::{AgentToolError, SessionRuntimeContext};
-use llm_context::tasks::{TaskResult, TaskState};
+use crate::task_model::{TaskResult, TaskState};
 
 pub const REMOTE_NODE_KIND: &str = "remote_node";
 const LOCATOR_VERSION: u32 = 1;
@@ -59,8 +59,7 @@ const BUSY_RETRY_WINDOW: Duration = Duration::from_secs(60);
 const BUSY_RETRY_FIRST: Duration = Duration::from_millis(100);
 const BUSY_RETRY_MAX: Duration = Duration::from_secs(2);
 
-pub trait NodeIo: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> NodeIo for T {}
+pub use buckyos_api::node_executor_ipc::ExecutorIo as NodeIo;
 
 /// Supplied by the host: a fresh byte stream to the executor of a node (via
 /// the local gateway) and the App session token to log in with.
@@ -402,6 +401,12 @@ impl NodeClient {
         let op_id = loc.op_id.clone();
         let call_id = loc.call_id.clone();
         let reply = match op {
+            RemoteOp::Computer { request } => self.request(
+                |rid, store, run| ExecutorClientMessage::Computer(buckyos_api::ExecutorComputerRequest {
+                    request_id: rid.into(), store_id: store.into(), op_id: op_id.clone(),
+                    run_id: run.into(), call_id: call_id.clone(), request: (*request).clone(),
+                }), None, Duration::ZERO,
+            ).await?,
             RemoteOp::Exec { cmd, cwd, env, timeout_ms } => {
                 self.request(
                     |rid, store, run| {
@@ -646,6 +651,7 @@ impl NodeClient {
 }
 
 pub(crate) enum RemoteOp<'a> {
+    Computer { request: &'a buckyos_api::ComputerRequest },
     Exec {
         cmd: &'a str,
         cwd: &'a str,
@@ -692,6 +698,7 @@ pub(crate) enum RemoteOp<'a> {
 impl RemoteOp<'_> {
     fn kind(&self) -> &'static str {
         match self {
+            RemoteOp::Computer { .. } => "computer",
             RemoteOp::Exec { .. } => "exec",
             RemoteOp::Read { .. } | RemoteOp::ReadRange { .. } => "read",
             RemoteOp::Write { .. } => "write",
@@ -705,6 +712,7 @@ impl RemoteOp<'_> {
 
     fn digest(&self) -> String {
         let value = match self {
+            RemoteOp::Computer { request } => json!({"kind": "computer", "request": request}),
             RemoteOp::Exec { cmd, cwd, env, timeout_ms } => {
                 json!({"kind": "exec", "cmd": cmd, "cwd": cwd, "env": env, "timeout_ms": timeout_ms})
             }
@@ -809,11 +817,7 @@ impl NodeClient {
             ));
         };
         let digest = op.digest();
-        let existing = if self.connector.executor_target().is_some() {
-            read_locator_checked(&run_dir, call_id)?
-        } else {
-            read_locator(&run_dir, call_id)
-        };
+        let existing = read_locator_checked(&run_dir, call_id)?;
         if let Some(existing) = existing {
             if existing.request_digest != digest || existing.kind != op.kind()
                 || existing.executor_target != self.connector.executor_target()
@@ -862,7 +866,9 @@ impl NodeClient {
 /// Windows path rules whatever OS this side runs on.
 fn remote_resolve(root: &Path, raw: &str, allowed: &[PathBuf]) -> Result<PathBuf, AgentToolError> {
     let root_text = root.to_string_lossy();
-    if !is_drive_path(&root_text) {
+    let root_text = plain_drive_path(&root_text);
+    let raw = plain_drive_path(raw);
+    if !is_drive_path(root_text) {
         let lexical = crate::path_utils::resolve_path_from_root(root, raw)?;
         check_allowed(&lexical, allowed)?;
         return Ok(lexical);
@@ -876,7 +882,12 @@ fn remote_resolve(root: &Path, raw: &str, allowed: &[PathBuf]) -> Result<PathBuf
         normalize_drive_path(&format!("{root_text}\\{raw}"))
     };
     let inside = |root: &PathBuf| {
-        let root = normalize_drive_path(&root.to_string_lossy()).to_ascii_lowercase();
+        let root = root.to_string_lossy();
+        let root = plain_drive_path(&root);
+        if !is_drive_path(root) {
+            return false;
+        }
+        let root = normalize_drive_path(root).to_ascii_lowercase();
         let path = lexical.to_ascii_lowercase();
         path == root || path.starts_with(&format!("{}\\", root.trim_end_matches('\\')))
     };
@@ -884,6 +895,14 @@ fn remote_resolve(root: &Path, raw: &str, allowed: &[PathBuf]) -> Result<PathBuf
         return Err(AgentToolError::InvalidArgs(format!("path not allowed by policy: {lexical}")));
     }
     Ok(PathBuf::from(lexical))
+}
+
+/// `\\?\C:\a` → `C:\a`: the verbatim form names the same Windows path.
+fn plain_drive_path(path: &str) -> &str {
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) if is_drive_path(rest) => rest,
+        _ => path,
+    }
 }
 
 fn is_drive_path(path: &str) -> bool {
@@ -1216,17 +1235,6 @@ impl FileBackend for RemoteNodeFiles {
         .await;
         Some(outcome)
     }
-
-    async fn path_type(&self, path: &Path) -> Result<PathType, AgentToolError> {
-        let path = path.to_string_lossy().to_string();
-        let status = self.run("stat", RemoteOp::Stat { path: &path, hash: false }).await?;
-        Ok(path_type_of(&status))
-    }
-
-    async fn mkdir(&self, path: &Path) -> Result<(), AgentToolError> {
-        let path = path.to_string_lossy().to_string();
-        self.run("mkdir", RemoteOp::Mkdir { path: &path }).await.map(|_| ())
-    }
 }
 
 fn path_type_of(status: &ExecutorOpStatus) -> PathType {
@@ -1264,6 +1272,7 @@ fn settled_status(status: ExecutorOpStatus, what: &str) -> Result<ExecutorOpStat
 pub struct RemoteNodeTarget {
     client: Arc<NodeClient>,
     described: ExecutorDescribeOk,
+    caps: Vec<buckyos_api::ExecutorOp>,
     max_file_bytes: usize,
 }
 
@@ -1287,12 +1296,18 @@ impl RemoteNodeTarget {
         Ok(Self {
             client: Arc::new(client),
             described,
+            caps: login.caps,
             max_file_bytes: login.limits.max_file_bytes as usize,
         })
     }
 
     pub fn described(&self) -> &ExecutorDescribeOk {
         &self.described
+    }
+
+    /// The operations the executor granted at login.
+    pub fn caps(&self) -> &[buckyos_api::ExecutorOp] {
+        &self.caps
     }
 
     pub fn os(&self) -> &str {
@@ -1600,10 +1615,10 @@ impl NodeRecovery {
         s
     }
 
-    pub(crate) async fn describe(&self, run: &RunBinding, action: &InflightAction) -> String {
+    pub(crate) async fn describe(&self, run: &RunBinding, call: &AiToolCall) -> String {
         let node = &self.node_did;
-        let tool = &action.tool;
-        match self.lookup(run, &action.call_id).await {
+        let tool = &call.name;
+        match self.lookup(run, &call.call_id).await {
             Recovered::NoLocator => format!(
                 "{tool} (remote_node {node}): the previous executor exited before this call was sent to the node (no operation locator), so it did not run there."
             ),
@@ -1671,7 +1686,7 @@ impl crate::tasks::RuntimeRecoveryReader for NodeRecovery {
                             code.map(|c| format!(" with exit code {c}")).unwrap_or_default(),
                             Self::tails(&out, &err)
                         ),
-                        tool_result: Some(llm_context::observation::ToolResultView {
+                        tool_result: Some(crate::result_view::ToolResultView {
                             cmd_name: Some(TOOL_SHELL.into()),
                             return_code: code,
                             summary: format!("{state:?}"),
@@ -1704,7 +1719,7 @@ impl RemoteNodeRuntime {
         let provisional = RuntimeDescriptor {
             runtime_id: config.id.clone().unwrap_or_default(),
             kind: REMOTE_NODE_KIND.into(),
-            host: config.remote_node.as_ref().and_then(|n| n.node_did.clone()),
+            host: config.remote_node.as_ref().and_then(|n| n.connect_target().map(str::to_string)),
             target: Value::Null,
             workdir: config.workdir.clone().unwrap_or_default(),
             capabilities: Capabilities::default(),
@@ -1719,7 +1734,7 @@ impl RemoteNodeRuntime {
 
     fn target(&self) -> (String, String) {
         let node = self.config.remote_node.clone().unwrap_or_default();
-        (node.node_did.unwrap_or_default(), node.profile_id.unwrap_or_default())
+        (node.connect_target().unwrap_or_default().to_string(), node.profile_id.unwrap_or_default())
     }
 
     fn runtime_id(&self) -> String {
@@ -1881,6 +1896,7 @@ impl AgentRuntime for RemoteNodeRuntime {
             files,
             &s.descriptor,
             ctx.run.clone(),
+            self.config().task_wait_ms(),
         )
         .await?;
         let mut info = self.info().await?;
@@ -1896,12 +1912,12 @@ impl AgentRuntime for RemoteNodeRuntime {
         Ok((effective, manager))
     }
 
-    async fn describe_interrupted(&self, run: &RunBinding, action: &InflightAction) -> String {
+    async fn describe_interrupted(&self, run: &RunBinding, call: &AiToolCall) -> String {
         if !matches!(
-            action.tool.as_str(),
+            call.name.as_str(),
             TOOL_SHELL | crate::TOOL_READ_FILE | crate::TOOL_WRITE_FILE | crate::TOOL_EDIT_FILE | crate::TOOL_READ
         ) {
-            return unresolved_reason(&action.tool);
+            return unresolved_reason(&call.name);
         }
         let (node, profile) = self.target();
         NodeRecovery {
@@ -1909,7 +1925,7 @@ impl AgentRuntime for RemoteNodeRuntime {
             node_did: node,
             profile_id: profile,
         }
-        .describe(run, action)
+        .describe(run, call)
         .await
     }
 }
@@ -2140,5 +2156,14 @@ mod tests {
         assert!(resolve(r"..\other").is_err());
         assert!(resolve(r"D:\ws").is_err());
         assert_eq!(remote_resolve(root, r"D:\x\..\y", &[]).unwrap(), PathBuf::from(r"D:\y"));
+
+        let verbatim = Path::new(r"\\?\C:\Users\owner\ws");
+        let verbatim_allowed = [verbatim.to_path_buf()];
+        assert_eq!(
+            remote_resolve(verbatim, r"C:\Users\owner\ws\a", &verbatim_allowed).unwrap(),
+            PathBuf::from(r"C:\Users\owner\ws\a")
+        );
+        assert_eq!(resolve(r"\\?\C:\Users\owner\ws\b").unwrap(), r"C:\Users\owner\ws\b");
+        assert!(remote_resolve(verbatim, r"C:\Users\owner\wsx", &verbatim_allowed).is_err());
     }
 }

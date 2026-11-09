@@ -249,7 +249,80 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
     let catalog = catalog();
     let providers = builtin_provider_registry(&catalog).unwrap();
     let codecs = providers.codecs();
+    let openrouter_matcher =
+        openrouter::OpenRouterDiscovery::new(HttpTransport::new(Default::default()).unwrap());
     for (provider, id, effort, pointer, expected) in [
+        ("sn", "glm-5", "none", "/reasoning/enabled", json!(false)),
+        ("sn", "glm-5", "thinking", "/reasoning/enabled", json!(true)),
+        ("sn", "glm-5.3", "low", "/reasoning/effort", json!("low")),
+        ("sn", "glm-5.3", "high", "/reasoning/effort", json!("high")),
+        ("sn", "glm-5.3", "max", "/reasoning/effort", json!("max")),
+        ("sn", "kimi-k3", "low", "/reasoning/effort", json!("low")),
+        ("sn", "kimi-k3", "high", "/reasoning/effort", json!("high")),
+        ("sn", "kimi-k3", "max", "/reasoning/effort", json!("max")),
+        (
+            "sn",
+            "qwen3.6-plus",
+            "none",
+            "/reasoning/enabled",
+            json!(false),
+        ),
+        (
+            "sn",
+            "qwen3.6-plus",
+            "thinking",
+            "/reasoning/enabled",
+            json!(true),
+        ),
+        (
+            "sn",
+            "qwen3.7-plus",
+            "none",
+            "/reasoning/enabled",
+            json!(false),
+        ),
+        (
+            "sn",
+            "qwen3.7-plus",
+            "thinking",
+            "/reasoning/enabled",
+            json!(true),
+        ),
+        (
+            "sn",
+            "qwen3.8-max-0902",
+            "low",
+            "/reasoning/effort",
+            json!("low"),
+        ),
+        (
+            "sn",
+            "qwen3.8-max-0902",
+            "medium",
+            "/reasoning/effort",
+            json!("medium"),
+        ),
+        (
+            "sn",
+            "qwen3.8-max-0902",
+            "xhigh",
+            "/reasoning/effort",
+            json!("xhigh"),
+        ),
+        (
+            "qwen",
+            "qwen3.8-max-0902",
+            "none",
+            "/reasoning/effort",
+            json!("none"),
+        ),
+        (
+            "openrouter",
+            "qwen/qwen3.8-max-0902",
+            "xhigh",
+            "/reasoning/effort",
+            json!("xhigh"),
+        ),
         (
             "qwen",
             "qwen3.8-flash",
@@ -363,6 +436,109 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
             "/reasoning/effort",
             json!("max"),
         ),
+        (
+            "openai",
+            "gpt-6.1-sol",
+            "high",
+            "/reasoning/effort",
+            json!("high"),
+        ),
+        (
+            "openai",
+            "gpt-6.1-sol",
+            "max",
+            "/reasoning/effort",
+            json!("max"),
+        ),
+        (
+            "openai",
+            "gpt-6.1-terra",
+            "xhigh",
+            "/reasoning/effort",
+            json!("xhigh"),
+        ),
+        (
+            "openai",
+            "gpt-6.1-terra",
+            "none",
+            "/reasoning/effort",
+            json!("none"),
+        ),
+        (
+            "sn",
+            "gpt-6-sol",
+            "medium",
+            "/reasoning/effort",
+            json!("medium"),
+        ),
+        (
+            "sn",
+            "gpt-6-sol",
+            "max",
+            "/reasoning/effort",
+            json!("max"),
+        ),
+        (
+            "sn",
+            "gpt-6-luna",
+            "none",
+            "/reasoning/effort",
+            json!("none"),
+        ),
+        (
+            "sn",
+            "gpt-5.5",
+            "high",
+            "/reasoning/effort",
+            json!("high"),
+        ),
+        ("sn", "glm-5", "thinking", "/reasoning/enabled", json!(true)),
+        ("sn", "glm-5", "none", "/reasoning/enabled", json!(false)),
+        ("sn", "glm-5.3", "high", "/reasoning/effort", json!("high")),
+        ("sn", "glm-5.3", "max", "/reasoning/effort", json!("max")),
+        ("sn", "kimi-k3", "max", "/reasoning/effort", json!("max")),
+        (
+            "sn",
+            "qwen3.7-plus",
+            "thinking",
+            "/reasoning/enabled",
+            json!(true),
+        ),
+        (
+            "sn",
+            "qwen3.7-plus",
+            "none",
+            "/reasoning/enabled",
+            json!(false),
+        ),
+        (
+            "sn",
+            "qwen3.8-max-0902",
+            "xhigh",
+            "/reasoning/effort",
+            json!("xhigh"),
+        ),
+        (
+            "openrouter",
+            "openai/gpt-6.1-sol",
+            "high",
+            "/reasoning/effort",
+            json!("high"),
+        ),
+        (
+            "openrouter",
+            "openai/gpt-6.1-terra",
+            "xhigh",
+            "/reasoning/effort",
+            json!("xhigh"),
+        ),
+        (
+            "openrouter",
+            "openai/gpt-6.1-terra",
+            "none",
+            "/reasoning/effort",
+            json!("none"),
+        ),
     ] {
         let profile = providers
             .profiles()
@@ -383,7 +559,15 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
             .unwrap();
             discovered.models = models;
         }
-        let inv = InventoryBuilder::build(profile, &config, discovered, &catalog, &codecs).unwrap();
+        let inv = InventoryBuilder::build_with_matcher(
+            profile,
+            &config,
+            discovered,
+            &catalog,
+            &codecs,
+            (provider == "openrouter").then_some(&openrouter_matcher as &dyn ProviderDiscovery),
+        )
+        .unwrap();
         let model = inv
             .models
             .iter()
@@ -415,12 +599,23 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
         let models =
             crate::service::builtin_registry_for_test(&catalog, &[inv.as_model_inventory()]);
         let exact = format!("{id}:reasoning-{effort}@test");
+        if provider == "sn" {
+            assert!(
+                models
+                    .resolve_candidates("llm.chat", ApiType::Llm)
+                    .unwrap()
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.model.identity.provider_model_id == id),
+                "{exact} not admitted to chat"
+            );
+        }
         let caller = CallerIdentity {
             tenant_id: "tenant".into(),
             user_id: "user".into(),
             app_id: None,
         };
-        let request = RoutingRequest::new("trace", "request", &exact, ApiType::Llm, caller);
+        let request = RoutingRequest::new("trace", "request", &exact, ApiType::Llm, caller.clone());
         let runtime = models
             .model_views()
             .into_iter()
@@ -435,7 +630,6 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
                         provider_privacy: ProviderPrivacy::PublicCloud,
                         trust: Some(ProviderTrustView {
                             provider_type: ProviderType::CloudApi,
-                            provider_type_source: ProviderTypeSource::SystemConfig,
                             provider_type_revision: "test".into(),
                             asserted_at_ms: 1,
                             trust_level: ProviderTrustLevel::Verified,
@@ -444,36 +638,43 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
                             tenant_id: "tenant".into(),
                         },
                         estimated_cost: None,
-                        p50_latency_ms: None,
                         p95_latency_ms: None,
-                        error_rate_5m: None,
-                        recent_failures: 0,
                         cache_hit_probability: None,
                     },
                 )
             })
             .collect();
         let policy = PolicyEngine::new(
-            EffectiveRoutingPolicy::merge(RoutingPolicyLayers {
-                system: None,
-                user: None,
-                app: None,
-                session: None,
-                request: None,
-            })
-            .unwrap(),
+            EffectiveRoutingPolicy::merge_ordered([]).unwrap(),
             Quota,
         )
         .unwrap();
         let route = Router::new(&models, &policy, &runtime)
             .route(&request)
             .unwrap();
+        if provider == "sn" {
+            let chat = Router::new(&models, &policy, &runtime)
+                .route(&RoutingRequest::new(
+                    "chat-trace",
+                    "chat-request",
+                    "llm.chat",
+                    ApiType::Llm,
+                    caller,
+                ))
+                .unwrap();
+            assert_eq!(chat.selected.provider_model_id, id);
+            assert_eq!(chat.selected.provider_instance_name, "test");
+        }
         // The output cap is optional in the canonical request; protocols that
         // require one get a default, the others must not grow one.
         for max_output_tokens in [Some(2048), None] {
             let mut request =
                 LlmChatInvokeRequest::new(&exact, vec![AiMessage::text(AiRole::User, "hello")]);
             request.max_output_tokens = max_output_tokens;
+            if provider == "openai" && id.starts_with("gpt-6.1-") {
+                request.temperature = Some(0.4);
+                request.top_p = Some(0.9);
+            }
             let call = buckyos_api::AiccCall::ChatCompletionsCreate(request);
             let credential = if provider == "claude" {
                 ResolvedCredential::named_header("secret://test", "x-api-key", "secret").unwrap()
@@ -485,6 +686,7 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
             };
             let target = ProviderCallTarget {
                 provider_rules_id: Some(provider.into()),
+                use_server_defaults: false,
                 base_url: config.base_url.clone(),
                 operation_base_urls: BTreeMap::new(),
                 credential,
@@ -520,6 +722,31 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
                 Some(&expected),
                 "{provider}/{id}/{effort}: {body}"
             );
+            if provider == "sn" {
+                assert_eq!(lowered.protocol_adapter_id, "sn-openai");
+                assert_eq!(lowered.operation, OPENAI_RESPONSES_OPERATION_ID);
+                assert_eq!(body["model"], id);
+                assert_eq!(
+                    body["reasoning"],
+                    if effort == "thinking" {
+                        json!({"enabled": true})
+                    } else if effort == "none" && (id.starts_with("glm-") || id.starts_with("qwen")) {
+                        json!({"enabled": false})
+                    } else {
+                        json!({"effort": effort})
+                    },
+                    "{provider}/{id}/{effort}: {body}"
+                );
+            }
+            if provider == "openai" && id.starts_with("gpt-6.1-") {
+                if effort == "none" {
+                    assert_eq!(body["temperature"], json!(0.4));
+                    assert_eq!(body["top_p"], json!(0.9));
+                } else {
+                    assert!(body.get("temperature").is_none(), "{id}/{effort}: {body}");
+                    assert!(body.get("top_p").is_none(), "{id}/{effort}: {body}");
+                }
+            }
             if provider == "claude" {
                 assert_eq!(
                     body["max_tokens"],
@@ -536,6 +763,166 @@ async fn builtin_presets_share_inventory_registry_and_wire_contracts() {
             }
         }
     }
+}
+
+#[test]
+fn gpt_6_1_presets_match_provider_channels_and_reject_unsupported_efforts() {
+    let catalog = catalog();
+    let providers = builtin_provider_registry(&catalog).unwrap();
+    let openrouter_matcher =
+        openrouter::OpenRouterDiscovery::new(HttpTransport::new(Default::default()).unwrap());
+    for (provider, prefix) in [("openai", ""), ("openrouter", "openai/"), ("sn", "")] {
+        let profile = providers
+            .profiles()
+            .find(|profile| profile.provider_profile_id == provider)
+            .unwrap();
+        let ids = [
+            format!("{prefix}gpt-6.1-sol"),
+            format!("{prefix}gpt-6.1-terra"),
+        ];
+        let inventory = InventoryBuilder::build_with_matcher(
+            profile,
+            &instance(profile, "test"),
+            discovery(&[&ids[0], &ids[1]]),
+            &catalog,
+            &providers.codecs(),
+            (provider == "openrouter").then_some(&openrouter_matcher as &dyn ProviderDiscovery),
+        )
+        .unwrap();
+        assert!(inventory.unmatched_models.is_empty(), "{provider}");
+        assert!(inventory.unavailable_presets.is_empty(), "{provider}");
+        if provider == "sn" {
+            assert!(
+                inventory.models.is_empty(),
+                "unlisted SN models must remain excluded"
+            );
+            continue;
+        }
+        assert_eq!(inventory.models.len(), 2, "{provider}");
+        let registry =
+            crate::service::builtin_registry_for_test(&catalog, &[inventory.as_model_inventory()]);
+        for model in &inventory.models {
+            let mut expected = vec![
+                "reasoning-high",
+                "reasoning-low",
+                "reasoning-max",
+                "reasoning-medium",
+                "reasoning-xhigh",
+            ];
+            if model.origin_model_id == "gpt-6.1-terra" {
+                expected.insert(4, "reasoning-none");
+            }
+            assert_eq!(
+                model
+                    .variants
+                    .iter()
+                    .map(|variant| variant.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{provider}/{}",
+                model.provider_model_id
+            );
+            for variant in expected {
+                let exact = format!("{}:{variant}@test", model.provider_model_id);
+                let resolved = registry.exact_model(&exact).unwrap();
+                assert_eq!(resolved.identity.origin_model_id, model.origin_model_id);
+            }
+        }
+        assert!(registry
+            .exact_model(&format!("{}:reasoning-none@test", ids[0]))
+            .is_none());
+        assert!(registry
+            .exact_model(&format!("{}:reasoning-minimal@test", ids[1]))
+            .is_none());
+    }
+}
+
+#[test]
+fn sn_presets_follow_model_metadata_and_discovery_restrictions() {
+    let catalog = catalog();
+    let providers = builtin_provider_registry(&catalog).unwrap();
+    let profile = providers
+        .profiles()
+        .find(|profile| profile.provider_profile_id == "sn")
+        .unwrap();
+    let ids = catalog
+        .llm_models()
+        .filter(|(driver, id, _)| {
+            *driver == "openai"
+                && catalog.provider_rules("sn").unwrap().models.iter()
+                    .any(|rule| rule.id == *id && !rule.exclude)
+        })
+        .map(|(_, id, _)| id)
+        .collect::<Vec<_>>();
+    assert!(!ids.is_empty());
+    for disable_reasoning in [false, true] {
+        let mut discovered = discovery(&ids);
+        if disable_reasoning {
+            for model in &mut discovered.models {
+                model.unsupported_features.insert("reasoning".into());
+            }
+        }
+        let inventory = InventoryBuilder::build(
+            profile,
+            &instance(profile, "sn"),
+            discovered,
+            &catalog,
+            &providers.codecs(),
+        )
+        .unwrap();
+        assert!(inventory.unmatched_models.is_empty());
+        assert_eq!(inventory.models.len(), ids.len());
+        if !disable_reasoning {
+            assert!(inventory.unavailable_presets.is_empty());
+        }
+        for model in &inventory.models {
+            let expected = catalog
+                .llm_model("openai", &model.origin_model_id)
+                .unwrap()
+                .semantics
+                .supported_efforts
+                .iter()
+                .filter_map(|effort| effort.variant())
+                .filter(|variant| !disable_reasoning || variant == "reasoning-none")
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                model
+                    .variants
+                    .iter()
+                    .map(|variant| variant.name.clone())
+                    .collect::<BTreeSet<_>>(),
+                expected,
+                "{} disable_reasoning={disable_reasoning}",
+                model.provider_model_id
+            );
+        }
+    }
+}
+
+#[test]
+fn sn_reasoning_presets_do_not_leak_to_non_llm_models_or_unsupported_drivers() {
+    let catalog = catalog();
+    let providers = builtin_provider_registry(&catalog).unwrap();
+    let profile = providers
+        .profiles()
+        .find(|profile| profile.provider_profile_id == "sn")
+        .unwrap();
+    let ids = ["gpt-image-2", "whisper-1", "claude-sonnet-5"];
+    let inventory = InventoryBuilder::build(
+        profile,
+        &instance(profile, "sn"),
+        discovery(&ids),
+        &catalog,
+        &providers.codecs(),
+    )
+    .unwrap();
+    assert!(inventory.unmatched_models.is_empty());
+    assert_eq!(inventory.models.len(), 1);
+    assert_eq!(inventory.models[0].provider_model_id, "gpt-image-2");
+    assert!(inventory.models[0].variants.is_empty());
+    assert!(!inventory.models.iter().any(|model| {
+        ["whisper-1", "claude-sonnet-5"].contains(&model.provider_model_id.as_str())
+    }));
 }
 
 #[test]
@@ -1152,7 +1539,7 @@ fn provider_pricing_contains_all_rebased_model_defaults() {
         ("glm", 101),
         ("kimi", 4),
         ("minimax", 23),
-        ("openai", 28),
+        ("openai", 30),
         ("qwen", 99),
     ] {
         assert_eq!(
@@ -1219,12 +1606,56 @@ fn every_builtin_provider_price_has_provenance() {
             );
         }
     }
-    assert_eq!(pricing_count, 326);
+    assert_eq!(pricing_count, 328);
 }
 
 #[test]
 fn corrected_provider_prices_match_official_billing_dimensions() {
     let catalog = catalog();
+
+    for (model, input, output, cache, write) in [
+        ("gpt-6.1-sol", 2e-6, 1e-5, 1e-7, 2.5e-6),
+        ("gpt-6.1-terra", 1e-6, 5e-6, 5e-8, 1.25e-6),
+    ] {
+        let pricing = catalog
+            .resolve_provider_rule("openai", model, &Default::default())
+            .unwrap()
+            .unwrap()
+            .action
+            .pricing
+            .unwrap();
+        assert_eq!(pricing.input_token, Some(input), "{model}");
+        assert_eq!(pricing.output_token, Some(output), "{model}");
+        assert_eq!(pricing.cache_input_token, Some(cache), "{model}");
+        assert_eq!(pricing.cache_write_input_token, Some(write), "{model}");
+        assert_eq!(
+            pricing.source_url,
+            Some(format!(
+                "https://developers.openai.com/api/docs/models/{model}"
+            ))
+        );
+        assert_eq!(pricing.verified_at.as_deref(), Some("2026-10-26"));
+        let tiers = pricing.tiers.as_ref().unwrap();
+        assert_eq!(tiers.dimension, crate::catalog::TierDimension::InputTokens);
+        assert_eq!(tiers.mode, crate::catalog::TierMode::Volume);
+        assert_eq!(tiers.steps[0].up_to, Some(272_001));
+        assert_eq!(tiers.steps[1].up_to, None);
+        assert_eq!(tiers.steps[1].input_token, Some(input * 2.0), "{model}");
+        assert!(
+            (tiers.steps[1].output_token.unwrap() - output * 1.5).abs() < 1e-15,
+            "{model}"
+        );
+        assert_eq!(
+            tiers.steps[1].cache_input_token,
+            Some(cache * 2.0),
+            "{model}"
+        );
+        assert_eq!(
+            tiers.steps[1].cache_write_input_token,
+            Some(write * 2.0),
+            "{model}"
+        );
+    }
 
     let claude = catalog.provider_rules("claude").unwrap();
     let haiku = claude

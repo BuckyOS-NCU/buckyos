@@ -1,9 +1,9 @@
 use crate::app_loader::{
-    buckyos_tool_mounts, command_matches_agent_process, command_matches_exact_agent_process,
-    container_list_contains_name, docker_deployment_health, docker_desc_requires_exact_match,
-    docker_image_tar_candidates_for_arch, docker_missing_text, docker_runtime_matches_deployment,
+    buckyos_tool_mounts, container_list_contains_name, docker_deployment_health,
+    docker_image_tar_candidates_for_arch, docker_runtime_matches_deployment,
     docker_runtime_matches_target, inspect_docker_image_layout, normalize_digest,
-    parse_docker_container_inspect, validate_app_launch_config, AppLoader, CommandSpec,
+    parse_docker_container_inspect, primary_service_port, validate_app_launch_config, AppLoader,
+    CommandSpec,
     ControlOperation, DockerCommandRunner,
     DockerExecOutcome, DockerRuntimeIdentity, PlatformArch, PlatformOs, PlatformTarget,
     RuntimeType, DOCKER_LABEL_APP_DOC_OBJECT_ID, DOCKER_LABEL_IMAGE_DIGEST, DOCKER_LABEL_PKG_ID,
@@ -23,9 +23,8 @@ use package_lib::PackageId;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn assert_programs(commands: &[CommandSpec], expected: &[&str]) {
@@ -305,7 +304,7 @@ fn agent_permission_mount_boundaries() {
     }
     let root = buckyos_kit::get_buckyos_root_dir();
     let home = root.join("data/home/alice");
-    let data = home.join(".local/share/jarvis-agent.example");
+    let data = home.join("agents/jarvis-agent.example");
     let pkg = root.join("test-package");
     fs::create_dir_all(&pkg).unwrap();
     fs::create_dir_all(home.join("Documents")).unwrap();
@@ -343,14 +342,21 @@ fn agent_permission_mount_boundaries() {
             },
         );
         config.external_mount_point.insert(
-            "/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example".into(),
+            "/other-agent".into(),
+            MountPointConfig {
+                target_path: "data/home/alice/agents/other-agent.example".into(),
+                access: "read_write".into(),
+            },
+        );
+        config.external_mount_point.insert(
+            "/opt/buckyos/data/home/alice/agents/jarvis-agent.example".into(),
             MountPointConfig {
                 target_path: "data/home/alice/Documents".into(),
                 access: "read_only".into(),
             },
         );
         config.external_mount_point.insert(
-            "/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example/agents/reader".into(),
+            "/opt/buckyos/data/home/alice/agents/jarvis-agent.example/subdir".into(),
             MountPointConfig {
                 target_path: "data/home/alice/Documents".into(),
                 access: "read_only".into(),
@@ -364,6 +370,7 @@ fn agent_permission_mount_boundaries() {
             "/opt/buckyos/data/home/alice",
             "/home-alias",
             "/external-home-alias",
+            "/other-agent",
         ] {
             let (_, _, access) = mounts.iter().find(|(path, _, _)| path == target).unwrap();
             assert_eq!(*access, expected_access, "{target}");
@@ -371,18 +378,18 @@ fn agent_permission_mount_boundaries() {
         let (_, actual, access) = mounts
             .iter()
             .find(|(path, _, _)| {
-                path == "/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example"
+                path == "/opt/buckyos/data/home/alice/agents/jarvis-agent.example"
             })
             .unwrap();
         assert_eq!(actual, &fs::canonicalize(&data).unwrap());
         assert_eq!(*access, "rw");
-        assert!(!mounts.iter().any(|(path, _, _)| path.ends_with("/agents/reader")));
+        assert!(!mounts.iter().any(|(path, _, _)| path.ends_with("/subdir")));
         let (_, storage, access) = mounts
             .iter()
             .find(|(path, _, _)| path == "/opt/buckyos/storage")
             .unwrap();
         assert_eq!(*access, "rw");
-        assert!(storage.starts_with(root.join("storage/apps")));
+        assert!(storage.starts_with(fs::canonicalize(root.join("storage/apps")).unwrap()));
         assert_ne!(storage, &root.join("storage"));
         if let Ok(image) = std::env::var("BUCKYOS_AGENT_MOUNTS_DOCKER_IMAGE") {
             let mut command = std::process::Command::new("docker");
@@ -407,7 +414,7 @@ fn agent_permission_mount_boundaries() {
             })
             .join("\n");
             let script = format!(
-                "set -eu\nmkdir -p /opt/buckyos/data/home/alice/.local/share/jarvis-agent.example/agents/reader\nprintf writable > /opt/buckyos/data/home/alice/.local/share/jarvis-agent.example/agents/reader/state\n{writes}"
+                "set -eu\nmkdir -p /opt/buckyos/data/home/alice/agents/jarvis-agent.example/subdir\nprintf writable > /opt/buckyos/data/home/alice/agents/jarvis-agent.example/subdir/state\n{writes}"
             );
             let output = command.args([&image, "-c", &script]).output().unwrap();
             assert!(
@@ -417,7 +424,7 @@ fn agent_permission_mount_boundaries() {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(
-                fs::read_to_string(data.join("agents/reader/state")).unwrap(),
+                fs::read_to_string(data.join("subdir/state")).unwrap(),
                 "writable"
             );
         }
@@ -720,14 +727,6 @@ fn local_paios_root() -> &'static Path {
     ROOT.get_or_init(|| tempdir().unwrap()).path()
 }
 
-fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
-}
-
 #[test]
 fn helper_functions_keep_expected_normalization() {
     let amd64_candidates = docker_image_tar_candidates_for_arch("demo", PlatformArch::Amd64);
@@ -783,21 +782,6 @@ fn default_tmp_mount_uses_platform_valid_host_path() {
             .join("alice")
             .join("demo.example")
     );
-}
-
-#[test]
-fn docker_missing_text_matches_lowercase_runtime_errors() {
-    assert!(docker_missing_text("error: no such object: 732418f568ce"));
-    assert!(docker_missing_text(
-        "Error response from daemon: No such container: demo"
-    ));
-    assert!(docker_missing_text("no such image: repo/demo:latest"));
-    assert!(docker_missing_text(
-        "Error response from daemon: get buckyos-exttool: no such volume"
-    ));
-    assert!(!docker_missing_text(
-        "permission denied while trying to connect to docker daemon"
-    ));
 }
 
 #[test]
@@ -868,7 +852,6 @@ fn docker_runtime_exact_match_uses_pkg_objid_and_digest() {
         .docker_image_digest("demo/service@sha256:deadbeef");
     desc.pkg_objid = Some(test_package_object_id(1));
 
-    assert!(docker_desc_requires_exact_match(&desc));
     assert!(docker_runtime_matches_target(
         &DockerRuntimeIdentity {
             image_id: Some("sha256:anotherhash".to_string()),
@@ -916,7 +899,6 @@ fn docker_runtime_exact_match_uses_pkg_objid_and_digest() {
 #[test]
 fn docker_runtime_exact_match_rejects_another_pkg_version_without_objid() {
     let desc = SubPkgDesc::new("demo-img#0.2.0");
-    assert!(docker_desc_requires_exact_match(&desc));
     assert!(!docker_runtime_matches_target(
         &DockerRuntimeIdentity {
             labels: HashMap::from([(
@@ -1041,54 +1023,6 @@ fn docker_runtime_exact_match_rejects_another_deployment_generation() {
 }
 
 #[test]
-fn agent_process_matching_distinguishes_wildcard_and_exact_checks() {
-    let agent_env = Path::new("/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example");
-    let expected_root =
-        Path::new("/opt/buckyos/env/pkgs/agent.jarvis-agent.example#pkg:1234567890");
-    let exact_cmd = vec![
-        "opendan".to_string(),
-        "--app-id".to_string(),
-        "jarvis-agent.example".to_string(),
-        "--agent-bin".to_string(),
-        expected_root.to_string_lossy().to_string(),
-        "--service-port".to_string(),
-        "4060".to_string(),
-    ];
-    let old_cmd = vec![
-        "opendan".to_string(),
-        "--app-id".to_string(),
-        "jarvis-agent.example".to_string(),
-        "--agent-bin".to_string(),
-        "/opt/buckyos/env/pkgs/agent.jarvis-agent.example#pkg:oldversion".to_string(),
-        "--service-port".to_string(),
-        "4060".to_string(),
-    ];
-
-    assert!(command_matches_agent_process(
-        &exact_cmd,
-        "jarvis-agent.example"
-    ));
-    assert!(command_matches_agent_process(
-        &old_cmd,
-        "jarvis-agent.example"
-    ));
-    assert!(command_matches_exact_agent_process(
-        &exact_cmd,
-        "jarvis-agent.example",
-        agent_env,
-        Some(expected_root),
-        Some("pkg:1234567890"),
-    ));
-    assert!(!command_matches_exact_agent_process(
-        &old_cmd,
-        "jarvis-agent.example",
-        agent_env,
-        Some(expected_root),
-        Some("pkg:1234567890"),
-    ));
-}
-
-#[test]
 fn appservice_control_commands_match_linux_amd64_docker_runtime() {
     let loader = build_service_loader(
         build_appservice_doc(),
@@ -1112,7 +1046,6 @@ fn appservice_control_commands_match_linux_amd64_docker_runtime() {
     let start = loader.preview_operation(ControlOperation::Start).unwrap();
     assert_eq!(start.runtime, RuntimeType::Docker);
     assert_programs(&start.commands, &["docker", "docker"]);
-    let runtime_key = test_runtime_key("demo.example");
     let container_name = test_container_name("test-app");
     assert_eq!(
         start.commands[0].args,
@@ -1252,12 +1185,12 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
     );
     assert_eq!(
         deploy.commands[4].args,
-        vec!["volume", "create", "buckyos-exttool-<image id 12>"]
+        vec!["volume", "create", "buckyos-tools"]
     );
     assert!(deploy.commands[5]
         .args
         .iter()
-        .any(|arg| arg == "buckyos-exttool-<image id 12>:/opt/buckyos/tools"));
+        .any(|arg| arg == "buckyos-tools:/mnt/buckyos-tools"));
     assert!(!deploy
         .commands
         .iter()
@@ -1288,7 +1221,7 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
         .args
         .contains(&"BUCKYOS_APP_TYPE=agent".to_string()));
     assert!(start.commands[1].args.contains(
-        &"BUCKYOS_DATA_DIR=/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example"
+        &"BUCKYOS_DATA_DIR=/opt/buckyos/data/home/alice/agents/jarvis-agent.example"
             .to_string(),
     ));
     assert!(start.commands[1]
@@ -1326,7 +1259,7 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
     assert!(start.commands[1]
         .args
         .iter()
-        .any(|arg| arg == "buckyos-exttool-<image id 12>:/opt/buckyos/tools:ro"));
+        .any(|arg| arg == "buckyos-tools:/opt/buckyos/tools:ro"));
     assert!(start.commands[1]
         .args
         .contains(&"BUCKYOS_EXTTOOL_DIR=/opt/buckyos/tools".to_string()));
@@ -1334,7 +1267,7 @@ fn agent_control_commands_match_expected_process_flow_on_linux() {
         .args
         .iter()
         .any(|arg| arg
-            == "<app_data>:/opt/buckyos/data/home/alice/.local/share/jarvis-agent.example:rw"));
+            == "<app_data>:/opt/buckyos/data/home/alice/agents/jarvis-agent.example:rw"));
     assert!(start.commands[1]
         .args
         .iter()
@@ -1489,7 +1422,7 @@ fn host_script_start_preview_uses_docker_with_script_service_image() {
     assert!(preview.commands[1]
         .args
         .iter()
-        .any(|a| a == "buckyos-exttool-<image id 12>:/opt/buckyos/tools:ro"));
+        .any(|a| a == "buckyos-tools:/opt/buckyos/tools:ro"));
     assert!(preview.commands[1]
         .args
         .iter()
@@ -1506,7 +1439,7 @@ fn host_script_start_preview_uses_docker_with_script_service_image() {
     assert!(!preview.commands[1]
         .args
         .iter()
-        .any(|a| a.contains("buckyos-tool") || a.contains("agent_skills")));
+        .any(|a| (a.contains("buckyos-tool") && !a.contains("buckyos-tools")) || a.contains("agent_skills")));
     assert!(!preview.commands[1]
         .args
         .iter()
@@ -1586,7 +1519,7 @@ fn host_script_deploy_preview_checks_local_images_without_pulling() {
     assert_eq!(preview.commands[2].args[3], "paios/exttool:latest-amd64");
     assert_eq!(
         preview.commands[3].args,
-        vec!["volume", "create", "buckyos-exttool-<image id 12>"]
+        vec!["volume", "create", "buckyos-tools"]
     );
 }
 
@@ -1618,7 +1551,7 @@ fn pinned_deploy_preview_loads_bundled_tarballs() {
     assert_eq!(docker[1], vec!["load", "-i", exttool_tar.to_str().unwrap()]);
     assert_eq!(
         docker[2],
-        vec!["volume", "create", "buckyos-exttool-444444444444"]
+        vec!["volume", "create", "buckyos-tools"]
     );
     assert!(docker[3].contains(&"paios/exttool:0.7.0-07787a750c1e-amd64".to_string()));
 
@@ -1628,7 +1561,7 @@ fn pinned_deploy_preview_loads_bundled_tarballs() {
         .contains(&"paios/aios:0.7.0-835b5bd44125-amd64".to_string()));
     assert!(start.commands[1]
         .args
-        .contains(&"buckyos-exttool-444444444444:/opt/buckyos/tools:ro".to_string()));
+        .contains(&"buckyos-tools:/opt/buckyos/tools:ro".to_string()));
 }
 
 #[test]
@@ -1772,7 +1705,7 @@ async fn fake_docker_outcome(args: &[String], state: &FakeDockerState) -> Docker
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     match args.as_slice() {
         ["volume", "ls", ..] => ok_outcome(state.volumes.lock().unwrap().join("\n")),
-        ["volume", "create", name] => {
+        ["volume", "create", .., name] => {
             state.volumes.lock().unwrap().push(name.to_string());
             ok_outcome(format!("{name}\n"))
         }
@@ -1829,7 +1762,7 @@ async fn concurrent_prepare_exttool_volume_seeds_exactly_once_without_pulling() 
         tokio::time::timeout(Duration::from_secs(5), prepare_both)
             .await
             .expect("both prepares should finish promptly");
-    let volume = "buckyos-exttool-4c1a2e5b6d7f";
+    let volume = "buckyos-tools";
     assert_eq!(agent_result.unwrap().as_deref(), Some(volume));
     assert_eq!(host_script_result.unwrap().as_deref(), Some(volume));
 
@@ -1840,25 +1773,25 @@ async fn concurrent_prepare_exttool_volume_seeds_exactly_once_without_pulling() 
             &entries,
             "image inspect --format={{json .}} paios/exttool:latest-amd64"
         ),
-        2,
-        "both callers must check the local ExtTool image: {entries:?}"
+        1,
+        "the second caller finds the seeded volume and needs no image: {entries:?}"
     );
     assert_eq!(count_entries(&entries, "pull"), 0, "{entries:?}");
     assert_eq!(
-        count_entries(&entries, &format!("volume create {volume}")),
+        count_entries(&entries, "volume create"),
         1,
         "the volume must be created exactly once: {entries:?}"
     );
     assert_eq!(
         count_entries(
             &entries,
-            "touch /opt/buckyos/tools/.buckyos-seeded-4c1a2e5b6d7f"
+            "touch /mnt/buckyos-tools/.buckyos-seeded"
         ),
         1,
         "the volume seeding run must happen exactly once: {entries:?}"
     );
     assert_eq!(
-        count_entries(&entries, "test -f /seed/.buckyos-seeded-4c1a2e5b6d7f"),
+        count_entries(&entries, "test -f /seed/.buckyos-seeded"),
         1,
         "the second caller only checks the seed marker: {entries:?}"
     );
@@ -1966,6 +1899,14 @@ fn docker_observation_loader(
                     ""
                 }
                 .to_string(),
+                ["images", "--quiet", "--no-trunc"] => {
+                    match (fixture.image_exists, fixture.container.as_ref()) {
+                        (true, Some(container)) => {
+                            container["Image"].as_str().unwrap_or_default().to_string()
+                        }
+                        _ => String::new(),
+                    }
+                }
                 _ => panic!("unexpected docker observation command: {args:?}"),
             };
             DockerExecOutcome {
@@ -2149,7 +2090,7 @@ async fn deployment_observation_retries_digest_inspect_after_failure() {
         loader.observe_deployment().await.unwrap().state,
         ServiceInstanceState::Started
     );
-    assert_eq!(fixture.lock().unwrap().commands.len(), 4);
+    assert_eq!(fixture.lock().unwrap().commands.len(), 5);
 }
 
 #[tokio::test]
@@ -2271,4 +2212,193 @@ async fn a_native_agent_process_is_recorded_found_and_stopped() {
     assert!(crate::service_pkg::read_process_identity(pid).is_none(), "the process ended");
     assert_eq!(loader.test_running_native_agent_pid(), None);
     assert!(fs::read_dir(state.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".json")));
+}
+
+fn lite_product() -> buckyos_api::ProductProfile {
+    buckyos_api::ProductProfile::parse(include_str!("../../../product/lite.json")).unwrap()
+}
+
+fn build_systest_doc() -> AppDoc {
+    let owner = DID::from_str("did:bns:buckyos").unwrap();
+    AppDoc::builder(AppType::AppService, "buckyos-systest", "0.5.1", "did:bns:buckyos", &owner)
+        .app_did(DID::from_str("did:bns:buckyos-systest.buckyos").unwrap())
+        .script_pkg(
+            SubPkgDesc::new("all.script.buckyos-systest.buckyos.bns.did#0.5.1")
+                .package_meta_object_id(test_package_object_id(31)),
+        )
+        .service_port("www", 3000)
+        .build()
+        .unwrap()
+}
+
+fn build_native_script_loader(app_doc: AppDoc, state_root: &Path) -> AppLoader {
+    let install_config = build_spec_config(&app_doc);
+    let app_spec = build_test_app_spec(app_doc, install_config);
+    let app_instance_id = app_spec.app_instance_id.to_string();
+    let mut config = AppServiceInstanceConfig::new("ood1", &app_spec).unwrap();
+    config.service_ports_config = HashMap::from([("www".to_string(), 10048)]);
+    config.run_mode = buckyos_api::AppRunMode::Native;
+    AppLoader::new_for_service(&app_instance_id, config)
+        .with_platform(PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64))
+        .with_product(lite_product())
+        .with_native_script("/opt/buckyos/libexec/buckyos-tool/runtime/deno", state_root)
+}
+
+/// BuckyOS Desktop Lite never runs a container: docker apps, the worker
+/// container of a script or local app and the Agent container are refused
+/// before any docker/wslc command, even where the device claims containers.
+#[test]
+fn lite_refuses_every_container_runtime() {
+    let platform = PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64);
+    let docker = build_service_loader(build_appservice_doc(), HashMap::new(), platform, true)
+        .with_product(lite_product());
+    let agent = build_agent_loader(platform).with_product(lite_product());
+    let local = AppLoader::new_for_local(
+        "desktop-tool",
+        LocalAppInstanceConfig {
+            target_state: ServiceInstanceState::Started,
+            enable: true,
+            app_doc: build_local_service_doc(),
+            user_id: "alice".to_string(),
+            install_config: ServiceSpecConfig::default(),
+        },
+    )
+    .with_platform(platform)
+    .with_container_support_override(true)
+    .with_product(lite_product());
+    // The preinstalled script app, but scheduled into a worker container.
+    let state = tempdir().unwrap();
+    let systest_in_container = {
+        let app_doc = build_systest_doc();
+        let install_config = build_spec_config(&app_doc);
+        let app_spec = build_test_app_spec(app_doc, install_config);
+        let config = AppServiceInstanceConfig::new("ood1", &app_spec).unwrap();
+        AppLoader::new_for_service(&app_spec.app_instance_id.to_string(), config)
+            .with_platform(platform)
+            .with_container_support_override(true)
+            .with_product(lite_product())
+            .with_native_script("/deno", state.path())
+    };
+    for loader in [docker, agent, local, systest_in_container] {
+        for operation in [ControlOperation::Deploy, ControlOperation::Start, ControlOperation::Status] {
+            assert!(
+                matches!(loader.preview_operation(operation), Err(ControlRuntItemErrors::NotSupport(_))),
+                "{operation:?}"
+            );
+        }
+    }
+}
+
+/// A preinstalled script app run natively: deploy only installs its
+/// package, start runs the node's Deno with the manifest's permissions on
+/// the package entry; nothing touches docker.
+#[test]
+fn a_preinstalled_script_app_runs_with_the_nodes_deno() {
+    let state = tempdir().unwrap();
+    let loader = build_native_script_loader(build_systest_doc(), state.path());
+    let deploy = loader.preview_operation(ControlOperation::Deploy).unwrap();
+    assert_eq!(deploy.runtime, RuntimeType::NativeScript);
+    assert_programs(&deploy.commands, &["pkg-install"]);
+    let start = loader.preview_operation(ControlOperation::Start).unwrap();
+    assert_eq!(start.runtime, RuntimeType::NativeScript);
+    assert_eq!(start.commands.len(), 1);
+    assert_eq!(start.commands[0].program, "/opt/buckyos/libexec/buckyos-tool/runtime/deno");
+    let args = &start.commands[0].args;
+    assert_eq!(&args[..2], ["run", "--no-prompt"]);
+    assert!(args.contains(&"--allow-net".to_string()));
+    assert!(args.last().unwrap().ends_with("main.ts"), "{args:?}");
+    assert!(start.commands.iter().all(|c| c.program != "docker"));
+}
+
+/// A script app learns where to listen from `BUCKYOS_SERVICE_PORT`: the port
+/// of its `www` service, or of its only service.
+#[test]
+fn a_script_app_is_handed_the_port_of_its_primary_service() {
+    assert_eq!(primary_service_port([("api", 9001), ("www", 9000)]), Some(9000));
+    assert_eq!(primary_service_port([("api", 9001)]), Some(9001));
+    assert_eq!(primary_service_port([("api", 9001), ("admin", 9002)]), None);
+    assert_eq!(primary_service_port(std::iter::empty()), None);
+}
+
+/// In a container the script app is handed the AppDoc inner port it listens
+/// on there (Docker publishes the instance port onto it).
+#[test]
+fn a_script_app_in_a_container_is_handed_its_inner_port() {
+    let app_doc = build_systest_doc();
+    let install_config = build_spec_config(&app_doc);
+    let app_spec = build_test_app_spec(app_doc, install_config);
+    let mut config = AppServiceInstanceConfig::new("ood1", &app_spec).unwrap();
+    config.service_ports_config = HashMap::from([("www".to_string(), 10032)]);
+    let loader = AppLoader::new_for_service(&app_spec.app_instance_id.to_string(), config)
+        .with_platform(PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64))
+        .with_container_support_override(true)
+        .with_worker_image_repo_override("paios/aios")
+        .with_paios_images_root(local_paios_root());
+    let start = loader.preview_operation(ControlOperation::Start).unwrap();
+    assert_eq!(start.runtime, RuntimeType::HostScript);
+    let run = start.commands.iter().find(|c| c.args.contains(&"run".to_string())).unwrap();
+    assert!(run.args.contains(&"BUCKYOS_SERVICE_PORT=3000".to_string()), "{:?}", run.args);
+}
+
+/// Running natively is only for the product's own script apps.
+#[test]
+fn a_script_app_outside_the_product_manifest_does_not_run_natively() {
+    let state = tempdir().unwrap();
+    let owner = DID::from_str("did:bns:test").unwrap();
+    let other = AppDoc::builder(AppType::AppService, "my-tool", "1.0.0", "did:bns:test", &owner)
+        .app_did(DID::from_str("did:web:my-tool.example").unwrap())
+        .script_pkg(SubPkgDesc::new("all.script.my-tool.example#1.0.0").package_meta_object_id(test_package_object_id(32)))
+        .service_port("www", 3000)
+        .build()
+        .unwrap();
+    let loader = build_native_script_loader(other, state.path());
+    assert!(matches!(
+        loader.preview_operation(ControlOperation::Start),
+        Err(ControlRuntItemErrors::NotSupport(_))
+    ));
+}
+
+/// What this edition cannot run does not exist on the node: a stopped
+/// instance needs nothing done (no error every round), the reason is reported.
+#[tokio::test]
+async fn an_unsupported_runtime_is_observed_as_not_existing_with_its_reason() {
+    let platform = PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64);
+    let docker = build_service_loader(build_appservice_doc(), HashMap::new(), platform, true)
+        .with_product(lite_product());
+    let observed = docker.observe_deployment().await.unwrap();
+    assert_eq!(observed.state, ServiceInstanceState::NotExist);
+    assert_eq!(observed.deployment_error.unwrap().code, "not_supported");
+}
+
+/// An Agent that ran natively and now has to run in a container this node
+/// does not have (its host runtime was closed) is not left running natively.
+#[tokio::test]
+async fn a_native_process_does_not_outlive_a_switch_to_an_unsupported_runtime() {
+    let state = tempdir().unwrap();
+    let native = build_native_agent_loader(false, state.path(), Path::new("/bin/sleep"));
+    native.test_spawn_native_agent(&["30".to_string()], state.path()).unwrap();
+    let pid = native.test_running_native_agent_pid().expect("the recorded process runs");
+
+    let app_doc = build_agent_doc_without_category();
+    let install_config = build_spec_config(&app_doc);
+    let app_spec = build_test_app_spec(app_doc, install_config);
+    let mut config = AppServiceInstanceConfig::new("ood1", &app_spec).unwrap();
+    config.run_mode = buckyos_api::AppRunMode::Container;
+    let container = AppLoader::new_for_service(&app_spec.app_instance_id.to_string(), config)
+        .with_platform(PlatformTarget::new(PlatformOs::Linux, PlatformArch::Amd64))
+        .with_container_support_override(false)
+        .with_product(lite_product())
+        .with_native_agent("/bin/sleep", state.path());
+    let observed = container.observe_deployment().await.unwrap();
+    assert_eq!(observed.state, ServiceInstanceState::NotExist);
+    assert_eq!(observed.deployment_error.unwrap().code, "not_supported");
+    for _ in 0..50 {
+        crate::service_pkg::reap_detached_children();
+        if crate::service_pkg::read_process_identity(pid).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(crate::service_pkg::read_process_identity(pid).is_none(), "the process ended");
+    assert_eq!(native.test_running_native_agent_pid(), None);
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { accessDenialOf, DENY_REASONS, type AccessDenial, type DenyReason } from 'buckyos'
+import { accessDenialOf, ANONYMOUS_IDENTITY, DENY_REASONS, type AccessDenial, type DenyReason } from 'buckyos'
 import {
   Alert,
   Box,
@@ -13,11 +13,14 @@ import {
   Typography,
 } from '@mui/material'
 import { Eye, EyeOff, ExternalLink, Fingerprint } from 'lucide-react'
-import { fetchSsoConfig } from '../api/sso'
+import { requestServiceLaunch } from '../api/app_launch'
+import { describeLoginTarget, fetchSsoConfig } from '../api/sso'
+import { onWorkspaceHost } from '../app/aiworkspace/links'
 import { useI18n } from '../i18n/provider'
 import { useDocumentTitle } from '../presentation/documentHead'
 import { useZonePresentation } from '../presentation/zone'
 import { denialText } from '../sso/denial'
+import { loadCurrentIdentity } from '../sso/identity'
 import { DidLoginForm } from '../sso/DidLoginForm'
 import { AuthPageFrame } from './AuthPageFrame'
 import { loginWithPassword } from './passwordLogin'
@@ -143,22 +146,16 @@ const LoginPage = () => {
   const didErrorText = useDidErrorText(searchParams.get('did_error') ?? '')
   const zone = useZonePresentation()
 
-  const sourceAppId = useMemo(() => {
-    if (!redirectUrl) return null
-    try {
-      const url = new URL(redirectUrl)
-      const host = url.hostname.toLowerCase()
-      // Extract subdomain prefix as app identifier
-      // e.g. "myapp.zone.buckyos.io" => "myapp"
-      const parts = host.split('.')
-      if (parts.length >= 3) {
-        const sub = parts[0]
-        if (sub !== 'www' && sub !== 'sys') return sub
-      }
-      return host
-    } catch {
-      return null
-    }
+  const [requester, setRequester] = useState<{ url: string; name: string } | null>(null)
+  const requesterName = requester?.url === redirectUrl ? requester.name : null
+
+  useEffect(() => {
+    if (!redirectUrl) return
+    let live = true
+    void describeLoginTarget(redirectUrl).then(({ data }) => {
+      if (live) setRequester(data ? { url: redirectUrl, name: data.display_name } : null)
+    })
+    return () => { live = false }
   }, [redirectUrl])
 
   const [username, setUsername] = useState(() => searchParams.get('username') ?? '')
@@ -179,6 +176,26 @@ const LoginPage = () => {
     })
     return () => { live = false }
   }, [])
+
+  // A page on a Workspace's own origin (`aiws-<id>.<zone>`, AI Workspace T4-8) sent its visitor here: someone
+  // already signed in on this host is handed over through the Control Panel's launch — the one-time callback on
+  // that origin signs them in there — without seeing the form. Anyone else signs in as usual.
+  const [handoff, setHandoff] = useState(() => {
+    try { return !!redirectUrl && onWorkspaceHost(new URL(redirectUrl).host) } catch { return false }
+  })
+  useEffect(() => {
+    if (!handoff) return
+    let live = true
+    void (async () => {
+      const identity = await loadCurrentIdentity().catch(() => ANONYMOUS_IDENTITY)
+      if (!live) return
+      const launch = identity.kind === 'anonymous' ? null : await requestServiceLaunch('aiworkspace', redirectUrl).catch(() => null)
+      if (!live) return
+      if (launch?.status === 'ready') window.location.replace(launch.callback_url)
+      else setHandoff(false)
+    })()
+    return () => { live = false }
+  }, [handoff, redirectUrl])
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -219,6 +236,14 @@ const LoginPage = () => {
   // DID login comes back to the page that asked for sign-in, or to the Desktop.
   const didRedirectUrl = redirectUrl || new URL('/', window.location.origin).href
 
+  if (handoff) {
+    return (
+      <Box sx={{ minHeight: '100dvh', display: 'grid', placeItems: 'center' }} data-testid="login-handoff">
+        <CircularProgress size={28} />
+      </Box>
+    )
+  }
+
   return (
     <AuthPageFrame
       title={<>Sign in to {zone.title}</>}
@@ -241,7 +266,7 @@ const LoginPage = () => {
           >
             Enter your credentials to continue
           </Typography>
-          {sourceAppId && (
+          {requesterName && (
             <Box
               sx={{
                 mt: 1.5,
@@ -257,7 +282,7 @@ const LoginPage = () => {
             >
               <ExternalLink size={14} style={{ opacity: 0.6 }} />
               <Typography variant="caption" color="text.secondary">
-                Requested by <strong>{sourceAppId}</strong>
+                Requested by <strong>{requesterName}</strong>
               </Typography>
             </Box>
           )}
@@ -292,6 +317,7 @@ const LoginPage = () => {
           <TextField
             label="Username"
             autoComplete="username"
+            slotProps={{ htmlInput: { autoCapitalize: 'none', autoCorrect: 'off', spellCheck: false } }}
             autoFocus
             value={username}
             onChange={(e) => setUsername(e.target.value)}

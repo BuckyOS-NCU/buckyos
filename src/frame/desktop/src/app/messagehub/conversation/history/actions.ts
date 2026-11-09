@@ -1,12 +1,14 @@
 import { createContext } from 'react'
-import type { DID, MessageObject } from '../../protocol/msgobj'
-import type { ReadReceipt } from '../../types'
+import type { DID } from 'buckyos'
+import type { MessageObject } from '../../protocol/msgobj'
+import type { GroupInvitationView, ReadReceipt } from '../../types'
+import type { WorklogDestination } from '../worklog/model'
 
 /** What a group notification card needs to show about its group. */
 export interface GroupNoticeView {
   groupName: string
   /** Only for invitations. */
-  state?: 'pending' | 'joined' | 'approval' | 'expired'
+  state?: GroupInvitationView['state']
 }
 
 /** Which relation actions the viewer may take on one message (host rules: author, time window, capability). */
@@ -48,8 +50,8 @@ export interface ConversationMessageActions {
   remove?: (message: MessageObject) => Promise<void>
   /** Pins the message to the session panel, or unpins it when it is the pinned one. */
   pin?: { isPinned: (message: MessageObject) => boolean; toggle: (message: MessageObject) => Promise<void> }
-  /** Opens the details of a message (original, effective content, edits, delivery, task). */
-  openDetails?: (message: MessageObject) => void
+  /** Opens the details of a message (original, effective content, edits, delivery, task); `worklog`: on that session's work log. */
+  openDetails?: (message: MessageObject, worklog?: WorklogDestination) => void
   /** Read receipt of an own group message, when the session shows receipts. */
   readReceipt?: (message: MessageObject) => ReadReceipt | null
   /** The viewer may answer, acknowledge and dismiss notification cards (the owner, never an observer). */

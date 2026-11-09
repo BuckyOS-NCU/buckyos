@@ -68,6 +68,7 @@ struct Sink {
     /// The target can be edited: a placeholder is offered.
     editable: bool,
     reject_placeholder: bool,
+    answer_placeholder_after_close: Option<std::path::PathBuf>,
     sent: Mutex<Vec<OutboundRecord>>,
 }
 
@@ -83,6 +84,17 @@ impl OutboundSink for Sink {
 
     async fn send(&self, _sid: &str, record: &OutboundRecord) -> SendResult {
         self.sent.lock().unwrap().push(record.clone());
+        if let (true, Some(path)) = (
+            record.key.ends_with(":placeholder"),
+            &self.answer_placeholder_after_close,
+        ) {
+            let sd = libopendan::SessionDir::open(path).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while sd.state().unwrap().turn_tasks.iter().all(|b| b.closed.is_none()) {
+                assert!(std::time::Instant::now() < deadline, "the Turn never closed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         if self.reject_placeholder && record.key.ends_with(":placeholder") {
             return SendResult::Rejected {
                 reason: "blocked".into(),
@@ -228,6 +240,57 @@ async fn a_slow_turn_sends_a_placeholder_and_edits_it() {
         vec![OutboxPurpose::Placeholder, OutboxPurpose::FinalEdit]
     );
     assert!(st.outbox.iter().all(|e| e.status == OutboxStatus::Sent));
+}
+
+async fn close_turn_while_placeholder_is_on_its_way(reject_placeholder: bool) -> (Vec<OutboundRecord>, SessionState) {
+    let env = Env::new();
+    let sd = env.create_work(ui_spec()).await;
+    libopendan::post_input(env.agent().as_ref(), sd.sid(), &from_bob("hello"))
+        .await
+        .unwrap();
+    let sink = Arc::new(Sink {
+        editable: true,
+        reject_placeholder,
+        answer_placeholder_after_close: Some(sd.path().to_path_buf()),
+        ..Default::default()
+    });
+    let tasks = Arc::new(Tasks::default());
+    let llm = ScriptedLlm::new(|_, _| {
+        std::thread::sleep(Duration::from_millis(300));
+        text("hi bob")
+    });
+    let deps = deps_with(&env, llm, &sink, &tasks, Duration::from_millis(50));
+    let r = drive(&sd, &deps, StopWhen::TurnClosed).await;
+    assert!(matches!(r, DriveResult::TurnClosed { turn: 1, .. }), "{r:?}");
+    let sent = sink.sent.lock().unwrap().clone();
+    (sent, sd.state().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_closing_while_the_placeholder_is_on_its_way_edits_it() {
+    let (sent, st) = close_turn_while_placeholder_is_on_its_way(false).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0].msg.content.content, "on it");
+    assert_eq!(sent[1].msg.content.content, "hi bob");
+    let rel = sent[1].msg.relates_to.as_ref().expect("the reply edits the placeholder");
+    assert_eq!(rel.rel, MsgRelType::Edit);
+    assert_eq!(rel.target.to_string(), msg_key(&sent[0].msg));
+    assert_eq!(st.turn_tasks[0].placeholder, Some(msg_key(&sent[0].msg)));
+    assert_eq!(
+        st.outbox.iter().map(|e| e.purpose).collect::<Vec<_>>(),
+        vec![OutboxPurpose::Placeholder, OutboxPurpose::FinalEdit]
+    );
+    assert!(st.outbox.iter().all(|e| e.status == OutboxStatus::Sent));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_placeholder_rejected_after_the_turn_closed_lets_the_reply_leave_on_its_own() {
+    let (sent, st) = close_turn_while_placeholder_is_on_its_way(true).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1].msg.content.content, "hi bob");
+    assert!(sent[1].msg.relates_to.is_none(), "nothing to edit at the other side");
+    assert!(task_of(&sent[1].msg).is_some());
+    assert_eq!(st.turn_tasks[0].placeholder, None);
 }
 
 #[tokio::test]
@@ -447,6 +510,8 @@ async fn a_sub_session_task_hangs_under_the_turn_that_created_it() {
                 let env = Env::at(&root);
                 let sub = SubSessionSpec {
                     objective: "first thing".into(),
+                    title: Some("First".into()),
+                    msgs: vec!["a long brief of the first thing".into()],
                     key: Some("k1".into()),
                     ..Default::default()
                 };
@@ -485,6 +550,11 @@ async fn a_sub_session_task_hangs_under_the_turn_that_created_it() {
         .expect("the sub session's Turn has a task");
     assert_eq!(of_child.parent_task, Some(parent_task));
     assert_eq!(of_child.kind, SessionKind::Work);
+    // A titled session's Turns are named by its title, not by its brief.
+    assert_eq!(of_child.title, "First");
+    // The parent's Turn keeps the user's message as its name.
+    assert_eq!(opened.iter().find(|o| o.session_id == sd.sid()).unwrap().title, "do two things");
+    assert!(child_dir.state().unwrap().finished_at_ms.is_some());
     // Its result goes to the parent session, never out as a message.
     assert!(sink
         .sent
@@ -672,5 +742,71 @@ async fn a_restart_at_any_stage_keeps_one_task_one_placeholder_one_edit() {
         "turn_task:after_close",
     ] {
         dies_at(fault).await;
+    }
+}
+
+/// The live line of an open Turn (TODO messagehub-worksession-ui §3.10): a
+/// call that states its intent is that intent, one that does not is
+/// `running <tool>`, a reply while its command still runs is waiting for
+/// that task; the Turn task's message and `one_line_status` are the same
+/// line. Closing the Turn writes the old ending line over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_line_is_the_call_intent_in_the_task_and_the_state() {
+    let env = Env::new();
+    let mut spec = ui_spec();
+    spec.prompt.llm_context = json!({
+        "tools": { "enabled": true, "tools": [{ "groupname": "bash_core" }] },
+        "runtime": { "task_wait_ms": 300 }
+    });
+    let sd = env.create_work(spec).await;
+    libopendan::post_input(env.agent().as_ref(), sd.sid(), &from_bob("build it"))
+        .await
+        .unwrap();
+    let dir = sd.clone();
+    let build = concat!(
+        "tries=0; until test -f release-build; do ",
+        "tries=$((tries + 1)); test $tries -lt 600 || exit 1; sleep 0.05; ",
+        "done; echo built"
+    );
+    let llm = ScriptedLlm::new(move |_, n| match n {
+        0 => tool_call(
+            "c1",
+            "shell",
+            json!({ "command": build, "intent": "  build the crate " }),
+        ),
+        1 => {
+            assert_eq!(dir.state().unwrap().one_line_status, "build the crate");
+            tool_call("c2", "shell", json!({ "command": "echo hi" }))
+        }
+        2 => {
+            // Within a second of the last commit: committed at the boundary.
+            assert_eq!(dir.state().unwrap().one_line_status, "running shell");
+            text("still building")
+        }
+        _ => text("built: done"),
+    });
+    let tasks = Arc::new(Tasks::default());
+    let deps = deps_with(&env, llm.clone(), &Arc::new(Sink::default()), &tasks, Duration::from_secs(60));
+    let waiting = tokio::time::timeout(
+        Duration::from_secs(15),
+        drive(&sd, &deps, StopWhen::Idle),
+    )
+    .await;
+    let waiting_line = sd.state().unwrap().one_line_status;
+    std::fs::write(sd.path().join("release-build"), "").unwrap();
+    waiting.expect("drive must yield while the shell task is pending");
+    assert_eq!(waiting_line, "waiting for 1 task(s)");
+    let started = std::time::Instant::now();
+    while llm.count() < 4 && started.elapsed() < Duration::from_secs(15) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drive(&sd, &deps, StopWhen::Idle).await;
+    }
+    assert_eq!(llm.count(), 4);
+    let st = sd.state().unwrap();
+    assert_eq!(st.turns_completed, 1);
+    assert!(st.one_line_status.contains("built: done"), "{}", st.one_line_status);
+    let messages: Vec<String> = tasks.updates.lock().unwrap().iter().map(|(_, u)| u.message.clone()).collect();
+    for line in ["build the crate", "running shell", "waiting for 1 task(s)"] {
+        assert!(messages.iter().any(|m| m == line), "{line} not in {messages:?}");
     }
 }

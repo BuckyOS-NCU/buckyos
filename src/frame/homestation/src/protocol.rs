@@ -312,23 +312,25 @@ pub fn parse_obj_id(value: &str) -> Result<ObjId, String> {
 }
 
 pub fn obj_id_of(obj_type: &str, claims: &Value) -> Result<(String, String), String> {
-    let jcs = serde_jcs_string(claims)?;
+    let jcs = serde_jcs_string(obj_type, claims)?;
     let (id, _) = build_named_object_by_json(obj_type, claims);
     Ok((id.to_string(), jcs))
 }
 
 /// The locked ndn-lib silently hashes `{}` when canonicalization fails; refuse such values.
-fn serde_jcs_string(value: &Value) -> Result<String, String> {
-    fn check(value: &Value) -> Result<(), String> {
+/// HomeStation's own objects are integer only. A `cyfile` is a CYFS standard object whose
+/// common meta (`geo`, `exposure`) holds floats.
+fn serde_jcs_string(obj_type: &str, value: &Value) -> Result<String, String> {
+    fn check(value: &Value, floats_allowed: bool) -> Result<(), String> {
         match value {
             Value::Number(n) if n.as_f64().is_some_and(|f| !f.is_finite()) => Err("non-finite number".into()),
-            Value::Number(n) if n.is_f64() => Err("floating point numbers are not allowed in objects".into()),
-            Value::Array(items) => items.iter().try_for_each(check),
-            Value::Object(map) => map.values().try_for_each(check),
+            Value::Number(n) if n.is_f64() && !floats_allowed => Err("floating point numbers are not allowed in objects".into()),
+            Value::Array(items) => items.iter().try_for_each(|item| check(item, floats_allowed)),
+            Value::Object(map) => map.values().try_for_each(|item| check(item, floats_allowed)),
             _ => Ok(()),
         }
     }
-    check(value)?;
+    check(value, obj_type == OBJ_TYPE_FILE)?;
     let (_, jcs) = build_named_object_by_json("x", value);
     if jcs == "{}" && value.as_object().is_none_or(|m| !m.is_empty()) {
         return Err("object cannot be canonicalized".into());
@@ -382,9 +384,19 @@ impl HomeRef {
         Self { zone: zone.trim_end_matches('.').to_ascii_lowercase(), user: user.to_string() }
     }
 
-    /// `cyfs://<zone>/home/<user>`
+    /// `https://<zone>/home/<user>`: the default Object URL, also across zones (doc/key url.md §6).
     pub fn base(&self) -> String {
-        format!("cyfs://{}/home/{}", self.zone, self.user)
+        format!("https://{}/home/{}", self.zone, self.user)
+    }
+
+    /// The current-zone alias `obj://homestation/home/<user>[/<rest>]`.
+    pub fn obj_url(&self, rest: &str) -> String {
+        let rest = rest.trim_matches('/');
+        if rest.is_empty() {
+            format!("obj://homestation/home/{}", self.user)
+        } else {
+            format!("obj://homestation/home/{}/{}", self.user, rest)
+        }
     }
 
     pub fn stream(&self) -> String {
@@ -415,7 +427,7 @@ pub fn valid_user_segment(user: &str) -> bool {
             && user != "..")
 }
 
-/// A mutable entry: a path under the publisher's home (`cyfs://<zone>/home/<user>/...`), or a
+/// A mutable entry: a path under the publisher's home (`https://<zone>/home/<user>/...`), or a
 /// content DID (E08).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryRef {
@@ -432,7 +444,7 @@ impl EntryRef {
             }
             return Ok(Self::Did(entry.to_string()));
         }
-        let rest = entry.strip_prefix("cyfs://").ok_or_else(|| format!("entry must be a cyfs URL or DID: {entry:?}"))?;
+        let rest = entry.strip_prefix("https://").or_else(|| entry.strip_prefix("cyfs://")).ok_or_else(|| format!("entry must be an https URL or DID: {entry:?}"))?;
         let (zone, path) = rest.split_once('/').ok_or_else(|| format!("entry has no path: {entry:?}"))?;
         let zone = zone.to_ascii_lowercase();
         if zone.is_empty() || zone.contains(':') {
@@ -442,7 +454,7 @@ impl EntryRef {
         let (home, user, ns, at, key) = (segments.next(), segments.next(), segments.next(), segments.next(), segments.next());
         let user = user.unwrap_or_default();
         if home != Some("home") || at != Some("@") || segments.next().is_some() || !valid_user_segment(user) || user == ZONE_FEED {
-            return Err(format!("entry must look like cyfs://<zone>/home/<user>/<namespace>/@/<key>: {entry:?}"));
+            return Err(format!("entry must look like https://<zone>/home/<user>/<namespace>/@/<key>: {entry:?}"));
         }
         let namespace = ns.and_then(EntryNamespace::parse).ok_or_else(|| format!("unknown entry namespace in {entry:?}"))?;
         let key = key.unwrap_or_default();
@@ -656,19 +668,27 @@ mod tests {
     fn entry_urls_round_trip() {
         let home = HomeRef::new("Example.org", "alice");
         let url = home.entry(EntryNamespace::Feed, "garden-0001");
-        assert_eq!(url, "cyfs://example.org/home/alice/feed/@/garden-0001");
-        assert_eq!(home.stream(), "cyfs://example.org/home/alice/feed");
-        assert_eq!(home.inbox(), "cyfs://example.org/home/alice/inbox");
+        assert_eq!(url, "https://example.org/home/alice/feed/@/garden-0001");
+        assert_eq!(home.stream(), "https://example.org/home/alice/feed");
+        assert_eq!(home.inbox(), "https://example.org/home/alice/inbox");
+        assert_eq!(home.obj_url("feed"), "obj://homestation/home/alice/feed");
         assert_eq!(home.path("objects/x"), "/home/alice/objects/x");
         let parsed = EntryRef::parse(&url).unwrap();
         assert_eq!(parsed.zone(), Some("example.org"));
         assert_eq!(parsed.home(), Some(&home));
-        assert!(EntryRef::parse("cyfs://example.org/home/feed/@/garden").is_err());
-        assert!(EntryRef::parse("cyfs://example.org/home/alice/feed/garden").is_err());
-        assert!(EntryRef::parse("https://example.org/home/alice/feed/@/x").is_err());
+        assert!(EntryRef::parse("https://example.org/home/feed/@/garden").is_err());
+        assert!(EntryRef::parse("https://example.org/home/alice/feed/garden").is_err());
+        assert_eq!(EntryRef::parse("cyfs://example.org/home/alice/feed/@/x").unwrap(), EntryRef::parse("https://example.org/home/alice/feed/@/x").unwrap());
+        for other in ["https://other.org/home/alice/feed/@/x", "https://example.org/home/bob/feed/@/x", "https://example.org/home/alice/follows/@/x", "https://example.org/home/alice/feed/@/y"] {
+            assert_ne!(EntryRef::parse("cyfs://example.org/home/alice/feed/@/x").unwrap(), EntryRef::parse(other).unwrap());
+        }
         assert!(EntryRef::parse("cyfs://example.org/home/alice/feed/@/a/b").is_err());
-        assert!(EntryRef::parse("cyfs://example.org/home/~zone/feed/@/x").is_err());
-        assert!(EntryRef::parse("cyfs://example.org/home/a%2Fb/feed/@/x").is_err());
+        assert!(EntryRef::parse("cyfs://example.org:80/home/alice/feed/@/x").is_err());
+        assert!(EntryRef::parse("http://example.org/home/alice/feed/@/x").is_err());
+        assert!(EntryRef::parse("obj://homestation/home/alice/feed/@/x").is_err());
+        assert!(EntryRef::parse("https://example.org/home/alice/feed/@/a/b").is_err());
+        assert!(EntryRef::parse("https://example.org/home/~zone/feed/@/x").is_err());
+        assert!(EntryRef::parse("https://example.org/home/a%2Fb/feed/@/x").is_err());
         assert!(matches!(EntryRef::parse("did:bns:plant-stand").unwrap(), EntryRef::Did(_)));
     }
 
@@ -744,5 +764,31 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.starts_with("cyfeed:"));
         assert!(obj_id_of(OBJ_TYPE_FEED, &json!({ "a": 0.5 })).is_err());
+        // Except the common meta of a standard `cyfile`, hashed as Rust and the SDK both do.
+        let (file, _) = obj_id_of(OBJ_TYPE_FILE, &json!({ "geo": { "lat": 34.9949 }, "create_time": 0, "last_update_time": 0 })).unwrap();
+        assert!(file.starts_with("cyfile:"));
+    }
+
+    // Written by the helper, with floats that hold whole numbers: serde_json prints `2.0`
+    // but JCS writes `2`. The ObjId is the one the SDK computes for the same object.
+    #[test]
+    fn a_cyfile_with_common_meta_has_the_sdks_object_id() {
+        let mut file = ndn_lib::FileObject::new("a.jpg".to_string(), 3, "mix256:00".to_string());
+        file.apply_media_meta(&ndn_lib::MediaMeta {
+            mime: Some("image/jpeg".to_string()),
+            width: Some(10),
+            height: Some(20),
+            geo: Some(ndn_lib::MediaGeo { lat: 34.9949, lon: -135.7567, alt: Some(-7.5), heading: Some(90.0), accuracy_m: Some(0.0) }),
+            exposure: Some(ndn_lib::MediaExposure {
+                iso: Some(100),
+                f_number: Some(2.0),
+                focal_length_mm: Some(50.0),
+                exposure_time: Some("1/120".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (id, _) = obj_id_of(OBJ_TYPE_FILE, &serde_json::to_value(&file).unwrap()).unwrap();
+        assert_eq!(id, "cyfile:fd3c8a8b83f78d4475957c428ef6061c6d2e760ca52c28beac590dfcc3520269");
     }
 }

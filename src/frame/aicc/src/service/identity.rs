@@ -371,10 +371,17 @@ impl AuthorizedCaller {
         )
     }
 
-    pub(crate) fn operator_id(&self) -> Option<&str> {
+    /// The App AICC files this call's artifacts under in the user's buckets:
+    /// the business App of a direct call, `system:<service>` otherwise.
+    pub(crate) fn artifact_app(&self) -> Option<String> {
         match &self.principal {
-            CallerPrincipal::Account { operator_id, .. } => operator_id.as_deref(),
-            CallerPrincipal::System { .. } => None,
+            CallerPrincipal::Account {
+                mode: AiccAttributionMode::Direct,
+                ..
+            } => self.app_id.clone(),
+            CallerPrincipal::Account { caller, .. } | CallerPrincipal::System { caller } => {
+                Some(business_app(caller))
+            }
         }
     }
 

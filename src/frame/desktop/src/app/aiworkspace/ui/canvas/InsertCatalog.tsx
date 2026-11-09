@@ -5,7 +5,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import FocusTrap from '@mui/material/Unstable_TrapFocus'
-import { ArrowDownToLine, Check, Database, FileUp, FlaskConical, FolderUp, Frame, Grid2X2, Image, Info, Layers3, LetterText, MousePointer2, Plus, Puzzle, Search, Shapes, Sparkles, Spline, StickyNote, Table, Type, X, type LucideIcon } from 'lucide-react'
+import { ArrowDownToLine, Check, Database, FileUp, FlaskConical, FolderUp, Frame, Grid2X2, Image, Info, Layers3, LetterText, MousePointer2, Plus, Puzzle, Search, Shapes, Sparkles, Spline, StickyNote, Table, Type, X, Network, type LucideIcon } from 'lucide-react'
 import type { BlockDefPayload, EntityEnvelope, Json } from '../../api/types'
 import type { ReadOk } from '../../api/session'
 import { useLoad, useOutlineVersion, useStore, useUserState } from '../../state/hooks'
@@ -17,22 +17,27 @@ import { ShapePicker } from '../blocks/shapeBlock'
 import { svgShapeFromDocument } from '@drawio/svg'
 import type { ShapeKind } from '@drawio/shapes'
 import { allEntries, dataFor, entryId, entrySize, type CatalogEntry, type InsertRequest } from './catalog'
+import { InstanceForm } from '../extensions/InstanceForm'
+import { configProblems, missingBindings } from '../extensions/controls'
+import { useShell } from '../shell/shellContext'
 
 export type CatalogTab = 'all' | CatalogGroup | 'existing'
 const TABS: CatalogTab[] = ['all', 'text', 'data', 'layout', 'ai', 'sample', 'extension', 'existing']
 const TAB_ICONS: Record<CatalogTab, LucideIcon> = { all: Grid2X2, text: Type, data: Database, layout: Shapes, ai: Sparkles, sample: FlaskConical, extension: Puzzle, existing: Layers3 }
-const ENTRY_ICONS: Record<string, LucideIcon> = { richtext: Type, 'shape-text': LetterText, note: StickyNote, shape: Shapes, connector: Spline, frame: Frame, table: Table, asset: Image, wish: Sparkles }
+const ENTRY_ICONS: Record<string, LucideIcon> = { richtext: Type, 'shape-text': LetterText, note: StickyNote, shape: Shapes, connector: Spline, frame: Frame, mindmap: Network, table: Table, asset: Image, wish: Sparkles }
 
 function EntryIcon({ entry }: { entry: CatalogEntry }) {
   const Icon = ENTRY_ICONS[entryId(entry)] ?? TAB_ICONS[entry.group]
   return <span className="aiws-catalog-entry-icon" data-group={entry.group}><Icon size={20} aria-hidden="true" /></span>
 }
 
-export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClose, onInsert, onImport, onImportAssets }: {
+export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClose, onInsert, onImport, onImportAssets, onImportTable }: {
   initialTab?: CatalogTab
   initialKey?: string
   /** "Import draw.io…" (draw.io 导入 TODO §3), when importing is possible here. */
   onImport?: () => void
+  /** The table entry's "From a file…" (表格数据导入 TODO §5.1): straight to the file picker and the wizard. */
+  onImportTable?: () => void
   onImportAssets?: (files: File[], folder: boolean, signal: AbortSignal) => Promise<void>
   /** A free Surface: the entry can also be placed by a click on the canvas. */
   canPlace: boolean
@@ -40,6 +45,7 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
   onInsert: (request: InsertRequest, how: 'center' | 'place') => void
 }) {
   const store = useStore()
+  const shell = useShell()
   const { t } = useAiwsText()
   useOutlineVersion()
   useOverlayMounted()
@@ -111,7 +117,9 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
                 <div className="aiws-catalog-browser">
                   <div className="aiws-catalog-section-label">{tabLabel(tab)}<span className="aiws-catalog-count">{shown.length}</span></div>
                   <ul className="aiws-catalog-list" aria-label={t('aiworkspace.canvas.catalog.objects')} data-testid="aiws-catalog-list">
-                    {shown.length === 0 && <li className="aiws-catalog-empty"><Search size={24} aria-hidden="true" /><span>{t(tab === 'extension' && !q ? 'aiworkspace.canvas.catalog.noExtensions' : 'aiworkspace.canvas.catalog.noMatch')}</span></li>}
+                    {shown.length === 0 && <li className="aiws-catalog-empty"><Search size={24} aria-hidden="true" /><span>{t(tab === 'extension' && !q ? 'aiworkspace.canvas.catalog.noExtensions' : 'aiworkspace.canvas.catalog.noMatch')}</span>
+                      {tab === 'extension' && !q && <button type="button" className="aiws-link" data-testid="aiws-catalog-manage-controls" onClick={() => { onClose(); shell.openDialog({ kind: 'extensions' }) }}>{t('aiworkspace.ext.manage')}</button>}</li>}
+                    {tab === 'extension' && shown.length > 0 && <li><button type="button" className="aiws-link" data-testid="aiws-catalog-manage-controls" onClick={() => { onClose(); shell.openDialog({ kind: 'extensions' }) }}>{t('aiworkspace.ext.manage')}</button></li>}
                     {shown.map((entry) => (
                       <li key={entry.key}>
                         <button type="button" data-testid={`aiws-catalog-entry-${entry.key.replace(':', '-')}`} aria-pressed={chosen?.key === entry.key} className={chosen?.key === entry.key ? 'is-active' : undefined}
@@ -124,7 +132,7 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
                     ))}
                   </ul>
                 </div>
-                {chosen ? <EntryDetail key={chosen.key} entry={chosen} canPlace={canPlace} onInsert={onInsert} /> : <div className="aiws-catalog-detail aiws-catalog-empty"><MousePointer2 size={28} aria-hidden="true" /><span>{t('aiworkspace.canvas.catalog.chooseEntry')}</span></div>}
+                {chosen ? <EntryDetail key={chosen.key} entry={chosen} canPlace={canPlace} onInsert={onInsert} onImportTable={onImportTable} /> : <div className="aiws-catalog-detail aiws-catalog-empty"><MousePointer2 size={28} aria-hidden="true" /><span>{t('aiworkspace.canvas.catalog.chooseEntry')}</span></div>}
               </>
             )}
           </div>
@@ -135,7 +143,7 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
   )
 }
 
-function EntryDetail({ entry, canPlace, onInsert }: { entry: CatalogEntry; canPlace: boolean; onInsert: (request: InsertRequest, how: 'center' | 'place') => void }) {
+function EntryDetail({ entry, canPlace, onInsert, onImportTable }: { entry: CatalogEntry; canPlace: boolean; onInsert: (request: InsertRequest, how: 'center' | 'place') => void; onImportTable?: () => void }) {
   const store = useStore()
   const { t, list } = useAiwsText()
   const [title, setTitle] = useState('')
@@ -149,18 +157,27 @@ function EntryDetail({ entry, canPlace, onInsert }: { entry: CatalogEntry; canPl
   const defId = entry.defEntity?.entity_id ?? ''
   const loadDef = useCallback(async () => (defId ? store.readBatched<{ payload: BlockDefPayload }>(defId) : null), [store, defId])
   const def = useLoad<ReadOk<{ payload: BlockDefPayload }> | null>(loadDef).data?.content.payload
+  // a control instance: its property overrides and named bindings (扩展控件 P0, B8)
+  const [instanceConfig, setInstanceConfig] = useState<Record<string, Json>>({})
+  const [instanceBindings, setInstanceBindings] = useState<Record<string, string>>({})
+  const configIssues = entry.defEntity ? configProblems(def, instanceConfig) : []
+  const unbound = entry.defEntity ? missingBindings(def, instanceBindings) : []
   const accepts = entry.defEntity ? (def?.accepts ?? entry.definition.accepts) : entry.definition.accepts
-  const needsData = entry.catalog.needs === 'data' || (entry.defEntity !== undefined && def !== undefined && def.allow_no_source !== true)
+  // a composite shows no data of its own: its Blocks do (扩展控件 P1)
+  const needsData = entry.catalog.needs === 'data' || (entry.defEntity !== undefined && def !== undefined && def.kind !== 'composite' && def.allow_no_source !== true)
   const optionalData = entry.defEntity !== undefined && def?.allow_no_source === true && accepts.length > 0
   const data = needsData || optionalData ? dataFor(store, accepts) : []
   const needsFile = entry.catalog.needs === 'file'
   const ready = (!needsData || sourceId !== '') && (!needsFile || file !== null) && (!entry.defEntity || def !== undefined) && (entryId(entry) !== 'shape-svg' || (svg !== null && svg.svg.body.length <= 48 * 1024))
+    && configIssues.length === 0 && unbound.length === 0
   const svgSize = svg ? (() => { const k = Math.min(1, 320 / Math.max(svg.w, svg.h, 1)); return { w: Math.max(24, Math.round(svg.w * k)), h: Math.max(24, Math.round(svg.h * k)) } })() : null
   const request = (): InsertRequest => svg && svgSize ? ({ entry: { ...entry, size: svgSize }, title: title.trim() || undefined, config: { shape: 'svg', svg: svg.svg as unknown as Json, fill: svg.fill, stroke: svg.stroke ?? 'none', stroke_width: 1 } }) : ({
     entry, title: title.trim() || undefined, sourceId: sourceId || undefined, file: file ?? undefined,
-    config: entry.defEntity ? { def_id: entry.defEntity.entity_id } : entryId(entry) === 'shape' ? { shape: kind } : Object.keys(choices).length ? choices : undefined,
+    config: entry.defEntity ? { def_id: entry.defEntity.entity_id, ...instanceConfig } : entryId(entry) === 'shape' ? { shape: kind } : Object.keys(choices).length ? choices : undefined,
+    bindings: entry.defEntity && Object.keys(instanceBindings).length > 0 ? instanceBindings : undefined,
   })
-  const missing = needsData && sourceId === '' ? t('aiworkspace.canvas.catalog.missingData') : needsFile && !file ? t('aiworkspace.canvas.catalog.missingFile') : null
+  const missing = needsData && sourceId === '' ? t('aiworkspace.canvas.catalog.missingData') : needsFile && !file ? t('aiworkspace.canvas.catalog.missingFile')
+    : unbound.length > 0 ? t('aiworkspace.ext.form.missingBindings', { names: list(unbound) }) : configIssues.length > 0 ? t('aiworkspace.ext.form.invalidConfig', { issues: list(configIssues) }) : null
   return (
     <div className="aiws-catalog-detail" data-testid="aiws-catalog-detail" data-entry={entry.key}>
       <div className="aiws-catalog-detail-content">
@@ -200,6 +217,7 @@ function EntryDetail({ entry, canPlace, onInsert }: { entry: CatalogEntry; canPl
             <span className="aiws-muted">{t('aiworkspace.canvas.catalog.sharesData')}</span>
           </label>
         )}
+        {entry.defEntity && def && <InstanceForm def={def} config={instanceConfig} bindings={instanceBindings} onConfig={setInstanceConfig} onBindings={setInstanceBindings} />}
         {needsFile && (
           <label className="aiws-field">{t('aiworkspace.canvas.catalog.file')}<input type="file" aria-label={t('aiworkspace.canvas.catalog.chooseFile')} data-testid="aiws-catalog-file" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /></label>
         )}
@@ -208,6 +226,7 @@ function EntryDetail({ entry, canPlace, onInsert }: { entry: CatalogEntry; canPl
       <div className="aiws-dialog-actions aiws-catalog-actions">
         <button type="button" className="is-primary" data-testid="aiws-catalog-insert" disabled={!ready} onClick={() => onInsert(request(), 'center')}><Plus size={16} aria-hidden="true" />{t('aiworkspace.canvas.catalog.insertCenter')}</button>
         {canPlace && <button type="button" data-testid="aiws-catalog-place" disabled={!ready} onClick={() => onInsert(request(), 'place')}><MousePointer2 size={16} aria-hidden="true" />{t('aiworkspace.canvas.catalog.place')}</button>}
+        {entryId(entry) === 'table' && onImportTable && <button type="button" data-testid="aiws-catalog-import-table" onClick={onImportTable}><FileUp size={16} aria-hidden="true" />{t('aiworkspace.canvas.catalog.importTable')}</button>}
         {entry.defEntity && (
           <button type="button" className="aiws-link" data-testid="aiws-catalog-pin" onClick={() => store.userState.set('ui:pinned-defs', pinned.includes(defId) ? pinned.filter((id) => id !== defId) : [...pinned, defId].slice(-6))}>
             {t(pinned.includes(defId) ? 'aiworkspace.canvas.catalog.unpin' : 'aiworkspace.canvas.catalog.pin')}

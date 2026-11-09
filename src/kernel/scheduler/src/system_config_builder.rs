@@ -1,22 +1,16 @@
 use anyhow::{anyhow, Result};
-use buckyos_api::load_local_node_identity_config;
 use buckyos_api::msg_queue::{
     generate_kmsg_service_doc, KMSG_SERVICE_MAIN_PORT, KMSG_SERVICE_UNIQUE_ID,
 };
 use buckyos_api::{
     generate_aicc_service_doc, generate_aiworkspace_doc, generate_control_panel_service_doc,
-    generate_homestation_doc, generate_msg_center_service_doc, generate_nfs_server_doc,
-    generate_opendan_service_doc, generate_repo_service_doc, generate_scheduler_service_doc,
-    generate_smb_service_doc, generate_task_manager_service_doc, generate_verify_hub_service_doc,
-    generate_workflow_service_doc, AgentId, AgentServiceBinding, AgentSpec, AppDoc, AppId,
-    AppInstanceId, AppRegistry, BuckyOSDevConfig, BuckyOSInfo,
+    generate_homestation_doc, generate_msg_center_service_doc, generate_nfs_server_doc, generate_repo_service_doc, generate_scheduler_service_doc,
+    generate_task_manager_service_doc, generate_verify_hub_service_doc,
+    generate_workflow_service_doc, AppDoc, AppRegistry, BuckyOSDevConfig, BuckyOSInfo,
     GatewaySettings, GatewayShortcut, KernelServiceSpec, NodeConfig, NodeState,
-    ServiceEndpointConfig, ServiceExposeConfig, ServiceExposeRouteConfig, ServiceInfo,
-    ServiceInstanceReportInfo, ServiceInstanceState, ServiceNode, ServiceProtocol,
+    ServiceEndpointConfig, ServiceExposeConfig, ServiceExposeRouteConfig, ServiceProtocol,
     ServiceSpecConfig, ServiceState, SubPkgDesc, UserContactSettings, UserPrivateProfile,
-    UserProfile, UserSettings, UserState, UserTunnelBinding, UserType, ZoneConfig,
-    AGENT_SPEC_SCHEMA_VERSION, APP_REGISTRY_KEY, BUCKYOS_DEV_CONFIG_KEY, BUCKYOS_INFO_KEY,
-    OPENDAN_SERVICE_UNIQUE_ID, SCHEDULER_SERVICE_UNIQUE_ID, VERIFY_HUB_UNIQUE_ID,
+    UserProfile, UserSettings, UserState, UserTunnelBinding, UserType, ZoneConfig, APP_REGISTRY_KEY, BUCKYOS_DEV_CONFIG_KEY, BUCKYOS_INFO_KEY, SCHEDULER_SERVICE_UNIQUE_ID, VERIFY_HUB_UNIQUE_ID,
     ZONE_OWNER_USER_ID_KEY,
 };
 use buckyos_api::{
@@ -24,15 +18,15 @@ use buckyos_api::{
     AICC_SERVICE_UNIQUE_ID, AIWORKSPACE_SERVICE_PORT, AIWORKSPACE_UNIQUE_ID,
     CONTROL_PANEL_SERVICE_PORT, CONTROL_PANEL_SERVICE_UNIQUE_ID, HOMESTATION_SERVICE_PORT,
     HOMESTATION_UNIQUE_ID, MSG_CENTER_SERVICE_PORT, MSG_CENTER_SERVICE_UNIQUE_ID,
-    NFS_SERVER_SERVICE_PORT, NFS_SERVER_UNIQUE_ID, REPO_SERVICE_UNIQUE_ID, SMB_SERVICE_UNIQUE_ID,
+    NFS_SERVER_SERVICE_PORT, NFS_SERVER_UNIQUE_ID, REPO_SERVICE_UNIQUE_ID,
     TASK_MANAGER_SERVICE_PORT,
     TASK_MANAGER_SERVICE_UNIQUE_ID, WORKFLOW_SERVICE_PORT, WORKFLOW_SERVICE_UNIQUE_ID,
 };
 use buckyos_kit::{
-    buckyos_get_unix_timestamp, get_buckyos_system_etc_dir, get_channel, get_target, get_version,
+    buckyos_get_unix_timestamp, get_channel, get_target, get_version,
 };
 use jsonwebtoken::jwk::Jwk;
-use log::{debug, info, warn};
+use log::info;
 use name_lib::{OwnerDocument, VerifyHubInfo};
 use package_lib::PackageId;
 use serde::{Deserialize, Serialize};
@@ -41,7 +35,6 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use url::Url;
 
-const DEFAULT_OOD_ID: &str = "ood1";
 const PROFILE_SYSTEM_CONTACT_KEY: &str = "system_contact";
 const DEFAULT_PROVIDER_TIMEOUT_MS: u64 = 600_000;
 const MANAGED_SN_PROVIDER_INSTANCE_NAME: &str = "sn-ai-provider-default";
@@ -225,10 +218,6 @@ pub struct StartConfigSummary {
     pub owner_document: OwnerDocument,
     pub zone_name: String, //zone hostname
     #[serde(default)]
-    pub sn_active_code: String,
-    #[serde(default)]
-    pub ood_jwt: Option<String>,
-    #[serde(default)]
     pub enabled_features: EnabledFeaturesSummary,
     #[serde(default)]
     pub ai_provider_config: AIProviderConfigSummary,
@@ -275,7 +264,7 @@ impl SystemConfigBuilder {
         };
         self.insert_json(&admin_key, &admin_settings)?;
         self.insert_json_if_absent(ZONE_OWNER_USER_ID_KEY, &config.user_name)?;
-        self.append_policy(&format!("g, {}, admin", config.user_name));
+        self.append_policy(&format!("g, {}, admin", config.user_name))?;
         Ok(self)
     }
 
@@ -333,20 +322,6 @@ impl SystemConfigBuilder {
         Ok(self)
     }
 
-    pub fn add_device_doc(
-        &mut self,
-        ood_name: &str,
-        config: &StartConfigSummary,
-    ) -> Result<&mut Self> {
-        let ood_jwt = config
-            .ood_jwt
-            .as_ref()
-            .ok_or_else(|| anyhow!("start_config.json missing ood_jwt"))?;
-        self.entries
-            .insert(format!("devices/{}/doc", ood_name), ood_jwt.clone());
-        Ok(self)
-    }
-
     pub fn add_system_defaults(&mut self) -> Result<&mut Self> {
         let installed_at = buckyos_get_unix_timestamp();
         let release_channel = get_channel().to_string();
@@ -370,13 +345,15 @@ impl SystemConfigBuilder {
         // control-panel available through the existing scheduling pipeline.
         let service_doc = generate_control_panel_service_doc();
 
-        let config = build_kernel_service_spec(
+        let mut config = build_kernel_service_spec(
             CONTROL_PANEL_SERVICE_UNIQUE_ID,
             CONTROL_PANEL_SERVICE_PORT,
             1,
             service_doc,
         )
         .await?;
+        config.spec_config.buckets = buckyos_api::control_panel_bucket_decls();
+        config.spec_config.storage_quota_mib = Some(buckyos_api::CONTROL_PANEL_STORAGE_QUOTA_MIB);
 
         self.insert_json("services/control-panel/spec", &config)?;
         Ok(self)
@@ -460,6 +437,8 @@ impl SystemConfigBuilder {
             buckyos_api::AICC_USAGE_LOG_RDB_INSTANCE_ID.to_string(),
             buckyos_api::aicc_usage_log_default_rdb_instance_config(),
         );
+        service_spec.spec_config.buckets = buckyos_api::aicc_bucket_decls();
+        service_spec.spec_config.storage_quota_mib = Some(buckyos_api::AICC_STORAGE_QUOTA_MIB);
         self.insert_json("services/aicc/spec", &service_spec)?;
         let sn_ai_provider_endpoints = if config.llm_router_enabled() {
             Some(derive_sn_ai_provider_endpoints(zone_sn)?)
@@ -485,6 +464,9 @@ impl SystemConfigBuilder {
             buckyos_api::MSG_CENTER_RDB_INSTANCE_ID.to_string(),
             buckyos_api::msg_center_default_rdb_instance_config(),
         );
+        service_spec.spec_config.buckets = buckyos_api::msg_center_bucket_decls();
+        service_spec.spec_config.storage_quota_mib =
+            Some(buckyos_api::MSG_CENTER_STORAGE_QUOTA_MIB);
         self.insert_json("services/msg-center/spec", &service_spec)?;
         let settings = build_msg_center_settings(config);
         self.insert_json_if_absent("services/msg-center/settings", &settings)?;
@@ -493,18 +475,19 @@ impl SystemConfigBuilder {
 
     pub async fn add_workflow(&mut self) -> Result<&mut Self> {
         let service_doc = generate_workflow_service_doc();
-        let config = build_kernel_service_spec(
+        let mut config = build_kernel_service_spec(
             WORKFLOW_SERVICE_UNIQUE_ID,
             WORKFLOW_SERVICE_PORT,
             1,
             service_doc,
         )
         .await?;
+        config.spec_config.buckets = buckyos_api::workflow_bucket_decls();
         self.insert_json("services/workflow/spec", &config)?;
         Ok(self)
     }
 
-    pub fn add_gateway_settings(&mut self, config: &StartConfigSummary) -> Result<&mut Self> {
+    pub fn add_gateway_settings(&mut self) -> Result<&mut Self> {
         let settings = GatewaySettings {
             shortcuts: HashMap::from([
                 // (
@@ -535,6 +518,8 @@ impl SystemConfigBuilder {
             buckyos_api::REPO_SERVICE_RDB_INSTANCE_ID.to_string(),
             buckyos_api::repo_service_default_rdb_instance_config(),
         );
+        config.spec_config.buckets = buckyos_api::repo_service_bucket_decls();
+        config.spec_config.storage_quota_mib = Some(buckyos_api::REPO_SERVICE_STORAGE_QUOTA_MIB);
         self.insert_json("services/repo-service/spec", &config)?;
 
         let settings = RepoServiceSettings {
@@ -591,6 +576,12 @@ impl SystemConfigBuilder {
                 expose_uri: Some("/nfs/v1".to_string()),
             };
         }
+        config.spec_config.rdb_instances.insert(
+            buckyos_api::BUCKET_INDEX_RDB_INSTANCE_ID.to_string(),
+            buckyos_api::bucket_index_rdb_instance_config(),
+        );
+        config.spec_config.buckets = buckyos_api::nfs_server_bucket_decls();
+        config.spec_config.storage_quota_mib = Some(buckyos_api::NFS_SERVER_STORAGE_QUOTA_MIB);
         self.insert_json("services/nfs-server/spec", &config)?;
 
         let settings = NfsServerSettings::default();
@@ -601,13 +592,15 @@ impl SystemConfigBuilder {
     pub async fn add_aiworkspace(&mut self) -> Result<&mut Self> {
         let service_doc = generate_aiworkspace_doc();
         // reached through the generic /kapi/aiworkspace gateway route
-        let config = build_kernel_service_spec(
+        let mut config = build_kernel_service_spec(
             AIWORKSPACE_UNIQUE_ID,
             AIWORKSPACE_SERVICE_PORT,
             1,
             service_doc,
         )
         .await?;
+        config.spec_config.buckets = buckyos_api::aiworkspace_bucket_decls();
+        config.spec_config.storage_quota_mib = Some(buckyos_api::AIWORKSPACE_STORAGE_QUOTA_MIB);
         self.insert_json("services/aiworkspace/spec", &config)?;
 
         let settings = AiWorkspaceSettings::default();
@@ -619,24 +612,23 @@ impl SystemConfigBuilder {
         let service_doc = generate_homestation_doc();
         // owner kRPC through the generic /kapi/homestation route; the zone-level /home/
         // protocol paths are forwarded by boot_gateway.yaml
-        let config = build_kernel_service_spec(
+        let mut config = build_kernel_service_spec(
             HOMESTATION_UNIQUE_ID,
             HOMESTATION_SERVICE_PORT,
             1,
             service_doc,
         )
         .await?;
+        config.spec_config.rdb_instances.insert(
+            buckyos_api::HOMESTATION_RDB_INSTANCE_ID.to_string(),
+            buckyos_api::homestation_default_rdb_instance_config(),
+        );
+        config.spec_config.buckets = buckyos_api::homestation_bucket_decls();
+        config.spec_config.storage_quota_mib = Some(buckyos_api::HOMESTATION_STORAGE_QUOTA_MIB);
         self.insert_json("services/homestation/spec", &config)?;
 
         let settings = HomeStationSettings::default();
         self.insert_json_if_absent("services/homestation/settings", &settings)?;
-        Ok(self)
-    }
-
-    pub async fn add_smb_service(&mut self) -> Result<&mut Self> {
-        let service_doc = generate_smb_service_doc();
-        let config = build_kernel_service_spec(SMB_SERVICE_UNIQUE_ID, 4100, 1, service_doc).await?;
-        self.insert_json("services/smb-service/spec", &config)?;
         Ok(self)
     }
 
@@ -663,6 +655,7 @@ impl SystemConfigBuilder {
             frame_services: HashMap::new(),
             state: NodeState::Running,
             executor: None,
+            ext_tools: Default::default(),
         };
         self.insert_json(&format!("nodes/{}/config", ood_name), &config)?;
 
@@ -676,6 +669,7 @@ impl SystemConfigBuilder {
         self.insert_json(&format!("nodes/{}/gateway_info", ood_name), &gateway_info)?;
 
         self.append_policy(&format!("g, {ood_name}, ood"))?;
+        self.insert_json_if_absent(buckyos_api::DEFAULT_DEVICE_KEY, &json!(ood_name))?;
         Ok(self)
     }
 
@@ -850,14 +844,6 @@ fn build_aicc_settings_with_endpoints(
     json!({ "providers": providers })
 }
 
-fn read_default_device_subject() -> String {
-    let node_identity_path = get_buckyos_system_etc_dir().join("node_identity.json");
-    if let Ok(node_identity) = load_local_node_identity_config(node_identity_path.as_path()) {
-        return node_identity.device_name;
-    }
-    DEFAULT_OOD_ID.to_string()
-}
-
 fn build_msg_center_settings(config: &StartConfigSummary) -> Value {
     json!({
         "telegram_tunnel": {
@@ -1009,12 +995,6 @@ impl TryFrom<&Value> for StartConfigSummary {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("start_config.json missing zone_name"))?
                 .to_string(),
-            sn_active_code,
-
-            ood_jwt: value
-                .get("ood_jwt")
-                .and_then(Value::as_str)
-                .map(|s| s.to_string()),
             enabled_features,
             ai_provider_config: serde_json::from_value(
                 value
@@ -1045,6 +1025,7 @@ impl StartConfigSummary {
 #[cfg(test)]
 mod beta22_tests {
     use super::*;
+    use buckyos_api::AppId;
 
     fn assert_no_legacy_aicc_fields(value: &Value) {
         match value {

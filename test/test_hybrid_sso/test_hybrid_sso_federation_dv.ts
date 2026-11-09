@@ -1,5 +1,5 @@
 /**
- * Three-Zone DID federation acceptance (notepads/hybrid-sso-implementation-todo.md SSO-09 / SSO-14)
+ * Three-Zone DID federation acceptance (notepads/done/hybrid-sso-implementation-todo.md SSO-09 / SSO-14)
  * against the `ssotest` VM group (src/dev_configs/ssotest.json): canonical Zone A (alice), target
  * Zones B (bob) and C (charlie), all resolved through the SN like the VMs themselves.
  *
@@ -384,7 +384,8 @@ step("entries-at-b", async () => {
   await expectDenied("AIWS join of a password-only entry", "entry_unavailable", () => rpc(B, "aiworkspace", "ws.join_entry", { entry_id: passwordOnly }, token));
   const didEntry = await entry(true);
   const joined = await rpc(B, "aiworkspace", "ws.join_entry", { entry_id: didEntry }, token);
-  assert(joined.granted === true && joined.path === `/workspace/${workspaceId}`, `join ${JSON.stringify(joined)}`);
+  // the workspace's page on its own origin (AI Workspace T4-8)
+  assert(joined.granted === true && String(joined.path).startsWith(`https://aiws-${workspaceId.replace(/^ws_/, "")}.`), `join ${JSON.stringify(joined)}`);
   const info = await rpc(B, "aiworkspace", "ws.get_info", { workspace_id: workspaceId }, token);
   assert(info.principal === A.ownerDid, `ws.get_info principal ${info.principal}`);
   console.log(`    ✓ AIWS: alice joins the did_login entry and reads as ${info.principal}`);

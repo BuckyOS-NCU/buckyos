@@ -370,10 +370,10 @@ async fn f09_semi_subscription() {
     let (_t, env, _) = load("09_semi_subscription");
     let b = session(&env, "work-fixture-sub-b");
     let llm = ScriptedLlm::new(|req, _| {
-        // The snapshot message comes first, the controlled input after it.
+        // The semi state is a background line of the controlled input.
         let users = user_texts(req);
-        assert_eq!(users.len(), 2, "{users:?}");
-        assert!(users[0].starts_with("<semi_subscription_snapshot>"), "{users:?}");
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert!(users[0].starts_with("<<background_context>>"), "{users:?}");
         assert!(users[0].contains("work-fixture-sub-a is finished"), "{users:?}");
         text("seen")
     });
@@ -413,10 +413,16 @@ async fn f11_worklog_with_summary() {
         sm.start_offset,
         e["next"]["stop_at_offset"].as_u64().unwrap()
     );
-    let w = libopendan::runner::history::read_window(&s, &sm, 100_000).unwrap();
+    let w = libopendan::runner::history::read_window(
+        &s,
+        &sm,
+        libopendan::runner::history::HistoryShape::Native,
+        Some(100_000),
+    )
+    .unwrap();
     assert!(w.reached_start);
     assert_eq!(
-        w.lines.len() as u64,
+        w.messages.len() as u64,
         e["next"]["raw_entries"].as_u64().unwrap()
     );
 }
@@ -531,7 +537,8 @@ async fn f16_goal_session() {
     let after = sd.state().unwrap();
     assert!(!after.goal.as_ref().unwrap().needs_flush());
     assert_eq!(after.run_state, RunState::Waiting);
-    assert_eq!(after.waiting_for.map(|w| w.kind), Some(WaitingKind::Event));
+    // Waiting for its next run opportunity, not for anyone's input.
+    assert!(!after.follows_work() && !after.needs_input(true));
     // Again: nothing more to write.
     drive(&sd, &deps, StopWhen::Idle).await;
     assert_eq!(agent.goals().activations(&goal_id, &Default::default()).await.unwrap().len(), 1);

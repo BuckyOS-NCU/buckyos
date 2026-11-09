@@ -114,7 +114,9 @@ impl ProviderRuntime {
             || current.unavailable_presets != candidate.inventory.unavailable_presets
             || current.provider_model_list_fingerprint
                 != candidate.inventory.provider_model_list_fingerprint
-            || current.metadata_applied_seq != candidate.inventory.metadata_applied_seq;
+            || current.metadata_applied_seq != candidate.inventory.metadata_applied_seq
+            || current.instance_rules_fingerprint != candidate.inventory.instance_rules_fingerprint
+            || current.discovered_model_ids != candidate.inventory.discovered_model_ids;
         if changed {
             if let Err(error) = self.commit_candidate(&candidate, publish).await {
                 if !matches!(error, ProviderError::StaleCandidate) {
@@ -348,17 +350,6 @@ impl ProviderRuntimeManager {
         self.registry.read().await.clone()
     }
 
-    pub(crate) async fn quota_observation(
-        &self,
-        provider_instance_name: &str,
-    ) -> ProviderResult<ProviderQuotaObservation> {
-        Ok(self
-            .runtime(provider_instance_name)
-            .await?
-            .quota_observation()
-            .await)
-    }
-
     pub(crate) fn subscribe_refresh_events(&self) -> broadcast::Receiver<ProviderRefreshEvent> {
         self.refresh_events.subscribe()
     }
@@ -523,7 +514,7 @@ impl ProviderRuntimeManager {
             account: connection.account.clone(),
             request_timeout: Duration::from_secs(120),
             auto_sync_models: false,
-            instance_rules: None,
+            instance_rules: draft.instance_rules.clone(),
         };
         instance.validate().map_err(|error| {
             ProviderDraftValidationError::from_provider_error(
@@ -567,11 +558,7 @@ impl ProviderRuntimeManager {
             ProviderDraftValidationError::from_provider_error(stage, &error)
         })?;
         Ok(ProviderDraftNegotiation {
-            provider_profile_id: profile.provider_profile_id.clone(),
             protocol_adapter_id: instance.protocol_adapter_id,
-            auth_mode: draft.auth.mode(),
-            connection,
-            catalog_revision_seq: catalog.target_revision_seq(),
             inventory: Arc::new(inventory),
         })
     }
@@ -729,6 +716,7 @@ impl ProviderRuntimeManager {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn build_inventory_candidate(
         &self,
         provider_instance_name: &str,
@@ -738,6 +726,7 @@ impl ProviderRuntimeManager {
         runtime.build_candidate().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_inventory_candidate(
         &self,
         candidate: ProviderInventoryCandidate,
@@ -814,35 +803,6 @@ impl ProviderRuntimeManager {
         results
     }
 
-    pub(crate) async fn replace(
-        &self,
-        config: ProviderInstanceConfig,
-        discovery: Arc<dyn ProviderDiscovery>,
-    ) -> ProviderResult<Arc<ExecutableProviderInstance>> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
-        let name = config.provider_instance_name.clone();
-        self.stop_and_remove_unlocked(&name).await?;
-        self.start_unpublished(config, discovery).await
-    }
-
-    pub(crate) async fn stop_and_remove(&self, name: &str) -> ProviderResult<()> {
-        let _lifecycle = self.lifecycle_lock.lock().await;
-        self.stop_and_remove_unlocked(name).await
-    }
-
-    async fn stop_and_remove_unlocked(&self, name: &str) -> ProviderResult<()> {
-        let runtime = self.runtimes.lock().await.remove(name);
-        let Some(runtime) = runtime else {
-            return Ok(());
-        };
-        runtime.stop().await;
-        let current = self.registry.read().await.clone();
-        let mut next = current.instances.clone();
-        next.remove(name);
-        *self.registry.write().await = Arc::new(ProviderRegistry { instances: next });
-        Ok(())
-    }
-
     pub(crate) async fn shutdown(&self) {
         let _lifecycle = self.lifecycle_lock.lock().await;
         let runtimes = {
@@ -862,6 +822,7 @@ impl ProviderRuntimeManager {
         *self.registry.write().await = Arc::new(ProviderRegistry { instances: next });
     }
 
+    #[cfg(test)]
     pub(super) async fn runtime(&self, name: &str) -> ProviderResult<Arc<ProviderRuntime>> {
         self.runtimes
             .lock()
@@ -890,6 +851,9 @@ async fn load_lkgs(
     let inventory: ProviderInventorySnapshot = serde_json::from_value(record.snapshot.clone())
         .map_err(|error| ProviderError::Inventory(error.to_string()))?;
     validate_inventory_identity(&inventory, &runtime.profile, &runtime.config)?;
+    if inventory.instance_rules_fingerprint != instance_rules_fingerprint(&runtime.config) {
+        return Ok(None);
+    }
     if inventory.provider_model_list_fingerprint != record.provider_model_list_fingerprint
         || inventory.metadata_applied_seq != record.metadata_applied_seq
         || inventory.inventory_revision != record.inventory_revision
@@ -944,6 +908,8 @@ fn empty_inventory(
     metadata_applied_seq: u64,
 ) -> ProviderInventorySnapshot {
     ProviderInventorySnapshot {
+        instance_rules_fingerprint: instance_rules_fingerprint(instance),
+        discovered_model_ids: Default::default(),
         schema_version: INVENTORY_SCHEMA_VERSION,
         provider_instance_name: instance.provider_instance_name.clone(),
         provider_profile_id: profile.provider_profile_id.clone(),
@@ -954,6 +920,7 @@ fn empty_inventory(
         discovered_at_ms: 0,
         health: ProviderHealthState::Unknown,
         models: Vec::new(),
+        filtered_capabilities: Vec::new(),
         unmatched_models: Vec::new(),
         unavailable_presets: Vec::new(),
     }

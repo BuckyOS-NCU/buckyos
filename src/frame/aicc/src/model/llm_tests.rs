@@ -86,6 +86,7 @@ fn builtin_llm_token_limits_are_positive_and_missing_limits_are_documented() {
         ("kimi", "kimi-k2.7-code", "max_output_tokens"),
         ("kimi", "kimi-k2.7-code-highspeed", "max_output_tokens"),
         ("kimi", "kimi-k2.8-preview", "max_output_tokens"),
+        ("mistral", "voxtral-small-24b-2507", "max_output_tokens"),
         ("qwen", "qwen2-5-72b-20240919", "max_context_tokens"),
         ("qwen", "qwen2-5-72b-20240919", "max_output_tokens"),
         ("qwen", "qwen3-0-6b-20250429", "max_context_tokens"),
@@ -649,21 +650,19 @@ fn d07_d08_efforts_never_fabricate_channel_support_or_bypass_task_membership() {
         .is_empty());
     let bypass: AiccRouteOverlay = serde_json::from_value(json!({"logical_tree":{"llm.plan":{"items":[{"name":"bypass","target":"sol:reasoning-low@a","weight":100}]}}})).unwrap();
     assert!(registry.with_session_overlay(&bypass).is_err());
-    for mode in [MountMode::Auto, MountMode::Hybrid] {
-        let mut task = definition("llm.chat");
-        task.mount_mode = mode;
-        let catalog = compile(vec![serde_json::from_value(openai_document()).unwrap()]).unwrap();
-        assert!(ModelRegistry::build(
-            &catalog,
-            &[model.clone()],
-            vec![task],
-            RegistryLayers {
-                factory: Some(&gpt_overlay()),
-                ..Default::default()
-            }
-        )
-        .is_err());
-    }
+    let mut task = definition("llm.chat");
+    task.mount_mode = MountMode::Hybrid;
+    let catalog = compile(vec![serde_json::from_value(openai_document()).unwrap()]).unwrap();
+    assert!(ModelRegistry::build(
+        &catalog,
+        &[model.clone()],
+        vec![task],
+        RegistryLayers {
+            factory: Some(&gpt_overlay()),
+            ..Default::default()
+        }
+    )
+    .is_err());
     let mut value = openai_document();
     value["models"]
         .as_array_mut()

@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_tool::xllm::XllmDeps;
-use agent_tool::{AgentToolResult, AgentToolStatus};
 use buckyos_api::msg_queue::MsgQueueClient;
 use crate::api::{create_session, create_sub_session, SubSessionSpec, SubWorkspace};
 use crate::bridge::{EventBridge, KEventBridge, TimerBridge};
@@ -26,7 +25,7 @@ use crate::host::goals::{GoalHost, GoalHostOptions};
 use crate::host::{run_session, serve, HostDeps, Supervisor};
 use crate::protocol::*;
 use crate::runner::{
-    BehaviorAssembler, DriveResult, RunnerOptions, StopSignal, StopWhen, SESSION_TASK_PREFIX,
+    BehaviorAssembler, DriveResult, RunnerOptions, StopSignal, StopWhen,
 };
 use crate::state::{
     connect, ActivationQuery, AgentStateClient, ConnectOptions, GoalCaller, GoalCreate,
@@ -47,17 +46,20 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
                 [--no-bridge] [--detach-children]
   xagent serve  <session_dir|sid>... [--idle-unload <secs>] [--no-bridge]
   xagent post   <sid> (--msg <text> [--from <did>] [--attach <obj_id>[=<name>]]... [--reply-to <obj_id>] | --json <file | ->)
-  xagent ctl    <sid> (stop | decide accept|discard [--note <t>] | subscribe <spec> | unsubscribe <id>
+  xagent ctl    <sid> (stop | pause | resume [--reason <t>] | decide accept|discard [--note <t>] | subscribe <spec> | unsubscribe <id>
                        | activity [--summary <t>] [--touch <ref>]... [--clear] | perceive <text>)
   xagent status <sid> [--worklog <n>] [--report] [--run] [--events]
   xagent list   --agent <did> [--active]
   xagent behaviors --agent <did> [--frozen <sid>]
   xagent xllm   <sid> [--run <id>]
   xagent workspace list|get|create|import|discover|check|archive|restore|unregister|set-url|runtime-impact|set-runtime ...
+        (list: [--active] [--runtime <id>] [--text <text>] [--json])
         (create/import: --runtime <id> --directory <abs path on that runtime> [--url <https://project>])
-  xagent runtime list [--available] | get <id> | check <id> | baseline [--json] [--check [--overlay]]
-                 | register <id> --kind container|host_native|remote_ssh --name <n> [--description <t>] [--exec <json>] [--root <dir>]...
-                   [--baseline standard|extended]
+  xagent runtime list [--available] [--json] | get <id> | check <id> [--commands <a,b>] [--full] | baseline [--level standard|extended] [--json] [--check [--overlay]]
+                 | register <id> --connector ssh --host <h> [--user <u>] [--port <p>] [--identity-file <f>] --name <n> [--desc <t>]
+                   --root <dir>... [--baseline standard|extended] [--expires-at-ms <t>]   (development; owners add runtimes in the directory)
+                 | update <id> --expected-revision <n> [--name <n>] [--desc <t>] [--root <dir>]... | unregister <id> --expected-revision <n>
+                 | op <op_id>   (the record of an earlier `run`)
                  | update <id> --expected-revision <n> [--name <n>] [--description <t>] [--root <dir>]...
                  | unregister <id> --expected-revision <n>
   xagent goal   create --objective <text> [--title <t>] [--lifecycle achieve|maintain] [--achieved-when <t>]
@@ -77,33 +79,42 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
   <spec> = active|semi:object:<id>[#<event>] | semi:session:<sid>[:watch=f1,f2] | active|semi:timer:<name>
 
   inside a session's shell (as `agent-session`; the session comes from the environment):
-  ctl activity ... | ctl perceive <text> | recall <tag>... | note <text> | sessions [--active] [--children]
+  ctl activity ... | ctl perceive <text> | recall <tag>... | note <text> | sessions [--active] [--children] [--json]
   read-session <sid> [--report] [--worklog <n>] | artifact head <aid> | artifact list
-  create-worksession --objective <t> [--msg <t>]... [--attach <obj_id>[=<name>]]... [--context recent:<n>|none]
+  create-worksession --title <t> --objective <t> [--msg <t>]... [--attach <obj_id>[=<name>]]... [--context recent:<n>|none]
         [--class <c>] [--behavior <b>] [--cmd-skill <name>]... [--workspace inherit|none|<id>] [--runtime inherit|<id>]
-        [--report final|progress|none] [--interactive] [--wait [--wait-ms <ms>]]
-        (--cmd-skill: up to 8 manuals from `skill list`, fixed for the session's life; none given: a work
-         session inherits its parent work's, a conversation's or a goal's are not inherited)
+        [--report final|progress|none] [--interactive]
+        (--title: a short name of the work, at most 60 chars, shown where the work is listed;
+         --cmd-skill: up to 8 manuals from `skill list`, fixed for the session's life; none given: a work
+         session inherits its parent work's, a conversation's or a goal's are not inherited; its end comes back as input)
   skill list [--kind cmd|goal] [--json] | skill install <x.pikg | dir> [--replace] | skill remove <name> [--kind cmd|goal]
-  wait <sid> [--wait-ms <ms>] | post <sid> --msg <t>
+  skill status [--runtime <id>] [--json]   the commands each manual relies on, on that runtime, and the extension package that would bring what is missing
+  post <sid> --msg <t>
   todo add <title> (--content <t> | --content - | --content-file <path>) [--accept <criterion>]... [--scope <t>] [--evidence <t>]... [--skill <cmd_skill>]...
-           [--after <todo_id>]... [--batch <b>] [--runtime <id>] [--workspace inherit|none|<id>] [--behavior <b>]
-           (a serial Todo: PLAN/DO's next_behavior = do runs it, in its own work session when it names another runtime or
-            workspace; `todo dispatch` starts it as a work session of its own (default behavior work_simple), in order)
-  todo explore <title> --content <t> [same options] [--class <c>]  (add + dispatch at once as an exploration sub session)
-  todo dispatch <todo_id> [--behavior <b>] [--class <c>]  (keeps the Todo's mode: a serial Todo starts only when no other
-           serial Todo runs, every result is reviewed and its --after Todos are accepted; an exploration starts at once;
-           the behavior is kept for later attempts) | todo list [--json] | todo show <todo_id> [--report]
-  todo review <todo_id> (--accept | --reject | --need-evidence) --reason <t> [--followup <todo_id>]...
+           [--after <todo_id>|none]... [--batch <b>] [--runtime <id>] [--workspace inherit|none|<id>] [--behavior <b>]
+           (work in a work session of its own, default behavior work_simple; without --after it runs after the latest
+            Todo that is not cancelled; it starts by itself as soon as every Todo it runs after completed)
+  todo explore <title> --content <t> [same options]  (a read-only investigation, behavior explore; no prerequisite unless --after)
+  todo update <todo_id> --reason <t> [--title <t>] [--content <t> | --content -] [--accept <c>]... [--clear-accept] [--scope <t>]
+           [--evidence <t>]... [--after <todo_id>|none]... [--runtime <id>] [--workspace inherit|none|<id>] [--skill <s>]...
+           (a running Todo's work session gets the update as its next input; --after / --runtime / --workspace / --skill
+            only while no attempt runs)
+  todo pause|resume|stop <todo_id> --reason <t>   (its work session: no more inference / on from its checkpoint / stopped)
+  todo list [--json] | todo show <todo_id> [--report]
   todo cancel <todo_id> --reason <t> | todo clean --reason <t> | todo retry <todo_id> --reason <t>
-  ask-user <question> [--option <id>=<label>]... [--allow-text]   (ui sessions: the result is the user's next message)
   copy --from <end> --to <end> [--replace] | copy status|cancel <transfer_id> | copy list
         <end> = session:<path> | workspace:<path> | <runtime_id>:<absolute path>; one regular file between the session's
         runtimes, verified by hash and committed by rename; an existing target only with --replace
         (exit 0 committed, 1 failed, 4 cancelled)
-  task state|wait|cancel <task_id> [--wait-ms <ms>]   (a shell command that continued as a task, in the run that started it;
-        wait: default 25s, max 30 min — give the shell call a larger wait_ms; exit 0 running/finished, 1 failed, 2 unknown)
-  runtime list [--available] | get <id> | check <id> | baseline [--json] | workspace ...
+  run --runtime <runtime_id|workspace> [--cwd <abs dir on it>] [--timeout <secs>] -- <command...>
+        one command on another runtime of this agent (only from a session whose working runtime is the private one);
+        `workspace` runs in the session's workspace directory, a runtime id needs --cwd inside its granted roots;
+        several words are a command and its arguments (-- sh -c 'a; b'), one word is a line for that shell (-- 'a | b');
+        the target's own PATH and shell; output and exit code come back as they are (exit 124: timed out)
+  task state|cancel <task_id>   (a task of the run this command runs in, e.g. a shell command that continued as a task;
+        its end comes back to the session as input on its own — nothing waits for it; exit 0 running/finished, 1 failed, 2 unknown)
+  runtime list [--available] [--json] | get <id> | check <id> | baseline [--level standard|extended] [--json] | workspace ...
+        (workspace list, runtime list and sessions: readable text by default; --json for structured output)
   goal ... (ui sessions: create / show / post / pause / resume / archive / reopen / restart / activate;
             goal sessions: show / skills add|remove / achieved --evidence / archive --reason)
   notify send --title <t> [--message <text>] [--level quiet|normal|timely|urgent] [--expires-in <dur>] [--key <k>]
@@ -279,6 +290,24 @@ fn print(v: &impl serde::Serialize) {
     println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
 
+fn list_label(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.replace('_', " ")))
+        .unwrap_or_default()
+}
+
+fn inline_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn list_heading(name: &str, count: usize) {
+    println!("{name} ({count}):");
+    if count == 0 {
+        println!("(none)");
+    }
+}
+
 fn who(a: &Args) -> String {
     a.env_or("who", "LIBOPENDAN_WHO")
         .unwrap_or_else(|| "app:xagent@local".to_string())
@@ -425,6 +454,7 @@ fn parse_subscription(spec: &str) -> R<Subscription> {
     };
     let (kind, rest) = rest.split_once(':').ok_or_else(err)?;
     let mut watch = Vec::new();
+    let mut id_spec = spec.to_string();
     let source = match kind {
         "session" => {
             // Pulled session state is always observed; an Input needs a
@@ -447,8 +477,16 @@ fn parse_subscription(spec: &str) -> R<Subscription> {
         }
         "object" => {
             let (object, event) = rest.split_once('#').unwrap_or((rest, ""));
+            // Events of an object are its kevents in this Zone (doc/key url.md §7): an `obj://` URL, kept in its
+            // canonical form; another Zone's objects have no event channel here yet.
+            let object = buckyos_api::parse_object_url(object)
+                .map_err(|e| bad(format!("`{spec}`: {e}")))?
+                .to_string();
+            crate::bridge::kevent::kevent_pattern(&object, event)
+                .map_err(|e| bad(format!("`{spec}`: {object} has no events this Zone delivers ({e})")))?;
+            id_spec = format!("{}:object:{object}#{event}", spec.split(':').next().unwrap_or_default());
             SubscriptionSource::ObjectEvent {
-                object: object.to_string(),
+                object,
                 event: event.to_string(),
             }
         }
@@ -461,7 +499,7 @@ fn parse_subscription(spec: &str) -> R<Subscription> {
         return Err(err());
     }
     Ok(Subscription {
-        id: format!("sub-{}", crate::ids::h(&[spec])),
+        id: format!("sub-{}", crate::ids::h(&[id_spec.as_str()])),
         mode,
         source,
         watch,
@@ -568,6 +606,7 @@ fn host(c: &Ctx, a: &Args) -> R<HostDeps> {
             std::env::current_exe().ok().as_deref().and_then(std::path::Path::parent),
         ),
         app_tools: Vec::new(),
+        context_windows: None,
         options,
         max_child_concurrency: max_children,
         bridges,
@@ -577,6 +616,7 @@ fn host(c: &Ctx, a: &Args) -> R<HostDeps> {
         notify: crate::notify::StateNotify::of(c.agent.clone()),
         share: None,
         runtime_id: a.get("runtime"),
+        notifier: None,
     })
 }
 
@@ -767,21 +807,27 @@ async fn cmd_serve(mut a: Args) -> R<i32> {
     Ok(code)
 }
 
-/// `agent-session task state|wait|cancel <task_id>`: the task tools of the
-/// run this shell command belongs to, through its task bridge.
+/// `agent-session task state|cancel <task_id>`: the task tools of the run
+/// this shell command belongs to, through its task bridge. There is no
+/// `wait`: the session follows the task and brings its end back as input
+/// (simple Work Session TODO §3.10).
+fn task_op(word: &str) -> R<agent_tool::task_bridge::TaskOp> {
+    use agent_tool::task_bridge::TaskOp;
+    match word {
+        "state" => Ok(TaskOp::State),
+        "cancel" => Ok(TaskOp::Cancel),
+        "wait" => Err(bad(
+            "there is no `task wait`: the task's end comes back to you as input with its full result; reply or go on with other work meanwhile (`task state <task_id>` checks it now)",
+        )),
+        other => Err(bad(format!("task takes state | cancel, not `{other}`"))),
+    }
+}
+
 async fn cmd_task(mut a: Args) -> R<i32> {
-    use agent_tool::task_bridge::{call, TaskBridgeRequest, TaskOp, ENV_TASK_ENDPOINT};
-    let op = match a.next("state | wait | cancel")?.as_str() {
-        "state" => TaskOp::State,
-        "wait" => TaskOp::Wait,
-        "cancel" => TaskOp::Cancel,
-        other => return Err(bad(format!("task takes state | wait | cancel, not `{other}`"))),
-    };
+    use agent_tool::task_bridge::{call, TaskBridgeRequest, ENV_TASK_ENDPOINT};
+    let op = task_op(&a.next("state | cancel")?)?;
     let task_id = a.next("<task_id>")?;
-    let wait_ms = a
-        .get("wait-ms")
-        .map(|v| v.parse::<u64>().map_err(|_| bad("--wait-ms takes milliseconds")))
-        .transpose()?;
+    let wait_ms = None;
     let endpoint = std::env::var(ENV_TASK_ENDPOINT)
         .ok()
         .filter(|e| !e.is_empty())
@@ -823,7 +869,9 @@ async fn cmd_post(mut a: Args) -> R<i32> {
     Ok(0)
 }
 
-const CTL_COMMANDS: &[&str] = &["stop", "decide", "subscribe", "unsubscribe", "activity", "perceive"];
+const CTL_COMMANDS: &[&str] = &[
+    "stop", "pause", "resume", "decide", "subscribe", "unsubscribe", "activity", "perceive",
+];
 
 async fn cmd_ctl(mut a: Args) -> R<i32> {
     let first = a.next("<sid> | <command>")?;
@@ -833,7 +881,7 @@ async fn cmd_ctl(mut a: Args) -> R<i32> {
             first,
         )
     } else {
-        (first, a.next("stop | decide | subscribe | unsubscribe | activity | perceive")?)
+        (first, a.next("stop | pause | resume | decide | subscribe | unsubscribe | activity | perceive")?)
     };
     let c = ctx(&a, None, true).await?;
     let given_key = a.get("key");
@@ -844,6 +892,8 @@ async fn cmd_ctl(mut a: Args) -> R<i32> {
     };
     let (key, command) = match cmd.as_str() {
         "stop" => (key("stop"), ControlCommand::stop(a.get("reason"))),
+        "pause" => (key("pause"), ControlCommand::Pause { reason: a.get("reason") }),
+        "resume" => (key("resume"), ControlCommand::Resume { reason: a.get("reason") }),
         "decide" => {
             let decision = a.next("accept|discard")?;
             if !matches!(decision.as_str(), "accept" | "discard") {
@@ -956,7 +1006,8 @@ async fn cmd_status(mut a: Args) -> R<i32> {
                 .map(|r| json!({
                     "run_id": r.run_id, "status": r.status, "handover": r.handover,
                     "host_commit_pending": r.host_commit_pending, "usage": r.usage,
-                    "inflight": r.inflight.len(), "live": state.live_run.is_some(),
+                    "in_flight": sd.runs().in_flight(&id).ok().flatten().map(|c| c.call_id),
+                    "live": state.live_run.is_some(),
                 }))
                 .unwrap_or(Value::Null),
             None => Value::Null,
@@ -1098,7 +1149,8 @@ fn brief(e: &RegistryEntry) -> Value {
         "session_id": e.session_id, "class": e.class, "objective": e.objective,
         "run_state": e.status.run_state, "outcome": e.status.outcome,
         "acceptance": e.status.acceptance, "one_line_status": e.status.one_line_status,
-        "waiting_for": e.status.waiting_for, "pending_decision": e.status.pending_decision,
+        "needs_input": e.status.needs_input, "paused": e.status.paused,
+        "pending_decision": e.status.pending_decision,
         "parent": e.origin.as_ref().and_then(|o| o.parent_session.clone()),
     });
     // A UI session's objective is its design intent: whose conversation it
@@ -1125,7 +1177,39 @@ async fn cmd_sessions(a: Args) -> R<i32> {
     if a.has("active") {
         entries.retain(|e| e.status.run_state != RunState::Finished);
     }
-    print(&entries.iter().map(brief).collect::<Vec<_>>());
+    if a.has("json") {
+        print(&entries.iter().map(brief).collect::<Vec<_>>());
+    } else {
+        list_heading("Sessions", entries.len());
+        for e in &entries {
+            let mut status = vec![inline_text(&e.class), e.status.run_state.as_str().to_string()];
+            if let Some(outcome) = e.status.outcome {
+                status.push(list_label(outcome));
+            }
+            println!("- {} [{}]: {}", e.session_id, status.join(", "), inline_text(&e.objective));
+            if !e.status.one_line_status.trim().is_empty() {
+                println!("  Status: {}", inline_text(&e.status.one_line_status));
+            }
+            if let Some(topic) = &e.status.topic {
+                println!("  Topic: {}", inline_text(&topic.title));
+            }
+            if e.status.needs_input {
+                println!("  Needs input: agent-session post {} --msg <text>", e.session_id);
+            }
+            if e.status.paused {
+                println!("  Paused");
+            }
+            if e.status.acceptance != Acceptance::NotApplicable {
+                println!("  Acceptance: {}", list_label(e.status.acceptance));
+            }
+            if e.status.pending_decision.is_some() {
+                println!("  Decision needed: agent-session read-session {}", e.session_id);
+            }
+            if let Some(parent) = e.origin.as_ref().and_then(|o| o.parent_session.as_deref()) {
+                println!("  Parent: {parent}");
+            }
+        }
+    }
     Ok(0)
 }
 
@@ -1147,66 +1231,6 @@ async fn cmd_artifact(mut a: Args) -> R<i32> {
         // Versions are registered by the session's driver when it finishes.
         other => return Err(bad(format!("artifact {other}: only `head <aid>` and `list` are available"))),
     }
-    Ok(0)
-}
-
-/// A tool result the `shell` tool forwards as the call's own result:
-/// `Pending` with the task id of the sub session being waited for.
-fn pending_on_session(tool: &str, sid: &str, wait_ms: Option<u64>) -> AgentToolResult {
-    let mut details = json!({ "session_id": sid, "status": "waiting" });
-    if let Some(ms) = wait_ms {
-        details["until_ms"] = json!(crate::now_ms() + ms);
-    }
-    let mut r = AgentToolResult::from_details(details)
-        .with_tool(tool)
-        .with_status(AgentToolStatus::Pending);
-    // The deadline the session's run waits until (whole seconds).
-    r.check_after = wait_ms.map(|ms| ms.div_ceil(1000).max(1));
-    r.task_id = Some(format!("{SESSION_TASK_PREFIX}{sid}"));
-    r.summary = format!("waiting for sub session {sid}");
-    r
-}
-
-/// `ask-user`: a question to the user. The result is `Pending` on
-/// `userinput:<call_id>`; the session sends the question and fills the
-/// call with the user's next message.
-fn cmd_ask_user(mut a: Args) -> R<i32> {
-    if env_sid().is_none() {
-        return Err(bad("ask-user runs inside a session ($OPENDAN_SESSION_ID)"));
-    }
-    let call_id = env_call_id()
-        .ok_or_else(|| bad("ask-user is a tool call of the session's run ($XLLM_CALL_ID); run it as a shell command of the run"))?;
-    let question = a.next("the question")?;
-    let options = a
-        .all("option")
-        .into_iter()
-        .map(|o| match o.split_once('=') {
-            Some((id, label)) => Ok(UserInputOption {
-                id: id.trim().to_string(),
-                label: label.trim().to_string(),
-            }),
-            None => Err(bad(format!("bad --option {o} (<id>=<label>)"))),
-        })
-        .collect::<R<Vec<_>>>()?;
-    let request = UserInputRequest {
-        question,
-        input: UserInputSpec {
-            kind: if options.is_empty() {
-                UserInputKind::Text
-            } else {
-                UserInputKind::Choice
-            },
-            options,
-            allow_text: a.has("allow-text"),
-        },
-    };
-    request.validate().map_err(bad)?;
-    let mut r = AgentToolResult::from_details(serde_json::to_value(&request)?)
-        .with_tool("ask-user")
-        .with_status(AgentToolStatus::Pending);
-    r.task_id = Some(format!("{USER_INPUT_TASK_PREFIX}{call_id}"));
-    r.summary = "waiting for the user's answer".into();
-    print(&r);
     Ok(0)
 }
 
@@ -1244,13 +1268,18 @@ async fn cmd_create_worksession(a: Args) -> R<i32> {
         Some("none") => ReportMode::None,
         Some(s) => return Err(bad(format!("bad --report {s} (final | progress | none)"))),
     };
-    let wait = a.has("wait");
-    if wait && report == ReportMode::None {
-        // Waiting is hearing the end.
-        return Err(bad("--wait waits for the sub session's end; it cannot be combined with --report none"));
+    if a.has("wait") {
+        return Err(bad(
+            "there is no --wait: the sub session's end (or what it needs) comes back to you as input; reply without tool calls to end this Turn meanwhile",
+        ));
     }
+    let title = a
+        .get("title")
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| bad("missing --title (a short name of the work)"))?;
     let sub = SubSessionSpec {
         objective: a.get("objective").ok_or_else(|| bad("missing --objective"))?,
+        title: Some(title),
         msgs: a.all("msg"),
         attachments: a
             .all("attach")
@@ -1272,15 +1301,12 @@ async fn cmd_create_worksession(a: Args) -> R<i32> {
         runtime_id: a.get("runtime").filter(|r| r != "inherit"),
         report,
         interactive: a.has("interactive"),
+        queued: false,
         call,
         key: a.get("key"),
     };
     let sd = create_sub_session(c.agent.as_ref(), &c.who, &parent, sub, c.channels.as_ref()).await?;
-    if wait {
-        print(&pending_on_session("create-worksession", sd.sid(), a.num("wait-ms")?));
-    } else {
-        print(&json!({ "session_id": sd.sid(), "status": "created", "path": sd.path() }));
-    }
+    print(&json!({ "session_id": sd.sid(), "status": "created", "path": sd.path() }));
     Ok(0)
 }
 
@@ -1360,10 +1386,38 @@ fn skill_kind(a: &Args) -> R<Option<SkillKind>> {
 /// / `skill remove <name> [--kind cmd|goal]`: the agent's skills. A new
 /// session takes the manuals installed when it is created; running sessions
 /// keep theirs.
+async fn cmd_skill_status(c: &Ctx, a: &Args) -> R<i32> {
+    let report = c.agent.behaviors().skills_status(a.get("runtime").as_deref()).await?;
+    if a.has("json") {
+        print(&report);
+        return Ok(0);
+    }
+    println!("runtime {}", report["runtime_id"].as_str().unwrap_or(""));
+    for skill in report["skills"].as_array().cloned().unwrap_or_default() {
+        let status = &skill["status"];
+        let state = match status["state"].as_str() {
+            Some("ready") => "ready".to_string(),
+            Some("ready_system") => "ready (system)".to_string(),
+            _ => {
+                let missing: Vec<String> = status["commands"]
+                    .as_object()
+                    .map(|c| c.iter().filter(|(_, v)| v["present"] == false).map(|(k, _)| k.clone()).collect())
+                    .unwrap_or_default();
+                let packages: Vec<&str> = status["recommended_packages"].as_array().map(|p| p.iter().filter_map(|x| x["id"].as_str()).collect()).unwrap_or_default();
+                let advice = if packages.is_empty() { String::new() } else { format!("; extension package: {}", packages.join(", ")) };
+                format!("partial (missing {}{advice})", missing.join(", "))
+            }
+        };
+        println!("{:<24} {state}", skill["name"].as_str().unwrap_or(""));
+    }
+    Ok(0)
+}
+
 async fn cmd_skill(mut a: Args) -> R<i32> {
-    let sub = a.next("list | install | remove")?;
+    let sub = a.next("list | status | install | remove")?;
     let c = ctx(&a, None, false).await?;
     match sub.as_str() {
+        "status" => return cmd_skill_status(&c, &a).await,
         "list" => {
             let skills = c.agent.behaviors().skills(skill_kind(&a)?).await?;
             if a.has("json") {
@@ -1439,7 +1493,35 @@ fn todo_content(a: &Args) -> R<String> {
     }
 }
 
+fn comma_list(a: &Args, name: &str) -> Vec<String> {
+    a.all(name)
+        .iter()
+        .flat_map(|v| v.split(',').map(|x| x.trim().to_string()))
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// `--after <id>...`: `None` when not given, `Some(vec![])` for `--after none`.
+fn after_arg(a: &Args) -> R<Option<Vec<String>>> {
+    let ids = comma_list(a, "after");
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    if ids.iter().any(|i| i == "none") {
+        if ids.len() > 1 {
+            return Err(bad("--after none means no prerequisite; it is not combined with todo ids"));
+        }
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(ids))
+}
+
 fn new_todo(a: &mut Args, mode: crate::todos::TodoMode) -> R<crate::todos::NewTodo> {
+    let after = match (after_arg(a)?, mode) {
+        // An exploration runs at once unless told otherwise.
+        (None, crate::todos::TodoMode::Explore) => Some(Vec::new()),
+        (after, _) => after,
+    };
     Ok(crate::todos::NewTodo {
         title: a.next("<title>")?,
         content: todo_content(a)?,
@@ -1447,18 +1529,8 @@ fn new_todo(a: &mut Args, mode: crate::todos::TodoMode) -> R<crate::todos::NewTo
         accept: a.all("accept"),
         scope: a.get("scope"),
         evidence: a.all("evidence"),
-        skills: a
-            .all("skill")
-            .iter()
-            .flat_map(|v| v.split(',').map(|x| x.trim().to_string()))
-            .filter(|x| !x.is_empty())
-            .collect(),
-        after: a
-            .all("after")
-            .iter()
-            .flat_map(|v| v.split(',').map(|x| x.trim().to_string()))
-            .filter(|x| !x.is_empty())
-            .collect(),
+        skills: comma_list(a, "skill"),
+        after,
         batch: a.get("batch"),
         runtime_id: a.get("runtime"),
         workspace: a.get("workspace"),
@@ -1466,29 +1538,7 @@ fn new_todo(a: &mut Args, mode: crate::todos::TodoMode) -> R<crate::todos::NewTo
     })
 }
 
-/// The Todo executor the session's current context hands serial Todos
-/// over to (`next_behavior`): a behavior loop with an `[entry] todo`
-/// behavior. `None`: Todos are dispatched as sub sessions of their own and
-/// waited for with `agent-session wait` (function call loop).
-fn todo_executor(sd: &SessionDir) -> Option<String> {
-    let cfg = sd.config().ok()?;
-    let current = sd
-        .state()
-        .ok()
-        .and_then(|s| s.current_behavior)
-        .or_else(|| cfg.prompt.behavior.clone())?;
-    let behaviors = cfg.behaviors().ok()?;
-    let loop_model = behaviors
-        .get(&current)
-        .and_then(|e| e.llm_context.get("loop_model").cloned())
-        .or_else(|| cfg.prompt.llm_context.get("loop_model").cloned());
-    if loop_model.as_ref().and_then(Value::as_str) != Some("behavior") {
-        return None;
-    }
-    behaviors.into_iter().find(|(_, e)| e.todo).map(|(name, _)| name)
-}
-
-/// A Todo's `--skill` names are cmd_skills the agent has: the sub session
+/// A Todo's `--skill` names are cmd_skills the agent has: the work session
 /// that executes it takes them.
 async fn check_todo_skills(c: &Ctx, names: &[String]) -> R<()> {
     if names.is_empty() {
@@ -1514,64 +1564,67 @@ async fn check_todo_skills(c: &Ctx, names: &[String]) -> R<()> {
     Ok(())
 }
 
-fn explore_options(a: &Args) -> crate::todos::ExploreOptions {
-    let mut o = crate::todos::ExploreOptions::from_env();
-    o.behavior = a.get("behavior");
-    o.class = a.get("class");
-    o
+/// A scheduling point of a command that changed the list: every Todo that
+/// is ready now starts. What happened, for the command's output.
+async fn todo_schedule(c: &Ctx, sd: &SessionDir) -> R<Value> {
+    let mut opts = crate::todos::DispatchOptions::from_env();
+    opts.class = None;
+    let out = crate::todos::schedule(c.agent.as_ref(), &c.who, c.channels.as_ref(), sd, &opts).await?;
+    Ok(json!(out))
 }
 
-/// Dispatch with an observable result: a refusal leaves the Todo pending
-/// and says why (exit 3, the caller may wait and dispatch again).
-/// A serial Todo keeps its mode: it starts in order as a work session of
-/// its own (`dispatch_serial`); an exploration starts as one at once.
-async fn todo_dispatch(c: &Ctx, sd: &SessionDir, todo_id: &str, a: &Args) -> R<i32> {
-    use crate::todos::{store_of, TodoMode};
-    let mode = store_of(sd)
-        .load()
-        .map_err(todo_fail)?
-        .get(todo_id)
-        .map(|t| t.mode)
-        .ok_or_else(|| bad(format!("todo {todo_id}: no such todo")))?;
-    let opts = explore_options(a);
-    let dispatched = match mode {
-        TodoMode::Serial => {
-            crate::todos::dispatch_serial(c.agent.as_ref(), &c.who, c.channels.as_ref(), sd, todo_id, &opts).await
-        }
-        TodoMode::Explore => {
-            crate::todos::dispatch(c.agent.as_ref(), &c.who, c.channels.as_ref(), sd, todo_id, &opts).await
-        }
-    };
-    match dispatched {
-        Ok(d) => {
-            let note = match todo_executor(sd) {
-                Some(_) => "the sub session reports back when it finishes; end your step with a progress report to wait for it".to_string(),
-                None => format!(
-                    "wait for it with `agent-session wait {}` as a shell call of its own, then read its report with `agent-session todo show {} --report` and review it",
-                    d.child_sid, d.todo_id
-                ),
-            };
-            print(&json!({
-                "todo_id": d.todo_id, "attempt": d.attempt, "child_sid": d.child_sid,
-                "mode": mode.as_str(), "status": "running", "dispatched": true, "note": note,
-            }));
-            Ok(0)
-        }
-        Err(OpenDanError::InvalidArgument(reason)) => {
-            print(&json!({ "todo_id": todo_id, "status": "pending", "dispatched": false, "reason": reason }));
-            Ok(3)
-        }
-        Err(e) => Err(e.into()),
+/// The Todo as the command leaves it, with what this scheduling point did.
+fn todo_brief(sd: &SessionDir, id: &str, scheduled: Value) -> R<Value> {
+    let list = crate::todos::store_of(sd).load().map_err(todo_fail)?;
+    let t = list.get(id).ok_or_else(|| bad(format!("todo {id}: no such todo")))?;
+    let mut v = json!({
+        "todo_id": id, "status": t.status.as_str(), "mode": t.mode.as_str(), "after": t.after,
+        "rev": list.rev, "scheduled": scheduled,
+    });
+    if let Some(a) = t.running() {
+        v["attempt"] = json!(a.attempt);
+        v["child_sid"] = json!(a.child_sid);
     }
+    if !t.blocked_by.is_empty() {
+        v["blocked_by"] = json!(t.blocked_by);
+    }
+    if let Some(r) = &t.block_reason {
+        v["block_reason"] = json!(r);
+    }
+    Ok(v)
 }
 
-const TODO_COMMANDS: &str = "add | explore | dispatch | list | show | review | cancel | clean | retry";
+fn todo_patch(a: &Args) -> R<crate::todos::TodoPatch> {
+    let content = if a.get("content").is_some() || a.get("content-file").is_some() {
+        Some(todo_content(a)?)
+    } else {
+        None
+    };
+    let skills = comma_list(a, "skill");
+    Ok(crate::todos::TodoPatch {
+        title: a.get("title"),
+        content,
+        accept: a.all("accept"),
+        clear_accept: a.has("clear-accept"),
+        scope: a.get("scope"),
+        evidence: a.all("evidence"),
+        after: after_arg(a)?,
+        runtime_id: a.get("runtime"),
+        workspace: a.get("workspace"),
+        skills: (!skills.is_empty()).then_some(skills),
+    })
+}
+
+const TODO_COMMANDS: &str =
+    "add | explore | update | list | show | retry | cancel | clean | pause | resume | stop";
 
 /// `todo …`. Inside a session (`agent-session todo …`, $OPENDAN_SESSION_ID)
 /// every command works on that session's list — the session's tool layer is
-/// the list's writer. From outside only `list` and `show` read a list.
+/// the list's writer, and every change is a scheduling point: what is ready
+/// starts before the command returns. From outside only `list` and `show`
+/// read a list.
 async fn cmd_todo(mut a: Args) -> R<i32> {
-    use crate::todos::{store_of, ReviewVerdict, TodoMode};
+    use crate::todos::{store_of, TodoMode};
     let sub = a.next(TODO_COMMANDS)?;
     let inside = env_sid();
     let target = match (sub.as_str(), a.get("session")) {
@@ -1587,34 +1640,22 @@ async fn cmd_todo(mut a: Args) -> R<i32> {
             "todo {sub} changes a session's list: only its own runs can (inside session {target})"
         )));
     }
-    let (c, sd) = locate(&a, &target, sub == "explore" || sub == "dispatch" || sub == "retry").await?;
+    let (c, sd) = locate(&a, &target, writes).await?;
     let store = store_of(&sd);
     let now = crate::now_ms();
     match sub.as_str() {
-        "add" => {
-            let new = new_todo(&mut a, TodoMode::Serial)?;
+        "add" | "explore" => {
+            let mode = if sub == "add" { TodoMode::Serial } else { TodoMode::Explore };
+            let new = new_todo(&mut a, mode)?;
             check_todo_skills(&c, &new.skills).await?;
             let id = store.update(|l| l.add(new, now)).map_err(todo_fail)?;
-            let list = store.load().map_err(todo_fail)?;
-            let note = match todo_executor(&sd) {
-                Some(executor) => format!("next_behavior = {executor} executes the next ready serial todo"),
-                None => format!(
-                    "start it with `agent-session todo dispatch {id}` once it is ready: a work session of its own; serial todos run one at a time, after the todos they run after are accepted"
-                ),
-            };
-            print(&json!({ "todo_id": id, "status": "pending", "mode": "serial", "rev": list.rev, "note": note }));
+            let scheduled = todo_schedule(&c, &sd).await?;
+            print(&todo_brief(&sd, &id, scheduled)?);
             Ok(0)
         }
-        "explore" => {
-            let new = new_todo(&mut a, TodoMode::Explore)?;
-            check_todo_skills(&c, &new.skills).await?;
-            let id = store.update(|l| l.add(new, now)).map_err(todo_fail)?;
-            todo_dispatch(&c, &sd, &id, &a).await
-        }
-        "dispatch" => {
-            let id = a.next("<todo_id>")?;
-            todo_dispatch(&c, &sd, &id, &a).await
-        }
+        "dispatch" | "review" => Err(bad(format!(
+            "there is no `todo {sub}`: a Todo starts by itself as soon as the Todos it runs after completed, and a result is judged by a Todo of its own (`todo explore \"verify …\" --after <id>`)"
+        ))),
         "list" => {
             let list = store.load().map_err(todo_fail)?;
             if a.has("json") {
@@ -1628,11 +1669,11 @@ async fn cmd_todo(mut a: Args) -> R<i32> {
             let id = a.next("<todo_id>")?;
             let list = store.load().map_err(todo_fail)?;
             let t = list.get(&id).ok_or_else(|| bad(format!("todo {id}: no such todo")))?;
-            let mut v = json!({ "todo": t, "review": t.review_state() });
+            let mut v = json!({ "todo": t });
             if a.has("report") {
                 v["report"] = match t.latest() {
                     Some(attempt) => serde_json::to_value(
-                        crate::todos::read_report(c.agent.as_ref(), &sd, attempt).await?,
+                        crate::todos::read_report(c.agent.as_ref(), attempt).await?,
                     )?,
                     None => Value::Null,
                 };
@@ -1640,52 +1681,38 @@ async fn cmd_todo(mut a: Args) -> R<i32> {
             print(&v);
             Ok(0)
         }
-        "review" => {
+        "update" => {
             let id = a.next("<todo_id>")?;
-            let verdict = match (a.has("accept"), a.has("reject"), a.has("need-evidence")) {
-                (true, false, false) => ReviewVerdict::Accept,
-                (false, true, false) => ReviewVerdict::Reject,
-                (false, false, true) => ReviewVerdict::NeedEvidence,
-                _ => return Err(bad("todo review takes exactly one of --accept | --reject | --need-evidence")),
-            };
-            let reason = a.get("reason").ok_or_else(|| bad("missing --reason <what the report shows and why>"))?;
-            let (attempt, recorded) = store
-                .update(|l| l.review(&id, verdict, &reason, a.all("followup"), Some(c.who.clone()), now))
+            let reason = a.get("reason").ok_or_else(|| bad("missing --reason <why the todo changes>"))?;
+            let patch = todo_patch(&a)?;
+            let out = store
+                .update(|l| l.update(&id, patch, &reason, Some(c.who.clone()), now))
                 .map_err(todo_fail)?;
-            let list = store.load().map_err(todo_fail)?;
-            let child = list
-                .get(&id)
-                .and_then(|t| t.attempt(attempt))
-                .and_then(|x| x.child_sid.clone());
-            // An exploration's acceptance is its sub session's too.
-            let mut out = json!({ "todo_id": id, "attempt": attempt, "verdict": verdict, "recorded": recorded });
-            if let Some(child) = child {
-                let decision = match verdict {
-                    ReviewVerdict::Accept => Some("accept"),
-                    ReviewVerdict::Reject => Some("discard"),
-                    ReviewVerdict::NeedEvidence => None,
-                };
-                if let Some(decision) = decision {
-                    match crate::api::decide_unqueued(c.agent.as_ref(), &c.who, &child, decision, Some(&reason)).await {
-                        Ok(acc) => out["acceptance"] = json!({ "session_id": child, "acceptance": acc }),
-                        Err(e) => {
-                            out["acceptance_error"] = json!(format!(
-                                "the review is recorded; the acceptance of {child} was not written ({e}): run the same review again"
-                            ));
-                            print(&out);
-                            return Ok(5);
-                        }
-                    }
+            let mut told = Value::Null;
+            if let Some((attempt, child)) = &out.running {
+                let list = store.load().map_err(todo_fail)?;
+                if let Some(t) = list.get(&id) {
+                    crate::todos::post_update(c.agent.as_ref(), &c.who, &sd, t, child, *attempt, &out, &reason)
+                        .await?;
+                    told = json!(child);
                 }
             }
-            print(&out);
+            let scheduled = todo_schedule(&c, &sd).await?;
+            let mut v = todo_brief(&sd, &id, scheduled)?;
+            v["changed"] = json!(out.changed);
+            if !told.is_null() {
+                v["told"] = told;
+                v["note"] = json!("its work session takes the update in as its next input");
+            }
+            print(&v);
             Ok(0)
         }
         "cancel" => {
             let id = a.next("<todo_id>")?;
             let reason = a.get("reason").ok_or_else(|| bad("missing --reason"))?;
             store.update(|l| l.cancel(&id, &reason, now)).map_err(todo_fail)?;
-            print(&json!({ "todo_id": id, "status": "cancelled" }));
+            let scheduled = todo_schedule(&c, &sd).await?;
+            print(&todo_brief(&sd, &id, scheduled)?);
             Ok(0)
         }
         "clean" => {
@@ -1698,29 +1725,57 @@ async fn cmd_todo(mut a: Args) -> R<i32> {
             let id = a.next("<todo_id>")?;
             let reason = a.get("reason").ok_or_else(|| bad("missing --reason <what the new attempt must do differently>"))?;
             store.update(|l| l.retry(&id, &reason, now)).map_err(todo_fail)?;
-            let mode = store.load().map_err(todo_fail)?.get(&id).map(|t| t.mode);
-            if mode == Some(TodoMode::Explore) {
-                return todo_dispatch(&c, &sd, &id, &a).await;
-            }
-            let note = match todo_executor(&sd) {
-                Some(executor) => format!("next_behavior = {executor} runs it again as a new attempt"),
-                None => format!("start the new attempt with `agent-session todo dispatch {id}`"),
+            let scheduled = todo_schedule(&c, &sd).await?;
+            print(&todo_brief(&sd, &id, scheduled)?);
+            Ok(0)
+        }
+        "pause" | "resume" | "stop" => {
+            let id = a.next("<todo_id>")?;
+            let reason = a.get("reason").ok_or_else(|| bad(format!("missing --reason <why {sub}>")))?;
+            let (attempt, child) = match sub.as_str() {
+                "stop" => {
+                    let list = store.load().map_err(todo_fail)?;
+                    let t = list.get(&id).ok_or_else(|| bad(format!("todo {id}: no such todo")))?;
+                    let a = t.running().filter(|a| a.child_sid.is_some()).ok_or_else(|| {
+                        bad(format!("todo {id} is {}: only a running todo is stopped", t.status.as_str()))
+                    })?;
+                    (a.attempt, a.child_sid.clone().unwrap_or_default())
+                }
+                _ => match store
+                    .update(|l| l.mark_paused(&id, sub == "pause", now))
+                    .map_err(todo_fail)?
+                {
+                    Some(found) => found,
+                    None => {
+                        print(&json!({ "todo_id": id, "unchanged": format!("already {sub}d") }));
+                        return Ok(0);
+                    }
+                },
             };
-            print(&json!({ "todo_id": id, "status": "pending", "note": note }));
+            let command = match sub.as_str() {
+                "pause" => ControlCommand::Pause { reason: Some(reason.clone()) },
+                "resume" => ControlCommand::Resume { reason: Some(reason.clone()) },
+                _ => ControlCommand::stop(Some(reason.clone())),
+            };
+            let key = format!("todo-{sub}:{}:{id}:{attempt}:{now}", sd.sid());
+            crate::todos::control_child(c.agent.as_ref(), &c.who, &child, key, command).await?;
+            let note = match sub.as_str() {
+                "pause" => "its work session infers no more after the call in flight; its tasks run on",
+                "resume" => "its work session goes on where it stopped",
+                _ => "its work session stops; the attempt ends as stopped (`todo retry` starts a new one)",
+            };
+            print(&json!({ "todo_id": id, "attempt": attempt, "child_sid": child, "sent": sub, "note": note }));
             Ok(0)
         }
         other => Err(bad(format!("unknown todo command `{other}` ({TODO_COMMANDS})"))),
     }
 }
 
-async fn cmd_wait(mut a: Args) -> R<i32> {
-    let sid = a.next("<sid>")?;
-    let c = ctx(&a, None, false).await?;
-    if c.agent.sessions().lookup(&sid).await?.is_none() {
-        return Err(bad(format!("session {sid} is not registered")));
-    }
-    print(&pending_on_session("wait", &sid, a.num("wait-ms")?));
-    Ok(0)
+/// There is no waiting for a sub session: its end comes back as input.
+async fn cmd_wait(_a: Args) -> R<i32> {
+    Err(bad(
+        "there is no `wait`: the end of a sub session (or what it needs) comes back to you as input; reply without tool calls to end this Turn meanwhile",
+    ))
 }
 
 async fn cmd_workspace(mut a: Args) -> R<i32> {
@@ -1736,7 +1791,7 @@ async fn cmd_workspace(mut a: Args) -> R<i32> {
         Ok(WorkspaceLocation {
             runtime_id: a
                 .get("runtime")
-                .unwrap_or_else(|| CONTAINER_RUNTIME.into()),
+                .unwrap_or_else(|| PRIVATE_RUNTIME.into()),
             directory,
         })
     };
@@ -1748,16 +1803,35 @@ async fn cmd_workspace(mut a: Args) -> R<i32> {
         }
     };
     match command.as_str() {
-        "list" => print(
-            &manager
+        "list" => {
+            let entries = manager
                 .query(&WorkspaceQuery {
                     runtime_id: a.get("runtime"),
                     lifecycle: a.has("active").then_some(WorkspaceLifecycle::Active),
                     text: a.get("text"),
                     ..Default::default()
                 })
-                .await?,
-        ),
+                .await?;
+            if a.has("json") {
+                print(&entries);
+            } else {
+                list_heading("Workspaces", entries.len());
+                for w in &entries {
+                    println!(
+                        "- {}: {} — {}:{} [{}, {}, {}]",
+                        w.workspace_id, inline_text(&w.name), w.location.runtime_id,
+                        w.location.directory.display(), list_label(w.lifecycle),
+                        list_label(w.availability), list_label(w.usage),
+                    );
+                    if let Some(url) = &w.url {
+                        println!("  URL: {url}");
+                    }
+                    if let Some(error) = &w.last_error {
+                        println!("  Error: {}", inline_text(error));
+                    }
+                }
+            }
+        }
         "create" => print(
             &manager
                 .create(
@@ -1884,24 +1958,65 @@ async fn cmd_workspace(mut a: Args) -> R<i32> {
     Ok(0)
 }
 
-/// `runtime baseline [--json] [--check [--overlay]]`: the standard
-/// environment's commands; `--check` looks for them on this machine's PATH
-/// (`--overlay`: session helpers come from a session bin overlay, so their
-/// providing executables are looked for instead). Exit 1 when any is
-/// missing.
+/// `runtime baseline [--level standard|extended] [--json] [--check
+/// [--overlay]]`: the commands of a baseline (default `standard`); `--check`
+/// looks for them on this machine's PATH and says where each is (`--overlay`:
+/// session helpers come from a session bin overlay, so their providing
+/// executables are looked for instead). Exit 1 when one is missing, or a
+/// standard one is not from `$BUCKYOS_ROOT`.
 fn cmd_runtime_baseline(a: &Args) -> R<i32> {
-    use crate::baseline::{missing_locally, required_commands, STANDARD_TOOLS};
+    use crate::baseline::{beside_current_exe, buckyos_root, checked_commands, evaluate, required_commands, resolve_locally, CommandOrigin, EXTENDED_TOOLS, STANDARD_TOOLS};
+    let level = match a.get("level").as_deref() {
+        None | Some("standard") => buckyos_api::RuntimeBaseline::Standard,
+        Some("extended") => buckyos_api::RuntimeBaseline::Extended,
+        Some(other) => return Err(bad(format!("--level takes standard | extended, not `{other}`"))),
+    };
+    let extended = level == buckyos_api::RuntimeBaseline::Extended;
     if a.has("check") {
-        let names = required_commands(a.has("overlay"));
-        let missing = missing_locally(&names, None, &[]);
-        print(&json!({ "baseline": "standard", "checked": names, "missing": missing, "ok": missing.is_empty() }));
-        return Ok(if missing.is_empty() { 0 } else { 1 });
+        let overlay = a.has("overlay");
+        let beside: Vec<PathBuf> = beside_current_exe().into_iter().collect();
+        let origin = CommandOrigin {
+            root: buckyos_root().map(|r| r.display().to_string()),
+            agent_root: None,
+            beside: beside.first().map(|d| d.display().to_string()),
+            windows: cfg!(windows),
+        };
+        let resolved: std::collections::BTreeMap<String, ResolvedCommand> = resolve_locally(&checked_commands(overlay), &[], None, &beside)
+            .into_iter()
+            .map(|(name, path)| {
+                let provided_by = origin.of(&path);
+                (name, ResolvedCommand { path, version: None, provided_by, stub: false })
+            })
+            .collect();
+        let findings = evaluate(level, overlay, &resolved);
+        print(&json!({
+            "baseline": level.as_str(),
+            "checked": required_commands(level, overlay),
+            "missing": findings.missing,
+            "unmanaged": findings.unmanaged,
+            "resolved": resolved,
+            "ext": findings.ext,
+            "ok": findings.ok(),
+        }));
+        return Ok(if findings.ok() { 0 } else { 1 });
     }
     if a.has("json") {
-        print(&STANDARD_TOOLS);
+        if extended {
+            print(&json!({ "standard": STANDARD_TOOLS, "extended": EXTENDED_TOOLS }));
+        } else {
+            print(&STANDARD_TOOLS);
+        }
     } else {
+        let label = |v: serde_json::Result<serde_json::Value>| v.ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
         for t in STANDARD_TOOLS {
-            println!("{:<22} {:<16} {}", t.name, serde_json::to_value(t.category).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default(), t.source);
+            println!("{:<22} {:<16} {}", t.name, label(serde_json::to_value(t.category)), t.source);
+        }
+        if extended {
+            for t in EXTENDED_TOOLS {
+                for c in t.commands {
+                    println!("{:<22} {:<16} {} ({})", c.name, label(serde_json::to_value(t.category)), t.id, label(serde_json::to_value(t.tier)));
+                }
+            }
         }
     }
     Ok(0)
@@ -1918,9 +2033,39 @@ async fn cmd_runtime(mut a: Args) -> R<i32> {
         "list" => {
             let mut all = registry.list().await?;
             if a.has("available") {
-                all.retain(|r| r.availability == RuntimeAvailability::Available);
+                all.retain(|r| r.usable());
             }
-            print(&all);
+            if a.has("json") {
+                print(&all);
+            } else {
+                list_heading("Runtimes", all.len());
+                for r in &all {
+                    println!("{}", crate::runtime::runtime_line(r));
+                    match &r.caps.baseline_check {
+                        Some(check) if check.error.is_some() => {
+                            println!("  Tool check: failed");
+                            println!("  Tool check error: {}", inline_text(check.error.as_deref().unwrap_or_default()));
+                        }
+                        Some(check) => {
+                            println!("  Tool check: {}", check.problem().unwrap_or_else(|| "ok".to_string()));
+                            let dev = check.dev_helpers();
+                            if !dev.is_empty() {
+                                println!("  Development helpers: {}", dev.join(", "));
+                            }
+                        }
+                        None => println!("  Tool check: not checked"),
+                    }
+                    if let Some(tools) = &r.caps.tools_check {
+                        println!("  Commands verified: {}{}", tools.present.join(", "), if tools.missing.is_empty() { String::new() } else { format!("; missing {}", tools.missing.join(", ")) });
+                    }
+                    if r.usage.sessions_total > 0 || r.usage.workspaces > 0 {
+                        println!("  Used by {} sessions, {} workspaces{}", r.usage.sessions_total, r.usage.workspaces, r.usage.last_session_id.as_ref().map(|s| format!("; last {s}")).unwrap_or_default());
+                    }
+                    if let Some(error) = &r.last_error {
+                        println!("  Error: {}", inline_text(error));
+                    }
+                }
+            }
         }
         "get" => {
             let id = a.next("runtime id")?;
@@ -1931,36 +2076,90 @@ async fn cmd_runtime(mut a: Args) -> R<i32> {
                     .ok_or_else(|| bad(format!("runtime {id} is not registered")))?,
             );
         }
-        "check" => print(&registry.check(&a.next("runtime id")?).await?),
-        "register" => {
-            let kind = match a.get("kind").as_deref() {
-                Some("container") => RuntimeKind::Container,
-                Some("host_native") => RuntimeKind::HostNative,
-                Some("remote_node") => RuntimeKind::RemoteNode,
-                Some("remote_ssh") => RuntimeKind::RemoteSsh,
-                _ => return Err(bad("--kind takes container | host_native | remote_node | remote_ssh")),
+        "check" => {
+            let id = a.next("runtime id")?;
+            let commands: Vec<String> = a
+                .all("commands")
+                .iter()
+                .flat_map(|v| v.split(',').map(|x| x.trim().to_string()))
+                .filter(|x| !x.is_empty())
+                .collect();
+            print(&registry.check(&id, &commands, a.has("full")).await?);
+        }
+        "ext-tools" => {
+            let verb = a.next("ext-tools command")?;
+            let id = a.next("runtime id")?;
+            let smoke = match verb.as_str() {
+                "status" => false,
+                "check" => a.has("full"),
+                other => return Err(bad(format!("ext-tools takes status | check, not `{other}`"))),
             };
-            let exec = a.get("exec").map(|e| json_arg::<Value>(&e)).transpose()?;
+            let record = if verb == "check" { Some(registry.check(&id, &[], smoke).await?) } else { None };
+            let report = registry.ext_tools(&id, smoke).await?;
+            if a.has("json") {
+                print(&serde_json::json!({ "report": report, "baseline_check": record.and_then(|r| r.caps.baseline_check) }));
+                return Ok(0);
+            }
+            println!("{} ({}, {})", report["runtime_id"].as_str().unwrap_or(&id), report["tools_root"].as_str().unwrap_or(""), report["managed_by"].as_str().unwrap_or(""));
+            let packages = report["packages"].as_object().cloned().unwrap_or_default();
+            if packages.is_empty() {
+                println!("no extension packages installed");
+            }
+            for (package, install) in &packages {
+                let commands = install["commands"].as_object().map(|c| c.len()).unwrap_or(0);
+                println!("{package} {} ({}): {commands} commands, smoke {}", install["version"].as_str().unwrap_or(""), install["origin"].as_str().unwrap_or(""), install["smoke"].as_str().unwrap_or(""));
+                if let Some(result) = report.get("smoke").and_then(|s| s.get(package)) {
+                    println!("  now: {}", if result["ok"] == true { "passed".to_string() } else { format!("FAILED: {}", result["error"].as_str().unwrap_or("")) });
+                }
+            }
+            if let Some(ext) = record.as_ref().and_then(|r| r.caps.baseline_check.as_ref()).and_then(|b| b.ext.as_ref()) {
+                println!("ext: {}", ext.summary());
+            }
+        }
+        "op" => {
+            let id = a.next("op id")?;
+            print(&crate::runtime::runtime_op(c.agent.as_ref(), &id)?.ok_or_else(|| bad(format!("no runtime operation {id}")))?);
+        }
+        "register" => {
+            let connector = match a.get("connector").as_deref() {
+                Some("ssh") => RuntimeConnector::Ssh {
+                    host: a.get("host").ok_or_else(|| bad("missing --host"))?,
+                    user: a.get("user"),
+                    port: a.get("port").map(|p| p.parse::<u16>().map_err(|_| bad("--port takes a number"))).transpose()?,
+                    identity_file: a.get("identity-file"),
+                },
+                Some("node_executor") => RuntimeConnector::NodeExecutor {
+                    node_did: a.get("node-did"),
+                    executor_id: a.get("executor-id"),
+                    profile_id: a.get("profile").unwrap_or_default(),
+                },
+                _ => return Err(bad("--connector takes ssh | node_executor (the private runtime and the owner's nodes are projected from the settings)")),
+            };
             print(
                 &registry
                     .register(
                         &RuntimeRegister {
                             runtime_id: a.next("runtime id")?,
-                            kind,
+                            connector,
                             name: a.get("name").ok_or_else(|| bad("missing --name"))?,
-                            description: a.get("description").unwrap_or_default(),
-                            exec,
-                            roots: a.all("root").into_iter().map(PathBuf::from).collect(),
-                            capabilities: json!({}),
+                            desc: a.get("desc").unwrap_or_default(),
+                            enabled: true,
                             default: false,
-                            computer: Default::default(),
                             baseline: match a.get("baseline").as_deref() {
                                 None | Some("standard") => buckyos_api::RuntimeBaseline::Standard,
                                 Some("extended") => buckyos_api::RuntimeBaseline::Extended,
                                 Some(b) => return Err(bad(format!("--baseline takes standard | extended, not `{b}`"))),
                             },
+                            grant: RuntimeGrant {
+                                ops: Vec::new(),
+                                roots: a.all("root").into_iter().map(PathBuf::from).collect(),
+                                computer: Default::default(),
+                                install: Default::default(),
+                                workspace: false,
+                                expires_at_ms: a.num("expires-at-ms")?,
+                            },
                         },
-                        &c.who,
+                        &format!("dev:{}", c.who),
                     )
                     .await?,
             );
@@ -1977,7 +2176,7 @@ async fn cmd_runtime(mut a: Args) -> R<i32> {
                                 bad("missing --expected-revision (read runtime get first)")
                             })?,
                             name: a.get("name"),
-                            description: a.get("description"),
+                            desc: a.get("desc"),
                             roots: (!roots.is_empty())
                                 .then(|| roots.into_iter().map(PathBuf::from).collect()),
                         },
@@ -1991,14 +2190,74 @@ async fn cmd_runtime(mut a: Args) -> R<i32> {
             let revision = a
                 .num("expected-revision")?
                 .ok_or_else(|| bad("missing --expected-revision (read runtime get first)"))?;
-            registry.unregister(&id, revision, &c.who).await?;
-            print(&json!({ "runtime_id": id, "unregistered": true }));
+            print(&registry.unregister(&id, revision, &c.who).await?);
         }
         _ => return Err(bad(format!("unknown runtime command `{command}`"))),
     }
     Ok(0)
 }
 
+fn run_command_line(words: &[String], windows: bool) -> String {
+    let quoted = |quote: fn(&str) -> String| words.iter().map(|word| quote(word)).collect::<Vec<_>>().join(" ");
+    match words {
+        [line] => line.clone(),
+        _ if windows => format!("& {}", quoted(crate::baseline::powershell_quote)),
+        _ => quoted(shell_quote),
+    }
+}
+
+/// `run --runtime <id|workspace> [--cwd <dir>] [--timeout <secs>] -- <command...>`:
+/// one command on another runtime of this agent, from a session whose
+/// working runtime is the private one (R-W5). Several words after `--` are a
+/// command and its arguments, which reach it as they are; one word is a line
+/// for the target's shell.
+async fn cmd_runtime_run(argv: Vec<String>) -> R<i32> {
+    let split = argv.iter().position(|x| x == "--").ok_or_else(|| bad("run takes `-- <command...>` after its options"))?;
+    let words = &argv[split + 1..];
+    if words.iter().all(|word| word.trim().is_empty()) {
+        return Err(bad("run: no command after `--`"));
+    }
+    let a = Args::parse(argv[..split].to_vec(), &[]);
+    let sid = env_sid().ok_or_else(|| bad("run runs inside a session ($OPENDAN_SESSION_ID)"))?;
+    let c = ctx(&a, None, false).await?;
+    let entry = c
+        .agent
+        .sessions()
+        .lookup(&sid)
+        .await?
+        .ok_or_else(|| bad(format!("session {sid} is not registered")))?;
+    let sd = SessionDir::open(&entry.location)?;
+    let cfg = sd.config()?;
+    if !cfg.runtime.is_private() {
+        return Err(bad(format!(
+            "this session's working runtime is `{}`: a single-machine session has no `agent-session run`; its creator places the material and commands on that machine",
+            cfg.runtime.runtime_id()
+        )));
+    }
+    let target = a.get("runtime").ok_or_else(|| bad("missing --runtime <runtime_id|workspace>"))?;
+    let (runtime_id, cwd) = if target == "workspace" {
+        let b = cfg
+            .workspace_binding
+            .as_ref()
+            .ok_or_else(|| bad("the session has no workspace; name a runtime id and --cwd"))?;
+        (canonical_runtime(&b.location.runtime_id).to_string(), Some(b.location.directory.display().to_string()))
+    } else {
+        (canonical_runtime(&target).to_string(), a.get("cwd"))
+    };
+    if is_private_runtime(&runtime_id) && target != "workspace" {
+        return Err(bad("the private runtime is where this session's `shell` already runs; use `shell`"));
+    }
+    let timeout_ms = a
+        .num::<u64>("timeout")?
+        .map(|s| s * 1000)
+        .unwrap_or(crate::runtime::RUNTIME_EXEC_DEFAULT_TIMEOUT_MS);
+    let windows = c.agent.runtimes().lookup(&runtime_id).await?.is_some_and(|r| r.caps.platform.os == "windows");
+    let command = run_command_line(words, windows);
+    let op = crate::runtime::runtime_exec(c.agent.as_ref(), &runtime_id, &command, cwd.as_deref(), timeout_ms, Some(&format!("session:{sid}"))).await?;
+    let record = crate::runtime::session_run_record(&sd, &op, env_call_id())?;
+    print(&record);
+    Ok(if op.timed_out { 124 } else { op.exit_code })
+}
 /// The caller of a goal operation: inside a session its kind decides what it
 /// may do (`$OPENDAN_SESSION_ID`), outside the owner side.
 fn goal_caller(c: &Ctx) -> GoalCaller {
@@ -2059,7 +2318,7 @@ async fn goal_show(c: &Ctx, a: &Args, id: &str) -> R<Value> {
     let session = c.agent.sessions().lookup(&goal.session.sid).await?;
     v["session"] = json!(session.map(|e| json!({
         "session_id": e.session_id, "run_state": e.status.run_state, "outcome": e.status.outcome,
-        "waiting_for": e.status.waiting_for, "turn_open": e.status.turn_open,
+        "needs_input": e.status.needs_input, "turn_open": e.status.turn_open,
         "one_line_status": e.status.one_line_status,
     })));
     if a.has("state") {
@@ -2635,18 +2894,13 @@ fn inline_files(argv: Vec<String>) -> R<(Vec<String>, Option<String>)> {
 async fn remote_main(remote: crate::session_context::SessionClient, cmd: String, argv: Vec<String>) -> R<i32> {
     let sid = remote.ctx.session_id.clone();
     if cmd == "task" {
-        use agent_tool::task_bridge::{TaskBridgeRequest, TaskBridgeResponse, TaskOp};
+        use agent_tool::task_bridge::{TaskBridgeRequest, TaskBridgeResponse};
         let mut a = Args::parse(argv, &[]);
-        let op = match a.next("state | wait | cancel")?.as_str() {
-            "state" => TaskOp::State,
-            "wait" => TaskOp::Wait,
-            "cancel" => TaskOp::Cancel,
-            other => return Err(bad(format!("task takes state | wait | cancel, not `{other}`"))),
-        };
+        let op = task_op(&a.next("state | cancel")?)?;
         let request = TaskBridgeRequest {
             op,
             task_id: a.next("<task_id>")?,
-            wait_ms: a.num("wait-ms")?,
+            wait_ms: None,
         };
         let v = remote
             .call("session.task", json!({ "sid": sid, "request": request }))
@@ -2685,11 +2939,15 @@ async fn real_main() -> R<i32> {
         return Ok(if argv.is_empty() { 2 } else { 0 });
     }
     let cmd = argv.remove(0);
+    // `run -- <command>` is the session helper `agent-session run`; `xagent
+    // run <sid>` drives a session.
+    if cmd == "run" && argv.iter().any(|x| x == "--") && remote_context(&mut argv.clone()).is_none() {
+        return cmd_runtime_run(argv).await;
+    }
     if let Some((path, sc)) = remote_context(&mut argv) {
         // What only reads this machine runs here; the rest is the session's
         // business on the control side.
         match (cmd.as_str(), argv.first().map(String::as_str)) {
-            ("ask-user", _) => std::env::set_var("OPENDAN_SESSION_ID", &sc.session_id),
             ("runtime", Some("baseline")) => {}
             _ => {
                 let client = crate::session_context::SessionClient { path, ctx: sc };
@@ -2697,14 +2955,14 @@ async fn real_main() -> R<i32> {
             }
         }
     }
-    // `--run` is a flag of `status` and takes a run id for `xllm`;
-    // `--accept` is a verdict of `todo review` and a criterion elsewhere.
+    // `--run` is a flag of `status` and takes a run id for `xllm`.
     let extra: &[&str] = match (cmd.as_str(), argv.first().map(String::as_str)) {
         ("status", _) => &["run"],
-        ("todo", Some("review")) => &["accept", "reject", "need-evidence", "json"],
-        ("todo", _) => &["json"],
+        ("todo", _) => &["json", "clear-accept"],
         ("skill", _) => &["json", "replace"],
         ("runtime", Some("baseline")) => &["json", "check", "overlay"],
+        ("runtime", Some("check")) => &["full"],
+        ("workspace" | "runtime", Some("list")) | ("sessions", _) => &["json"],
         ("copy", _) => &["replace"],
         _ => &[],
     };
@@ -2732,7 +2990,6 @@ async fn real_main() -> R<i32> {
         "read-session" => cmd_read_session(a).await,
         "artifact" => cmd_artifact(a).await,
         "create-worksession" => cmd_create_worksession(a).await,
-        "ask-user" => cmd_ask_user(a),
         "wait" => cmd_wait(a).await,
         "goal" => cmd_goal(a).await,
         "notify" => cmd_notify(a).await,
@@ -2769,4 +3026,40 @@ pub fn main() -> ! {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    #[test]
+    fn a_powershell_target_calls_the_command_with_its_words_quoted() {
+        let words = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        assert_eq!(run_command_line(&words(&["my prog", "it's", "$x"]), true), "& 'my prog' 'it''s' '$x'");
+        assert_eq!(run_command_line(&words(&["Get-Process | Select -First 1"]), true), "Get-Process | Select -First 1");
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    #[test]
+    fn object_subscriptions_are_canonical_object_urls_of_this_zone() {
+        let ok = |spec: &str| parse_subscription(spec).unwrap_or_else(|e| panic!("{spec}: {}", e.msg));
+        let a = ok("active:object:OBJ://AIWorkspace/ws_1#head");
+        let b = ok("active:object:obj://aiworkspace/ws_1#head");
+        assert_eq!(a.id, b.id, "one object, one subscription");
+        match &a.source {
+            SubscriptionSource::ObjectEvent { object, event } => {
+                assert_eq!((object.as_str(), event.as_str()), ("obj://aiworkspace/ws_1", "head"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let Err(err) = parse_subscription("active:object:https://bob.example.org/home/bob/feed") else {
+            panic!("another Zone's object has no events here");
+        };
+        assert!(err.msg.contains("no events this Zone delivers"), "{}", err.msg);
+        assert!(parse_subscription("active:object:not a url").is_err());
+    }
 }

@@ -2,7 +2,11 @@ use crate::error::ResourceError;
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use buckyos_api::{AiArtifact, AiccError, AiccErrorCode, ResourceRef};
+use buckyos_api::bucket_client::{Action, BucketClient, BucketId, Grant, GranteeKind, PutRequest};
+use buckyos_api::{
+    bucket_obj_url, get_buckyos_api_runtime, AiArtifact, AiccError, AiccErrorCode, ResourceRef,
+    AICC_BUCKET_INPUTS, AICC_BUCKET_OUTPUTS, AICC_SERVICE_SERVICE_NAME,
+};
 use futures_util::StreamExt;
 use named_store::{NamedDataMgr, PinScope};
 use ndn_lib::{load_named_obj_and_verify, ChunkHasher, FileObject, NamedObject, ObjId};
@@ -10,7 +14,7 @@ use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::io::{Cursor, Read};
 use std::net::IpAddr;
@@ -30,13 +34,14 @@ const REJECTED_ARCHIVE_MIME_TYPES: [&str; 5] = [
     "application/x-7z-compressed",
     "application/vnd.rar",
 ];
-const RESERVED_ARTIFACT_META_KEYS: [&str; 6] = [
-    "mime_type",
+const RESERVED_ARTIFACT_META_KEYS: [&str; 7] = [
+    "mime",
     "file_name",
     "digest",
     "rows",
     "dimensions",
     "space",
+    "bucket_ref",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +49,9 @@ pub(crate) struct ResourceAccessContext {
     pub tenant_id: String,
     pub caller_id: String,
     pub request_id: String,
+    /// The App the call's artifacts are filed under (`AuthorizedCaller::artifact_app`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
 }
 
 impl ResourceAccessContext {
@@ -56,6 +64,7 @@ impl ResourceAccessContext {
             tenant_id: tenant_id.into(),
             caller_id: caller_id.into(),
             request_id: request_id.into(),
+            app_id: None,
         };
         if context.tenant_id.trim().is_empty()
             || context.caller_id.trim().is_empty()
@@ -67,6 +76,53 @@ impl ResourceAccessContext {
             ));
         }
         Ok(context)
+    }
+
+    pub fn with_app(mut self, app_id: Option<String>) -> Self {
+        self.app_id = app_id;
+        self
+    }
+}
+
+/// Where a written artifact is retained: one of AICC's buckets of the call's
+/// user (`user/aicc/<tenant>/<outputs|inputs>`), keyed `<app>/<hash>/<name>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArtifactTarget {
+    pub bucket: BucketId,
+    pub app_id: Option<String>,
+}
+
+impl ArtifactTarget {
+    pub fn new(context: &ResourceAccessContext, bucket: &str) -> Result<Self, ResourceError> {
+        let bucket = BucketId::user(AICC_SERVICE_SERVICE_NAME, &context.tenant_id, bucket)
+            .map_err(|_| {
+                ResourceError::new(
+                    ResourceFailure::Unauthorized,
+                    "the AICC user cannot own a bucket",
+                )
+            })?;
+        Ok(Self {
+            bucket,
+            app_id: context.app_id.clone(),
+        })
+    }
+
+    pub fn key(&self, obj_id: &ObjId, name: &str) -> String {
+        let id = obj_id.to_string();
+        let hash = id.split_once(':').map(|(_, h)| h).unwrap_or(&id);
+        format!(
+            "{}/{}/{name}",
+            self.app_id.as_deref().unwrap_or("_"),
+            &hash[..hash.len().min(16)]
+        )
+    }
+
+    /// The App granted `read` on its own prefix so it can copy its results
+    /// out; system UIs and services read through their own rights.
+    fn reader(&self) -> Option<&str> {
+        self.app_id
+            .as_deref()
+            .filter(|app| !app.starts_with("system:"))
     }
 }
 
@@ -268,9 +324,8 @@ impl fmt::Debug for ResourceMetadata {
 ///   (nothing is downloaded), a `Base64` stays bytes, and a `NamedObject` is
 ///   handed over as the zone's NDN object URL whenever the zone serves named
 ///   objects over HTTP — which avoids inlining a possibly large payload.
-/// - `UrlOnly`: the field is an absolute URL and nothing else. A `Base64`
-///   payload is published into the local NDN store first so that it gains an
-///   object URL of its own.
+/// - `UrlOnly`: the field is an absolute public URL. Inline payloads are
+///   published as named objects when the zone provides object URLs.
 /// - `BytesOnly`: the field carries the payload itself (multipart upload,
 ///   `bytesBase64Encoded`, ...). A `Url` is downloaded and a `NamedObject` is
 ///   read before encoding.
@@ -286,11 +341,6 @@ pub(crate) enum ResourceInputForm {
 }
 
 impl ResourceInputForm {
-    /// `BytesOnly` protocols must download a `ResourceRef::Url` payload.
-    pub(crate) fn downloads_url_bytes(self) -> bool {
-        matches!(self, Self::BytesOnly)
-    }
-
     /// `UrlOrBytes` / `UrlOnly` protocols can be handed a URL string.
     pub(crate) fn accepts_url(self) -> bool {
         !matches!(self, Self::BytesOnly)
@@ -311,16 +361,25 @@ impl ResourceInputForm {
 ///
 /// Returning `None` means this zone does not expose named objects over HTTP;
 /// the object then has to be inlined as bytes.
+#[async_trait]
 pub(crate) trait NamedObjectUrlProvider: Send + Sync {
     fn object_url(&self, obj_id: &ObjId) -> Option<String>;
+
+    /// Whether a Provider could read `url` without this zone's credentials.
+    async fn is_public(&self, url: &str) -> bool;
 }
 
 /// This zone does not serve named objects over HTTP.
 pub(crate) struct DisabledNamedObjectUrlProvider;
 
+#[async_trait]
 impl NamedObjectUrlProvider for DisabledNamedObjectUrlProvider {
     fn object_url(&self, _obj_id: &ObjId) -> Option<String> {
         None
+    }
+
+    async fn is_public(&self, _url: &str) -> bool {
+        false
     }
 }
 
@@ -339,6 +398,7 @@ impl ZoneNamedObjectUrlProvider {
     }
 }
 
+#[async_trait]
 impl NamedObjectUrlProvider for ZoneNamedObjectUrlProvider {
     fn object_url(&self, obj_id: &ObjId) -> Option<String> {
         let base = self.base_url.trim_end_matches('/');
@@ -350,6 +410,24 @@ impl NamedObjectUrlProvider for ZoneNamedObjectUrlProvider {
         // expects (the same form `Serialize` emits and `ObjId::new` round-trips).
         // Its `Display` impl would instead emit base32, a different spelling.
         Some(format!("{base}/{}", obj_id.to_string()))
+    }
+
+    /// `/ndn/` answers an anonymous request only for what the zone published.
+    async fn is_public(&self, url: &str) -> bool {
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        else {
+            return false;
+        };
+        client
+            .get(url)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
     }
 }
 
@@ -391,6 +469,7 @@ pub(crate) struct MaterializedResource {
 }
 
 impl MaterializedResource {
+    #[cfg(test)]
     pub fn key(&self) -> &ResourceKey {
         &self.key
     }
@@ -400,6 +479,7 @@ impl MaterializedResource {
     }
 
     /// The URL form of this resource, when the protocol takes one.
+    #[cfg(test)]
     pub fn url(&self) -> Option<&str> {
         self.url.as_deref()
     }
@@ -429,18 +509,6 @@ impl MaterializedResource {
         })
     }
 
-    pub fn multipart_part(&self) -> Result<reqwest::multipart::Part, ResourceError> {
-        let mut part = reqwest::multipart::Part::bytes(self.bytes.clone());
-        if let Some(mime) = &self.metadata.mime {
-            part = part.mime_str(mime).map_err(|_| {
-                ResourceError::new(ResourceFailure::MimeInvalid, "invalid multipart MIME")
-            })?;
-        }
-        if let Some(file_name) = &self.metadata.file_name {
-            part = part.file_name(file_name.clone());
-        }
-        Ok(part)
-    }
 }
 
 impl fmt::Debug for MaterializedResource {
@@ -476,35 +544,6 @@ impl fmt::Debug for CodecResourceParts {
             .field("has_url", &self.url.is_some())
             .finish()
     }
-}
-
-pub(crate) fn require_materialized<'a, T>(
-    resources: &'a BTreeMap<String, T>,
-    resource: &ResourceRef,
-) -> Result<&'a T, ResourceError> {
-    let key = ResourceKey::from_ref(resource);
-    resources.get(key.as_str()).ok_or_else(|| {
-        ResourceError::new(
-            ResourceFailure::PhaseViolation,
-            "resource was not materialized before protocol encoding",
-        )
-    })
-}
-
-pub(crate) fn multipart_form(
-    fields: impl IntoIterator<Item = (String, MaterializedResource)>,
-) -> Result<reqwest::multipart::Form, ResourceError> {
-    let mut form = reqwest::multipart::Form::new();
-    for (field_name, resource) in fields {
-        if field_name.trim().is_empty() || field_name.contains(['\r', '\n']) {
-            return Err(ResourceError::new(
-                ResourceFailure::InvalidReference,
-                "invalid multipart field name",
-            ));
-        }
-        form = form.part(field_name, resource.multipart_part()?);
-    }
-    Ok(form)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -558,6 +597,8 @@ pub(crate) struct StoredFile {
     size_bytes: u64,
     digest: Option<String>,
     attributes: Map<String, Value>,
+    /// `obj://bucket/...` of the binding that retains a written artifact.
+    bucket_ref: Option<String>,
 }
 
 /// Request-owned lease. Clones share renewal; dropping the last guard releases
@@ -628,22 +669,107 @@ pub(crate) trait ResourceStore: Send + Sync {
     }
     async fn inspect(&self, obj_id: &ObjId) -> Result<StoredFile, ResourceError>;
     async fn read(&self, obj_id: &ObjId, max_bytes: u64) -> Result<Vec<u8>, ResourceError>;
+    /// Store `bytes` as a FileObject and bind it under `target`; success
+    /// means the bucket retains it.
     async fn write_artifact(
         &self,
         bytes: &[u8],
         spec: &ArtifactSpec,
+        target: &ArtifactTarget,
     ) -> Result<StoredFile, ResourceError>;
 }
 
 #[derive(Clone)]
 pub(crate) struct NamedDataMgrResourceStore {
     store: NamedDataMgr,
+    /// `None`: a fresh client of the runtime per write.
+    buckets: Option<Arc<BucketClient>>,
+    /// `<bucket>|<app>` whose reader grant exists.
+    granted: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl NamedDataMgrResourceStore {
     pub fn new(store: NamedDataMgr) -> Self {
-        Self { store }
+        Self {
+            store,
+            buckets: None,
+            granted: Arc::default(),
+        }
     }
+
+    #[cfg(test)]
+    pub fn with_bucket_client(mut self, client: BucketClient) -> Self {
+        self.buckets = Some(Arc::new(client));
+        self
+    }
+
+    async fn bucket_client(&self) -> Result<Arc<BucketClient>, ResourceError> {
+        if let Some(client) = &self.buckets {
+            return Ok(client.clone());
+        }
+        let runtime = get_buckyos_api_runtime().map_err(|e| retain_error("bucket client", e))?;
+        runtime
+            .get_bucket_client()
+            .await
+            .map(Arc::new)
+            .map_err(|e| retain_error("bucket client", e))
+    }
+
+    async fn grant_reader(
+        &self,
+        client: &BucketClient,
+        bucket: &BucketId,
+        app: &str,
+    ) -> Result<(), ResourceError> {
+        let marker = format!("{bucket}|{app}");
+        if self
+            .granted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&marker)
+        {
+            return Ok(());
+        }
+        let prefix = format!("{app}/");
+        let grants: Vec<Grant> = client
+            .call("bucket.list_grants", json!({"bucket_id": bucket}))
+            .await
+            .and_then(|v| {
+                serde_json::from_value(v)
+                    .map_err(|e| kRPC::RPCErrors::ParserResponseError(e.to_string()))
+            })
+            .map_err(|e| retain_error(&marker, e))?;
+        let granted = grants.iter().any(|g| {
+            g.grantee.kind == GranteeKind::App
+                && g.grantee.id == app
+                && g.prefix == prefix
+                && g.actions.contains(Action::Read)
+                && g.expires_at.is_none()
+        });
+        if !granted {
+            client
+                .call(
+                    "bucket.grant",
+                    json!({"bucket_id": bucket, "grantee": {"kind": "app", "id": app}, "prefix": prefix, "actions": ["read"]}),
+                )
+                .await
+                .map_err(|e| retain_error(&marker, e))?;
+            log::info!("aicc granted {app} read on {bucket}/{prefix}");
+        }
+        self.granted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(marker);
+        Ok(())
+    }
+}
+
+fn retain_error(what: &str, error: impl fmt::Display) -> ResourceError {
+    log::warn!("AICC artifact retention failed ({what}): {error}");
+    ResourceError::new(
+        ResourceFailure::Unavailable,
+        "artifact could not be retained",
+    )
 }
 
 #[async_trait]
@@ -747,6 +873,7 @@ impl ResourceStore for NamedDataMgrResourceStore {
         &self,
         bytes: &[u8],
         spec: &ArtifactSpec,
+        target: &ArtifactTarget,
     ) -> Result<StoredFile, ResourceError> {
         let chunk_id = ChunkHasher::new(None)
             .map_err(|_| ResourceError::new(ResourceFailure::Unavailable, "hasher unavailable"))?
@@ -757,7 +884,9 @@ impl ResourceStore for NamedDataMgrResourceStore {
             .map_err(store_error)?;
 
         let mut file = FileObject::new(spec.name.clone(), bytes.len() as u64, chunk_id.to_string());
-        file.meta.insert("mime_type".to_string(), json!(spec.mime));
+        file.apply_media_meta(
+            &ndn_lib::probe_media_meta(&ndn_lib::MemoryByteSource::new(bytes), &spec.name, Some(&spec.mime)).await,
+        );
         file.meta.insert("file_name".to_string(), json!(spec.name));
         file.meta.insert(
             "digest".to_string(),
@@ -778,7 +907,24 @@ impl ResourceStore for NamedDataMgrResourceStore {
             .put_object(&obj_id, &encoded)
             .await
             .map_err(store_error)?;
-        stored_file_from_object(obj_id, file)
+        let key = target.key(&obj_id, &spec.name);
+        let client = self.bucket_client().await?;
+        let request = PutRequest {
+            key: key.clone(),
+            obj_id: obj_id.to_string(),
+            content_type: Some(spec.mime.clone()),
+            ..Default::default()
+        };
+        client
+            .put(&target.bucket, &request)
+            .await
+            .map_err(|e| retain_error(&format!("{}/{key}", target.bucket), e))?;
+        if let Some(app) = target.reader() {
+            self.grant_reader(&client, &target.bucket, app).await?;
+        }
+        let mut stored = stored_file_from_object(obj_id, file)?;
+        stored.bucket_ref = Some(bucket_obj_url(&target.bucket, &key));
+        Ok(stored)
     }
 }
 
@@ -1166,7 +1312,8 @@ impl ResourceManager {
                             embedding: None,
                         };
                         validate_artifact_spec(&spec)?;
-                        let stored = self.store.write_artifact(&decoded, &spec).await?;
+                        let target = ArtifactTarget::new(context, AICC_BUCKET_INPUTS)?;
+                        let stored = self.store.write_artifact(&decoded, &spec, &target).await?;
                         let stored_url = self.object_urls.object_url(&stored.obj_id);
                         let Some(stored_url) = stored_url else {
                             return Err(ResourceError::new(
@@ -1194,12 +1341,21 @@ impl ResourceManager {
                     self.authorizer
                         .authorize(context, &target, ResourceAccessOperation::ReadContent)
                         .await?;
-                    match self
+                    let object_url = self
                         .input_form
                         .accepts_url()
                         .then(|| self.object_urls.object_url(&obj_id))
-                        .flatten()
-                    {
+                        .flatten();
+                    let object_url = match object_url {
+                        Some(url)
+                            if self.input_form.requires_url()
+                                || self.object_urls.is_public(&url).await =>
+                        {
+                            Some(url)
+                        }
+                        _ => None,
+                    };
+                    match object_url {
                         // A URL-accepting protocol prefers the object's own URL
                         // over inlining its payload: the Provider fetches the
                         // object from this zone, and the bytes never have to be
@@ -1249,11 +1405,32 @@ impl ResourceManager {
         Ok(materialized)
     }
 
+    /// A result of the call, retained in the user's `outputs` bucket.
     pub async fn write_artifact(
         &self,
         context: &ResourceAccessContext,
         bytes: &[u8],
         spec: ArtifactSpec,
+    ) -> Result<AiArtifact, ResourceError> {
+        self.write(context, bytes, spec, AICC_BUCKET_OUTPUTS).await
+    }
+
+    /// A file derived from the call's inputs, retained in the user's `inputs` bucket.
+    pub async fn write_input(
+        &self,
+        context: &ResourceAccessContext,
+        bytes: &[u8],
+        spec: ArtifactSpec,
+    ) -> Result<AiArtifact, ResourceError> {
+        self.write(context, bytes, spec, AICC_BUCKET_INPUTS).await
+    }
+
+    async fn write(
+        &self,
+        context: &ResourceAccessContext,
+        bytes: &[u8],
+        spec: ArtifactSpec,
+        bucket: &str,
     ) -> Result<AiArtifact, ResourceError> {
         validate_artifact_spec(&spec)?;
         if bytes.len() as u64 > self.limits.max_single_bytes {
@@ -1280,9 +1457,13 @@ impl ResourceManager {
                 ResourceAccessOperation::WriteArtifact,
             )
             .await?;
-        let stored = self.store.write_artifact(bytes, &spec).await?;
+        let target = ArtifactTarget::new(context, bucket)?;
+        let stored = self.store.write_artifact(bytes, &spec, &target).await?;
         let mut metadata = stored.attributes;
         metadata.insert("size_bytes".to_string(), json!(stored.size_bytes));
+        if let Some(bucket_ref) = stored.bucket_ref {
+            metadata.insert("bucket_ref".to_string(), json!(bucket_ref));
+        }
         if let Some(digest) = stored.digest {
             metadata.insert("digest".to_string(), json!(digest));
         }
@@ -1425,7 +1606,7 @@ impl fmt::Debug for ResourceError {
 
 fn stored_file_from_object(obj_id: ObjId, file: FileObject) -> Result<StoredFile, ResourceError> {
     let mut attributes: Map<String, Value> = file.meta.into_iter().collect();
-    let mime = take_string(&mut attributes, &["media_type", "mime_type", "mime"])
+    let mime = take_string(&mut attributes, &["mime"])
         .map(|mime| normalize_mime(&mime))
         .transpose()?;
     let file_name = take_string(&mut attributes, &["file_name", "filename"])
@@ -1439,6 +1620,7 @@ fn stored_file_from_object(obj_id: ObjId, file: FileObject) -> Result<StoredFile
         size_bytes: file.size,
         digest,
         attributes,
+        bucket_ref: None,
     })
 }
 
@@ -1819,9 +2001,6 @@ fn inspect_zip(
     Ok(())
 }
 
-/// Names the object under which a `ResourceRef::Base64` payload is published
-/// when the selected protocol needs a URL. The name only has to be a safe file
-/// name — the object's real identity is its content hash, not this string.
 fn inline_resource_name(key: &ResourceKey, mime: &str) -> String {
     let extension = mime
         .split_once('/')
@@ -1895,8 +2074,12 @@ fn store_error(error: ndn_lib::NdnError) -> ResourceError {
 }
 
 #[cfg(test)]
+mod bucket_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::Mutex;
     use zip::write::SimpleFileOptions;
@@ -2008,6 +2191,7 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         files: Mutex<BTreeMap<String, (StoredFile, Vec<u8>)>>,
+        targets: Mutex<Vec<ArtifactTarget>>,
     }
 
     impl FakeStore {
@@ -2051,19 +2235,25 @@ mod tests {
             &self,
             bytes: &[u8],
             spec: &ArtifactSpec,
+            target: &ArtifactTarget,
         ) -> Result<StoredFile, ResourceError> {
             let mut file = FileObject::new(
                 spec.name.clone(),
                 bytes.len() as u64,
                 "sha256:artifact-content".to_string(),
             );
-            file.meta.insert("mime_type".to_string(), json!(spec.mime));
+            file.apply_media_meta(
+                &ndn_lib::probe_media_meta(&ndn_lib::MemoryByteSource::new(bytes), &spec.name, Some(&spec.mime)).await,
+            );
             file.meta.insert(
                 "digest".to_string(),
                 json!(format!("sha256:{}", sha256_hex(bytes))),
             );
             let (obj_id, _) = file.gen_obj_id();
-            let stored = stored_file_from_object(obj_id, file)?;
+            let key = target.key(&obj_id, &spec.name);
+            let mut stored = stored_file_from_object(obj_id, file)?;
+            stored.bucket_ref = Some(bucket_obj_url(&target.bucket, &key));
+            self.targets.lock().unwrap().push(target.clone());
             self.insert(stored.clone(), bytes.to_vec());
             Ok(stored)
         }
@@ -2104,7 +2294,7 @@ mod tests {
             bytes.len() as u64,
             "sha256:content".to_string(),
         );
-        file.meta.insert("mime_type".to_string(), json!(mime));
+        file.meta.insert("mime".to_string(), json!(mime));
         file.meta.insert("width".to_string(), json!(640));
         stored_file_from_object(obj_id_for(&file), file).unwrap()
     }
@@ -2137,7 +2327,45 @@ mod tests {
         store: Arc<FakeStore>,
     ) -> ResourceManager {
         manager(authorizer, store, ResourceLimits::default())
-            .with_object_url_provider(Arc::new(ZoneNamedObjectUrlProvider::new(ZONE_BASE_URL)))
+            .with_object_url_provider(Arc::new(StubObjectUrls { public: true }))
+    }
+
+    struct StubObjectUrls {
+        public: bool,
+    }
+
+    #[async_trait]
+    impl NamedObjectUrlProvider for StubObjectUrls {
+        fn object_url(&self, obj_id: &ObjId) -> Option<String> {
+            ZoneNamedObjectUrlProvider::new(ZONE_BASE_URL).object_url(obj_id)
+        }
+
+        async fn is_public(&self, _url: &str) -> bool {
+            self.public
+        }
+    }
+
+    #[tokio::test]
+    async fn url_or_bytes_form_inlines_an_object_a_provider_could_not_fetch() {
+        let store = Arc::new(FakeStore::default());
+        let bytes = b"private-artifact".to_vec();
+        let stored = stored_named(&bytes, "image/png");
+        let obj_id = stored.obj_id.clone();
+        store.insert(stored, bytes.clone());
+        let manager = manager(Arc::new(RecordingAuthorizer::default()), store, ResourceLimits::default())
+            .with_object_url_provider(Arc::new(StubObjectUrls { public: false }))
+            .with_input_form(ResourceInputForm::UrlOrBytes);
+        let source = ResourceRef::NamedObject { obj_id };
+        let inspected = manager
+            .inspect(&context(), std::slice::from_ref(&source))
+            .await
+            .unwrap();
+        let materialized = manager
+            .materialize_after_provider_selected(&context(), "provider-call", inspected)
+            .await
+            .unwrap();
+        assert_eq!(materialized[0].url(), None);
+        assert_eq!(materialized[0].bytes(), bytes.as_slice());
     }
 
     #[tokio::test]
@@ -2348,7 +2576,6 @@ mod tests {
             url.starts_with(ZONE_BASE_URL),
             "unexpected object URL: {url}"
         );
-        // `WriteArtifact` is authorized for the object we just created.
         assert_eq!(
             authorizer.operations.lock().unwrap().as_slice(),
             &[
@@ -2357,17 +2584,15 @@ mod tests {
                 ResourceAccessOperation::WriteArtifact
             ]
         );
-        // The URL must carry the canonical `{obj_type}:{hex}` spelling (the one
-        // `ObjId::to_string` emits), not the base32 spelling of `Display`.
         let advertised = url.strip_prefix(ZONE_BASE_URL).unwrap();
         assert!(
             advertised.contains(':'),
             "object URL must use the `{{obj_type}}:{{hex}}` form, got {advertised}"
         );
-        // The payload really landed in the store under the advertised object.
         let stored = store.files.lock().unwrap().get(advertised).cloned();
         assert_eq!(stored.map(|entry| entry.1), Some(payload.to_vec()));
     }
+
 
     #[tokio::test]
     async fn url_or_bytes_and_bytes_only_forms_keep_base64_inline() {
@@ -2550,8 +2775,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_keys_cover_all_refs_and_missing_resources_fail_closed_without_secrets() {
-        let credential = "credential-super-secret";
+    fn stable_keys_cover_all_refs_without_secrets() {
         let base64_content = "YmFzZTY0LXN1cGVyLXNlY3JldA==";
         let refs = [
             ResourceRef::url(
@@ -2580,12 +2804,6 @@ mod tests {
             assert_eq!(key, ResourceKey::from_ref(resource));
             assert!(!key.as_str().contains(base64_content));
             assert!(!key.as_str().contains("private-name"));
-            let error =
-                require_materialized::<CodecResourceParts>(&BTreeMap::new(), resource).unwrap_err();
-            let rendered = format!("{error:?} {error}");
-            assert_eq!(error.failure, ResourceFailure::PhaseViolation);
-            assert!(!rendered.contains(base64_content));
-            assert!(!rendered.contains(credential));
         }
         assert_ne!(
             ResourceKey::from_ref(&refs[0]),
@@ -2792,7 +3010,7 @@ mod tests {
     async fn writes_named_artifact_with_embedding_metadata() {
         let authorizer = Arc::new(RecordingAuthorizer::default());
         let store = Arc::new(FakeStore::default());
-        let manager = manager(authorizer.clone(), store, ResourceLimits::default());
+        let manager = manager(authorizer.clone(), store.clone(), ResourceLimits::default());
         let artifact = manager
             .write_artifact(
                 &context(),
@@ -2810,8 +3028,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(artifact.resource, ResourceRef::NamedObject { .. }));
+        let ResourceRef::NamedObject { obj_id } = &artifact.resource else {
+            panic!("artifact must be a named object");
+        };
         let metadata = artifact.metadata.unwrap();
+        let target = store.targets.lock().unwrap()[0].clone();
+        assert_eq!(target.bucket.to_string(), "user/aicc/tenant/outputs");
+        assert_eq!(
+            metadata["bucket_ref"],
+            json!(bucket_obj_url(
+                &target.bucket,
+                &target.key(obj_id, "embedding.bin")
+            ))
+        );
+        assert!(target.key(obj_id, "embedding.bin").starts_with("_/"));
         assert_eq!(metadata["rows"], json!(2));
         assert_eq!(metadata["dimensions"], json!(1536));
         assert_eq!(metadata["space"], json!("cosine"));
@@ -2834,10 +3064,63 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(reserved.failure, ResourceFailure::ArtifactInvalid);
+        let forged = manager
+            .write_artifact(
+                &context(),
+                b"data",
+                ArtifactSpec {
+                    name: "bad.bin".to_string(),
+                    mime: "application/octet-stream".to_string(),
+                    attributes: Map::from_iter([(
+                        "bucket_ref".to_string(),
+                        json!("obj://bucket/x"),
+                    )]),
+                    embedding: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(forged.failure, ResourceFailure::ArtifactInvalid);
+    }
+
+    #[tokio::test]
+    async fn derived_inputs_are_filed_under_the_calling_app() {
+        let store = Arc::new(FakeStore::default());
+        let manager = manager(Arc::default(), store.clone(), ResourceLimits::default());
+        let context = context().with_app(Some("agent.example.com".to_string()));
+        manager
+            .write_input(
+                &context,
+                b"frame",
+                ArtifactSpec {
+                    name: "video-condition-first.png".to_string(),
+                    mime: "application/octet-stream".to_string(),
+                    attributes: Map::new(),
+                    embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        let target = store.targets.lock().unwrap()[0].clone();
+        assert_eq!(target.bucket.to_string(), "user/aicc/tenant/inputs");
+        assert_eq!(target.reader(), Some("agent.example.com"));
+        let id = ObjId::new("cyfile:0123456789abcdef0123456789").unwrap();
+        assert_eq!(
+            target.key(&id, "a.png"),
+            "agent.example.com/0123456789abcdef/a.png"
+        );
+        let system = ArtifactTarget::new(
+            &context
+                .clone()
+                .with_app(Some("system:control-panel".to_string())),
+            AICC_BUCKET_OUTPUTS,
+        )
+        .unwrap();
+        assert_eq!(system.reader(), None);
     }
 
     #[test]
-    fn multipart_and_debug_never_expose_content() {
+    fn debug_never_exposes_content() {
         let source = ResourceRef::base64("text/plain".to_string(), "c3VwZXItc2VjcmV0".to_string());
         let resource = MaterializedResource {
             key: ResourceKey::from_ref(&source),
@@ -2856,7 +3139,6 @@ mod tests {
         let debug = format!("{resource:?}");
         assert!(!debug.contains("super-secret"));
         assert!(!debug.contains("secret-digest"));
-        multipart_form([("file".to_string(), resource)]).unwrap();
     }
 
     fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {

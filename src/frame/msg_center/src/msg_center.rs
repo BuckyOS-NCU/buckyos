@@ -13,7 +13,7 @@ use buckyos_api::{
     MsgReceiptObj, OwnerSessionState, PostSendDelivery, PostSendResult, ReadReceiptState,
     RecipientState, SessionDeliveryOverall, SessionDeliveryTarget, SessionDeliveryView,
     SessionLifecycle, SessionListLifecycleFilter, SessionListOrder, SessionMessageDirection,
-    SessionMessageItem, SessionMessagePage, SessionSummary, SessionSummaryPage,
+    SessionMessageItem, SessionMessagePage, SessionSummaryPage,
     SetGroupSubscribersResult, TransportKind, UiSessionStateEntry,
 };
 use kRPC::{RPCContext, RPCErrors};
@@ -29,8 +29,6 @@ const DEFAULT_PEEK_LIMIT: usize = 20;
 const MAX_PEEK_LIMIT: usize = 200;
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 500;
-const DEFAULT_SESSION_LIST_LIMIT: usize = 50;
-const MAX_SESSION_LIST_LIMIT: usize = 200;
 const DEFAULT_READ_RECEIPT_LIMIT: usize = 100;
 const MAX_READ_RECEIPT_LIMIT: usize = 1000;
 const MAX_DELIVERY_RETRY: u32 = 5;
@@ -38,7 +36,6 @@ const MAX_DELIVERY_RETRY: u32 = 5;
 const DELIVERY_SENDING_LEASE_MS: u64 = 60_000;
 const DELIVERY_RETRY_BASE_MS: u64 = 2_000;
 const DELIVERY_RETRY_MAX_MS: u64 = 300_000;
-const MSG_CENTER_BOX_CHANGED_EVENT_NAME: &str = "changed";
 const PRIVATE_EDIT_REDACT_SCAN_PAGE: usize = 200;
 const IDEMPOTENCY_SCOPE_DISPATCH: &str = "dispatch";
 const IDEMPOTENCY_SCOPE_POST_SEND: &str = "post_send";
@@ -113,12 +110,18 @@ pub struct MessageCenter {
     pub(crate) directory: Arc<crate::network_directory::DirectorySlot>,
     /// OOD device key used to sign native messages of this Zone's users.
     pub(crate) zone_signer: Arc<crate::network_directory::ZoneSignerSlot>,
+    /// Documents behind signing keys and custody (`buckyos_api::check_custody`).
+    pub(crate) custody: Arc<crate::network_directory::CustodySlot>,
+    /// Logins and requests into other Zones (`buckyos_api::CrossZoneClient`).
+    pub(crate) cross_zone: Arc<crate::network_directory::CrossZoneSlot>,
     /// Serializes friend request state changes (`friend_service.rs`).
     pub(crate) friend_lock: Arc<tokio::sync::Mutex<()>>,
     /// Unauthenticated signed ingress per sender: (window start, count).
     pub(crate) ingress_budget: Arc<std::sync::Mutex<HashMap<String, (u64, u32)>>>,
-    /// Where accepted messages hold their attachments (`attachment_retention.rs`).
-    pub(crate) attachment_store: Arc<crate::attachment_retention::AttachmentStoreSlot>,
+    /// Where stored messages and their attachments are bound (`buckets.rs`).
+    pub(crate) buckets: Arc<crate::buckets::BucketSlot>,
+    /// Attachments being fetched from senders' Zones (`remote_attachment.rs`).
+    pub(crate) remote_fetches: Arc<crate::remote_attachment::RemoteFetches>,
 }
 
 impl MessageCenter {
@@ -134,7 +137,6 @@ impl MessageCenter {
         let contact_mgr = ContactMgr::new_with_msg_box(msg_box_db.clone()).await?;
         let groups = crate::group_store::GroupStore::open(msg_box_db.clone()).await?;
         let notifies = crate::notify::NotifyStore::open(msg_box_db.clone()).await?;
-        crate::attachment_retention::open_tables(&msg_box_db).await?;
         let hosted = groups
             .list()
             .await?
@@ -160,9 +162,12 @@ impl MessageCenter {
             notify_lock: Arc::new(tokio::sync::Mutex::new(())),
             directory: Arc::new(Default::default()),
             zone_signer: Arc::new(Default::default()),
+            custody: Arc::new(Default::default()),
+            cross_zone: Arc::new(Default::default()),
             friend_lock: Arc::new(tokio::sync::Mutex::new(())),
             ingress_budget: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            attachment_store: Arc::new(Default::default()),
+            buckets: Arc::new(Default::default()),
+            remote_fetches: Arc::new(Default::default()),
         })
     }
 
@@ -277,7 +282,7 @@ impl MessageCenter {
         msg: &MsgObject,
     ) -> std::result::Result<(), RPCErrors> {
         match caller.filter(|caller| caller.restricted()) {
-            Some(caller) if !crate::attachment_retention::attachment_ids(msg).is_empty() => {
+            Some(caller) if !crate::buckets::attachment_ids(msg).is_empty() => {
                 Err(crate::owner_session::gate_denial(
                     buckyos_api::DenyReason::SessionKindNotAllowed,
                     &caller.user_id,
@@ -377,6 +382,22 @@ impl MessageCenter {
     /// accounts (a Limited account has no inbox but is still signed for).
     pub(crate) fn is_hosted_identity(&self, did: &DID) -> bool {
         self.is_local_recipient(did) || self.is_zone_account(did)
+    }
+
+    /// This Zone's DID: the runtime's, else the configured receive Zone's host.
+    pub(crate) fn local_zone_did(&self) -> Option<DID> {
+        buckyos_api::get_buckyos_api_runtime()
+            .ok()
+            .map(|runtime| runtime.zone_id.clone())
+            .filter(DID::is_valid)
+            .or_else(|| {
+                self.cyfs_dispatch
+                    .read()
+                    .unwrap()
+                    .target_zone
+                    .as_deref()
+                    .map(|host| DID::new("web", host))
+            })
     }
 
     /// Is this DID hosted by this zone? True for registered recipients, the
@@ -661,18 +682,12 @@ impl MessageCenter {
     }
 
     pub(crate) fn publish_box_changed_event(record: &MailboxRecord, operation: &str) {
-        let box_id = format!(
-            "/msg_center/{}/{}/{}",
-            record.owner.to_raw_host_name(),
-            Self::box_kind_name(&record.box_kind),
-            hex::encode(record.mailbox.to_string())
-        );
-        let event_id = format!("{box_id}/changed");
+        let event_ids = record.mailbox.box_event_ids(record.box_kind.clone());
         let payload = json!({
             "operation": operation,
             "owner": record.owner.to_string(),
             "box_kind": Self::box_kind_name(&record.box_kind),
-            "box_id": box_id,
+            "box_id": event_ids.first(),
             "mailbox": record.mailbox,
             "record_id": record.record_id.clone(),
             "msg_id": record.msg_id.to_string(),
@@ -680,15 +695,13 @@ impl MessageCenter {
             "session_id": record.session_id.clone(),
             "updated_at_ms": record.updated_at_ms,
         });
-        Self::publish_event(event_id, payload);
+        for event_id in event_ids {
+            Self::publish_event(event_id, payload.clone());
+        }
     }
 
     pub(crate) fn publish_delivery_changed_event(record: &DeliveryRecord, operation: &str) {
-        let executor_token = record.envelope.transport_did.to_raw_host_name();
-        let event_id = format!(
-            "/msg_center/{}/delivery_queue_{}/{}",
-            executor_token, executor_token, MSG_CENTER_BOX_CHANGED_EVENT_NAME
-        );
+        let event_id = buckyos_api::delivery_changed_event_id(&record.envelope.transport_did);
         let payload = json!({
             "operation": operation,
             "transport_did": record.envelope.transport_did.to_string(),
@@ -727,7 +740,7 @@ impl MessageCenter {
         result
     }
 
-    fn is_group_message(msg: &MsgObject) -> bool {
+    pub(crate) fn is_group_message(msg: &MsgObject) -> bool {
         msg.kind == MsgObjKind::GroupMsg
     }
 
@@ -919,7 +932,7 @@ impl MessageCenter {
     /// is a semantic hint and never a session key. Direct messages without
     /// `to_session` fall back to the legacy session hints, then to the peer
     /// DID, so both directions of a DM land in the same session.
-    fn derive_session_id(box_kind: &MailboxKind, msg: &MsgObject) -> Option<String> {
+    pub(crate) fn derive_session_id(box_kind: &MailboxKind, msg: &MsgObject) -> Option<String> {
         if Self::is_group_message(msg) {
             if *box_kind == MailboxKind::GroupInbox {
                 return msg.to_session.clone();
@@ -943,39 +956,6 @@ impl MessageCenter {
         }
     }
 
-    pub(crate) async fn store_message(
-        msg_id: &ObjId,
-        msg_json_str: &str,
-    ) -> std::result::Result<(), RPCErrors> {
-        let msg_id = msg_id.clone();
-        let msg_json = msg_json_str.to_string();
-        let runtime = match get_buckyos_api_runtime() {
-            Ok(runtime) => runtime,
-            Err(RPCErrors::ReasonError(reason))
-                if reason.contains("BuckyOSRuntime is not initialized") =>
-            {
-                warn!(
-                    "skip storing message {} to named_store because runtime is not initialized",
-                    msg_id.to_string()
-                );
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let named_store = runtime.get_local_named_store().await?;
-        named_store
-            .put_object(&msg_id, &msg_json)
-            .await
-            .map_err(|error| {
-                RPCErrors::ReasonError(format!(
-                    "store message {} in named_store failed: {}",
-                    msg_id.to_string(),
-                    error
-                ))
-            })?;
-        Ok(())
-    }
-
     pub(crate) async fn load_message(
         &self,
         msg_id: &ObjId,
@@ -988,8 +968,7 @@ impl MessageCenter {
             return Ok(msg);
         }
         let msg_id = msg_id.clone();
-        let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_local_named_store().await?;
+        let named_store = self.named_store().await?;
         let msg_json = named_store.get_object(&msg_id).await.map_err(|error| {
             RPCErrors::ReasonError(format!(
                 "load message {} from named_store failed: {}",
@@ -1049,6 +1028,17 @@ impl MessageCenter {
         hasher.update(b"|");
         hasher.update(transport_did.to_string().as_bytes());
         format!("dlv-{}", hex::encode(&hasher.finalize()[..16]))
+    }
+
+    /// Initial `RecipientState` of an inbound record. A reaction, or the
+    /// redaction that cancels one, is a quick interaction folded into its
+    /// target by every client: it has no row of its own to be read with, so it
+    /// is stored READ and never counts towards a session's `unread_count`.
+    pub(crate) fn inbound_initial_state(msg: &MsgObject) -> RecipientState {
+        match msg.relates_to.as_ref().map(|relation| &relation.rel) {
+            Some(MsgRelType::Reaction | MsgRelType::Redact) => RecipientState::Read,
+            _ => RecipientState::Unread,
+        }
     }
 
     pub(crate) fn build_mailbox_record(
@@ -1208,7 +1198,7 @@ impl MessageCenter {
         }
     }
 
-    async fn is_contact_blocked(
+    pub(crate) async fn is_contact_blocked(
         &self,
         did: &DID,
         owner: Option<DID>,
@@ -1232,7 +1222,7 @@ impl MessageCenter {
 
     /// The target's admission policy towards the principal when the
     /// transport identified one, otherwise towards the sender.
-    async fn decide_inbox_kind(
+    pub(crate) async fn decide_inbox_kind(
         &self,
         sender: &DID,
         principal: Option<&DID>,
@@ -1496,19 +1486,6 @@ impl MessageCenter {
         let retention_key = Self::dispatch_idempotency_retention_key(&stored_msg, ingress.as_ref());
         let principal = Self::ingress_principal(ingress.as_ref());
 
-        Self::store_message(&stored_msg_id, &stored_msg_json).await?;
-
-        // Re-check idempotency before doing any work; a concurrent caller may
-        // have completed the same dispatch while we were awaiting store_message.
-        if let Some(key) = idempotency_key.as_ref() {
-            if let Some(cached) = self
-                .load_dispatch_idempotency(&idempotency_owner_scope, key)
-                .await?
-            {
-                return Ok(cached);
-            }
-        }
-
         let mut result = DispatchResult {
             ok: true,
             msg_id: stored_msg_id.clone(),
@@ -1602,10 +1579,14 @@ impl MessageCenter {
                     }
                 }
 
-                let decision = match self
-                    .decide_inbox_kind(&sender, principal.as_ref(), &recipient, context_id.clone())
-                    .await
-                {
+                let from_group = self.is_notice_of_own_group(&stored_msg, &recipient).await;
+                let decided = if from_group {
+                    Ok(Some(MailboxKind::Inbox))
+                } else {
+                    self.decide_inbox_kind(&sender, principal.as_ref(), &recipient, context_id.clone())
+                        .await
+                };
+                let decision = match decided {
                     Ok(value) => value,
                     Err(error) => {
                         warn!(
@@ -1634,9 +1615,13 @@ impl MessageCenter {
                             recipient.clone(),
                             box_kind,
                             &stored_msg,
-                            RecipientState::Unread,
+                            Self::inbound_initial_state(&stored_msg),
                             ingress.clone(),
-                            Vec::new(),
+                            if from_group {
+                                vec![format!("group:{}", sender.to_string())]
+                            } else {
+                                Vec::new()
+                            },
                             "inbox",
                         )?);
                         result.delivered_recipients.push(recipient);
@@ -1662,7 +1647,13 @@ impl MessageCenter {
         }
 
         if !mailbox_records.is_empty() {
-            self.retain_attachments(&stored_msg_id, &stored_msg).await?;
+            let arrival = if receiver.is_some() {
+                crate::buckets::Arrival::Remote
+            } else {
+                crate::buckets::Arrival::Local
+            };
+            self.store_message(&stored_msg_id, &stored_msg_json, &stored_msg, arrival)
+                .await?;
         }
         let now_ms = Self::now_ms();
         let expires_at_ms = if receiver.is_some() {
@@ -1688,9 +1679,6 @@ impl MessageCenter {
         {
             IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
             IdempotencyCommitOutcome::Committed => {
-                if !mailbox_records.is_empty() {
-                    self.confirm_attachments(&stored_msg_id).await;
-                }
                 self.note_records_committed(&mailbox_records).await;
                 for record in mailbox_records.iter() {
                     Self::publish_box_changed_event(record, "upsert");
@@ -1702,7 +1690,7 @@ impl MessageCenter {
 
     /// Route planning of `post_send`: one delivery envelope per deduped
     /// `msg.to` target. Pure, no writes; one unroutable target fails the plan.
-    fn plan_delivery_envelopes(
+    async fn plan_delivery_envelopes(
         &self,
         msg: &MsgObject,
         msg_id: &ObjId,
@@ -1712,9 +1700,7 @@ impl MessageCenter {
         for target in targets {
             let mut envelope = self.build_delivery_envelope(msg_id, target.clone())?;
             if msg.kind == MsgObjKind::GroupMsg {
-                let settings = self.cyfs_dispatch.read().unwrap();
-                let route = settings
-                    .message_route(msg, &target)
+                let route = self.native_message_route(msg, &target).await
                     .map_err(|e| e.to_string())?
                     .ok_or_else(|| "joined-group-route-not-configured".to_string())?;
                 let snapshot = envelope.address.get_or_insert_with(Default::default);
@@ -1761,7 +1747,7 @@ impl MessageCenter {
         }
 
         let msg_id = msg.gen_obj_id().0;
-        let envelopes = match self.plan_delivery_envelopes(&msg, &msg_id) {
+        let envelopes = match self.plan_delivery_envelopes(&msg, &msg_id).await {
             Ok(envelopes) => envelopes,
             Err(reason) => return Ok(not_editable(reason)),
         };
@@ -1976,7 +1962,7 @@ impl MessageCenter {
         // Phase 1: resolve every target up front (pure, no writes). One
         // unroutable target fails the whole post_send with a clear reason —
         // the database keeps no partial state, never a silent fallback.
-        let envelopes = match self.plan_delivery_envelopes(&stored_msg, &stored_msg_id) {
+        let envelopes = match self.plan_delivery_envelopes(&stored_msg, &stored_msg_id).await {
             Ok(envelopes) => envelopes,
             Err(reason) => {
                 let result = PostSendResult {
@@ -2014,7 +2000,13 @@ impl MessageCenter {
         // Phase 2: persist the message, the SENT mailbox record and one
         // delivery record per target. All ids are deterministic, so replays
         // converge onto the same rows.
-        Self::store_message(&stored_msg_id, &stored_msg_json).await?;
+        self.store_message(
+            &stored_msg_id,
+            &stored_msg_json,
+            &stored_msg,
+            crate::buckets::Arrival::Local,
+        )
+        .await?;
 
         if let Some(key) = idempotency_key.as_ref() {
             if let Some(cached) = self
@@ -2071,7 +2063,6 @@ impl MessageCenter {
             deliveries,
             reason: None,
         };
-        self.retain_attachments(&stored_msg_id, &stored_msg).await?;
         let expires_at_ms = Self::idempotency_expires_at(now_ms);
         match self
             .msg_box_db
@@ -2092,7 +2083,6 @@ impl MessageCenter {
         {
             IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
             IdempotencyCommitOutcome::Committed => {
-                self.confirm_attachments(&stored_msg_id).await;
                 self.note_records_committed(std::slice::from_ref(&sent_record))
                     .await;
                 Self::publish_box_changed_event(&sent_record, "upsert");
@@ -2431,124 +2421,6 @@ impl MessageCenter {
             recipient_state,
             delivery,
             msg,
-        })
-    }
-
-    #[allow(dead_code)]
-    async fn list_sessions_internal(
-        &self,
-        owner: DID,
-        limit: Option<usize>,
-        cursor_updated_at_ms: Option<u64>,
-        cursor_session_id: Option<String>,
-        with_object: Option<bool>,
-    ) -> std::result::Result<SessionSummaryPage, RPCErrors> {
-        let limit = Self::clamp_limit(limit, DEFAULT_SESSION_LIST_LIMIT, MAX_SESSION_LIST_LIMIT);
-        // Fetch one extra row to detect whether another page exists.
-        let entries = self
-            .msg_box_db
-            .list_session_index(
-                &owner,
-                limit + 1,
-                cursor_updated_at_ms,
-                cursor_session_id.as_deref(),
-            )
-            .await?;
-        let has_more = entries.len() > limit;
-        let page_entries = entries.into_iter().take(limit).collect::<Vec<_>>();
-
-        let mut items = Vec::with_capacity(page_entries.len());
-        for entry in page_entries {
-            let last_record = self
-                .msg_box_db
-                .list_session_records(&owner, &entry.session_id, 1, None, None, true)
-                .await?
-                .into_iter()
-                .next();
-            let last_record = match last_record {
-                Some(record) => Some(
-                    self.build_record_view(record, Some(with_object.unwrap_or(false)))
-                        .await?,
-                ),
-                None => None,
-            };
-            items.push(SessionSummary {
-                session_id: entry.session_id,
-                last_record,
-                unread_count: entry.unread_count,
-                updated_at_ms: entry.updated_at_ms,
-                last_activity_ms: 0,
-                request_count: 0,
-                lifecycle: SessionLifecycle::Active,
-                state: None,
-            });
-        }
-
-        let (next_cursor_updated_at_ms, next_cursor_session_id) = if has_more {
-            items
-                .last()
-                .map(|item| (Some(item.updated_at_ms), Some(item.session_id.clone())))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-
-        Ok(SessionSummaryPage {
-            items,
-            next_cursor_updated_at_ms,
-            next_cursor_session_id,
-        })
-    }
-
-    #[allow(dead_code)]
-    async fn list_session_internal(
-        &self,
-        owner: DID,
-        session_id: String,
-        limit: Option<usize>,
-        cursor_sort_key: Option<u64>,
-        cursor_record_id: Option<String>,
-        descending: Option<bool>,
-        with_object: Option<bool>,
-    ) -> std::result::Result<SessionMessagePage, RPCErrors> {
-        let session_id = Self::normalize_ui_session_arg("session_id", &session_id)?;
-        let descending = descending.unwrap_or(true);
-        let limit = Self::clamp_limit(limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-        let records = self
-            .msg_box_db
-            .list_session_records(
-                &owner,
-                &session_id,
-                limit + 1,
-                cursor_sort_key,
-                cursor_record_id.as_deref(),
-                descending,
-            )
-            .await?;
-        let has_more = records.len() > limit;
-        let page_records = records.into_iter().take(limit).collect::<Vec<_>>();
-
-        let mut items = Vec::with_capacity(page_records.len());
-        for record in page_records {
-            items.push(
-                self.build_session_item(record, with_object.unwrap_or(false))
-                    .await?,
-            );
-        }
-
-        let (next_cursor_sort_key, next_cursor_record_id) = if has_more {
-            items
-                .last()
-                .map(|item| (Some(item.sort_key), Some(item.record_id.clone())))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-
-        Ok(SessionMessagePage {
-            items,
-            next_cursor_sort_key,
-            next_cursor_record_id,
         })
     }
 
@@ -3444,6 +3316,11 @@ impl MsgCenterHandler for MessageCenter {
         value: Value,
         ctx: RPCContext,
     ) -> std::result::Result<UiSessionStateEntry, RPCErrors> {
+        if let Some(owner) = self.caller_ui_state_owner(&ctx).await? {
+            return self
+                .handle_update_owner_ui_session_state(owner, session_id, key, value, ctx)
+                .await;
+        }
         self.authorize_resource(&ctx, "obj://msg-center/ui-state", "write")
             .await?;
         self.update_ui_session_state_internal(session_id, key, value)
@@ -3456,6 +3333,11 @@ impl MsgCenterHandler for MessageCenter {
         key: String,
         ctx: RPCContext,
     ) -> std::result::Result<Option<UiSessionStateEntry>, RPCErrors> {
+        if let Some(owner) = self.caller_ui_state_owner(&ctx).await? {
+            return self
+                .handle_get_owner_ui_session_state(owner, session_id, key, ctx)
+                .await;
+        }
         self.authorize_resource(&ctx, "obj://msg-center/ui-state", "read")
             .await?;
         self.get_ui_session_state_internal(session_id, key).await
@@ -3466,6 +3348,11 @@ impl MsgCenterHandler for MessageCenter {
         session_id: String,
         ctx: RPCContext,
     ) -> std::result::Result<Vec<UiSessionStateEntry>, RPCErrors> {
+        if let Some(owner) = self.caller_ui_state_owner(&ctx).await? {
+            return self
+                .handle_list_owner_ui_session_state(owner, session_id, ctx)
+                .await;
+        }
         self.authorize_resource(&ctx, "obj://msg-center/ui-state", "read")
             .await?;
         self.list_ui_session_state_internal(session_id).await

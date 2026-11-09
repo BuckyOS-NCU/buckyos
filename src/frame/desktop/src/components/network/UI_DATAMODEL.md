@@ -2,7 +2,7 @@
 
 - 文档版本：v0.2（2026-10-17，M6：后端定稿后的错误码、`msg.list_sessions` 消息请求、`group.list_by_member` 的 `member` / `invitations`、PeoplePicker `candidates` 与内嵌模式、mock 宿主桥）；v0.1（M0/M4）
 - 模块位置：`src/frame/desktop/src/components/network/`（组织方式同 `components/ContentPreview.tsx` + `components/preview/`）
-- 上游：[My Network 升级 TODO](../../../../../../notepads/my-network-upgrade-todo.md) §3.1–§3.6、[My Network PRD](../../../../../../product/my_networks/My_Network_PRD.md) §6.2–§6.4、§11.3
+- 上游：[My Network 升级 TODO](../../../../../../notepads/done/my-network-upgrade-todo.md) §3.1–§3.6、[My Network PRD](../../../../../../product/my_networks/My_Network_PRD.md) §6.2–§6.4、§11.3
 - 后端契约：websdk `src/msg_center_client.ts` 的 “Relationships (msg_contact.rs)” 一节；buckyos-api `msg_contact.rs`；`group.*` 见 msg-center `group_service.rs`
 - 使用方：My Network（本轮），MessageHub、HomeStation（M6），第三方 App 经 `/sysdlg/*`（M7）
 - My Network 独有的视图见 [`app/my-network/UI_DATAMODEL.md`](../../app/my-network/UI_DATAMODEL.md)
@@ -160,6 +160,8 @@ type RequestItem =
 
 `useRequests()` 返回 `{ status: 'loading' | 'ready' | 'error' | 'partial', items, errors, retry }`；部分列表失败时为 `partial`。`actionableCount(items)` 不计发出的请求，用于角标。
 
+接受邀请仍使用本 Zone 的 RPC，由服务端完成群宿主路由。返回 `pending_admin_approval` 时保留等待审批语义；返回 `active` 时读回 `group.list_by_member`，确认本地 `items` 或远端 `joined` 包含群后才完成操作。`sync_pending = true` 显示 `group-sync-pending`，前端读回失败显示 `group-refresh-pending`；两者都说明邀请已接受并允许使用原邀请重试。远端不可达、身份验证失败及邀请过期、撤销均保留具体原因。
+
 ## 7. 对话框契约（zod，`schemas.ts`）
 
 所有结果只含 DID 与展示文字，不含邀请 token、会话 token 或消息正文；关闭/取消统一返回 `{ action: 'cancelled' }`，Promise 不会因取消而 reject。
@@ -247,7 +249,7 @@ networkCache.refresh(key) / networkCache.lookup(input, opts) / networkCache.owne
 | `invitations` | `group.list_by_member` 的 `invitations`（见 §6） | `mailbox`、`groups` |
 | `joinRequests` | 我管理的群的 `list_members` | `groups` |
 
-`group.list_by_member` 在 1.5 秒内共享一次结果（三个资源都读它），入群、退群、审批后作废。事件来源（`realBackend.subscribe`）：kevent `/msg_center/<owner raw host>/CONTACTS/changed` → `contacts` + `requests`；`/REQUEST_BOX/**` → `mailbox`；`/INBOX/**` → `mailbox` + `groups`；浏览器 `online` → 全部。组件内的动作完成后立即按受影响资源重载，不等事件。只重载已经被读过的资源。
+`group.list_by_member` 在 1.5 秒内共享一次结果（三个资源都读它），入群、退群、审批后作废。事件来源（`realBackend.subscribe`）：kevent `/obj/msg-center/owners/<owner>/contacts/changed` → `contacts` + `requests`；`/obj/msg-center/owners/<owner>/sessions/**` 中事件名 `request_box` → `mailbox`、`inbox` → `mailbox` + `groups`；浏览器 `online` → 全部。组件内的动作完成后立即按受影响资源重载，不等事件。只重载已经被读过的资源。
 
 ## 10. Mock
 

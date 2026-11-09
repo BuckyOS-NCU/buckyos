@@ -26,6 +26,12 @@ export function desktopWorkspaceInsets(taskbarPinned: boolean) {
   return { top: 0, left: taskbarPinned ? desktopTaskbarWidth : 0 }
 }
 
+/**
+ * The mobile home screen keeps a row for the page dots above the bottom safe area; the wallpaper runs
+ * edge to edge under it (and under the system status bar), as on a phone home screen.
+ */
+export const mobilePagerRowHeight = 24
+
 export type ConnectionState = 'online' | 'degraded' | 'offline'
 
 export function mobileStatusBarMode(app?: AppDefinition) {

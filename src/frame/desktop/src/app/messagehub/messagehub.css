@@ -53,10 +53,11 @@
   font-weight: 650;
 }
 
-.mh-markdown a {
+.mh-link {
   color: var(--mh-link, var(--cp-accent));
   text-decoration: underline;
   text-underline-offset: 2px;
+  overflow-wrap: anywhere;
 }
 
 .mh-markdown code {
@@ -137,18 +138,19 @@
   mask-image: linear-gradient(to right, transparent, #000 36px, #000 calc(100% - 36px), transparent);
 }
 
-/* Message hover bar (quick reactions + actions), Discord-style: shown while the
-   bubble is hovered or holds focus on pointer devices; touch devices use the
-   footer menu instead. */
 .mh-bubble {
   position: relative;
 }
 
 .mh-hover-bar {
   position: absolute;
-  top: -27px;
+  bottom: calc(100% - 7px);
   z-index: 5;
-  display: none;
+  display: flex;
+  visibility: hidden;
+  width: max-content;
+  max-width: calc(100vw - 40px);
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
   padding: 2px;
@@ -169,14 +171,16 @@
   right: 8px;
 }
 
-@media (hover: hover) {
-  .mh-hover-bar {
-    display: flex;
-  }
+.mh-bubble[data-actions-open="true"] .mh-hover-bar,
+.mh-hover-bar[data-open="true"] {
+  visibility: visible;
+  opacity: 1;
+}
 
-  .mh-bubble:hover > .mh-hover-bar,
-  .mh-bubble:focus-within > .mh-hover-bar,
-  .mh-hover-bar[data-open="true"] {
+@media (hover: hover) {
+  .mh-bubble:hover .mh-hover-bar,
+  .mh-bubble:focus-within .mh-hover-bar {
+    visibility: visible;
     opacity: 1;
   }
 
@@ -301,6 +305,34 @@
 
 .mh-task-spin {
   animation: mh-task-spin 1.4s linear infinite;
+}
+
+/* Work session cards under an Agent bubble: narrow (phone) cards keep the output tokens and the time. */
+.mh-work {
+  container-type: inline-size;
+  width: 30rem;
+  max-width: 100%;
+  background: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+.mh-work-card {
+  cursor: pointer;
+}
+
+.mh-work-card:hover,
+.mh-work-toggle:hover {
+  background: color-mix(in srgb, var(--cp-text) 6%, transparent);
+}
+
+.mh-work-card:active {
+  background: color-mix(in srgb, var(--cp-text) 10%, transparent);
+}
+
+@container (max-width: 359px) {
+  .mh-work-in,
+  .mh-work-model {
+    display: none;
+  }
 }
 
 /* Questions an Agent asked during a Turn and their answers, under its bubble. */

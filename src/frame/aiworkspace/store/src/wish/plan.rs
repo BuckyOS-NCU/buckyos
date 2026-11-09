@@ -8,11 +8,13 @@
 //! (`record_id_for_key`), fields through their names; a type change of a logical result is a
 //! conflict, not a silent conversion; results missing this time are listed, never deleted.
 
+use super::outline::{node_title, tree_of, OutlineNode};
 use crate::docdb::SqlCtx;
 use crate::workspace::{Caller, Workspace};
 use aiworkspace_core::canonical::{canonical_json, sha256_hex};
 use aiworkspace_core::filter::live_fields;
 use aiworkspace_core::model::*;
+use aiworkspace_core::types::MANIFEST_VERSION;
 use aiworkspace_core::order_key::order_key_between;
 use aiworkspace_core::value::{reference_entity_id, FieldType};
 use aiworkspace_core::wish::{config_digest, current_results, record_id_for_key, with_basis};
@@ -37,6 +39,9 @@ pub fn default_renderer(ty: &str) -> &'static str {
         _ => "richtext",
     }
 }
+
+/// The grid slot a new control takes (its real box is its layout's).
+const CONTROL_SIZE: (f64, f64) = (480.0, 320.0);
 
 fn default_size(renderer: &str, ty: &str) -> (f64, f64) {
     match (renderer, ty) {
@@ -123,7 +128,34 @@ pub fn store_value(ty: FieldType, scale: Option<u8>, options: &BTreeMap<String, 
             Value::Object(_) => v.clone(),
             _ => return None,
         },
+        // a bare amount takes the field's default currency (the core fills it in)
+        FieldType::Currency => {
+            let digits = scale.unwrap_or(aiworkspace_core::value::CURRENCY_DEFAULT_SCALE) as usize;
+            let amount = |a: &Value| match a {
+                Value::Number(n) => n.as_f64().map(|n| format!("{n:.digits$}")),
+                Value::String(s) => super::profile::numeric_text(s).map(|n| format!("{n:.digits$}")),
+                _ => None,
+            };
+            match v {
+                Value::Object(o) => json!({ "amount": amount(o.get("amount")?)?, "currency": o.get("currency")?.as_str()?.to_ascii_uppercase() }),
+                other => json!(amount(other)?),
+            }
+        }
     })
+}
+
+/// The default currency of a result's currency field: declared, else the most common code of its values, else USD.
+fn default_currency(declared: Option<&str>, values: &mut dyn Iterator<Item = &Value>) -> String {
+    if let Some(c) = declared.filter(|c| c.len() == 3 && c.chars().all(|c| c.is_ascii_alphabetic())) {
+        return c.to_ascii_uppercase();
+    }
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for v in values {
+        if let Some(c) = v.get("currency").and_then(Value::as_str) {
+            *counts.entry(c.to_ascii_uppercase()).or_default() += 1;
+        }
+    }
+    counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0))).map(|(c, _)| c).unwrap_or_else(|| "USD".into())
 }
 
 fn field_type(s: &str) -> FieldType {
@@ -135,6 +167,7 @@ fn field_type(s: &str) -> FieldType {
         "datetime" => FieldType::Datetime,
         "select" => FieldType::Select,
         "multi_select" => FieldType::MultiSelect,
+        "currency" => FieldType::Currency,
         _ => FieldType::Text,
     }
 }
@@ -143,8 +176,8 @@ fn field_type(s: &str) -> FieldType {
 pub struct Plan {
     pub operations: Vec<Value>,
     pub preconditions: Vec<Value>,
-    /// Assets the plan references: `(object_id, absolute path of the bytes)` — re-staged at apply.
-    pub assets: Vec<(String, String)>,
+    /// Assets the plan references (staged when the candidate was collected; bound again at apply).
+    pub assets: Vec<String>,
     pub summary: Value,
     pub digest: String,
     /// No blocking problem and every required choice was made.
@@ -154,9 +187,21 @@ pub struct Plan {
 impl Plan {
     pub fn to_json(&self) -> Value {
         json!({ "operations": self.operations, "preconditions": self.preconditions,
-                "assets": self.assets.iter().map(|(o, p)| json!({ "object_id": o, "path": p })).collect::<Vec<_>>(),
+                "assets": self.assets.iter().map(|o| json!({ "object_id": o })).collect::<Vec<_>>(),
                 "summary": self.summary, "plan_digest": self.digest, "ready": self.ready })
     }
+}
+
+/// A new Block of a result, laid out in the result group's grid.
+struct Place {
+    id: String,
+    type_id: &'static str,
+    payload: Value,
+    size: (f64, f64),
+    /// A control: its box wraps its children (`w` / `h` "auto").
+    auto_size: bool,
+    /// What follows its creation (a control's nodes).
+    then: Vec<Value>,
 }
 
 struct Planner<'a> {
@@ -168,11 +213,13 @@ struct Planner<'a> {
     destructive: bool,
     confirm_structure: bool,
     results_summary: Vec<Value>,
-    assets: Vec<(String, String)>,
+    assets: Vec<String>,
     /// result name → entity id (links between results and html bindings)
     ids: BTreeMap<String, String>,
     inputs: BTreeMap<String, String>,
     last_key: BTreeMap<String, String>,
+    /// The author of the controls a wish generates (扩展控件 P0 identity): the Workspace itself, `did:aiws:<workspace_id>`.
+    author_did: String,
 }
 
 impl<'a> Planner<'a> {
@@ -238,6 +285,7 @@ impl Workspace {
             ids: BTreeMap::new(),
             inputs: BTreeMap::new(),
             last_key: BTreeMap::new(),
+            author_did: format!("did:aiws:{}", self.workspace_id),
         };
         let payload = &wish.payload;
         // the wish as it was when the run started: any change since means the candidate answers an old question
@@ -332,6 +380,23 @@ impl Workspace {
             let ty = r["type"].as_str().unwrap_or("").to_string();
             let binding = if mode == "overwrite" { prev_bindings.get(&name).cloned() } else { None };
             let choice = choices.get(&name).and_then(Value::as_str).map(str::to_string);
+            if ty == "control" {
+                // a control is a new container each time (an overwrite deletes the last one), or nodes under a node
+                // the wish read; there is no data entity
+                let entity_id = match r["control"]["under_id"].as_str() {
+                    Some(t) => t.to_string(),
+                    None => {
+                        let base = make_id(&[&group_id, &slug(&name)]);
+                        if p.ctx.entity(&base)?.is_some() { make_id(&[&group_id, &slug(&name), req.run_id]) } else { base }
+                    }
+                };
+                if let Some(was) = binding.as_ref().and_then(|b| b["type"].as_str()).filter(|t| *t != "control") {
+                    p.problems.push(format!("The type of result \"{name}\" changed from {was} to control: it cannot be converted in place; use a different result name, or switch to \"Create a new set each time\""));
+                }
+                p.ids.insert(name.clone(), entity_id.clone());
+                items.push(Item { r: r.clone(), name, ty, entity_id, existing: None, binding, choice, new_copy: false });
+                continue;
+            }
             let mut entity_id = match (&binding, ty.as_str()) {
                 (_, "table_columns") => r["columns"]["target_id"].as_str().unwrap_or("").to_string(),
                 (Some(b), _) => b["entity_id"].as_str().unwrap_or("").to_string(),
@@ -409,8 +474,8 @@ impl Workspace {
             if before.as_ref() != prog.get("digest") {
                 let stored = json!({ "language": "js", "api_version": aiworkspace_core::wish::PROGRAM_API_VERSION, "source": prog["object_id"], "digest": prog["digest"],
                                      "produces": prog.get("produces").cloned().unwrap_or(json!([])), "run_id": req.run_id });
-                if let Some(path) = prog.get("path").and_then(Value::as_str) {
-                    p.assets.push((prog["object_id"].as_str().unwrap_or("").to_string(), path.to_string()));
+                if let Some(source) = prog.get("object_id").and_then(Value::as_str) {
+                    p.assets.push(source.to_string());
                 }
                 after.insert("program".into(), stored.clone());
                 wish_keys.push(json!({ "key": "program", "value": stored, "expect": { "rev": wish.key_rev("program") } }));
@@ -448,11 +513,28 @@ impl Workspace {
 
         // canvas group
         let group_exists = p.alive(&group_id)?.is_some();
-        let mut cells_to_place: Vec<(String, Value, (f64, f64))> = Vec::new();
+        let mut cells_to_place: Vec<Place> = Vec::new();
         let mut bindings_out: Map<String, Value> = Map::new();
         let mut produced: Vec<String> = Vec::new();
+        // composites go last: their slots take the Blocks of other results of this run
+        let mut composites: Vec<&Item> = Vec::new();
         for it in &items {
             let approach = it.r.get("approach").cloned().unwrap_or(Value::Null);
+            if it.ty == "control" && it.r["control"]["kind"] == json!(aiworkspace_core::types::COMPOSITE) {
+                composites.push(it);
+                continue;
+            }
+            if it.ty == "control" {
+                let id_base = make_id(&[&wish_id, &slug(&it.name), req.run_id]);
+                let (binding, summary) = plan_control(&mut p, it, &approach, surface.is_some(), &id_base, &mut cells_to_place)?;
+                match binding.get("under") {
+                    Some(_) => produced.extend(binding["nodes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string)),
+                    None => produced.push(it.entity_id.clone()),
+                }
+                p.results_summary.push(summary);
+                bindings_out.insert(it.name.clone(), binding);
+                continue;
+            }
             let mut action = if it.existing.is_some() { "update" } else { "create" };
             let mut cells: Vec<String> = it.binding.as_ref().and_then(|b| b["cells"].as_array()).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
             let mut binding = json!({ "type": it.ty, "entity_id": it.entity_id, "approach": approach, "title": it.r.get("title") });
@@ -541,7 +623,7 @@ impl Workspace {
                     if let (true, Some(o)) = (renderer == "table", &order) {
                         cp["manual_order"] = o.clone();
                     }
-                    cells_to_place.push((cell_id.clone(), cp, (w, h)));
+                    cells_to_place.push(Place { id: cell_id.clone(), type_id: TYPE_CELL, payload: cp, size: (w, h), auto_size: false, then: Vec::new() });
                     cells.push(cell_id);
                 }
             } else if let Some(o) = &order {
@@ -574,6 +656,17 @@ impl Workspace {
                                            "approach": approach, "blocks": binding["cells"].as_array().map_or(0, Vec::len), "reordered": reordered }));
             bindings_out.insert(it.name.clone(), binding);
         }
+        for it in composites {
+            let approach = it.r.get("approach").cloned().unwrap_or(Value::Null);
+            let id_base = make_id(&[&wish_id, &slug(&it.name), req.run_id]);
+            let (binding, summary) = plan_composite(&mut p, it, &approach, surface.is_some(), &id_base, &folder_id, &items, &mut bindings_out, &mut cells_to_place)?;
+            match binding.get("under") {
+                Some(_) => produced.extend(binding["nodes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string)),
+                None => produced.push(it.entity_id.clone()),
+            }
+            p.results_summary.push(summary);
+            bindings_out.insert(it.name.clone(), binding);
+        }
         // results produced earlier and not this time: listed, never deleted (§10.2); a program re-run
         // leaves the written results as they are
         let mut missing = Vec::new();
@@ -598,7 +691,7 @@ impl Workspace {
             if !cells_to_place.is_empty() {
                 let (ax, ay, aw, ah) = anchor;
                 let placement_hint = cand.get("placement").and_then(Value::as_str).unwrap_or("right_of_wish");
-                let col_w = cells_to_place.iter().map(|(_, _, (w, _))| *w).fold(0.0, f64::max);
+                let col_w = cells_to_place.iter().map(|c| c.size.0).fold(0.0, f64::max);
                 let mut x: f64 = 20.0;
                 let mut y: f64 = 48.0;
                 let mut row_h: f64 = 0.0;
@@ -607,7 +700,8 @@ impl Workspace {
                     let mut max_y: f64 = 0.0;
                     for edge in p.ctx.children(&group_id)? {
                         if let Some(pl) = edge.placement {
-                            max_y = max_y.max(pl["y"].as_f64().unwrap_or(0.0) + pl["h"].as_f64().unwrap_or(0.0));
+                            let h = pl["h"].as_f64().unwrap_or(if pl["h"] == json!("auto") { CONTROL_SIZE.1 } else { 0.0 });
+                            max_y = max_y.max(pl["y"].as_f64().unwrap_or(0.0) + h);
                         }
                     }
                     max_y + 20.0
@@ -617,7 +711,8 @@ impl Workspace {
                 y = y.max(start_y);
                 let mut max_x: f64 = 0.0;
                 let mut max_y: f64 = 0.0;
-                for (cell_id, cp, (w, h)) in &cells_to_place {
+                for c in &cells_to_place {
+                    let (w, h) = c.size;
                     if col == 2 {
                         col = 0;
                         x = 20.0;
@@ -625,11 +720,13 @@ impl Workspace {
                         row_h = 0.0;
                     }
                     let key = p.next_key(&group_id)?;
-                    p.ops.push(json!({ "op": "entity.create", "entity_id": cell_id, "type_id": TYPE_CELL, "parent_id": group_id, "order_key": key,
-                                       "placement": { "x": x, "y": y, "w": w, "h": h }, "payload": cp }));
+                    let placement = if c.auto_size { json!({ "x": x, "y": y, "w": "auto", "h": "auto" }) } else { json!({ "x": x, "y": y, "w": w, "h": h }) };
+                    p.ops.push(json!({ "op": "entity.create", "entity_id": c.id, "type_id": c.type_id, "parent_id": group_id, "order_key": key,
+                                       "placement": placement, "payload": c.payload }));
+                    p.ops.extend(c.then.iter().cloned());
                     max_x = max_x.max(x + w);
                     max_y = max_y.max(y + h);
-                    row_h = row_h.max(*h);
+                    row_h = row_h.max(h);
                     x += col_w + 20.0;
                     col += 1;
                 }
@@ -869,9 +966,16 @@ fn plan_record(p: &mut Planner, it: &Item, parent: &str) -> WsResult<bool> {
         used.insert(key.clone());
         let mut def = json!({ "key": key, "name": name, "type": ty });
         let ft = field_type(ty);
-        let scale = if ft == FieldType::Decimal { Some(prop["scale"].as_u64().unwrap_or(2) as u8) } else { None };
+        let scale = match ft {
+            FieldType::Decimal => Some(prop["scale"].as_u64().unwrap_or(2) as u8),
+            FieldType::Currency => prop["scale"].as_u64().map(|s| s.min(18) as u8),
+            _ => None,
+        };
         if let Some(s) = scale {
             def["scale"] = json!(s);
+        }
+        if ft == FieldType::Currency {
+            def["currency"] = json!(default_currency(prop["currency"].as_str(), &mut rec["props"].get(&name).into_iter()));
         }
         let mut options = BTreeMap::new();
         if matches!(ft, FieldType::Select | FieldType::MultiSelect) {
@@ -974,7 +1078,9 @@ fn field_plans(spec: &[Value], rows: &[&Map<String, Value>], existing: &[FieldRo
         };
         // decimals are never rounded silently: the declared scale, else what the values need; an
         // existing field keeps its scale unless that is too small
-        let (scale, widen) = if ty == FieldType::Decimal {
+        let (scale, widen) = if ty == FieldType::Currency {
+            (f["scale"].as_u64().map(|s| s.min(18) as u8).or_else(|| cur.and_then(|c| c.def.scale)), None)
+        } else if ty == FieldType::Decimal {
             let need = f["scale"].as_u64().map_or_else(|| needed_scale(rows, &name), |s| s.min(18) as u8);
             match cur.and_then(|c| c.def.scale.map(|s| (s, c.def_rev))) {
                 Some((s, rev)) if s < need => (Some(need), Some(rev)),
@@ -1012,6 +1118,11 @@ fn field_plans(spec: &[Value], rows: &[&Map<String, Value>], existing: &[FieldRo
         let mut def = json!({ "field_id": field_id, "name": name, "type": ty.as_str() });
         if let Some(s) = scale {
             def["scale"] = json!(s);
+        }
+        if ty == FieldType::Currency {
+            // an existing field keeps its default currency (stored values carry their own)
+            let code = cur.and_then(|c| c.def.currency.clone()).unwrap_or_else(|| default_currency(f["currency"].as_str(), &mut rows.iter().filter_map(|r| r.get(&name))));
+            def["currency"] = json!(code);
         }
         if matches!(ty, FieldType::Select | FieldType::MultiSelect) {
             let mut opts: Vec<(&String, &String)> = options.iter().collect();
@@ -1322,9 +1433,7 @@ fn plan_columns(p: &mut Planner, it: &Item, wish_id: &str, run_id: &str, choice:
 fn plan_asset(p: &mut Planner, it: &Item, parent: &str) -> WsResult<bool> {
     let f = &it.r()["file"];
     let obj = f["object_id"].as_str().ok_or_else(|| WsError::invalid_op(format!("result {} has no staged file", it.name())))?.to_string();
-    if let Some(path) = f["path"].as_str() {
-        p.assets.push((obj.clone(), path.to_string()));
-    }
+    p.assets.push(obj.clone());
     let image = f.get("image").filter(|i| i["width"].as_u64().is_some() && i["height"].as_u64().is_some()).cloned();
     match it.existing() {
         Some(e) => {
@@ -1378,19 +1487,327 @@ fn plan_html(p: &mut Planner, it: &Item, parent: &str, wish_id: &str, binding: &
                 return Ok(false);
             }
             let version = e.payload.get("version").and_then(Value::as_u64).unwrap_or(1) + 1;
-            p.ops.push(json!({ "op": "entity.set_keys", "entity_id": e.entity_id, "keys": [
-                { "key": "html", "value": body, "expect": { "rev": e.key_rev("html") } },
-                { "key": "version", "value": version, "expect": { "rev": e.key_rev("version") } }] }));
+            let mut keys = vec![json!({ "key": "html", "value": body, "expect": { "rev": e.key_rev("html") } }),
+                                json!({ "key": "version", "value": version, "expect": { "rev": e.key_rev("version") } })];
+            // definitions generated before controls had identities get one (the control catalogue lists them alike)
+            if e.payload.get("ident").is_none() && e.payload.get("def_id").and_then(Value::as_str) == Some(def_id.as_str()) {
+                keys.push(json!({ "key": "ident", "value": { "author_did": p.author_did, "name": def_id }, "expect": { "rev": e.key_rev("ident") } }));
+                keys.push(json!({ "key": "manifest_version", "value": MANIFEST_VERSION, "expect": { "rev": e.key_rev("manifest_version") } }));
+            }
+            p.ops.push(json!({ "op": "entity.set_keys", "entity_id": e.entity_id, "keys": keys }));
             Ok(true)
         }
         None => {
             let key = p.next_key(parent)?;
             p.ops.push(json!({ "op": "entity.create", "entity_id": it.entity_id(), "type_id": TYPE_BLOCK_DEF, "parent_id": parent, "order_key": key, "name": it.name(),
                                "payload": { "def_id": def_id, "version": 1, "kind": "html", "title": it.r().get("title").cloned().unwrap_or(json!(it.name())),
+                                            "ident": { "author_did": p.author_did, "name": def_id }, "manifest_version": MANIFEST_VERSION,
                                             "allow_no_source": true, "html": body, "description": h.get("description").cloned().unwrap_or(json!("HTML block generated by a wish block")) } }));
             Ok(true)
         }
     }
+}
+
+/// The text node of the controls so far (mindmap).
+const CONTROL_NODE_VIEW: &str = "mindnode";
+
+fn sibling_keys(n: usize) -> WsResult<Vec<String>> {
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(order_key_between(out.last().map(String::as_str), None)?);
+    }
+    Ok(out)
+}
+
+/// One text node per outline item under `parent`, all placed by the control. Returns the ids of `list`.
+fn node_ops(list: &[OutlineNode], parent: &str, keys: Vec<String>, base: &str, n: &mut usize, ops: &mut Vec<Value>) -> WsResult<Vec<String>> {
+    let mut ids = Vec::new();
+    for (node, key) in list.iter().zip(keys) {
+        *n += 1;
+        let id = make_id(&[base, &format!("n{n}")]);
+        ops.push(json!({ "op": "entity.create", "entity_id": id, "type_id": TYPE_CELL, "parent_id": parent, "order_key": key,
+                         "placement": { "x": "auto", "y": "auto", "w": "auto", "h": "auto" },
+                         "payload": { "view": { "type": CONTROL_NODE_VIEW }, "title": node.text } }));
+        node_ops(&node.children, &id, sibling_keys(node.children.len())?, base, n, ops)?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// `entity.delete` of `id` with every live Block below it.
+fn delete_subtree(p: &mut Planner, id: &str) -> WsResult<()> {
+    let Some(e) = p.alive(id)? else { return Ok(()) };
+    let mut below = Vec::new();
+    let mut stack = vec![id.to_string()];
+    while let Some(cur) = stack.pop() {
+        for edge in p.ctx.children(&cur)? {
+            if p.alive(&edge.child_id)?.is_some() {
+                below.push(json!(edge.child_id));
+                stack.push(edge.child_id);
+            }
+        }
+    }
+    p.ops.push(json!({ "op": "entity.delete", "entity_id": id, "subtree": { "delete": below }, "expect": { "rev": e.life_rev } }));
+    Ok(())
+}
+
+/// A control result (脑图 TODO M3): a container of the control's kind with one text node per outline item, laid
+/// out by the control, or (`under`) the items as new children of a node the wish read. A control has no data
+/// entity and no generation record: the result binding owns what was made, so an overwrite deletes it (with
+/// everything below) and puts the new tree in its place. Returns the binding and the summary line.
+fn plan_control(p: &mut Planner, it: &Item, approach: &Value, on_canvas: bool, id_base: &str, places: &mut Vec<Place>) -> WsResult<(Value, Value)> {
+    let c = &it.r()["control"];
+    let kind = c["kind"].as_str().unwrap_or("").to_string();
+    let tree = tree_of(&c["nodes"]);
+    let under = c["under_id"].as_str();
+    let mut old_place: Option<TreeEdge> = None;
+    let mut replaced = false;
+    if let Some(b) = it.binding().filter(|b| b["type"] == json!("control")) {
+        let was_under = b.get("under").is_some();
+        let owned: Vec<String> = if was_under {
+            b["nodes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+        } else {
+            b["entity_id"].as_str().map(str::to_string).into_iter().collect()
+        };
+        for id in owned {
+            if p.alive(&id)?.is_none() {
+                continue;
+            }
+            if !was_under {
+                old_place = p.ctx.edge(&id)?;
+            }
+            delete_subtree(p, &id)?;
+            replaced = true;
+        }
+    }
+    let mut ops = Vec::new();
+    let mut n = 0;
+    let roots = match under {
+        Some(target) => {
+            if p.alive(target)?.is_none() {
+                p.problems.push(format!("The node {target} that control result \"{}\" goes under no longer exists", it.name()));
+            }
+            let mut keys = Vec::new();
+            for _ in &tree {
+                keys.push(p.next_key(target)?);
+            }
+            let roots = node_ops(&tree, target, keys, id_base, &mut n, &mut ops)?;
+            p.ops.extend(ops);
+            roots
+        }
+        None => {
+            let title = it.r()["title"].as_str().or_else(|| (tree.len() == 1).then(|| tree[0].text.as_str())).unwrap_or(it.name());
+            // the layout is implied by the kind
+            let mut payload = json!({ "kind": kind, "title": node_title(title) });
+            if c["config"].as_object().is_some_and(|o| !o.is_empty()) {
+                payload["config"] = c["config"].clone();
+            }
+            let roots = node_ops(&tree, it.entity_id(), sibling_keys(tree.len())?, it.entity_id(), &mut n, &mut ops)?;
+            match old_place {
+                Some(edge) => {
+                    let mut op = json!({ "op": "entity.create", "entity_id": it.entity_id(), "type_id": TYPE_CONTAINER, "parent_id": edge.parent_id, "order_key": edge.order_key, "payload": payload });
+                    if let Some(mut pl) = edge.placement {
+                        pl["w"] = json!("auto");
+                        pl["h"] = json!("auto");
+                        op["placement"] = pl;
+                    }
+                    p.ops.push(op);
+                    p.ops.extend(ops);
+                }
+                None if on_canvas => places.push(Place { id: it.entity_id().to_string(), type_id: TYPE_CONTAINER, payload, size: CONTROL_SIZE, auto_size: true, then: ops }),
+                None => p.problems.push(format!("Control result \"{}\" is drawn on a canvas: set the wish block's output canvas", it.name())),
+            }
+            roots
+        }
+    };
+    let mut binding = json!({ "type": "control", "entity_id": it.entity_id(), "approach": approach, "title": it.r().get("title"), "kind": kind, "nodes": roots });
+    if let Some(t) = under {
+        binding["under"] = json!(t);
+    }
+    let summary = json!({ "name": it.name(), "type": "control", "title": it.r().get("title"), "entity_id": it.entity_id(), "action": if replaced { "update" } else { "create" },
+                          "approach": approach, "kind": kind, "nodes": n, "under": under, "blocks": if under.is_some() { 0 } else { 1 } });
+    Ok((binding, summary))
+}
+
+/// A composite result (扩展控件 P3): an instance of a composite definition of the Workspace whose slots hold Blocks — the
+/// Blocks of other results of this run (taken off the result grid), copies of input Blocks (`tree.clone`), new Blocks
+/// showing input data, and new rich texts — or (`under`) those Blocks added to a slot of a composite the wish read. Like
+/// a mind map result it has no data entity: an overwrite deletes the last instance (or what it added) and plans anew.
+#[allow(clippy::too_many_arguments)]
+fn plan_composite(p: &mut Planner, it: &Item, approach: &Value, on_canvas: bool, id_base: &str, folder: &str, items: &[Item], bindings: &mut Map<String, Value>, places: &mut Vec<Place>) -> WsResult<(Value, Value)> {
+    let c = &it.r()["control"];
+    let def_id = c["def_id"].as_str().unwrap_or("").to_string();
+    let under = c["under_id"].as_str().map(str::to_string);
+    let container = under.clone().unwrap_or_else(|| it.entity_id().to_string());
+    let def = p.alive(&def_id)?;
+    let algorithm = def.as_ref().and_then(|d| d.payload.get("composition")?.get("layout")?.get("algorithm")?.as_str().map(str::to_string)).unwrap_or_else(|| "stack".into());
+    let slots_def = def.as_ref().and_then(|d| d.payload.get("composition")?.get("slots")?.as_object().cloned()).unwrap_or_default();
+    if def.is_none() {
+        p.problems.push(format!("The composite control {} of result \"{}\" is no longer in this Workspace", c["def"].as_str().unwrap_or(""), it.name()));
+    }
+    let mut old_place: Option<TreeEdge> = None;
+    let mut replaced = false;
+    let mut doomed: BTreeSet<String> = BTreeSet::new();
+    if let Some(b) = it.binding().filter(|b| b["type"] == json!("control")) {
+        let was_under = b.get("under").is_some();
+        let owned: Vec<String> = if was_under { b["nodes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect() } else { b["entity_id"].as_str().map(str::to_string).into_iter().collect() };
+        for id in owned {
+            if p.alive(&id)?.is_none() {
+                continue;
+            }
+            if !was_under {
+                old_place = p.ctx.edge(&id)?;
+            }
+            let mut stack = vec![id.clone()];
+            while let Some(cur) = stack.pop() {
+                doomed.insert(cur.clone());
+                for edge in p.ctx.children(&cur)? {
+                    stack.push(edge.child_id);
+                }
+            }
+            delete_subtree(p, &id)?;
+            replaced = true;
+        }
+    }
+    let mut ops = Vec::new();
+    let mut nodes: Vec<String> = Vec::new();
+    let mut n = 0;
+    let mut key: Option<String> = if under.is_some() { p.ctx.children(&container)?.last().map(|e| e.order_key.clone()) } else { None };
+    let next = |key: &mut Option<String>| -> WsResult<String> {
+        let k = order_key_between(key.as_deref(), None)?;
+        *key = Some(k.clone());
+        Ok(k)
+    };
+    for (slot, list) in c["slots"].as_object().into_iter().flatten() {
+        let free = algorithm == "fixed" || slots_def.get(slot).and_then(|s| s["placement"].as_str()) == Some("free");
+        for item in list.as_array().into_iter().flatten() {
+            let place = |w: f64, h: f64, i: usize| if free { json!({ "x": 16, "y": 16 + i as u64 * 24, "w": w, "h": h }) } else { json!({ "x": "auto", "y": "auto", "w": w, "h": h }) };
+            let cell_id = make_id(&[id_base, &format!("s{n}")]);
+            let i = n;
+            n += 1;
+            let cell = |payload: Value, size: (f64, f64), ops: &mut Vec<Value>, key: &mut Option<String>| -> WsResult<String> {
+                let mut payload = payload;
+                payload["slot"] = json!(slot);
+                ops.push(json!({ "op": "entity.create", "entity_id": cell_id, "type_id": TYPE_CELL, "parent_id": container, "order_key": next(key)?, "placement": place(size.0, size.1, i), "payload": payload }));
+                Ok(cell_id.clone())
+            };
+            let id = match item {
+                Value::String(s) if s.starts_with("result:") => {
+                    let r = &s[7..];
+                    let Some(src) = items.iter().find(|x| x.name == r && x.ty != "control") else {
+                        p.problems.push(format!("Control result \"{}\" puts {s} into {slot}: no result of this run is called {r}", it.name()));
+                        continue;
+                    };
+                    // the result's new Blocks leave the grid for the slot; Blocks of an earlier instance are replaced
+                    let mut kept: Vec<Value> = Vec::new();
+                    let mut moved = None;
+                    for cid in bindings.get(r).and_then(|b| b["cells"].as_array()).cloned().unwrap_or_default() {
+                        let Some(cid) = cid.as_str() else { continue };
+                        if let Some(pos) = places.iter().position(|pl| pl.id == cid) {
+                            let pl = places.remove(pos);
+                            let mut payload = pl.payload;
+                            payload["slot"] = json!(slot);
+                            ops.push(json!({ "op": "entity.create", "entity_id": pl.id, "type_id": TYPE_CELL, "parent_id": container, "order_key": next(&mut key)?, "placement": place(pl.size.0, pl.size.1, i), "payload": payload }));
+                            moved.get_or_insert(pl.id.clone());
+                            kept.push(json!(pl.id));
+                        } else if !doomed.contains(cid) {
+                            kept.push(json!(cid));
+                        }
+                    }
+                    let id = match moved {
+                        Some(id) => id,
+                        None => {
+                            let renderer = if src.ty == "html" { "html" } else { src.r.get("renderer").and_then(Value::as_str).unwrap_or(default_renderer(&src.ty)) };
+                            let mut payload = json!({ "view": { "type": renderer }, "title": src.r.get("title").cloned().unwrap_or(json!(src.name)) });
+                            if src.ty == "html" {
+                                payload["def_ref"] = json!({ "entity_id": src.entity_id });
+                            } else {
+                                payload["source_ref"] = json!({ "entity_id": src.entity_id });
+                            }
+                            let id = cell(payload, default_size(renderer, &src.ty), &mut ops, &mut key)?;
+                            kept.push(json!(id));
+                            id
+                        }
+                    };
+                    if let Some(b) = bindings.get_mut(r) {
+                        b["cells"] = json!(kept);
+                    }
+                    id
+                }
+                Value::String(s) if s.starts_with("input:") => {
+                    let Some(src_id) = p.inputs.get(&s[6..]).cloned() else { continue };
+                    let Some(src) = p.alive(&src_id)? else {
+                        p.problems.push(format!("Control result \"{}\": the input {} is gone", it.name(), &s[6..]));
+                        continue;
+                    };
+                    if src.type_id == TYPE_CELL || aiworkspace_core::types::is_block_container(&src) {
+                        let seed = make_id(&[id_base, &format!("c{i}")]);
+                        let pl = p.ctx.edge(&src_id)?.and_then(|e| e.placement).unwrap_or(json!({ "w": 360, "h": 240 }));
+                        let num = |k: &str, d: f64| pl[k].as_f64().unwrap_or(d);
+                        ops.push(json!({ "op": "tree.clone", "source_id": src_id, "parent_id": container, "order_key": next(&mut key)?, "slot": slot, "id_seed": seed,
+                                         "placement": place(num("w", 360.0), num("h", 240.0), i) }));
+                        aiworkspace_core::plan::clone_id(&seed, &src_id)
+                    } else {
+                        let ty = match src.type_id.as_str() {
+                            TYPE_TABLE => "table",
+                            TYPE_RICHTEXT => "richtext",
+                            TYPE_RECORD => "record",
+                            TYPE_ASSET => "asset",
+                            t => {
+                                p.problems.push(format!("Control result \"{}\": the input {} is a {t}, which no Block shows", it.name(), &s[6..]));
+                                continue;
+                            }
+                        };
+                        cell(json!({ "view": { "type": ty }, "source_ref": { "entity_id": src_id } }), default_size(ty, ty), &mut ops, &mut key)?
+                    }
+                }
+                Value::Object(o) => {
+                    let text_id = make_id(&[id_base, &format!("t{i}")]);
+                    let ast = {
+                        let resolve = link_resolver(p);
+                        aiworkspace_core::markdown::to_richtext(o.get("markdown").and_then(Value::as_str).unwrap_or(""), &block_prefix(&text_id), &resolve)?
+                    };
+                    let k = p.next_key(folder)?;
+                    p.ops.push(json!({ "op": "entity.create", "entity_id": text_id, "type_id": TYPE_RICHTEXT, "parent_id": folder, "order_key": k, "payload": { "content": ast } }));
+                    cell(json!({ "view": { "type": "richtext" }, "source_ref": { "entity_id": text_id } }), default_size("richtext", "richtext"), &mut ops, &mut key)?
+                }
+                _ => continue,
+            };
+            nodes.push(id);
+        }
+    }
+    if under.is_none() {
+        let mut payload = json!({ "kind": aiworkspace_core::types::COMPOSITE, "def_ref": { "entity_id": def_id } });
+        if c["config"].as_object().is_some_and(|o| !o.is_empty()) {
+            payload["config"] = c["config"].clone();
+        }
+        if let Some(t) = it.r()["title"].as_str() {
+            payload["title"] = json!(node_title(t));
+        }
+        match old_place {
+            Some(edge) => {
+                let mut op = json!({ "op": "entity.create", "entity_id": it.entity_id(), "type_id": TYPE_CONTAINER, "parent_id": edge.parent_id, "order_key": edge.order_key, "payload": payload });
+                if let Some(mut pl) = edge.placement {
+                    pl["w"] = json!("auto");
+                    pl["h"] = json!("auto");
+                    op["placement"] = pl;
+                }
+                p.ops.push(op);
+                p.ops.extend(ops);
+            }
+            None if on_canvas => places.push(Place { id: it.entity_id().to_string(), type_id: TYPE_CONTAINER, payload, size: CONTROL_SIZE, auto_size: true, then: ops }),
+            None => p.problems.push(format!("Control result \"{}\" is drawn on a canvas: set the wish block's output canvas", it.name())),
+        }
+    } else {
+        p.ops.extend(ops);
+    }
+    let mut binding = json!({ "type": "control", "entity_id": it.entity_id(), "approach": approach, "title": it.r().get("title"), "kind": aiworkspace_core::types::COMPOSITE, "def": c["def"], "nodes": nodes });
+    if let Some(u) = &under {
+        binding["under"] = json!(u);
+    }
+    let summary = json!({ "name": it.name(), "type": "control", "title": it.r().get("title"), "entity_id": it.entity_id(), "action": if replaced { "update" } else { "create" },
+                          "approach": approach, "kind": aiworkspace_core::types::COMPOSITE, "def": c["def"], "nodes": n, "under": under, "blocks": if under.is_some() { 0 } else { 1 } });
+    Ok((binding, summary))
 }
 
 /// Is `entity_id` referenced as the source of any Block (helper for callers).
@@ -1433,5 +1850,31 @@ impl Workspace {
             assets: Vec::new(),
             digest,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn currency_results() {
+        let none = BTreeMap::new();
+        let usd = |v: Value| store_value(FieldType::Currency, None, &none, &v);
+        assert_eq!(usd(json!(12.5)), Some(json!("12.50")));
+        assert_eq!(usd(json!("1,200")), Some(json!("1200.00")));
+        assert_eq!(usd(json!({ "amount": 3, "currency": "cny" })), Some(json!({ "amount": "3.00", "currency": "CNY" })));
+        assert_eq!(store_value(FieldType::Currency, Some(0), &none, &json!({ "amount": "300", "currency": "JPY" })), Some(json!({ "amount": "300", "currency": "JPY" })));
+        assert_eq!(usd(json!({ "amount": "x", "currency": "USD" })), None);
+        assert_eq!(usd(Value::Null), None);
+        let a = json!({ "price": { "amount": 1, "currency": "EUR" } });
+        let b = json!({ "price": { "amount": 2, "currency": "EUR" } });
+        let c = json!({ "price": 3 });
+        let rows: Vec<&Map<String, Value>> = vec![a.as_object().unwrap(), b.as_object().unwrap(), c.as_object().unwrap()];
+        let fps = field_plans(&[json!({ "name": "price", "type": "currency" })], &rows, &[], "f", &BTreeSet::new());
+        assert_eq!(fps[0].def, json!({ "field_id": "f1", "name": "price", "type": "currency", "currency": "EUR" }));
+        let fps = field_plans(&[json!({ "name": "price", "type": "currency", "currency": "gbp", "scale": 0 })], &rows, &[], "f", &BTreeSet::new());
+        assert_eq!(fps[0].def, json!({ "field_id": "f1", "name": "price", "type": "currency", "scale": 0, "currency": "GBP" }));
+        aiworkspace_core::value::FieldDef::from_value(&fps[0].def).expect("a valid field definition");
     }
 }

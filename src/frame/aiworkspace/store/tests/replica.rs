@@ -61,7 +61,7 @@ fn root_of(m: &MemStore) -> String {
 
 fn bootstrap(ws: &mut Workspace, who: &Caller, peer: u64) -> Replica {
     let b = ws.replica_bootstrap(who).unwrap();
-    let confirmed = load_rows(&replica_tables(b["path"].as_str().unwrap())).unwrap();
+    let confirmed = load_rows(&replica_tables(fetched(&ws.objects, &b).to_str().unwrap())).unwrap();
     Replica::new(&who.principal, &ws.workspace_id, &ws.epoch, confirmed, b["head_seq"].as_u64().unwrap(), peer)
 }
 
@@ -271,7 +271,7 @@ fn unknown_results_revoked_permission_and_epoch_change() {
     assert_eq!(r["code"], "LOCK_REQUIRED");
 
     // 5. the Workspace is restored from a package: the old epoch is dead, nothing is replayed onto the new history
-    let pkg = std::path::PathBuf::from(ws.export(&alice(), "share", true, None).unwrap()["path"].as_str().unwrap());
+    let pkg = { let r = ws.export(&alice(), "share", true, None).unwrap(); fetched(&ws.objects, &r) };
     drop(ws);
     env.svc.import(&alice(), &pkg, "restore", true).unwrap();
     let h = env.svc.workspace(&id).unwrap();
@@ -305,7 +305,7 @@ fn replica_keeps_anchors_it_does_not_know() {
         "operations": [{ "op": "entity.create", "entity_id": "note-future", "type_id": "buckyos.annotation", "parent_id": "data",
             "order_key": "zz", "payload": { "target": { "entity_id": "notes", "selector": { "kind": "richtext_line", "line": 2 } },
                 "range": { "kind": "richtext_columns", "from": 1 }, "kind": "note", "body": "来自新版本" } }] });
-    let r = ws.commit(&req, &alice(), &CommitOpts { internal: true, import: true, undoes: None, as_principal: None, maintenance: false, as_source: false });
+    let r = ws.commit(&req, &alice(), &CommitOpts { internal: true, import: true, undoes: None, as_principal: None, maintenance: false, as_source: false, as_build: false, as_session: false });
     assert_eq!(r["status"], "accepted", "{r}");
     catch_up(&ws, &alice(), &mut rep);
     let read = aiworkspace_core::read::read(&rep.working, &aiworkspace_core::access::Access::full("alice"), "note-future", None).unwrap();

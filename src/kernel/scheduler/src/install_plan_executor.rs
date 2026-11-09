@@ -5,7 +5,6 @@ use buckyos_kit::{buckyos_get_unix_timestamp, KVAction};
 use ndn_lib::NamedObject;
 use package_lib::PackageId;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 
 use crate::scheduler_server::SchedulerServer;
 use crate::system_config_agent::{refresh_rbac, schedule_loop};
@@ -182,6 +181,7 @@ fn default_reserved_hostnames(settings: &ZoneGatewaySettings) -> BTreeSet<String
         "sys".to_string(),
         "homestation".to_string(),
         "share".to_string(),
+        "s3".to_string(),
     ]);
     reserved.extend(settings.shortcuts.keys().cloned());
     reserved
@@ -861,7 +861,7 @@ impl SchedulerHandler for SchedulerServer {
         _ctx: RPCContext,
     ) -> Result<SchedulerRunThunkResponse> {
         self.thunk_runner
-            .run_thunk(request.task_id, request.thunk, request.function_object)
+            .run_thunk(request.task_id, request.thunk, request.function_object, request.registration)
             .await
             .map_err(rpc_error)
     }
@@ -1047,7 +1047,6 @@ impl SchedulerHandler for SchedulerServer {
             if existing.state != SchedulerShortcutMutationState::Claimed {
                 return Ok(existing);
             }
-            record = existing;
         }
 
         for _ in 0..MAX_CAS_RETRIES {
@@ -1074,6 +1073,7 @@ impl SchedulerHandler for SchedulerServer {
                 "sys".to_string(),
                 "homestation".to_string(),
                 "share".to_string(),
+                "s3".to_string(),
             ]);
             let collides = plan.target_app_instance_id.is_some()
                 && (reserved.contains(&plan.shortcut_hostname)

@@ -65,6 +65,12 @@ impl AgentDIDObjectRuntime {
     }
 
     pub async fn read(&self, input: ReadInput) -> Result<AgentToolResult, AgentDIDObjectError> {
+        let response = self.read_response(&input).await?;
+        Ok(read_response_to_tool_result(&input, response))
+    }
+
+    /// What the routed adapter read, before it is rendered as a tool result.
+    pub async fn read_response(&self, input: &ReadInput) -> Result<AdapterReadResponse, AgentDIDObjectError> {
         let object_ref = ObjectRef::parse(&input.object)?;
         let route_match = self.router.route(RouteMethod::Read, &object_ref)?;
         let adapter_config = self
@@ -80,7 +86,7 @@ impl AgentDIDObjectRuntime {
                 AgentDIDObjectError::AdapterNotFound(route_match.route.adapter.clone())
             })?;
 
-        let response = adapter
+        adapter
             .read(AdapterReadRequest {
                 object_ref,
                 input: input.clone(),
@@ -88,9 +94,7 @@ impl AgentDIDObjectRuntime {
                 route_trace: route_match.trace,
                 adapter_config,
             })
-            .await?;
-
-        Ok(read_response_to_tool_result(&input, response))
+            .await
     }
 
     pub async fn x_call(&self, input: XCallInput) -> Result<AgentToolResult, AgentDIDObjectError> {
@@ -121,6 +125,8 @@ impl AgentDIDObjectRuntime {
 
         Ok(AgentToolResult {
             agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+            hints: Vec::new(),
+            dedup: None,
             tool: None,
             cmd_name: Some("xcall".to_string()),
             status: match response.status {
@@ -155,6 +161,7 @@ impl AgentDIDObjectRuntime {
             }),
             partial_output: None,
             output: response.output,
+            images: Vec::new(),
         })
     }
 
@@ -209,6 +216,8 @@ fn read_response_to_tool_result(
     if unchanged {
         return AgentToolResult {
             agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+            hints: Vec::new(),
+            dedup: None,
             tool: None,
             cmd_name: Some("read".to_string()),
             status: AgentToolStatus::Success,
@@ -235,6 +244,7 @@ fn read_response_to_tool_result(
             return_code: Some(0),
             partial_output: None,
             output: Some(READ_UNCHANGED_MESSAGE.to_string()),
+            images: Vec::new(),
         };
     }
 
@@ -255,6 +265,8 @@ fn read_response_to_tool_result(
 
     AgentToolResult {
         agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+        hints: Vec::new(),
+        dedup: None,
         tool: None,
         cmd_name: Some("read".to_string()),
         status: if response.errors.is_empty() {
@@ -285,6 +297,7 @@ fn read_response_to_tool_result(
         return_code: Some(0),
         partial_output: None,
         output: Some(output),
+        images: Vec::new(),
     }
 }
 

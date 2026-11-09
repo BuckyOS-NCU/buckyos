@@ -23,8 +23,13 @@ import * as common from '../../src/i18n/aiworkspace/common.ts'
 import * as core from '../../src/i18n/aiworkspace/core.ts'
 import * as data from '../../src/i18n/aiworkspace/data.ts'
 import * as demos from '../../src/i18n/aiworkspace/demos.ts'
+import * as ext from '../../src/i18n/aiworkspace/ext.ts'
+import * as imports from '../../src/i18n/aiworkspace/import.ts'
+import * as pdf from '../../src/i18n/aiworkspace/pdf.ts'
 import * as presentation from '../../src/i18n/aiworkspace/presentation.ts'
+import * as office from '../../src/i18n/aiworkspace/office.ts'
 import * as richtext from '../../src/i18n/aiworkspace/richtext.ts'
+import * as session from '../../src/i18n/aiworkspace/session.ts'
 import * as shell from '../../src/i18n/aiworkspace/shell.ts'
 import * as wish from '../../src/i18n/aiworkspace/wish.ts'
 
@@ -41,12 +46,17 @@ const PARTS: Part[] = [
   { name: 'data', prefixes: ['data'], ...data },
   { name: 'presentation', prefixes: ['presentation'], ...presentation },
   { name: 'richtext', prefixes: ['richtext'], ...richtext },
+  { name: 'session', prefixes: ['session'], ...session },
   { name: 'core', prefixes: ['core'], ...core },
+  { name: 'pdf', prefixes: ['pdf'], ...pdf },
   { name: 'demos', prefixes: ['demo'], ...demos },
+  { name: 'ext', prefixes: ['ext'], ...ext },
+  { name: 'import', prefixes: ['import'], ...imports },
+  { name: 'office', prefixes: ['office'], ...office },
 ]
 
 const ROOT = new URL('../../', import.meta.url).pathname
-const SOURCE_DIRS = ['src/app/aiworkspace', '../aiworkspace/import-drawio']
+const SOURCE_DIRS = ['src/app/aiworkspace', '../aiworkspace/import-drawio', '../aiworkspace/import-pdf', '../aiworkspace/import-table', '../aiworkspace/import-office']
 const SKIP_DIRS = new Set(['wasm', 'node_modules', 'tools', 'fixtures'])
 const CJK = /[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]/
 const EXEMPT = 'i18n-exempt'

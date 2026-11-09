@@ -1,0 +1,379 @@
+# Issue #689：MessageHub 跨 Zone 附件 TODO
+
+日期：2026-11-06 重写，2026-11-07 实现 P0–P2（America/Los_Angeles）。关联：[issue #689](https://github.com/buckyos/buckyos/issues/689)、[Bucket 设计 §4.6.5 与 §21 N18](../doc/arch/应用对象桶%20Bucket%20设计.md)、[跨 Zone 登录断言契约](../doc/arch/verify-hub/跨Zone登录断言契约.md)。
+
+实现基线：`buckyos@a3a50cfa2`、`cyfs-ndn@c5dd866`。cyfs-ndn 的部分（`max_bytes`、`NdnError::TooLarge`）在 [cyfs-ndn#42](https://github.com/buckyos/cyfs-ndn/pull/42)。
+
+旧版是 10-28／29 的全链路分析（`git show 780e102f0:notepads/issue-689-cross-zone-attachments-protocol-todo.md`）。它列出的缺口大多已被基础设施解决，所以删除了，旧章节的去向见 §3.2。§15 是 Agent 授权分析，被 [agent-appid TODO](agent-appid-authorization-implementation-todo.md) 引用，原样保留。
+
+## 1. 结论：P0–P2 已完成，P3 未做
+
+| 优先级 | 内容 | 状态 |
+| --- | --- | --- |
+| P0 | 本地重发越权（§5.1）、伪造大小绕过上限（§5.2） | 已修，单测和真实 Zone DV 通过 |
+| P1 | 私聊收尾（§6）：陌生人不拉、非图片点击才拉、屏蔽后不发票据、未读转发和收藏、UI 状态 | 已完成，单测、Desktop e2e、真实 Zone DV 通过 |
+| P2 | 群（§7） | 已完成，三 Zone DV 通过，host 分别试了 did:bns 和 did:web |
+| P3 | 目录、预取（§8） | 未做，拆到 [#723](https://github.com/buckyos/buckyos/issues/723)。目录现在明确返回 415 |
+
+#689 的验收项对照：
+
+| issue 验收项 | 现状 |
+| --- | --- |
+| 图片首次到达时自动获取并展示 | 私聊和群成立（DV），Desktop 经代理连真实 Zone 验证过 |
+| 多附件、重复读取、并发不错绑、不重复下载 | 成立。同 key 只下载一次有用例。同一对象在不同消息里各下载一次，这是有意的（§4 第 1 条） |
+| 临时故障恢复后可重试，不用重发 | 成立。来源离线后恢复有单测和真实 Zone 验证 |
+| 未授权用户不能凭 ObjId 读取 | 成立，含 §5.1 的本地重发 |
+| 明确文件、音视频、目录的覆盖范围 | 64 MiB 以内的文件成立，音视频走同一路径（视频卡片不下载，点击才拉）；目录 415；超过 64 MiB 返回 413，大文件走文件分享 URL（§9 第 4 项） |
+
+实施时发现跨 Zone 成员发带附件的消息被 host 拒绝，§7 根本走不到，所以放开了这一种情况（§9 第 7 项）。用户给出的判断原则：群消息的来源是群（§9 第 8 项）。
+
+## 2. 现状：按入口核对
+
+| 入口 | 现在的行为 | 验证 |
+| --- | --- | --- |
+| 私聊，FileObject，64 MiB 以内 | `describe` 只问来源、不绑定；`content` 拉取，读取最多等 20 秒，之后 503，后台继续 | 单测、DV |
+| 私聊或群，超过 64 MiB | 413，不下载 chunk。按 chunk 自带长度判断，`size` 伪造无效 | 单测、DV |
+| 私聊，目录 | 415 `attachment-directory-unsupported`，Desktop 说明暂不支持 | 单测、e2e |
+| 群：host 本地作者 | 绑定，可读 | 单测 |
+| 群：joined 作者，host 上的读者 | host 接受后后台以群 DID 取回并保留；读取时没有就再触发 | 单测、DV |
+| 群：joined 成员在自己 Zone 读 | 向 host 申请票据，host 按群规则裁决，没有内容时返回可重试 | 单测、DV（作者 Zone 冻结时照常读到） |
+| 群：作者在自己 Zone 读自己发的 | 按本地发件绑定，可读 | 单测 |
+| 群展示文件（`_display`） | joined 成员经 host 取，绑定到本 Zone 的 `<group>/_display/<obj_id>`。host 撤下后旧令牌失效，本地副本不动 | 单测、DV |
+| 转发没读过的远端附件 | 先按读取规则取回；取回前发送失败，`attachment_pending` 可重试 | 单测、DV |
+| 收藏没读过的远端附件 | 同上 | 单测、DV |
+| Agent 读取 | requester 是 AgentDID，策略按 Agent 的联系人判定 | 单测 |
+| Agent 读工具（`read_tool`、`buckyos-agent`） | 按 `Retry-After` 重试，最多累计等 60 秒 | 编译和既有用例通过，没有真实 Agent 跑过 |
+| Telegram 外发 | 仍直接读本地 named store；经 `post_send` 的转发已先取回 | 静态 |
+| 陌生人消息（REQUEST_BOX） | 403 `attachment-awaiting-acceptance`，不外连；接受后可读，记录仍在 REQUEST_BOX | 单测、DV、Desktop 真实 Zone |
+| 失败状态 | 403／404／413／415／502／503 分开，见 [Message Center](../doc/message_hub/Message%20Center.md) 附件一节；Desktop 分别显示 | 单测、e2e、Desktop 真实 Zone |
+
+External 和 Session Only 访客向 host 发带附件的消息仍被拒绝（[test_hybrid_sso.rs:529](../src/frame/msg_center/src/test_hybrid_sso.rs#L529)），这是既定限制。跨 Zone 断言登录的群成员不在此列（§9 第 7 项）。
+
+## 3. 已经解决的部分
+
+### 3.1 现在的协议
+
+```text
+收到远端消息：不绑定，无论内容是否已在本 Zone
+读取内容（或转发、收藏）：本 Zone 消息权限通过，发现没有绑定
+  1. 本 Zone 设备以收件人 DID 签断言，换取源 Zone 的 External 会话（login_by_cross_zone_assertion）
+  2. msg.attachment_ticket {msg_id, obj_id}
+     源 Zone 检查：请求者在 msg.to 里、FileObject、绑定持有它；私聊还要发送方没有屏蔽请求者
+     返回 bkt_ 令牌：只读、单 key、1 小时、不限次
+  3. GET https://<源 Zone>/ndn/<file>?hint={"token":...}
+     FileObject、ChunkList、chunk 逐项校验写入本 Zone，不跳过本地已有的内容
+  4. bucket.put(<session>/<msg_id>/<n>)，内容完整才成功，读取继续
+状态只有消息和绑定；失败由下一次读取重做
+取描述：同样 1、2，3 只取对象本身（resp=raw）并校验，不绑定
+私聊外连前要读者已接受发送方。群见 §7.1
+```
+
+### 3.2 旧问题的去向
+
+其他文档还在引用旧章节号（Bucket §4.6.5、§4.6.6，`done/cross-zone-comm-todo.md`），按下表对应。
+
+| 旧问题 | 现状 | 旧章节 |
+| --- | --- | --- |
+| 跨 Zone 请求者身份，session token 不能跨 Zone | `CrossZoneClient` 加 `login_by_cross_zone_assertion`：设备签断言，目标 Zone 验 custody 后签发自己的 External 会话。HTTPS 和 RTCP 同一规则 | §4、§5.1、§5.2 |
+| 谁裁决读取 | 源 Zone 的 msg-center（`msg.attachment_ticket`）。私聊已实现，群见 §7 | §5.3、§6.1 第 4–6 步 |
+| `bkt_` 能否做数据面凭据 | 能。`/ndn/` 的 `hint.token` 只接受只读、单 key、未绑定主体、不限次的令牌，且 key 当前绑定必须等于授权根，解绑即失效 | §5.4 |
+| 消息与凭据分离 | 令牌只在拉取时申请，不进 `MsgObject` | §5.4 末段 |
+| bucket GET 不是对象图导出，子请求丢凭据 | `/ndn/` 的 `resp=raw` 和 `path`；`CyfsNdnClient` 子请求带路径和令牌，不跟随重定向 | §7.1、§7.2 第 1 条 |
+| 内容校验 | 逐项校验，本地副本不能代替拉取 | §7.3 |
+| 来源定位 | 由 `msg.from` 经 custody 解析当前 Zone，消息不加字段，`uri_hint` 不参与 | §6.3 |
+| 保留策略与获取时机 | 取回后进 `attachments`（AppData、Recursive pin），和本地发件相同；首次读取时获取 | §1、§8.3 |
+| 持久状态、任务认领、恢复 | 不需要。拉取中没有 lease，GC 命中只表现为这次失败，下次读取重拉 | §8.1、§8.2 |
+| 本地命中越权 | N1：远端消息不绑定。N1 漏掉的路径见 §5.1 | §9 |
+| 已有的缺附件私聊消息 | 下一次读取自动取回，不用迁移 | §12 末节 |
+| 群两段流程、撤回竞争 | 未实现，见 §7 | §6.2、§8.2 第 6 条、§10 |
+| 目录递归 pull、Range、大文件 | 目录 pull 未实现，见 §8。大文件不走附件，走文件分享 URL（§9 第 4 项） | §7.2 第 2、3 条 |
+
+### 3.3 明确不再做
+
+除非出现具体需求：
+
+- 持久获取状态表、任务 claim、后台 reconcile。
+- 来源字段进 `MsgObject` 或 sidecar，多源回源，Zone 迁移后的来源证据。迁移后解析到新 Zone，新 Zone 没有绑定就是取不到。
+- 附件取得回执。
+- 让用户逐个登录源 Zone（External SSO）作为附件入口。收件人 Zone 代为登录已经够用。
+- 超过 64 MiB 的附件和 msg-center 流式读取。大文件走文件分享，消息里带 URL。发件时怎么引导到文件分享，另开 issue。
+
+## 4. 仍然成立的约束
+
+1. 消息签名、ObjId、本地副本都不授权。绑定的依据只有两种：本人持有或可读的证明；字节确实从有权的来源取回并校验。本地副本不能代替拉取，所以同一对象在不同消息里各下载一次。
+2. 业务裁决在 msg-center，数据面只判令牌。不开放通用 NDM 读权限，不公开附件桶，私聊和群附件不进 `public-cache`。
+3. 令牌和 `hint` 不进 `MsgObject`、日志、错误详情、Task 数据。
+4. 内容完整才绑定。
+5. 消息接收不等附件。附件失败只重试获取，不重新投递。
+6. 撤销只控制后续获取。已取回、收藏、导出的副本不承诺远程删除。
+7. 新的跨 Zone 调用用 `CrossZoneClient`，不再造身份协议。
+
+## 5. P0：越权和限额
+
+### 5.1 本地重发绕过 N1（已复现）
+
+远端消息不再绑定，但 `authorize_outgoing_attachments` 判断能否复用引用时，只看调用者的邮箱里有一条引用该对象的消息，不看那条消息是否真的持有它（[buckets.rs:429](../src/frame/msg_center/src/buckets.rs#L429)）。通过后走本地发件，用 msg-center 的服务身份绑定。
+
+```text
+1. 外部 DID S 给本 Zone 用户 R 发签名消息，引用本 Zone 的私有对象 X。不绑定，R 读到 404
+2. R 发一条新消息，同样引用 X。post_send 接受，新消息的 key 绑定了 X
+3. R 经新消息读 X，200，拿到原文
+```
+
+临时用例放在 `test_group_service.rs` 的 `attachment_buckets` 模块，用 `bound_center` 和 `verifier(false)`，输出：
+
+```text
+remote message bound: None
+read via remote message: 404
+resend accepted: Ok(true)
+resend bound: Some("cyfile:75b0…")
+read via resend: 200 "someone's private bytes"
+```
+
+前提：知道 X 的 ObjId，X 已完整存在本 Zone，R 有本 Zone 账号并能收到这条消息。R 可以是攻击者自己的账号配一个外部 DID；也可以是被诱导转发的普通用户，此时转发给 S，S 还能用 `msg.attachment_ticket` 把 X 取走（这一步是静态推断）。
+
+验证的边界：
+
+- 用例里的 nfs-server 没开鉴权（`Session::Open`）。真实 Zone 上由 `ServicePolicy::holds` 决定，`frame` 角色有 `obj://ndm/objects` read（[bucket/mod.rs:336](../src/frame/nfs_server/src/bucket/mod.rs#L336)、[rbac_config.rs:256](../src/kernel/buckyos-api/src/rbac_config.rs#L256)），静态核对会放行，没有在真实 Zone 跑。
+- 群分支（[buckets.rs:434](../src/frame/msg_center/src/buckets.rs#L434)）同样只看消息是否引用，静态判断同样可达，没有运行。
+- External 和 Limited 会话带附件的发送已被拒绝，不走这条路。
+
+TODO（已完成）：
+
+- [x] 复用引用的条件改成“来源消息的绑定持有该对象”，私聊和群两个分支都改（`buckets.rs` `reuse_of`）。
+- [x] 没有绑定时先 `ensure_remote_attachment`，得到 `Bound` 才算数；来源暂时不可达返回 `attachment_pending`，其他情况拒绝。
+- [x] `own_message_referencing` 优先选已绑定的消息。
+- [x] 回归用例：`a_message_that_only_names_an_object_cannot_be_reissued`（私聊、群、合法转发对照）、`a_message_naming_a_private_object_cannot_be_forwarded_into_it`、`a_new_message_naming_a_file_does_not_take_it_away`。真实 Zone DV：`remote_attachment_dv.mjs` 第 10 节，charlie 的设备伪造一条引用 bob 私有文件的消息发给 bob Zone 的第二个账号，读不到、取描述读不到文件名、重发被拒，文件所有者照常能发。
+- [x] 更新了 Bucket Z7、G2、§21 N1。
+
+### 5.2 伪造 `size` 绕过 64 MiB 上限（静态）
+
+`pull_attachment` 用 FileObject 里的 `size` 判断是否超限（[remote_attachment.rs:186](../src/frame/msg_center/src/remote_attachment.rs#L186)）。`size` 是发送方写的，`pull_chunk_list_by_object` 按 ChunkList 逐个下载，既不和 `size` 比较，也没有总量上限（[cyfs_ndn_client.rs:1941](../../cyfs-ndn/src/ndn-toolkit/src/cyfs_ndn_client.rs#L1941)）。发送方写一个小 `size`，content 指向很大的 ChunkList，接收方就会全部下载并绑定，读取时才因实际长度超限返回 413。
+
+- [x] 拉取前先取回 ChunkList，按 chunk 自带长度累加后判断上限；content 是单个 chunk 时同样比较。`size` 与实际长度不符按校验失败处理，不带长度的 chunk 拒绝。超出的 `NdnError::TooLarge` 对应 413，不符的对应 502。
+- [x] 上限是 `CyfsNdnClient` 请求的 `max_bytes`，目录（§8）可以直接用。下载单个 chunk 时最多读到它声明的长度加一字节，来源多发的内容不会读进内存。
+- [x] 回归用例：`ndn_pull_tests.rs` 两个，`a_declared_size_is_not_believed`，DV 第 7 节。
+
+## 6. P1：私聊收尾
+
+- [x] 陌生人消息不拉（§9 第 1 项）：`ensure_remote_attachment` 外连前按读者对发送方的当前访问策略判定，复用 `decide_inbox_kind`（[msg_center.rs:1225](../src/frame/msg_center/src/msg_center.rs#L1225)），不允许投递就不外连。不能看记录在哪个 box：接受（好友或 `allow`）只改联系人的 `access_level`，消息记录不会搬出 REQUEST_BOX。检查放在所有外连的共同入口（`ensure` 和下面的取描述），转发和收藏一起受约束；群消息不走这个判定。
+- [x] 陌生人消息的前端：显示“接受后可查看附件”，不算失败；接受后失效该会话的附件缓存并重新加载。
+- [x] `remote_attachment_dv.mjs` 没有建立联系人关系，静态看会被上面的规则挡住。先允许发送者，再加一条“陌生人不外连、允许后可读”的用例。
+- [x] `msg.collect_attachment` 没有绑定时先 `ensure_remote_attachment`，完整取回后再复制。
+- [x] 拆开 `RemoteAttachment::Unavailable`：获取中（503 + `Retry-After`）、暂时不可达（503）、等待接受（403）、源端拒绝或对象不存在（404）、校验失败（502）。票据错误按 `CrossZoneError::is_retryable` 分类。`Retry-After`：获取中 5 秒，暂时不可达 30 秒。
+- [x] Desktop 读 `Retry-After` 自动重试，有次数上限；增加“正在从对方 Zone 获取”的状态。重试在 `api/objects.ts`，所以下载、预览、语音、展示文件都受益；获取中最多 12 次，不可达最多 2 次。
+- [x] 目录在 P3 完成之前返回 415，不再是 404 加“no longer available”。
+- [x] 非图片附件点击才拉（§9 第 5 项）：`describe` 不再触发完整拉取。没有绑定时申请票据，用 `resp=raw` 从源端取 FileObject 并校验 ObjId（`pull_attachment` 前半段已有），直接返回，不写绑定。不能用本地 named store 的副本回答，否则引用私有对象的远端消息能读到它的文件名和大小（§4 第 1 条）。`content` 才走 `ensure_remote_attachment`。Desktop 不用改流程：它本来就先 `describe`，只有内联图片才取 `content`，下载和预览在点击时取（[MediaAttachment.tsx:60](../src/frame/desktop/src/app/messagehub/conversation/media/MediaAttachment.tsx#L60)）；语音条的播放路径核对过：点击才取内容。实施时发现视频卡片的缩略图会下载完整内容，所以描述带上 `x-attachment-remote: 1`，这种卡片不生成缩略图，点击后才拉。
+- [x] 私聊中被发送方屏蔽的收件人拿不到票据（§9 第 6 项，群消息不适用，见第 8 项）：`attachment_ticket` 用 `is_contact_blocked(收件人, Some(msg.from))` 判定（[msg_center.rs:1201](../src/frame/msg_center/src/msg_center.rs#L1201)），拒绝时和消息不存在的响应相同。已发的令牌最多 1 小时内还能用，不额外撤销；已取回的副本不动（§4 第 6 条）。
+- [x] 补验证：并发读取（`concurrent_readers_download_once`）、发送方 Zone 离线后恢复（单测、DV、Desktop 真实 Zone）、Agent 作为收件人和发送方、带 refs 的 edit。Desktop 对真实 Zone：`attachment_ui_dv.mjs`，收图、陌生人、接受、离线、重试都过了；换账号只有代码（`setObjectViewer` 重置缓存，等待中的重试会停），没有在真实 Zone 跑。
+- [x] 同步文档：[Message Center](../doc/message_hub/Message%20Center.md) 附件一节（625–640 行）还写着“任一不满足返回 404”，没有远端拉取、503、413 和 `msg.attachment_ticket`；Durable Data Schema 和 Bucket §21 N18 里的“首次读取时拉取”改成“首次读取内容时拉取”；[UI_DATAMODEL](../src/frame/desktop/src/app/messagehub/UI_DATAMODEL.md) 的附件状态；`buckyos_admin` 手册第 306 行的附件排查补上“远端附件未取回”。实施时检查 `aigc_image`、`aigc_video` 里涉及消息附件的部分。
+
+## 7. P2：群
+
+### 7.1 目标流程
+
+host 是群附件的唯一裁决者，并保留一份副本。作者 Zone 不看成员表，成员 Zone 不找作者。两段都复用 §3.1 的做法：
+
+```text
+作者到 host：host 接受消息后后台拉取，不阻塞 accept；没拉到时由读取或票据请求再次触发
+  host 以群 DID 登录作者 Zone，作者 Zone 的 verify-hub 按群 DID 文档判定 custody
+  msg.attachment_ticket：调用者是 msg.to 里的群，绑定持有它
+  host 拉取、校验、绑定进 attachments，按 AppData 保留
+
+host 到成员：ZB 的读者没有绑定
+  ZB 本地消息权限通过
+  以读者 DID 登录 host，申请票据，带 context_path=<session>/<msg_id>
+  host 用 authorize_group_attachment 裁决（成员、历史可见范围、read hooks、客户端策略）
+  host 还没有内容时再次触发上一段，完成前返回可重试
+  ZB 经 host 的 /ndn/ 拉取、校验、绑定
+```
+
+群 DID 就是这条消息的收件人，所以作者到 host 这一段的票据规则和私聊相同，都是“请求者在 `msg.to` 里”。
+
+host 接受后就拉取，是因为按首次读取拉取时，如果作者在有人读之前离线，host 就取不到，保留副本也就失去了意义。成员 Zone 和私聊一样，非图片附件点击才拉。
+
+### 7.2 TODO
+
+- [x] `canonical_zone_from_doc` 增加群文档分支（[cross_zone_auth.rs:174](../src/kernel/buckyos-api/src/cross_zone_auth.rs#L174)）。现在群文档走到末尾的 `zone_did`，得到空，custody 拒绝。改成沿文档的 `owner` 走到它的 canonical Zone。群主可能是 Agent，而 Agent 分支要求 owner 文档带 `binded_zone_list` 或 `ns/owner`，不能直接共用那段检查。这是 `check_custody` 的共用逻辑，verify-hub、msg-center 消息验签和 HomeStation 都受影响，同步[跨 Zone 登录断言契约](../doc/arch/verify-hub/跨Zone登录断言契约.md) §3，并补正反例：host 的设备可以代表群，其他 Zone 的设备不可以。
+- [x] 守住“群主 Zone 就是 host”：`group.transfer_owner` 和 `group.accept_owner_transfer` 拒绝其他 Zone 的成员。现在只判成员身份（[group_service.rs:2003](../src/frame/msg_center/src/group_service.rs#L2003)）。Desktop 走不到跨 Zone 接受，因为 joined 成员的 Zone 上没有这个群，只有 `accept_invitation` 和 `get_doc` 会转给 host；但 External 会话直接调 host 的 kRPC，代码里没有拦（静态）。
+- [x] `ensure_remote_attachment` 放开群消息，并接受调用者身份。host 上 requester 是群 DID，用 `groups.load` 判断群是否托管在本 Zone，不依赖 `is_local_recipient`：`register_local_recipients` 只在建群时调用（[group_service.rs:920](../src/frame/msg_center/src/group_service.rs#L920)），重启后一级 DID 的群不算本地（静态）。成员 Zone 上 `msg.to` 是群，要用实际读者的 DID。§6 的取描述用同样的身份。
+- [x] 扩展 `msg.attachment_ticket`：调用者是 `msg.to` 里的群时走作者到 host；带 `context_path` 时走 host 到成员，用 `authorize_group_attachment` 裁决。令牌都只覆盖对应 key。joined 路由只知道 host 主机名，host 到成员这一段用 `CrossZoneClient::request_host`（[group_sync.rs:95](../src/frame/msg_center/src/group_sync.rs#L95) 已有同样的用法）。
+- [x] host 接受消息后后台拉取，复用 `spawn_fetch` 的合并逻辑。不阻塞 accept，失败不影响消息接受，崩溃后由下一次读取补上，不新建任务表。§5.2 的上限同样适用；群附件计入 msg-center 的桶配额，超配额按不可用处理。
+- [x] `_display`：`authorize_display_file` 支持 joined 成员在本 Zone 读，票据 key 是 `<group>/_display/<obj_id>`。展示文件移除后解绑，旧令牌随之失效，这一点 `/ndn/` 已保证。
+- [x] 撤回竞争：`pull_attachment` 绑定前确认消息还在，绑定后再查一次，已撤回就解绑。否则晚到的拉取会复活已撤回的附件。
+- [x] 退群、移出：host 不再发票据；本地已有副本的展示规则不变。
+- [x] 独立 ZA、G、ZB 三 Zone 的 DV：`group_attachment_dv.mjs`，36 项，host 在 bob 和 charlie 各跑一遍，作者 Zone 冻结时成员照常读到。四台 VM 的日志里没有令牌。
+- [x] 实施时新增：跨 Zone 成员发带附件的消息原来被 `refuse_guest_attachments` 拒绝，host 收不到（单测直接调 `accept_group_message`，所以没发现）。`group_http` 对跨 Zone 断言登录的群成员放行，见 §9 第 7 项。
+- [x] 同步文档：[Self-Host-Groupv2](../doc/message_hub/Self-Host-Groupv2.md) §5.7 的保留策略和 §6.2 的转让群主（写明跨 Zone 转让等于转服，本版本不支持）、[group-v2-backend](../src/frame/msg_center/doc/group-v2-backend.md)、Durable Data Schema 里“group's attachments stay unreadable”一句。
+
+## 8. P3：目录、预取
+
+已拆到 [#723](https://github.com/buckyos/buckyos/issues/723)。
+
+目录：
+
+- [ ] 票据和 `ensure` 放开 DirObject。`/ndn/` 已能沿目录子项走路径（[ndn_read.rs:238](../../cyfs-ndn/src/bucket_store/src/ndn_read.rs#L238)）。
+- [ ] `CyfsNdnClient` 增加目录 pull，现在是 Unsupported（[cyfs_ndn_client.rs:1534](../../cyfs-ndn/src/ndn-toolkit/src/cyfs_ndn_client.rs#L1534)）：递归、深度／节点数／总字节上限、去重、子项名规范化。`bucket.cache_public` 也在等这个（Bucket §4.6.5）。
+- [ ] 目录卡片同样只取描述，保存或打开时才拉（§9 第 5 项）。
+
+预取和预算：
+
+- [ ] 按来源、按用户的下载预算，可信会话预取。等有实际需求再做。
+
+## 9. 决定
+
+全部已定（2026-11-06）：
+
+| # | 问题 | 决定 | 影响 |
+| --- | --- | --- | --- |
+| 1 | 陌生人消息（REQUEST_BOX）是否自动拉取 | 不拉。发送方被接受（好友或 `allow`）后，按普通消息处理。否则卡片渲染就外连，陌生人能得知读取时间和对方 Zone 的出口地址，还占用磁盘 | §6 |
+| 2 | 作者 Zone 怎么确认调用者是 G 的 host | 看群的 DID 文档：host 以群 DID 登录，custody 沿文档里的 `owner` 走到它的 canonical Zone，和 Agent 的规则同类。不比对 `JoinedGroupRoute`，作者退群后路由失效也不影响判定。前提是群主 Zone 就是 host：转让群主在运维上等于转服，本版本不支持。群管理员是 host 上的成员角色，可以在其他 Zone，不影响判定 | §7 |
+| 3 | host 是否必须保留副本 | 保留：取回后按 AppData 保留。群要有自己的消息处理逻辑，host 必须持有内容。Self-Host §5.7 现在写“不是协议要求”，要同步改 | §7 |
+| 4 | 是否支持超过 64 MiB 的跨 Zone 附件 | 不支持，不在本 issue 做。BuckyOS 体系希望大附件带 URL，走文件分享 | §3.3 |
+| 5 | 非图片附件是否延后到点击再拉 | 延后。图片照旧在渲染时拉取；其他附件的卡片只取 FileObject 描述，不绑定 | §6 |
+| 6 | 私聊的对方被屏蔽后是否还发票据 | 不发 | §6 |
+| 7 | 跨 Zone 成员发带附件的消息是否放行（实施时新增，按第 8 项的原则放行） | 放行：`auth_method` 是跨 Zone 断言，且是群成员。这种会话是成员自己的 Zone 代发，那边已经检查过它能发什么。联合登录的 External 和 Session Guest 仍然拒绝。host 不因此绑定，还是取回校验后才绑定 | §7 |
+| 8 | 群消息和联系人策略的关系（用户 11-07 明确） | 群消息的来源是群：成员拉黑了 A，仍然收到 A 在群里发的消息和附件，除非专门在群里设置屏蔽。联系人的屏蔽和陌生人规则只管发给本人的消息。代码原本如此，补了单测和 DV。群管理通知（审批、拒绝、移出、转让群主）的来源也是群，已改：`from` 是群，操作者在 `by`，进群的默认 Session；只有屏蔽群本身才丢弃。邀请仍来自邀请人。成员个人的群内屏蔽见 [#724](https://github.com/buckyos/buckyos/issues/724) | §6、§7 |
+
+## 10. 验收
+
+| 类别 | 场景 | 判断标准 | 状态 |
+| --- | --- | --- | --- |
+| 私聊从零副本 | 图片、ChunkList 文件、多附件，经中继 | 原 ObjId 不变，逐字节一致，非收件人拿不到令牌 | 通过（DV，含 Desktop） |
+| 本地重发越权 | §5.1 的私聊和群分支；合法转发对照 | 非法引用不产生绑定；合法转发照常 | 通过（单测；私聊有 DV，群分支只有单测） |
+| 伪造大小 | 小 `size` 加大 ChunkList；不带长度的 chunk | 不下载超限内容，不绑定 | 通过（单测；前者有 DV，发送方网关日志只有 `cyfile` 和 `clist` 请求，没有 chunk） |
+| 并发 | 同一 key 多读者；同一对象在多条消息 | 只下载一次（同 key），各自鉴权 | 通过（单测）。describe 和 content 同时请求没有专门用例，describe 不下载 chunk |
+| 恢复 | 短时断网、发送方离线后恢复 | 不用重发消息，下一次读取成功 | 通过（单测、Desktop 真实 Zone）。**服务重启、拉取中 GC 命中未测** |
+| 陌生人消息 | 陌生人发附件；接受后；屏蔽后 | 接受前不外连，取描述也不外连；接受后可读；屏蔽后不外连 | 通过（单测断言发送方网关零请求；DV 只验响应，没有核对网关日志） |
+| 非图片附件 | 文件卡片渲染；点击预览或下载；本地已有同 ObjId 的私有对象 | 渲染时只有对象请求，没有 chunk 请求；点击后才拉；描述只来自源端 | 通过（单测；Desktop 真实 Zone 验证了卡片不下载、点击才拉） |
+| 私聊发送方屏蔽 | 发送方屏蔽收件人后读没取回的附件；已取回的附件 | 拿不到令牌，响应和消息不存在时相同；已取回的照常可读 | 通过（单测、DV） |
+| 群的来源是群 | 成员拉黑作者（host 上的成员、其他 Zone 的成员）；作者拉黑成员 | 消息进 `INBOX`，描述和内容都能读 | 通过（单测 `a_member_who_blocked_the_author_still_gets_it_from_the_group`；DV 验证其他 Zone 的成员拉黑作者） |
+| 群管理通知 | 成员拉黑操作者、操作者是陌生人；成员屏蔽群本身；不相关的群；不是群本身发的 | 进群的默认 Session，`from` 是群，`by` 是操作者；屏蔽群才丢弃；后两种按联系人策略 | 通过（单测；DV 验证跨 Zone 成员被移出）。审批、拒绝、转让只有单测，**Telegram 成员未测** |
+| 前端 | 获取中、等待接受、自动重试、源端拒绝 | 状态能看懂，不把获取中显示成不可用 | 通过（mock e2e、Desktop 真实 Zone）。**换账号未在真实 Zone 跑** |
+| 群三 Zone | ZA 作者、G host、ZB 成员；非成员、被移出的成员 | 两段都授权，joined 不依赖本地恰好有内容，host 的裁决贯穿 | 通过（DV）。**Guest 越 Session 只靠 `require_session` 既有用例，没有跨 Zone 用例** |
+| host 身份 | host 的设备代表群、其他 Zone 的设备冒充、群主是 Agent、其他 Zone 的管理员、向其他 Zone 的成员转让群主 | 只有真正的 host 能取到票据，跨 Zone 转让被拒绝 | 通过（共用 custody 表、DV）。群主是 Agent 只在 custody 表里，没有真实 Zone |
+| host 保留 | 消息被接受后作者立刻离线，之后才有人读；未拉完的由下一次读取补上 | 成员照常可读 | 通过（单测、DV）。**host 重启未测** |
+| 撤回竞争 | 下载中、绑定前后撤回 | 不复活已撤回的附件 | 通过（单测 `a_recall_during_the_pull_is_not_undone`；DV 只验撤回后读不到） |
+| 展示文件 | `_display` 读取、配置替换和移除 | 展示配置和 Session 权限都通过，旧令牌失效 | 通过（单测、DV） |
+| 关联操作 | 未读转发、收藏、Agent 收发 | 先合法取得再操作，不传旧令牌 | 通过（单测；转发和收藏有 DV）。**Telegram 外发未测** |
+| 目录 | 嵌套目录、同一子对象多处引用、缺子节点、超规模 | 图完整才绑定，路径规范化 | 未做（P3），现在返回 415 |
+
+验证入口：
+
+```sh
+# 在 buckyos/src
+cargo test -p msg_center -- --test-threads=1
+cargo test -p nfs_server -- --test-threads=1
+# 在 cyfs-ndn/src
+cargo test -p ndn-toolkit
+cargo test -p bucket_store
+# 在 buckyos/src/frame/desktop
+pnpm exec playwright test tests/e2e/pages/messagehub-media.spec.ts
+# 在 buckyos/test/nfs_server_test，用 PVE 上的 ssotest 三 Zone，说明见脚本头部
+BUCKYOS_TEST_DNS=<sn ip> BUCKYOS_TEST_DEVICE_DIR=<dir> node remote_attachment_dv.mjs
+BUCKYOS_TEST_DNS=<sn ip> BUCKYOS_TEST_DEVICE_DIR=<dir> node group_attachment_dv.mjs
+BUCKYOS_TEST_DNS=<sn ip> BUCKYOS_TEST_DEVICE_DIR=<dir> node attachment_ui_dv.mjs
+```
+
+`messagehub-media.spec.ts` 里 `media settings` 用例和这些改动无关地失败：它找 `checkbox`，现在的 MUI Switch 是 `switch`。
+
+mock 和单 Zone 测试通过不能代替不同信任域的验收。
+
+---
+
+以下 §15 是 10-29 的原文，基线 `buckyos@688df1577`，本轮没有重新核对。它对 #689 的影响已经很小：源 Zone 按 External 会话的 DID 判收件关系，不依赖 Agent App 的 RBAC；本 Zone 的读取走 §2 的 Agent 读取路径。后续在 agent-appid TODO 跟踪。
+
+## 15. 2026-10-29：Agent 作为特殊 appid 的授权模型与资源命名
+
+### 15.1 用户确认的框架方向
+
+Agent 的资源执行身份保持为特殊 App。Owner 是权限上限，调度器根据受 Owner 控制的 Agent 配置构造 App 侧 RBAC，最多放开到 Owner 当前拥有的权限。扩大的是 Agent App 的授权范围，不给 Owner 增加权限，也不把 Agent 提升为系统服务。
+
+普通资源调用的目标判定为：
+
+```text
+允许 = Owner 对该资源和操作有权
+    AND Agent App 对该资源和操作有权
+    AND 该服务的资源关系／业务规则通过
+```
+
+AgentDID 仍可以标识消息作者、收件人、群成员和对象归属。它与执行授权主体的职责应明确：本地执行主体可以统一为 `(owner_user_id, app:<runtime_app_id>)`，业务 actor 可以是该 App 绑定的 AgentDID，绑定必须来自可信 AgentSpec，不能由请求者随意声明。不能为了统一 appid，把 Agent 发言改成 Owner 发言。
+
+“最大等于 Owner”按当前正常会话权限理解；Owner 能通过另一次 sudo 获得的权限，不自动变成 Agent 常驻权限。只读 Agent 仍可写自身运行状态、Session、记忆、自己的 mailbox／产物等已明确允许的资源；这些例外应在配置和策略里可见，并保持 Owner 上限。
+
+### 15.2 当前普通 RBAC 已具备核心交集
+
+在 `688df1577`：
+
+- `AgentSpec.permission_mode` 支持 `read_write`／`read_only`，默认读写。
+- scheduler 的 `update_rbac` 为绑定 App 生成 `g, app:<appid>, agent_read_write` 或 `agent_read_only`。读写 App 还有 agent_runtime／agent 角色；只读 App 不进入普通 app／agent_runtime 组，并在生成策略尾部追加兜底 deny，前序规则保留自身运行必需的操作。
+- 默认 `agent_read_write` 规则为 `obj://* all`；`agent_read_only` 为 `obj://*` 的 read／list／query／subscribe，另有敏感配置 deny 和自身产物写入等例外。当前模式粒度主要是读写／只读，尚不是任意资源的细粒度权限配置。
+- `runtime::enforce_verified` 从已验 token 取 `sub` 和 target 的 `authorization_key`，把原 resource/action 传给 `rbac::enforce`。
+- `buckyos-base` 的 `rbac::enforce` 先检查 appid，再检查 userid，合取放行；常规 Agent App session 的 sub 为 Owner、App target 绑定其 AppInstance。它没有在底层统一转换资源 URL。
+
+因此，对已经使用这条链路的 `obj://...` 调用，读写 Agent 的 App 侧已经很宽。失败应先定位 Owner 侧、实际资源名、token 主体及服务规则，而不是继续增加一条相同的 app 通配 allow。
+
+依据：[scheduler 动态策略](../src/kernel/scheduler/src/system_config_agent.rs)、[默认策略与模型](../src/kernel/buckyos-api/src/rbac_config.rs)、[runtime 鉴权](../src/kernel/buckyos-api/src/runtime.rs)、[底层双主体检查](../../buckyos-base/src/rbac/src/lib.rs)、[AgentSpec](../src/kernel/buckyos-api/src/app_schema.rs)。已有 `agent_permissions_preserve_owner_limits_and_read_only_runtime_state` 等测试表达了这一约束；本轮只阅读，未重新运行。
+
+### 15.3 整个 Home 的授权确实存在，但走的是挂载链
+
+创建 Agent 时，Control Panel 给构造 App 写入 `PermissionItem {scope_path: "user/home", actions: [read, write] 或 [read]}`。node-daemon 读取该授权，把 `$BUCKYOS_ROOT/data/home/<owner>` 整个映射到容器 `/opt/buckyos/data/home/<owner>`，读写模式分别为 rw／ro；自己的 AgentRoot 单独保持 rw，供 Session、记忆与技能运行。
+
+这里的 `user/home` 是权限声明 scope，不是传给 Casbin 的资源 URI。容器内程序直接 open/read/write 该挂载，受 Docker mount／OS 权限约束，不经过 `runtime::enforce`。宿主调试或 host runtime 还需按各自 OS／executor 边界审视，不能把 Docker 挂载限制当成所有执行路径都已统一。
+
+依据：[构造 App 权限](../src/frame/control_panel/src/agent_mgr.rs)、[权限 scope](../src/kernel/buckyos-api/src/permission.rs)、[挂载执行](../src/kernel/node_daemon/src/app_loader.rs)。关键位置分别为 `agent_mgr.rs:781`、`app_loader.rs:2638,2761`。
+
+### 15.4 `obj://` 与实际传入值的核对结果
+
+| 路径／接口 | 权限定义或定位方式 | 实际检查 | 结论 |
+|---|---|---|---|
+| system-config | 裸 key、`/config/...`、`obj://config/...` | 服务归一化为 `obj://config/<key>` 后鉴权 | 这里有显式转换，不能把客户端原参数直接等同 RBAC resource |
+| bucket | `obj://bucket/<scope>/<appid>/<owner>/<bucket>/<key>` | `BucketId::resource(key)` 生成同样的 `obj://bucket/...` | 资源名主线一致，但授权还包含 grant／token／服务分支 |
+| NDM | `/ndm/v1/...` HTTP 接口 | `obj://ndm/uploads`、`objects`、`retain`、`manage`，另校验 holding | HTTP URL 和 RBAC resource 不同，但当前常量与策略对应 |
+| msg-center 附件 | `/kapi/msg-center/objects/<id>` + context | `obj://msg-center/objects`，再检查消息和精确附件绑定 | 全局 API read 不等于任意附件 read |
+| NFS／NFSP 文件面 | `cyfs:///home/<user>/...` | 自己的 path ACL；App／Agent 映射为 Delegated，file plane 直接拒绝 | 即使 App 有 `obj://* all` 也不会放行此入口，需调整服务接入模型 |
+| Agent 容器 Home | `user/home` scope + 挂载路径 | mount rw／ro 与 OS 文件权限 | 没有一条 `obj://home/...` 检查覆盖这些本地文件操作 |
+
+当前还不能把问题概括为所有 `obj://` 都写错：bucket／NDM／msg-center 的上述资源名确实相互对应。更明确的偏差是**权限声明、资源 URI、文件 locator、挂载和服务内特殊分支没有统一的转换及执行契约**。
+
+通用 Casbin matcher 不会自动把 `cyfs:///...`、`obj://dfs/...`、`user/home`、HTTP 路径视为同一资源，`obj://*` 也不匹配 `cyfs://...`。路径别名、URL 编码、DID／AppId 中的标点、尾斜杠都应在服务入口通过规范化和共享 builder 处理，再使用同一结果执行鉴权与资源访问。
+
+文档也有滞后：[key url.md](../doc/key%20url.md) 的示例是 `cyfs:///users/{users}/*`，当前 NFSP 的 Home 是 `cyfs:///home/<user>/...`，且目前走自有 ACL；其中 `obj://dfs` 被定义为服务对象，不是文件路径。不能照抄该示例推导当前 Agent 的 Home 已通过 RBAC 放行。
+
+### 15.5 仍需统一的 Agent 特殊分支
+
+1. **NFSP 文件面**：`auth.rs::require_file_actor` 直接拒绝 App／Agent 的 Delegated actor，path ACL 对 Delegated 返回 None。它尚不能表达“Owner 可访问，Agent App 授权范围也覆盖，所以放行”。这与用户要求的统一 App 模型有实际偏差，不能靠 scheduler 再加一条 allow 修复。
+2. **独立 Agent token**：系统仍支持 `principal_kind=Agent、sub=AgentDID`，部分服务把它映射回 Owner，部分沿用 AgentDID。若要保证所有独立资源访问均不超过 Owner，应在通用认证／授权适配后形成可信 `(Owner, AppId)`，避免各服务自行猜测主体；消息／群身份仍保留 AgentDID。
+3. **bucket AgentPolicy**：App token 走 Owner＋App 的 RbacPolicy；Agent token 则有专门的 AgentPolicy，按 Owner 名下 user buckets 直接允许 list/read，并按 permission mode 允许 create/write，拒绝 delete/manage。它没有在该分支对每个资源调用同样的 Owner＋App RBAC，权限效果可能与 App session 不同。按统一方向需收敛这一差异，并覆盖 Limited／动态授权变化；不能仅声称“有 Owner 字段，所以已满足 Owner 上限”。
+4. **AppInstance 粒度**：当前动态角色主要绑定 `app:<appid>`；只读集合也按 AppId 汇总。一个 AppId 被多个实例／AgentSpec 复用时，应确认共享授权语义。当前共享 runtime 采用最严格只读的保护逻辑，后续细粒度 scope 不能把一个 Owner 的配置意外推广到其他实例。
+
+bucket 还有一层关键语义：`authorize_any` 依次尝试 Identity、grant、`bkt_` token，Identity 返回 false 只表示没有经该来源放行，不是强制 deny。Agent Caller 使用 Owner 作为 user，还会匹配授予 Owner 的 user grant；因此 read_only 的 Identity 拒绝仍可能被有效 write grant／token 放行。当前 Agent Caller 也没有设置 app，无法匹配 App grant 或带 bind_app_id 的 token。这些差异都应在统一 App 模型下消除。
+
+如果“Owner／Agent 配置上限”是必须遵守的约束，应在所有授权来源之外执行共同 ceiling，再选择 RBAC／grant／token 作为具体资源的授权依据；不能把 ceiling 仅实现为可被后续 grant 替代的 Identity false。Owner 的有效资源权利本身可以来自合法 grant，故 Owner 上限也不应被误写为仅检查默认 Owner RBAC 角色。依据：[bucket 授权组合](../../cyfs-ndn/src/bucket_store/src/access.rs)。
+
+依据：[NFS 认证与 file gate](../src/frame/nfs_server/src/auth.rs)、[NFS path ACL](../src/frame/nfs_server/src/acl.rs)、[bucket session／RbacPolicy／AgentPolicy](../src/frame/nfs_server/src/bucket/mod.rs)、[verify-hub 登录映射](../src/kernel/verify_hub/src/main.rs)。这些是静态代码结论，尚未在运行中比较两类 token 的效果。
+
+### 15.6 对 #689 的落地含义
+
+Agent 读取自己收到的附件，先在本 Zone 按可信 Owner＋App 授权；消息关系仍以实际 Agent 收件人／群成员身份检查。源 Zone 的授权也需要能验证这种身份与代理关系，不能直接使用接收 Zone 的 RBAC item 或转发本地 session token。
+
+扩大 Agent appid 权限可以解决“本 Zone 不允许该 App 发起读取”的问题；它本身不会赋予源 Zone 的附件权限，也不补齐 §6–8 的来源获取、完整性和保留链路。独立 Agent 与普通 MessageHub 应调用同一附件 ensure／读取流程，使用不同的可信 actor 上下文。
+
+### 15.7 按该方向新增 TODO
+
+- [ ] 将 `(Owner, appid)` 作为 Agent 独立资源执行的统一授权输入，校验 AgentSpec／AppInstance 绑定与当前状态；AgentDID 保留为业务 actor／地址。
+- [ ] 明确动态 App 权限是 Owner 权限的上限内授权，所有服务 adapter 都保留 Owner 侧检查；覆盖 Owner 降权、Limited、停用、Agent 配置收紧和旧 token。
+- [ ] 明确只读 Agent 的自身运行写入例外，保持 Session／记忆／产物可运行；不以全局服务提权实现这些例外。
+- [ ] 建立 PermissionItem scope → canonical resource／action → 执行边界的映射表；由 scheduler 和各服务使用共享类型／builder，不把 `user/home` 直接当资源 URI。
+- [ ] 对齐 NFSP 的 App／Agent 入口：以 Owner 文件 ACL 决定资源上限，以 App RBAC／grant 决定授权范围；替换仅凭 principal kind 一律拒绝的路径，保留 path／子树检查。
+- [ ] 收敛 bucket 的 App 与 Agent token 授权差异；对 grant／capability 路径同样明确 Owner 上限如何生效，不能默认 capability 旁路即可代表 Owner。
+- [ ] 审计 service API 的实际 `resource/action` 与 policy：config、bucket、NDM、msg-center、TaskMgr、NFSP；日志区分 App 拒绝、Owner 拒绝、业务 ACL 拒绝、token 类型 gate。
+- [ ] 对规范化后的资源做正反例验证：scheme、Home 名称、编码、DID 中的点、精确 key／前缀、跨 Owner 路径；scheduler 输出与服务输入应使用同一规范。
+- [ ] 分别验收 API 访问、Docker Home 挂载、host runtime／executor；记录各自执行边界，权限配置收紧需同步撤销旧执行能力。
+- [ ] 将可信 Owner／App／Agent actor 上下文接入跨 Zone 附件授权，验证 Owner 允许而 App 拒绝、App 允许而 Owner 拒绝、两侧允许但非消息收件人仍拒绝等场景。
+
+本轮只更新分析和 TODO，未改变授权行为或执行测试。核对依据是当前源码及已有测试断言，不表示部署中的 RBAC 已按该版本刷新。
+
+### 15.8 后续具体实施方案
+
+已继续整理为 [Agent App 统一授权契约与实施 TODO](agent-appid-authorization-implementation-todo.md)，包含按侧求值、grant/token 与强制权限上限的组合、匿名 bearer 的保证边界、NFSP 文件资源 URI 提案、各模块实施顺序和回归矩阵。该方案仍是待实施文档，不表示已改变授权行为。

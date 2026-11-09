@@ -525,54 +525,6 @@ async fn machine_discovery_failure_uses_static_fallback_as_degraded() {
     assert_eq!(snapshot.models[0].provider_model_id, "configured-model");
 }
 
-fn routed_catalog() -> Arc<CatalogSnapshot> {
-    let driver = |model_driver_id: &str| -> ModelDriverCatalog {
-        serde_json::from_value(serde_json::json!({
-            "format": "buckyos.aicc.model-driver-catalog",
-            "schema_version": 2,
-            "schema_revision": 0,
-            "model_driver_id": model_driver_id,
-            "revision_seq": 7,
-            "models": [{
-                "id": "shared-model",
-                "api_types": ["llm"],
-                "capabilities": {"tool_call": true},
-                "llm": {"spec":format!("{model_driver_id}-spec"),"family_id":format!("{model_driver_id}-shared-model"),"effort":"native","default_effort":"native","supported_efforts":["native"],"stability":"stable","weight":1.0}
-            }],
-            "patterns": [],
-            "defaults": {},
-            "specs": [{"id":format!("{model_driver_id}-spec"),"direct_only":true}]
-        }))
-        .unwrap()
-    };
-    let provider_rules: ProviderRulesCatalog = serde_json::from_value(serde_json::json!({
-        "format": "buckyos.aicc.provider-rules-catalog",
-        "schema_version": 1,
-        "schema_revision": 0,
-        "revision_seq": 7,
-        "provider_profile_id": "openrouter",
-        "models": [],
-        "patterns": [{
-            "match": "*",
-            "operations": {"llm": "responses.create"}
-        }],
-        "variants": []
-    }))
-    .unwrap();
-    Arc::new(
-        CatalogSnapshot::build(
-            7,
-            CatalogDocuments {
-                model_drivers: vec![driver("openai"), driver("claude")],
-                provider_rules: vec![provider_rules],
-                known_providers: vec![],
-            },
-            &CatalogBuildOptions::default(),
-        )
-        .unwrap(),
-    )
-}
-
 fn codecs() -> Arc<CodecRegistry> {
     let descriptor = OperationDescriptor {
         operation_id: "responses.create".into(),
@@ -649,6 +601,7 @@ fn connection_contract() -> ProviderConnectionContract {
 
 fn draft(auth: ProviderAuthConfig) -> ProviderDraftConfig {
     ProviderDraftConfig {
+        instance_rules: None,
         provider_instance_name: "draft-provider".into(),
         provider_profile_id: "openai".into(),
         protocol_adapter_id: "openai-responses".into(),
@@ -783,33 +736,35 @@ fn inventory_intersects_capabilities_and_uses_dynamic_pricing() {
 async fn draft_validation_negotiates_without_runtime_or_storage_side_effects() {
     let store = Arc::new(MemoryStore::default());
     let discovery = Arc::new(WorkspaceRecordingDiscovery {
-        snapshot: discovery("gpt-test"),
+        snapshot: discovery("endpoint-alias"),
         workspaces: Mutex::new(Vec::new()),
     });
     let (manager, _) = manager(store.clone(), discovery.clone());
-    let draft = draft(ProviderAuthConfig::ApiKey {
+    let mut draft = draft(ProviderAuthConfig::ApiKey {
         credential_ref: "system-config://secrets/aicc/openai".into(),
         credential_kind: None,
     });
 
+    let mut rules = buckyos_api::ProviderInstanceRules::default();
+    rules
+        .model_driver_overrides
+        .insert("endpoint-alias".into(), "openai/gpt-test".into());
+    rules
+        .server_default_routes
+        .insert("endpoint-alias".into(), BTreeSet::from(["llm.chat".into()]));
+    draft.instance_rules = Some(rules);
     let negotiated = manager
         .validate_draft(&draft, &connection_contract(), discovery.as_ref(), None)
         .await
         .unwrap();
 
-    assert_eq!(negotiated.provider_profile_id, "openai");
     assert_eq!(negotiated.protocol_adapter_id, "openai-responses");
-    assert_eq!(negotiated.auth_mode, ProviderAuthMode::ApiKey);
-    assert_eq!(
-        negotiated.connection.workspace.as_deref(),
-        Some("workspace-1")
-    );
-    assert_eq!(
-        negotiated.connection.base_url,
-        "https://workspace-1.example.test/v1/"
-    );
-    assert_eq!(negotiated.catalog_revision_seq, 7);
     assert_eq!(negotiated.inventory.models.len(), 1);
+    assert_eq!(negotiated.inventory.models[0].origin_model_id, "gpt-test");
+    assert_eq!(
+        negotiated.inventory.models[0].server_default_routes,
+        BTreeSet::from(["llm.chat".into()])
+    );
     assert_eq!(store.commits.load(Ordering::SeqCst), 0);
     assert!(store.records.lock().await.is_empty());
     assert!(manager.runtimes.lock().await.is_empty());
@@ -844,7 +799,7 @@ async fn runtime_uses_explicit_credential_variant() {
 }
 
 #[tokio::test]
-async fn workspace_survives_inventory_build_and_instance_replace() {
+async fn workspace_survives_inventory_build() {
     let store = Arc::new(MemoryStore::default());
     let initial_discovery = Arc::new(WorkspaceRecordingDiscovery {
         snapshot: discovery("gpt-test"),
@@ -869,35 +824,14 @@ async fn workspace_survives_inventory_build_and_instance_replace() {
         Some("workspace-initial")
     );
 
-    let replacement_discovery = Arc::new(WorkspaceRecordingDiscovery {
-        snapshot: discovery("gpt-test"),
-        workspaces: Mutex::new(Vec::new()),
-    });
-    let mut replacement = instance("primary");
-    replacement.workspace = Some("workspace-reloaded".into());
-    manager
-        .replace(replacement, replacement_discovery.clone())
-        .await
-        .unwrap();
     manager.build_inventory_candidate("primary").await.unwrap();
 
     assert_eq!(
-        replacement_discovery.workspaces.lock().await.as_slice(),
+        initial_discovery.workspaces.lock().await.as_slice(),
         &[
-            Some("workspace-reloaded".into()),
-            Some("workspace-reloaded".into())
+            Some("workspace-initial".into()),
+            Some("workspace-initial".into())
         ]
-    );
-    assert_eq!(
-        manager
-            .registry()
-            .await
-            .get("primary")
-            .unwrap()
-            .config
-            .workspace
-            .as_deref(),
-        Some("workspace-reloaded")
     );
     manager.shutdown().await;
 }
@@ -917,9 +851,12 @@ async fn quota_view_ignores_untrusted_discovery_and_reports_provider_quota_unsup
         .await
         .unwrap();
     let unsupported = unsupported_manager
-        .quota_observation("primary")
+        .registry()
         .await
-        .unwrap();
+        .get("primary")
+        .unwrap()
+        .quota_observation()
+        .await;
     assert_eq!(
         unsupported.state,
         ProviderQuotaObservationState::Unsupported
@@ -952,7 +889,6 @@ async fn draft_validation_resolves_dynamic_login_without_exposing_token() {
         .await
         .unwrap();
 
-    assert_eq!(negotiated.auth_mode, ProviderAuthMode::DynamicLogin);
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
     assert_eq!(resolver.contexts.lock().await[0].user_name, "alice");
     assert!(!format!("{negotiated:?}").contains("draft-secret"));
@@ -1001,7 +937,9 @@ async fn draft_validation_classifies_connection_auth_discovery_and_adapter_failu
         .unwrap_err();
     assert_eq!(error.stage, ProviderDraftValidationStage::Authentication);
     assert_eq!(error.kind, ProviderRefreshFailure::Credential);
-    assert!(error.message.contains("credential reference was not resolved"));
+    assert!(error
+        .message
+        .contains("credential reference was not resolved"));
 
     let mut invalid_adapter = draft(ProviderAuthConfig::ApiKey {
         credential_ref: "system-config://secrets/aicc/openai".into(),
@@ -1380,7 +1318,7 @@ async fn failed_refresh_preserves_lkgs_and_reports_degraded_health() {
 }
 
 #[tokio::test]
-async fn registry_publication_is_copy_on_write_and_stop_is_idempotent() {
+async fn registry_publication_is_copy_on_write() {
     let store = Arc::new(MemoryStore::default());
     let discovery = Arc::new(ScriptedDiscovery::new([], discovery("gpt-test")));
     let (manager, discovery) = manager(store, discovery);
@@ -1391,9 +1329,9 @@ async fn registry_publication_is_copy_on_write_and_stop_is_idempotent() {
     assert!(after.get("primary").is_some());
     assert_eq!(after.list().len(), 1);
 
-    manager.stop_and_remove("primary").await.unwrap();
-    manager.stop_and_remove("primary").await.unwrap();
+    manager.shutdown().await;
     assert!(manager.registry().await.get("primary").is_none());
+    assert!(after.get("primary").is_some());
 }
 
 #[tokio::test]
@@ -1422,6 +1360,8 @@ async fn disabled_auto_sync_keeps_initial_discovery_without_periodic_task() {
 fn instance_rules_exclude_models_before_inventory_publication() {
     let mut config = instance("filtered");
     config.instance_rules = Some(buckyos_api::ProviderInstanceRules {
+        catalog: None,
+        server_default_routes: BTreeMap::new(),
         policy_region: None,
         exclude_models: BTreeSet::from(["gpt-test".to_string()]),
         model_driver_overrides: BTreeMap::new(),
@@ -1442,6 +1382,8 @@ fn instance_rules_exclude_models_before_inventory_publication() {
 fn instance_driver_override_maps_endpoint_ids_without_global_provider_rules() {
     let mut config = instance("doubao-endpoint");
     config.instance_rules = Some(buckyos_api::ProviderInstanceRules {
+        catalog: None,
+        server_default_routes: BTreeMap::new(),
         policy_region: None,
         exclude_models: BTreeSet::new(),
         model_driver_overrides: BTreeMap::from([(
@@ -1585,7 +1527,7 @@ async fn invalid_instance_is_rejected_before_discovery() {
 }
 
 #[tokio::test]
-async fn stop_is_idempotent_and_rejects_late_refresh_commit() {
+async fn shutdown_is_idempotent_and_rejects_late_refresh_commit() {
     let store = Arc::new(MemoryStore::default());
     let discovery = Arc::new(BlockingDiscovery {
         snapshot: discovery("gpt-test"),
@@ -1603,7 +1545,7 @@ async fn stop_is_idempotent_and_rejects_late_refresh_commit() {
     let refresh_manager = manager.clone();
     let refresh = tokio::spawn(async move { refresh_manager.refresh("primary").await });
     discovery.started.notified().await;
-    manager.stop_and_remove("primary").await.unwrap();
+    manager.shutdown().await;
     discovery.release.notify_waiters();
     assert!(matches!(
         refresh.await.unwrap(),
@@ -1727,11 +1669,23 @@ fn custom_channel_defaults_each_api_type_to_its_preferred_operation() {
         ),
     ] {
         assert_eq!(
-            resolve_operation(&adapter, &BTreeMap::new(), None, api_type, name).unwrap(),
+            resolve_operation(&adapter, &BTreeMap::new(), None, api_type, name, None).unwrap(),
             Some(expected.to_string()),
             "{name}"
         );
     }
+    assert_eq!(
+        resolve_operation(
+            &adapter,
+            &BTreeMap::new(),
+            None,
+            ApiType::Llm,
+            "llm",
+            Some("interactions.create"),
+        )
+        .unwrap(),
+        Some("interactions.background".to_string())
+    );
     // Discovery narrows the candidates before the priority applies, so an
     // instance that only exposes the synchronous interactions endpoint still
     // resolves `llm` onto it.
@@ -1742,7 +1696,8 @@ fn custom_channel_defaults_each_api_type_to_its_preferred_operation() {
             &BTreeMap::new(),
             Some(&discovered),
             ApiType::Llm,
-            "llm"
+            "llm",
+            None
         )
         .unwrap(),
         Some("interactions.create".to_string())
@@ -1750,7 +1705,778 @@ fn custom_channel_defaults_each_api_type_to_its_preferred_operation() {
     // An explicit override always wins.
     let overrides = BTreeMap::from([("llm".to_string(), "models.embedContent".to_string())]);
     assert_eq!(
-        resolve_operation(&adapter, &overrides, None, ApiType::Llm, "llm").unwrap(),
+        resolve_operation(&adapter, &overrides, None, ApiType::Llm, "llm", None).unwrap(),
         Some("models.embedContent".to_string())
     );
+}
+
+#[test]
+fn custom_openai_inventory_uses_model_operations_and_discovery_limits() {
+    let (adapter, _) = crate::protocol::openai_responses_adapter();
+    assert!(matches!(
+        resolve_operation(
+            &adapter,
+            &BTreeMap::new(),
+            None,
+            ApiType::ImageImageToImage,
+            "image.img2img",
+            Some("audio.speech"),
+        ),
+        Err(ProviderError::Inventory(_))
+    ));
+    let catalog = crate::settings::MetadataSources {
+        builtin: crate::settings::load_builtin_metadata().unwrap(),
+        ..crate::settings::MetadataSources::default()
+    }
+    .build_snapshot(
+        crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+        &CatalogBuildOptions::default(),
+    )
+    .unwrap();
+    let registry = builtin_provider_registry(&catalog).unwrap();
+    let mut config = instance("custom-provider");
+    config.provider_profile_id = "custom".into();
+    config.instance_rules = Some(buckyos_api::ProviderInstanceRules {
+        model_driver_overrides: BTreeMap::from([(
+            "ep-custom".into(),
+            "openai/gpt-5.6-luna".into(),
+        )]),
+        ..Default::default()
+    });
+    assert!(config.provider_rules_id.is_none());
+    let binding = registry
+        .resolve_instance(&config, ProviderAuthMode::ApiKey, None)
+        .unwrap();
+
+    for (model_id, remote_methods, expected) in [
+        (
+            "gpt-5.6-luna",
+            None,
+            vec![
+                ("llm", "responses.create"),
+                ("vision.ocr", "responses.create"),
+                ("vision.caption", "responses.create"),
+                ("image.txt2img", "images.generate"),
+                ("image.img2img", "images.edit"),
+                ("agent.computer_use", "responses.create"),
+            ],
+        ),
+        (
+            "gpt-image-2",
+            None,
+            vec![
+                ("image.txt2img", "images.generate"),
+                ("image.img2img", "images.edit"),
+                ("image.inpaint", "images.edit"),
+            ],
+        ),
+        (
+            "ep-custom",
+            None,
+            vec![
+                ("llm", "responses.create"),
+                ("vision.ocr", "responses.create"),
+                ("vision.caption", "responses.create"),
+                ("image.txt2img", "images.generate"),
+                ("image.img2img", "images.edit"),
+                ("agent.computer_use", "responses.create"),
+            ],
+        ),
+        (
+            "gpt-5.6-luna",
+            Some(vec!["images.generate", "images.edit"]),
+            vec![
+                ("image.txt2img", "images.generate"),
+                ("image.img2img", "images.edit"),
+            ],
+        ),
+        (
+            "gpt-image-2",
+            Some(vec!["responses.create"]),
+            vec![
+                ("image.txt2img", "responses.create"),
+                ("image.img2img", "responses.create"),
+            ],
+        ),
+    ] {
+        let mut discovered = discovery(model_id);
+        discovered.models[0].api_types = None;
+        discovered.models[0].supported_features = None;
+        discovered.models[0].pricing = None;
+        discovered.models[0].remote_methods =
+            remote_methods.map(|methods| methods.into_iter().map(str::to_owned).collect());
+        let inventory = InventoryBuilder::build(
+            &binding.profile,
+            &config,
+            discovered,
+            &catalog,
+            &registry.codecs(),
+        )
+        .unwrap();
+        assert_eq!(inventory.models.len(), 1, "{model_id}");
+        let model = &inventory.models[0];
+        assert_eq!(model.provider_model_id, model_id);
+        assert_eq!(
+            model.operations,
+            expected
+                .into_iter()
+                .map(|(api_type, operation)| (api_type.to_owned(), operation.to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+            "{model_id} {:?}",
+            model.remote_methods
+        );
+        assert!(model.pricing.is_none(), "{model_id}");
+        assert!(model.provider_rules_revision.is_none(), "{model_id}");
+    }
+}
+
+#[test]
+fn custom_provider_explicit_efforts_populate_logical_directories() {
+    let catalog = crate::settings::MetadataSources {
+        builtin: crate::settings::load_builtin_metadata().unwrap(),
+        ..crate::settings::MetadataSources::default()
+    }
+    .build_snapshot(
+        crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+        &CatalogBuildOptions::default(),
+    )
+    .unwrap();
+    let providers = builtin_provider_registry(&catalog).unwrap();
+    let mut config = instance("custom-provider");
+    config.provider_profile_id = "custom".into();
+    config.provider_rules_id = Some("openai".into());
+    let binding = providers
+        .resolve_instance(&config, ProviderAuthMode::ApiKey, None)
+        .unwrap();
+    let mut discovered = discovery("gpt-6.1-sol");
+    discovered.models = ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]
+        .into_iter()
+        .map(|id| {
+            let mut model = discovery(id).models.remove(0);
+            model.api_types = Some(vec![ApiType::Llm]);
+            model.supported_features = None;
+            model.remote_methods = None;
+            model.pricing = None;
+            model
+        })
+        .collect();
+    let inventory = InventoryBuilder::build(
+        &binding.profile,
+        &config,
+        discovered,
+        &catalog,
+        &providers.codecs(),
+    )
+    .unwrap();
+    assert_eq!(inventory.models.len(), 3);
+    assert!(inventory.unavailable_presets.is_empty());
+    for model in &inventory.models {
+        assert!(
+            model
+                .variants
+                .iter()
+                .any(|variant| variant.name == "reasoning-medium"),
+            "{}",
+            model.provider_model_id
+        );
+        assert!(model.provider_rules_revision.is_some());
+    }
+    let registry = crate::model::llm_tests::gpt_registry(&[inventory.as_model_inventory()]);
+    for (path, exact) in [
+        (
+            "llm.gpt-standard",
+            "gpt-6.1-sol:reasoning-medium@custom-provider",
+        ),
+        (
+            "llm.gpt-6-1-sol",
+            "gpt-6.1-sol:reasoning-medium@custom-provider",
+        ),
+        (
+            "llm.gpt-6-1-sol:medium",
+            "gpt-6.1-sol:reasoning-medium@custom-provider",
+        ),
+        (
+            "llm.gpt-6-sol:medium",
+            "gpt-6-sol:reasoning-medium@custom-provider",
+        ),
+        ("llm.gpt-pro", "gpt-6.1-sol:reasoning-high@custom-provider"),
+        (
+            "llm.gpt-codex",
+            "gpt-6.1-sol:reasoning-xhigh@custom-provider",
+        ),
+        ("llm.gpt-nano", "gpt-6-luna:reasoning-none@custom-provider"),
+        ("llm.gpt-mini", "gpt-6-luna:reasoning-low@custom-provider"),
+    ] {
+        let candidates = registry.resolve_candidates(path, ApiType::Llm).unwrap();
+        assert_eq!(candidates.candidates.len(), 1, "{path}");
+        assert_eq!(
+            candidates.candidates[0].model.exact_model.as_str(),
+            exact,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn custom_provider_efforts_respect_adapter_rules_and_discovery() {
+    let mut builtin = crate::settings::load_builtin_metadata().unwrap();
+    let sn_rules = builtin
+        .iter_mut()
+        .find(|file| {
+            file.kind == crate::catalog::CatalogKind::ProviderRules && file.catalog_id == "sn"
+        })
+        .unwrap();
+    let mut rules: ProviderRulesCatalog = serde_json::from_slice(&sn_rules.contents).unwrap();
+    rules.variants.clear();
+    sn_rules.contents = serde_json::to_vec(&rules).unwrap();
+    let catalog = crate::settings::MetadataSources {
+        builtin,
+        ..crate::settings::MetadataSources::default()
+    }
+    .build_snapshot(
+        crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+        &CatalogBuildOptions::default(),
+    )
+    .unwrap();
+    let providers = builtin_provider_registry(&catalog).unwrap();
+    for (adapter, rules, model_id, disable_reasoning, expected) in [
+        (
+            "openai-responses",
+            None,
+            "gpt-6-luna",
+            true,
+            Vec::<&str>::new(),
+        ),
+        (
+            "openai-chat-completions",
+            None,
+            "gpt-6.1-sol",
+            false,
+            Vec::<&str>::new(),
+        ),
+        ("openai-responses", Some("sn"), "gpt-6-sol", false, Vec::<&str>::new()),
+    ] {
+        let mut config = instance("custom-provider");
+        config.provider_profile_id = "custom".into();
+        config.protocol_adapter_id = adapter.into();
+        config.provider_rules_id = rules.map(str::to_owned);
+        let binding = providers
+            .resolve_instance(&config, ProviderAuthMode::ApiKey, None)
+            .unwrap();
+        let mut discovered = discovery(model_id);
+        discovered.models[0].api_types = Some(vec![ApiType::Llm]);
+        discovered.models[0].supported_features = None;
+        discovered.models[0].remote_methods = None;
+        if disable_reasoning {
+            discovered.models[0]
+                .unsupported_features
+                .insert("reasoning".into());
+        }
+        let inventory = InventoryBuilder::build(
+            &binding.profile,
+            &config,
+            discovered,
+            &catalog,
+            &providers.codecs(),
+        )
+        .unwrap();
+        assert_eq!(inventory.models.len(), 1);
+        assert_eq!(
+            inventory.models[0]
+                .variants
+                .iter()
+                .map(|variant| variant.name.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{adapter} {rules:?}"
+        );
+        assert!(inventory.unavailable_presets.iter().any(|preset| {
+            preset.effort == "medium" && preset.reason == "missing_channel_mapping"
+        }));
+    }
+}
+
+#[test]
+fn server_default_model_ids_accept_upstream_paths_and_reject_patterns() {
+    for model in [
+        "qwen/qwen3.7-plus",
+        "local-model",
+        "*",
+        "model?",
+        "model@instance",
+        "model:reasoning-low",
+        "",
+    ] {
+        let mut config = instance("custom-defaults");
+        let mut rules = buckyos_api::ProviderInstanceRules::default();
+        rules
+            .server_default_routes
+            .insert(model.into(), BTreeSet::from(["llm.chat".into()]));
+        config.instance_rules = Some(rules);
+        assert_eq!(
+            config.validate().is_ok(),
+            ["qwen/qwen3.7-plus", "local-model"].contains(&model),
+            "{model}"
+        );
+    }
+}
+
+#[test]
+fn custom_provider_adapters_have_unique_defaults_for_every_api_type() {
+    let catalog = crate::model::llm_tests::builtin_catalog();
+    let registry = builtin_provider_registry(&catalog).unwrap();
+    let codecs = registry.codecs();
+    for adapter_id in registry.custom_provider_adapter_ids() {
+        let adapter = codecs.adapter(adapter_id).unwrap();
+        for binding in adapter
+            .operations
+            .values()
+            .flat_map(|operation| &operation.bindings)
+        {
+            let api_name = api_type_name(binding.api_type).unwrap();
+            assert!(resolve_operation(
+                adapter,
+                &BTreeMap::new(),
+                None,
+                binding.api_type,
+                &api_name,
+                None
+            )
+            .unwrap_or_else(|error| panic!("{adapter_id}/{api_name}: {error}"))
+            .is_some());
+        }
+    }
+}
+
+#[test]
+fn custom_openai_image_inventory_respects_discovery_and_explicit_mappings() {
+    let catalog = crate::model::llm_tests::builtin_catalog();
+    let registry = builtin_provider_registry(&catalog).unwrap();
+    let codecs = registry.codecs();
+    let mut profile = profile();
+    profile.provider_profile_id = "custom".into();
+    profile.accepts_any_adapter = true;
+    let mut config = instance("custom-provider");
+    config.provider_profile_id = "custom".into();
+    for remote_methods in [None, Some(BTreeSet::from(["responses.create".into()]))] {
+        let mut discovered = discovery("google/gemini-2.5-flash-image");
+        discovered.models[0].api_types = None;
+        discovered.models[0].supported_features = None;
+        discovered.models[0].remote_methods = remote_methods.clone();
+        let inventory =
+            InventoryBuilder::build(&profile, &config, discovered, &catalog, &codecs).unwrap();
+        let model = inventory
+            .models
+            .iter()
+            .find(|model| model.provider_model_id == "google/gemini-2.5-flash-image")
+            .unwrap();
+        for (api, default) in [
+            ("image.txt2img", "images.generate"),
+            ("image.img2img", "images.edit"),
+        ] {
+            assert_eq!(
+                model.operations[api],
+                if remote_methods.is_some() {
+                    "responses.create"
+                } else {
+                    default
+                }
+            );
+        }
+    }
+    let adapter = codecs.adapter("openai-responses").unwrap();
+    for (api, name) in [
+        (ApiType::ImageTextToImage, "image.txt2img"),
+        (ApiType::ImageImageToImage, "image.img2img"),
+    ] {
+        let overrides = BTreeMap::from([(name.into(), "responses.create".into())]);
+        assert_eq!(
+            resolve_operation(adapter, &overrides, None, api, name, None)
+                .unwrap()
+                .as_deref(),
+            Some("responses.create")
+        );
+        let unsupported = BTreeSet::from(["embeddings.create".into()]);
+        assert_eq!(
+            resolve_operation(
+                adapter,
+                &BTreeMap::new(),
+                Some(&unsupported),
+                api,
+                name,
+                None
+            )
+            .unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn custom_operation_priority_ties_are_rejected() {
+    let (mut adapter, _) = crate::protocol::openai_responses_adapter();
+    for operation in adapter.operations.values_mut() {
+        for binding in &mut operation.bindings {
+            binding.default_priority = 0;
+        }
+    }
+    assert!(resolve_operation(
+        &adapter,
+        &BTreeMap::new(),
+        None,
+        ApiType::ImageImageToImage,
+        "image.img2img",
+        None
+    )
+    .is_err());
+}
+
+#[test]
+fn missing_protocol_bindings_filter_cells_and_preserve_supported_capabilities() {
+    let catalog = crate::settings::MetadataSources {
+        builtin: crate::settings::load_builtin_metadata().unwrap(),
+        ..Default::default()
+    }
+    .build_snapshot(
+        crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+        &Default::default(),
+    )
+    .unwrap();
+    let registry = builtin_provider_registry(&catalog).unwrap();
+    let codecs = registry.codecs();
+    let mut profile = profile();
+    profile.provider_profile_id = "custom".into();
+    profile.accepts_any_adapter = true;
+    let mut config = instance("filtered-cells");
+    config.provider_profile_id = "custom".into();
+    config.provider_rules_id = Some("openrouter".into());
+    let mut discovered = discovery("google/gemini-2.5-flash-image");
+    discovered.models[0].api_types = None;
+    discovered.models[0].remote_methods = None;
+    let inventory =
+        InventoryBuilder::build(&profile, &config, discovered.clone(), &catalog, &codecs).unwrap();
+    let model = &inventory.models[0];
+    assert!(model.api_types.contains(&ApiType::ImageTextToImage));
+    assert!(!model.api_types.contains(&ApiType::ImageImageToImage));
+    assert!(!model.operations.contains_key("image.img2img"));
+    let filtered = inventory
+        .filtered_capabilities
+        .iter()
+        .find(|item| item.api_type == "image.img2img")
+        .unwrap();
+    assert_eq!(filtered.provider_model_id, "google/gemini-2.5-flash-image");
+    assert_eq!(filtered.protocol_adapter_id, "openai-responses");
+    assert_eq!(filtered.operation_id.as_deref(), Some("images.generate"));
+    assert_eq!(filtered.reason, "unregistered_binding");
+    let wire = serde_json::to_value(&inventory).unwrap();
+    let restored: ProviderInventorySnapshot = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        restored.filtered_capabilities,
+        inventory.filtered_capabilities
+    );
+
+    config.protocol_adapter_id = "openai-chat-completions".into();
+    let inventory =
+        InventoryBuilder::build(&profile, &config, discovered, &catalog, &codecs).unwrap();
+    assert!(inventory.models[0].api_types.is_empty());
+    assert!(inventory.models[0].operations.is_empty());
+    assert!(inventory.models[0].server_default_routes.is_empty());
+    assert!(!inventory.filtered_capabilities.is_empty());
+}
+
+#[test]
+fn unsupported_adapter_capabilities_are_reported_without_an_operation() {
+    let catalog = crate::settings::MetadataSources {
+        builtin: crate::settings::load_builtin_metadata().unwrap(),
+        ..Default::default()
+    }
+    .build_snapshot(
+        crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+        &Default::default(),
+    )
+    .unwrap();
+    let registry = builtin_provider_registry(&catalog).unwrap();
+    let mut profile = profile();
+    profile.provider_profile_id = "custom".into();
+    let mut config = instance("unsupported-cells");
+    config.provider_profile_id = "custom".into();
+    config.protocol_adapter_id = "openai-chat-completions".into();
+    let mut discovered = discovery("google/gemini-2.5-flash-image");
+    discovered.models[0].api_types = None;
+    discovered.models[0].remote_methods = None;
+    let inventory =
+        InventoryBuilder::build(&profile, &config, discovered, &catalog, &registry.codecs())
+            .unwrap();
+    assert!(inventory.models[0].api_types.is_empty());
+    let filtered = inventory
+        .filtered_capabilities
+        .iter()
+        .find(|item| item.api_type == "image.img2img")
+        .unwrap();
+    assert_eq!(filtered.operation_id, None);
+    assert_eq!(filtered.reason, "unsupported_api_type");
+}
+
+#[test]
+fn filtering_llm_binding_removes_server_default_routes() {
+    let catalog = catalog();
+    let registry = builtin_provider_registry(&catalog).unwrap();
+    let mut config = instance("filtered-llm");
+    config.protocol_adapter_id = "openai-chat-completions".into();
+    config.instance_rules = Some(buckyos_api::ProviderInstanceRules {
+        catalog: None,
+        server_default_routes: BTreeMap::from([(
+            "gpt-test".into(),
+            BTreeSet::from(["llm.chat".into()]),
+        )]),
+        ..Default::default()
+    });
+    let mut discovered = discovery("gpt-test");
+    discovered.models[0].remote_methods = None;
+    let inventory = InventoryBuilder::build(
+        &profile(),
+        &config,
+        discovered,
+        &catalog,
+        &registry.codecs(),
+    )
+    .unwrap();
+    assert!(inventory.models[0].api_types.is_empty());
+    assert!(inventory.models[0].server_default_routes.is_empty());
+    assert!(inventory
+        .filtered_capabilities
+        .iter()
+        .any(|item| { item.api_type == "llm" && item.reason == "unregistered_binding" }));
+}
+
+#[test]
+fn custom_multi_operation_defaults_respect_every_discovered_subset() {
+    let expected = BTreeMap::from([
+        (("gemini-interactions", "llm"), "interactions.background"),
+        (
+            ("gemini-interactions", "vision.ocr"),
+            "interactions.background",
+        ),
+        (
+            ("gemini-interactions", "vision.caption"),
+            "interactions.background",
+        ),
+        (
+            ("gemini-interactions", "vision.detect"),
+            "interactions.background",
+        ),
+        (
+            ("gemini-interactions", "vision.segment"),
+            "interactions.background",
+        ),
+        (
+            ("gemini-interactions", "audio.asr"),
+            "interactions.background",
+        ),
+        (
+            ("gemini-interactions", "video.generate"),
+            "models.predictLongRunning",
+        ),
+        (
+            ("gemini-interactions", "video.extend"),
+            "models.predictLongRunning",
+        ),
+        (("openai-responses", "image.txt2img"), "images.generate"),
+        (("openai-responses", "image.img2img"), "images.edit"),
+    ]);
+    let catalog = crate::model::llm_tests::builtin_catalog();
+    let registry = builtin_provider_registry(&catalog).unwrap();
+    let codecs = registry.codecs();
+    let mut reviewed = BTreeSet::new();
+    for adapter_id in [
+        "gemini-interactions",
+        "claude-messages",
+        "openai-chat-completions",
+        "openai-responses",
+        "typesafe-systemone",
+    ] {
+        let adapter = codecs.adapter(adapter_id).unwrap();
+        let mut by_api = BTreeMap::new();
+        for operation in adapter.operations.values() {
+            for binding in &operation.bindings {
+                by_api
+                    .entry(api_type_name(binding.api_type).unwrap())
+                    .or_insert_with(|| (binding.api_type, Vec::new()))
+                    .1
+                    .push(operation.operation_id.clone());
+            }
+        }
+        for (api_name, (api_type, operations)) in by_api {
+            let default = if operations.len() > 1 {
+                reviewed.insert((adapter_id, api_name.clone()));
+                expected[&(adapter_id, api_name.as_str())]
+            } else {
+                &operations[0]
+            };
+            assert_eq!(
+                resolve_operation(adapter, &BTreeMap::new(), None, api_type, &api_name, None)
+                    .unwrap()
+                    .as_deref(),
+                Some(default),
+                "{adapter_id}/{api_name}"
+            );
+            for mask in 0..(1usize << operations.len()) {
+                let methods = operations
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| mask & (1 << index) != 0)
+                    .map(|(_, operation)| operation.clone())
+                    .collect::<BTreeSet<_>>();
+                let selected = resolve_operation(
+                    adapter,
+                    &BTreeMap::new(),
+                    Some(&methods),
+                    api_type,
+                    &api_name,
+                    None,
+                )
+                .unwrap();
+                let expected_selection = if methods.contains(default) {
+                    Some(default)
+                } else {
+                    methods.first().map(String::as_str)
+                };
+                assert_eq!(
+                    selected.as_deref(),
+                    expected_selection,
+                    "{adapter_id}/{api_name}: {methods:?}"
+                );
+            }
+            for operation in &operations {
+                for key in [api_name.as_str(), api_type.typed_method()] {
+                    let overrides = BTreeMap::from([(key.to_string(), operation.clone())]);
+                    assert_eq!(
+                        resolve_operation(adapter, &overrides, None, api_type, &api_name, None)
+                            .unwrap()
+                            .as_ref(),
+                        Some(operation),
+                        "{adapter_id}/{key}"
+                    );
+                }
+                let methods = BTreeSet::from([operation.clone()]);
+                assert_eq!(
+                    resolve_operation(
+                        adapter,
+                        &BTreeMap::new(),
+                        Some(&methods),
+                        api_type,
+                        &api_name,
+                        None
+                    )
+                    .unwrap()
+                    .as_ref(),
+                    Some(operation)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        reviewed,
+        expected
+            .keys()
+            .map(|(adapter, api)| (*adapter, api.to_string()))
+            .collect()
+    );
+}
+
+#[test]
+fn custom_instance_catalog_updates_inventory_and_retains_disabled_discovery() {
+    let base = catalog();
+    let mut value = serde_json::to_value(base.provider_rules("openai").unwrap()).unwrap();
+    value["model_pricing"] =
+        serde_json::json!([{"id":"gpt-test","pricing":{"currency":"USD","input_token":0.25}}]);
+    value["server_default_routes"] = serde_json::json!({"gpt-test":["llm.chat"]});
+    let catalog = base.with_instance_catalog("rules-test", &value).unwrap();
+    let mut config = instance("rules-test");
+    config.provider_profile_id = "custom".into();
+    config.provider_rules_id = Some(CatalogSnapshot::instance_rules_id("rules-test"));
+    config.instance_rules = Some(buckyos_api::ProviderInstanceRules {
+        catalog: Some(value),
+        ..Default::default()
+    });
+    let mut discovered = discovery("gpt-test");
+    discovered.models[0].pricing.as_mut().unwrap().input_token = Some(9.0);
+    let inventory =
+        InventoryBuilder::build(&profile(), &config, discovered.clone(), &catalog, &codecs())
+            .unwrap();
+    assert_eq!(
+        inventory.models[0]
+            .pricing
+            .as_ref()
+            .unwrap()
+            .value
+            .input_token,
+        Some(0.25)
+    );
+    assert_eq!(inventory.models[0].operations["llm"], "responses.create");
+    assert_eq!(inventory.models[0].server_default_routes, BTreeSet::from(["llm.chat".into()]));
+    config
+        .instance_rules
+        .as_mut()
+        .unwrap()
+        .exclude_models
+        .insert("gpt-test".into());
+    let inventory =
+        InventoryBuilder::build(&profile(), &config, discovered, &catalog, &codecs()).unwrap();
+    assert!(inventory.models.is_empty());
+    assert_eq!(
+        inventory.discovered_model_ids,
+        BTreeSet::from(["gpt-test".into()])
+    );
+}
+
+#[tokio::test]
+async fn changed_instance_rules_do_not_restore_stale_cached_models() {
+    let store = Arc::new(MemoryStore::default());
+    let good = Arc::new(ScriptedDiscovery::new([], discovery("gpt-test")));
+    let (first, good) = manager(store.clone(), good);
+    first.start(instance("primary"), good).await.unwrap();
+    first.shutdown().await;
+    let failed = Arc::new(ScriptedDiscovery::new([Err("offline".into())], discovery("gpt-test")));
+    let (second, failed) = manager(store, failed);
+    let mut config = instance("primary");
+    config.instance_rules = Some(buckyos_api::ProviderInstanceRules {
+        exclude_models: BTreeSet::from(["gpt-test".into()]),
+        ..Default::default()
+    });
+    assert!(second.start(config, failed).await.is_err());
+    second.shutdown().await;
+}
+
+#[test]
+fn custom_provider_unconfigured_efforts_are_not_published() {
+    let catalog = crate::settings::MetadataSources {
+        builtin: crate::settings::load_builtin_metadata().unwrap(),
+        ..Default::default()
+    }.build_snapshot(crate::settings::BUILTIN_CATALOG_REVISION_SEQ, &Default::default()).unwrap();
+    let providers = builtin_provider_registry(&catalog).unwrap();
+    for (adapter, id) in [("openai-responses", "gpt-6.1-sol"), ("gemini-interactions", "gemini-4-argon")] {
+        let mut config = instance("custom-explicit");
+        config.provider_profile_id = "custom".into();
+        config.protocol_adapter_id = adapter.into();
+        let binding = providers.resolve_instance(&config, ProviderAuthMode::ApiKey, None).unwrap();
+        let mut discovered = discovery(id);
+        discovered.models[0].remote_methods = None;
+        discovered.models[0].supported_features = None;
+        let inventory = InventoryBuilder::build(&binding.profile, &config, discovered, &catalog, &providers.codecs()).unwrap();
+        assert_eq!(inventory.models.len(), 1);
+        assert!(inventory.models[0].variants.is_empty(), "{adapter}");
+        assert!(inventory.models[0].variant_rules.is_empty(), "{adapter}");
+        assert!(!inventory.unavailable_presets.is_empty(), "missing mappings must remain visible as unavailable");
+    }
+}
+
+#[test]
+fn provider_catalog_server_default_routes_reject_non_task_paths() {
+    let base = catalog();
+    for route in ["llm.chat", "llm", "image.generate", "llm.chat/other", "llm."] {
+        let mut value = serde_json::to_value(base.provider_rules("openai").unwrap()).unwrap();
+        value["server_default_routes"] = serde_json::json!({"gpt-test":[route]});
+        assert_eq!(base.with_instance_catalog("route-validation", &value).is_ok(), route == "llm.chat", "{route}");
+    }
 }

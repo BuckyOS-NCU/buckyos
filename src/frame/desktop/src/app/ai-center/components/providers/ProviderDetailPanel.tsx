@@ -1,3 +1,4 @@
+import { ProviderRulesPanel } from './ProviderRulesPanel'
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useMediaQuery } from '@mui/material'
 import { AlertTriangle, ArrowLeft, ChevronDown, ChevronRight, Filter, MoreHorizontal, Power, RefreshCw, Save, Search, ShieldCheck, Trash2 } from 'lucide-react'
@@ -10,7 +11,7 @@ import { isManagedSnProvider, isSettingsRevisionConflict, type AuthStatus, type 
 
 type TFn = (key: string, fallback?: string, variables?: Record<string, string | number>) => string
 type FilterKey = 'apiType' | 'logicalMount' | 'health' | 'costClass' | 'latencyClass' | 'tier'
-type ProviderDetailSection = 'overview' | 'routing' | 'inventory'
+type ProviderDetailSection = 'overview' | 'routing' | 'inventory' | 'rules'
 type MultiFilter = {
   query: string
   selected: string[]
@@ -86,6 +87,7 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted, onBack }:
   const store = useAICCStore()
   const isMobile = useMediaQuery('(max-width: 767px)')
   const [activeSection, setActiveSection] = useState<ProviderDetailSection>('overview')
+  const visibleSection = isMobile && activeSection === 'rules' ? 'overview' : activeSection
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
@@ -420,6 +422,9 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted, onBack }:
           ['overview', t('aiCenter.providers.overview', 'Overview')],
           ['routing', t('aiCenter.providers.routing', 'Routing')],
           ['inventory', t('aiCenter.providers.inventory', 'Inventory')],
+          ...(!isMobile && config.provider_profile_id === 'custom'
+            ? [['rules', t('aiCenter.rules.title', 'Provider rules')]] as Array<[ProviderDetailSection, string]>
+            : []),
         ] as Array<[ProviderDetailSection, string]>).map(([section, label]) => (
           <button
             key={section}
@@ -427,9 +432,9 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted, onBack }:
             onClick={() => setActiveSection(section)}
             className="min-h-8 rounded-lg px-3 text-xs font-medium"
             style={{
-              background: activeSection === section ? 'var(--cp-surface-2)' : 'transparent',
-              color: activeSection === section ? 'var(--cp-text)' : 'var(--cp-muted)',
-              border: activeSection === section ? '1px solid var(--cp-border)' : '1px solid transparent',
+              background: visibleSection === section ? 'var(--cp-surface-2)' : 'transparent',
+              color: visibleSection === section ? 'var(--cp-text)' : 'var(--cp-muted)',
+              border: visibleSection === section ? '1px solid var(--cp-border)' : '1px solid transparent',
             }}
           >
             {label}
@@ -437,7 +442,13 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted, onBack }:
         ))}
       </div>
 
-      {activeSection === 'overview' && (
+      {!isMobile && config.provider_profile_id === 'custom' && (
+        <div hidden={visibleSection !== 'rules'}>
+          <ProviderRulesPanel provider={provider} active={visibleSection === 'rules'} />
+        </div>
+      )}
+
+      {visibleSection === 'overview' && (
       <>
       <InlineNotice tone={config.enabled ? 'success' : 'warning'}>
         <span>
@@ -462,7 +473,6 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted, onBack }:
         style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
       >
         <Row label={t('aiCenter.providers.profile', 'Profile')} value={config.provider_profile_id} copyValue={config.provider_profile_id} />
-        <Row label={t('aiCenter.providers.adapter', 'Protocol Adapter')} value={config.protocol_adapter_id} copyValue={config.protocol_adapter_id} />
         <Row label={t('aiCenter.providers.enabled', 'Enabled')} value={config.enabled ? t('common.on', 'On') : t('common.off', 'Off')} />
         <Row label={t('aiCenter.providers.routingWeight', 'Routing Weight')} value={`${formatWeight(routingWeight)} / ${routingWeightLabel}`} />
         <Row label={t('aiCenter.providers.runtimeType', 'Runtime Type')} value={config.provider_runtime_type} copyValue={config.provider_runtime_type} />
@@ -489,7 +499,7 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted, onBack }:
       </>
       )}
 
-      {activeSection === 'routing' && (
+      {visibleSection === 'routing' && (
       <>
       <div
         className="rounded-xl p-4 flex flex-col gap-3"
@@ -566,8 +576,28 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted, onBack }:
       </>
       )}
 
-      {activeSection === 'inventory' && (
+      {visibleSection === 'inventory' && (
         <div className="flex flex-col gap-3">
+          {(inventory.filtered_capabilities?.length ?? 0) > 0 && (
+            <details className="rounded-lg border p-3 text-xs" style={{ borderColor: 'var(--cp-border)' }}>
+              <summary className="cursor-pointer" style={{ color: 'var(--cp-warning)' }}>
+                {t('aiCenter.providers.filteredCapabilities', 'Unsupported capabilities filtered out')}: {inventory.filtered_capabilities?.length}
+              </summary>
+              <div className="mt-2 max-h-64 overflow-auto">
+                {inventory.filtered_capabilities?.map((item, index) => (
+                  <div key={index} className="border-t py-2 break-words" style={{ borderColor: 'var(--cp-border)' }}>
+                    <p className="font-mono">{item.provider_model_id} · {item.api_type}</p>
+                    <p className="font-mono">{item.protocol_adapter_id}{item.operation_id ? ` · ${item.operation_id}` : ''}</p>
+                    <p>{item.reason === 'unregistered_binding'
+                      ? t('aiCenter.providers.unregisteredBinding', 'No protocol binding for this capability and operation')
+                      : item.reason === 'unsupported_api_type'
+                        ? t('aiCenter.providers.unsupportedApiType', 'The selected protocol or discovery does not support this capability')
+                        : item.reason}</p>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
           <InventoryToolbar
             t={t}
             searchQuery={searchQuery}
@@ -992,7 +1022,13 @@ function ModelInventoryRow({ model, t, compact = false, groupLabel }: { model: M
         <div className="min-w-0">
           <LongField value={model.provider_model_id} className="text-sm font-medium" />
           <LongField
-            value={`${groupLabel ? `${groupLabel} / ` : ''}${model.logical_mounts.join(', ')} / ${model.api_types.join(', ')}`}
+            value={[
+              model.model_driver,
+              model.provider_actual_model_id !== model.provider_model_id ? model.provider_actual_model_id : undefined,
+              groupLabel,
+              model.logical_mounts.join(', '),
+              model.api_types.join(', '),
+            ].filter(Boolean).join(' / ')}
             className="text-xs"
             tone="muted"
             copyable={false}

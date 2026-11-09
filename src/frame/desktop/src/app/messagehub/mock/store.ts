@@ -5,10 +5,11 @@ import { InMemoryConversationMessageReader } from '../conversation/history/data-
 import { registerObjectAccess, rememberLocalObject } from '../conversation/history/objectAccess'
 import { jpegName, normalizeImageFile } from '../conversation/input/imageNormalize'
 import type { ConversationMessageReader } from '../conversation/history/types'
-import { getMessageStableId, messageNotify, messageVoice, notifySessionCategory, type MessageObject, type MessageDeliveryStatus } from '../protocol/msgobj'
+import { notifyCategoryFromSessionId } from 'buckyos'
+import { getMessageStableId, messageNotify, messageVoice, type MessageObject, type MessageDeliveryStatus } from '../protocol/msgobj'
 import { effectiveContent, foldMessageRelations, messageObjId, messageRelation, messageSummaryText } from '../conversation/history/relations'
 import { createSessionSchema, creationReason, defaultPreferences, groupSharedStateSchema, isMessageActivity, sharedStateSchema, memberStateSchema, presentationSchema, selectDefaultSession, sessionAccess, sessionKey, sessionTitle, sortSessions, viewerSessionKey } from '../sessionModel'
-import { createGroupSchema, GROUP_INVITATION_INTENT, groupSessionId, groupSessionKey, participating, withinWindow } from '../groupModel'
+import { createGroupSchema, GROUP_INVITATION_INTENT, groupSessionId, groupSessionKey, inviteBlocked, participating, withinWindow } from '../groupModel'
 import { ensureDefaultSession } from '../store/defaultSession'
 import { noGroupCapabilities, type CreationPolicy, type Entity, type EntityDetail, type GroupInfo, type GroupInvitation, type GroupMemberState, type GroupRole, type GroupSessionInfo, type GroupSessionParticipant, type GroupSessionParticipants, type MessageHubContext, type ReadReceipt, type RuntimeState, type Session, type SessionAccess, type SessionBinding, type SessionPreferences } from '../types'
 import { createOutgoingMockMessage, getMockEntityDid, MOCK_SELF_DID, mockEntities, mockEntityDetails, mockMessageReaders, mockMessageSeeds, mockSessions } from './data'
@@ -142,9 +143,9 @@ function seedSnapshot(now: number): Snapshot {
       reading: { sessionId: 'reading', title: 'Reading list', description: '', announcement: '', lifecycle: 'active', revision: 'rev-reading-1', receipts: 'count', allowGuests: true, participants: { [MOCK_SELF_DID]: 'invited_guest' } },
     }, inviteLinks: { 'book-club-token': { requireApproval: false, revoked: false } } },
   }
-  const notice = (id: string, from: string, sessionId: string, at: number, groupDid: string, action: string, data: Record<string, unknown>): MessageObject => ({
+  const notice = (id: string, from: string, sessionId: string, at: number, groupDid: string, action: string, data: Record<string, unknown>, by?: string): MessageObject => ({
     from, to: [MOCK_SELF_DID], kind: 'operation', created_at_ms: at, ui_message_id: id, ui_session_id: sessionId,
-    content: { format: 'text/plain', content: action, machine: { intent: GROUP_INVITATION_INTENT, data: { group_did: groupDid, action, data: data as Record<string, never> } } },
+    content: { format: 'text/plain', content: action, machine: { intent: GROUP_INVITATION_INTENT, data: { group_did: groupDid, action, ...(by ? { by } : {}), data: data as Record<string, never> } } },
   })
   sessions[sessionKey(MOCK_SELF_DID, 'session-carol-1')] = {
     id: 'session-carol-1', ownerDid: MOCK_SELF_DID, entityId: carol, title: 'Telegram', type: 'chat', source: 'telegram', binding: { kind: 'tunnel', tunnelInstanceId: 'telegram-personal', endpointDid: 'did:telegram:telegram-personal:carol', connectionName: 'Telegram · Personal', supportsMultipleSessions: false, canCreateRemoteSession: false, canSend: true, connected: true }, origin: 'connection', lifecycle: 'active',
@@ -158,8 +159,10 @@ function seedSnapshot(now: number): Snapshot {
     [sessionKey(MOCK_SELF_DID, 'session-bob-1')]: [notice('msg-invite-hiking', bob, 'session-bob-1', now - 50 * 60000, MOCK_HIKING_GROUP, 'invite', { invite_id: 'invite-hiking', role: 'member', expires_at_ms: now + INVITE_TTL_MS, state: 'invited' })],
     [sessionKey(MOCK_SELF_DID, 'session-alice-1')]: [
       notice('msg-invite-team-active', alice, 'session-alice-1', now - 12 * 60000, MOCK_PRODUCT_TEAM, 'invite', { invite_id: 'invite-team-self', role: 'admin', expires_at_ms: now + INVITE_TTL_MS, state: 'active' }),
-      notice('msg-pending-erin', alice, 'session-alice-1', now - 11 * 60000, MOCK_PRODUCT_TEAM, 'pending_approval', { member_did: erin, invited_by: bob }),
-      notice('msg-transfer-team', alice, 'session-alice-1', now - 10 * 60000, MOCK_PRODUCT_TEAM, 'owner_transfer', { transfer_id: 'transfer-team', expires_at_ms: now + INVITE_TTL_MS }),
+    ],
+    [sessionKey(MOCK_SELF_DID, 'session-team-1')]: [
+      notice('msg-pending-erin', MOCK_PRODUCT_TEAM, 'session-team-1', now - 11 * 60000, MOCK_PRODUCT_TEAM, 'pending_approval', { member_did: erin, invited_by: bob }, erin),
+      notice('msg-transfer-team', MOCK_PRODUCT_TEAM, 'session-team-1', now - 10 * 60000, MOCK_PRODUCT_TEAM, 'owner_transfer', { transfer_id: 'transfer-team', expires_at_ms: now + INVITE_TTL_MS }, alice),
     ],
     [sessionKey(MOCK_SELF_DID, 'session-carol-1')]: [
       notice('msg-invite-book-agent', carol, 'session-carol-1', now - 42 * 60000, MOCK_BOOK_CLUB, 'invite', { invite_id: 'invite-book-agent', role: 'member', expires_at_ms: now + INVITE_TTL_MS, state: 'invited', member_did: MOCK_AGENT_OWNER }),
@@ -357,7 +360,7 @@ export class MessageHubMockStore implements MessageHubStore {
       Object.assign(stored.sessions, seeded.sessions, stored.sessions)
     }
     // Demo sessions added after a browser stored its snapshot.
-    for (const id of ['session-coder-task', 'session-coder-ask', 'session-coder-qa', ...mockNotifySessions(this.now()).map(session => session.id)]) {
+    for (const id of ['session-coder-task', 'session-coder-ask', 'session-coder-qa', 'session-coder-work', ...mockNotifySessions(this.now()).map(session => session.id)]) {
       const demoKey = sessionKey(MOCK_SELF_DID, id)
       if (stored && !stored.sessions[demoKey] && !stored.deleted[demoKey]) {
         stored.sessions[demoKey] = this.snapshot.sessions[demoKey]
@@ -826,7 +829,7 @@ export class MessageHubMockStore implements MessageHubStore {
   denyOwner = (owner: string) => { this.revokedOwners.add(owner); this.snapshot = { ...this.snapshot }; this.listeners.forEach(listener => listener()) }
   title(context: MessageHubContext, session: Session) {
     const preferences = this.preferences(context, session.id)
-    const category = notifySessionCategory(session.id)
+    const category = notifyCategoryFromSessionId(session.id)
     return category && !preferences.title ? translate(`messagehub.notify.category.${category}`, session.title) : sessionTitle(session, preferences)
   }
 
@@ -972,7 +975,7 @@ export class MessageHubMockStore implements MessageHubStore {
         if (!entity || (entity.type !== 'person' && entity.type !== 'agent')) { failed.push({ did, reason: 'member-must-be-single-entity' }); continue }
         if (entity.type === 'agent' && mockAgentGroupAllowed(did) === false) { failed.push({ did, reason: 'agent-group-disabled' }); continue }
         const current = group.members[did]
-        if (current && participating({ did, ...current })) { failed.push({ did, reason: 'member-already-participating' }); continue }
+        if (current && inviteBlocked({ did, ...current })) { failed.push({ did, reason: 'member-already-participating' }); continue }
         group.members[did] = { role: 'member', state: 'invited', inviteId: crypto.randomUUID(), expiresAt: this.now() + INVITE_TTL_MS, invitedBy: context.ownerDid }
         this.groupLog(next, group, 'entity.member_invited', context.ownerDid, did)
       }
@@ -984,10 +987,20 @@ export class MessageHubMockStore implements MessageHubStore {
       const group = this.requireGroup(next, context, groupDid)
       if (!this.groupInfo(group, context.ownerDid).can.remove) throw Error('capability-denied')
       const member = group.members[memberDid]
-      if (!member || !participating({ did: memberDid, ...member })) throw Error('not-found')
+      if (member?.state !== 'active') throw Error('not-found')
       if (member.role === 'owner' || memberDid === context.ownerDid) throw Error('role-not-allowed')
-      member.state = member.state === 'active' ? 'removed' : 'revoked'
-      this.groupLog(next, group, member.state === 'removed' ? 'entity.member_removed' : 'entity.invite_revoked', context.ownerDid, memberDid)
+      member.state = 'removed'
+      this.groupLog(next, group, 'entity.member_removed', context.ownerDid, memberDid)
+    })
+  }
+  revokeGroupInvite(context: MessageHubContext, groupDid: string, memberDid: string) {
+    return this.mutate(next => {
+      const group = this.requireGroup(next, context, groupDid)
+      if (!this.groupInfo(group, context.ownerDid).can.invite) throw Error('capability-denied')
+      const member = group.members[memberDid]
+      if (member?.state !== 'invited') throw Error('not-found')
+      member.state = 'revoked'
+      this.groupLog(next, group, 'entity.invite_revoked', context.ownerDid, memberDid)
     })
   }
   private decideMember(context: MessageHubContext, groupDid: string, memberDid: string, approve: boolean) {

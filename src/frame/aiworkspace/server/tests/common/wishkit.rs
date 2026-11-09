@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 //! A wish test harness: the service in process with a scripted model (see wish.rs, quality.rs).
 
+#[path = "nfs.rs"]
+pub mod nfs;
+
 use aiworkspace_server::auth::StaticTokens;
 use aiworkspace_server::wish::WishConfig;
 use aiworkspace_server::{build_router, AppState, Limits};
@@ -34,7 +37,7 @@ pub struct ScriptedModel {
     /// Output limit of the last stage request (not `llm.map`).
     pub max_tokens: Mutex<Option<u32>>,
     /// Every call is refused by the AI service with this reason.
-    pub refuse: Mutex<Option<llm_context::RefusalKind>>,
+    pub refuse: Mutex<Option<&'static str>>,
     /// The provider of every model client the service asked for (stages and `llm.map`), in order.
     pub providers: Mutex<Vec<ProviderConfig>>,
 }
@@ -64,8 +67,8 @@ pub fn text(t: &str) -> AiResponse {
 impl LlmClient for ScriptedModel {
     async fn infer(&self, req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(kind) = *self.refuse.lock().unwrap() {
-            return Err(LLMComputeError::provider(llm_context::ProviderFailure::Refused(kind), "refused by the AI service"));
+        if let Some(code) = *self.refuse.lock().unwrap() {
+            return Err(LLMComputeError::provider(llm_context::ProviderFailure::Refused { code: code.to_string() }, "refused by the AI service"));
         }
         let delay = self.delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
@@ -103,6 +106,7 @@ pub struct Srv {
     pub model: Arc<ScriptedModel>,
     pub _dir: tempfile::TempDir,
     pub ws: String,
+    pub nfs: nfs::Nfs,
 }
 
 pub fn find_deno() -> String {
@@ -120,18 +124,20 @@ impl Srv {
     }
 
     pub async fn start_with_limits(dir: tempfile::TempDir, model: Arc<ScriptedModel>, tokens: Value, limits: Limits) -> Srv {
-        let svc = Service::open(&dir.path().join("data")).unwrap();
+        let nfs = nfs::Nfs::start(dir.path()).await;
+        let svc = Service::open(&dir.path().join("data"), nfs.objects().await).unwrap();
         let tokens: StaticTokens = serde_json::from_value(json!({ "tokens": tokens })).unwrap();
         let mut cfg = WishConfig::default();
         cfg.llm_override = Some(Arc::new(ScriptedFactory(model.clone())));
         cfg.deno = find_deno();
         cfg.program_timeout_secs = 60;
         let state = AppState::new(svc, Arc::new(tokens), limits, None, cfg);
+        let _ = state.ndm_gateway.set(nfs.base.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         *state.wish.host_base.lock().unwrap() = Some(format!("http://{addr}/kapi/aiworkspace"));
         tokio::spawn(async move { axum::serve(listener, build_router(state)).await.unwrap() });
-        Srv { base: format!("http://{addr}/kapi/aiworkspace"), http: reqwest::Client::new(), model, _dir: dir, ws: String::new() }
+        Srv { base: format!("http://{addr}/kapi/aiworkspace"), http: reqwest::Client::new(), model, _dir: dir, ws: String::new(), nfs }
     }
 
     pub async fn rpc(&self, method: &str, mut params: Value) -> Value {
@@ -170,6 +176,20 @@ impl Srv {
         let r = self.rpc("doc.commit", json!({ "protocol_version": "1.0", "epoch": info["epoch"], "idempotency_key": format!("k{}", K.fetch_add(1, Ordering::SeqCst)), "session_id": "s1", "operations": ops })).await;
         assert_eq!(r["status"], "accepted", "{r}");
         r
+    }
+
+    /// The three-state result of a Commit, whatever it is.
+    pub async fn commit_raw(&self, ops: Value) -> Value {
+        static K: AtomicU64 = AtomicU64::new(0);
+        let info = self.rpc("ws.get_info", json!({})).await;
+        self.rpc("doc.commit", json!({ "protocol_version": "1.0", "epoch": info["epoch"], "idempotency_key": format!("raw{}", K.fetch_add(1, Ordering::SeqCst)), "session_id": "s1", "operations": ops })).await
+    }
+
+    /// `GET /asset/<ws>/<object_id>` as alice.
+    pub async fn asset_bytes(&self, ws: &str, object_id: &str) -> Vec<u8> {
+        let r = self.http.get(format!("{}/asset/{ws}/{object_id}", self.base)).bearer_auth("tok-alice").send().await.unwrap();
+        assert!(r.status().is_success(), "asset {object_id}: {}", r.status());
+        r.bytes().await.unwrap().to_vec()
     }
 
     /// Start a stage and wait until it leaves the working states.
@@ -218,11 +238,6 @@ pub fn handle(map: &str, needle: &str) -> String {
 /// Scripts by default answer the stage with a plain sentence.
 pub fn model() -> Arc<ScriptedModel> {
     Arc::new(ScriptedModel { analyze: Mutex::new(Box::new(|_| text("没有可做的。"))), execute: Mutex::new(Box::new(|_| text("没有可做的。"))), calls: AtomicUsize::new(0), map_calls: AtomicUsize::new(0), delay_ms: AtomicU64::new(0), max_tokens: Mutex::new(None), refuse: Mutex::new(None), providers: Mutex::new(Vec::new()) })
-}
-
-/// The tool results so far contain `needle`.
-pub fn seen(t: &Turn, needle: &str) -> bool {
-    t.results.iter().any(|r| r.contains(needle))
 }
 
 /// Run an async test body on a runtime with large stacks (debug builds of the xllm loop and of big

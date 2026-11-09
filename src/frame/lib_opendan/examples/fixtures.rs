@@ -11,6 +11,7 @@
 //! scenario directory); a consumer substitutes its own copy location.
 
 #[path = "support/fixture_paths.rs"]
+#[allow(dead_code)] // `expand` is used by tests/fixtures.rs
 mod fixture_paths;
 #[path = "support/input_fixture.rs"]
 mod input_fixture;
@@ -115,19 +116,6 @@ impl LlmClient for Script {
                         "shell",
                         json!({ "command": "echo start >> marker; sleep 60; echo done >> marker" }),
                     )
-                }
-            }
-            "ask_notify" => {
-                if all.contains("<tool_result q1") {
-                    text("migrated to Postgres")
-                } else {
-                    let pending = json!({
-                        "agent_tool_protocol": "1", "tool": "ask-user", "status": "pending",
-                        "task_id": "userinput:q1", "summary": "waiting for the answer",
-                        "detail": { "question": "Postgres or SQLite?", "input": { "kind": "choice",
-                            "options": [ { "id": "pg", "label": "Postgres" }, { "id": "lite", "label": "SQLite" } ] } },
-                    });
-                    tool("q1", "shell", json!({ "command": format!("printf '%s' '{pending}'") }))
                 }
             }
             "goal_no_action" => tool(
@@ -305,7 +293,7 @@ fn observe(sd: &SessionDir) -> Value {
             "applied_input_seq": l.applied_input_seq,
             "run_status": rec.as_ref().map(|r| r.status.as_str()),
             "host_commit_pending": rec.as_ref().and_then(|r| r.host_commit_pending),
-            "inflight": rec.as_ref().map(|r| r.inflight.iter().map(|a| a.call_id.clone()).collect::<Vec<_>>()),
+            "in_flight": sd.runs().in_flight(&l.run_id).ok().flatten().map(|c| c.call_id),
         })
     });
     json!({
@@ -502,19 +490,16 @@ async fn gen(out: &Path) -> R<()> {
         ch.kill()?;
         let _ = ch.wait();
         // The command belongs to nobody now (standard process semantics);
-        // leave no process behind in the generator environment.
+        // leave no process behind in the generator environment, or it ends
+        // later and writes its exit into the fixture.
         let _ = std::process::Command::new("pkill")
-            .args([
-                "-KILL",
-                "-f",
-                &sd.path().join("marker").display().to_string(),
-            ])
+            .args(["-KILL", "-f", "sleep 60; echo done >> marker"])
             .status();
         write_expected(&d, "killed_during_exec",
-            "The runner was killed while `shell` ran: run.json holds the in-flight call c1; the latest snapshot has no result for c1. No process identity is recorded.",
+            "The runner was killed while `shell` ran: the latest snapshot, taken before the call, has no result for c1; its execution directory has no exit. No process identity is recorded.",
             vec![observe(&sd)],
-            json!({ "action": "materialize_interrupted_then_resume", "materialize_unresolved": ["c1"], "rerun_tool": false,
-                    "process_verification": "none", "result_text": "runtime-specific: exit code and output tail from the execution directory when the command ended, otherwise 'may still be running'" }));
+            json!({ "action": "resume_and_dispatch_c1_again_by_call_id", "unresolved": ["c1"], "rerun_tool": false,
+                    "process_verification": "none", "result_text": "runtime-specific: the task's end when the execution directory has one (exit code and output tail), otherwise 'may still be running', effect unknown" }));
         relativize(&d);
     }
     // 7. new input into a resumed run: receipt ahead of state
@@ -597,7 +582,7 @@ async fn gen(out: &Path) -> R<()> {
                 &WorkspaceImport {
                     operation_id: "fixture-overlap".into(),
                     location: WorkspaceLocation {
-                        runtime_id: CONTAINER_RUNTIME.into(),
+                        runtime_id: PRIVATE_RUNTIME.into(),
                         directory: ws,
                     },
                     name: Some("Overlap fixture".into()),
@@ -726,7 +711,6 @@ async fn gen(out: &Path) -> R<()> {
     }
     // 14. the input bus: records, rejections, renderings (no session state)
     {
-        use libopendan::runner::assembler::render_snapshot_events;
         use libopendan::runner::input_view::{event_view, EventView};
         use libopendan::runner::render_template;
         let d = scen("14_input_bus");
@@ -778,20 +762,17 @@ async fn gen(out: &Path) -> R<()> {
             let text = input_fixture::chat_text(&records, batch, *group);
             write(&format!("rendering/{file}"), text.as_bytes());
         }
-        // The semi event as the snapshot message of the next controlled input.
+        // The semi event as a background line of the next controlled input
+        // (`background_context`).
         let semi = &records[3].1;
         let SessionInput::Event(ev) = parse_logical_record(semi).map_err(|e| e.to_string())? else {
             return Err("fixture record 04 is not an event".into());
         };
         let views: Vec<EventView> = vec![event_view(semi["key"].as_str().unwrap(), &ev)];
-        let snapshot = format!(
-            "<semi_subscription_snapshot>\n{}\n</semi_subscription_snapshot>",
-            render_snapshot_events(&views)
+        let background = libopendan::runner::background::render(
+            &libopendan::runner::background::event_lines(&views),
         );
-        write(
-            "rendering/semi_subscription_snapshot.txt",
-            snapshot.as_bytes(),
-        );
+        write("rendering/background_context.txt", background.as_bytes());
         let v = json!({
             "scenario": "input_bus",
             "description": "Hand-written Session Input Bus records (opendan.session_input/3): what a consumer does with each, why the rejected ones are rejected, and the byte-exact text of the built-in formats and the example templates for one batch.",
@@ -811,7 +792,7 @@ async fn gen(out: &Path) -> R<()> {
                 "vars": "rendering/vars.json",
                 "input_text": "rendering/input_text.xml",
                 "on_input_builtin": "rendering/on_input_builtin.txt",
-                "semi_subscription_snapshot": { "of": "04_event_semi_object.json", "text": "rendering/semi_subscription_snapshot.txt" },
+                "background_context": { "of": "04_event_semi_object.json", "text": "rendering/background_context.txt" },
                 "templates": input_fixture::TEMPLATES.iter().map(|(n, _)| json!({
                     "template": format!("rendering/templates/{n}.tpl"),
                     "output": format!("rendering/templates/{n}.out"),
@@ -849,11 +830,9 @@ async fn gen(out: &Path) -> R<()> {
         let live = sd.state()?.live_run.unwrap();
         let (record, snapshot) = sd.runs().load_checked(&live.run_id)?;
         assert!(!record.status.is_terminal());
-        assert!(
-            agent_tool::exec_tracking::persisted_outcome_ids(&snapshot.unwrap())
-                .iter()
-                .any(|call_id| call_id == "report-final")
-        );
+        assert!(snapshot.unwrap().state.accumulated.iter().any(|m| m.content.iter().any(
+            |c| matches!(c, buckyos_api::AiContent::ToolResult { call_id, .. } if call_id == "report-final")
+        )));
         assert_eq!(
             record.host.as_ref().unwrap().extra["reports"]
                 .as_array()
@@ -942,7 +921,7 @@ async fn gen(out: &Path) -> R<()> {
         let st = gsd.state()?;
         let shadow = st.goal.clone().unwrap();
         assert!(shadow.needs_flush() && shadow.unwritten.len() == 1);
-        assert_eq!(st.waiting_for.as_ref().map(|w| w.kind), Some(WaitingKind::Event));
+        assert!(!st.follows_work() && !st.needs_input(true));
         let mut observed = observe(&gsd);
         observed["goal"] = json!({
             "goal_id": goal.goal_id,
@@ -951,7 +930,7 @@ async fn gen(out: &Path) -> R<()> {
             "published_rev": shadow.published_rev,
             "unwritten": shadow.unwritten.iter().map(|a| json!([a.epoch, a.seq])).collect::<Vec<_>>(),
             "activation_open": shadow.activation.is_some(),
-            "waiting_for": st.waiting_for.as_ref().map(|w| w.kind),
+            "needs_input": st.needs_input(true),
         });
         write_expected(&d, "goal_session",
             "Goal g (agent_root/state/goals/<goal_id>/) with its epoch-1 Goal Session between Activations (waiting for an event). Activation 1 consumed a scheduled run opportunity and the end of the Goal's Work, its Turn close is committed in state.json (state.goal), but the Goal State and the Activation record are not written back to the Goal yet.",
@@ -973,30 +952,35 @@ async fn gen(out: &Path) -> R<()> {
                     "distance": "TODO.md has no finished items left",
                     "activations": 1
                 },
-                "session": { "run_state": "waiting", "waiting_for": "event", "finished": false }
+                "session": { "run_state": "waiting", "needs_input": false, "finished": false }
             }));
         relativize(&d);
     }
     {
-        // A Work waiting for the answer to a question it asked through a
-        // notification (files of the AgentRoot: LocalNotify), and a UI
-        // session that observed a notification shown in its conversation.
+        // A UI session that observed an `input` notification another session
+        // sent (files of the AgentRoot: LocalNotify), shown in its
+        // conversation.
         let d = scen("17_notify");
         let env = Env::new(&d);
         let local = Arc::new(libopendan::notify::LocalNotify::enable(&d.join("agent_root"), AGENT)?);
-        let mut spec = libopendan::SessionTemplate::load("work", None)?.spec("Pick the database of the notes app");
-        spec.prompt.llm_context = json!({ "tools": { "enabled": true } });
-        let wsd = env.create("work-notify", spec).await;
-        let mut deps = env.deps("ask_notify");
-        deps.notify = Some(local.clone());
-        let r = drive(&wsd, &deps, StopWhen::Idle).await;
-        assert!(matches!(r, libopendan::runner::DriveResult::Idle { .. }), "{r:?}");
-        let st = wsd.state()?;
-        let w = st.waiting_for.clone().unwrap();
-        assert_eq!(w.kind, WaitingKind::Input);
-        let views = libopendan::notify::NotifyHost::list(local.as_ref(), Default::default()).await?;
-        assert_eq!(views.len(), 1);
-        let asked = &views[0];
+        let mut asking = buckyos_api::NotifySendReq::input(
+            "alice",
+            "Postgres or SQLite?",
+            "",
+            vec![
+                buckyos_api::HumanPromptOption::new("pg", "Postgres"),
+                buckyos_api::HumanPromptOption::new("lite", "SQLite"),
+            ],
+            false,
+            "ask:work-notify-run:q1",
+        );
+        asking.level = Some(buckyos_api::NotifyLevel::Timely);
+        asking.source = Some(buckyos_api::NotifySource {
+            session_id: Some("work-notify".into()),
+            call_id: Some("q1".into()),
+            ..Default::default()
+        });
+        let asked = libopendan::notify::NotifyHost::send(local.as_ref(), asking).await?;
         let mut ui = libopendan::SessionTemplate::load("ui", None)?.spec("chat with alice");
         ui.route_key = Some(format!("{AGENT}/dm%3Adid%3Abns%3Aalice"));
         ui.outbound = Some(OutboundBinding {
@@ -1015,7 +999,7 @@ async fn gen(out: &Path) -> R<()> {
             message: None,
             options: libopendan::notify::prompt_options(&asked.prompt),
             source: buckyos_api::NotifySource {
-                session_id: Some(wsd.sid().to_string()),
+                session_id: Some("work-notify".into()),
                 ..Default::default()
             },
             delivered_msg_id: None,
@@ -1031,21 +1015,12 @@ async fn gen(out: &Path) -> R<()> {
         env.post(&usd, posted).await;
         let _ = drive(&usd, &env.deps("answer"), StopWhen::Idle).await;
         assert_eq!(usd.state()?.pending_events.len(), 1);
-        let mut work_obs = observe(&wsd);
-        work_obs["waiting_for"] = serde_json::to_value(&w)?;
         let mut ui_obs = observe(&usd);
         ui_obs["pending_events"] = serde_json::to_value(&usd.state()?.pending_events)?;
         write_expected(&d, "notify",
-            "Work work-notify asked the user with `ask-user` (call q1) and, nobody reading it, the question went out as an `input` notification (agent_root/state/notifies/, run.json host.extra.asks.q1.notify): state waits for input with the deadline and the notification's task. UI session ui-notify holds a `_notify` observation of that notification in its conversation, not injected yet (it opened no Turn).",
-            vec![work_obs, ui_obs],
+            "UI session ui-notify holds a `_notify` observation of an `input` notification another session sent (agent_root/state/notifies/), shown in its conversation and not injected yet (it opened no Turn).",
+            vec![ui_obs],
             json!({
-                "work": {
-                    "action": "answer_the_notification_then_fill_q1_once",
-                    "answer": { "option": "pg" },
-                    "tool_result_q1": { "option": "pg", "text": "Postgres", "via": "notification", "notify_id": asked.notify_id },
-                    "llm_calls": 1,
-                    "report": "migrated to Postgres"
-                },
                 "ui": {
                     "action": "show_the_observation_with_the_next_message",
                     "snapshot_line_starts_with": format!("[notify {}] input/timely", asked.notify_id),

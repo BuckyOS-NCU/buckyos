@@ -6,11 +6,11 @@
  * what hovering it offers and the type section of the near toolbar. They are registered like any
  * extension would be. */
 
-import { useCallback, useEffect, useState, type CSSProperties, type ReactNode } from 'react'
-import { ALargeSmall, Columns3, Eye, Image as ImageIcon, ListFilter, ListTree, Plus, Replace, Reply, Scan, Table, Type } from 'lucide-react'
+import { useCallback, type CSSProperties, type ReactNode } from 'react'
+import { ALargeSmall, ClipboardCopy, Columns3, Eye, File as FileIcon, FileText, Film, Image as ImageIcon, LayoutGrid, ListFilter, ListTree, Music, Play, Plus, Replace, Reply, Scan, Table, Type } from 'lucide-react'
 import { randomId } from '../../api/ids'
 import type { ReadOk } from '../../api/session'
-import type { AnnotationContent, Json, Reference, RichTextContent } from '../../api/types'
+import type { AnnotationContent, Json, KeyedContent, Reference, RichTextContent } from '../../api/types'
 import { StaticRichText } from '../../richtext/RichTextEditor'
 import { isGuestPrincipal } from '../../api/transport'
 import { aiwsT } from '../../i18n'
@@ -18,11 +18,16 @@ import { useAiwsText } from '../../useAiwsText'
 import { authorLabel, readGuestName } from '../../state/guest'
 import { useEdit, useLoad, useStore, useVersion, useWorkspaceUi } from '../../state/hooks'
 import type { WorkspaceStore } from '../../state/store'
+import { pdfImports } from '../canvas/pdfImportRequest'
+import { officeImports } from '../import/officeImportRequest'
+import { officeKind } from '@office/package'
 import { TableViewCell } from '../TableViewCell'
 import { sourceLabel } from './affordances'
-import { consumeIntent, requestIntent, useIntent, useOnFreeCanvas } from './editorToolbar'
+import { requestIntent, useOnFreeCanvas } from './editorToolbar'
 import { AssetCell, LockScope, NoteEditor, NoteReplies, RecordCell, RichTextCell, TableEditor } from './editors'
-import { cellOp, createOp, MAX_EMBED_DEPTH, replaceAsset, setCellConfig } from './ops'
+import { cellOp, createOp, MAX_EMBED_DEPTH, replaceAccept, replaceAsset, setCellConfig } from './ops'
+import { assetMediaType, mediaKindOf, playsInPlace } from '../media/kinds'
+import type { StagedPayload } from '../media/stage'
 import { blockRegistry, type BlockDefinition, type RenderContext, type ToolbarItem } from './registry'
 import { frameDefinition } from './frameBlock'
 import { shapeDefinition } from './shapeBlock'
@@ -87,6 +92,8 @@ const table: BlockDefinition = {
     { kind: 'button', id: 'table-filter', icon: ListFilter, label: aiwsT('aiworkspace.blocks.table.filter'), run: () => openWith(context, 'filter') },
     ...(context.readOnlyReason === null && context.source?.capabilities.includes('structure') ? [{ kind: 'button' as const, id: 'table-fields', icon: Columns3, label: aiwsT('aiworkspace.blocks.table.fields'), run: () => openWith(context, 'fields') }] : []),
     ...(canAppend(context) ? [{ kind: 'button' as const, id: 'table-add', icon: Plus, label: aiwsT('aiworkspace.blocks.table.addRecord'), run: () => openWith(context, 'add') }] : []),
+    // "copy as table" (表格数据导入 TODO §4.1): run by the table's editor, which knows the view's rows
+    { kind: 'button', id: 'table-copy', icon: ClipboardCopy, label: aiwsT('aiworkspace.data.table.copyAsTable'), run: () => openWith(context, 'copy') },
   ],
   create: (args) => (args.existingSourceId ? [cellOp(args, 'table', args.existingSourceId)] : [
     createOp(args.dataId, 'buckyos.table-source', args.contentFolderId, args.dataOrderKey, {
@@ -204,57 +211,51 @@ const record: BlockDefinition = {
   ]),
 }
 
-// ---- asset (image): the picture itself; no editor — replace, fit and preview are toolbar actions (§4.4)
+// ---- asset: a picture, or any file shown by its poster or icon; a video or a sound plays in place, the rest opens the
+// preview (多媒体对象 §4). No editor of its own: replace, fit and preview are toolbar actions (§4.4)
 
 function fitOf(context: RenderContext): 'contain' | 'cover' {
   return (context.payload.config?.fit ?? context.payload.options?.fit) === 'cover' ? 'cover' : 'contain'
 }
 
-function AssetPreview({ entityId, onClose }: { entityId: string; onClose: () => void }) {
-  const { t } = useAiwsText()
-  return (
-    <div className="aiws-media-preview" role="dialog" aria-label={t('aiworkspace.blocks.asset.previewDialog')} data-testid="aiws-media-preview" onClick={onClose}>
-      <div className="aiws-media-preview-body" onClick={(event) => event.stopPropagation()}>
-        <AssetCell entityId={entityId} fit="contain" readOnly />
-        <button type="button" onClick={onClose}>{t('aiworkspace.blocks.asset.closePreview')}</button>
-      </div>
-    </div>
-  )
+/** The asset as the outline knows it (the Block's toolbar and hover have no content read). */
+function kindOfSource(context: RenderContext) {
+  const mediaType = assetMediaType(context.source?.media_type ?? undefined, context.source?.name ?? undefined)
+  const kind = mediaKindOf(mediaType)
+  return { kind, playable: playsInPlace(kind, mediaType), mediaType }
 }
 
-/** "Preview" from the toolbar: the Block opens its preview (also in edit mode, where there is no editor). */
-function usePreviewIntent(cellId: string): [boolean, (open: boolean) => void] {
-  const [preview, setPreview] = useState(false)
-  const intent = useIntent(cellId)
-  const [seen, setSeen] = useState(0)
-  if (intent?.value === 'preview' && intent.seq !== seen) { setSeen(intent.seq); setPreview(true) }
-  useEffect(() => { if (intent?.value === 'preview') consumeIntent(cellId, intent) }, [intent, cellId])
-  return [preview, setPreview]
-}
-
+/** On a free canvas in edit mode "play" activates the Block: its Editor plays, and the canvas leaves it the pointer. */
 function AssetStatic(context: RenderContext) {
-  const [preview, setPreview] = usePreviewIntent(context.cell.entity_id)
   // a flow page has no near toolbar: the file facts and "replace" stay under the picture there
   const bare = useOnFreeCanvas()
   if (!context.source) return null
   return (
     <div className="aiws-block-static aiws-block-asset">
-      <AssetCell entityId={context.source.entity_id} fit={fitOf(context)} readOnly={bare || context.readOnlyReason !== null || context.mode !== 'edit'} bare={bare} />
-      {preview && <AssetPreview entityId={context.source.entity_id} onClose={() => setPreview(false)} />}
+      <AssetCell entityId={context.source.entity_id} fit={fitOf(context)} readOnly={bare || context.readOnlyReason !== null || context.mode !== 'edit'} bare={bare}
+        media={{ cellId: context.cell.entity_id, onActivate: bare && context.mode === 'edit' ? context.activateEditor : undefined }} />
     </div>
   )
 }
-/** View mode: a reading interaction (the explicit media preview, §8.3) without any write. */
+/** View mode: a reading interaction (play in place, the explicit media preview, §8.3) without any write. */
 function AssetView(context: RenderContext) {
-  const { t } = useAiwsText()
-  const [preview, setPreview] = usePreviewIntent(context.cell.entity_id)
   const bare = useOnFreeCanvas()
   if (!context.source) return null
   return (
     <div className="aiws-block-static aiws-block-asset" data-testid="aiws-asset-view">
-      <AssetCell entityId={context.source.entity_id} fit={fitOf(context)} readOnly bare={bare} />
-      <button type="button" className="aiws-link aiws-block-view-action" data-testid="aiws-asset-preview" onClick={() => setPreview(true)}>{t('aiworkspace.blocks.asset.preview')}</button>
-      {preview && <AssetPreview entityId={context.source.entity_id} onClose={() => setPreview(false)} />}
+      <AssetCell entityId={context.source.entity_id} fit={fitOf(context)} readOnly bare={bare} media={{ cellId: context.cell.entity_id }} />
+    </div>
+  )
+}
+/** On a free canvas: mounted by an explicit activation, it plays or opens the preview and ends the activation when
+ * done. A flow page keeps editors mounted: there it is the Static view with "replace". */
+function AssetEditor(context: RenderContext) {
+  const bare = useOnFreeCanvas()
+  if (!context.source) return null
+  return (
+    <div className="aiws-block-static aiws-block-asset">
+      <AssetCell entityId={context.source.entity_id} fit={fitOf(context)} readOnly={bare || context.readOnlyReason !== null} bare={bare}
+        media={{ cellId: context.cell.entity_id, activated: bare, onDone: bare ? context.deactivateEditor : undefined }} />
     </div>
   )
 }
@@ -265,7 +266,8 @@ function pickReplacement(context: RenderContext, store: WorkspaceStore) {
   if (!sourceId) return
   const input = document.createElement('input')
   input.type = 'file'
-  input.accept = 'image/*'
+  const accept = replaceAccept({ object_id: '', media_type: context.source?.media_type ?? undefined, file_name: context.source?.name ?? undefined })
+  if (accept) input.accept = accept
   input.onchange = () => {
     const file = input.files?.[0]
     if (file) void replaceAsset(store, sourceId, file).then((problem) => { if (problem) store.notify('error', problem) })
@@ -273,35 +275,90 @@ function pickReplacement(context: RenderContext, store: WorkspaceStore) {
   input.click()
 }
 
+/** Which Office document a file Block holds, by its name (Office 导入 TODO §6). */
+function officeKindOf(context: RenderContext) {
+  const name = context.source?.name ?? ''
+  const ext = /\.([a-z]+)$/i.exec(name)?.[1]?.toLowerCase() ?? ''
+  return ['docx', 'docm', 'pptx', 'pptm', 'ppsx', 'doc', 'ppt', 'odt', 'odp', 'rtf'].includes(ext) ? ext : null
+}
+
+/** An Office file Block as an editable document or pages (Office 导入 TODO §6): the stored file is the original. */
+async function expandOffice(context: RenderContext, store: WorkspaceStore) {
+  const sourceId = context.source?.entity_id
+  if (!sourceId) return
+  if (officeImports.busy || pdfImports.busy) { store.notify('info', aiwsT('aiworkspace.canvas.import.busy')); return }
+  try {
+    const read = await store.session.read<KeyedContent<{ object_id?: string; file_name?: string }>>(sourceId)
+    const objectId = read.content.payload.object_id
+    if (!objectId) return
+    const name = read.content.payload.file_name ?? context.source?.name ?? 'document'
+    const bytes = new Uint8Array(await (await store.session.fetchAsset(objectId)).arrayBuffer())
+    const kind = officeKind(name, bytes)
+    if (!kind) { store.notify('info', aiwsT('aiworkspace.office.error.unreadable', { reason: name })); return }
+    officeImports.open({ source: { name, bytes, kind, asset: { object_id: objectId } }, step: 'options' })
+  } catch (error) {
+    store.notify('error', aiwsT('aiworkspace.office.error.unreadable', { reason: error instanceof Error ? error.message : String(error) }))
+  }
+}
+
+/** A PDF file Block's pages as editable objects on a new canvas (PDF 导入方案 §5 入口): the stored file is the original. */
+async function expandPdf(context: RenderContext, store: WorkspaceStore) {
+  const sourceId = context.source?.entity_id
+  if (!sourceId) return
+  if (pdfImports.busy) { store.notify('info', aiwsT('aiworkspace.canvas.import.busy')); return }
+  try {
+    const read = await store.session.read<KeyedContent<{ object_id?: string; file_name?: string }>>(sourceId)
+    const objectId = read.content.payload.object_id
+    if (!objectId) return
+    const bytes = new Uint8Array(await (await store.session.fetchAsset(objectId)).arrayBuffer())
+    pdfImports.open({ source: { name: read.content.payload.file_name ?? context.source?.name ?? 'PDF', bytes, asset: { object_id: objectId } }, step: 'options' })
+  } catch (error) {
+    store.notify('error', aiwsT('aiworkspace.pdf.error.unreadable', { reason: error instanceof Error ? error.message : String(error) }))
+  }
+}
+
 const FIT_OPTIONS = [
   { value: 'contain', get label() { return aiwsT('aiworkspace.blocks.asset.fitContain') } },
   { value: 'cover', get label() { return aiwsT('aiworkspace.blocks.asset.fitCover') } },
 ]
+const KIND_ICON = { image: ImageIcon, video: Film, audio: Music, pdf: FileText, file: FileIcon }
 
 const asset: BlockDefinition = {
   type: 'asset', version: 1, get title() { return aiwsT('aiworkspace.blocks.asset.title') }, accepts: ['buckyos.asset-ref'], allowNoSource: false,
   defaultSize: { w: 320, h: 240 }, cost: { editor: false, html: false },
-  Static: AssetStatic, View: AssetView,
+  Static: AssetStatic, View: AssetView, Editor: AssetEditor,
   resize: { aspect: 'locked' },
   catalog: { group: 'data', get description() { return aiwsT('aiworkspace.blocks.asset.description') }, needs: 'file', standard: true },
   actions: [{ id: 'replace', get label() { return aiwsT('aiworkspace.blocks.asset.replaceFile') }, modes: ['edit'], needs: ['update'], onSource: true, run: pickReplacement }],
-  hover: (context) => sourceLabel(context, ImageIcon),
-  toolbar: (context, store) => [
-    ...(context.mode === 'edit' && context.source?.capabilities.includes('update') && context.readOnlyReason === null ? [{ kind: 'button' as const, id: 'asset-replace', icon: Replace, label: aiwsT('aiworkspace.blocks.asset.replace'), run: () => pickReplacement(context, store) }] : []),
-    { kind: 'menu', id: 'asset-fit', icon: Scan, label: aiwsT('aiworkspace.blocks.asset.fit'), value: fitOf(context), items: FIT_OPTIONS,
-      disabled: context.capabilities.includes('update') && context.mode === 'edit' ? false : aiwsT('aiworkspace.blocks.noPermission'),
-      onPick: (value) => setCellConfig(context, store, { fit: value === 'contain' ? null : value }, aiwsT('aiworkspace.blocks.edit.change', { label: aiwsT('aiworkspace.blocks.asset.fit'), value: aiwsT(value === 'cover' ? 'aiworkspace.blocks.asset.fitCover' : 'aiworkspace.blocks.asset.fitContain') })) },
-    { kind: 'button', id: 'asset-preview', icon: Eye, label: aiwsT('aiworkspace.blocks.asset.preview'), run: () => requestIntent(context.cell.entity_id, 'preview') },
-  ],
+  hover: (context) => sourceLabel(context, KIND_ICON[kindOfSource(context).kind]),
+  toolbar: (context, store): ToolbarItem[] => {
+    const { kind, playable } = kindOfSource(context)
+    return [
+      ...(playable ? [{ kind: 'button' as const, id: 'asset-play', icon: Play, label: aiwsT('aiworkspace.blocks.media.playShort'),
+        run: () => { if (context.mode === 'edit') context.activateEditor(); else requestIntent(context.cell.entity_id, 'open') } }] : []),
+      ...(context.mode === 'edit' && context.source?.capabilities.includes('update') && context.readOnlyReason === null ? [{ kind: 'button' as const, id: 'asset-replace', icon: Replace, label: aiwsT('aiworkspace.blocks.asset.replace'), run: () => pickReplacement(context, store) }] : []),
+      ...(kind === 'image' || kind === 'video' || kind === 'pdf' ? [{ kind: 'menu' as const, id: 'asset-fit', icon: Scan, label: aiwsT('aiworkspace.blocks.asset.fit'), value: fitOf(context), items: FIT_OPTIONS,
+        disabled: context.capabilities.includes('update') && context.mode === 'edit' ? false as const : aiwsT('aiworkspace.blocks.noPermission'),
+        onPick: (value: string) => setCellConfig(context, store, { fit: value === 'contain' ? null : value }, aiwsT('aiworkspace.blocks.edit.change', { label: aiwsT('aiworkspace.blocks.asset.fit'), value: aiwsT(value === 'cover' ? 'aiworkspace.blocks.asset.fitCover' : 'aiworkspace.blocks.asset.fitContain') })) }] : []),
+      { kind: 'button', id: 'asset-preview', icon: Eye, label: aiwsT('aiworkspace.blocks.asset.preview'), run: () => requestIntent(context.cell.entity_id, 'preview') },
+      ...(kind === 'pdf' && context.mode === 'edit' ? [{ kind: 'button' as const, id: 'asset-expand-pdf', icon: LayoutGrid, label: aiwsT('aiworkspace.blocks.asset.expandPdf'),
+        disabled: !store.session.info().capabilities.includes('structure') ? aiwsT('aiworkspace.pdf.reason.noStructure') : store.session.status().kind !== 'live' ? aiwsT('aiworkspace.pdf.reason.offline') : false as const,
+        run: () => { void expandPdf(context, store) } }] : []),
+      ...(officeKindOf(context) && context.mode === 'edit' ? [{ kind: 'button' as const, id: 'asset-expand-office', icon: LayoutGrid,
+        label: aiwsT(/^(docx?|docm|odt|rtf)$/.test(officeKindOf(context) ?? '') ? 'aiworkspace.office.expandDoc' : 'aiworkspace.office.expandSlides'),
+        disabled: !store.session.info().capabilities.includes('structure') ? aiwsT('aiworkspace.pdf.reason.noStructure') : store.session.status().kind !== 'live' ? aiwsT('aiworkspace.pdf.reason.offline') : false as const,
+        run: () => { void expandOffice(context, store) } }] : []),
+    ]
+  },
   configFields: [{ key: 'fit', get label() { return aiwsT('aiworkspace.blocks.asset.fitField') }, kind: 'select', options: FIT_OPTIONS }],
   create: (args) => {
     if (args.existingSourceId) return [cellOp(args, 'asset', args.existingSourceId)]
-    const file = args.config?.file as { object_id: string; file_name: string } | undefined
+    const file = args.config?.file as StagedPayload | undefined
     if (!file) throw new Error(aiwsT('aiworkspace.blocks.asset.fileRequired'))
     const { file: _file, ...rest } = args.config ?? {}
     void _file
     return [
-      createOp(args.dataId, 'buckyos.asset-ref', args.contentFolderId, args.dataOrderKey, { object_id: file.object_id, file_name: file.file_name }, file.file_name),
+      createOp(args.dataId, 'buckyos.asset-ref', args.contentFolderId, args.dataOrderKey, { ...file } as Record<string, Json>, file.file_name),
       cellOp({ ...args, config: Object.keys(rest).length > 0 ? rest : undefined }, 'asset', args.dataId),
     ]
   },

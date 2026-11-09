@@ -4,6 +4,7 @@
  * "需要处理". Creating a Viewport or a Frame and adding its step, or changing the stage size together with the
  * Frames' aspect, is one commit and one undo step. */
 
+import { fixed } from '@controls/placement'
 import { randomId } from '../api/ids'
 import type { CommitOutcome, Json, KeyedContent, Operation, Placement, ShowPathPayload, ShowStep, StageSize } from '../api/types'
 import { aiwsT } from '../i18n'
@@ -64,11 +65,11 @@ export async function setPathKeys(store: WorkspaceStore, pathId: string, values:
   return store.submit({ editId: `path:${pathId}:keys`, label, operations })
 }
 
-/** A new path in the `shows` folder. */
-export function createPathOp(store: WorkspaceStore, title: string, purpose: 'presentation' | 'guide'): { op: Operation; id: string } {
+/** A new path in the `shows` folder, empty or with its stage, background and steps (an imported PDF's pages). */
+export function createPathOp(store: WorkspaceStore, title: string, purpose: 'presentation' | 'guide', init: Partial<Pick<ShowPathPayload, 'stage' | 'background' | 'steps'>> = {}): { op: Operation; id: string } {
   const id = randomId('p')
   const last = store.outline.childrenOf('shows').at(-1)?.order_key
-  const payload: ShowPathPayload = { title, purpose, stage: DEFAULT_STAGE, background: DEFAULT_BACKGROUND, steps: [] }
+  const payload: ShowPathPayload = { title, purpose, stage: init.stage ?? DEFAULT_STAGE, background: init.background ?? DEFAULT_BACKGROUND, steps: init.steps ?? [] }
   return { id, op: { op: 'entity.create', entity_id: id, type_id: 'buckyos.show-path', parent_id: 'shows', order_key: store.core.order_key_between(last ?? undefined, undefined), payload: payload as unknown as Json } }
 }
 
@@ -98,9 +99,10 @@ export function createFrameOp(store: WorkspaceStore, surfaceId: string, rect: Pl
 export function fitFrameOps(store: WorkspaceStore, frameId: string, stage: StageSize): Operation[] {
   const frame = store.outline.get(frameId)
   const placed = worldRectOf(store.outline, frameId)
-  if (!frame?.placement || !placed || sameRatio(placed.rect, stage)) return []
-  const next = frameAtRatio(frame.placement, stage)
-  const placement: Placement = { ...frame.placement, x: next.x, y: next.y, w: next.w, h: next.h }
+  const at = fixed(frame?.placement)
+  if (!at || !placed || sameRatio(placed.rect, stage)) return []
+  const next = frameAtRatio(at, stage)
+  const placement: Placement = { ...at, x: next.x, y: next.y, w: next.w, h: next.h }
   store.noteLayoutIntent(frameId, placement)
   return [{ op: 'tree.place', entity_id: frameId, placement }]
 }

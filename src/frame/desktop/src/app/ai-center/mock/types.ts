@@ -83,12 +83,18 @@ export interface ProviderInventory {
   provider_origin: ProviderOrigin
   version?: string
   inventory_revision?: string
+  filtered_capabilities?: FilteredProviderCapability[]
   models: ModelMetadata[]
 }
 
 // ========== Provider ==========
 
 export interface ProviderConfig {
+  discovered_model_ids?: string[]
+  rules_catalog?: Record<string, unknown>
+  resolved_model_rules?: Record<string, Record<string, unknown>>
+  provider_rules_id?: string
+  instance_rules?: Record<string, unknown>
   id: string
   name: string
   enabled: boolean
@@ -147,6 +153,7 @@ export interface UsageEvent {
   requested_model: string
   api_type: ApiType
   tenant_id: string
+  user_id?: string
   app_id?: string
   agent_id?: string
   session_id?: string
@@ -318,6 +325,11 @@ export interface AIStatus {
 // ========== Wizard ==========
 
 export interface WizardDraft {
+  rules_config_json?: string
+  rules_settings_revision?: number
+  provider_rules_id?: string
+  model_driver_overrides_json?: string
+  server_default_routes_json?: string
   provider_instance_name?: string
   provider_profile_id: ProviderType | null
   display_name: string
@@ -353,6 +365,8 @@ export interface KnownProviderProfile {
   protocol_adapter_id: string
   discovery_behavior_id: string
   provider_rules_id?: string
+  model_driver_overrides?: Record<string, string>
+  rules_catalog?: Record<string, unknown>
   ui_hints: Record<string, unknown>
   endpoint_hints: Record<string, ProviderEndpointHint>
   connection_fields: Partial<Record<'region' | 'workspace' | 'account' | 'policy_region', ProviderConnectionField>>
@@ -381,6 +395,7 @@ export interface ProviderConnectionField {
 }
 
 export interface ProtocolFamilyOption {
+  protocol_adapter_id: string
   protocol_family_id: string
   display_name: string
 }
@@ -391,7 +406,21 @@ export interface ProviderSetupCatalog {
   protocol_families: ProtocolFamilyOption[]
 }
 
+export interface FilteredProviderCapability {
+  provider_model_id: string
+  protocol_adapter_id: string
+  api_type: string
+  operation_id: string | null
+  reason: string
+}
+
 export interface ValidationResult {
+  filtered_capabilities?: FilteredProviderCapability[]
+  models_recognized?: string[]
+  unmatched_models?: unknown[]
+  unavailable_presets?: unknown[]
+  routing_candidates?: Record<string, string[]>
+  warnings?: string[]
   base_url_reachable: boolean
   auth_valid: boolean
   models_discovered: string[]

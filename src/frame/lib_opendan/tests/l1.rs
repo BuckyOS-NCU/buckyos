@@ -13,7 +13,7 @@ use common::*;
 use libopendan::channel::{DirMsgQueue, InputSource};
 use libopendan::lock::{Acquire, FileLock, Lease};
 use libopendan::protocol::*;
-use libopendan::runner::history::{build_history, read_window, Summarizer};
+use libopendan::runner::history::{build_history, read_window, HistoryShape, Summarizer};
 use libopendan::runner::{drive, DriveResult, StopWhen};
 use libopendan::state::AgentStateClient;
 use libopendan::{fsutil, SessionDir};
@@ -184,7 +184,7 @@ async fn worklog_turn_pages_preserve_boundaries_and_live_catchup() {
     let mut cursor = None;
     let mut seen = Vec::new();
     loop {
-        let page = log.page(end, 1, cursor, None, 50).unwrap();
+        let page = log.page(end, Some(1), cursor, None, 50).unwrap();
         assert!(page.entries.iter().all(|e| e.body.turn() == Some(1)));
         assert!(page.entries.windows(2).all(|w| w[0].seq < w[1].seq));
         seen.extend(page.entries.into_iter().map(|e| e.seq));
@@ -197,18 +197,68 @@ async fn worklog_turn_pages_preserve_boundaries_and_live_catchup() {
     let mut after = first_end;
     let mut count = 0;
     while after < end {
-        let page = log.page(end, 2, None, Some(after), 50).unwrap();
+        let page = log.page(end, Some(2), None, Some(after), 50).unwrap();
         assert!(page.next_after > after);
         assert!(page.entries.iter().all(|e| e.body.turn() == Some(2)));
         count += page.entries.len();
         after = page.next_after;
     }
     assert_eq!(count, 2100);
-    assert!(log.page(end, 3, None, None, 50).unwrap().entries.is_empty());
-    assert!(log.page(end, 1, Some(end + 1), None, 50).is_err());
-    assert!(log.page(end, 1, Some(first_end - 1), None, 50).is_err());
-    assert!(log.page(end, 1, Some(end), Some(0), 50).is_err());
-    assert!(log.page(end, 1, None, None, 0).is_err());
+    assert!(log.page(end, Some(3), None, None, 50).unwrap().entries.is_empty());
+    assert!(log.page(end, Some(1), Some(end + 1), None, 50).is_err());
+    assert!(log.page(end, Some(1), Some(first_end - 1), None, 50).is_err());
+    assert!(log.page(end, Some(1), Some(end), Some(0), 50).is_err());
+    assert!(log.page(end, Some(1), None, None, 0).is_err());
+}
+
+/// Without a Turn the pages are the whole session in commit order: across
+/// Turns, records without a Turn included (TODO messagehub-worksession-ui
+/// §3.8).
+#[tokio::test]
+async fn worklog_pages_without_a_turn_are_the_whole_session() {
+    let env = Env::new();
+    let sd = env.create_work(work_spec("continuous history")).await;
+    let Acquire::Acquired(lease) = sd.acquire(holder("pages")).unwrap() else { panic!() };
+    let mut session = sd.load(&lease).unwrap();
+    let body = |turn, i| WorklogBody::UserMessage {
+        run_id: format!("r-{turn}"), turn, content: format!("message-{i}"), brief: None,
+    };
+    let control = || WorklogBody::ControlApplied {
+        input: InputRef { src: "ctl".into(), index: 1, key: String::new(), kind: "control".into() },
+        command: "pause".into(), detail: serde_json::json!({ "applied": true }),
+    };
+    let mut bodies: Vec<WorklogBody> = (0..30).map(|i| body(1, i)).collect();
+    bodies.push(control());
+    bodies.extend((0..40).map(|i| body(2, i)));
+    bodies.push(control());
+    bodies.extend((0..30).map(|i| body(3, i)));
+    session.append_worklog(&lease, bodies).unwrap();
+    session.commit_state(&lease).unwrap();
+    let end = session.worklog_end();
+    let total = sd.worklog().read_range(0, end).unwrap().len();
+    let log = sd.worklog();
+    let mut cursor = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = log.page(end, None, cursor, None, 25).unwrap();
+        assert_eq!(page.next_after, end);
+        seen.splice(0..0, page.entries.into_iter().map(|e| (e.seq, e.body.turn())));
+        cursor = page.next_before;
+        if cursor.is_none() { break; }
+    }
+    assert_eq!(seen.len(), total);
+    assert!(seen.windows(2).all(|w| w[0].0 + 1 == w[1].0), "contiguous across Turns");
+    assert_eq!(seen.iter().filter(|(_, t)| t.is_none()).count(), total - 100);
+    assert!(seen.iter().any(|(_, t)| *t == Some(1)) && seen.iter().any(|(_, t)| *t == Some(3)));
+    // Forward from the start: the same records.
+    let mut after = 0;
+    let mut count = 0;
+    while after < end {
+        let page = log.page(end, None, None, Some(after), 40).unwrap();
+        count += page.entries.len();
+        after = page.next_after;
+    }
+    assert_eq!(count, total);
 }
 
 #[tokio::test]
@@ -245,9 +295,9 @@ async fn worklog_reverse_read_is_bounded_by_the_start_point() {
     sm.start_offset = offsets[start_idx];
     sm.start_seq = start_idx as u64 + 2;
     s.write_summary(&lease, &sm).unwrap();
-    let w = read_window(&s, &sm, 1_000_000).unwrap();
+    let w = read_window(&s, &sm, HistoryShape::Native, Some(1_000_000)).unwrap();
     assert!(w.reached_start);
-    assert_eq!(w.lines.len(), 4000 - start_idx);
+    assert_eq!(w.messages.len(), 4000 - start_idx);
     assert!(w.bytes_read <= 2 * 64 * 1024, "read {} bytes", w.bytes_read);
     // Uncommitted tail is truncated on the next load.
     s.append_worklog(
@@ -264,14 +314,19 @@ async fn worklog_reverse_read_is_bounded_by_the_start_point() {
     assert_eq!(fsutil::file_len(sd.worklog().path()).unwrap(), size);
 }
 
+/// Summary model: the number of rounds it was given.
 struct FakeSummarizer;
 
 #[async_trait]
-impl Summarizer for FakeSummarizer {
-    async fn summarize(&self, previous: &str, segment: &str) -> libopendan::Result<String> {
-        Ok(format!(
-            "{previous}|{} lines",
-            segment.lines().filter(|l| !l.is_empty()).count()
+impl llm_context::deps::LlmClient for FakeSummarizer {
+    async fn infer(
+        &self,
+        req: llm_context::deps::LlmInferenceRequest,
+    ) -> Result<buckyos_api::AiResponse, llm_context::error::LLMComputeError> {
+        let prompt = req.messages[1].text_content();
+        Ok(text(
+            &json!({ "summary": format!("{} rounds", prompt.matches("### round").count()) })
+                .to_string(),
         ))
     }
 }
@@ -288,36 +343,55 @@ async fn budget_exhaustion_compacts_without_gap() {
     for i in 0..200u64 {
         s.append_worklog(
             &lease,
-            vec![WorklogBody::UserMessage {
-                run_id: "r".into(),
-                turn: i,
-                content: format!("message {i} {}", "y".repeat(200)),
-                brief: None,
-            }],
+            vec![
+                WorklogBody::UserMessage {
+                    run_id: "r".into(),
+                    turn: i,
+                    content: format!("message {i} {}", "y".repeat(200)),
+                    brief: None,
+                },
+                WorklogBody::AssistantMessage {
+                    run_id: "r".into(),
+                    turn: i,
+                    assistant: format!("answer {i} {}", "z".repeat(200)),
+                    tool_calls: Vec::new(),
+                },
+            ],
         )
         .unwrap();
     }
     s.commit_state(&lease).unwrap();
-    let (msg, w) = build_history(&mut s, &lease, Some(&FakeSummarizer), 2_000)
+    let summarizer = Summarizer {
+        llm: Arc::new(FakeSummarizer),
+        model: "llm.summarize".into(),
+    };
+    let budget = 12_000;
+    let history = build_history(&mut s, &lease, Some(&summarizer), HistoryShape::Native, budget)
         .await
         .unwrap();
-    assert!(
-        w.reached_start,
-        "after compaction the window reaches the start"
-    );
+    assert!(libopendan::runner::history::estimate(&history) <= u64::from(budget));
     let sm = sd.summary_opt().unwrap().expect("summary.json written");
-    assert!(sm.history_summary.contains("lines"));
-    // No gap: the oldest rendered entry is exactly the new start.
+    assert!(sm.history_summary.ends_with("rounds"), "{}", sm.history_summary);
+    // Head (the first exchange), the summary block, the raw tail.
+    assert!(history[0].text_content().starts_with("message 0 "));
+    assert!(history[1].text_content().starts_with("answer 0 "));
+    assert!(history[2].text_content().starts_with("<history_summary>"));
+    assert!(history[3].text_content().starts_with("message "));
+    assert!(history.last().unwrap().text_content().starts_with("answer 199 "));
+    assert!(sm.head_end_offset > 0 && sm.head_end_offset < sm.start_offset);
+    // No gap: the raw records after the start point are exactly the tail.
+    let w = read_window(&s, &sm, HistoryShape::Native, None).unwrap();
+    assert!(w.reached_start);
     assert_eq!(w.oldest_offset, Some(sm.start_offset));
-    let text = msg.unwrap().text_content();
-    assert!(text.contains("message 199"));
-    assert!(!text.contains("message 0 "));
-    // Deterministic rendering for the same inputs.
-    let (msg2, _) = build_history(&mut s, &lease, Some(&FakeSummarizer), 2_000)
+    assert_eq!(w.messages[..], history[3..]);
+    // Rebuilt from summary.json the same history, without a new compaction.
+    let again = build_history(&mut s, &lease, Some(&summarizer), HistoryShape::Native, budget)
         .await
         .unwrap();
-    assert_eq!(text, msg2.unwrap().text_content());
-    assert_eq!(read_worklog(&sd).last().unwrap().body.kind(), "compaction");
+    assert_eq!(again, history);
+    let wl = read_worklog(&sd);
+    assert_eq!(wl.last().unwrap().body.kind(), "compaction");
+    assert_eq!(wl.iter().filter(|e| e.body.kind() == "compaction").count(), 1);
 }
 
 async fn kmsg_rules(client: Arc<buckyos_api::msg_queue::MsgQueueClient>) {
@@ -545,7 +619,7 @@ async fn missing_tool_or_runtime_mismatch_fails_before_inference() {
             schema: libopendan::runtime::BINDING_SCHEMA.into(),
             target: serde_json::Value::Null,
             runtime_id: "rt-other-host".into(),
-            kind: "native".into(),
+            connector: "native".into(),
             workdir: sd3.path().display().to_string(),
             workspace: None,
             bound_at_ms: 0,
@@ -597,8 +671,9 @@ async fn tool_plan_tombstones_are_repaired_before_running() {
         .await
         .is_finished());
     let bin = sd.runtime_bin_dir();
-    assert!(bin.join("rm-all").exists());
-    std::fs::remove_file(bin.join("rm-all")).unwrap();
+    let tombstone = bin.join(libopendan::runtime::bin_overlay::tombstone_name("rm-all"));
+    assert!(tombstone.exists());
+    std::fs::remove_file(tombstone).unwrap();
     let plan =
         libopendan::runtime::bin_plan_for(&sd.config().unwrap(), Some(&env.agent_root), None, &[])
             .unwrap();

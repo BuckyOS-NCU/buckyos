@@ -13,12 +13,9 @@ use buckyos_api::{DeliveryRecordWithObject, DeliveryReportResult};
 use log::{info, warn};
 use name_lib::DID;
 
-pub const MESSAGE_HUB_PLATFORM: &str = "messagehub";
-
 pub struct MessageHubExecutor {
     transport_did: DID,
     center: MessageCenter,
-    name: String,
 }
 
 impl MessageHubExecutor {
@@ -26,7 +23,6 @@ impl MessageHubExecutor {
         Self {
             transport_did,
             center,
-            name: "message-hub".to_string(),
         }
     }
 
@@ -45,14 +41,6 @@ impl MessageHubExecutor {
 impl DeliveryExecutor for MessageHubExecutor {
     fn transport_did(&self) -> DID {
         self.transport_did.clone()
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn platform(&self) -> &str {
-        MESSAGE_HUB_PLATFORM
     }
 
     fn supports_ingress(&self) -> bool {
@@ -137,7 +125,7 @@ impl DeliveryExecutor for MessageHubExecutor {
                 });
             }
             let target = configured_target.unwrap_or_else(|| {
-                format!("cyfs://local/{}/inbox", envelope.target_did.to_string())
+                format!("https://local/{}/inbox", envelope.target_did.to_string())
             });
             let dispatch = self
                 .center
@@ -179,10 +167,7 @@ impl DeliveryExecutor for MessageHubExecutor {
         } else {
             let configured = self
                 .center
-                .cyfs_dispatch
-                .read()
-                .unwrap()
-                .message_route(&msg, &envelope.target_did);
+                .native_message_route(&msg, &envelope.target_did).await;
             let snapshot = envelope.address.as_ref().and_then(|a| a.address.clone());
             let route = match configured {
                 Err(e) => {
@@ -231,7 +216,7 @@ impl DeliveryExecutor for MessageHubExecutor {
             if jwt.is_none() && self.center.is_hosted_identity(&msg.from) {
                 if let Some(signer) = self.center.zone_signer.get() {
                     let signed = msg
-                        .to_jwt(&signer.key, &signer.kid)
+                        .to_jwt(signer.key(), &signer.kid)
                         .map_err(|error| anyhow!("sign native message failed: {}", error))?;
                     self.center
                         .msg_box_db
@@ -241,7 +226,7 @@ impl DeliveryExecutor for MessageHubExecutor {
                     jwt = Some(signed);
                 }
             }
-            crate::cyfs_dispatch::send(&route, &msg, jwt.as_deref(), &envelope.msg_id).await
+            crate::cyfs_dispatch::send_authenticated(Some(&self.center), &route, &msg, jwt.as_deref(), &envelope.msg_id).await
         }
     }
 }

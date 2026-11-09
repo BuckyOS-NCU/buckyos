@@ -1,18 +1,19 @@
 //! The checkpoint hook (§8.3 / §8.5).
 //!
-//! The hook runs before every inference with the outer snapshot: it
-//! publishes the snapshot with the tool results it now contains (clears the
-//! in-flight markers it covers), routes what the bus delivered meanwhile
+//! The hook runs before every tool call and every inference with the outer
+//! snapshot: it publishes the snapshot (before a tool call: the record of
+//! what is about to be dispatched), routes what the bus delivered meanwhile
 //! (controls are applied, Observe events are merged into `pending_events`
 //! and saved) and refreshes the activity heartbeat.
 //!
-//! Inputs are never injected here: reaching a checkpoint, finishing a tool
+//! Nothing else is injected here: reaching a checkpoint, finishing a tool
 //! call or receiving an Observe event never puts a message or an event into
-//! the context. Saved semi-subscription state waits for the next controlled
-//! input (`on_init / on_input / on_context_switch`), which renders it as the
-//! snapshot message in front of its own. The one host observation placed
-//! here is the background after tool results of a run that asks for it
-//! (`[input] background = "after_tools"`, see `observe.rs`).
+//! the context. The one exception is the host's own `<<budget>>` line when
+//! the tool budget runs out (`budget.rs`). Semi-subscription state (and the new output of followed tasks)
+//! is never an input of its own: it waits for the next controlled input
+//! (`on_init / on_input / on_context_switch`), whose template may place it
+//! as background (`background.rs`). The tasks the run's calls just started
+//! are only recorded where their output stands (`observe.rs`).
 
 use std::sync::Arc;
 
@@ -58,9 +59,6 @@ pub struct SessionCheckpointHook {
     shared: Arc<Shared>,
     run: RunHandle,
     rounds: Arc<super::rounds::RoundCounter>,
-    /// The run is shown background after its tool results.
-    background: bool,
-    behavior: bool,
 }
 
 impl SessionCheckpointHook {
@@ -69,14 +67,10 @@ impl SessionCheckpointHook {
         run: RunHandle,
         rounds: Arc<super::rounds::RoundCounter>,
     ) -> Self {
-        let background = super::observe::enabled(&run);
-        let behavior = run.record().config.loop_model == agent_tool::xllm::LoopModel::Behavior;
         Self {
             shared,
             run,
             rounds,
-            background,
-            behavior,
         }
     }
 
@@ -84,23 +78,29 @@ impl SessionCheckpointHook {
         let sh = &self.shared;
         sh.lease.check()?;
         super::drive::verify_workspace_admission(sh).await?;
-        // Tool results first: publish and clear covered in-flight actions.
+        // Tool results first.
         self.run.checkpoint_with_results(snapshot, None)?;
         super::rounds::flush_counts(sh, &self.run, &self.rounds).await?;
         super::reports::sync_xml(sh, &self.run, snapshot).await?;
         // Controls, rejected records, Observe events. msg / Input events
         // stay queued for the next controlled input.
-        route_inputs(sh, true, &[]).await?;
-        let (stop, turn_stop) = {
+        route_inputs(sh, true).await?;
+        let (stop, turn_stop, paused) = {
             let s = sh.session.lock().await;
-            (s.state.stop_requested, s.state.turn_stop_requested)
+            (
+                s.state.stop_requested,
+                s.state.turn_stop_requested,
+                s.state.paused.is_some(),
+            )
         };
-        if stop || turn_stop {
+        if stop || turn_stop || paused {
             if let Some(h) = sh.interrupt.lock().expect("interrupt lock").as_ref() {
                 h.interrupt(if stop {
                     "session stop requested"
-                } else {
+                } else if turn_stop {
                     "turn stop requested"
+                } else {
+                    super::outcome::PAUSE_REASON
                 });
             }
             return Ok(());
@@ -126,7 +126,8 @@ impl SessionCheckpointHook {
         let changed = s.state.activity.touching != before;
         let due = now.saturating_sub(s.state.activity.heartbeat_ms)
             >= sh.deps.options.heartbeat_interval.as_millis() as u64;
-        if changed || due {
+        let line = sh.line_pending.swap(false, std::sync::atomic::Ordering::SeqCst);
+        if changed || due || line {
             s.state.activity.heartbeat_ms = now;
             s.commit_state(&sh.lease)?;
             let status = s.status(sh.lease.epoch());
@@ -164,10 +165,12 @@ impl CheckpointHook for SessionCheckpointHook {
         result: &llm_context::behavior_loop::LLMBehaviorResult,
         step_index: u32,
     ) -> std::result::Result<(), String> {
+        let (artifacts, report_result) =
+            agent_tool::xllm::split_report_result(result.report_result.as_ref());
         let args = super::reports::ReportArgs {
             report: result.self_report.clone().unwrap_or_default(),
-            artifacts: result.report_artifacts.clone(),
-            result: result.report_result.clone(),
+            artifacts,
+            result: report_result,
             is_end: result.report_end,
         };
         if self
@@ -189,36 +192,15 @@ impl CheckpointHook for SessionCheckpointHook {
         snapshot: &LLMContextSnapshot,
     ) -> std::result::Result<Option<Injection>, String> {
         self.boundary(snapshot).await.map_err(|e| e.to_string())?;
-        if !self.background {
-            return Ok(None);
+        // The TodoList follows its work sessions (what became ready starts).
+        if let Err(e) = super::todos::sync(&self.shared).await {
+            log::warn!("todo sync of {}: {e}", self.shared.dir.sid());
         }
-        super::observe::at_boundary(&self.shared, snapshot, self.behavior)
+        super::observe::note_started(&self.shared, &self.run)
             .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// Hand-overs to a Todo executor and yields are the session's to judge
-    /// (TodoList §2.2): refused, they are corrected in the same run.
-    async fn review_decision(
-        &self,
-        snapshot: &LLMContextSnapshot,
-        result: &llm_context::LLMBehaviorResult,
-        _step_index: u32,
-        decision: llm_context::StepDecision,
-    ) -> Option<llm_context::DecisionVerdict> {
-        let run_id = self.run.run_id();
-        match decision {
-            llm_context::StepDecision::Handover => {
-                let target = result.next_behavior.as_deref()?.trim();
-                if !agent_tool::xllm::is_handover_target(target) {
-                    return None;
-                }
-                super::todos::review_handover(&self.shared, run_id, target).await
-            }
-            llm_context::StepDecision::Yield => {
-                super::todos::review_yield(&self.shared, run_id, snapshot).await
-            }
-        }
+            .map_err(|e| e.to_string())?;
+        // The one injection of the host: the tool budget is running out.
+        Ok(super::budget::warning(snapshot))
     }
 }
 

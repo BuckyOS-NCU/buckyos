@@ -27,6 +27,17 @@ export interface ObjectIdRef {
 }
 
 /**
+ * A binding in an application object bucket: `obj://bucket/<bucket_id>/<key>`.
+ * `token` is a `bkt_` read token for content the viewer has no grant on.
+ */
+export interface BucketObjectRef {
+  kind: 'bucket-object'
+  url: string
+  version?: number
+  token?: string
+}
+
+/**
  * Host-provided, already-resolved content (drag & drop, clipboard, an IM
  * attachment held in memory). Reserved extension slot per §10.2 — it must
  * never be required by a host that only has paths / object ids.
@@ -49,7 +60,7 @@ export function extensionRefField(ref: ContentRef, field: 'name' | 'reference'):
   return typeof found === 'string' && found ? found : undefined
 }
 
-export type ContentRef = CyfsPathRef | ObjectIdRef | BlobRef | ExtensionRef
+export type ContentRef = CyfsPathRef | ObjectIdRef | BucketObjectRef | BlobRef | ExtensionRef
 
 export function isCyfsPathRef(ref: ContentRef): ref is CyfsPathRef {
   return ref.kind === 'cyfs-path' && typeof (ref as CyfsPathRef).path === 'string'
@@ -57,6 +68,10 @@ export function isCyfsPathRef(ref: ContentRef): ref is CyfsPathRef {
 
 export function isObjectIdRef(ref: ContentRef): ref is ObjectIdRef {
   return ref.kind === 'object-id' && typeof (ref as ObjectIdRef).objectId === 'string'
+}
+
+export function isBucketObjectRef(ref: ContentRef): ref is BucketObjectRef {
+  return ref.kind === 'bucket-object' && typeof (ref as BucketObjectRef).url === 'string'
 }
 
 export function isBlobRef(ref: ContentRef): ref is BlobRef {
@@ -226,8 +241,13 @@ export type PreviewResolution =
 export interface PreviewRuntimeProfile {
   acceptTypes: PreviewRendererType[]
   imageMediaTypes: string[]
+  /** Containers `canPlayType` answered for — a hint, never a Direct gate (video Direct is tried by container). */
   videoMediaTypes: string[]
   audioMediaTypes: string[]
+  /** `canPlayType` with codecs: hints sent to the Pipeline so it can remux instead of transcoding. */
+  videoCodecs: { h264: boolean; hevc: boolean }
+  /** The 2×2 HEIC decode probe succeeded (Safari 17+). */
+  heic: boolean
   pdfInline: boolean
 }
 
@@ -243,6 +263,8 @@ export interface EnsurePreviewWorkRequest {
   source: ResolvedPreviewSource
   runtimeProfile: PreviewRuntimeProfile
   targetProfile: PreviewTargetProfile
+  /** The classified media type (bytes / header / extension): picks the provider's conversion profile. */
+  mediaType?: string
   options?: {
     retry?: boolean
     expectedAttemptId?: string
@@ -269,13 +291,16 @@ export class PreviewError extends Error {
   readonly code: PreviewErrorCode
   readonly retryable: boolean
   readonly detail?: string
+  /** HTTP status when the content server answered with an error. */
+  readonly status?: number
 
-  constructor(code: PreviewErrorCode, message: string, opts?: { retryable?: boolean; detail?: string }) {
+  constructor(code: PreviewErrorCode, message: string, opts?: { retryable?: boolean; detail?: string; status?: number }) {
     super(message)
     this.name = 'PreviewError'
     this.code = code
     this.retryable = opts?.retryable ?? (code === 'NETWORK' || code === 'TIMEOUT' || code === 'INTERNAL')
     this.detail = opts?.detail
+    this.status = opts?.status
   }
 }
 

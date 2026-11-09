@@ -2,10 +2,11 @@
  * method, no behaviour of its own: retries, idempotency and the change stream live in session.ts. */
 
 import type {
-  AnnotationRead, ChangesPage, CollabState, CommitRequest, CommitResult, EntityEnvelope, ExportResult, GrantList, ListAnnotationsParams, LockInfo, PrepareResult,
+  AnnotationRead, BucketBinding, BucketDownload, ChangesPage, CollabState, CommitRequest, CommitResult, EntityEnvelope, ExportResult, GrantList, ListAnnotationsParams, LockInfo, PrepareResult, StagedAsset,
   QueryPage, QueryParams, ReadResult, Result, RunView, Selector, WorkspaceInfo, WorkspaceSummary, Capability, Json, WishAiccMode,
   DerivedRecord, FreshnessInfo, Operation, RelationsInfo, Subject, VersionInfo, WishChoices, WishRunView,
   ShowCommand, ShowLockInfo, ShowNotes, ShowStart, ShowState, ShowWatch, ShareEntry, EntryJoin, WishClaim, WishToolAnswer, HostedExecConfig, Publication, Referrer,
+  ExtBuildResult, ExtExportResult, ExtMigration, ExtPackResult, LibraryPackage, TemplateSpec,
 } from './types'
 import { parseAccessDenial, type AccessDenial } from 'buckyos'
 import type { Transport } from './transport'
@@ -43,6 +44,36 @@ export class AiwsClient {
   wsUnpublish(ws: Ws, entity_id: string) { return this.call<Result<{ removed: number }>>('ws.unpublish', { ...ws, entity_id }) }
   wsListPublications(ws: Ws) { return this.call<Result<{ publications: Publication[] }>>('ws.list_publications', ws) }
   wsListReferrers(ws: Ws, entity_id: string) { return this.call<Result<{ referrers: Referrer[] }>>('ws.list_referrers', { ...ws, entity_id }) }
+  // extension controls (扩展控件 P0, README “Extension controls”): the Workspace's definitions and the caller's library
+  extBuild(ws: Ws, params: Record<string, unknown>) { return this.call<Result<ExtBuildResult>>('ext.build', { ...ws, ...params }) }
+  extExport(ws: Ws, entity_ids: string[], purpose: 'package' | 'pull' = 'package') { return this.call<Result<ExtExportResult>>('ext.export', { ...ws, entity_ids, purpose }) }
+  extImport(ws: Ws, items: { pkg_id: string; ident: string }[]) { return this.call<Result<ExtBuildResult>>('ext.import', { ...ws, items }) }
+  extInstallFrom(ws: Ws, entity_ids: string[], pkg: { name: string; version: string; title?: string }, templates?: TemplateSpec[]) {
+    return this.call<Result<{ pkg_id: string; version: string; action: string }>>('ext.install', { from: { ...ws, entity_ids, ...(templates?.length ? { templates } : {}) }, package: pkg, mode: 'dev' })
+  }
+  /** P2 (Q30): rebuild definitions from the version of their package in the caller's library, with a migration. */
+  extUpgrade(ws: Ws, items: { def_entity_id: string; pkg_id?: string }[], opts: { migration?: Record<string, ExtMigration>; force?: boolean; dry_run?: boolean }) {
+    return this.call<Result<ExtBuildResult>>('ext.upgrade', { ...ws, items, ...opts })
+  }
+  /** The files of library controls (base64), e.g. to compare a newer version's interface. */
+  extLibraryBundle(pkg_id: string, idents?: string[]) {
+    return this.call<Result<{ manifest: Json; controls: { ident: string; files: { name: string; size: number; obj_id: string; base64: string }[] }[] }>>('ext.library_bundle', { pkg_id, ...(idents ? { idents } : {}) })
+  }
+  /** P3 (Q32): a template of chosen Surfaces (its manifest item, the definitions it needs, its files). */
+  extExportTemplate(ws: Ws, spec: TemplateSpec) {
+    return this.call<Result<{ template: Json; controls: Json[]; files: { path: string; size: number; base64: string }[] }>>('ext.export_template', { ...ws, ...spec })
+  }
+  /** A new Workspace from a template of the caller's library. */
+  extCreateFromTemplate(pkg_id: string, template_id: string, title?: string, params?: Record<string, Json>) {
+    return this.call<Result<{ workspace_id: string; title: string; epoch: string }>>('ext.create_from_template', { pkg_id, template_id, ...(title ? { title } : {}), ...(params ? { params } : {}) })
+  }
+  extListLibrary() { return this.call<Result<{ packages: LibraryPackage[] }>>('ext.list_library', {}) }
+  /** P1 (Q20): the service packs the definitions (and what they build on) as an `aiws` .pikg in the caller's `exports` bucket. */
+  extPack(ws: Ws, entity_ids: string[], pkg: { name: string; version: string; title?: string }, templates?: TemplateSpec[]) { return this.call<Result<ExtPackResult>>('ext.pack', { ...ws, entity_ids, package: pkg, ...(templates?.length ? { templates } : {}) }) }
+  /** A .pikg bound in the caller's own `exports` bucket into its library (the binding is consumed, Q21). */
+  extInstallBound(binding: { bucket_id: string; key: string }) {
+    return this.call<Result<{ pkg_id: string; version: string; action: string; controls: Json[] }>>('ext.install', { pikg: binding, mode: 'dev' })
+  }
   // share entries (hybrid SSO contract §8.3): links that offer sign-in methods and grant a template
   wsCreateEntry(ws: Ws, params: { capabilities: Capability[]; methods: ShareEntry['methods']; scope_entity_id?: string; expires_at?: number }) {
     return this.call<Result<{ entry: ShareEntry }>>('ws.create_entry', { ...ws, ...params })
@@ -53,9 +84,9 @@ export class AiwsClient {
   wsGetUserState(ws: Ws) { return this.call<Result<{ entries: Record<string, Json>; updated_at: Record<string, string>; revisions: Record<string, number> }>>('ws.get_user_state', ws) }
   /** `expect: { key: revision }` makes a write conditional (D13): a moved revision is a REVISION_CONFLICT. */
   wsSetUserState(ws: Ws, entries: Record<string, Json | null>, expect?: Record<string, number>) { return this.call<Result<{ updated_at: string; revisions: Record<string, number> }>>('ws.set_user_state', { ...ws, entries, ...(expect ? { expect } : {}) }) }
-  wsBeginImport() { return this.call<Result<{ upload_id: string }>>('ws.begin_import', {}) }
-  wsImport(upload_id: string, semantics: 'restore' | 'new', replace: boolean) {
-    return this.call<Result<{ workspace_id: string; epoch: string; content_root?: string }>>('ws.import', { upload_id, semantics, ...(replace ? { replace: true } : {}) })
+  /** The package the caller bound into its own `exports` bucket; a successful import consumes it. */
+  wsImport(pkg: BucketBinding, semantics: 'restore' | 'new', replace: boolean) {
+    return this.call<Result<{ workspace_id: string; epoch: string; content_root?: string }>>('ws.import', { bucket_id: pkg.bucket_id, key: pkg.key, semantics, ...(replace ? { replace: true } : {}) })
   }
 
   // ---- reads
@@ -112,18 +143,12 @@ export class AiwsClient {
 
   // ---- offline replica (design §6.2)
   replicaBootstrap(ws: Ws) {
-    return this.call<Result<{ replica_id: string; epoch: string; head_seq: number; principal: string; prepared_at: string }>>('replica.bootstrap', ws)
+    return this.call<Result<{ replica_id: string; epoch: string; head_seq: number; principal: string; prepared_at: string; download: BucketDownload }>>('replica.bootstrap', ws)
   }
 
-  // ---- assets
-  assetBeginUpload(ws: Ws, size: number, file_name?: string) {
-    return this.call<Result<{ upload_id: string }>>('asset.begin_upload', { ...ws, size, ...(file_name ? { file_name } : {}) })
-  }
-  assetFinishUpload(ws: Ws, upload_id: string) {
-    return this.call<Result<{ object_id: string; media_type: string; size: number }>>('asset.finish_upload', { ...ws, upload_id })
-  }
-  assetImportObject(ws: Ws, obj_id: string) {
-    return this.call<Result<{ object_id: string; source_obj_id: string; media_type: string; size: number }>>('asset.import_object', { ...ws, obj_id })
+  // ---- assets: uploaded through NDM, then taken over into the Workspace owner's `assets` bucket
+  assetImportObject(ws: Ws, source: { obj_id: string } | BucketBinding) {
+    return this.call<Result<StagedAsset>>('asset.import_object', { ...ws, ...source })
   }
 
   // ---- controlled processing (Mock)

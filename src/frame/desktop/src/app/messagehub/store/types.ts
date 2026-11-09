@@ -1,7 +1,8 @@
 import type { z } from 'zod'
 import type { ComposerAttachmentInput } from '../conversation/input/attachmentDraft'
 import type { ConversationMessageReader } from '../conversation/history/types'
-import type { MachineContent, MessageObject, MsgMentions, MsgRelation, VoiceNote } from '../protocol/msgobj'
+import type { ndn } from 'buckyos'
+import type { MessageObject, VoiceNote } from '../protocol/msgobj'
 import type { createSessionSchema } from '../sessionModel'
 import type { createGroupSchema } from '../groupModel'
 import type { CreationPolicy, Entity, EntityDetail, GroupInfo, GroupInvitation, GroupInvitationView, GroupSessionInfo, GroupSessionParticipants, MessageHubContext, ReadReceipt, RuntimeState, Session, SessionAccess, SessionBinding, SessionPreferences } from '../types'
@@ -17,9 +18,9 @@ export interface OutgoingPayload {
   signal?: AbortSignal
   content: string
   attachments: ComposerAttachmentInput[]
-  relatesTo?: MsgRelation
-  mentions?: MsgMentions
-  machine?: MachineContent
+  relatesTo?: ndn.MsgRelation
+  mentions?: ndn.MsgMentions
+  machine?: ndn.MachineContent
   voice?: VoiceNote
   localId?: string
   submittedAt?: number
@@ -39,7 +40,8 @@ export interface ConnectionChoice {
 
 /** Load state of one owner's data (self or an observed agent). */
 export type OwnerStatus =
-  | { phase: 'idle' | 'loading' | 'ready' }
+  | { phase: 'idle' | 'loading' }
+  | { phase: 'ready'; refreshing?: boolean }
   | { phase: 'denied' }
   | { phase: 'error'; message: string }
 
@@ -145,6 +147,7 @@ export interface MessageHubStore {
   /** Invites each DID; resolves to the DIDs whose invitation failed, with the reason. */
   inviteGroupMembers(context: MessageHubContext, groupDid: string, memberDids: string[]): Promise<Array<{ did: string; reason: string }>>
   removeGroupMember(context: MessageHubContext, groupDid: string, memberDid: string): Promise<void>
+  revokeGroupInvite(context: MessageHubContext, groupDid: string, memberDid: string): Promise<void>
   approveGroupMember(context: MessageHubContext, groupDid: string, memberDid: string): Promise<void>
   rejectGroupMember(context: MessageHubContext, groupDid: string, memberDid: string): Promise<void>
   updateGroupMemberRole(context: MessageHubContext, groupDid: string, memberDid: string, role: 'admin' | 'member'): Promise<void>

@@ -1,8 +1,9 @@
-import { Download, File, FileArchive, FileText, Film, FolderOpen, Loader2, Music, Play } from 'lucide-react'
+import { Bookmark, BookmarkCheck, Download, File, FileArchive, FileText, Film, FolderOpen, Loader2, Music, Play } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { networkCache } from '../../../../components/network/cache'
 import { usePreviewThumbnail } from '../../../../components/preview/thumbnail'
 import { useI18n } from '../../../../i18n/provider'
-import { getObjectAccess, type ObjectInfo } from '../history/objectAccess'
+import { getObjectAccess, isLocalObjectId, objectFailure, type ObjectFailure, type ObjectInfo } from '../history/objectAccess'
 import { useOpenAttachment } from './context'
 import { knownReadyObject, objectCacheKey, readyObjectKind, readyObjects, rememberReadyObject, type ReadyObjectState } from './objectCache'
 import { useMediaSettings } from './settings'
@@ -17,6 +18,8 @@ import {
 installMessageHubPreviewSources()
 
 const THUMBNAIL_BOX = { width: 320, height: 240 }
+/** A local read answers well before this; anything slower is waiting for another Zone. */
+const FETCHING_HINT_MS = 1200
 
 function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`
@@ -41,8 +44,17 @@ export function MessageAttachmentView({ attachment, isSelf, onKind }: { attachme
 
 type ObjectState =
   | { phase: 'loading' }
+  | { phase: 'fetching' }
+  | { phase: 'awaiting' }
   | ReadyObjectState
-  | { phase: 'error'; message: string }
+  | { phase: 'error'; message: string; failure: ObjectFailure }
+
+/** Failures a retry cannot change, with what to say about them. */
+const FINAL_FAILURES: Partial<Record<ObjectFailure, string>> = {
+  directory: 'messagehub.attachmentDirectoryUnsupported',
+  too_large: 'messagehub.attachmentTooLargeToOpen',
+  corrupt: 'messagehub.attachmentCorrupt',
+}
 
 function ObjectAttachment({ attachment, isSelf, onKind }: { attachment: MessageAttachment; isSelf: boolean; onKind?: (kind: AttachmentKind) => void }) {
   const { t } = useI18n()
@@ -54,20 +66,47 @@ function ObjectAttachment({ attachment, isSelf, onKind }: { attachment: MessageA
     if (readyObjects.has(cacheKey) && retry === 0) return
     const access = getObjectAccess()
     let cancelled = false
+    const slow = window.setTimeout(() => { if (!cancelled) setState(current => current.phase === 'loading' ? { phase: 'fetching' } : current) }, FETCHING_HINT_MS)
+    const failed = (error: unknown) => {
+      if (cancelled) return
+      const failure = objectFailure(error)
+      setState(failure === 'awaiting_acceptance' ? { phase: 'awaiting' } : { phase: 'error', message: error instanceof Error ? error.message : String(error), failure })
+    }
     const resolve = access ? access.describe(objId, attachment.context) : Promise.reject(new Error('unavailable'))
     void resolve.then(async (info) => {
       if (cancelled) return
       const inline = info.isFile && isInlineImageType(attachmentMediaType(info, attachment.label))
-      const contentUrl = inline && access ? await access.contentUrl(objId, attachment.context).catch(() => undefined) : undefined
+      let contentUrl: string | undefined
+      if (inline && access) {
+        try {
+          contentUrl = await access.contentUrl(objId, attachment.context)
+        } catch (error) {
+          const failure = objectFailure(error)
+          if (failure === 'fetching' || failure === 'unreachable' || failure === 'corrupt') {
+            failed(error)
+            return
+          }
+        }
+      }
       if (cancelled) return
       const ready: ReadyObjectState = { phase: 'ready', info, contentUrl }
-      if (!inline || contentUrl) rememberReadyObject(cacheKey, ready)
+      if ((!inline || contentUrl) && !info.remote) rememberReadyObject(cacheKey, ready)
       setState(ready)
-    }).catch((error: unknown) => {
-      if (!cancelled) setState({ phase: 'error', message: error instanceof Error ? error.message : String(error) })
-    })
-    return () => { cancelled = true }
+    }).catch(failed).finally(() => window.clearTimeout(slow))
+    return () => { cancelled = true; window.clearTimeout(slow) }
   }, [objId, attachment.label, attachment.context, cacheKey, retry])
+
+  // Accepting the sender changes the answer: nothing was cached, ask again.
+  const awaiting = state.phase === 'awaiting'
+  useEffect(() => {
+    if (!awaiting) return
+    const seen = networkCache.getEpoch()
+    return networkCache.subscribe(() => {
+      if (networkCache.getEpoch() === seen) return
+      setState({ phase: 'loading' })
+      setRetry(value => value + 1)
+    })
+  }, [awaiting])
 
   const label = attachment.label
   const readyKind = state.phase === 'ready' ? readyObjectKind(state, label) : undefined
@@ -75,8 +114,15 @@ function ObjectAttachment({ attachment, isSelf, onKind }: { attachment: MessageA
   if (state.phase === 'loading') {
     return <span className="text-xs" data-testid="attachment-loading">{t('messagehub.attachmentLoading')} · {label}</span>
   }
+  if (state.phase === 'fetching') {
+    return <span className="flex items-center gap-1.5 text-xs break-all" data-testid="attachment-fetching"><Loader2 size={12} className="shrink-0 animate-spin" />{t('messagehub.attachmentFetching')} · {label}</span>
+  }
+  if (state.phase === 'awaiting') {
+    return <span className="text-xs break-all" data-testid="attachment-awaiting">{label} · {t('messagehub.attachmentAwaitingAcceptance')}</span>
+  }
   if (state.phase === 'error') {
-    return <span className="text-xs break-all" role="alert" data-testid="attachment-error">{label} · {t('messagehub.attachmentUnavailable')} <button type="button" className="underline" onClick={() => { setState({ phase: 'loading' }); setRetry(value => value + 1) }}>{t('messagehub.retry')}</button></span>
+    const final = FINAL_FAILURES[state.failure]
+    return <span className="text-xs break-all" role="alert" data-testid="attachment-error" data-failure={state.failure}>{label} · {t(final ?? 'messagehub.attachmentUnavailable')} {final ? null : <button type="button" className="underline" onClick={() => { setState({ phase: 'loading' }); setRetry(value => value + 1) }}>{t('messagehub.retry')}</button>}</span>
   }
   const { info } = state
   if (info.isDirectory) return <DirectoryAttachment attachment={attachment} info={info} />
@@ -87,7 +133,12 @@ function ObjectAttachment({ attachment, isSelf, onKind }: { attachment: MessageA
   const kind = readyKind ?? 'file'
   let body: ReactNode
   if (kind === 'image' && state.contentUrl) {
-    body = <InlineImage attachment={attachment} url={state.contentUrl} isGif={mediaType === 'image/gif'} />
+    body = (
+      <div className="group/collect relative w-fit max-w-full">
+        <InlineImage attachment={attachment} url={state.contentUrl} isGif={mediaType === 'image/gif'} />
+        <CollectButton attachment={attachment} name={info.name ?? label} overlay />
+      </div>
+    )
   } else if (kind === 'video' || kind === 'image') {
     body = <ThumbnailTile attachment={attachment} kind={kind} info={info} />
   } else {
@@ -125,7 +176,6 @@ function InlineImage({ attachment, url, isGif }: { attachment: MessageAttachment
       type="button"
       onClick={() => open(attachment, 'image')}
       className="group relative block w-fit max-w-[min(100%,420px)] cursor-zoom-in overflow-hidden rounded-xl focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--cp-accent)]"
-      style={{ background: 'color-mix(in srgb, var(--cp-text) 6%, transparent)' }}
       title={t('messagehub.media.open', undefined, { name: attachment.label })}
       data-testid="attachment-image"
       data-gif={isGif ? (still ? 'still' : 'animated') : undefined}
@@ -161,7 +211,8 @@ function GifStill({ url, label }: { url: string; label: string }) {
 function ThumbnailTile({ attachment, kind, info }: { attachment: MessageAttachment; kind: AttachmentKind; info: ObjectInfo }) {
   const { t } = useI18n()
   const open = useOpenAttachment()
-  const thumbnail = usePreviewThumbnail(attachment.source, THUMBNAIL_BOX)
+  // A thumbnail needs the bytes: one still in another Zone waits for a click.
+  const thumbnail = usePreviewThumbnail(info.remote ? null : attachment.source, THUMBNAIL_BOX)
   const ready = thumbnail.status === 'ready' ? thumbnail.thumbnail : null
   const duration = ready?.durationSeconds
   const isVideo = kind === 'video'
@@ -171,7 +222,7 @@ function ThumbnailTile({ attachment, kind, info }: { attachment: MessageAttachme
         type="button"
         onClick={() => open(attachment, kind)}
         className="relative block w-fit max-w-[min(100%,420px)] cursor-pointer overflow-hidden rounded-xl focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--cp-accent)]"
-        style={{ background: 'color-mix(in srgb, var(--cp-text) 10%, transparent)' }}
+        style={{ background: ready ? undefined : 'color-mix(in srgb, var(--cp-text) 10%, transparent)' }}
         title={t('messagehub.media.open', undefined, { name: attachment.label })}
         data-testid={isVideo ? 'attachment-video' : 'attachment-thumbnail'}
         data-thumbnail={thumbnail.status}
@@ -193,6 +244,7 @@ function ThumbnailTile({ attachment, kind, info }: { attachment: MessageAttachme
       </button>
       <span className="flex max-w-[min(100%,420px)] items-center gap-1">
         <span className="min-w-0 flex-1 truncate text-[11px] opacity-75">{info.name ?? attachment.label}{info.size !== undefined ? ` · ${formatBytes(info.size)}` : ''}</span>
+        <CollectButton attachment={attachment} name={info.name ?? attachment.label} compact />
         <DownloadButton attachment={attachment} name={info.name ?? attachment.label} compact />
       </span>
     </div>
@@ -225,8 +277,44 @@ function FileCard({ attachment, kind, info, mediaType, isSelf }: { attachment: M
           <span className="block truncate text-[11px] opacity-75">{[info.size !== undefined ? formatBytes(info.size) : null, mediaType].filter(Boolean).join(' · ')}</span>
         </span>
       </button>
+      <CollectButton attachment={attachment} name={info.name ?? attachment.label} />
       <DownloadButton attachment={attachment} name={info.name ?? attachment.label} />
     </div>
+  )
+}
+
+/** Saves the attachment to the viewer's collection, which keeps it after the message is recalled. */
+function CollectButton({ attachment, name, compact = false, overlay = false }: { attachment: MessageAttachment; name: string; compact?: boolean; overlay?: boolean }) {
+  const { t } = useI18n()
+  const [state, setState] = useState<'idle' | 'saving' | 'saved' | 'failed'>('idle')
+  const access = getObjectAccess()
+  const objId = attachment.objId
+  if (!access?.collect || !objId || !attachment.context || isLocalObjectId(objId)) return null
+  const collect = access.collect
+  const save = () => {
+    if (state === 'saving' || state === 'saved') return
+    setState('saving')
+    collect(objId, attachment.context).then(() => setState('saved'), () => setState('failed'))
+  }
+  const label = state === 'saved' ? t('messagehub.media.collected') : state === 'failed' ? `${t('messagehub.media.collectFailed')} · ${t('messagehub.retry')}` : t('messagehub.media.collect', undefined, { name })
+  const size = compact || overlay ? 14 : 18
+  const placement = overlay
+    ? `absolute right-2 top-2 h-8 w-8 rounded-full text-white ${state === 'idle' ? 'opacity-0 group-hover/collect:opacity-100 focus-visible:opacity-100' : ''}`
+    : `rounded-lg ${compact ? 'h-8 w-8' : 'h-11 w-11'}`
+  return (
+    <button
+      type="button"
+      onClick={save}
+      className={`flex shrink-0 items-center justify-center focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--cp-accent)] ${placement}`}
+      style={overlay ? { background: 'rgba(0,0,0,0.55)', color: state === 'failed' ? 'var(--cp-danger)' : undefined } : { color: state === 'failed' ? 'var(--cp-danger)' : 'inherit', opacity: state === 'idle' ? 0.8 : 1 }}
+      aria-label={label}
+      title={label}
+      aria-busy={state === 'saving'}
+      data-testid="attachment-collect"
+      data-state={state}
+    >
+      {state === 'saving' ? <Loader2 size={size} className="animate-spin" /> : state === 'saved' ? <BookmarkCheck size={size} /> : <Bookmark size={size} />}
+    </button>
   )
 }
 

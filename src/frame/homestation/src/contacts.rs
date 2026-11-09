@@ -276,13 +276,16 @@ mod tests {
         );
         let mut cfg = crate::StationConfig::new(owner, "alice", "alice.test", "alice");
         cfg.spider_enabled = false;
+        let signer = crate::sign::Signer::from_pem(pem.as_bytes(), format!("{owner}#main_key")).unwrap();
+        let cross_zone = Arc::new(buckyos_api::CrossZoneClient::new(signer.device_signer().unwrap(), None).unwrap());
         let station = crate::Station::new(
             cfg,
-            crate::db::Db::open(&dir.path().join("hs.db")).unwrap(),
-            crate::sign::Signer::from_pem(pem.as_bytes(), format!("{owner}#main_key")).unwrap(),
+            crate::db::Db::open(&dir.path().join("homestation-main.db")).unwrap().for_owner("alice"),
+            signer,
             Arc::new(directory),
+            cross_zone,
             CachedContacts::new(contacts, Duration::from_secs(30)),
-            Arc::new(crate::objects::FsChunkStore { dir: dir.path().join("chunks") }),
+            Arc::new(crate::objects::Storage::nfs_server(&crate::test_nfs::start_nfs_server(&dir.path().join("nfs")).await)),
             None,
         );
         let input = serde_json::from_value(json!({ "text": "for some", "attachments": [], "link": null, "audience": audience })).unwrap();

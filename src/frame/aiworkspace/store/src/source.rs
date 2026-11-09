@@ -38,6 +38,9 @@ pub enum Fetched {
 }
 
 /// A name in a published link: lower-case ASCII letters, digits and dashes.
+/// First path segments a Workspace title may not take on its own host (see `workspace_slug`).
+pub const RESERVED_WORKSPACE_SLUGS: &[&str] = &["home", "kapi", "api", "s3", "bucket", "ndm", "nfs", "assets", "aiworkspace", "messagehub"];
+
 pub fn pub_name(s: &str) -> String {
     let ascii: String = s.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     ascii.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-").chars().take(64).collect()
@@ -99,10 +102,12 @@ impl Workspace {
                    "published_at": at, "published_by": by, "referrers": referrers }))
     }
 
-    /// The workspace's own segment of a link (D21): its title, slugified; the id is in the host.
+    /// The workspace's own segment of a link (D21): its title, slugified; the id is in the host. Empty, or one of
+    /// the first segments the Zone gateway routes elsewhere on every host (`/home/*` → HomeStation, `/kapi/*`,
+    /// `/s3/*`, `/bucket/*`, `/ndm/*`, `/nfs/*`) or the Desktop build's own directories, becomes `workspace`.
     pub fn workspace_slug(&self) -> String {
         let s = pub_name(&self.title());
-        if s.is_empty() { "workspace".into() } else { s }
+        if s.is_empty() || RESERVED_WORKSPACE_SLUGS.contains(&s.as_str()) { "workspace".into() } else { s }
     }
 
     /// `ws.list_publications` (any read): names, entities and how many referrers registered.
@@ -181,14 +186,18 @@ impl Workspace {
         if fixed {
             let mut sink = crate::objects::StoreSink::new(&self.objects);
             let root = content_object(&ctx, &e, &mut sink)?;
+            // a consumer pins this version: the owner's `exports` bucket keeps it a week past its last fixed read
+            let mut members = std::collections::BTreeMap::new();
+            self.objects.entity_members(&root, &e.type_id, &mut members)?;
+            self.objects.retain(&self.bucket(crate::objects::EXPORTS)?, &format!("{}/fixed/{root}", self.workspace_id), &members)?;
             v["content_root"] = json!(root);
             v["reference"] = json!({ "workspace_id": self.workspace_id, "entity_id": entity_id, "mode": "fixed", "version": { "content_root": root } });
         }
         Ok(v)
     }
 
-    /// The content a consumer pinned (`version.content_root`), read back from the object store: valid as long as
-    /// the object is retained.
+    /// The content a consumer pinned (`version.content_root`), read back from the named store: valid as long as
+    /// it is there (its `exports` binding keeps it seven days after the last fixed read).
     pub fn public_fixed_content(&self, content_root: &str) -> WsResult<Value> {
         if !self.objects.has_object(content_root) {
             return Err(WsError::new(Code::VersionNotRetained, "that fixed version is no longer retained"));
@@ -251,6 +260,9 @@ impl Workspace {
         check_idempotency_key(idem_key)?;
         let access = self.require_ws_any(caller)?;
         let (_, source) = self.source_of(entity_id)?;
+        if source["kind"] == json!("session") {
+            return Err(WsError::invalid_op("a session feed is written by its session, not fetched"));
+        }
         let now = self.now();
         if !access.can(&self.ctx(&now), entity_id, Cap::Update)? {
             return Err(WsError::denied("refreshing a Source needs update on its entity"));
@@ -329,7 +341,7 @@ impl Workspace {
     }
 
     /// Operations that turn the current content into `fetched`.
-    fn source_ops(&mut self, caller: &Caller, entity_id: &str, fetched: &Fetched) -> WsResult<Vec<Value>> {
+    pub(crate) fn source_ops(&mut self, caller: &Caller, entity_id: &str, fetched: &Fetched) -> WsResult<Vec<Value>> {
         let now = self.now();
         let (e, fields, records, ast) = {
             let ctx = self.ctx(&now);
@@ -525,7 +537,6 @@ pub fn refreshed_at(ws: &Workspace, entity_id: &str) -> WsResult<Option<String>>
     local_get(&ws.local, &format!("source_refreshed:{entity_id}"))
 }
 
-#[allow(dead_code)]
 fn _format(ms: i64) -> String {
     format_utc_ms(ms)
 }

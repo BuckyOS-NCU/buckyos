@@ -2,7 +2,7 @@
 
 日期：2026-10-21。状态：阶段 A 交付物，随实现迭代；与代码冲突时以代码和本文同步修订为准。
 
-依据：[混合 SSO PRD](<BuckyOS 混合SSO PRD.md>)（v0.2）、[实施 TODO](<../../../notepads/hybrid-sso-implementation-todo.md>) §4 已定决策（D-1～D-9、Q-01～Q-10、S-1、P-1、P-2）、[UserType.md](<../../../product/users_and_agents/UserType.md>)。本文只冻结工程契约，不新增产品决策；术语沿用 PRD：专属邀请、自助注册、DID 登录、Guest。
+依据：[混合 SSO PRD](<BuckyOS 混合SSO PRD.md>)（v0.2）、[实施 TODO](<../../../notepads/done/hybrid-sso-implementation-todo.md>) §4 已定决策（D-1～D-9、Q-01～Q-10、S-1、P-1、P-2）、[UserType.md](<../../../product/users_and_agents/UserType.md>)。本文只冻结工程契约，不新增产品决策；术语沿用 PRD：专属邀请、自助注册、DID 登录、Guest。
 
 ## 1. 组件职责
 
@@ -192,7 +192,7 @@ kRPC 失败响应增加可选字段（buckyos-base kRPC）：
 
 ### 5.6 App 签发的登录码与 `verify-hub.login_by_app_access_token`（EXT-09，2026-10-24；`kind=link` 见 EXT-11）
 
-App 为自己的外部客户代登录（[应用扩展实施 TODO](../../../notepads/self-host-group-extension-todo.md) D-5 / D-7）。复用专属邀请的记录结构与判定表，差别只在签发方、有效期和一次性。`credential.kind`（`link` 缺省 | `code`）标明记录的凭据是 `/sso/invite` 链接的 `#s=` 还是 App 页面兑换的一次性 code，两者不互换：`login_by_exclusive_invite` 只接受 `link`，`login_by_app_access_token` 只接受 `code`，不符返回 `entry_unavailable` + `credential_kind`（排在“记录不存在 / 撤销”之后、账号状态之前）。
+App 为自己的外部客户代登录（[应用扩展实施 TODO](../../../notepads/done/self-host-group-extension-todo.md) D-5 / D-7）。复用专属邀请的记录结构与判定表，差别只在签发方、有效期和一次性。`credential.kind`（`link` 缺省 | `code`）标明记录的凭据是 `/sso/invite` 链接的 `#s=` 还是 App 页面兑换的一次性 code，两者不互换：`login_by_exclusive_invite` 只接受 `link`，`login_by_app_access_token` 只接受 `code`，不符返回 `entry_unavailable` + `credential_kind`（排在“记录不存在 / 撤销”之后、账号状态之前）。
 
 - **开关**：`services/control_panel/app_login/<app_instance_id>` → `{enabled, updated_by, updated_at}`，缺省关；owner 以 CP 用户会话调 `apps.app_login.set`。关闭时 CP 对每个绑定账号调 `revoke_families {subject, source_app_instance_id}`。
 - **绑定表**：`services/control_panel/app_identities/<app_instance_id>/<digest>` → `{user_id, created_at, last_issued_at, issue_count}`，`digest = base64url(sha256(app_instance_id "\n" external_account_id))`；外部账号原文不落盘。
@@ -320,6 +320,7 @@ CREATE TABLE IF NOT EXISTS share_entries (
 - Guest：入口 active 且允许 guest 时，`guest:` 主体在该 scope 获得入口模板能力（每次请求计算，入口关闭即失效）。现有 `public` grant 保留为“公开阅读”。
 - 已认证访问者：`ws.join_entry {entry_id}`，按 token 的 `auth_method` 与类别检查入口方式（`did_federation` 需 `did_login`；本地账号需 `password` 或 `self_register`），通过后为该主体写一条 grant（记录 `via_entry`）。关闭入口不回收已加入者的 grant，回收走 `ws.revoke`。
 - 授权对象：`<user_id>`（账号）、`<did>`（External）、`group:<id>`（系统用户组，服务端解析调用者所属组）、`contact:<owner_did>#<tag>`（经 `contact.check_membership` 精确查询）、`public`、`*`。`*` 只匹配非受限的 Admin / User 账号。
+- **工作区页面在自己的源上**（AI Workspace 内核架构改进 T4-8，2026-10-28）：`entry.describe` / `ws.join_entry` 返回的 `resource.path` 是资源页 URL——工作区为绝对地址 `https://aiws-<id>.<zonehost>/<workspace slug>`（无 public base 时为 `/`），不再是 Zone 相对路径。该源持有自己的会话：网关把 `aiws-<label>.<zone>` 折到 `aiws` 服务项，Control Panel 解析 `redirect_url` 时同样折叠，登录目标为 `System(aiworkspace)`（已加入可交互登录目标），`/sso_callback` 在该主机落 host-only cookie、`/sso_refresh` 续期。已登录的 Desktop 用户由 `auth.prepare_app_launch { service_id: "aiworkspace", redirect_url }` 委派（verify-hub `delegate_user_session` 允许 `App` 与可委派系统服务 `aiworkspace`；External 仍不可委派），Zone 根 `/login?redirect_url=<aiws url>` 对已登录者自动完成这一接力。所有 `aiws-*` 主机共用该目标：cookie 按主机隔离，token 不绑定工作区，服务按 grant 判权。
 
 ### 8.4 Message Hub 入口
 
@@ -416,3 +417,12 @@ CREATE TABLE IF NOT EXISTS share_entries (
 - App 登录码的“已兑换”标记在 verify-hub 内存与 CP 记录各一份：verify-hub 重启后，同 nonce 的幂等重试会得到 `consumed`（需重新领 code），不会重复签发。
 - `allowed_clients` 不能区分系统 SPA：Message Hub、Desktop、AI Workspace 的 `appid` 都是 `control-panel`（扩展 TODO D-4）。
 - External（DID 登录）仍不能 delegate 进 App；外部客户进 App 只能经 App 代登录（§5.6）。
+
+### 登录请求方展示
+
+登录页通过公开 CP RPC `auth.describe_target {redirect_url}` 获取 `{target, display_name}`。
+CP 与 `auth.login` 共用 redirect URL 校验和网关路由解析；`target` 是结构化的
+`AuthTarget`（App 的 `app_instance_id` 或 System 的 `service_id`）。App 名称取安装
+规格的 `app_doc.show_name`，缺失时显示 appid；系统入口使用服务展示名。
+前端解析失败时隐藏请求方，不从域名片段推断应用或用户名。此接口仅提供展示信息，
+不签发 token；提交登录时仍重新解析和校验目标。

@@ -1,6 +1,6 @@
 # 扩展 Self-host Group：应用开发指南
 
-本文面向希望在 BuckyOS 群聊上增加业务能力的应用开发者。实现核对日期为 **2026-10-24**，基于当前工作区（[应用扩展实施 TODO](../../notepads/self-host-group-extension-todo.md) 阶段 A～D 的改动）；“已实现”表示当前源码存在相应执行路径，不代表已经完成真实部署或跨 Zone 联调。
+本文面向希望在 BuckyOS 群聊上增加业务能力的应用开发者。实现核对日期为 **2026-10-24**，基于当前工作区（[应用扩展实施 TODO](../../notepads/done/self-host-group-extension-todo.md) 阶段 A～D 的改动）；“已实现”表示当前源码存在相应执行路径，不代表已经完成真实部署或跨 Zone 联调。
 
 **现在可以开发配置生成器、嵌入式应用侧面板、HTTP Hook、使用默认群服务的自定义应用，以及为外部客户代登录；通用 Process Chain、自动跨 Zone 接入和群服务多副本仍需补齐。** 可落地的组合是 L1 + L2 + L3（Message Hub 内增强）和 L1 + L4A + L3（自己的 UI 服务外部客户）。
 
@@ -396,7 +396,8 @@ async function postAnnouncement(senderDid: string, text: string) {
 | --- | --- |
 | [datamodel/sessionApi.ts](../../src/frame/desktop/src/app/messagehub/datamodel/sessionApi.ts) | kRPC 调用与常用 wire 类型 |
 | [api/store.ts](../../src/frame/desktop/src/app/messagehub/api/store.ts) | 用户投影、群管理、发送、幂等和本地事件刷新 |
-| [protocol/msgobj.ts](../../src/frame/desktop/src/app/messagehub/protocol/msgobj.ts) | MsgObject、Session ID、关系和提及类型 |
+| `buckyos` 的 `ndn` 命名空间（buckyos-websdk `src/ndn_types.ts`） | `ndn.MsgObject`、关系和提及类型、`ndn.isValidMsgSessionId`、`ndn.msgObjectFromJsonChecked` |
+| [protocol/msgobj.ts](../../src/frame/desktop/src/app/messagehub/protocol/msgobj.ts) | Message Hub 自己的扩展字段（`agent_task`、`agent_ask`、`voice`）和通知读取函数 |
 | [ConversationView.tsx](../../src/frame/desktop/src/app/messagehub/ConversationView.tsx) | 聊天视图，组合历史、输入及媒体能力 |
 | [GroupPanel.tsx](../../src/frame/desktop/src/app/messagehub/GroupPanel.tsx) / [SessionDetails.tsx](../../src/frame/desktop/src/app/messagehub/SessionDetails.tsx) | 群成员管理、共享状态和 Session 参与者 UI |
 

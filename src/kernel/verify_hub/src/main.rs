@@ -1,4 +1,3 @@
-#[allow(unused_braces)]
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use lazy_static::lazy_static;
 use log::*;
@@ -228,6 +227,9 @@ async fn sign_session_token(
     set_token_principal_kind(&mut token, session.principal_kind);
     session.claims.bind(&mut token);
     bind_token_target(&mut token, &session.target, token_use)?;
+    if let Some(zone) = issuer_zone().await {
+        bind_token_zone(&mut token, &zone);
+    }
 
     {
         let private_key = VERIFY_HUB_PRIVATE_KEY.read().await;
@@ -236,6 +238,16 @@ async fn sign_session_token(
     }
 
     Ok(token)
+}
+
+/// The Zone this hub signs for, written into every token (`zone` claim) so services of
+/// other Zones refuse it whatever key they hold.
+async fn issuer_zone() -> Option<String> {
+    VERIFY_SERVICE_CONFIG
+        .lock()
+        .await
+        .as_ref()
+        .map(|config| config.zone_document.id.to_string())
 }
 
 /// New identifiers for a pair: session token 15 minutes, refresh token 7 days, neither past
@@ -493,6 +505,9 @@ async fn get_my_krpc_token() -> Result<RPCSessionToken> {
         ),
         TokenUse::Session,
     )?;
+    if let Some(zone) = issuer_zone().await {
+        bind_token_zone(&mut session_token, &zone);
+    }
 
     {
         let private_key = VERIFY_HUB_PRIVATE_KEY.read().await;
@@ -867,6 +882,8 @@ struct HubState {
     families: FamilyStore,
     zone: Arc<dyn ZoneDirectory>,
     federation: Arc<dyn FederationPeer>,
+    /// Documents behind cross-Zone login assertions (name service in production).
+    custody: Arc<dyn CustodyResolver>,
     federation_codes: FederationCodes,
     app_login_codes: AppLoginCodes,
     last_family_gc: AtomicU64,
@@ -909,6 +926,9 @@ impl AppLoginCodes {
 #[derive(Clone)]
 struct VerifyHubServer {
     state: Arc<HubState>,
+    /// The RTCP-verified device the current request came through (`X-Cyfs-Rtcp-Device`,
+    /// written only by the gateway); none for HTTPS and in-Zone callers.
+    rtcp_device: Option<String>,
 }
 
 /// Whether a family may answer again after the D-5 recheck.
@@ -930,11 +950,22 @@ impl VerifyHubServer {
         zone: Arc<dyn ZoneDirectory>,
         federation: Arc<dyn FederationPeer>,
     ) -> Self {
+        Self::with_custody(families, zone, federation, Arc::new(NameServiceResolver))
+    }
+
+    fn with_custody(
+        families: FamilyStore,
+        zone: Arc<dyn ZoneDirectory>,
+        federation: Arc<dyn FederationPeer>,
+        custody: Arc<dyn CustodyResolver>,
+    ) -> Self {
         VerifyHubServer {
+            rtcp_device: None,
             state: Arc::new(HubState {
                 families,
                 zone,
                 federation,
+                custody,
                 federation_codes: FederationCodes::default(),
                 app_login_codes: AppLoginCodes::default(),
                 last_family_gc: AtomicU64::new(0),
@@ -1712,9 +1743,13 @@ impl VerifyHubApiHandler for VerifyHubServer {
     ) -> Result<DelegateUserSessionResult> {
         self.gc().await;
         authorize_control_panel_caller(caller_token, "delegate_user_session").await?;
-        if !matches!(target, AuthTarget::App { .. }) {
+        let delegable = match target {
+            AuthTarget::App { .. } => true,
+            AuthTarget::System { service_id } => is_system_delegation_target(service_id.as_str()),
+        };
+        if !delegable {
             return Err(RPCErrors::NoPermission(
-                "delegate_user_session only issues App targets".to_string(),
+                "delegate_user_session only issues App targets and delegable system services".to_string(),
             ));
         }
         let Some(source) = verify_delegation_source(source_session_token).await? else {
@@ -2275,6 +2310,104 @@ impl VerifyHubApiHandler for VerifyHubServer {
             profile: assertion.profile,
         })
     }
+
+    /// A device of another Zone vouches for its user or Agent (跨Zone登录断言契约 §4): the
+    /// assertion and its custody verify, the RTCP peer (if any) is of the same Zone, and the
+    /// result is an External family for the asserted target and scopes.
+    async fn handle_login_by_cross_zone_assertion(
+        &self,
+        request: CrossZoneLoginRequest,
+    ) -> Result<TokenPair> {
+        use CrossZoneLoginError::*;
+        self.gc().await;
+        let zone = self.state.zone.zone_did().await?;
+        let hostname = self.state.zone.zone_hostname().await?;
+        let now = buckyos_get_unix_timestamp();
+        let resolver = self.state.custody.as_ref();
+        let verified = match tokio::time::timeout(
+            FEDERATION_PEER_TIMEOUT,
+            verify_signed_assertion(resolver, &request.assertion, &zone, &hostname, now),
+        )
+        .await
+        {
+            Ok(Ok(verified)) => verified,
+            Ok(Err(failure)) => {
+                info!("cross-zone login refused: {}", failure.detail);
+                return Err(failure.into_rpc_error());
+            }
+            Err(_) => return Err(ZoneUnavailable.into_rpc_error("resolution timed out")),
+        };
+        let allowed = cross_zone_target_scopes(&verified.target).ok_or_else(|| {
+            TargetNotAllowed.into_rpc_error(verified.target.canonical_key())
+        })?;
+        if let Some(scope) = request.scopes.iter().find(|scope| !allowed.contains(scope)) {
+            return Err(TargetNotAllowed.into_rpc_error(scope.as_str()));
+        }
+        let scopes = if request.scopes.is_empty() {
+            allowed.to_vec()
+        } else {
+            request.scopes.clone()
+        };
+        if let Some(rtcp_device) = self.rtcp_device.as_deref() {
+            self.check_rtcp_peer(rtcp_device, &verified).await?;
+        }
+        let requester = verified.requester.to_string();
+        let replay_key = format!("assertion:{requester}:{requester}:{}", verified.jti);
+        if is_used(&replay_key).await {
+            return Err(AssertionInvalid.into_rpc_error("assertion already used"));
+        }
+        mark_used(&replay_key, verified.exp).await;
+
+        let session = SessionSubject {
+            subject: requester.clone(),
+            principal_kind: SessionPrincipalKind::User,
+            target: verified.target.clone(),
+            session_id: rand::thread_rng().gen(),
+            claims: FamilyClaims::cross_zone(scopes, verified.device.to_string(), verified.app),
+        };
+        let token_pair = self
+            .issue_family(session, None, Some(now + FEDERATION_SESSION_MAX_SECONDS))
+            .await?;
+        info!(
+            "cross-zone login of {} by {} ({:?}) for {}",
+            requester,
+            verified.device.to_string(),
+            verified.custody,
+            verified.target.canonical_key()
+        );
+        Ok(token_pair)
+    }
+}
+
+impl VerifyHubServer {
+    /// The tunnel peer must be of the Zone the assertion's device (else its principal) is in:
+    /// an RTCP stream from one Zone cannot carry another Zone's login.
+    async fn check_rtcp_peer(&self, rtcp_device: &str, verified: &VerifiedRequester) -> Result<()> {
+        use CrossZoneLoginError::*;
+        let resolver = self.state.custody.as_ref();
+        let peer = DID::from_str(rtcp_device)
+            .map_err(|_| RtcpIdentityMismatch.into_rpc_error("RTCP peer is not a DID"))?;
+        if peer == verified.device {
+            return Ok(());
+        }
+        let unavailable = |error: ResolveFailure| ZoneUnavailable.into_rpc_error(error);
+        let expected = match &verified.device_zone {
+            Some(zone) => Some(zone.clone()),
+            None => canonical_zone_of(resolver, &verified.requester, None)
+                .await
+                .map_err(unavailable)?,
+        };
+        // A stream opened back over a tunnel this Zone dialed names its peer by the Zone DID it
+        // was dialed as (the gateway verified that Zone's gateway key).
+        if expected.as_ref().is_some_and(|zone| same_zone(&peer, zone)) {
+            return Ok(());
+        }
+        let peer_zone = device_zone_of(resolver, &peer).await.map_err(unavailable)?;
+        match (peer_zone, expected) {
+            (Some(peer_zone), Some(expected)) if same_zone(&peer_zone, &expected) => Ok(()),
+            _ => Err(RtcpIdentityMismatch.into_rpc_error(rtcp_device)),
+        }
+    }
 }
 
 #[async_trait]
@@ -2285,7 +2418,16 @@ impl HttpServer for VerifyHubServer {
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         if *req.method() == Method::POST {
-            let rpc_handler = VerifyHubRpcHandler::new(self.clone());
+            // Only the gateway writes this header, and only on RTCP-sourced streams.
+            let rtcp_device = req
+                .headers()
+                .get(RTCP_DEVICE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let rpc_handler = VerifyHubRpcHandler::new(VerifyHubServer {
+                rtcp_device,
+                ..self.clone()
+            });
             return serve_http_by_rpc_handler(req, info, &rpc_handler).await;
         }
         return Err(server_err!(
@@ -4575,6 +4717,40 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
     }
 
     #[tokio::test]
+    async fn delegate_issues_the_aiworkspace_system_target_and_no_other_system_target() {
+        setup_test_environment().await;
+        let (hub, zone) = test_hub();
+        let caller = cp_caller().await;
+        let user = unique_user("aiws");
+        zone.add_user(&user, UserType::User, Some("pw"));
+        let desktop = assertion_login(&hub, &user).await;
+        // AI Workspace pages live on `aiws-<id>.<zone>` and get their session the way an App does (内核架构改进 D21)
+        let issued = hub
+            .handle_delegate_user_session(
+                Some(caller.as_str()),
+                desktop.session_token.as_str(),
+                &system_target("aiworkspace"),
+            )
+            .await
+            .unwrap();
+        let DelegateUserSessionResult::Issued(pair) = issued else { panic!("expected an issued pair, got {issued:?}") };
+        let claims = validate_verify_hub_token_claims(&decoded(&pair.session_token), TokenUse::Session).unwrap();
+        assert_eq!(claims.target, system_target("aiworkspace"));
+        assert_eq!(decoded(&pair.session_token).sub.as_deref(), Some(user.as_str()));
+        // the other interactive system targets are never delegated
+        for service in ["control-panel", "kernel", "system-config", "messagehub"] {
+            let result = hub
+                .handle_delegate_user_session(
+                    Some(caller.as_str()),
+                    desktop.session_token.as_str(),
+                    &system_target(service),
+                )
+                .await;
+            assert!(matches!(result, Err(RPCErrors::NoPermission(_))), "{service}: {result:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn delegation_keeps_the_source_ceiling_and_restricted_children_die_with_it() {
         setup_test_environment().await;
         let (hub, zone) = test_hub();
@@ -5064,5 +5240,176 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
                 .await,
             Err(RPCErrors::NoPermission(_))
         ));
+    }
+
+    // ─── cross-Zone login (跨Zone登录断言契约 §4) ──────────────────────────
+
+    const PEER_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr\n-----END PRIVATE KEY-----";
+    const PEER_X: &str = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8";
+
+    fn peer_device_doc(id: &str, zone: &str) -> Value {
+        json!({
+            "id": id,
+            "verificationMethod": [{"type": "Ed25519VerificationKey2020", "id": "#main_key", "controller": id,
+                "publicKeyJwk": {"kty": "OKP", "crv": "Ed25519", "x": PEER_X}}],
+            "authentication": ["#main_key"],
+            "exp": 4102444800u64, "iat": 1,
+            "zone_did": zone, "owner": zone, "device_type": "ood", "name": "ood1"
+        })
+    }
+
+    fn cross_zone_hub() -> VerifyHubServer {
+        let did = |value: &str| DID::from_str(value).unwrap();
+        let resolver = StaticCustodyResolver::default()
+            .with_doc(&did("did:web:ood1.bob.example"), Some(DidDocType::Device),
+                peer_device_doc("did:web:ood1.bob.example", "did:web:bob.example"))
+            .with_doc(&did("did:web:gw.bob.example"), Some(DidDocType::Device),
+                peer_device_doc("did:web:gw.bob.example", "did:web:bob.example"))
+            .with_doc(&did("did:web:ood1.mallory.example"), Some(DidDocType::Device),
+                peer_device_doc("did:web:ood1.mallory.example", "did:web:mallory.example"))
+            .with_doc(&did("did:web:bob.example"), None,
+                json!({"@context": "https://www.buckyos.org/ns/owner", "id": "did:web:bob.example"}));
+        VerifyHubServer::with_custody(
+            FamilyStore::open_in_memory().unwrap(),
+            MemoryDirectory::new("did:web:alice.example"),
+            Arc::new(UnreachableCanonical),
+            Arc::new(resolver),
+        )
+    }
+
+    fn cross_zone_assertion(device: &str, service: &str) -> String {
+        let signer = DeviceSigner::new(
+            DID::from_str(device).unwrap(),
+            EncodingKey::from_ed_pem(PEER_KEY.as_bytes()).unwrap(),
+        );
+        sign_cross_zone_assertion(
+            &signer,
+            &DID::from_str("did:web:bob.example").unwrap(),
+            &DID::from_str("did:web:alice.example").unwrap(),
+            &system_target(service),
+            Some("app.example"),
+        )
+        .unwrap()
+    }
+
+    fn login_error(result: Result<TokenPair>) -> CrossZoneLoginError {
+        CrossZoneLoginError::from_rpc_error(&result.unwrap_err()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cross_zone_assertion_signs_a_narrow_external_family() {
+        setup_test_environment().await;
+        let hub = cross_zone_hub();
+        let request = |assertion: String, scopes: Vec<SessionScope>| CrossZoneLoginRequest { assertion, scopes };
+        let assertion = cross_zone_assertion("did:web:ood1.bob.example", "msg-center");
+        let pair = hub
+            .handle_login_by_cross_zone_assertion(request(assertion.clone(), vec![]))
+            .await
+            .unwrap();
+        let token = decoded(&pair.session_token);
+        assert_eq!(token.sub.as_deref(), Some("did:web:bob.example"));
+        assert!(token_is_external(&token));
+        assert_eq!(token_auth_method(&token), Some(AuthMethod::CrossZoneAssertion));
+        assert_eq!(
+            ceiling_of(&pair.session_token),
+            SessionCeiling::restricted([SessionScope::MsgInbox, SessionScope::MsgGroup])
+        );
+        assert_eq!(token.extra[TOKEN_SRC_DEVICE_CLAIM], json!("did:web:ood1.bob.example"));
+        assert_eq!(token.extra[TOKEN_SRC_APP_CLAIM], json!("app.example"));
+        let claims = validate_verify_hub_token_claims(&token, TokenUse::Session).unwrap();
+        assert_eq!(claims.target, system_target("msg-center"));
+        // The family refreshes as any External one, keeping its claims.
+        let refreshed = hub.handle_refresh_token(&pair.refresh_token).await.unwrap();
+        let refreshed = decoded(&refreshed.session_token);
+        assert_eq!(refreshed.extra[TOKEN_SRC_DEVICE_CLAIM], json!("did:web:ood1.bob.example"));
+        assert!(token_is_external(&refreshed));
+
+        // One assertion, one login.
+        assert_eq!(
+            login_error(hub.handle_login_by_cross_zone_assertion(request(assertion, vec![])).await),
+            CrossZoneLoginError::AssertionInvalid
+        );
+        // Scopes stay within the target's whitelist; other targets are refused.
+        let fresh = || cross_zone_assertion("did:web:ood1.bob.example", "msg-center");
+        let narrowed = hub
+            .handle_login_by_cross_zone_assertion(request(fresh(), vec![SessionScope::MsgInbox]))
+            .await
+            .unwrap();
+        assert_eq!(ceiling_of(&narrowed.session_token), SessionCeiling::restricted([SessionScope::MsgInbox]));
+        assert_eq!(
+            login_error(hub.handle_login_by_cross_zone_assertion(request(fresh(), vec![SessionScope::AccountSelf])).await),
+            CrossZoneLoginError::TargetNotAllowed
+        );
+        assert_eq!(
+            login_error(hub.handle_login_by_cross_zone_assertion(request(
+                cross_zone_assertion("did:web:ood1.bob.example", "control-panel"), vec![])).await),
+            CrossZoneLoginError::TargetNotAllowed
+        );
+        // Another Zone's device cannot speak for bob.
+        assert_eq!(
+            login_error(hub.handle_login_by_cross_zone_assertion(request(
+                cross_zone_assertion("did:web:ood1.mallory.example", "msg-center"), vec![])).await),
+            CrossZoneLoginError::CustodyRejected
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_zone_login_over_rtcp_requires_a_peer_of_the_same_zone() {
+        setup_test_environment().await;
+        let hub = cross_zone_hub();
+        let through = |peer: &str| VerifyHubServer { rtcp_device: Some(peer.to_string()), ..hub.clone() };
+        let login = |server: VerifyHubServer| async move {
+            server
+                .handle_login_by_cross_zone_assertion(CrossZoneLoginRequest {
+                    assertion: cross_zone_assertion("did:web:ood1.bob.example", "homestation"),
+                    scopes: vec![],
+                })
+                .await
+        };
+        // The source Zone's gateway device carries its OOD's login.
+        let pair = login(through("did:web:gw.bob.example")).await.unwrap();
+        assert_eq!(ceiling_of(&pair.session_token), SessionCeiling::restricted([SessionScope::HomeStation]));
+        assert!(login(through("did:web:ood1.bob.example")).await.is_ok());
+        // A tunnel this Zone dialed to bob's Zone names its peer by the Zone DID.
+        assert!(login(through("did:web:bob.example")).await.is_ok());
+        assert_eq!(login_error(login(through("did:web:ood1.mallory.example")).await), CrossZoneLoginError::RtcpIdentityMismatch);
+        assert_eq!(login_error(login(through("did:web:mallory.example")).await), CrossZoneLoginError::RtcpIdentityMismatch);
+        assert_eq!(login_error(login(through("did:web:unknown.example")).await), CrossZoneLoginError::RtcpIdentityMismatch);
+    }
+
+    /// V-11: verify-hub signs in by the shared custody table.
+    #[tokio::test]
+    async fn cross_zone_logins_follow_the_shared_custody_table() {
+        use buckyos_api::custody_cases::{cases, resolver, Outcome, TARGET_ZONE};
+        setup_test_environment().await;
+        let hub = VerifyHubServer::with_custody(
+            FamilyStore::open_in_memory().unwrap(),
+            MemoryDirectory::new(TARGET_ZONE),
+            Arc::new(UnreachableCanonical),
+            Arc::new(resolver()),
+        );
+        for case in cases() {
+            let signer = DeviceSigner::new(
+                DID::from_str(case.device).unwrap(),
+                EncodingKey::from_ed_pem(case.key_pem.as_bytes()).unwrap(),
+            );
+            let assertion = sign_cross_zone_assertion(
+                &signer,
+                &DID::from_str(case.principal).unwrap(),
+                &DID::from_str(TARGET_ZONE).unwrap(),
+                &system_target("msg-center"),
+                None,
+            )
+            .unwrap();
+            let result = hub
+                .handle_login_by_cross_zone_assertion(CrossZoneLoginRequest { assertion, scopes: vec![] })
+                .await;
+            let outcome = match result {
+                Ok(_) => Outcome::Allowed,
+                Err(error) if CrossZoneLoginError::from_rpc_error(&error) == Some(CrossZoneLoginError::ZoneUnavailable) => Outcome::Retry,
+                Err(_) => Outcome::Refused,
+            };
+            assert_eq!(outcome, case.outcome, "{} for {}", case.device, case.principal);
+        }
     }
 }

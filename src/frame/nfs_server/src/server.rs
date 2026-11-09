@@ -38,7 +38,11 @@ const WRITE_METHODS: &[&str] = &[
 ];
 
 pub fn build_router(state: SharedState) -> Router {
+    let objects = std::sync::Arc::new(crate::obj_provider::provider(state.clone()));
+    let objects_root = objects.clone();
     let mut router = Router::new()
+        .route(crate::obj_provider::OBJ_PATH, axum::routing::any(move |req| crate::obj_provider::serve(objects_root.clone(), req)))
+        .route(&format!("{}/{{*rest}}", crate::obj_provider::OBJ_PATH), axum::routing::any(move |req| crate::obj_provider::serve(objects.clone(), req)))
         .route("/nfs/v1/watch", get(watch_handler))
         .route("/nfs/v1/read/{node_id}", get(read_handler))
         .route(
@@ -51,6 +55,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/s/{token}/unlock", post(crate::share::serving::unlock))
         .route("/s/{token}/d", get(crate::share::serving::download_root))
         .route("/s/{token}/d/{*inner}", get(crate::share::serving::download_inner))
+        .route("/ndn/{*path}", axum::routing::any(crate::ndn::handle))
         .route("/ndm/v1/uploads", options(crate::ndm::uploads::options).post(crate::ndm::uploads::create))
         .route(
             "/ndm/v1/uploads/{id}",
@@ -60,6 +65,19 @@ pub fn build_router(state: SharedState) -> Router {
                 .post(crate::ndm::uploads::post_override)
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
+        .route(crate::bucket::rpc::KRPC_PATH, post(crate::bucket::rpc::krpc))
+        .route(crate::bucket::rpc::KRPC_PATH_SLASH, post(crate::bucket::rpc::krpc))
+        .route(
+            "/bucket/v1/{*path}",
+            get(crate::bucket::http::handle)
+                .head(crate::bucket::http::handle)
+                .put(crate::bucket::http::handle)
+                .delete(crate::bucket::http::handle)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(crate::bucket::s3::PATH_PREFIX, axum::routing::any(crate::bucket::s3::handle).layer(axum::extract::DefaultBodyLimit::disable()))
+        .route("/s3/", axum::routing::any(crate::bucket::s3::handle))
+        .route("/s3/{*path}", axum::routing::any(crate::bucket::s3::handle).layer(axum::extract::DefaultBodyLimit::disable()))
         .route("/ndm/v1/objects/lookup", get(crate::ndm::forward::lookup))
         .route("/ndm/v1/import/finalize", post(crate::ndm::import::finalize).layer(axum::extract::DefaultBodyLimit::disable()))
         .route("/ndm/v1/store/{method}", post(crate::ndm::forward::store_api))
@@ -74,6 +92,7 @@ pub fn build_router(state: SharedState) -> Router {
     }
     router
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::share::serving::host_guard))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::bucket::s3::host_route))
         .with_state(state)
 }
 
@@ -218,9 +237,12 @@ fn op_hello(state: &SharedState, env: &Envelope, actor: Actor) -> NfsResult<Valu
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+    let repr = crate::share::ShareMgr::store_configured(&state.config).then(|| state.preview.refresh());
+    let repr_ready = repr.as_ref().is_some_and(|p| p.available());
     let features: Vec<&str> = SERVER_FEATURES
         .iter()
         .copied()
+        .chain(repr_ready.then_some(crate::preview::FEATURE))
         .filter(|f| client_features.is_empty() || client_features.iter().any(|c| c == f))
         .collect();
     let identity = json!({
@@ -248,6 +270,7 @@ fn op_hello(state: &SharedState, env: &Envelope, actor: Actor) -> NfsResult<Valu
             "attr_ttl_ms": 5000,
         },
         "realms": [ {"id": "dfs", "writable": true} ],
+        "repr": repr.map(|p| p.describe()).unwrap_or_else(|| json!({"available": false, "detail": "the named store is not configured"})),
     }))
 }
 
@@ -265,6 +288,9 @@ async fn dispatch(
     let args = &env.args;
     if method.starts_with("share.") {
         return crate::share::rpc::dispatch(state, actor, method, args, bearer).await;
+    }
+    if let (Some(user), "resolve" | "stat" | "list" | "batch" | "delete") = (actor.user_id(), method) {
+        crate::bucket::spec::sync_projection_names(state, user).await;
     }
     match method {
         "bye" => {
@@ -290,7 +316,19 @@ async fn dispatch(
         "batch" => op_batch(state, actor, env).await,
         "mkdir" => state.op_mkdir(actor, at, args),
         "move" => state.op_move(actor, args),
-        "delete" => state.op_delete(actor, at, args),
+        "delete" => {
+            if let Some(parent) = state.projection_parent(actor, at, args) {
+                let name = args["name"].as_str().ok_or_else(|| invalid("delete requires name"))?;
+                crate::fsutil::validate_name(name)?;
+                if let Some(expected) = args["expected_revision"].as_str() {
+                    if expected != state.projection_revision(&parent) {
+                        return Err(NfsError::new(ErrorCode::RevMismatch, "the directory changed"));
+                    }
+                }
+                return state.projection_delete(actor, &parent, name, args["recursive"].as_bool().unwrap_or(false)).await;
+            }
+            state.op_delete(actor, at, args)
+        }
         "bind_ref" => state.op_bind_ref(actor, args),
         "unlink" => state.op_unlink(actor, args),
         "abort_write" => state.op_abort_write(args, session),
@@ -310,6 +348,8 @@ async fn dispatch(
         "get_acl" => state.op_get_acl(actor, at, args),
         "set_acl" => state.op_set_acl(actor, at, args),
         "list_acls" => state.op_list_acls(actor),
+        "repr" => crate::preview::rpc::op_repr(state, actor, env, headers).await,
+        "get_repr" => crate::preview::rpc::op_get_repr(state, actor, args).await,
         other => Err(NfsError::new(
             ErrorCode::Unsupported,
             format!("unknown method '{}'", other),
@@ -566,7 +606,6 @@ async fn read_handler(
     let body = Body::from_stream(file_stream(file, content_len));
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, content_type_for(&name))
         .header(header::CONTENT_LENGTH, content_len)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, etag)
@@ -577,17 +616,12 @@ async fn read_handler(
             format!("bytes {}-{}/{}", start, end, len),
         );
     }
-    if q.contains_key("download") {
-        let fname = q.get("name").cloned().unwrap_or(name);
-        let encoded: String =
-            percent_encoding::utf8_percent_encode(&fname, percent_encoding::NON_ALPHANUMERIC)
-                .to_string();
-        builder = builder.header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename*=UTF-8''{}", encoded),
-        );
-    }
-    builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    let want_download = q.contains_key("download");
+    let file_name = q.get("name").filter(|_| want_download).unwrap_or(&name);
+    let mut response = builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    // This route shares the Desktop origin: what is in a file never runs here (D24).
+    ndn_lib::apply_content_policy(response.headers_mut(), content_type_for(&name), Some(file_name), want_download);
+    response
 }
 
 fn file_stream(

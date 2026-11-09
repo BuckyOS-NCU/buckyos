@@ -1,6 +1,6 @@
 import { useI18n } from '../../../../i18n/provider'
 import { isActionMessage } from '../../sessionModel'
-import { groupErrorText, isAgentGroupDisabled, parseGroupNotice } from '../../groupModel'
+import { groupErrorCode, groupErrorText, isAgentGroupDisabled, parseGroupNotice } from '../../groupModel'
 import { AgentGroupSettingsLink } from '../../AgentGroupSettingsLink'
 import { parseFriendNotice } from '../../friendNotice'
 import { useEntityRelation } from '../../relation'
@@ -25,19 +25,8 @@ import {
   UserPlus,
   Users,
 } from 'lucide-react'
-import {
-  getMessageDeliveryStatus,
-  getMessageMetaString,
-  getMessageSenderName,
-  getMessageStableId,
-  messageNotify,
-  messageVoice,
-  type RefItem,
-  type DID,
-  type MessageDeliveryStatus,
-  type MessageObject,
-  type VoiceNote,
-} from '../../protocol/msgobj'
+import type { DID, ndn } from 'buckyos'
+import { getMessageDeliveryStatus, getMessageMetaString, getMessageSenderName, getMessageStableId, messageNotify, messageVoice, type MessageDeliveryStatus, type MessageObject, type VoiceNote } from '../../protocol/msgobj'
 import { MessageAttachmentView } from '../media/MediaAttachment'
 import { VoiceNoteView } from '../media/VoiceNote'
 import { emojiOnlyCount } from '../input/emoji'
@@ -47,10 +36,10 @@ import type { OutgoingUpload } from '../../store/types'
 import { formatAttachmentSize } from '../input/attachmentDraft'
 import { attachmentKindOf, attachmentMediaType, attachmentOfRef, isHttpUri, objectContextOf, type AttachmentKind, type MessageAttachment } from '../media/source'
 import { ConversationMessageActionsContext } from './actions'
-import { MessageMarkdown } from './MessageMarkdown'
+import { LinkifiedText, MessageMarkdown } from './MessageMarkdown'
 import { getObjectAccess } from './objectAccess'
 import { displayedContent, effectiveContent, mentionsViewer, messageObjId, messageRelations, messageSummaryText, ownReactionId } from './relations'
-import { MessageTaskArea } from '../tasks/MessageTask'
+import { MessageAgentWork } from '../worksessions/WorkSessionCards'
 import { AgentQuestions } from './AgentQuestions'
 import { NotifyCard } from '../../notify/NotifyCard'
 import type { ConversationListItem } from './types'
@@ -181,32 +170,37 @@ function isTextFormat(format: string | undefined): boolean {
   return format === undefined || format === 'text/plain' || format === 'text/markdown' || format === 'text/html'
 }
 
-const DETAILS_IGNORED_TARGETS = 'a, button, input, textarea, select, summary, video, audio, [role="button"], [role="menu"], [role="menuitem"], [data-no-details]'
+const ACTIONS_IGNORED_TARGETS = 'a, button, input, textarea, select, summary, video, audio, [role="button"], [role="menu"], [role="menuitem"], [data-no-details]'
 
-/**
- * Clicking a bubble (or Enter on it) opens the message details. Links,
- * attachments, buttons and a text selection inside it keep their own behaviour.
- */
-function useBubbleDetails(message: MessageObject): Pick<React.HTMLAttributes<HTMLDivElement>, 'tabIndex' | 'onClick' | 'onKeyDown'> {
+function useBubbleActions(message: MessageObject): React.HTMLAttributes<HTMLDivElement> & React.RefAttributes<HTMLDivElement> & { 'data-actions-open'?: boolean } {
   const { openDetails } = useContext(ConversationMessageActionsContext)
+  const [open, setOpen] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
+  const close = useCallback(() => {
+    setOpen(false)
+    if (document.activeElement instanceof HTMLElement && root.current?.contains(document.activeElement)) document.activeElement.blur()
+  }, [])
+  useDismiss(open, root, close)
   if (!openDetails || !messageObjId(message)) return {}
   return {
+    ref: root,
     tabIndex: 0,
+    'data-actions-open': open || undefined,
     onClick: event => {
-      if (event.defaultPrevented || (event.target as HTMLElement).closest(DETAILS_IGNORED_TARGETS)) return
+      if (event.defaultPrevented || (event.target as HTMLElement).closest(ACTIONS_IGNORED_TARGETS)) return
       if (window.getSelection()?.toString()) return
-      openDetails(message)
+      setOpen(true)
     },
     onKeyDown: event => {
-      if (event.key !== 'Enter' || event.target !== event.currentTarget) return
+      if ((event.key !== 'Enter' && event.key !== ' ') || event.target !== event.currentTarget) return
       event.preventDefault()
-      openDetails(message)
+      setOpen(true)
     },
   }
 }
 
 function TextMessage({ message, context: { isGroup, selfDid, continued, peerMarkdown } }: { message: MessageObject; context: MessageRenderContext }) {
-  const details = useBubbleDetails(message)
+  const actions = useBubbleActions(message)
   const format = effectiveContent(message).format ?? 'text/plain'
   const isSelf = message.from === selfDid
   const senderName = getMessageSenderName(message)
@@ -220,7 +214,7 @@ function TextMessage({ message, context: { isGroup, selfDid, continued, peerMark
         style={bubbleStyle(isSelf, continued)}
         data-testid="message-bubble"
         data-message-id={messageObjId(message)}
-        {...details}
+        {...actions}
       >
         {!isSelf && isGroup && !continued ? (
           <p
@@ -235,7 +229,7 @@ function TextMessage({ message, context: { isGroup, selfDid, continued, peerMark
           <div className={bodyTextClass}><MessageMarkdown text={displayedContent(message)} /></div>
         ) : (
           <p className={`${bodyTextClass} whitespace-pre-wrap break-words`}>
-            {displayedContent(message)}
+            <LinkifiedText text={displayedContent(message)} />
           </p>
         )}
         <MessageFooter message={message} isSelf={isSelf} deliveryStatus={deliveryStatus} selfDid={selfDid} />
@@ -251,12 +245,12 @@ function isBigEmoji(message: MessageObject): boolean {
 }
 
 function BigEmojiMessage({ message, context: { isGroup, selfDid, continued } }: { message: MessageObject; context: MessageRenderContext }) {
-  const details = useBubbleDetails(message)
+  const actions = useBubbleActions(message)
   const isSelf = message.from === selfDid
   const text = displayedContent(message).trim()
   return (
     <div className={rowClass(isSelf, continued)}>
-      <div className={`mh-bubble ${bubbleWidthClass} flex flex-col ${isSelf ? 'items-end' : 'items-start'}`} style={framelessStyle()} data-testid="message-emoji" data-message-id={messageObjId(message)} {...details}>
+      <div className={`mh-bubble ${bubbleWidthClass} flex flex-col ${isSelf ? 'items-end' : 'items-start'}`} style={framelessStyle()} data-testid="message-emoji" data-message-id={messageObjId(message)} {...actions}>
         {!isSelf && isGroup && !continued ? <p className="mb-1 text-[13px] font-semibold" style={{ color: 'var(--cp-accent)' }}>{getMessageSenderName(message)}</p> : null}
         <ReplyQuote message={message} />
         <p className="mh-big-emoji" data-count={emojiOnlyCount(text)}>{text}</p>
@@ -279,7 +273,7 @@ function voiceOf(message: MessageObject, messageIndex: number): { voice: VoiceNo
 }
 
 function VoiceMessage({ message, context }: { message: MessageObject; context: MessageRenderContext }) {
-  const details = useBubbleDetails(message)
+  const actions = useBubbleActions(message)
   const note = voiceOf(message, context.messageIndex)
   if (!note) return null
   const isSelf = message.from === context.selfDid
@@ -287,12 +281,12 @@ function VoiceMessage({ message, context }: { message: MessageObject; context: M
   const upload = outgoingUpload(message)
   return (
     <div className={rowClass(isSelf, context.continued)}>
-      <div className={`mh-bubble ${bubbleWidthClass} min-w-[200px]`} style={bubbleStyle(isSelf, context.continued)} data-testid="message-voice" data-message-id={messageObjId(message)} {...details}>
+      <div className={`mh-bubble ${bubbleWidthClass} min-w-[200px]`} style={bubbleStyle(isSelf, context.continued)} data-testid="message-voice" data-message-id={messageObjId(message)} {...actions}>
         {!isSelf && context.isGroup && !context.continued ? <p className="mb-1 text-[13px] font-semibold" style={{ color: 'var(--cp-accent)' }}>{getMessageSenderName(message)}</p> : null}
         <ReplyQuote message={message} />
         <VoiceNoteView id={messageObjId(message) ?? note.attachment.id} source={note.attachment} voice={note.voice} isSelf={isSelf} />
         {upload ? <UploadProgress upload={upload} alignEnd={isSelf} /> : null}
-        {caption ? <p className={`${bodyTextClass} mt-1.5 whitespace-pre-wrap break-words`}>{caption}</p> : null}
+        {caption ? <p className={`${bodyTextClass} mt-1.5 whitespace-pre-wrap break-words`}><LinkifiedText text={caption} /></p> : null}
         <MessageFooter message={message} isSelf={isSelf} deliveryStatus={getMessageDeliveryStatus(message)} selfDid={context.selfDid} />
       </div>
     </div>
@@ -462,11 +456,6 @@ function MoreMenuItems({ message, mode, run, onDone }: { message: MessageObject;
   </>
 }
 
-/**
- * Discord-style bar on the bubble's top edge (pointer devices only, see
- * `messagehub.css`): quick reactions, the emoji picker, the common actions as
- * icons and a menu for the rest.
- */
 function MessageHoverBar({ message, isSelf, selfDid, mode }: { message: MessageObject; isSelf: boolean; selfDid?: string; mode: ActionMode }) {
   const { t } = useI18n()
   const [open, setOpen] = useState<ActionPopover>(null)
@@ -524,13 +513,13 @@ function MessageActionsMenu({ message, isSelf, selfDid, mode, selfTone }: { mess
 /** Placeholder for a redacted (recalled or deleted) message. */
 function RedactedMessage({ message, context }: { message: MessageObject; context: MessageRenderContext }) {
   const { t } = useI18n()
-  const details = useBubbleDetails(message)
+  const actions = useBubbleActions(message)
   const { displayName } = useContext(ConversationMessageActionsContext)
   const isSelf = message.from === context.selfDid
   const redacted = messageRelations(message)?.redacted
   const who = redacted?.by === message.from ? (isSelf ? t('messagehub.you') : displayName?.(message.from) ?? getMessageSenderName(message)) : displayName?.(redacted?.by ?? '') ?? redacted?.by ?? ''
   return <div className={rowClass(isSelf, context.continued)}>
-    <div className={`mh-bubble ${bubbleWidthClass} min-w-[80px]`} style={{ ...bubbleStyle(isSelf, context.continued), opacity: 0.7 }} data-testid="message-redacted" {...details}>
+    <div className={`mh-bubble ${bubbleWidthClass} min-w-[80px]`} style={{ ...bubbleStyle(isSelf, context.continued), opacity: 0.7 }} data-testid="message-redacted" {...actions}>
       <p className="text-[13px] italic">{t(redacted?.by === message.from ? 'messagehub.message.redacted' : 'messagehub.message.deletedBy', undefined, { name: who })}</p>
       <MessageFooter message={message} isSelf={isSelf} deliveryStatus={undefined} selfDid={context.selfDid} />
     </div>
@@ -555,7 +544,7 @@ function MessageFooter({ message, isSelf, deliveryStatus, selfDid, frameless = f
   return (
     <>
       <MessageHoverBar message={message} isSelf={isSelf} selfDid={selfDid} mode={relations?.redacted ? 'redacted' : mode} />
-      {mode === 'message' && !relations?.redacted ? <MessageTaskArea message={message} /> : null}
+      {mode === 'message' && !relations?.redacted ? <MessageAgentWork message={message} selfDid={selfDid} /> : null}
       {mode === 'message' && !relations?.redacted && relations?.thread ? <AgentQuestions message={message} selfDid={selfDid} /> : null}
       <ReactionChips message={message} isSelf={selfTone} selfDid={selfDid} />
       <div className="mt-1 flex items-center justify-end gap-1">
@@ -571,7 +560,7 @@ function MessageFooter({ message, isSelf, deliveryStatus, selfDid, frameless = f
         >
           {formatMessageTime(message.created_at_ms)}
         </span>
-        {isSelf ? <MessageStatusIcon status={deliveryStatus} /> : null}
+        {isSelf ? <MessageStatusIcon status={deliveryStatus} selfTone={selfTone} /> : null}
       </div>
       {isSelf && deliveryStatus === 'failed' && getMessageMetaString(message, 'ui_delivery_reason') ? <p role="alert" className="mt-0.5 text-right text-[11px]" data-testid="post-rejected" data-reason={getMessageMetaString(message, 'ui_delivery_reason')} style={{ color: metaColor }}>{t('messagehub.message.rejected')} · {groupErrorText(t, `rejected: ${getMessageMetaString(message, 'ui_delivery_reason')}`)}</p> : null}
       {receipt ? <p className="mt-0.5 text-right text-[11px]" data-testid="read-receipt" style={{ color: metaColor }} title={receipt.readers?.map(did => displayName?.(did) ?? did).join(', ')}>{t('messagehub.message.readBy', undefined, { count: receipt.count })}{receipt.readers?.length ? ` · ${receipt.readers.map(did => displayName?.(did) ?? did).join(', ')}` : ''}</p> : null}
@@ -639,7 +628,7 @@ function isLikelyImageUri(uri: string): boolean {
 }
 
 /** The kind a ref is expected to render as, from what is already known (resolved object, or its name). */
-function expectedKind(item: RefItem, id: string, context: string | undefined): AttachmentKind | null {
+function expectedKind(item: ndn.RefItem, id: string, context: string | undefined): AttachmentKind | null {
   const attachment = attachmentOfRef(item, id, context)
   if (!attachment) return null
   if (attachment.uri) return 'image'
@@ -652,10 +641,10 @@ function AttachmentMessage({ message, context }: { message: MessageObject; conte
   const isSelf = message.from === context.selfDid
   const senderName = getMessageSenderName(message)
   const deliveryStatus = getMessageDeliveryStatus(message)
-  const details = useBubbleDetails(message)
+  const actions = useBubbleActions(message)
   const caption = displayedContent(message).trim()
   const format = effectiveContent(message).format
-  const captionBody = format === 'text/markdown' || (context.peerMarkdown && !isSelf && (format ?? 'text/plain') === 'text/plain') ? <div className="whitespace-normal"><MessageMarkdown text={caption} /></div> : caption
+  const captionBody = format === 'text/markdown' || (context.peerMarkdown && !isSelf && (format ?? 'text/plain') === 'text/plain') ? <div className="whitespace-normal"><MessageMarkdown text={caption} /></div> : <LinkifiedText text={caption} />
   const refs = effectiveContent(message).refs ?? []
   const messageId = getMessageStableId(message, context.messageIndex)
   const objectContext = objectContextOf(message)
@@ -672,7 +661,7 @@ function AttachmentMessage({ message, context }: { message: MessageObject; conte
   if (frameless) {
     return (
       <div className={rowClass(isSelf, context.continued)}>
-        <div className={`mh-bubble ${bubbleWidthClass} flex min-w-[160px] flex-col ${isSelf ? 'items-end' : 'items-start'}`} style={framelessStyle()} data-testid="message-media" data-message-id={messageObjId(message)} {...details}>
+        <div className={`mh-bubble ${bubbleWidthClass} flex min-w-[160px] flex-col ${isSelf ? 'items-end' : 'items-start'}`} style={framelessStyle()} data-testid="message-media" data-message-id={messageObjId(message)} {...actions}>
           {sender}
           <ReplyQuote message={message} />
           <div className={`flex max-w-full flex-col gap-2 ${isSelf ? 'items-end' : 'items-start'}`} style={upload ? { opacity: 0.7 } : undefined} data-no-details>{items}</div>
@@ -692,7 +681,7 @@ function AttachmentMessage({ message, context }: { message: MessageObject; conte
         style={bubbleStyle(isSelf, context.continued)}
         data-testid="message-attachments"
         data-message-id={messageObjId(message)}
-        {...details}
+        {...actions}
       >
         {sender}
         <ReplyQuote message={message} />
@@ -721,7 +710,7 @@ function UploadProgress({ upload, alignEnd }: { upload: OutgoingUpload; alignEnd
   )
 }
 
-function MessageRef({ item, id, objectContext, isSelf, index, onKind }: { item: RefItem; id: string; objectContext: string | undefined; isSelf: boolean; index: number; onKind: (index: number, kind: AttachmentKind) => void }) {
+function MessageRef({ item, id, objectContext, isSelf, index, onKind }: { item: ndn.RefItem; id: string; objectContext: string | undefined; isSelf: boolean; index: number; onKind: (index: number, kind: AttachmentKind) => void }) {
   const target = item.target
   const report = useCallback((kind: AttachmentKind) => onKind(index, kind), [onKind, index])
   if (target.type === 'service_did') {
@@ -764,23 +753,27 @@ function renderFallbackMessage(
 
 function MessageStatusIcon({
   status,
+  selfTone,
 }: {
   status?: MessageDeliveryStatus
+  selfTone: boolean
 }) {
   const { t } = useI18n()
+  const pendingColor = selfTone ? 'var(--cp-message-self-meta)' : 'var(--cp-muted)'
+  const readColor = selfTone ? 'var(--cp-message-self-text)' : 'var(--cp-accent)'
   let icon: React.ReactNode
   switch (status) {
     case 'sending':
-      icon = <Clock size={14} style={{ color: 'var(--cp-muted)' }} aria-hidden />
+      icon = <Clock size={14} style={{ color: pendingColor }} aria-hidden />
       break
     case 'sent':
-      icon = <Check size={14} style={{ color: 'var(--cp-muted)' }} aria-hidden />
+      icon = <Check size={14} style={{ color: pendingColor }} aria-hidden />
       break
     case 'delivered':
-      icon = <CheckCheck size={14} style={{ color: 'var(--cp-muted)' }} aria-hidden />
+      icon = <CheckCheck size={14} style={{ color: pendingColor }} aria-hidden />
       break
     case 'read':
-      icon = <CheckCheck size={14} style={{ color: 'var(--cp-accent)' }} aria-hidden />
+      icon = <CheckCheck size={14} style={{ color: readColor }} aria-hidden />
       break
     case 'failed':
       icon = <AlertCircle size={14} style={{ color: 'var(--cp-danger)' }} aria-hidden />
@@ -915,17 +908,18 @@ function GroupNoticeMessage({ message, context }: { message: MessageObject; cont
   const [state, setState] = useState<'idle' | 'pending' | 'done'>('idle')
   const [outcome, setOutcome] = useState('')
   const [error, setError] = useState('')
+  const [errorReason, setErrorReason] = useState('')
   const [agentGroupDisabled, setAgentGroupDisabled] = useState(false)
   const notice = parseGroupNotice(message)
   const view = notice ? actions.groupNotice?.(message) : null
   if (!notice || !view) return renderFallbackMessage(message, context)
   const nameOf = (did: string) => actions.displayName?.(did) ?? did
-  const inviter = nameOf(message.from)
+  const inviter = nameOf(notice.by ?? message.from)
   const invitation = notice.invitation
   const run = (operation: ((message: MessageObject) => Promise<void>) | undefined, doneKey: string) => {
     if (!operation || state === 'pending') return
     setState('pending'); setError(''); setAgentGroupDisabled(false)
-    void operation(message).then(() => { setState('done'); setOutcome(doneKey) }, failure => { setState('idle'); setError(groupErrorText(t, failure)); setAgentGroupDisabled(isAgentGroupDisabled(failure)) })
+    void operation(message).then(() => { setState('done'); setOutcome(doneKey) }, failure => { setState('idle'); setError(groupErrorText(t, failure)); setErrorReason(groupErrorCode(failure)); setAgentGroupDisabled(isAgentGroupDisabled(failure)) })
   }
   const forAgent = invitation?.memberDid && invitation.memberDid !== context.selfDid ? nameOf(invitation.memberDid) : undefined
   const line = invitation ? (forAgent ? t('messagehub.group.invitedAgent', undefined, { name: inviter, agent: forAgent }) : t('messagehub.group.invitedBy', undefined, { name: inviter }))
@@ -951,6 +945,10 @@ function GroupNoticeMessage({ message, context }: { message: MessageObject; cont
         {invitation ? (
           <div className="mt-3 flex flex-wrap items-center gap-2">
             {view.state === 'pending' && actions.joinGroup ? <button type="button" className={primaryClass} style={{ background: 'var(--cp-accent)' }} disabled={state === 'pending'} onClick={() => run(actions.joinGroup, 'joined')}>{t(state === 'pending' ? 'messagehub.group.joining' : forAgent ? 'messagehub.group.acceptForAgent' : 'messagehub.group.join')}</button> : null}
+            {view.state === 'syncing' ? <>
+              <span className="text-xs font-medium" style={{ color: 'var(--cp-muted)' }}>{t('messagehub.group.syncPending')}</span>
+              {actions.joinGroup ? <button type="button" className={secondaryClass} style={{ borderColor: 'var(--cp-border)' }} disabled={state === 'pending'} onClick={() => run(actions.joinGroup, 'joined')}>{t(state === 'pending' ? 'messagehub.group.joining' : 'messagehub.retry')}</button> : null}
+            </> : null}
             {view.state === 'joined' ? <>
               <span className="text-xs font-medium" style={{ color: 'var(--cp-success)' }}>{t(forAgent ? 'messagehub.group.agentJoined' : 'messagehub.group.joined')}</span>
               {actions.openEntity && !forAgent ? <button type="button" className={secondaryClass} style={{ borderColor: 'var(--cp-border)' }} onClick={() => actions.openEntity?.(notice.groupDid)}>{t('messagehub.group.open')}</button> : null}
@@ -979,7 +977,7 @@ function GroupNoticeMessage({ message, context }: { message: MessageObject; cont
             </> : <button type="button" className={primaryClass} style={{ background: 'var(--cp-accent)' }} disabled={state === 'pending'} onClick={() => run(actions.acceptSessionInvitation, 'joined')}>{pendingLabel('messagehub.group.acceptSessionInvite')}</button>}
           </div>
         ) : null}
-        {error ? <p role="alert" className="mt-2 text-xs" style={{ color: 'var(--cp-danger)' }}>{error}</p> : null}
+        {error && !(view.state === 'joined' && ['group-sync-pending', 'group-refresh-pending'].includes(errorReason)) ? <p role="alert" className="mt-2 text-xs" style={{ color: 'var(--cp-danger)' }}>{error}</p> : null}
         {agentGroupDisabled && invitation?.memberDid ? <AgentGroupSettingsLink agentDid={invitation.memberDid} name={nameOf(invitation.memberDid)} /> : null}
         <MessageFooter message={message} isSelf={false} mode="card" />
       </div>

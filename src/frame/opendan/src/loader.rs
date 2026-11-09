@@ -16,8 +16,8 @@ use libopendan::bridge::{EventBridge, KEventBridge, TimerBridge};
 use libopendan::channel::{KmsgChannels, Waker};
 use libopendan::host::goals::{GoalHost, GoalHostOptions};
 use libopendan::host::{HostDeps, Supervisor};
-use libopendan::protocol::{builtin_runtimes, RuntimeAvailability};
-use libopendan::runner::{BehaviorAssembler, ObjectStore, OutboundSink, RunnerOptions};
+use libopendan::protocol::{builtin_runtimes, private_layout_missing, PrivateRuntimeInfo};
+use libopendan::runner::{BehaviorAssembler, DefaultAssembler, ObjectStore, OutboundSink, RunnerOptions};
 use libopendan::state::{
     register_in_process, unregister_in_process, AgentStateClient, FsAgentStateClient, WithNotify,
 };
@@ -89,6 +89,9 @@ pub struct LoaderEnv {
     /// Further commands every session gets (`llm_understand_media` →
     /// `agent_tool llm_understand_media`).
     pub session_helpers: Vec<libopendan::runtime::bin_overlay::SessionHelper>,
+    /// Where the window of a run's model is looked up (the zone's AICC;
+    /// `None` with `--dev`: the session's `context_window` or the default).
+    pub context_windows: Option<Arc<dyn libopendan::runner::ContextWindowSource>>,
     pub options: RunnerOptions,
 }
 
@@ -99,34 +102,55 @@ pub struct Loader {
     pub ui: Option<Arc<UiModule>>,
     pub config: AgentConfig,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-}
-
-/// Where workspaces are best placed in the agent's own environment: the
-/// AgentRoot's `workspaces/`, and the owner's home when the AgentRoot lives
-/// under it (`<home>/.local/share/<app>/agents/<agent>`).
-fn container_roots(agent_root: &std::path::Path) -> Vec<PathBuf> {
-    let mut roots = vec![agent_root.join("workspaces")];
-    let home = agent_root
-        .ancestors()
-        .find(|p| p.file_name().is_some_and(|n| n == ".local"))
-        .and_then(|local| local.parent());
-    if let Some(home) = home.filter(|h| h.is_dir()) {
-        roots.push(home.to_path_buf());
-    }
-    roots
+    /// `shell` commands of the sessions that outlived their wait.
+    local_tasks: Arc<agent_tool::InProcessTaskManager>,
 }
 
 /// node_daemon runs this Agent Service natively on its node (the zone
-/// owner's Agent on its host runtime): there is no agent container.
+/// owner's Agent on its host runtime, Desktop Lite): the private runtime is
+/// that process's environment.
 fn native_service() -> bool {
     std::env::var("OPENDAN_SERVICE_MODE").is_ok_and(|v| v == "native")
 }
 
-fn container_note() -> &'static str {
-    if std::path::Path::new("/.dockerenv").exists() {
-        "It is the agent's container: paths here are not the owner's host paths."
+/// The private runtime as this process sees it. Its `$BUCKYOS_ROOT` must
+/// have the standard layout (`bin/`, `data/home/<owner>/agents/<agent>`,
+/// `instance/`, `tools/`): a missing directory is a deployment error and is
+/// logged, never "unavailable".
+fn private_runtime(agent_root: &std::path::Path) -> PrivateRuntimeInfo {
+    let mut note = if native_service() {
+        "The Agent Service runs natively on its host.".to_string()
+    } else if std::path::Path::new("/.dockerenv").exists() {
+        String::new()
     } else {
-        "The agent currently runs as a process on its host (development), so this is the host's own environment."
+        "The agent currently runs as a process on its host (development), so this is the host's own environment.".to_string()
+    };
+    // `<root>/data/home/<owner>/agents/<agent_id>`
+    let owner_and_agent = agent_root
+        .file_name()
+        .and_then(|a| a.to_str())
+        .zip(agent_root.parent().and_then(|p| p.parent()).and_then(|o| o.file_name()).and_then(|o| o.to_str()));
+    match (libopendan::baseline::buckyos_root(), owner_and_agent) {
+        (Some(root), Some((agent_id, owner))) => {
+            let missing = private_layout_missing(&root, owner, agent_id);
+            if !missing.is_empty() {
+                log::error!(
+                    "loader: the private runtime's $BUCKYOS_ROOT {} lacks {} (deployment error; the directory convention needs bin/, data/home/<owner>/agents/<agent>, instance/, tools/)",
+                    root.display(),
+                    missing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                );
+            } else {
+                note.push_str(&format!(" $BUCKYOS_ROOT is {}.", root.display()));
+            }
+        }
+        (None, _) => log::warn!("loader: $BUCKYOS_ROOT is not known to this process; the private runtime's layout was not verified"),
+        (_, None) => log::debug!("loader: AgentRoot {} is not under <root>/data/home/<owner>/agents; layout not verified", agent_root.display()),
+    }
+    PrivateRuntimeInfo {
+        native_service: native_service(),
+        native_node_did: std::env::var("OPENDAN_NATIVE_NODE_DID").ok(),
+        computer_endpoint: std::env::var("OPENDAN_COMPUTER_IPC").ok(),
+        note: note.trim().to_string(),
     }
 }
 
@@ -275,7 +299,6 @@ impl Loader {
             Arc::new(MsgCenterSink {
                 mail,
                 texts: OutboundTexts::load(&env.agent_root, &config.language),
-                owner: env.owner_did.clone(),
             }) as Arc<dyn OutboundSink>
         });
         if env.session_cli.is_none() {
@@ -300,11 +323,24 @@ impl Loader {
             agent: agent.clone(),
             inputs: env.channels.clone(),
             waker: env.waker.clone(),
-            xllm: env.xllm.clone(),
-            assembler: Arc::new(BehaviorAssembler::default()),
+            xllm: {
+                // `read` reaches other devices' files through the Agent's node runtimes.
+                let mut xllm = env.xllm.clone();
+                xllm.url_reader = Some(Arc::new(crate::urls::AgentUrlReader {
+                    objects: agent_did_object_lib::ObjectUrlReader::builtin(),
+                    agent: agent.clone(),
+                    ops_dir: env.agent_root.join(".meta").join("node-reads"),
+                }));
+                xllm
+            },
+            assembler: Arc::new(BehaviorAssembler::new(DefaultAssembler {
+                known_objects: true,
+                ..Default::default()
+            })),
             session_cli: env.session_cli.clone(),
             session_helpers: env.session_helpers.clone(),
             app_tools: Vec::new(),
+            context_windows: env.context_windows.clone(),
             options,
             max_child_concurrency,
             bridges,
@@ -319,6 +355,11 @@ impl Loader {
                 }) as Arc<dyn libopendan::runner::TurnTaskSink>
             }),
             runtime_id: None,
+            notifier: match (&env.kevent, DID::from_str(&env.agent_did)) {
+                (Some(client), Ok(agent)) => Some(Arc::new(crate::obj_provider::SessionEvents::new(client.clone(), agent))
+                    as Arc<dyn libopendan::channel::Notifier>),
+                _ => None,
+            },
         };
         let mut supervisor = Supervisor::new(
             host,
@@ -412,6 +453,7 @@ impl Loader {
                             None
                         }
                     },
+                    objects: std::sync::OnceLock::new(),
                     home: Home::new(
                         env.records.clone(),
                         env.owner_did.as_ref().map(|d| d.to_string()),
@@ -421,6 +463,10 @@ impl Loader {
                         },
                     ),
                 });
+                if let Ok(agent_did) = name_lib::DID::from_str(&info.agent_did) {
+                    let provider = crate::obj_provider::provider(Arc::downgrade(&service), agent.agent_id(), agent_did);
+                    let _ = service.objects.set(provider.into_http_server());
+                }
                 for path in [SERVICE_PATH, WEB_API_PATH] {
                     runner
                         .add_http_server(path.to_string(), service.clone())
@@ -502,11 +548,6 @@ impl Loader {
             env.who.clone(),
             env.options.poll_interval.saturating_mul(6).max(Duration::from_secs(15)),
         )));
-        if let Some(shell_tasks) = env.xllm.shell_tasks.clone() {
-            // The `shell` tasks a previous process left open are taken
-            // back (or failed) before anything asks for them.
-            tasks.push(tokio::spawn(async move { shell_tasks.recover().await }));
-        }
         match &env.tasks {
             Some(service) => {
                 module("task_mgr", true, true, None);
@@ -558,6 +599,7 @@ impl Loader {
             ui,
             config,
             tasks,
+            local_tasks: env.xllm.local_tasks.clone(),
         })
     }
 
@@ -572,6 +614,10 @@ impl Loader {
             let _ = t.await;
         }
         self.supervisor.shutdown().await;
+        // Commands still running continue without this process: their
+        // execution directories record their ends, which the next start
+        // reads by call id.
+        self.local_tasks.release_running().await;
         unregister_in_process(self.agent.agent_did());
     }
 }
@@ -583,13 +629,7 @@ pub async fn project_runtimes(
     settings: &AgentSettings,
     who: &str,
 ) {
-    let builtin = builtin_runtimes(
-        container_roots(agent_root),
-        container_note(),
-        settings,
-        agent.agent_did(),
-        native_service(),
-    );
+    let builtin = builtin_runtimes(settings, agent.agent_did(), &private_runtime(agent_root));
     match agent.runtimes().ensure_builtin(&builtin, who).await {
         Ok(r) => log::info!(
             "loader: runtimes {}",
@@ -619,20 +659,18 @@ pub async fn check_runtimes(agent: Arc<dyn AgentStateClient>) {
             return;
         }
     };
-    for r in runtimes.into_iter().filter(|r| r.availability == RuntimeAvailability::Available) {
-        match agent.runtimes().check(&r.runtime_id).await {
-            Ok(c) => match &c.baseline_check {
+    for r in runtimes.into_iter().filter(|r| r.usable()) {
+        match agent.runtimes().check(&r.runtime_id, &[], false).await {
+            Ok(c) => match &c.caps.baseline_check {
                 Some(b) if !b.ok => log::warn!(
-                    "loader: runtime {} ({:?} declared {}): {}",
+                    "loader: runtime {} ({:?} declared {}): {} (see `xagent runtime baseline --level {}`)",
                     c.runtime_id,
                     c.availability,
-                    c.baseline.as_str(),
-                    b.error.clone().unwrap_or_else(|| format!(
-                        "standard tools missing: {} (install them on that machine, see `xagent runtime baseline`)",
-                        b.missing.join(", ")
-                    ))
+                    c.caps.baseline.as_str(),
+                    b.problem().unwrap_or_default(),
+                    c.caps.baseline.as_str(),
                 ),
-                _ => log::info!("loader: runtime {} {:?}, standard tools complete", c.runtime_id, c.availability),
+                _ => log::info!("loader: runtime {} {:?}, {} tools complete", c.runtime_id, c.availability, c.caps.baseline.as_str()),
             },
             Err(e) => log::warn!("loader: runtime {} not checked: {e}", r.runtime_id),
         }
@@ -689,5 +727,24 @@ async fn report_loaded(records: Arc<dyn AgentRecords>, info: AgentRuntimeInfo, s
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_private_runtime_layout_is_verified_against_the_directory_convention() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_root = root.path().join("data/home/alice/agents/xiaobai.test.buckyos.io");
+        std::fs::create_dir_all(&agent_root).unwrap();
+        let missing = private_layout_missing(root.path(), "alice", "xiaobai.test.buckyos.io");
+        assert_eq!(missing, vec![root.path().join("bin"), root.path().join("instance"), root.path().join("tools")]);
+        for d in ["bin", "instance", "tools"] {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+        }
+        assert!(private_layout_missing(root.path(), "alice", "xiaobai.test.buckyos.io").is_empty());
+        assert!(!private_runtime(&agent_root).native_service);
     }
 }

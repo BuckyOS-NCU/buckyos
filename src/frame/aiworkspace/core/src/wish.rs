@@ -27,8 +27,9 @@ pub const MAX_REFINEMENT_CHARS: usize = 2000;
 pub const MAX_CONTRACT_RESULTS: usize = 32;
 pub const MAX_CHECKS: usize = 32;
 pub const MAX_VIEWS: usize = 4;
-/// Result types of `wish.results.v2`.
-pub const RESULT_TYPES: &[&str] = &["richtext", "record", "table", "table_columns", "image", "asset", "html", "video"];
+/// Result types of `wish.results.v2`. A `control` result is a Block-control instance on the canvas (a mind map…):
+/// no data entity, its tree in the result.
+pub const RESULT_TYPES: &[&str] = &["richtext", "record", "table", "table_columns", "image", "asset", "html", "video", "control"];
 /// Result types only a program may produce (§8.2: counting, aggregating and rows come from code).
 pub const PROGRAM_ONLY_TYPES: &[&str] = &["table", "table_columns"];
 
@@ -160,7 +161,7 @@ fn check_views(v: &Value) -> WsResult<()> {
 /// One result of an output contract (§7.2).
 pub fn check_contract_result(r: &Value) -> WsResult<()> {
     let o = r.as_object().ok_or_else(|| bad("contract result must be an object"))?;
-    only(o, &["name", "type", "title", "approach", "key", "target", "views", "description", "fields"], "contract result")?;
+    only(o, &["name", "type", "title", "approach", "key", "target", "views", "description", "fields", "kind", "def"], "contract result")?;
     let name = o.get("name").and_then(Value::as_str).filter(|s| is_result_name(s)).ok_or_else(|| bad("contract result needs a valid name"))?;
     let ty = o.get("type").and_then(Value::as_str).unwrap_or("");
     if !RESULT_TYPES.contains(&ty) {
@@ -188,6 +189,22 @@ pub fn check_contract_result(r: &Value) -> WsResult<()> {
     }
     if ty != "table_columns" && o.contains_key("target") {
         return Err(bad(format!("result {name}: target is only valid on table_columns")));
+    }
+    match o.get("kind") {
+        Some(k) if ty != "control" || !k.as_str().is_some_and(crate::types::is_control_kind) => {
+            return Err(bad(format!("result {name}: kind names the control of a control result (catalog/controls.json)")));
+        }
+        _ => {}
+    }
+    // a composite result names its definition (扩展控件 P3): `<author_did>#<name>`
+    if let Some(d) = o.get("def") {
+        let ok = ty == "control" && o.get("kind").is_none_or(|k| k == crate::types::COMPOSITE) && d.as_str().and_then(|d| d.split_once('#')).is_some_and(|(a, n)| crate::types::is_author_did(a) && crate::types::is_renderer_id(n));
+        if !ok {
+            return Err(bad(format!("result {name}: def names a composite control of the Workspace (<author_did>#<name>) on a control result")));
+        }
+    }
+    if ty == "control" && o.contains_key("views") {
+        return Err(bad(format!("result {name}: a control result is drawn by its control and has no views")));
     }
     if let Some(v) = o.get("views") {
         check_views(v)?;

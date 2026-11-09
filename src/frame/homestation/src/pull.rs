@@ -1,7 +1,6 @@
 //! Pull (§4.4 "Pull 是事实来源"): read followed streams by change cursor, fetch objects and
 //! chunks by ObjId from whoever may hold them, resolve remote entries.
 
-use crate::auth::make_reader_proof;
 use crate::error::{bad, HsError, HsResult};
 use crate::ingress::Arrival;
 use crate::protocol::*;
@@ -19,6 +18,18 @@ pub struct SyncReport {
     pub resynced: bool,
 }
 
+/// Service id other zones' HomeStations sign in for.
+pub const HOMESTATION_SERVICE: &str = "homestation";
+
+/// A refused login is final for this attempt; anything else may pass later.
+pub fn cross_zone_error(e: buckyos_api::CrossZoneError) -> HsError {
+    if e.is_retryable() {
+        HsError::Unavailable(e.to_string())
+    } else {
+        HsError::Unauthorized(e.to_string())
+    }
+}
+
 pub fn dir_error(e: crate::directory::DirError) -> HsError {
     match e {
         crate::directory::DirError::NotFound(m) => HsError::NotFound(m),
@@ -27,7 +38,7 @@ pub fn dir_error(e: crate::directory::DirError) -> HsError {
 }
 
 impl Station {
-    /// Home of a DID (`cyfs://<zone>/home/<user>`) and the HTTP origin serving its zone. In-zone
+    /// Home of a DID (`https://<zone>/home/<user>`) and the HTTP origin serving its zone. In-zone
     /// homes resolve to this node's own listener.
     pub async fn origin_for_did(&self, did: &str) -> HsResult<(HomeRef, String)> {
         let home = self.directory.home_of(did).await.map_err(dir_error)?;
@@ -35,19 +46,25 @@ impl Station {
         Ok((home, origin))
     }
 
-    /// GET a protocol path on another zone, identified by a reader proof.
+    /// GET a protocol path on another zone as this station's owner: a session of that zone,
+    /// signed in by this zone's device (`CrossZoneClient`).
     pub async fn remote_get(&self, zone: &str, origin: &str, path_and_query: &str) -> HsResult<reqwest::Response> {
         self.remote_get_as(zone, origin, path_and_query, true).await
     }
 
     /// `as_owner = false` reads as an anonymous visitor (portal previews).
     pub async fn remote_get_as(&self, zone: &str, origin: &str, path_and_query: &str, as_owner: bool) -> HsResult<reqwest::Response> {
-        let url = format!("{}{}", origin.trim_end_matches('/'), path_and_query);
-        let mut request = self.http.get(&url).header("host", zone).timeout(Duration::from_secs(20));
         if as_owner {
-            let proof = make_reader_proof(&self.signer, &self.cfg.owner, zone).map_err(HsError::Internal)?;
-            request = request.header("authorization", format!("DID {proof}"));
+            let owner = name_lib::DID::from_str(&self.cfg.owner).map_err(|e| HsError::Internal(format!("owner is not a DID: {e}")))?;
+            let request = buckyos_api::CrossZoneRequest::new(http::Method::GET, path_and_query).timeout(Duration::from_secs(20));
+            return self
+                .cross_zone
+                .request_host(zone, HOMESTATION_SERVICE, &buckyos_api::Principal::new(owner), request)
+                .await
+                .map_err(cross_zone_error);
         }
+        let url = format!("{}{}", origin.trim_end_matches('/'), path_and_query);
+        let request = self.http.get(&url).header("host", zone).timeout(Duration::from_secs(20));
         request.send().await.map_err(|e| HsError::Unavailable(format!("GET {url}: {e}")))
     }
 
@@ -77,8 +94,8 @@ impl Station {
         let sources: Vec<(String, String, Option<String>)> = self
             .db
             .call(|c| {
-                let mut stmt = c.prepare("SELECT id, kind, did FROM sources WHERE paused=0 AND basis!='[]' ORDER BY COALESCE(last_fetch_at, 0)")?;
-                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+                let mut stmt = c.prepare("SELECT id, kind, did FROM sources WHERE paused=0 AND basis!='[]' AND owner=?1 ORDER BY COALESCE(last_fetch_at, 0)")?;
+                let rows = stmt.query_map(params![c.owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
             .await?;
@@ -111,9 +128,9 @@ impl Station {
         let changed = self
             .db
             .call(move |c| {
-                let previous: Option<String> = c.query_row("SELECT last_error FROM sources WHERE id=?1", [&id], |r| r.get(0)).unwrap_or(None);
+                let previous: Option<String> = c.query_row("SELECT last_error FROM sources WHERE id=?1 AND owner=?2", params![id, c.owner], |r| r.get(0)).unwrap_or(None);
                 let same = previous.and_then(|p| serde_json::from_str::<Value>(&p).ok()).and_then(|p| p.get("reason").and_then(Value::as_str).map(str::to_string)) == Some(reason);
-                c.execute("UPDATE sources SET last_error=?2, last_fetch_at=?3 WHERE id=?1", params![id, error, now])?;
+                c.execute("UPDATE sources SET last_error=?2, last_fetch_at=?3 WHERE id=?1 AND owner=?4", params![id, error, now, c.owner])?;
                 Ok(!same)
             })
             .await?;
@@ -129,7 +146,7 @@ impl Station {
         let (did, name, cursor) = self
             .db
             .call(move |c| {
-                Ok(c.query_row("SELECT did, name, cursor FROM sources WHERE id=?1", [id], |r| {
+                Ok(c.query_row("SELECT did, name, cursor FROM sources WHERE id=?1 AND owner=?2", params![id, c.owner], |r| {
                     Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?))
                 })?)
             })
@@ -165,10 +182,10 @@ impl Station {
         let recovered = self
             .db
             .call(move |c| {
-                let had_error: bool = c.query_row("SELECT last_error IS NOT NULL FROM sources WHERE id=?1", [&id], |r| r.get(0)).unwrap_or(false);
+                let had_error: bool = c.query_row("SELECT last_error IS NOT NULL FROM sources WHERE id=?1 AND owner=?2", params![id, c.owner], |r| r.get(0)).unwrap_or(false);
                 c.execute(
-                    "UPDATE sources SET cursor=?2, last_success_at=?3, last_fetch_at=?3, last_error=NULL WHERE id=?1",
-                    params![id, since, now],
+                    "UPDATE sources SET cursor=?2, last_success_at=?3, last_fetch_at=?3, last_error=NULL WHERE id=?1 AND owner=?4",
+                    params![id, since, now, c.owner],
                 )?;
                 Ok(had_error)
             })
@@ -284,7 +301,10 @@ impl Station {
         };
         if home == self.home() {
             let entry = entry.to_string();
-            return self.db.call(move |c| crate::publish::get_head(c, &entry)).await;
+            return self.db.call(move |c| {
+                let row = crate::publish::get_entry_at_path(c, &entry)?;
+                crate::publish::get_head(c, row.as_ref().map(|r| r.entry.as_str()).unwrap_or(&entry))
+            }).await;
         }
         let origin = self.directory.origin_of_zone(&home.zone).await.map_err(dir_error)?;
         let response = self.remote_get(&home.zone, &origin, &home.path(&format!("{}/@/{}", namespace.as_str(), key))).await?;
@@ -297,11 +317,12 @@ impl Station {
         let restricted = response.headers().get(crate::delivery::HEADER_AUDIENCE).and_then(|v| v.to_str().ok()) == Some("restricted");
         let body = response.text().await.map_err(|e| HsError::Unavailable(e.to_string()))?;
         let verified = crate::objects::verify_jwt(self.directory.as_ref(), body.trim(), Some(OBJ_TYPE_HEAD)).await.map_err(HsError::from)?;
-        if verified.claims.get("entry").and_then(Value::as_str) != Some(entry) {
+        let received_entry = verified.claims.get("entry").and_then(Value::as_str).ok_or_else(|| bad("head has no entry"))?;
+        if EntryRef::parse(received_entry).map_err(bad)? != EntryRef::parse(entry).map_err(bad)? {
             return Err(bad("head is for another entry"));
         }
+        let entry = received_entry.to_string();
         self.ingest_head(verified, restricted).await?;
-        let entry = entry.to_string();
         self.db.call(move |c| crate::publish::get_head(c, &entry)).await
     }
 
@@ -339,7 +360,7 @@ impl Station {
         for collector in settings.collectors {
             let key = format!("collector_cursor:{}", collector.did);
             let key2 = key.clone();
-            let since: i64 = self.db.call(move |c| crate::db::get_meta(c, &key2)).await?.and_then(|v| v.parse().ok()).unwrap_or(0);
+            let since: i64 = self.db.call(move |c| crate::db::get_setting(c, &key2)).await?.and_then(|v| v.parse().ok()).unwrap_or(0);
             let (home, origin) = match self.origin_for_did(&collector.did).await {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -361,7 +382,7 @@ impl Station {
             }
             total += report.objects;
             let next = page.change_cursor;
-            self.db.call(move |c| crate::db::set_meta(c, &key, &next.to_string())).await?;
+            self.db.call(move |c| crate::db::set_setting(c, &key, &next.to_string())).await?;
         }
         Ok(total)
     }

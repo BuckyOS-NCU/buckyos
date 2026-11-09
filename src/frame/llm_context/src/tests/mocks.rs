@@ -9,7 +9,8 @@ use serde_json::json;
 
 use crate::deps::{
     ToolCallCtx,
-    InferenceHook,
+    CheckpointHook,
+    Injection,
     LlmClient,
     LlmInferenceRequest,
     ToolDispatchError,
@@ -19,7 +20,6 @@ use crate::deps::{
 use crate::error::{LLMComputeError, ProviderFailure};
 use crate::observation::{Observation, ToolExecStatus};
 use crate::request::{
-    ContextOwnerRef,
     LLMContextRequest,
     ModelPolicy,
     OutputSpec,
@@ -27,7 +27,6 @@ use crate::request::{
     ToolPolicy,
 };
 use crate::state::{LLMContextSnapshot};
-use crate::{StepResultHook, StepResultHookOutput};
 
 /// Scripted LLM responses popped off in order.
 pub(super) struct ScriptedLlm {
@@ -126,7 +125,8 @@ impl ToolManager for EchoTools {
             content: json!({ "echo": value }),
             bytes: 0,
             truncated: false,
-            tool_result: None,
+            host: None,
+            images: Vec::new(),
         })
     }
 
@@ -147,7 +147,7 @@ impl ToolManager for FailingTools {
         Ok(Observation::Error {
             call_id: call.call_id,
             message: "boom".into(),
-            tool_result: None,
+            host: None,
         })
     }
 
@@ -156,45 +156,9 @@ impl ToolManager for FailingTools {
     }
 }
 
-pub(super) struct CustomStepResultHook;
-
-#[async_trait]
-impl StepResultHook for CustomStepResultHook {
-    async fn on_behavior_step_ob(
-        &self,
-        _snapshot: &LLMContextSnapshot,
-        step: &crate::behavior_loop::StepRecord,
-    ) -> Result<StepResultHookOutput, String> {
-        Ok(StepResultHookOutput {
-            user_message: Some(AiMessage::text(
-                AiRole::User,
-                format!("custom step result {}", step.meta.step_index),
-            )),
-            history_inputs: Vec::new(),
-            skip_next_inference: false,
-        })
-    }
-}
-
-pub(super) struct SkipStepResultHook;
-
-#[async_trait]
-impl StepResultHook for SkipStepResultHook {
-    async fn on_behavior_step_ob(
-        &self,
-        _snapshot: &LLMContextSnapshot,
-        _step: &crate::behavior_loop::StepRecord,
-    ) -> Result<StepResultHookOutput, String> {
-        Ok(StepResultHookOutput {
-            skip_next_inference: true,
-            ..Default::default()
-        })
-    }
-}
-
 pub(super) fn base_request() -> LLMContextRequest {
     LLMContextRequest {
-        owner: ContextOwnerRef::OneShot { id: "t".into() },
+        owner: serde_json::json!({"id": "t"}),
         trace: Some("trace-1".into()),
         objective: "test".into(),
         behavior_name: String::new(),
@@ -211,7 +175,6 @@ pub(super) fn base_request() -> LLMContextRequest {
         },
         output: OutputSpec::Text,
         budget: Default::default(),
-        human_policy: Default::default(),
         error_policy: Default::default(),
         forbid_next_behavior: false,
     }
@@ -225,10 +188,12 @@ pub(super) fn tool_response(text: Option<&str>, calls: Vec<AiToolCall>) -> AiRes
     AiResponse::from_parts(text.map(str::to_string), calls, vec![])
 }
 
-/// Scripted responses / errors, recording every request like `RecordingLlm`.
+/// Scripted responses / errors, recording every request like `RecordingLlm`
+/// (and the tools it offered).
 pub(super) struct ScriptedRecordingLlm {
     script: Mutex<Vec<Result<AiResponse, LLMComputeError>>>,
     seen: Mutex<Vec<Vec<AiMessage>>>,
+    offers: Mutex<Vec<Option<Vec<String>>>>,
 }
 
 impl ScriptedRecordingLlm {
@@ -240,17 +205,28 @@ impl ScriptedRecordingLlm {
         Self {
             script: Mutex::new(script),
             seen: Mutex::new(Vec::new()),
+            offers: Mutex::new(Vec::new()),
         }
     }
 
     pub(super) fn seen(&self) -> Vec<Vec<AiMessage>> {
         self.seen.lock().unwrap().clone()
     }
+
+    /// Per request: the tool names advertised, `None` when tool calls were
+    /// not allowed.
+    pub(super) fn offers(&self) -> Vec<Option<Vec<String>>> {
+        self.offers.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl LlmClient for ScriptedRecordingLlm {
     async fn infer(&self, req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
+        self.offers.lock().unwrap().push(
+            req.allow_tool_calls
+                .then(|| req.tool_specs.iter().map(|spec| spec.name.clone()).collect()),
+        );
         self.seen.lock().unwrap().push(req.messages);
         let mut guard = self.script.lock().unwrap();
         if guard.is_empty() {
@@ -290,7 +266,7 @@ impl ToolManager for ScriptedTools {
             return Ok(Observation::Error {
                 call_id: call.call_id,
                 message: "bad args".to_string(),
-                tool_result: None,
+                host: None,
             });
         }
         Ok(Observation::Success {
@@ -298,7 +274,8 @@ impl ToolManager for ScriptedTools {
             content: json!("ok"),
             bytes: 2,
             truncated: false,
-            tool_result: None,
+            host: None,
+            images: Vec::new(),
         })
     }
 
@@ -355,9 +332,13 @@ pub(super) struct CountingHook {
     pub(super) count: Arc<Mutex<u32>>,
 }
 
-impl InferenceHook for CountingHook {
-    fn before_inference(&self, _snapshot: &LLMContextSnapshot) -> Result<(), String> {
+#[async_trait]
+impl CheckpointHook for CountingHook {
+    async fn before_inference(
+        &self,
+        _snapshot: &LLMContextSnapshot,
+    ) -> Result<Option<Injection>, String> {
         *self.count.lock().unwrap() += 1;
-        Ok(())
+        Ok(None)
     }
 }

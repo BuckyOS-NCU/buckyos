@@ -296,7 +296,7 @@ Provider 原生扩展只允许放入带 Provider namespace 的 `ProviderState` �
 
 AICC 为 typed inference 生成并返回的 Named Object artifact 归当前认证 tenant 所有；AICC 在后续请求中解析这类 artifact 时必须校验 tenant 一致，跨 tenant 引用必须拒绝。这一约束不把调用方自有或全局内容寻址的 NDM 对象改成 AICC 私有对象；外部资源仍按 Resource 层的原有授权规则处理。
 
-Provider 返回的 URL artifact 继续以 `ResourceRef::Url` 出现在 typed result 中，AICC 不在结果解码阶段提前下载。AICC 必须同时持久登记 URL、artifact id、ProviderInstance、Adapter 和 tenant 来源。调用方需要内容时调用 `open_artifact_url_reader(url, artifact_id?)`；AICC 先按精确 URL 查询来源并校验 tenant，可选 `artifact_id` 只作为附加一致性校验，然后由登记的 ProviderInstance 通过其 Adapter 下载协议返回异步字节流。未登记的普通 URL 返回 `resource_invalid`，AICC 不猜测 URL host、Provider 或下载协议，也不充当通用代理。
+Provider 返回的 URL artifact 继续以 `ResourceRef::Url` 出现在 typed result 中，AICC 不在结果解码阶段提前下载。AICC 必须同时持久登记 URL、artifact id、ProviderInstance、Adapter、该 operation 的实际请求 base URL 和 tenant/user 来源。调用方需要内容时调用 `open_artifact_url_reader(url, artifact_id?)`；AICC 先按精确 URL 查询来源并校验 tenant/user，可选 `artifact_id` 只作为附加一致性校验，然后由登记的 ProviderInstance 通过其 Adapter 下载协议返回异步字节流。该 URL 后续作为模型输入时，`BytesOnly` 在首次调用前下载；`UrlOrBytes` 首次直传，遭 Provider 明确拒绝后下载为 bytes 重试一次；`UrlOnly` 首次直传，明确拒绝后仅在显式配置公网 Named Object 下载入口时下载、写入 Named Object 并用公网 NDN URL 重试一次，没有该配置则不重试。登记 URL 的下载先校验 tenant/user，同来源请求 origin 时使用原 ProviderInstance 鉴权，其他 origin 按普通 URL 下载。异步重提必须保持原 BuckyOS task id 并更新其远端 task id。未登记的普通 URL 不进入 artifact reader，fallback 下载使用匿名 HTTP；AICC 不按 host 猜测 Provider，也不推导公网 NDN 地址。
 
 Provider 为图片、视频、音频等内容返回的原生对象 ID 由 Adapter 显式绑定到对应 artifact，并可同时声明绝对 `expires_at_ms`。AICC 以解码或下载后的原始内容字节直接计算 SHA-256，不拼接 MIME、文件名、tenant 或其他盐，并建立 `content_digest + provider_instance_name + origin_provider -> artifact_id + expires_at_ms` 映射。映射在所有用户间共享，但 ProviderInstance 与模型原厂必须同时一致；这既隔离不同账号，也防止聚合 ProviderInstance 内不同原厂模型互相传入 opaque ID。后续调用物化源资源时只查询当前目标实例和模型原厂，且只返回未过期 ID；到期记录在查询时删除，未命中时不构造或猜测 ID。`expires_at_ms = NULL` 表示 Provider 未声明期限，不代表永久有效。Base64 内容先解码再计算；Provider URL 结果先登记 ID、期限和空摘要，调用方完整读取内容至 EOF 后才对实际下载字节计算摘要并补全映射，下载失败或提前停止不登记。该映射是 AICC 内部状态，不改变公共 `ResourceRef`，也不把摘要、Provider ID 或期限暴露给调用方。
 
@@ -543,7 +543,18 @@ pub enum ResourceRef {
 
 `base64` 是输入和 Adapter 解码中间态，不是最终输出形态。Adapter 解析 provider 响应后，AICC 必须在结果持久化边界把所有内联二进制写入对象存储，并把 typed output、`artifacts`、`provider_state` / `provider_states` 中的对应字段替换为 `named_object`。最终结果优先使用 `named_object`；只有已登记来源、有效期和访问策略且当前不需要下载内容的 Provider URL 可以保留为 `url`。TaskMgr result 的任何位置不得出现 `ResourceRef::Base64`、裸 base64 或 data URL。
 
+物化即保留：每个写入对象存储的结果在同一次写入里绑定进调用用户的 AICC 桶，绑定失败即写入失败。桶由 `services/aicc/spec` 声明（`buckyos_api::aicc_bucket_decls`），归属是请求的归属用户（`AuthorizedCaller.tenant_id`：用户本人、Agent 的 owner、`on_behalf_of` 的用户；无委托的系统服务调用归属其设备主体）：
+
+| 桶 | 档位 | 内容 |
+|---|---|---|
+| `user/aicc/<user>/outputs` | `data` / `temp`，7 天 | 调用的结果（图片、音频、视频、embedding JSON） |
+| `user/aicc/<user>/inputs` | `data` / `temp`，1 天 | 为调用上传或由输入派生的文件：Desktop AI Center 上传（浏览器 finalize 时 `auto_bind`）、为只收 URL 的 Provider 发布的 inline 输入、视频素材变换 |
+
+key 为 `<app>/<对象 id 前 16 位>/<name>`，`<app>` 是调用的业务 App（直接调用为 AppId / AgentId，系统 UI 或系统服务为 `system:<service>`）。业务 App 不是 `system:*` 时，AICC 首次为它写入时给该用户桶授 `{grantee: app, prefix: "<app>/", actions: [read]}`：App 会话（含 Agent 运行时）只能读到自己的前缀，用 `bucket.copy` 把要长期保留的结果复制进自己的桶（不传输字节）；同一用户的其它 App 读不到。结果里的引用：`AiArtifact.metadata.bucket_ref` 与 `extra.materialized_artifacts[] = {obj_id, name, mime, bucket_ref}`，`bucket_ref` 为 `obj://bucket/user/aicc/<user>/<bucket>/<key>`（`bucket_ref` 是保留 metadata key，Provider attributes 不得写入）。输入 Lease `aicc:input:*`（24h 续租）照旧保护请求期间读取的输入对象。
+
 物化后执行两道公共门禁：第一道验证本次被物化的 payload 没有以其它字符串副本残留；第二道按 `runner_complete` 的实际 `{ result: { output } }` 包装计算 JSON 大小，必须低于 kRPC 1 MiB 上限并保留 64 KiB envelope 余量。大小门禁位于 usage/billing 和 staging 之前，并在 staged result recovery/commit 时重复执行。超限属于明确、不可重试的任务失败，不能让任务停留在 Accepted/running。
+
+这里的 1 MiB 是 **TaskMgr** 的 kRPC 上限。AICC 服务自己接收请求的上限是 32 MiB（`AICC_MAX_RPC_BODY_SIZE`），超过仍返回 `413 Payload Too Large`。请求侧随之约定：AICC 建任务时，序列化 ≤ 256 KiB 的 canonical 请求原样写进 `input.request.request`；更大的只写 `input.request.request_summary`（`bytes`、`fingerprint`、`messages.count/by_role`、`tools` 名、标量 `params`、`provider_state_bytes`（消息内容块里 `provider_state` 的序列化字节数，没有时为 0）），不存原文，`trace_id` 指向调用方保有完整上下文的 run。两种形态对同一请求都是确定性的，TaskMgr 的 `input_digest` 幂等重放与 AICC 的 `body_fingerprint` 保持一致。
 
 当 `obj_id` 指向 FileObject 时，AICC 从 FileObject meta 获取资源属性：
 
@@ -1888,6 +1899,7 @@ AICC 错误 payload schema：
 | `resource_invalid` | 资源不存在、无权限、格式不支持或过大。 |
 | `no_provider_available` | 无 Provider 支持指定 method / capability。 |
 | `no_candidate_model` | route 过滤后无候选。 |
+| `context_length_exceeded` | 请求放不进模型的上下文窗口：Provider 以结构化码拒绝，或有候选仅因上下文长度不足被过滤。不可原样重试，缩小输入后再发。 |
 | `fallback_not_allowed` | fallback 被 policy 或 method 禁止。 |
 | `provider_start_failed` | Provider 启动或提交失败。 |
 | `provider_error` | Provider 原生错误。 |

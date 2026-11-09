@@ -4,14 +4,16 @@
  * left — with the right panel taking layout width (a drawer in narrow windows). This view owns the
  * selection, the pointer tool, one-shot placement, insertion, the object clipboard, grouping,
  * cross-Surface moves and the per-Surface viewport; the RenderHost owns rendering and gestures. Menus,
- * buttons, context menus and shortcuts call the same actions. A phone (§16) gets the canvas in view mode
+ * buttons, context menus and shortcuts call the same actions. A phone (§16) gets a free canvas in view mode
  * with one toolbar (canvas switcher, annotation, zoom, identity, share) and touch gestures, and keeps a
- * viewport of its own. */
+ * viewport of its own; a flow page it edits (§16.5), with undo / redo in that toolbar. */
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { imageSize } from '@drawio/bytes'
+import { onInsertDefinition } from '../extensions/extEvents'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { looksLikeDrawio } from '@drawio/file'
 import { svgShapeFromDocument } from '@drawio/svg'
+import { isControlKind } from '@controls/contract'
+import { ALL_AUTO, fixed } from '@controls/placement'
 import { Group, Lock, LockOpen, MessageSquarePlus, Sparkles, Ungroup } from 'lucide-react'
 import { describeError } from '../../api/session'
 import { randomId } from '../../api/ids'
@@ -19,6 +21,7 @@ import type { CellPayload, EntityEnvelope, Json, KeyedContent, Operation, Placem
 import { aiwsT } from '../../i18n'
 import { useAiwsText } from '../../useAiwsText'
 import { useReadOnlyReason, useStore, useUserState, useWorkspaceUi } from '../../state/hooks'
+import { RunModeContext, useRunMode } from '../../state/runMode'
 import type { WorkspaceStore } from '../../state/store'
 import { BlockBoundary } from '../blocks/BlockHost'
 import { setCellConfig } from '../blocks/ops'
@@ -42,15 +45,32 @@ import { PathEditor } from '../../presentation/PathEditor'
 import { setLive } from '../../presentation/pathOps'
 import { WishPanel } from '../wish/WishPanel'
 import { entryId, entrySize, registryEntries, type CatalogEntry, type InsertRequest } from './catalog'
-import { canvasClipboard, copyToClipboard, pasteOperations } from './clipboard'
+import { describeMediaFile } from '../media/poster'
+import { mediaBlockSize, stageMediaFile } from '../media/stage'
+import { canvasClipboard, copyToClipboard, makeClip, pasteOperations } from './clipboard'
+import { controlCommands } from '../controls/commands'
+import { addNode } from '../controls/mindmap/definition'
+import { importOutline, outlineFileKind, richtextToMindmap } from '../controls/mindmap/convert'
+import { resetLayoutOps } from '../controls/mindmap/ops'
+import { InstanceInspector } from '../controls/composite/Inspector'
+import { DefineControlDialog } from '../extensions/DefineControlDialog'
+import { isComposite, isFixedComposite, slotForDrop } from '../controls/composite/model'
+import { controlRegistry, type ControlCommandContext } from '../controls/registry'
 import { anchorWorld, axisOf, boxOf, facingAnchor } from './connectors/geometry'
 import { formOf, hasBoundEnd, isConnector } from './connectors/layout'
 import { connectorChangeOps, createConnectorOp, freezeOps, type ConnectorChange, type NewConnector } from './connectors/ops'
 import { flowOrder, moveInFlow } from './flowOps'
 import { FlowSurface } from './FlowSurface'
 import { exportSurfaceDrawio, saveTextFile } from './drawioExport'
-import { classifyFile, importDrawio, importReports } from './drawioImport'
+import { classifyFile, importDrawio, importReports, type ImportOutcome } from './drawioImport'
 import { ImportReportDialog } from './ImportReportDialog'
+import { PdfImportHost } from './ImportPdfDialog'
+import { pdfImports } from './pdfImportRequest'
+import { officeImports } from '../import/officeImportRequest'
+import { OFFICE_ACCEPT, officeKind } from '@office/package'
+import { TABULAR_ACCEPT, tabularKind } from '@table/files'
+import { clipboardTable } from '../import/clipboardTable'
+import { tableImports, type TableImportSource } from '../import/tableImportRequest'
 import { MetadataForm } from './MetadataForm'
 import { libraryShapeConfig, SHAPE_DRAG_TYPE, stencilPack } from './stencilLibrary'
 import { InsertCatalog, type CatalogTab } from './InsertCatalog'
@@ -58,11 +78,14 @@ import { importedAssetOps } from '../sources/dataOps'
 import { boundsOf, groupAt, movedPlacement, placementOf, relativeTo, surfaceBounds, topLevel, type Laid } from './layout'
 import { ObjectToolbar, type PointerTool } from './ObjectToolbar'
 import { Camera } from './render/camera'
-import { RenderHost, type LayoutChange } from './render/RenderHost'
+import { RenderHost, type LayoutChange, type NodeMove } from './render/RenderHost'
 import { useSurfaceConfig } from './surfaceManage'
 import { createSurfaceOps, surfacesOf } from './surfaceOps'
 import { useSurfaceLayout } from './useSurfaceLayout'
 import { BlockInspector, ContextMenu, NearToolbar, type NearAction } from './tools'
+import { InkBar } from '../../ink/InkBar'
+import { InkControl } from '../../ink/input'
+import { inkStyleOf, useInkPrefs } from '../../ink/prefs'
 
 export interface CanvasFocus { surfaceId: string; blockId: string | null; nonce: number }
 
@@ -95,7 +118,8 @@ export function CanvasView({ focus }: { focus: CanvasFocus | null }) {
   return (
     <>
       {active ? <SurfaceView key={active.entity_id} surface={active} mode={mode} focus={focus} /> : <EmptyCanvas mode={mode} />}
-      {report && <ImportReportDialog outcome={report} onClose={() => importReports.show(null)} />}
+      <PdfImportHost />
+      {report && <ImportReportDialog outcome={report} onClose={() => importReports.show(null)} onStartShow={report.pathId ? () => { const pathId = report.pathId; importReports.show(null); shell.startShow({ pathId }) } : undefined} />}
     </>
   )
 }
@@ -121,7 +145,7 @@ function EmptyCanvas({ mode }: { mode: CanvasMode }) {
                 <button type="button" className="is-primary" data-testid="aiws-create-first-surface" onClick={() => { void create('free') }}>{t('aiworkspace.canvas.empty.newFree')}</button>
                 <button type="button" data-testid="aiws-create-first-flow" onClick={() => { void create('flow') }}>{t('aiworkspace.canvas.empty.newFlow')}</button>
               </div>
-            ) : <p className="aiws-muted">{t(shell.phone ? 'aiworkspace.canvas.empty.phoneViewOnly' : 'aiworkspace.canvas.empty.noPermission')}</p>}
+            ) : <p className="aiws-muted">{t(shell.phone ? 'aiworkspace.canvas.empty.phoneNoCreate' : 'aiworkspace.canvas.empty.noPermission')}</p>}
           </div>
           <div className="aiws-chrome-top">
             {shell.phone ? <ViewToolbar camera={null} hasSelection={false} onFitAll={() => undefined} onFitSelection={() => undefined} annotate={null} /> : <MainToolbar canvas={null} />}
@@ -153,8 +177,13 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
   const [typeAhead] = useState(() => new Map<'typed', { id: string; text: string }>())
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [picker, setPicker] = useState<{ kind: 'add-view' | 'move-surface' } | null>(null)
+  /** “定义为控件…” (扩展控件 P1): the Blocks the new composite is made of. */
+  const [defining, setDefining] = useState<string[] | null>(null)
   const [catalog, setCatalog] = useState<{ tab: CatalogTab; key?: string; world: { x: number; y: number } | null; parentId?: string; afterId?: string | null } | null>(null)
   const [tool, setTool] = useState<PointerTool>('select')
+  const inkTool = tool === 'pen' || tool === 'eraser'
+  const [inkPrefs, setInkPrefs] = useInkPrefs()
+  const [inkControl] = useState(() => new InkControl())
   const [placing, setPlacing] = useState<InsertRequest | null>(null)
   const [annotatePick, setAnnotatePick] = useState(false)
   /** A line just drawn to blank space offers to create the next object at its end (标准对象的交互改进 §6.1, R11). */
@@ -163,6 +192,9 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
   const collapsed = collapsedChoice ?? shell.size === 'narrow'
   const [camera] = useState(() => new Camera())
   const [budget] = useState(() => createBudget(surface.layout?.mode === 'free' ? undefined : { editors: 200, html: 8 }))
+  // design / run mode (Q27): this window's switch; guests and phones never run extensions here
+  const runMode = useRunMode(store.runMode, mode, shell.phone || shell.identity.guest)
+  const runContext = useMemo(() => ({ interactive: runMode.interactive }), [runMode.interactive])
   const isFree = surface.layout?.mode === 'free'
   const { laid, index, shapeBook } = useSurfaceLayout(surfaceId)
   /** The page settings of the Surface (draw.io 导入 TODO §2.5): its background colour. */
@@ -189,8 +221,26 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     setAnnotatePick(false)
     ui.annotate?.({ target: { entity_id: source.entity_id }, label: source.title ?? source.name ?? source.entity_id })
   }
+  /** The segments of each long pen stroke (手写笔 TODO D0): selected as one — a part of a stroke is never selected (the
+   * canvas takes a whole stroke out of a selection itself). */
+  const strokeCells = useMemo(() => {
+    const map = new Map<string, string[]>()
+    for (const [id, l] of laid) { const stroke = l.entity.ink_stroke; if (stroke) { const list = map.get(stroke); if (list) list.push(id); else map.set(stroke, [id]) } }
+    return map
+  }, [laid])
+  const wholeStrokes = (next: Set<string>): Set<string> => {
+    let out = next
+    for (const id of next) {
+      const stroke = laid.get(id)?.entity.ink_stroke
+      const cells = stroke ? strokeCells.get(stroke) : undefined
+      if (!cells || cells.length < 2 || cells.every((c) => out.has(c))) continue
+      if (out === next) out = new Set(next)
+      for (const c of cells) out.add(c)
+    }
+    return out
+  }
   // selection survives mode switches when the policy still allows it (§10.2); editors are released
-  const setSelection = (next: Set<string>) => { setSelectionState(next); pickForAnnotation(next) }
+  const setSelection = (next: Set<string>) => { const whole = wholeStrokes(next); setSelectionState(whole); pickForAnnotation(whole) }
   // activating an editor brings its Block into view (§8.2: the active Block is never half off-screen);
   // on a free canvas a wish opens in the right panel instead (its Block stays a card)
   const { setSide } = shell
@@ -221,7 +271,7 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     setPolicySeen(policyKey)
     if (!policy.select) setSelectionState(new Set())
     if (!policy.editContent) setEditingState(null)
-    if (!policy.insert) { setPlacing(null); setCatalog(null); setTool((t) => (t === 'connector' ? 'select' : t)) }
+    if (!policy.insert) { setPlacing(null); setCatalog(null); setTool((t) => (t === 'connector' || t === 'pen' || t === 'eraser' ? 'select' : t)) }
     if (!policy.annotate) setAnnotatePick(false)
   }
   const [laidSeen, setLaidSeen] = useState(laid)
@@ -296,8 +346,9 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     // a group's backing (its frame or shape) keeps covering it (draw.io 导入 TODO §2.2)
     for (const change of changes) {
       const l = laid.get(change.id)
-      if (!l?.backingId || (Math.abs(l.rect.w - change.placement.w) < 0.5 && Math.abs(l.rect.h - change.placement.h) < 0.5)) continue
-      const placement = { x: 0, y: 0, w: change.placement.w, h: change.placement.h }
+      const size = fixed(change.placement)
+      if (!l?.backingId || !size || (Math.abs(l.rect.w - size.w) < 0.5 && Math.abs(l.rect.h - size.h) < 0.5)) continue
+      const placement = { x: 0, y: 0, w: size.w, h: size.h }
       ops.push({ op: 'tree.place', entity_id: l.backingId, placement })
       store.outline.patchLocal(l.backingId, { placement })
     }
@@ -308,6 +359,37 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       : changes.length === 1 ? aiwsT('aiworkspace.canvas.moveNamedLabel', { name: laid.get(changes[0].id)?.entity.title ?? changes[0].id }) : aiwsT('aiworkspace.canvas.layout.moveBlocks', { count: changes.length })
     void store.submit({ editId: `layout:${surfaceId}:${randomId().slice(0, 8)}`, label, operations: ops })
   }, [store, laid, policy.layout, surfaceId])
+
+  /** Nodes re-hung inside their control (脑图方案 §7.2): laid out again where they now hang, one commit. */
+  const moveNodes = useCallback((moves: NodeMove[]) => {
+    if (!policy.layout || moves.length === 0) return
+    const ops: Operation[] = []
+    // several nodes dropped together keep their order, one after the other
+    const last = new Map<string, string | undefined>()
+    const moving = new Set(moves.map((m) => m.id))
+    for (const move of moves) {
+      const siblings = store.outline.childrenOf(move.parentId).filter((c) => !moves.some((m) => m.id === c.entity_id))
+      const i = move.beforeId ? siblings.findIndex((c) => c.entity_id === move.beforeId) : siblings.length
+      const low = last.has(move.parentId) ? last.get(move.parentId) : siblings[i - 1]?.order_key ?? undefined
+      const key = store.core.order_key_between(low, siblings[i]?.order_key ?? undefined)
+      last.set(move.parentId, key)
+      const entity = store.outline.get(move.id)
+      const stored = entity?.placement
+      // into a composite (扩展控件 P1): the slot of the Block it lands beside, else the first that takes it; a fixed
+      // composite keeps it where it is, laid out nowhere
+      let slot: string | null | undefined
+      if (isComposite(store.outline.get(move.parentId))) {
+        slot = entity ? slotForDrop(store, move.parentId, entity, siblings[i - 1]?.entity_id ?? siblings[i]?.entity_id ?? null, moving) : null
+        if (!slot) { store.notify('info', t('aiworkspace.ext.composite.slotRefuses')); return }
+      } else if (entity?.slot && isComposite(store.outline.get(entity.parent_id ?? ''))) slot = null
+      const fixed = isComposite(store.outline.get(move.parentId)) && isFixedComposite(store, move.parentId)
+      const placement = fixed && entity?.parent_id === move.parentId && stored ? stored : fixed ? { x: 12, y: 12, w: stored?.w ?? 160, h: stored?.h ?? 90 } : { x: 'auto' as const, y: 'auto' as const, w: stored?.w ?? 'auto', h: stored?.h ?? 'auto' }
+      store.noteLayoutIntent(move.id, placement, key, move.parentId)
+      store.outline.patchLocal(move.id, { parent_id: move.parentId, order_key: key, placement, ...(slot !== undefined ? { slot } : {}) })
+      ops.push({ op: 'tree.move', entity_id: move.id, new_parent_id: move.parentId, order_key: key, placement, ...(slot !== undefined ? { slot } : {}) })
+    }
+    void store.submit({ editId: `layout:${surfaceId}:${randomId().slice(0, 8)}`, label: t('aiworkspace.mindmap.moveNodes', { count: moves.length }), operations: ops })
+  }, [store, policy.layout, surfaceId, t])
 
   const canLayout = policy.layout && surface.capabilities.includes('structure') && !readOnlyNow
   /** A Block this user may move, resize and remove: anything on a canvas it may restructure, and — with `comment`
@@ -322,6 +404,19 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
   const noteReason = !policy.annotate ? insertReason
     : !surface.capabilities.includes('structure') && !surface.capabilities.includes('comment') ? t('aiworkspace.canvas.reason.noNotePermission')
       : readOnlyReason
+  // writing needs a free canvas this user may insert on, now (手写笔 TODO D3): otherwise the pen is put down
+  const inkAllowed = isFree && !phone && insertReason === null
+  if (inkTool && !inkAllowed) setTool('select')
+  /** Pick a pointer tool; the pen and the eraser start with nothing selected or edited (the canvas is for writing). */
+  const chooseTool = (next: PointerTool) => {
+    setTool(next)
+    setPlacing(null)
+    if (next === 'pen' || next === 'eraser') {
+      setSelectionState(new Set()); setEditing(null); setAnnotatePick(false)
+      // the tool button keeps no focus: the canvas's keys (P, E, Esc) work at once
+      if (document.activeElement instanceof HTMLElement && document.activeElement.closest('.aiws-panel')) document.activeElement.blur()
+    }
+  }
   /** What the creation tools (edit mode only) offer for notes. */
   const toolNoteReason = policy.insert ? noteReason : insertReason
   const insertReasonOf = (type: string) => (type === 'note' ? noteReason : insertReason)
@@ -345,18 +440,32 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     if (!definition.create || insertReasonOf(definition.type)) return false
     // a flow page shows no connectors (连接线实现方案 §8.3)
     if (definition.type === 'connector' && !isFree) { store.notify('info', aiwsT('aiworkspace.canvas.flowNoConnectors')); return false }
+    // under a node of a control: laid out by it, no lines inside (脑图方案 §7.2)
+    const intoNode = parentId !== undefined && Boolean(laid.get(parentId)?.node)
+    if (intoNode && definition.type === 'connector') { store.notify('info', aiwsT('aiworkspace.mindmap.noLinesInside')); return false }
     let config = request.entry.config || request.config ? { ...(request.entry.config ?? {}), ...(request.config ?? {}) } : undefined
+    let size = entrySize(request.entry)
     if (request.file) {
+      // a large file takes a while to read and upload: say so until it is placed
+      const notice = request.file.size > 4 * 1024 * 1024 ? store.notify('info', aiwsT('aiworkspace.canvas.mediaPreparing', { name: request.file.name })) : null
       try {
-        const uploaded = await store.session.uploadAsset(request.file, request.file.name)
-        config = { ...(config ?? {}), file: { object_id: uploaded.object_id, file_name: request.file.name } }
+        if (definition.type === 'asset') {
+          // with its poster and facts, at its own proportions unless the entry fixed a size (多媒体对象 §3)
+          const { facts, payload } = await stageMediaFile(store, request.file, request.facts)
+          config = { ...(config ?? {}), file: payload as Record<string, Json> }
+          if (!request.entry.size) size = mediaBlockSize(facts)
+        } else {
+          const uploaded = await store.session.uploadAsset(request.file, request.file.name)
+          config = { ...(config ?? {}), file: { object_id: uploaded.object_id, file_name: request.file.name } }
+        }
       } catch (error) {
         store.notify('error', aiwsT('aiworkspace.canvas.uploadFailed', { name: request.file.name, reason: describeError(error) }))
         return false
+      } finally {
+        if (notice !== null) store.dismissNotice(notice)
       }
     }
     const contentFolderId = surface.content_folder_id ?? ''
-    const size = entrySize(request.entry)
     const spot = world ?? centreSpot(size)
     // placed inside a lane or another group, it joins it (draw.io 导入 TODO §2.2)
     const parent = parentId ?? (isFree && world ? groupAt(laid, { x: spot.x + size.w / 2, y: spot.y + size.h / 2 }, surfaceId) : surfaceId)
@@ -373,6 +482,23 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       return false
     }
     if (!isFree) for (const op of operations) if (op.op === 'entity.create' && op.entity_id === cellId) delete (op as Record<string, unknown>).placement
+    // a control instance's named data bindings (扩展控件 P0): the Cell's `bindings`, each a reference
+    if (request.bindings) {
+      for (const op of operations) {
+        if (op.op !== 'entity.create' || op.entity_id !== cellId) continue
+        const payload = (op.payload ?? {}) as Record<string, Json>
+        payload.bindings = Object.fromEntries(Object.entries(request.bindings).map(([name, id]) => [name, { entity_id: id }])) as Json
+        op.payload = payload
+      }
+    }
+    // the control places the new Block; a nested control sizes itself, any other Block keeps the entry's size
+    if (intoNode) {
+      for (const op of operations) {
+        if (op.op !== 'entity.create' || op.parent_id !== parent) continue
+        const kind = (op.payload as { kind?: string } | undefined)?.kind
+        op.placement = op.type_id === 'buckyos.container' && isControlKind(kind) ? { ...ALL_AUTO } : { x: 'auto', y: 'auto', w: size.w, h: size.h }
+      }
+    }
     if (also) {
       try { operations = [...operations, ...await also(cellId, { ...spot, ...size })] } catch (error) { store.notify('error', aiwsT('aiworkspace.canvas.insertFailed', { name: request.entry.title, reason: describeError(error) })); return false }
     }
@@ -430,6 +556,8 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     pick({ entry })
   }
   const openCatalog = (tab: CatalogTab, key?: string, world: { x: number; y: number } | null = null, parentId?: string, afterId?: string | null) => setCatalog({ tab, key, world, parentId, afterId })
+  // "insert an instance" from the Workspace controls dialog (扩展控件 P0)
+  useEffect(() => onInsertDefinition((defEntityId) => setCatalog({ tab: 'extension', key: `def:${defEntityId}`, world: null })), [])
 
   // ---- a flow page inserts where the user is (流式页交互改进 §2.3): after a Block, a file asked for first when needed
   const insertGroup = (parent: string, afterId?: string | null) => {
@@ -442,7 +570,6 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     if (entry.catalog.needs === 'file') {
       const input = document.createElement('input')
       input.type = 'file'
-      if (entry.definition.type === 'asset') input.accept = 'image/*'
       input.onchange = () => { const file = input.files?.[0]; if (file) void insert({ entry, file }, null, parent, undefined, afterId) }
       input.click()
     } else if (entry.catalog.needs !== 'none') openCatalog(entry.group === 'extension' ? 'extension' : 'all', entry.key, null, parent, afterId)
@@ -463,6 +590,52 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     editorActive: Boolean(subject && editing === subject.entity_id), zoom: camera.zoom,
     onActivate: () => { if (subject) setEditing(subject.entity_id) }, onDeactivate: () => setEditing(null),
   })
+  /** A Block-control's command context (脑图方案 §7.1) for the selected node `nodeId` or the control itself. */
+  const controlCtx = (containerId: string, nodeId: string | null): ControlCommandContext => ({
+    store, laid, nodeId, containerId, surface, canEdit: policy.insert && insertReason === null,
+    select: (ids) => setSelectionState(new Set(ids)),
+    edit: (id) => { if (policy.editContent) { requestIntent(id, 'end'); setEditing(id) } },
+  })
+  /** The control the selection belongs to: a node selected in it, or the control itself. */
+  const controlOfSelection = (): { containerId: string; nodeId: string | null } | null => {
+    const l = single ? laid.get(single.entity_id) : undefined
+    if (!l || selection.size !== 1) return null
+    if (l.node) return { containerId: l.node.control, nodeId: l.entity.entity_id }
+    if (l.control) return { containerId: l.entity.entity_id, nodeId: null }
+    return null
+  }
+  const selectionControl = controlOfSelection()
+  /** Nodes of a control in the selection: they stay in their control (no grouping, no other canvas, no stacking). */
+  const nodesSelected = [...selection].some((id) => laid.get(id)?.node)
+  // a node's editor or toolbar asks for a child or a sibling (it saves first); the canvas adds, selects and edits it
+  const commandRef = useRef<(command: ReturnType<typeof controlCommands.take>[number]) => void>(() => undefined)
+  useLayoutEffect(() => {
+    commandRef.current = (command) => {
+      if (command.kind === 'select') { setSelectionState(new Set(command.ids)); if (command.edit) setEditing(command.edit); return }
+      if (command.kind === 'insert') {
+        if (insertReason) { store.notify('info', insertReason); return }
+        if (laid.get(command.nodeId)?.node) openCatalog('all', undefined, null, command.nodeId)
+        return
+      }
+      const l = laid.get(command.nodeId)
+      const containerId = l?.node?.control
+      if (!containerId) return
+      addNode(controlCtx(containerId, command.nodeId), command.kind === 'add-child' || !l?.node?.parent ? 'child' : 'sibling', command.nodeId)
+    }
+  })
+  useEffect(() => controlCommands.subscribe(() => { for (const command of controlCommands.take()) commandRef.current(command) }), [])
+  /** Ctrl+D: the selected node's subtree copied right after it (D05: own data cloned on the same canvas). */
+  const duplicateNode = async (nodeId: string) => {
+    const l = laid.get(nodeId)
+    if (!l?.node || insertReason) return
+    const clip = await makeClip(store, surfaceId, laid, new Set([nodeId]), 'copy')
+    if (!clip) return
+    const c = camera.center
+    const { operations, newIds, refused } = pasteOperations(store, clip, { surfaceId, isFree, at: null, center: camera.toWorld(c.x, c.y), into: { parentId: l.parentId, after: nodeId } })
+    if (refused) { store.notify('info', refused); return }
+    const outcome = await store.submit({ editId: `duplicate:${randomId().slice(0, 8)}`, label: t('aiworkspace.mindmap.duplicate'), operations })
+    if (outcome.status === 'accepted' || outcome.status === 'saved_locally') setSelectionState(new Set(newIds))
+  }
   /** Locked objects stay where they are (§7.2): skipped by delete, moves and grouping, with a note. */
   const unlocked = (ids: string[], what: 'delete' | 'group' | 'move') => {
     const kept = ids.filter((id) => !laid.get(id)?.locked)
@@ -515,7 +688,8 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
   }
   const reorder = (direction: 'front' | 'back') => {
     const ops: Operation[] = []
-    for (const id of topLevel(laid, selection).filter(canLayoutBlock)) {
+    // a node's order is its place in the tree, not a stacking order
+    for (const id of topLevel(laid, selection).filter(canLayoutBlock).filter((id) => !laid.get(id)?.node)) {
       const l = laid.get(id)
       if (!l) continue
       const siblings = store.outline.childrenOf(l.parentId)
@@ -525,6 +699,7 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     if (ops.length) void store.submit({ editId: `order:${randomId().slice(0, 8)}`, label: t(direction === 'front' ? 'aiworkspace.canvas.order.front' : 'aiworkspace.canvas.order.back'), operations: ops })
   }
   const group = () => {
+    if (nodesSelected) { store.notify('info', t('aiworkspace.mindmap.nodesStay')); return }
     const ids = unlocked(topLevel(laid, selection), 'group')
     if (ids.length < 2) return
     const bounds = boundsOf(laid, ids)
@@ -565,10 +740,13 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     let key = store.outline.childrenOf(targetId).at(-1)?.order_key
     const toFlow = target.layout?.mode !== 'free'
     const carried = (l: Laid) => [l.entity, ...store.outline.descendants(l.entity.entity_id)].some((e) => isConnector(e))
+    const inked = (l: Laid) => [l.entity, ...store.outline.descendants(l.entity.entity_id)].some((e) => e.view_type === 'ink')
     for (const id of unlocked(topLevel(laid, selection), 'move')) {
       const l = laid.get(id)
       if (!l) continue
+      if (l.node) { store.notify('info', t('aiworkspace.mindmap.nodesStay')); continue }
       if (toFlow && carried(l)) { store.notify('info', t('aiworkspace.canvas.flowConnectorsNotMoved')); continue }
+      if (toFlow && inked(l)) { store.notify('info', t('aiworkspace.canvas.ink.flowNotMoved')); continue }
       key = store.core.order_key_between(key, undefined)
       const placement = movedPlacement(laid, l, 0, 0, '')
       store.noteLayoutIntent(id, placement, key, targetId)
@@ -674,6 +852,85 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     }
   }
   const importCommand: Command = { reason: importReason, run: () => importInput.current?.click() }
+  // ---- PDF import (PDF 导入方案 §5): pages on a new canvas, a path through them
+  const pdfInput = useRef<HTMLInputElement>(null)
+  const pdfReason = !canCreateSurfaces ? t('aiworkspace.pdf.reason.noStructure') : store.session.status().kind !== 'live' ? t('aiworkspace.pdf.reason.offline') : null
+  const finishPdfImport = (outcome: ImportOutcome) => {
+    if (outcome.surfaceId) {
+      // the new canvas opens showing all its pages (the window, and so the clear area, is this one's)
+      if (outcome.bounds) { const v = camera.fitted(outcome.bounds, 60); store.userState.set(`viewport:${outcome.surfaceId}`, { x: Math.round(v.x), y: Math.round(v.y), zoom: Number(v.zoom.toFixed(3)) }) }
+      shell.selectSurface(outcome.surfaceId)
+    }
+    const pathId = outcome.pathId ?? null
+    if (outcome.error || outcome.report.notes.size > 0) importReports.show(outcome)
+    if (!outcome.error) store.notify('info', t('aiworkspace.pdf.done', { name: outcome.name, summary: outcome.summary ?? '' }), pathId ? { label: t('aiworkspace.pdf.startShow'), run: () => shell.startShow({ pathId }) } : undefined)
+  }
+  /** Open the PDF import for a file: `ask` first when it was dropped or pasted (insert as a file, or as pages). */
+  const openPdfImport = async (file: File, bytes: Uint8Array | null, ask: boolean, at: { x: number; y: number } | null) => {
+    if (pdfImports.busy) { store.notify('info', t('aiworkspace.canvas.import.busy')); return }
+    pdfImports.open({ source: { name: file.name, bytes: bytes ?? new Uint8Array(await file.arrayBuffer()) }, step: ask ? 'ask' : 'options', insertAsFile: () => { void insertFile(file, at) }, finish: finishPdfImport })
+  }
+  const importPdfCommand: Command = { reason: pdfReason, run: () => pdfInput.current?.click() }
+  // ---- Office documents (Office 导入 TODO §6): a docx as a new flow page, a pptx as pages on a new canvas
+  const officeInput = useRef<HTMLInputElement>(null)
+  const finishOfficeImport = (outcome: ImportOutcome) => {
+    if (outcome.surfaceId) {
+      if (outcome.bounds) { const v = camera.fitted(outcome.bounds, 60); store.userState.set(`viewport:${outcome.surfaceId}`, { x: Math.round(v.x), y: Math.round(v.y), zoom: Number(v.zoom.toFixed(3)) }) }
+      shell.selectSurface(outcome.surfaceId)
+    }
+    const pathId = outcome.pathId ?? null
+    if (outcome.error || outcome.report.notes.size > 0) importReports.show(outcome)
+    if (!outcome.error) store.notify('info', t('aiworkspace.office.done', { name: outcome.name, summary: outcome.summary ?? '' }), pathId ? { label: t('aiworkspace.pdf.startShow'), run: () => shell.startShow({ pathId }) } : undefined)
+  }
+  /** Open the Office import for a file: `ask` first when it was dropped or pasted (insert as a file, or import). */
+  const openOfficeImport = async (file: File, bytes: Uint8Array | null, ask: boolean, at: { x: number; y: number } | null) => {
+    if (officeImports.busy || pdfImports.busy) { store.notify('info', t('aiworkspace.canvas.import.busy')); return }
+    const data = bytes ?? new Uint8Array(await file.arrayBuffer())
+    const kind = officeKind(file.name, data)
+    if (!kind) { void insertFile(file, at); return }
+    officeImports.open({ source: { name: file.name, bytes: data, kind }, step: ask ? 'ask' : 'options', insertAsFile: () => { void insertFile(file, at) }, finish: finishOfficeImport })
+  }
+  const importOfficeCommand: Command = { reason: pdfReason, run: () => officeInput.current?.click() }
+  const finishOfficeRef = useRef(finishOfficeImport)
+  useEffect(() => { finishOfficeRef.current = finishOfficeImport })
+  useEffect(() => {
+    const finisher = (outcome: ImportOutcome) => finishOfficeRef.current(outcome)
+    officeImports.finisher = finisher
+    return () => { if (officeImports.finisher === finisher) officeImports.finisher = null }
+  }, [])
+  // an import started elsewhere (a PDF file Block's "expand into pages") ends on this canvas's terms
+  const finishRef = useRef(finishPdfImport)
+  useEffect(() => { finishRef.current = finishPdfImport })
+  useEffect(() => {
+    const finisher = (outcome: ImportOutcome) => finishRef.current(outcome)
+    pdfImports.finisher = finisher
+    return () => { if (pdfImports.finisher === finisher) pdfImports.finisher = null }
+  }, [])
+  // ---- table data import (表格数据导入 TODO §3.5, §4, §5): a TableSource in the content folder, a table Block here
+  const tableInput = useRef<HTMLInputElement>(null)
+  const tableReason = insertReason
+  /** Where a table chosen from the insert catalog goes (the catalog's spot), for the file picker's answer. */
+  const catalogSpot = useRef<{ x: number; y: number } | null>(null)
+  const finishTableImport = (outcome: ImportOutcome) => {
+    if (outcome.created.length === 0) return
+    setSelectionState(new Set(outcome.created))
+    if (outcome.bounds) camera.fit(outcome.bounds, 60)
+  }
+  /** Open the table import: `ask` first for a dropped or pasted file (a table, or a file). */
+  const openTableImport = (source: TableImportSource, ask: boolean, at: { x: number; y: number } | null, file?: File) => {
+    if (tableReason) { store.notify('info', tableReason); return }
+    if (tableImports.busy) { store.notify('info', t('aiworkspace.import.busy')); return }
+    const c = camera.center
+    // a flow page: after the selected Block (when it sits on the page itself)
+    const afterId = !isFree && single && store.outline.get(single.entity_id)?.parent_id === surfaceId ? single.entity_id : null
+    tableImports.open({
+      source, step: ask ? 'ask' : 'wizard', finish: finishTableImport, insertAsFile: file ? () => { void insertFile(file, at) } : undefined,
+      destination: { canvas: { surfaceId, isFree, contentFolderId: surface.content_folder_id ?? '', at: isFree ? at : null, center: camera.toWorld(c.x, c.y), afterId } },
+    })
+  }
+  const importTableCommand: Command = { reason: tableReason, run: () => tableInput.current?.click() }
+  /** The insert catalog's "From a file…": the picker, the table at the catalog's spot. */
+  const importTableAt = (world: { x: number; y: number } | null) => { catalogSpot.current = world; tableInput.current?.click() }
   const exportCommand: Command = {
     reason: !isFree ? t('aiworkspace.canvas.export.onlyFree') : null,
     run: () => {
@@ -685,21 +942,19 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       }, (error: unknown) => store.notify('error', t('aiworkspace.canvas.export.failed', { reason: describeError(error) })))
     },
   }
-  /** A picture as an image Block (its natural size, at most 480 wide or high), centred on `at` or the view. */
-  const insertImage = (file: File, bytes: Uint8Array, at: { x: number; y: number } | null) => {
+  /** A file as an asset Block — a picture, a video, a sound, a PDF or any other file — at its own proportions
+   * (at most 480 wide or high), centred on `at` or the view (多媒体对象 §3). */
+  const insertFile = async (file: File, at: { x: number; y: number } | null) => {
     const entry = registryEntries().find((e) => e.definition.type === 'asset' && !e.variant)
     if (!entry) return
-    const natural = imageSize(bytes, file.type) ?? entry.definition.defaultSize
-    const nw = 'width' in natural ? natural.width : natural.w
-    const nh = 'height' in natural ? natural.height : natural.h
-    const k = Math.min(1, 480 / Math.max(nw, nh, 1))
-    const size = { w: Math.max(24, Math.round(nw * k)), h: Math.max(24, Math.round(nh * k)) }
-    void insert({ entry: { ...entry, size }, file }, at ? { x: Math.round(at.x - size.w / 2), y: Math.round(at.y - size.h / 2) } : null)
+    const facts = await describeMediaFile(file)
+    const size = mediaBlockSize(facts)
+    void insert({ entry: { ...entry, size }, file, facts }, at ? { x: Math.round(at.x - size.w / 2), y: Math.round(at.y - size.h / 2) } : null)
   }
   /** An SVG document as a recolourable SVG shape (§2.4); too large for a Block's configuration, it stays a picture. */
   const insertSvg = (text: string, at: { x: number; y: number } | null, file?: File) => {
     const parsed = svgShapeFromDocument(text)
-    const asPicture = () => { const f = file ?? new File([text], 'image.svg', { type: 'image/svg+xml' }); insertImage(f, new TextEncoder().encode(text), at) }
+    const asPicture = () => { void insertFile(file ?? new File([text], 'image.svg', { type: 'image/svg+xml' }), at) }
     if (!parsed) { if (file) asPicture(); else store.notify('info', t('aiworkspace.canvas.svg.unreadable')); return }
     if (parsed.svg.body.length > 48 * 1024) { store.notify('info', t('aiworkspace.canvas.svg.tooLarge')); asPicture(); return }
     const entry = registryEntries().find((e) => e.definition.type === 'shape' && !e.variant)
@@ -714,10 +969,25 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     for (const file of files) {
       const { kind, bytes, text } = await classifyFile(file)
       if (kind === 'drawio') await runImport({ name: file.name, bytes }, spot)
+      // a single table file asks: a table, or a file (表格数据导入 TODO §5.1); several are inserted as files
+      else if (kind === 'tabular' && files.length === 1 && !insertReason) openTableImport({ kind: 'file', name: file.name, bytes }, true, spot, file)
+      // a single PDF asks: a file, or editable pages (Q7); several are inserted as files
+      else if (kind === 'pdf' && files.length === 1 && pdfReason === null && !insertReason) await openPdfImport(file, bytes, true, spot)
+      // a single Office document asks the same: a file, or a document / editable pages (Office 导入 TODO §6)
+      else if (kind === 'office' && files.length === 1 && pdfReason === null && !insertReason) await openOfficeImport(file, bytes, true, spot)
       else if (insertReason) { store.notify('info', insertReason); return }
       else if (kind === 'svg' && text) insertSvg(text, spot, file)
-      else if (kind === 'image') insertImage(file, bytes, spot)
-      else store.notify('info', t('aiworkspace.canvas.unsupportedFile', { name: file.name }))
+      else {
+        // an OPML or Markdown outline becomes a mind map (脑图 TODO M4)
+        const decoded = kind === 'other' && file.size < 4 * 1024 * 1024 ? text ?? new TextDecoder().decode(bytes) : ''
+        const outline = decoded ? outlineFileKind(file.name, decoded) : null
+        if (outline) {
+          const c = camera.center
+          const at = isFree ? spot ?? camera.toWorld(c.x, c.y) : null
+          const id = await importOutline(store, { name: file.name, text: decoded }, outline, surfaceId, at ? { x: Math.round(at.x), y: Math.round(at.y) } : null)
+          if (id && isFree) setSelectionState(new Set([id]))
+        } else await insertFile(file, spot)
+      }
       spot = spot ? { x: spot.x + 24, y: spot.y + 24 } : null
     }
   }
@@ -755,7 +1025,13 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     if (!current) return
     if (current.workspaceId !== store.session.workspaceId) { store.notify('info', t('aiworkspace.canvas.clipboard.crossWorkspace')); return }
     const c = camera.center
-    const { operations, newIds, label, refused } = pasteOperations(store, current, { surfaceId, isFree, at, center: camera.toWorld(c.x, c.y) })
+    // with a node (or a control) selected the clip hangs under it (脑图方案 §7.2); in a composite it goes beside the
+    // selected Block, into a slot, and a selected composite itself is pasted beside on the canvas (扩展控件 P1)
+    const composite = selectionControl && isComposite(store.outline.get(selectionControl.containerId))
+    const into = !selectionControl || at ? undefined
+      : composite ? (selectionControl.nodeId ? { parentId: selectionControl.containerId, after: selectionControl.nodeId } : undefined)
+        : { parentId: selectionControl.nodeId ?? selectionControl.containerId }
+    const { operations, newIds, label, refused } = pasteOperations(store, current, { surfaceId, isFree, at, center: camera.toWorld(c.x, c.y), into })
     if (refused) { store.notify('info', refused); return }
     if (operations.length === 0) { store.notify('info', t('aiworkspace.canvas.clipboard.cutGone')); canvasClipboard.set(null); return }
     void store.submit({ editId: `paste:${randomId().slice(0, 8)}`, label, operations }).then((outcome) => {
@@ -784,6 +1060,12 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       // a guide owns the keys while it runs (第三期规划 §10.4)
       if (shell.guide) return
       if (event.isComposing || target?.closest('input, textarea, select, [contenteditable="true"], [data-role="editor"]')) return
+      // Esc while writing drops the stroke under way, else puts the pen down (also from the writing bar's buttons)
+      if (event.key === 'Escape' && inkTool && !target?.closest('.aiws-popover, .aiws-dialog, .aiws-menu')) {
+        event.preventDefault()
+        if (inkControl.busy()) inkControl.cancel(); else setTool('select')
+        return
+      }
       // a placement or target pick started from a toolbar button is cancelled by Esc even while that button has the focus
       if (event.key === 'Escape' && (placing || annotatePick || tool === 'connector') && !target?.closest('.aiws-popover, .aiws-dialog, .aiws-menu')) { setPlacing(null); setAnnotatePick(false); setTool((t) => (t === 'connector' ? 'select' : t)); return }
       if (target?.closest('.aiws-panel, .aiws-popover, .aiws-dialog, .aiws-menu, .aiws-side, .aiws-near')) return
@@ -803,7 +1085,7 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       }
       if (placing && event.key === 'Enter') { event.preventDefault(); void insert(placing, null); setPlacing(null); return }
       // a selected text or note takes typing at once (§4.4): the key starts the editor (single-letter shortcuts yield)
-      const typable = subject && !editing && policy.editContent && (subject.view_type === 'richtext' || subject.view_type === 'note' || subject.view_type === 'shape') && !laid.get(subject.entity_id)?.locked
+      const typable = subject && !editing && policy.editContent && (subject.view_type === 'richtext' || subject.view_type === 'note' || subject.view_type === 'shape' || subject.view_type === 'mindnode') && !laid.get(subject.entity_id)?.locked
       // keys typed before the editor that typing opened has mounted (its Block still loading) are passed on to it
       const typed = typeAhead.get('typed')
       if (editing && typed?.id === editing && !mod && !event.altKey && event.key.length === 1) {
@@ -822,6 +1104,8 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       if (!mod && !event.altKey && isFree && (event.key === 'v' || event.key === 'V')) { setTool('select'); setPlacing(null); return }
       if (!mod && !event.altKey && isFree && (event.key === 'h' || event.key === 'H')) { setTool('hand'); setPlacing(null); return }
       if (!mod && !event.altKey && isFree && (event.key === 'l' || event.key === 'L') && insertReason === null) { setTool('connector'); setPlacing(null); return }
+      if (!mod && !event.altKey && inkAllowed && (event.key === 'p' || event.key === 'P')) { chooseTool('pen'); return }
+      if (!mod && !event.altKey && inkAllowed && (event.key === 'e' || event.key === 'E')) { chooseTool('eraser'); return }
       if (mod && !event.altKey && !event.shiftKey) {
         const key = event.key.toLowerCase()
         // copy and cut let the browser's copy event run (it writes the marker); a paste waits for the paste event,
@@ -835,6 +1119,12 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
         }
       }
       if (!policy.select) return
+      // a control takes the keys while it or one of its Blocks is selected (脑图方案 §7.1)
+      if (selectionControl && !editing && isFree) {
+        const def = controlRegistry.get(store.outline.get(selectionControl.containerId)?.kind)
+        if (def?.keys?.(controlCtx(selectionControl.containerId, selectionControl.nodeId), event)) { event.preventDefault(); return }
+        if (mod && event.key.toLowerCase() === 'd' && selectionControl.nodeId) { event.preventDefault(); void duplicateNode(selectionControl.nodeId); return }
+      }
       if ((event.key === 'Delete' || event.key === 'Backspace') && remove.reason === null) { event.preventDefault(); remove.run(); return }
       if (event.key === 'Enter' && subject && policy.editContent && !editing) { event.preventDefault(); requestIntent(subject.entity_id, 'end'); setEditing(subject.entity_id); return }
       // a flow page (流式页交互改进 §2.4): ↑ ↓ walk the Blocks, Ctrl+Shift+↑ ↓ move the selected one
@@ -883,7 +1173,9 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       const files = [...data.files]
       const text = data.getData('text/plain')
       const svg = /^\s*(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*<svg[\s>]/i.test(text)
-      const foreign = files.length > 0 || (text !== '' && text !== copyMarker.current && (looksLikeDrawio(text) || svg))
+      // a table from a spreadsheet, a web page or another table view (after our own marker and files, before draw.io / SVG)
+      const table = files.length === 0 && text !== copyMarker.current ? clipboardTable(data) : null
+      const foreign = files.length > 0 || table !== null || (text !== '' && text !== copyMarker.current && (looksLikeDrawio(text) || svg))
       if (!foreign) {
         if (pendingPaste.current) { pendingPaste.current = false; event.preventDefault(); paste.run() }
         return
@@ -891,6 +1183,7 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       event.preventDefault()
       pendingPaste.current = false
       if (files.length > 0) void handleFiles(files, null)
+      else if (table) openTableImport(table, false, null)
       else if (looksLikeDrawio(text)) void runImport({ name: t('aiworkspace.canvas.import.pastedName'), text }, null)
       else if (insertReason) store.notify('info', insertReason)
       else insertSvg(text, null)
@@ -942,14 +1235,28 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
       try { typeItems.push(...definition.toolbar(context, store)) } catch (error) { console.error('[aiworkspace] block toolbar failed', error) }
     }
     if (single.kind === 'group' && canLayout && !singleLocked) typeItems.push({ kind: 'button', id: 'ungroup', icon: Ungroup, label: t('aiworkspace.canvas.ungroup'), key: 'Ctrl+Shift+G', run: ungroup })
-    if (definition?.Inspector || definition?.configFields || single.kind === 'group') moreActions.push({ id: 'inspector', label: t('aiworkspace.canvas.inspector.title'), key: 'F2', run: () => shell.setSide('inspector') })
+    // a control's own tools (direction, edges, spacing) while it is selected
+    if (selectionControl && !selectionControl.nodeId && mode === 'edit' && !singleLocked) {
+      const def = controlRegistry.get(single.kind)
+      try { if (def?.toolbar) typeItems.push(...def.toolbar(controlCtx(selectionControl.containerId, null))) } catch (error) { console.error('[aiworkspace] control toolbar failed', error) }
+    }
+    // a pinned node of another view goes back to the control's layout (§5.5); a text node has the tool on its toolbar
+    const pin = laid.get(single.entity_id)?.node?.pinned && single.view_type !== 'mindnode' ? single.entity_id : null
+    if (pin && canLayout && !singleLocked) moreActions.push({ id: 'mindmap-auto', label: t('aiworkspace.mindmap.backToLayout'), run: () => { void store.submit({ editId: `layout:${pin}`, label: t('aiworkspace.mindmap.backToLayout'), operations: resetLayoutOps(store, [pin]) }) } })
+    if (definition?.Inspector || definition?.configFields || single.kind === 'group' || single.kind === 'composite') moreActions.push({ id: 'inspector', label: t('aiworkspace.canvas.inspector.title'), key: 'F2', run: () => shell.setSide('inspector') })
     if (policy.annotate && source && ui.annotate) commonItems.push({ kind: 'button', id: 'annotate', icon: MessageSquarePlus, label: t('aiworkspace.canvas.annotate.label'), run: annotateSelection })
     if (source) moreActions.push({ id: 'relations', label: t('aiworkspace.canvas.relations'), run: () => shell.setSide('relations') })
+    // a rich text's lists as a mind map beside it (脑图方案 §8)
+    if (single.view_type === 'richtext' && source && insertReason === null) moreActions.push({ id: 'mindmap-from-list', label: t('aiworkspace.mindmap.fromList'), run: () => { void richtextToMindmap(store, laid, single, surfaceId).then((id) => { if (id) setSelectionState(new Set([id])) }) } })
     if (source && canLayout && !singleLocked) moreActions.push({ id: 'add-view', label: t('aiworkspace.canvas.addView'), run: () => setPicker({ kind: 'add-view' }) })
     if (single.kind === 'group' && canLayout && !singleLocked) moreActions.push({ id: 'ungroup', label: t('aiworkspace.canvas.ungroup'), key: 'Ctrl+Shift+G', run: ungroup })
   }
   if (selection.size > 1 && canLayout && mode === 'edit') typeItems.push({ kind: 'button', id: 'group', icon: Group, label: t('aiworkspace.canvas.group'), key: 'Ctrl+G', run: group })
   if (selection.size > 1 && canLayout) moreActions.push({ id: 'group', label: t('aiworkspace.canvas.group'), key: 'Ctrl+G', run: group })
+  // the selection as a composite control: its definition in the user's home, built, and an instance in its place
+  if (selection.size > 0 && isFree && canLayout && mode === 'edit' && !phone && !nodesSelected && insertReason === null && store.session.status().kind === 'live') {
+    moreActions.push({ id: 'define-control', label: t('aiworkspace.ext.define.action'), run: () => setDefining(topLevel(laid, selection).filter((id) => !isConnector(laid.get(id)?.entity))) })
+  }
   if (lockable && mode === 'edit') commonItems.push(allLocked
     ? { kind: 'button', id: 'unlock', icon: LockOpen, label: t('aiworkspace.canvas.lock.unlock'), disabled: lockedHere ? false : t('aiworkspace.canvas.lock.groupLocked'), run: () => { void setLocked(topIds, false) } }
     : { kind: 'button', id: 'lock', icon: Lock, label: t('aiworkspace.canvas.lock.lock'), run: () => { void setLocked(topIds, true) } })
@@ -959,8 +1266,9 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     if (cut.reason === null && !allLocked) moreActions.push({ id: 'cut', label: t('aiworkspace.canvas.clipboard.cutAction'), key: 'Ctrl+X', run: cut.run })
   }
   if (layoutable.length > 0 && !allLocked) {
-    moreActions.push({ id: 'front', label: t('aiworkspace.canvas.order.front'), key: 'Ctrl+]', run: () => reorder('front') }, { id: 'back', label: t('aiworkspace.canvas.order.back'), key: 'Ctrl+[', run: () => reorder('back') })
-    if (canLayout && surfacesOf(store).length > 1) moreActions.push({ id: 'move-surface', label: t('aiworkspace.canvas.moveToCanvasMenu'), run: () => setPicker({ kind: 'move-surface' }) })
+    if (!nodesSelected) moreActions.push({ id: 'front', label: t('aiworkspace.canvas.order.front'), key: 'Ctrl+]', run: () => reorder('front') }, { id: 'back', label: t('aiworkspace.canvas.order.back'), key: 'Ctrl+[', run: () => reorder('back') })
+    if (canLayout && surfacesOf(store).length > 1 && !nodesSelected) moreActions.push({ id: 'move-surface', label: t('aiworkspace.canvas.moveToCanvasMenu'), run: () => setPicker({ kind: 'move-surface' }) })
+    if (selectionControl?.nodeId && insertReason === null) moreActions.push({ id: 'mindmap-duplicate', label: t('aiworkspace.mindmap.duplicate'), key: 'Ctrl+D', run: () => { void duplicateNode(selectionControl.nodeId!) } })
     moreActions.push({ id: 'delete', label: t('aiworkspace.common.delete'), key: 'Delete', run: () => { void deleteSelection() } })
   }
   // a locked object offers "unlock" and reading only (§4.3): no type tools, nothing that moves or removes it
@@ -1000,6 +1308,9 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
     openCatalog: (tab, key) => openCatalog(tab, key),
     copy, cut, paste, remove,
     importDrawio: importCommand,
+    importPdf: importPdfCommand,
+    importOffice: importOfficeCommand,
+    importTable: importTableCommand,
     exportDrawio: exportCommand,
     view: isFree ? { camera, fitAll, fitSelection, hasSelection: selection.size > 0 } : null,
     canvasTabs: CANVAS_SIDE_TABS,
@@ -1034,6 +1345,7 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
   const placingTitle = placing?.entry.title ?? ''
   return (
     <BudgetContext.Provider value={budget}>
+    <RunModeContext.Provider value={runContext}>
       <div className="aiws-canvas-view" data-testid="aiws-canvas-view" data-mode={mode}>
         <div className="aiws-canvas-body" ref={hostRef} data-testid="aiws-canvas-body">
           <div ref={mainRef} className={`aiws-canvas-main${shell.prefs.grid ? '' : ' no-grid'}${showObjectToolbar && !collapsed ? ' has-left-tools' : ''}`}
@@ -1055,8 +1367,9 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
               <EditorToolbarContext.Provider value={toolbarSink}>
               <OpenWishContext.Provider value={shell.side === 'wish' ? wishOpen?.cellId ?? null : null}>
               <RenderHost surfaceId={surfaceId} mode={mode} camera={camera} laid={laid} index={index} selection={selection} onSelectionChange={setSelection} editing={editing} onEditingChange={setEditing}
-                canLayout={canLayoutBlock} onCommitLayout={commitLayout} onOpenEntity={ui.openEntity} gesturesPaused={Boolean(menu || picker || catalog || overlayOpen)}
+                canLayout={canLayoutBlock} onCommitLayout={commitLayout} onMoveNodes={moveNodes} onOpenEntity={ui.openEntity} gesturesPaused={Boolean(menu || picker || catalog || overlayOpen)}
                 tool={tool} placing={placing ? { ...entrySize(placing.entry), label: placingTitle } : null}
+                ink={inkTool ? { style: inkStyleOf(inkPrefs), touchLock: inkPrefs.touchLock, control: inkControl } : null}
                 onPlace={(world) => {
                   const request = placing
                   setPlacing(null)
@@ -1087,12 +1400,17 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
             {shell.guide && <GuideOverlay key={shell.guide.pathId} camera={camera} surfaceId={surfaceId} />}
             <div className="aiws-chrome-top">
               {!phone && <MainToolbar canvas={commands} />}
-              {(shell.prefs.viewToolbar || phone) && <ViewToolbar camera={isFree ? camera : null} hasSelection={selection.size > 0} onFitAll={fitAll} onFitSelection={fitSelection} annotate={annotateCommand} />}
+              {(shell.prefs.viewToolbar || phone) && <ViewToolbar camera={isFree ? camera : null} hasSelection={selection.size > 0} onFitAll={fitAll} onFitSelection={fitSelection} annotate={annotateCommand} runMode={runMode} />}
             </div>
             {showObjectToolbar && (
               <div className="aiws-chrome-left">
-                <ObjectToolbar isFree={isFree} tool={tool} onTool={(next) => { setTool(next); setPlacing(null) }} placingKey={placing?.entry.key ?? (tool === 'connector' ? 'block:connector' : null)} insertReason={insertReason} noteReason={toolNoteReason}
+                <ObjectToolbar isFree={isFree} tool={tool} onTool={chooseTool} placingKey={placing?.entry.key ?? (tool === 'connector' ? 'block:connector' : null)} insertReason={insertReason} noteReason={toolNoteReason}
                   onPick={pickEntry} onPickFile={(entry, file) => pick({ entry, file })} onOpenCatalog={(tab, key) => openCatalog(tab, key)} collapsed={collapsed} onCollapsed={setCollapsed} />
+              </div>
+            )}
+            {inkTool && (
+              <div className="aiws-chrome-bottom">
+                <InkBar tool={tool === 'eraser' ? 'eraser' : 'pen'} prefs={inkPrefs} onTool={chooseTool} onPrefs={setInkPrefs} onDone={() => chooseTool('select')} />
               </div>
             )}
             {(placing || annotatePick || tool === 'connector') && (
@@ -1106,7 +1424,14 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
             <StatusDock />
             <input ref={importInput} type="file" hidden aria-hidden="true" tabIndex={-1} accept=".drawio,.xml,.png,.svg,application/xml,text/xml,image/png,image/svg+xml" data-testid="aiws-import-drawio-file"
               onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void file.arrayBuffer().then((buffer) => runImport({ name: file.name, bytes: new Uint8Array(buffer) }, null)) }} />
+            <input ref={pdfInput} type="file" hidden aria-hidden="true" tabIndex={-1} accept=".pdf,application/pdf" data-testid="aiws-import-pdf-file"
+              onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void openPdfImport(file, null, false, null) }} />
+            <input ref={officeInput} type="file" hidden aria-hidden="true" tabIndex={-1} accept={OFFICE_ACCEPT} data-testid="aiws-import-office-file"
+              onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void openOfficeImport(file, null, false, null) }} />
+            <input ref={tableInput} type="file" hidden aria-hidden="true" tabIndex={-1} accept={TABULAR_ACCEPT} data-testid="aiws-import-table-file"
+              onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; const at = catalogSpot.current; catalogSpot.current = null; if (file) void file.arrayBuffer().then((buffer) => openTableImport({ kind: 'file', name: file.name, bytes: new Uint8Array(buffer) }, false, at)) }} />
             {menu && <ContextMenu at={menu.at} items={menuItems} onClose={() => setMenu(null)} />}
+            {defining && defining.length > 0 && <DefineControlDialog ids={defining} laid={laid} surfaceId={surfaceId} onClose={() => setDefining(null)} onDone={(ids) => { setDefining(null); setSelectionState(new Set(ids)) }} />}
             {picker && <Picker kind={picker.kind} selection={selectedEntities} surfaceId={surfaceId} onClose={() => setPicker(null)} onPick={(choice) => {
               if (picker.kind === 'move-surface') moveToSurface(choice)
               else if (picker.kind === 'add-view' && single?.source_id) {
@@ -1115,9 +1440,13 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
                 setPicker(null)
               }
             }} />}
-            {catalog && (
-              <InsertCatalog initialTab={catalog.tab} initialKey={catalog.key} canPlace={isFree} onClose={() => setCatalog(null)} onImport={importReason === null ? () => { setCatalog(null); importCommand.run() } : undefined}
-                onImportAssets={insertReason === null ? async (files, folder, signal) => {
+            {catalog && (() => {
+              // for a mind-map node the entry becomes its child: no placing by click, no bulk imports onto the canvas
+              const intoNode = catalog.parentId !== undefined && Boolean(laid.get(catalog.parentId)?.node)
+              return (
+              <InsertCatalog initialTab={catalog.tab} initialKey={catalog.key} canPlace={isFree && !intoNode} onClose={() => setCatalog(null)} onImport={importReason === null && !intoNode ? () => { setCatalog(null); importCommand.run() } : undefined}
+                onImportTable={tableReason === null && !intoNode ? () => { setCatalog(null); importTableAt(catalog.world ?? null) } : undefined}
+                onImportAssets={insertReason === null && !intoNode ? async (files, folder, signal) => {
                   try {
                     const items = await store.session.importAssets(files, folder, signal)
                     signal.throwIfAborted()
@@ -1132,14 +1461,26 @@ function SurfaceView({ surface, mode, focus }: { surface: EntityEnvelope; mode: 
                 const at = catalog.world
                 const parentId = catalog.parentId
                 setCatalog(null)
+                // a table file chosen for the file entry asks: a table, or a file (§5.1)
+                const file = request.file
+                if (file && request.entry.definition.type === 'asset' && !request.entry.variant && how === 'center' && !(parentId && laid.get(parentId)?.node)) {
+                  void file.arrayBuffer().then((buffer) => {
+                    const bytes = new Uint8Array(buffer)
+                    if (tabularKind(file.name, bytes)) openTableImport({ kind: 'file', name: file.name, bytes }, true, at, file)
+                    else void insert(request, at, parentId, undefined, catalog.afterId)
+                  })
+                  return
+                }
                 if (how === 'place') pick(request)
                 else void insert(request, at, parentId, undefined, catalog.afterId)
               }} />
-            )}
+              )
+            })()}
           </div>
           <SidePanel tabs={sideTabs} render={sideContent} />
         </div>
       </div>
+    </RunModeContext.Provider>
     </BudgetContext.Provider>
   )
 }
@@ -1155,9 +1496,8 @@ function SelectionInspector({ cell, mode, context, resolved, registryVersion }: 
   const keyRevs = context?.keyRevs ?? {}
   const readOnly = !context || context.readOnlyReason !== null
   const setConfig = (key: string, value: Json) => {
-    if (!payload || readOnly) return
-    const config = { ...(payload.config ?? {}), [key]: value }
-    void store.submit({ editId: `config:${cell.entity_id}`, label: t('aiworkspace.canvas.inspector.configLabel', { key }), operations: [{ op: 'entity.set_keys', entity_id: cell.entity_id, keys: [{ key: 'config', value: config as Json, expect: { rev: keyRevs.config ?? 0 } }] }] })
+    if (!payload || readOnly || !context) return
+    setCellConfig(context, store, { [key]: value }, t('aiworkspace.canvas.inspector.configLabel', { key }))
   }
   const setTitle = (title: string) => {
     if (!payload || readOnly || title === (payload.title ?? '')) return
@@ -1167,6 +1507,9 @@ function SelectionInspector({ cell, mode, context, resolved, registryVersion }: 
   const operable = cell.view_type !== 'frame' && cell.view_type !== 'connector' && cell.type_id === 'buckyos.cell'
   return (
     <BlockInspector cellId={cell.entity_id} mode={mode}>
+      {((cell.type_id === 'buckyos.container' && cell.kind === 'composite') || (cell.type_id === 'buckyos.cell' && cell.def_id && store.outline.get(cell.def_id)?.ident)) && (
+        <InstanceInspector entity={cell} readOnly={mode === 'edit' && cell.capabilities.includes('update') ? null : t('aiworkspace.blocks.noPermission')} />
+      )}
       {operable && payload && (
         <label className="aiws-inline-form" title={t('aiworkspace.canvas.inspector.liveTip')}>
           <input type="checkbox" data-testid="aiws-inspector-live" checked={payload.presentation?.live === true} disabled={readOnly}

@@ -78,6 +78,9 @@ interface MockAccount {
 /** Per-account facts of the Zone's users; `null` overrides mean the type default. */
 interface MockZoneUser {
   user_type: string
+  state?: string
+  show_name?: string
+  is_local?: boolean
   allow_password_change?: boolean | null
   allow_contact_edit?: boolean | null
 }
@@ -123,6 +126,8 @@ interface MockState {
   runtime_offers: AgentRuntimeOffer[]
   /** A node of the zone runs Agent containers (default true). */
   container_available?: boolean
+  /** `lite`: BuckyOS Desktop Lite, one Agent and no containers (default full). */
+  edition?: 'full' | 'lite'
   runtime_directory_error?: string
   agents: MockAgent[]
   step_ms: number
@@ -254,7 +259,7 @@ function defaultState(): MockState {
     zone_users: {
       alice: { user_type: 'admin' },
       bob: { user_type: 'user' },
-      carol: { user_type: 'user' },
+      carol: { user_type: 'user', state: 'pending' },
       dave: { user_type: 'limited' },
     },
     user_groups: [],
@@ -420,6 +425,10 @@ function advanceAll(state: MockState) {
   for (const agent of state.agents) advance(state, agent, now)
 }
 
+function agentSlotHolder(state: MockState): MockAgent | undefined {
+  return state.agents.find((agent) => agent.install.state !== 'removed')
+}
+
 function visibleAgents(state: MockState) {
   return liveAgents(state).filter((agent) => isAdmin(state.account) || agent.owner_user_id === state.account.user_id)
 }
@@ -476,7 +485,24 @@ function effectiveOptions(user: MockZoneUser) {
   }
 }
 
-function userDetail(state: MockState) {
+function userDetail(state: MockState, userId = state.account.user_id) {
+  if (userId !== state.account.user_id) {
+    requireAdmin(state)
+    const user = zoneUser(state, userId)
+    const profile = { did: `did:bns:${userId}.${state.zone}`, display_name: user.show_name ?? userId }
+    return {
+      user_id: userId,
+      show_name: profile.display_name,
+      user_type: user.user_type,
+      state: user.state ?? 'active',
+      res_pool_id: 'default',
+      is_local: user.is_local ?? false,
+      groups: groupsOf(state, userId),
+      ...effectiveOptions(user),
+      profile,
+      local_profile: { ...profile, private_extra: { system_contact: { did: profile.did, bindings: [] } } },
+    }
+  }
   const { account } = state
   const contact = { did: account.did, bindings: state.user_bindings.map((binding) => ({ ...binding })) }
   const profile = { did: account.did, display_name: account.user_name, ...account.profile }
@@ -485,7 +511,7 @@ function userDetail(state: MockState) {
     user_id: account.user_id,
     show_name: profile.display_name,
     user_type: account.user_type,
-    state: 'active',
+    state: facts.state ?? 'active',
     res_pool_id: 'default',
     is_local: false,
     groups: groupsOf(state, account.user_id),
@@ -498,23 +524,24 @@ function userDetail(state: MockState) {
   }
 }
 
-function userList(state: MockState) {
+function userList(state: MockState, includeDeleted = false) {
   const users = state.user_names
     .filter((userId) => state.zone_users[userId])
+    .filter((userId) => includeDeleted || state.zone_users[userId].state !== 'deleted')
     .map((userId) => {
       const user = zoneUser(state, userId)
       const effective = effectiveOptions(user)
       return {
         user_id: userId,
-        show_name: userId === state.account.user_id ? state.account.user_name : userId,
+        show_name: userId === state.account.user_id ? state.account.user_name : user.show_name ?? userId,
         user_type: user.user_type,
-        state: 'active',
-        is_local: false,
+        state: user.state ?? 'active',
+        is_local: user.is_local ?? false,
         groups: groupsOf(state, userId),
         allow_password_change: user.allow_password_change ?? null,
         allow_contact_edit: user.allow_contact_edit ?? null,
-        can_change_password: effective.allow_password_change,
-        can_edit_contacts: effective.allow_contact_edit,
+        can_change_password: effective.allow_password_change && (user.state ?? 'active') === 'active',
+        can_edit_contacts: effective.allow_contact_edit && (user.state ?? 'active') === 'active',
       }
     })
   return { total: users.length, users }
@@ -858,7 +885,7 @@ function defaultSso(): MockSso {
         service: 'aiworkspace',
         entry_id: 'se-dj',
         state: 'active',
-        resource: { kind: 'workspace', title: 'DJ Radio', owner_name: 'DJ', path: '/workspace/ws-dj' },
+        resource: { kind: 'workspace', title: 'DJ Radio', owner_name: 'DJ', path: '/workspace' },
         methods: allMethods,
       },
       {
@@ -1032,7 +1059,8 @@ function defaultReturnPath(resource: InviteResource | undefined) {
   if (resource?.kind === 'group_session') {
     return `/messagehub/guest?group=${encodeURIComponent(resource.group_did)}&session=${encodeURIComponent(resource.session_id)}`
   }
-  if (resource?.kind === 'workspace') return `/workspace/${encodeURIComponent(resource.workspace_id)}`
+  // a workspace lives on its own origin (T4-8): the Zone host has only the list
+  if (resource?.kind === 'workspace') return '/workspace'
   return '/'
 }
 
@@ -1076,6 +1104,8 @@ function handleSso(state: MockState, method: string, params: Record<string, unkn
   const sso = ssoOf(state)
   const now = nowSecs()
   switch (method) {
+    case 'auth.describe_target':
+      return { target: { kind: 'system', service_id: 'control-panel' }, display_name: 'Desktop' }
     case 'auth.sso_config':
       return {
         self_register_enabled: sso.settings.self_register_enabled,
@@ -1343,6 +1373,23 @@ function handle(state: MockState, method: string, params: Record<string, unknown
       return checkName(state, stringParam(params, 'name'))
     case 'agent.list_templates':
       return { templates: state.templates.map((template) => ({ ...template })) }
+    case 'system.product.get': {
+      const lite = state.edition === 'lite'
+      const holder = lite ? agentSlotHolder(state) : undefined
+      return {
+        edition: lite ? 'lite' : 'full',
+        capabilities: {
+          container: !lite,
+          user_service_apps: !lite,
+          static_web_apps: true,
+          max_running_agents: lite ? 1 : null,
+        },
+        preinstalled_script_apps: [],
+        agent_slot: holder
+          ? { owner_user_id: holder.owner_user_id, agent_id: holder.agent_id, acquired_at: holder.step_started_at }
+          : null,
+      }
+    }
     case 'agent.runtime_directory': {
       if (state.runtime_directory_error) throw new MockRpcError(state.runtime_directory_error)
       const agent = typeof params.agent_id === 'string' ? findAgent(state, params.agent_id) : null
@@ -1365,8 +1412,14 @@ function handle(state: MockState, method: string, params: Record<string, unknown
         container: 'container',
       }
     }
-    case 'agent.create':
+    case 'agent.create': {
+      // BuckyOS Desktop Lite runs one Agent: the run slot is taken until it is deleted.
+      const holder = state.edition === 'lite' ? agentSlotHolder(state) : undefined
+      if (holder) {
+        throw new MockRpcError(`agent_slot_occupied: this BuckyOS edition runs one Agent and ${holder.agent_id} already exists; delete it before creating another`)
+      }
       return createAgent(state, params)
+    }
     case 'agent.create.status':
       return { ...findAgent(state, stringParam(params, 'agent_id')).install }
     case 'agent.create.retry':
@@ -1400,9 +1453,52 @@ function handle(state: MockState, method: string, params: Record<string, unknown
       return { ok: true }
     }
     case 'user.get':
-      return userDetail(state)
+      return userDetail(state, typeof params.user_id === 'string' ? params.user_id : undefined)
     case 'user.list':
-      return userList(state)
+      return userList(state, params.include_deleted === true)
+    case 'user.create': {
+      requireAdmin(state)
+      const userId = stringParam(params, 'user_id').toLowerCase()
+      if (state.zone_users[userId]?.state === 'deleted') {
+        throw new MockRpcError(`user_deleted: User '${userId}' was deleted; restore the existing account with user.change_state (state: active). Its identity, credentials, permissions and data are retained.`)
+      }
+      const check = checkName(state, userId)
+      if (!check.available) throw new MockRpcError(`name_conflict: ${check.message}`)
+      const userType = params.user_type ?? 'user'
+      if (userType !== 'user' && userType !== 'limited') throw new MockRpcError('user.create supports the User and Limited types')
+      stringParam(params, 'password_hash')
+      const groups = stringListParam(params, 'groups')
+      for (const groupId of groups) {
+        if (!state.user_groups.some((group) => group.group_id === groupId)) throw new MockRpcError(`Unknown group '${groupId}'`)
+      }
+      state.zone_users[userId] = {
+        user_type: userType,
+        state: 'active',
+        is_local: true,
+        show_name: typeof params.show_name === 'string' ? params.show_name : userId,
+        allow_password_change: optionParam(params, 'allow_password_change'),
+        allow_contact_edit: optionParam(params, 'allow_contact_edit'),
+      }
+      state.user_names.push(userId)
+      for (const group of state.user_groups) {
+        if (groups.includes(group.group_id)) group.members.push(userId)
+      }
+      return { ok: true, created: true, user_id: userId, user_type: userType, state: 'active', rbac_refreshed: true }
+    }
+    case 'user.delete':
+    case 'user.change_state': {
+      requireAdmin(state)
+      const userId = stringParam(params, 'user_id').toLowerCase()
+      const user = zoneUser(state, userId)
+      const nextState = method === 'user.delete' ? 'deleted' : stringParam(params, 'state')
+      if (!['active', 'pending', 'deleted'].includes(nextState) && !/^(suspended|banned):/.test(nextState)) {
+        throw new MockRpcError(`Invalid user state: ${nextState}`)
+      }
+      if (nextState !== 'active' && (userId === 'root' || user.user_type === 'root')) throw new MockRpcError('Cannot disable root user')
+      if (nextState !== 'active' && userId === state.account.user_id) throw new MockRpcError('Cannot disable yourself')
+      user.state = nextState
+      return { ok: true, user_id: userId, state: nextState, rbac_refreshed: true }
+    }
     case 'user.change_type': {
       requireAdmin(state)
       const userId = stringParam(params, 'user_id')

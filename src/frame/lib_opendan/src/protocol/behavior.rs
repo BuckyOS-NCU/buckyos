@@ -61,8 +61,6 @@ pub struct BehaviorPromptConfig {
     pub on_input: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_context_switch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semi_subscription_snapshot: Option<String>,
     /// Goal Sessions: template of the Goal header (variable `goal`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_activation: Option<String>,
@@ -82,6 +80,11 @@ pub struct BehaviorCapabilities {
     /// why the call is made now and what it should yield.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub call_intent: bool,
+    /// The access a session entered with this behavior takes to its
+    /// workspace (`None`: what its creator asked). A plan reads the
+    /// workspace; the work sessions of its Todos write it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<super::config::WorkspaceAccess>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -97,6 +100,11 @@ pub struct BehaviorBudget {
     pub max_completion_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wallclock_ms: Option<u64>,
+    /// Functions still offered once `max_tool_iterations` is used up
+    /// (`None`: `report` / `ask_user` of an explicit-report session; `[]`:
+    /// none). Calling them costs no iteration, at most 2 batches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_up_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -119,11 +127,6 @@ pub struct BehaviorEntryConfig {
     pub mode: Option<ContextMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit: Option<InheritMode>,
-    /// A hand-over to this behavior (`next_behavior`) executes the session's
-    /// next serial Todo: the host admits it and hands its body over as the
-    /// sub task (`create_sub_context` only).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub todo: bool,
 }
 
 /// `[tool]`: a sub context behavior offered to its callers as a named
@@ -161,7 +164,7 @@ pub struct BehaviorReply {
     /// JSON Schema of the reply (an object schema).
     pub schema: Value,
     /// An array field of the reply that must list every question the
-    /// context asked the user (`agent-session ask-user`), one entry each.
+    /// context asked the user (`ask_user`), one entry each.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asks_field: Option<String>,
 }
@@ -197,6 +200,9 @@ pub const MAX_CMD_SKILLS: usize = 8;
 pub struct CmdSkill {
     pub name: String,
     pub text: String,
+    /// Commands the manual relies on that the session's runtime was found without when the session froze.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_commands: Vec<String>,
 }
 
 /// Kind of an installed skill: a command manual (`cmd_skills/`) or a
@@ -255,6 +261,11 @@ pub struct SkillMeta {
     /// `linux`, `macos`, `windows`); empty: all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
+    /// Commands the manual relies on (front matter `commands`, comma separated). A skill without them still works in
+    /// part, and is never refused for them: they are for telling the owner what is missing and which extension package
+    /// would bring it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
 }
 
 fn standard_baseline() -> buckyos_api::RuntimeBaseline {
@@ -273,6 +284,7 @@ impl Default for SkillMeta {
             tools: Vec::new(),
             baseline: standard_baseline(),
             platforms: Vec::new(),
+            commands: Vec::new(),
         }
     }
 }
@@ -392,8 +404,24 @@ pub fn skill_meta(kind: SkillKind, name: &str, text: &str) -> SkillMeta {
         requires: fields.get("requires").cloned().unwrap_or_default(),
         baseline,
         platforms,
+        commands: skill_commands_of(&fields),
         ..Default::default()
     }
+}
+
+/// `commands: ffmpeg, ffprobe` of a manual; what is no command name is left out.
+fn skill_commands_of(fields: &BTreeMap<String, String>) -> Vec<String> {
+    let mut commands: Vec<String> = fields
+        .get("commands")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && !c.starts_with('.') && c.chars().all(|x| x.is_ascii_alphanumeric() || matches!(x, '.' | '_' | '+' | '-')))
+        .map(str::to_string)
+        .collect();
+    commands.dedup();
+    commands
 }
 
 fn valid_function_name(name: &str) -> bool {
@@ -605,7 +633,6 @@ impl BehaviorConfig {
                 on_init: self.prompt.on_init.clone(),
                 on_input: self.prompt.on_input.clone(),
                 on_context_switch: self.prompt.on_context_switch.clone(),
-                semi_subscription_snapshot: self.prompt.semi_subscription_snapshot.clone(),
                 goal_activation: self.prompt.goal_activation.clone(),
             },
             input: self.input,
@@ -615,7 +642,6 @@ impl BehaviorConfig {
                 _ => InheritMode::None,
             }),
             tool: self.tool.clone(),
-            todo: self.entry.todo,
             reply: self.reply.clone(),
             call_intent: self.capabilities.call_intent,
         };

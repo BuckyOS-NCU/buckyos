@@ -1,256 +1,194 @@
-//! What a context is shown after its tool results (`[input] background =
-//! "after_tools"`, plan_simple TODO §4.4): the action → observation →
-//! next decision of the behavior loop, for a function call loop. Before the
-//! next inference the host brings the TodoList up to its sub sessions'
-//! committed state and appends, as one `<<background_context>>` message,
-//! the lines that changed since they were last shown: each Todo (its
-//! compact view line) and the sub sessions no Todo binds. The session's
-//! runtime and workspace are frozen for its life and told by its first
-//! input. Never a sub session's transcript or report: those are read on
-//! demand (`todo show --report`).
+//! The tasks a session follows, as lines of its background (simple Work
+//! Session TODO §3.2, Q8): a running task that printed something since its
+//! output was last shown gets a line with only the new output, at most
+//! [`TASK_OUTPUT_MAX`] bytes of it (its end is kept). The task's end is its
+//! event (`<<task_result>>`), never a line; like every background line, the
+//! output is only seen in an input that places it (`background.rs`).
 //!
-//! What was shown is `HostMeta.observed` (line key → digest), committed with
-//! the snapshot that carries the message: a crash before that commit shows
-//! the lines again, one after it never twice. A batch whose results are not
-//! all paired is never at this boundary (the waist only calls the hook
-//! between batches), and the message after a final report is never needed
-//! (the run finishes without another inference).
+//! How far a task's output was shown is `background_shown["task:<id>"]`
+//! (`<stdout bytes>,<stderr bytes>`). The call that became the task showed
+//! the output so far: the boundary right after it records where the output
+//! stands ([`note_started`]), without showing anything.
 
-use std::collections::BTreeMap;
-
-use buckyos_api::{AiMessage, AiRole};
-use llm_context::deps::Injection;
-use llm_context::state::LLMContextSnapshot;
-use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::protocol::*;
 use crate::session::runs::RunHandle;
 
-use super::background::{child_line, digest, render, BackgroundLine};
-use super::receipts::{snapshot_host_meta, with_host_meta};
+use super::background::BackgroundLine;
 use super::shared::{commit_and_report, Shared};
 
-/// run.json `host.extra` key: the run is shown background after its tool
-/// results (`"after_tools"`), frozen with the run.
-pub(super) const EXTRA_BACKGROUND: &str = "background";
+/// Most new output of one task a line shows (its end is kept).
+pub(super) const TASK_OUTPUT_MAX: usize = 2048;
 
-const BLOCK_START: &str = "<<background_context>>";
+const LOCAL_SHELL_PREFIX: &str = "local:shell:";
 
-pub(super) fn enabled(run: &RunHandle) -> bool {
-    super::tools::run_flag(run, EXTRA_BACKGROUND)
+fn key(task_id: &str) -> String {
+    format!("task:{task_id}")
+}
+
+fn fmt_elapsed(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+/// Bytes `[from, len)` of a file, at most `max` of them (its end).
+fn read_from(path: &Path, from: u64, max: usize) -> (u64, String, bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (from, String::new(), false);
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= from {
+        return (len.min(from), String::new(), false);
+    }
+    let start = from.max(len.saturating_sub(max as u64));
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return (from, String::new(), false);
+    }
+    (len, String::from_utf8_lossy(&buf).to_string(), start > from)
+}
+
+fn lengths(dir: &Path) -> String {
+    let len = |f: &str| std::fs::metadata(dir.join(f)).map(|m| m.len()).unwrap_or(0);
+    format!("{},{}", len("stdout"), len("stderr"))
+}
+
+fn parse(mark: &str) -> Option<[u64; 2]> {
+    let (out, err) = mark.split_once(',')?;
+    Some([out.parse().ok()?, err.parse().ok()?])
+}
+
+/// The execution directory of a `local:shell:<call>` task, under the run
+/// whose call started it.
+fn exec_dir(sh: &Shared, task_id: &str) -> Option<PathBuf> {
+    let call = task_id.strip_prefix(LOCAL_SHELL_PREFIX)?;
+    let runs = sh.dir.runs();
+    runs.list()
+        .ok()?
+        .into_iter()
+        .rev()
+        .map(|run| runs.dir().join(run).join("exec").join(call))
+        .find(|d| d.is_dir())
+}
+
+/// The tasks the session follows: the watched ones and those its live run
+/// noted (a batch joining an open Turn comes before the Turn hands them
+/// over).
+fn followed(sh: &Shared, state: &SessionState) -> Vec<String> {
+    let mut tasks = state.watched_tasks.clone();
+    let noted: Vec<String> = state
+        .live_run
         .as_ref()
-        .and_then(Value::as_str)
-        == Some("after_tools")
-}
-
-/// Whether the snapshot stands right after a batch of tool results (a
-/// behavior step with action results).
-fn after_tool_results(snapshot: &LLMContextSnapshot, behavior: bool) -> bool {
-    let st = &snapshot.state;
-    if behavior {
-        return st
-            .last_step
-            .as_ref()
-            .is_some_and(|s| !s.action_results.is_empty());
-    }
-    st.accumulated.last().is_some_and(|m| m.role == AiRole::Tool)
-}
-
-/// The candidate lines now, and the finished sub sessions with the key of
-/// the line that tells their end.
-struct Observed {
-    lines: Vec<BackgroundLine>,
-    ends: Vec<(String, String)>,
-}
-
-fn todo_key(todo_id: &str) -> String {
-    format!("todo:{todo_id}")
-}
-
-async fn observe(sh: &Shared) -> Result<Observed> {
-    let sid = sh.dir.sid().to_string();
-    let list = super::todos::load(sh);
-    let mut lines = Vec::new();
-    for t in &list.todos {
-        lines.push(BackgroundLine::new(todo_key(&t.todo_id), t.view_line()));
-    }
-    let bound: BTreeMap<String, (String, u32)> = list
-        .todos
-        .iter()
-        .flat_map(|t| {
-            t.attempts.iter().filter_map(|a| {
-                a.child_sid
-                    .clone()
-                    .map(|c| (c, (t.todo_id.clone(), a.attempt)))
-            })
-        })
-        .collect();
-    let mut ends = Vec::new();
-    for e in sh.agent().sessions().children_of(&[sid]).await? {
-        let st = &e.status;
-        let finished = st.run_state == RunState::Finished;
-        match bound.get(&e.session_id) {
-            // Its Todo's line tells it, once the attempt ended there.
-            Some((todo, attempt)) => {
-                if finished
-                    && list
-                        .get(todo)
-                        .and_then(|t| t.attempt(*attempt))
-                        .is_some_and(|a| a.ended())
-                {
-                    ends.push((e.session_id.clone(), todo_key(todo)));
-                }
-            }
-            None => {
-                let line = if finished
-                    || st.pending_decision.is_some()
-                    || st.waiting_for == Some(WaitingKind::Input)
-                {
-                    child_line(&e)
-                } else {
-                    // A running session's activity is not a change to
-                    // decide on.
-                    BackgroundLine::new(
-                        format!("work:{}", e.session_id),
-                        format!("work {}: {}", e.session_id, st.run_state.as_str()),
-                    )
-                };
-                if finished {
-                    ends.push((e.session_id.clone(), line.key.clone()));
-                }
-                lines.push(line);
-            }
+        .and_then(|l| sh.dir.runs().record(&l.run_id).ok())
+        .and_then(|r| r.host)
+        .and_then(|h| serde_json::from_value(h.extra["tasks"].clone()).ok())
+        .unwrap_or_default();
+    for t in noted {
+        if !tasks.contains(&t) {
+            tasks.push(t);
         }
     }
-    Ok(Observed { lines, ends })
+    tasks.retain(|t| !t.starts_with(super::children::SESSION_TASK_PREFIX));
+    tasks
 }
 
-/// The lines to show and the `observed` map after showing them.
-fn select(
-    lines: &[BackgroundLine],
-    observed: &BTreeMap<String, String>,
-) -> (Vec<BackgroundLine>, BTreeMap<String, String>) {
-    let mut shown = Vec::new();
-    let mut next = observed.clone();
-    for l in lines {
-        let d = digest(&l.text);
-        if observed.get(&l.key) == Some(&d) {
+/// The candidate lines of the running tasks the session follows: the new
+/// output of each, or (nothing new) a record that keeps where it stands.
+pub(super) async fn task_lines(sh: &Arc<Shared>, state: &SessionState) -> Vec<BackgroundLine> {
+    let resolver = super::drive::task_resolver(sh);
+    let mut lines = Vec::new();
+    for task_id in followed(sh, state) {
+        if !resolver.can_resolve(&task_id) {
             continue;
         }
-        next.insert(l.key.clone(), d);
-        shown.push(l.clone());
+        let agent_tool::TaskState::Running {
+            brief,
+            elapsed_ms,
+            output_tail,
+            ..
+        } = resolver.state(&task_id).await
+        else {
+            continue;
+        };
+        let key = key(&task_id);
+        let before = state.background_shown.get(&key);
+        let Some(dir) = exec_dir(sh, &task_id) else {
+            // Another runtime: its tail, shown when it changed.
+            let tail = output_tail.trim_end();
+            if !tail.is_empty() {
+                lines.push(BackgroundLine::new(
+                    key,
+                    format!("task {task_id} · {brief} · output so far (tail):\n{tail}"),
+                ));
+            } else if let Some(b) = before {
+                lines.push(BackgroundLine::marked(key, "", b.clone()));
+            }
+            continue;
+        };
+        let Some([out_at, err_at]) = before.and_then(|b| parse(b)) else {
+            // Not recorded at its call (an earlier host's run): from now.
+            lines.push(BackgroundLine::marked(key, "", lengths(&dir)));
+            continue;
+        };
+        let (out_len, out, out_cut) = read_from(&dir.join("stdout"), out_at, TASK_OUTPUT_MAX);
+        let (err_len, err, err_cut) = read_from(&dir.join("stderr"), err_at, TASK_OUTPUT_MAX);
+        let mut text = String::new();
+        if out_cut || err_cut {
+            text.push_str("[… earlier new output omitted]\n");
+        }
+        text.push_str(out.trim_end());
+        if !err.trim().is_empty() {
+            if !text.trim().is_empty() {
+                text.push_str("\n--- stderr ---\n");
+            }
+            text.push_str(err.trim_end());
+        }
+        if text.trim().is_empty() {
+            lines.push(BackgroundLine::marked(key, "", format!("{out_at},{err_at}")));
+            continue;
+        }
+        lines.push(BackgroundLine::marked(
+            key,
+            format!(
+                "task {task_id} · {brief} · running {} · new output:\n{text}",
+                fmt_elapsed(elapsed_ms)
+            ),
+            format!("{out_len},{err_len}"),
+        ));
     }
-    (shown, next)
+    lines
 }
 
-/// A finished sub session whose end the context was shown (the line in the
-/// published snapshot is the current one) is heard from: its end is not
-/// delivered again, and the session may finish without waiting for it.
-async fn mark_delivered(
-    sh: &Shared,
-    now: &Observed,
-    observed: &BTreeMap<String, String>,
-) -> Result<()> {
-    let current: BTreeMap<&str, String> = now
-        .lines
-        .iter()
-        .map(|l| (l.key.as_str(), digest(&l.text)))
-        .collect();
+/// At an inference boundary: the tasks the run's calls just started are
+/// recorded where their output stands (their call's result showed it so
+/// far). Nothing is shown here.
+pub(super) async fn note_started(sh: &Shared, run: &RunHandle) -> Result<()> {
+    let run_dir = sh.dir.runs().dir().join(run.run_id()).join("exec");
     let mut s = sh.session.lock().await;
     let mut changed = false;
-    for (sid, key) in &now.ends {
-        let shown = observed
-            .get(key)
-            .is_some_and(|d| current.get(key.as_str()) == Some(d));
-        if shown && !super::children::end_delivered(&s.state, sid) {
-            super::children::set_attention(&mut s.state, sid, Some(super::children::ATTENTION_FINISHED));
-            changed = true;
+    for task_id in run.noted_tasks() {
+        let Some(call) = task_id.strip_prefix(LOCAL_SHELL_PREFIX) else {
+            continue;
+        };
+        let key = key(&task_id);
+        if s.state.background_shown.contains_key(&key) || !run_dir.join(call).is_dir() {
+            continue;
         }
+        s.state.background_shown.insert(key, lengths(&run_dir.join(call)));
+        changed = true;
     }
     if changed {
         commit_and_report(sh, &mut s).await?;
     }
     Ok(())
-}
-
-/// The checkpoint hook's observation at an inference boundary (after the
-/// snapshot was published): the TodoList is synchronized, ends already
-/// shown are marked heard, and right after tool results the changed lines
-/// are returned as the injection (with the `observed` map in the host
-/// metadata; after a history rewrite an unchanged state is recorded anew
-/// without a message).
-pub(super) async fn at_boundary(
-    sh: &Shared,
-    snapshot: &LLMContextSnapshot,
-    behavior: bool,
-) -> Result<Option<Injection>> {
-    if let Err(e) = super::todos::sync(sh).await {
-        log::warn!("todo sync of {}: {e}", sh.dir.sid());
-    }
-    let mut meta = snapshot_host_meta(snapshot);
-    let current_epoch = meta.observed_epoch == meta.history_epoch;
-    let observed = if current_epoch {
-        meta.observed.clone()
-    } else {
-        BTreeMap::new()
-    };
-    let now = observe(sh).await?;
-    mark_delivered(sh, &now, &observed).await?;
-    if !after_tool_results(snapshot, behavior) {
-        if snapshot
-            .state
-            .accumulated
-            .last()
-            .is_some_and(|m| m.role == AiRole::User && m.text_content().starts_with(BLOCK_START))
-        {
-            // The injection is published with the snapshot.
-            crate::fault::point("observe:after_inject_commit");
-        }
-        return Ok(None);
-    }
-    let (shown, next) = select(&now.lines, &observed);
-    if shown.is_empty() && next == observed && current_epoch {
-        return Ok(None);
-    }
-    meta.observed = next;
-    meta.observed_epoch = meta.history_epoch;
-    crate::fault::point("observe:before_inject");
-    let messages = if shown.is_empty() {
-        Vec::new()
-    } else {
-        vec![AiMessage::text(AiRole::User, render(&shown).trim_end().to_string())]
-    };
-    Ok(Some(Injection {
-        messages,
-        host: Some(with_host_meta(snapshot.state.host.as_ref(), &meta)),
-    }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn line(key: &str, text: &str) -> BackgroundLine {
-        BackgroundLine::new(key, text)
-    }
-
-    #[test]
-    fn changed_lines_only() {
-        let lines = vec![
-            line("todo:T01", "<todo id=\"T01\" status=\"running\">a</todo>"),
-            line("work:w1", "work w1: running"),
-        ];
-        let (shown, map) = select(&lines, &BTreeMap::new());
-        assert_eq!(shown.len(), 2);
-        let (shown, again) = select(&lines, &map);
-        assert!(shown.is_empty());
-        assert_eq!(again, map);
-        let changed = vec![
-            line("todo:T01", "<todo id=\"T01\" status=\"completed\">a — done</todo>"),
-            line("work:w1", "work w1: running"),
-        ];
-        let (shown, _) = select(&changed, &map);
-        assert_eq!(shown.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(), ["todo:T01"]);
-    }
 }

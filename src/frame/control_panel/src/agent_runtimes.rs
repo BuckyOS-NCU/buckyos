@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use ::kRPC::RPCErrors;
 use buckyos_api::{
     is_valid_runtime_id, node_settings_key, AgentRuntimeSettings, AgentRuntimeTarget,
-    AgentSettings, ComputerAccess, NodeSettings, RuntimeBaseline, CONTAINER_RUNTIME_ID,
-    HOST_RUNTIME_ID, ZONE_OWNER_USER_ID_KEY,
+    AgentSettings, ComputerAccess, NodeSettings, ProductProfile, RuntimeBaseline,
+    CONTAINER_RUNTIME_ID, HOST_RUNTIME_ID, PRODUCT_PROFILE_KEY, ZONE_OWNER_USER_ID_KEY,
 };
 use name_lib::DeviceInfo;
 use serde::Serialize;
@@ -102,8 +102,17 @@ pub(crate) async fn runtime_directory(kv: &dyn AgentKv, owner: &str) -> Result<V
 }
 
 /// Whether an Agent container can run anywhere in the zone (a node that
-/// takes app instances and supports containers).
+/// takes app instances and supports containers) and the product runs
+/// containers at all (BuckyOS Desktop Lite does not).
 pub(crate) async fn container_available(kv: &dyn AgentKv) -> bool {
+    let product = match kv.get(PRODUCT_PROFILE_KEY).await {
+        Ok(Some((raw, _))) => ProductProfile::parse(&raw).ok(),
+        Ok(None) => Some(ProductProfile::full()),
+        Err(_) => None,
+    };
+    if !product.is_some_and(|product| product.container_enabled()) {
+        return false;
+    }
     let Ok(devices) = kv.list("devices").await else {
         return false;
     };
@@ -152,6 +161,7 @@ pub(crate) async fn apply_create_defaults(kv: &dyn AgentKv, owner: &str, setting
                 node_did: host.node_did.clone(),
             },
             baseline: None,
+            grant: None,
         },
     );
     settings.default_runtime_id = Some(HOST_RUNTIME_ID.to_string());
@@ -223,6 +233,7 @@ pub(crate) async fn apply_update(
                             node_did: offer.node_did.clone(),
                         },
                         baseline: None,
+                        grant: None,
                     }
                 }
             };
@@ -325,7 +336,7 @@ pub(crate) fn directory_view(
             }
             let (kind, target) = match &r.target {
                 AgentRuntimeTarget::Node { node_id, node_did } => ("node", json!({"node_id": node_id, "node_did": node_did})),
-                AgentRuntimeTarget::Executor { executor_id } => ("executor", json!({"executor_id": executor_id})),
+                AgentRuntimeTarget::Executor { executor_id, profile_id } => ("executor", json!({"executor_id": executor_id, "profile_id": profile_id})),
             };
             let mut entry = json!({
                 "runtime_id": id, "kind": kind, "closed": true, "withdrawn": true,

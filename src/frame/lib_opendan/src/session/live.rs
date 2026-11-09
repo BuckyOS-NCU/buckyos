@@ -154,7 +154,7 @@ impl Session {
         Ok(self
             .dir
             .summary_opt()?
-            .unwrap_or_else(|| SessionSummary::initial(self.config.prompt.mechanical_compress.clone())))
+            .unwrap_or_else(SessionSummary::initial))
     }
 
     pub fn write_summary(&self, lease: &Lease, summary: &SessionSummary) -> Result<()> {
@@ -187,13 +187,13 @@ impl Session {
             one_line_status: self.state.one_line_status.clone(),
             report_brief,
             pending_decision: self.state.pending_decision.clone(),
-            waiting_for: self
-                .state
-                .waiting_for
-                .as_ref()
-                .filter(|_| self.state.run_state == crate::protocol::RunState::Waiting)
-                .map(|w| w.kind),
+            needs_input: self.state.needs_input(
+                self.config.session.kind == crate::protocol::SessionKind::Goal
+                    && self.config.session.goal.is_some(),
+            ),
             turn_open: self.state.open_turn.is_some(),
+            paused: self.state.paused.is_some(),
+            retry_not_before_ms: self.state.retry.as_ref().map(|r| r.not_before_ms),
             activity: self.state.activity.clone(),
             last_runner: self.writer.as_ref().map(|w| crate::protocol::LastRunner {
                 runner_id: w.runner_id.clone(),

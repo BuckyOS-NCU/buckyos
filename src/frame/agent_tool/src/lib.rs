@@ -1,8 +1,8 @@
-// TODO(stage 5/12): split this file into trait.rs / envelope.rs / host.rs /
+// TODO(stage 5/12): split this file into trait.rs / envelope.rs /
 // manager.rs / tools/*.rs (target ≤600 lines per file). Deferred from the
-// initial cleanup pass because the AgentToolResult/MCPTool/manager blocks
-// share several private helpers (`truncate_text`, `compact_json_text`,
-// history constants) that need coordinated relocation.
+// initial cleanup pass because the AgentToolResult/manager blocks share
+// several private helpers (`truncate_text`, `compact_json_text`) that need
+// coordinated relocation.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -11,15 +11,23 @@ use std::sync::{Arc, RwLock as StdRwLock};
 
 use async_trait::async_trait;
 use buckyos_api::AiToolCall;
-use llm_context::{ToolResultStatusView, ToolResultView};
+pub use prompt_engine::{escape_xml_attr, escape_xml_text};
+pub use hints::{
+    apply_hints, render_hint_block, render_with_hints, HintLedger, MemoryHintLedger,
+    HINT_NS_DEDUP, HINT_NS_ONCE,
+};
+pub use intent::{intent_of, take_intent, with_intent, IntentPolicy, INTENT_ARG};
+pub use result_view::{ToolResultStatusView, ToolResultView};
+pub use step_record::XmlStepRenderer;
+pub use task_model::{
+    task_state_observation, task_state_observation_via, CancelUnsupported, RunningTaskResolver,
+    TaskBrief, TaskFollowup, TaskResult, TaskState, DEFAULT_TASK_WAIT_MS, MAX_IN_TOOL_WAIT_MS,
+};
 use log::{info, warn};
 use schemars::JsonSchema;
-use serde::ser::SerializeSeq;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value as Json};
-use tokio::time::{timeout, Duration};
 
-pub mod agent_attention_signal;
 pub mod agent_memory;
 pub mod agent_notebook;
 pub mod aicc_model_tools;
@@ -28,6 +36,8 @@ pub mod exec_tracking;
 pub mod file_tools;
 pub mod glob_tool;
 pub mod grep_tool;
+pub mod hints;
+pub mod intent;
 pub mod json_args;
 pub mod llm_bash;
 pub mod llm_compress;
@@ -35,35 +45,26 @@ pub mod llm_explore;
 pub mod llm_tool_carft;
 pub mod llm_understand_media;
 pub mod path_utils;
+pub mod prompt_engine;
 pub mod read_tool;
+pub mod result_view;
 pub mod run_local_llm;
 pub mod runtime;
 pub mod runtime_context;
+pub mod step_record;
 pub mod task_bridge;
+pub mod task_model;
 pub mod tasks;
 pub mod tasks_zone;
 pub mod todo_tools;
 pub mod tool;
 pub mod xllm;
+pub mod xml_util;
 
-pub use tool::{
-    BasicToolHost, CallingConventions, CliInvocation, ContentInput, NullToolHost, ToolCtx,
-    ToolHost, TypedTool, TypedToolHandle,
-};
+pub use tool::{CallingConventions, CliInvocation, ContentInput, ToolCtx, TypedTool, TypedToolHandle};
 
-pub use agent_attention_signal::{
-    AgentAttentionSignalStage1Runner, AgentAttentionSignalStore, AttentionSignal,
-    AttentionSignalConfig, AttentionSignalError, AttentionSignalExtractionInput,
-    AttentionSignalExtractor, AttentionSignalHistoryEntry, AttentionSignalHistoryReader,
-    AttentionSignalPayload, AttentionSignalSessionWindow, AttentionSignalStage1RunReport,
-    AttentionSignalStoreConfig, AttentionSignalTimeWindow, AttentionSignalToolRuntime,
-    AttentionSignalWriteResult, DiscoverEventTool, DiscoverObjectObservationTool,
-    DiscoverRelationshipTool, DiscoverSkillCoverageGapTool, ExtractionWindow, MarkScannedInput,
-    ScanCheckpoint, TOOL_DISCOVER_EVENT, TOOL_DISCOVER_OBJECT_OBSERVATION,
-    TOOL_DISCOVER_RELATIONSHIP, TOOL_DISCOVER_SKILL_COVERAGE_GAP,
-};
 pub use agent_memory::{
-    AgentMemory, AgentMemoryConfig, AgentMemoryError, Envelope as AgentMemoryEnvelope, LoadItem,
+    AgentMemory, AgentMemoryConfig, AgentMemoryError, LoadItem,
     LoadOptions, VerifyReport,
 };
 pub use aicc_model_tools::{
@@ -78,28 +79,24 @@ pub use file_tools::{
 };
 pub use glob_tool::{GlobTool, TOOL_GLOB};
 pub use grep_tool::{GrepTool, TOOL_GREP};
-pub use json_args::{
-    optional_string_arg, optional_trimmed_string_arg, optional_u64_arg, read_bool_from_map,
-    read_string_from_map, read_u64_from_map, require_string_arg, require_trimmed_string_arg,
-    u64_to_usize_arg,
-};
+pub use json_args::u64_to_usize_arg;
 pub use llm_bash::{
     kill_running_bash_process_groups, BashRunOutput, BashRunRequest, BashRunner, BashTarget,
     BashTargetSpec, BinOverlayConfig, CommandHandle, CommandProgress, LlmBashConfig,
-    LocalProcessBashRunner, RunBinding, RunBindingSlot, ShellMode, ShellRuntimeNote, ShellTool,
-    TOOL_SHELL,
+    LocalProcessBashRunner, RunBinding, RunBindingSlot, ShellResultShape, ShellRuntimeNote,
+    ShellTool, SHELL_TASK_FOLLOWUP_HINT, TOOL_SHELL,
 };
 pub use tasks::{
     exec_dir_state, task_tools, CancelTaskTool, CompositeTaskResolver, GetTaskStateTool,
-    InProcessTaskManager, LocalTask, ShellTask, ShellTaskContext, ShellTaskManager, WaitTaskTool,
-    TOOL_CANCEL_TASK, TOOL_GET_TASK_STATE, TOOL_WAIT_TASK,
+    InProcessTaskManager, LocalTask, ShellTask, WaitTaskTool, TOOL_CANCEL_TASK,
+    TOOL_GET_TASK_STATE, TOOL_WAIT_TASK,
 };
 pub use tasks_zone::{
-    MemoryShellTaskBackend, ShellTaskBackend, ShellTaskCreate, ShellTaskRecord,
-    ZoneShellTaskBackend, ZoneShellTasks, ZONE_TASK_PREFIX,
+    MemoryTaskBackend, ZoneTaskBackend, ZoneTaskMgrBackend, ZoneTaskRecord, ZoneTaskResolver,
+    ZONE_TASK_PREFIX,
 };
 pub use path_utils::{
-    normalize_abs_path, normalize_root_path, resolve_path_from_root, resolve_path_under_root,
+    normalize_abs_path, resolve_path_from_root,
     rewrite_path_with_shell_cwd, sanitize_session_id_for_path, session_record_path, to_abs_path,
     MAX_SESSION_ID_LEN,
 };
@@ -108,9 +105,8 @@ pub use runtime_context::{
     OPENDAN_AGENT_ROOT_ENV, OPENDAN_SESSION_ID_ENV, OPENDAN_TRACE_ID_ENV,
 };
 pub use todo_tools::{
-    CallRef, ChildObservation, NewTodo, ReportRef, ReviewState, ReviewVerdict, SerialPick,
-    TodoAttempt, TodoList, TodoMode, TodoRecord, TodoStatus, TodoStore, TODO_LIST_FILE,
-    TODO_LIST_SCHEMA,
+    ChildObservation, NewTodo, ReportRef, TodoAttempt, TodoList, TodoMode, TodoPatch, TodoRecord,
+    TodoStatus, TodoStore, TodoSummary, TODO_LIST_FILE, TODO_LIST_SCHEMA,
 };
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -163,158 +159,6 @@ impl SessionRuntimeContext {
 
 pub const TOOL_GET_SESSION: &str = "get_session";
 pub const TOOL_READ: &str = "read";
-pub const TOOL_LIST_SESSION: &str = "list_session";
-pub const TOOL_LOAD_MEMORY: &str = "load_memory";
-pub const TOOL_SET_MEMORY: &str = "set_memory";
-pub const TOOL_REMOVE_MEMORY: &str = "remove_memory";
-pub const TOOL_TODO_MANAGE: &str = "todo_manage";
-pub const TOOL_WORKLOG_MANAGE: &str = "worklog_manage";
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionExecutionMode {
-    Serial,
-    Parallel,
-}
-
-impl Default for ActionExecutionMode {
-    fn default() -> Self {
-        Self::Serial
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FsScope {
-    pub read_roots: Vec<String>,
-    pub write_roots: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ActionCall {
-    pub call_action_name: String,
-    pub call_params: Json,
-}
-
-impl ActionCall {
-    pub fn parse_json(value: &Json) -> Result<Self, String> {
-        if let Some(items) = value.as_array() {
-            if items.len() != 2 {
-                return Err(format!(
-                    "action call array must have 2 items, got {}",
-                    items.len()
-                ));
-            }
-
-            let action_name = items[0]
-                .as_str()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| "action call first item must be non-empty string".to_string())?
-                .to_string();
-
-            let params = items[1].clone();
-            if !params.is_object() {
-                return Err("action call second item must be json object params".to_string());
-            }
-
-            return Ok(Self {
-                call_action_name: action_name,
-                call_params: params,
-            });
-        }
-
-        let Some(map) = value.as_object() else {
-            return Err(
-                "action call must be array [\"action_id\", {...}] or object {\"action_id\": {...}}"
-                    .to_string(),
-            );
-        };
-
-        if map.len() != 1 {
-            return Err(format!(
-                "action call object must have exactly one action key, got {}",
-                map.len()
-            ));
-        }
-        let (action_name, raw_params) = map.iter().next().unwrap();
-        let action_name = action_name.trim();
-        if action_name.is_empty() {
-            return Err("action call object key must be non-empty string".to_string());
-        }
-
-        let params = if raw_params.is_null() {
-            json!({})
-        } else if raw_params.is_object() {
-            raw_params.clone()
-        } else {
-            return Err("action call object value must be json object params".to_string());
-        };
-
-        Ok(Self {
-            call_action_name: action_name.to_string(),
-            call_params: params,
-        })
-    }
-}
-
-impl Serialize for ActionCall {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut seq = serializer.serialize_seq(Some(2))?;
-        seq.serialize_element(&self.call_action_name)?;
-        seq.serialize_element(&self.call_params)?;
-        seq.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ActionCall {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = Json::deserialize(deserializer)?;
-        Self::parse_json(&raw).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum DoAction {
-    //One line bash command
-    //TODO: 确保是一行
-    Exec(String),
-    Call(ActionCall),
-}
-
-fn default_do_actions_mode() -> String {
-    "failed_end".to_string()
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct DoActions {
-    #[serde(default = "default_do_actions_mode")]
-    pub mode: String,
-    #[serde(default)]
-    pub cmds: Vec<DoAction>,
-}
-
-impl Default for DoActions {
-    fn default() -> Self {
-        Self {
-            mode: default_do_actions_mode(),
-            cmds: Vec::new(),
-        }
-    }
-}
-
-impl DoActions {
-    pub fn is_empty(&self) -> bool {
-        self.cmds.is_empty()
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolSpec {
@@ -324,12 +168,6 @@ pub struct ToolSpec {
     pub output_schema: Json,
     #[serde(default)]
     pub usage: Option<String>,
-}
-
-impl ToolSpec {
-    pub fn render_for_prompt(tools: &[ToolSpec]) -> String {
-        serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string())
-    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -360,47 +198,11 @@ pub enum AgentToolError {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct MCPToolConfig {
-    pub name: String,
-    pub endpoint: String,
-    #[serde(default)]
-    pub mcp_tool_name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default = "default_json_object")]
-    pub args_schema: Json,
-    #[serde(default = "default_json_object")]
-    pub output_schema: Json,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-    #[serde(default = "default_mcp_timeout_ms")]
-    pub timeout_ms: u64,
-}
-
-fn default_json_object() -> Json {
-    json!({"type":"object"})
-}
-
-fn default_mcp_timeout_ms() -> u64 {
-    30_000
-}
-
 pub fn normalize_tool_name(name: &str) -> String {
     name.trim().to_string()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentHistoryShowLevel {
-    Min,
-    Mini,
-    Medium,
-    Full,
-}
-
 const HISTORY_COMPACT_CMD_MAX_CHARS: usize = 96;
-const HISTORY_STD_DETAILS_MAX_CHARS: usize = 1600;
-const HISTORY_OUTPUT_FULL_LINES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -411,12 +213,30 @@ pub enum AgentToolStatus {
     Pending,
 }
 
+/// Well-known values of `AgentToolResult.pending_reason`. The field is a
+/// free string: a reader must accept values it does not know.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolPendingReason {
     LongRunning,
     UserApproval,
     WaitForInstall,
+}
+
+impl AgentToolPendingReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentToolPendingReason::LongRunning => "long_running",
+            AgentToolPendingReason::UserApproval => "user_approval",
+            AgentToolPendingReason::WaitForInstall => "wait_for_install",
+        }
+    }
+}
+
+impl From<AgentToolPendingReason> for String {
+    fn from(reason: AgentToolPendingReason) -> Self {
+        reason.as_str().to_string()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -434,8 +254,10 @@ pub struct AgentToolResult {
     pub status: AgentToolStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Why the result is pending, for the model (see
+    /// [`AgentToolPendingReason`] for well-known values).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_reason: Option<AgentToolPendingReason>,
+    pub pending_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_after: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +279,37 @@ pub struct AgentToolResult {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+
+    /// Guidance for the model rendered apart from the output
+    /// (`<runtime_hints>`), never mixed into it. A hint with `once` is shown
+    /// once per session under that key (`<tool>.<topic>[:<version>]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<ResultHint>,
+    /// When a result with the same key was already shown in this run, the
+    /// output and detail are replaced by `hint` (e.g. a file read again
+    /// unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup: Option<ResultDedup>,
+    /// Images shown to the model with the result (a desktop screenshot).
+    /// Only an in-process tool can attach them: they never travel in the
+    /// protocol JSON, so a command's output cannot make the host load a file.
+    #[serde(skip)]
+    pub images: Vec<buckyos_api::ResourceRef>,
+}
+
+/// One entry of [`AgentToolResult::hints`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResultHint {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub once: Option<String>,
+}
+
+/// [`AgentToolResult::dedup`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResultDedup {
+    pub key: String,
+    pub hint: String,
 }
 
 /// Current `agent_tool_protocol` schema version emitted in the AgentToolResult JSON.
@@ -555,6 +408,67 @@ impl AgentToolResult {
             check_after: None,
             estimated_wait: None,
             output: None,
+            hints: Vec::new(),
+            dedup: None,
+            images: Vec::new(),
+        }
+    }
+
+    pub fn with_image(mut self, image: buckyos_api::ResourceRef) -> Self {
+        self.images.push(image);
+        self
+    }
+
+    /// Add a hint (see [`AgentToolResult::hints`]).
+    pub fn with_hint(mut self, text: impl Into<String>, once: Option<&str>) -> Self {
+        let text = text.into();
+        if !text.trim().is_empty() {
+            self.hints.push(ResultHint {
+                text,
+                once: once.map(str::to_string),
+            });
+        }
+        self
+    }
+
+    pub fn with_dedup(mut self, key: impl Into<String>, hint: impl Into<String>) -> Self {
+        self.dedup = Some(ResultDedup {
+            key: key.into(),
+            hint: hint.into(),
+        });
+        self
+    }
+
+    /// The text the LLM sees for this result: the output (or summary) of a
+    /// success, the summary and output of an error. A finished task's
+    /// result reads the same as the call that ended synchronously.
+    pub fn observation_text(&self) -> String {
+        match self.status {
+            AgentToolStatus::Success | AgentToolStatus::Pending => self
+                .output
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if self.summary.trim().is_empty() {
+                        self.details.to_string()
+                    } else {
+                        self.summary.clone()
+                    }
+                }),
+            AgentToolStatus::Error => {
+                let summary = self.summary.trim();
+                let output = self
+                    .output
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                match (summary.is_empty(), output) {
+                    (false, Some(out)) => format!("{summary}\n{out}"),
+                    (false, None) => summary.to_string(),
+                    (true, Some(out)) => out.to_string(),
+                    (true, None) => "tool error".to_string(),
+                }
+            }
         }
     }
 
@@ -604,8 +518,9 @@ impl AgentToolResult {
         self
     }
 
-    pub fn with_pending_reason(mut self, pending_reason: AgentToolPendingReason) -> Self {
-        self.pending_reason = Some(pending_reason);
+    pub fn with_pending_reason(mut self, pending_reason: impl Into<String>) -> Self {
+        let pending_reason = pending_reason.into();
+        self.pending_reason = (!pending_reason.trim().is_empty()).then_some(pending_reason);
         self
     }
 
@@ -623,18 +538,6 @@ impl AgentToolResult {
     pub fn with_estimated_wait(mut self, estimated_wait: impl Into<String>) -> Self {
         let estimated_wait = estimated_wait.into();
         self.estimated_wait = (!estimated_wait.trim().is_empty()).then_some(estimated_wait);
-        self
-    }
-
-    pub fn with_command_metadata(
-        mut self,
-        cmd_name: impl Into<String>,
-        cmd_args: impl Into<String>,
-    ) -> Self {
-        let cmd_name = cmd_name.into();
-        let cmd_args = cmd_args.into();
-        self.cmd_name = (!cmd_name.trim().is_empty()).then_some(cmd_name);
-        self.cmd_args = (!cmd_args.trim().is_empty()).then_some(cmd_args);
         self
     }
 
@@ -692,14 +595,6 @@ impl AgentToolResult {
         lines.join("\n")
     }
 
-    pub fn render_for_level(&self, level: AgentHistoryShowLevel) -> String {
-        self.render_protocol_result_for_level(level)
-    }
-
-    pub fn render_for_last_step(&self) -> String {
-        self.render_protocol_result_for_last_step()
-    }
-
     pub fn command_line_text(&self) -> Option<String> {
         self.cmd_name.as_ref().map(|cmd_name| {
             match self
@@ -714,178 +609,15 @@ impl AgentToolResult {
         })
     }
 
-    pub fn to_tool_result_view(&self) -> ToolResultView {
-        ToolResultView {
-            agent_tool_protocol: Some(self.agent_tool_protocol.clone()),
-            status: match self.status {
-                AgentToolStatus::Success => ToolResultStatusView::Success,
-                AgentToolStatus::Error => ToolResultStatusView::Error,
-                AgentToolStatus::Pending => ToolResultStatusView::Pending,
-            },
-            cmd_name: self.cmd_name.clone(),
-            cmd_args: self.cmd_args.clone(),
-            title: self.title.clone(),
-            summary: self.summary.clone(),
-            output: self.output.clone(),
-            detail: match &self.details {
-                Json::Null => None,
-                Json::Object(map) if map.is_empty() => None,
-                value => Some(value.clone()),
-            },
-            return_code: self.return_code,
-            task_id: self.task_id.clone(),
-            partial_output: self.partial_output.clone(),
-            pending_reason: self
-                .pending_reason
-                .map(history_pending_reason_label)
-                .map(str::to_string),
-            check_after: self.check_after,
-        }
+    /// The envelope as carried in `Observation.host` (read back with
+    /// [`ToolResultView::from_host`]).
+    pub fn to_host(&self) -> Json {
+        serde_json::to_value(self).unwrap_or(Json::Null)
     }
 
     pub fn refresh_default_title(mut self) -> Self {
         self.title = derive_default_title(&self);
         self
-    }
-
-    fn render_protocol_result_for_level(&self, level: AgentHistoryShowLevel) -> String {
-        match level {
-            AgentHistoryShowLevel::Min => {
-                let title = self.title.trim();
-                if title.is_empty() {
-                    self.render_command_with_status(self.history_compact_command_text())
-                } else {
-                    title.to_string()
-                }
-            }
-            AgentHistoryShowLevel::Mini | AgentHistoryShowLevel::Medium => {
-                let summary = self.summary.trim();
-                if summary.is_empty() {
-                    let title = self.title.trim();
-                    if title.is_empty() {
-                        self.render_command_with_status(self.history_compact_command_text())
-                    } else {
-                        title.to_string()
-                    }
-                } else {
-                    summary.to_string()
-                }
-            }
-            AgentHistoryShowLevel::Full => self.render_protocol_full(false),
-        }
-    }
-
-    fn render_protocol_result_for_last_step(&self) -> String {
-        self.render_protocol_full(true)
-    }
-
-    fn render_protocol_full(&self, uncompressed: bool) -> String {
-        let command = self
-            .command_line_text()
-            .or_else(|| self.history_compact_command_text())
-            .unwrap_or_else(|| "action".to_string());
-        let mut lines = vec![command];
-        let mut has_body = false;
-        if let Some(output) = self
-            .output
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            lines.push("```output".to_string());
-            lines.push(if uncompressed {
-                output.to_string()
-            } else {
-                take_head_lines(output, HISTORY_OUTPUT_FULL_LINES)
-            });
-            lines.push("```".to_string());
-            has_body = true;
-        }
-        if let Some(details) = if uncompressed {
-            self.render_details_block_uncompressed()
-        } else {
-            self.render_details_block()
-        } {
-            lines.push("```json".to_string());
-            lines.push(details);
-            lines.push("```".to_string());
-            has_body = true;
-        }
-        if !has_body {
-            lines.push(self.history_result_text());
-        }
-        lines.join("\n")
-    }
-
-    fn history_compact_command_text(&self) -> Option<String> {
-        let cmd = self.command_line_text()?;
-        Some(truncate_text(cmd.trim(), HISTORY_COMPACT_CMD_MAX_CHARS))
-    }
-
-    fn render_command_with_status(&self, command: Option<String>) -> String {
-        let status = self.history_result_text();
-        match command
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(command) => format!("{command} => {status}"),
-            None => status,
-        }
-    }
-
-    fn history_result_text(&self) -> String {
-        match self.status {
-            AgentToolStatus::Success => "success".to_string(),
-            AgentToolStatus::Pending => match self.history_pending_reason_text() {
-                Some(reason) => format!("pending ({reason})"),
-                None => "pending".to_string(),
-            },
-            AgentToolStatus::Error => match self.history_error_reason_text() {
-                Some(reason) => format!("failed ({reason})"),
-                None => "failed".to_string(),
-            },
-        }
-    }
-
-    fn history_pending_reason_text(&self) -> Option<String> {
-        self.pending_reason
-            .map(history_pending_reason_label)
-            .map(str::to_string)
-    }
-
-    fn history_error_reason_text(&self) -> Option<String> {
-        self.output
-            .as_deref()
-            .and_then(last_non_empty_line)
-            .map(|value| collapse_inline_whitespace(value, 120))
-            .or_else(|| self.return_code.map(|code| format!("exit={code}")))
-            .or_else(|| {
-                let summary = self.summary.trim();
-                (!summary.is_empty()).then(|| collapse_inline_whitespace(summary, 120))
-            })
-    }
-
-    fn render_details_block(&self) -> Option<String> {
-        match &self.details {
-            Json::Null => None,
-            Json::Object(map) if map.is_empty() => None,
-            value => Some(truncate_text(
-                serde_json::to_string_pretty(value)
-                    .unwrap_or_else(|_| compact_json_text(value, HISTORY_STD_DETAILS_MAX_CHARS))
-                    .as_str(),
-                HISTORY_STD_DETAILS_MAX_CHARS,
-            )),
-        }
-    }
-
-    fn render_details_block_uncompressed(&self) -> Option<String> {
-        match &self.details {
-            Json::Null => None,
-            Json::Object(map) if map.is_empty() => None,
-            value => {
-                Some(serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
-            }
-        }
     }
 }
 
@@ -928,49 +660,12 @@ pub(crate) fn derive_default_title(result: &AgentToolResult) -> String {
     let status_text = match result.status {
         AgentToolStatus::Success => "success".to_string(),
         AgentToolStatus::Error => "error".to_string(),
-        AgentToolStatus::Pending => match result.pending_reason {
-            Some(reason) => format!("pending ({})", history_pending_reason_label(reason)),
+        AgentToolStatus::Pending => match &result.pending_reason {
+            Some(reason) => format!("pending ({reason})"),
             None => "pending".to_string(),
         },
     };
     format!("{cmd} => {status_text}")
-}
-
-fn history_pending_reason_label(reason: AgentToolPendingReason) -> &'static str {
-    match reason {
-        AgentToolPendingReason::LongRunning => "long_running",
-        AgentToolPendingReason::UserApproval => "user_approval",
-        AgentToolPendingReason::WaitForInstall => "wait_for_install",
-    }
-}
-
-fn collapse_inline_whitespace(input: &str, max_chars: usize) -> String {
-    let collapsed = input.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_text(collapsed.as_str(), max_chars)
-}
-
-fn last_non_empty_line(input: &str) -> Option<&str> {
-    input
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-}
-
-fn take_head_lines(content: &str, max_lines: usize) -> String {
-    if max_lines == 0 {
-        return String::new();
-    }
-    let lines = content.lines().collect::<Vec<_>>();
-    if lines.len() <= max_lines {
-        return content.to_string();
-    }
-    let mut out = lines[..max_lines].join("\n");
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(format!("... [TRUNCATED: showing first {max_lines} lines only] ...").as_str());
-    out
 }
 
 /// Decorate an `AgentToolResult` produced by a tool with the CLI-specific
@@ -1001,6 +696,8 @@ pub fn cli_error_result(tool_name: Option<&str>, err: &AgentToolError) -> AgentT
     };
     AgentToolResult {
         agent_tool_protocol: default_agent_tool_protocol(),
+        hints: Vec::new(),
+        dedup: None,
         tool: tool_name.map(|value| value.to_string()),
         cmd_name: None,
         status: AgentToolStatus::Error,
@@ -1015,6 +712,7 @@ pub fn cli_error_result(tool_name: Option<&str>, err: &AgentToolError) -> AgentT
         return_code: None,
         partial_output: None,
         output: Some(message),
+        images: Vec::new(),
     }
 }
 
@@ -1027,6 +725,8 @@ pub fn cli_success_result(
 ) -> AgentToolResult {
     AgentToolResult {
         agent_tool_protocol: default_agent_tool_protocol(),
+        hints: Vec::new(),
+        dedup: None,
         tool,
         cmd_name: None,
         status: AgentToolStatus::Success,
@@ -1041,6 +741,7 @@ pub fn cli_success_result(
         return_code: None,
         partial_output: None,
         output: None,
+        images: Vec::new(),
     }
 }
 
@@ -1091,6 +792,14 @@ pub trait AgentTool: Send + Sync {
     /// dispatcher cannot cancel the work and abandons the call on an
     /// interrupt (effect unknown); a graceful finish waits for it.
     fn cancellable(&self) -> bool {
+        false
+    }
+
+    /// Whether running the same call again is harmless (reads, a write of
+    /// the same content). On resume, a call a previous executor may have
+    /// started is run again only when it is idempotent; otherwise its
+    /// result is reported unknown. Default `false`.
+    fn idempotent(&self) -> bool {
         false
     }
 
@@ -1289,359 +998,6 @@ impl TypedTool for GetSessionTool {
     }
 }
 
-// NOTE(beta2.2): the legacy MemoryLoadBackend / MemoryMutationBackend traits
-// and their `LoadMemoryTool` / `SetMemoryTool` / `RemoveMemoryTool` wrappers
-// were removed in the v2.10 Memory Graph rewrite. Agents now invoke the `agent-memory`
-// CLI via the standard bash tool; the in-process API lives in
-// `crate::agent_memory`. The TOOL_*_MEMORY constants above are kept only as
-// stable command names for prompt scaffolding.
-
-#[async_trait]
-pub trait WorklogActionBackend: Send + Sync {
-    async fn execute_action(
-        &self,
-        ctx: &SessionRuntimeContext,
-        args: Json,
-    ) -> Result<Json, AgentToolError>;
-}
-
-#[derive(Clone)]
-pub struct WorklogTool {
-    backend: Arc<dyn WorklogActionBackend>,
-}
-
-impl WorklogTool {
-    pub fn new(backend: Arc<dyn WorklogActionBackend>) -> Self {
-        Self { backend }
-    }
-}
-
-#[async_trait]
-impl TypedTool for WorklogTool {
-    type Args = Json;
-    type Output = Json;
-
-    fn name(&self) -> &str {
-        TOOL_WORKLOG_MANAGE
-    }
-    fn description(&self) -> &str {
-        "Append-only audit log of agent runtime events. Used for debugging and post-hoc analysis; does not feed into prompts."
-    }
-    fn calling(&self) -> CallingConventions {
-        CallingConventions::BASH
-    }
-
-    fn args_schema(&self) -> Json {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "append_worklog",
-                        "list_worklog",
-                        "get_worklog"
-                    ]
-                },
-                "record": { "type": "object" },
-                "id": { "type": "string" },
-                "step_id": { "type": "string" },
-                "owner_session_id": { "type": "string" },
-                "workspace_id": { "type": "string" },
-                "type": { "type": "string" },
-                "status": { "type": "string" },
-                "keyword": { "type": "string" },
-                "limit": { "type": "integer", "minimum": 1 },
-                "offset": { "type": "integer", "minimum": 0 }
-            },
-            "required": ["action"],
-            "additionalProperties": true
-        })
-    }
-
-    fn output_schema(&self) -> Json {
-        json!({
-            "type": "object",
-            "properties": {
-                "ok": { "type": "boolean" },
-                "action": { "type": "string" },
-                "record": { "type": "object" },
-                "records": { "type": "array", "items": { "type": "object" } },
-                "total": { "type": "integer" }
-            }
-        })
-    }
-
-    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
-        let action = args.get("action").and_then(Json::as_str).unwrap_or("");
-        Some(build_worklog_manage_cmd_line(action, args))
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        output
-            .get("action")
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("ok")
-            .to_string()
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        self.backend.execute_action(ctx.session(), args).await
-    }
-}
-
-fn build_worklog_manage_cmd_line(action: &str, args: &Json) -> String {
-    let mut out = TOOL_WORKLOG_MANAGE.to_string();
-    if !action.is_empty() {
-        out.push_str(format!(" {action}").as_str());
-    }
-    for key in [
-        "id",
-        "step_id",
-        "owner_session_id",
-        "workspace_id",
-        "type",
-        "status",
-        "keyword",
-    ] {
-        if let Some(value) = args
-            .get(key)
-            .and_then(Json::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            out.push_str(format!(" {key}={value}").as_str());
-        }
-    }
-    if let Some(limit) = args.get("limit").and_then(Json::as_u64) {
-        out.push_str(format!(" limit={limit}").as_str());
-    }
-    if let Some(offset) = args.get("offset").and_then(Json::as_u64) {
-        if offset > 0 {
-            out.push_str(format!(" offset={offset}").as_str());
-        }
-    }
-    out
-}
-
-pub struct MCPTool {
-    spec: ToolSpec,
-    endpoint: String,
-    mcp_tool_name: String,
-    headers: HashMap<String, String>,
-    timeout_ms: u64,
-    client: reqwest::Client,
-}
-
-impl MCPTool {
-    pub fn new(cfg: MCPToolConfig) -> Result<Self, AgentToolError> {
-        let tool_name = cfg.name.trim();
-        if tool_name.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "mcp tool `name` cannot be empty".to_string(),
-            ));
-        }
-
-        let endpoint = cfg.endpoint.trim();
-        if endpoint.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "mcp tool `endpoint` cannot be empty".to_string(),
-            ));
-        }
-
-        if cfg.timeout_ms == 0 {
-            return Err(AgentToolError::InvalidArgs(
-                "mcp tool `timeout_ms` must be > 0".to_string(),
-            ));
-        }
-
-        let mcp_tool_name = cfg
-            .mcp_tool_name
-            .unwrap_or_else(|| tool_name.to_string())
-            .trim()
-            .to_string();
-        if mcp_tool_name.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "mcp tool `mcp_tool_name` cannot be empty".to_string(),
-            ));
-        }
-
-        let description = cfg
-            .description
-            .unwrap_or_else(|| format!("MCP tool `{}`", mcp_tool_name));
-
-        let client = reqwest::Client::builder().build().map_err(|err| {
-            AgentToolError::ExecFailed(format!("build mcp http client failed: {err}"))
-        })?;
-
-        Ok(Self {
-            spec: ToolSpec {
-                name: tool_name.to_string(),
-                description,
-                args_schema: cfg.args_schema,
-                output_schema: cfg.output_schema,
-                usage: None,
-            },
-            endpoint: endpoint.to_string(),
-            mcp_tool_name,
-            headers: cfg.headers,
-            timeout_ms: cfg.timeout_ms,
-            client,
-        })
-    }
-}
-
-#[async_trait]
-impl TypedTool for MCPTool {
-    type Args = Json;
-    type Output = Json;
-
-    fn name(&self) -> &str {
-        self.spec.name.as_str()
-    }
-
-    fn description(&self) -> &str {
-        self.spec.description.as_str()
-    }
-
-    fn calling(&self) -> CallingConventions {
-        CallingConventions::BASH | CallingConventions::ACTION
-    }
-
-    fn args_schema(&self) -> Json {
-        self.spec.args_schema.clone()
-    }
-
-    fn output_schema(&self) -> Json {
-        self.spec.output_schema.clone()
-    }
-
-    fn build_cmd_line(&self, _args: &Self::Args) -> Option<String> {
-        Some(self.spec.name.clone())
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        let content_count = output
-            .get("content")
-            .and_then(Json::as_array)
-            .map(|items| items.len());
-        match content_count {
-            Some(count) => format!(
-                "mcp {} completed with {count} content item(s)",
-                self.spec.name
-            ),
-            None => format!("mcp {} completed", self.spec.name),
-        }
-    }
-
-    fn build_title(&self, _output: &Self::Output) -> Option<String> {
-        Some(format!("mcp {} => success", self.spec.name))
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let ctx = ctx.session();
-        let request_body = json!({
-            "jsonrpc": "2.0",
-            "id": format!(
-                "{}:{}:{}:{}:{}",
-                ctx.trace_id, ctx.wakeup_id, ctx.behavior, ctx.tool_call_index, self.spec.name
-            ),
-            "method": "tools/call",
-            "params": {
-                "name": self.mcp_tool_name,
-                "arguments": args
-            }
-        });
-
-        let mut req = self.client.post(&self.endpoint).json(&request_body);
-        for (key, value) in &self.headers {
-            req = req.header(key, value);
-        }
-
-        let response = timeout(Duration::from_millis(self.timeout_ms), req.send())
-            .await
-            .map_err(|_| AgentToolError::Timeout)?
-            .map_err(|err| AgentToolError::ExecFailed(format!("mcp request failed: {err}")))?;
-
-        let status = response.status();
-        let body = timeout(Duration::from_millis(self.timeout_ms), response.text())
-            .await
-            .map_err(|_| AgentToolError::Timeout)?
-            .map_err(|err| {
-                AgentToolError::ExecFailed(format!("read mcp response failed: {err}"))
-            })?;
-
-        if !status.is_success() {
-            return Err(AgentToolError::ExecFailed(format!(
-                "mcp server returned http {}: {}",
-                status.as_u16(),
-                truncate_text(&body, 512)
-            )));
-        }
-
-        let payload: Json = serde_json::from_str(&body).map_err(|err| {
-            AgentToolError::ExecFailed(format!("invalid mcp response json: {err}"))
-        })?;
-
-        if let Some(err_obj) = payload.get("error") {
-            let msg = extract_jsonrpc_error_message(err_obj);
-            return Err(AgentToolError::ExecFailed(format!(
-                "mcp tool call error: {msg}"
-            )));
-        }
-
-        let result = payload.get("result").cloned().ok_or_else(|| {
-            AgentToolError::ExecFailed("mcp response missing `result` field".to_string())
-        })?;
-
-        if let Some(message) = extract_mcp_result_error(&result) {
-            return Err(AgentToolError::ExecFailed(format!(
-                "mcp tool returned error: {message}"
-            )));
-        }
-
-        Ok(result)
-    }
-}
-
-fn extract_jsonrpc_error_message(value: &Json) -> String {
-    if let Some(msg) = value.get("message").and_then(|v| v.as_str()) {
-        return msg.to_string();
-    }
-    truncate_text(&value.to_string(), 512)
-}
-
-fn extract_mcp_result_error(result: &Json) -> Option<String> {
-    let is_error = result
-        .get("isError")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !is_error {
-        return None;
-    }
-
-    if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
-        for item in content {
-            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                if !text.trim().is_empty() {
-                    return Some(text.to_string());
-                }
-            }
-        }
-    }
-
-    Some(truncate_text(&result.to_string(), 512))
-}
-
 fn truncate_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -1674,7 +1030,6 @@ fn registered_tool_spec(name: &str, tool: &dyn AgentTool) -> ToolSpec {
 #[derive(Clone)]
 pub struct AgentToolManager {
     namespaces: Arc<StdRwLock<ToolNamespaceRegistry>>,
-    host: Arc<dyn ToolHost>,
 }
 
 impl Default for AgentToolManager {
@@ -1685,43 +1040,18 @@ impl Default for AgentToolManager {
 
 impl AgentToolManager {
     pub fn new() -> Self {
-        Self::with_host(Arc::new(NullToolHost))
-    }
-
-    pub fn with_host(host: Arc<dyn ToolHost>) -> Self {
         Self {
             namespaces: Arc::new(StdRwLock::new(ToolNamespaceRegistry::default())),
-            host,
         }
     }
 
-    /// Currently configured `ToolHost`. Stage 3 will start consuming
-    /// this for typed-tool registrations; for now it is exposed so
-    /// embedders can share a single host between manager-managed and
-    /// ad-hoc tool invocations.
-    pub fn host(&self) -> Arc<dyn ToolHost> {
-        self.host.clone()
-    }
-
-    pub fn set_host(&mut self, host: Arc<dyn ToolHost>) {
-        self.host = host;
-    }
-
-    pub fn register_tool<T>(&self, tool: T) -> Result<(), AgentToolError>
-    where
-        T: AgentTool + 'static,
-    {
-        self.register_tool_arc(Arc::new(tool))
-    }
-
-    /// Register a `TypedTool` implementation. The manager wraps it
-    /// into a `TypedToolHandle` capturing the current host so the
-    /// tool gets `ctx.host()` access at call time.
+    /// Register a `TypedTool` implementation (wrapped into a
+    /// `TypedToolHandle`).
     pub fn register_typed_tool<T>(&self, tool: T) -> Result<(), AgentToolError>
     where
         T: TypedTool,
     {
-        let handle = TypedToolHandle::new(tool, self.host.clone());
+        let handle = TypedToolHandle::new(tool);
         self.register_tool_arc(Arc::new(handle))
     }
 
@@ -1765,21 +1095,6 @@ impl AgentToolManager {
         Ok(())
     }
 
-    pub fn register_mcp_tool(&self, cfg: MCPToolConfig) -> Result<(), AgentToolError> {
-        self.register_typed_tool(MCPTool::new(cfg)?)
-    }
-
-    pub fn unregister_tool(&self, name: &str) -> bool {
-        let normalized_name = normalize_tool_name(name);
-        if normalized_name.is_empty() {
-            return false;
-        }
-        let Ok(mut guard) = self.namespaces.write() else {
-            return false;
-        };
-        guard.tools.remove(normalized_name.as_str()).is_some()
-    }
-
     pub fn has_tool(&self, name: &str) -> bool {
         self.get_tool(name).is_some()
     }
@@ -1807,20 +1122,6 @@ impl AgentToolManager {
             .cloned()
     }
 
-    pub fn get_bash_cmd(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
-        self.get_tool_by_calling(name, CallingConventions::BASH)
-    }
-
-    pub fn get_action(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
-        self.get_tool_by_calling(name, CallingConventions::ACTION)
-    }
-
-    pub fn get_tool_spec(&self, name: &str) -> Option<ToolSpec> {
-        let normalized_name = normalize_tool_name(name);
-        self.get_tool(normalized_name.as_str())
-            .map(|tool| registered_tool_spec(normalized_name.as_str(), tool.as_ref()))
-    }
-
     pub fn list_tool_specs(&self) -> Vec<ToolSpec> {
         let Ok(guard) = self.namespaces.read() else {
             return vec![];
@@ -1833,135 +1134,6 @@ impl AgentToolManager {
             .collect();
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
-    }
-
-    pub fn list_bash_cmd_specs(&self) -> Vec<ToolSpec> {
-        let Ok(guard) = self.namespaces.read() else {
-            return vec![];
-        };
-        let mut specs: Vec<ToolSpec> = guard
-            .tools
-            .iter()
-            .filter(|(_, tool)| tool.calling().supports_bash())
-            .map(|(name, tool)| registered_tool_spec(name, tool.as_ref()))
-            .collect();
-        specs.sort_by(|a, b| a.name.cmp(&b.name));
-        specs
-    }
-
-    pub fn list_action_tool_specs(&self) -> Vec<ToolSpec> {
-        let Ok(guard) = self.namespaces.read() else {
-            return vec![];
-        };
-        let mut specs: Vec<ToolSpec> = guard
-            .tools
-            .iter()
-            .filter(|(_, tool)| tool.calling().supports_action())
-            .map(|(name, tool)| registered_tool_spec(name, tool.as_ref()))
-            .collect();
-        specs.sort_by(|a, b| a.name.cmp(&b.name));
-        specs
-    }
-
-    pub fn parse_bash_command_name(line: &str) -> Option<String> {
-        let tokens = tokenize_bash_command_line(line).ok()?;
-        let first = tokens.first()?.trim();
-        if first.is_empty() {
-            return None;
-        }
-        Some(first.to_string())
-    }
-
-    pub fn resolve_bash_registered_tool_name(&self, line: &str) -> Option<String> {
-        let raw_name = Self::parse_bash_command_name(line)?;
-        let normalized = normalize_tool_name(raw_name.as_str());
-        if normalized.is_empty() {
-            return None;
-        }
-        let Ok(guard) = self.namespaces.read() else {
-            return None;
-        };
-        guard
-            .tools
-            .get(normalized.as_str())
-            .filter(|tool| tool.calling().supports_bash())
-            .is_some()
-            .then_some(normalized)
-    }
-
-    pub async fn call_tool_from_bash_line(
-        &self,
-        ctx: &SessionRuntimeContext,
-        line: &str,
-    ) -> Result<Option<AgentToolResult>, AgentToolError> {
-        self.call_tool_from_bash_line_with_cwd(ctx, line, None)
-            .await
-    }
-
-    pub async fn call_tool_from_bash_line_with_cwd(
-        &self,
-        ctx: &SessionRuntimeContext,
-        line: &str,
-        shell_cwd: Option<&Path>,
-    ) -> Result<Option<AgentToolResult>, AgentToolError> {
-        let tokens = tokenize_bash_command_line(line)?;
-        if tokens.is_empty() {
-            return Ok(None);
-        }
-
-        let tool_name = normalize_tool_name(tokens[0].as_str());
-        if tool_name.is_empty() {
-            return Ok(None);
-        }
-        let Some(tool) = self.get_bash_cmd(tool_name.as_str()) else {
-            return Ok(None);
-        };
-        let spec = registered_tool_spec(tool_name.as_str(), tool.as_ref());
-        let usage = render_bash_tool_usage(&spec);
-        if is_help_flag(&tokens[1..]) {
-            return Ok(Some(build_builtin_tool_result(
-                json!({
-                    "ok": true,
-                    "tool": tool_name,
-                    "usage": usage,
-                    "args_schema": spec.args_schema
-                }),
-                line.trim().to_string(),
-                "show usage",
-            )));
-        }
-
-        let call_id = format!("bash-cli-{}-{}", ctx.trace_id, ctx.tool_call_index);
-        info!(
-            "opendan.tool_call: status=start tool={} call_id={} trace_id={} session_id={} source=bash",
-            tool_name, call_id, ctx.trace_id, ctx.session_id
-        );
-        let result = tool.exec(ctx, line, shell_cwd).await;
-        match &result {
-            Ok(result) if result.status == AgentToolStatus::Error => warn!(
-                "opendan.tool_call: status=failed tool={} call_id={} trace_id={} session_id={} source=bash err={}",
-                tool_name, call_id, ctx.trace_id, ctx.session_id, result.summary
-            ),
-            Err(err) => warn!(
-                "opendan.tool_call: status=failed tool={} call_id={} trace_id={} session_id={} source=bash err={}",
-                tool_name, call_id, ctx.trace_id, ctx.session_id, err
-            ),
-            _ => {}
-        }
-        let result = result.map_err(|err| {
-            if let Some(usage) = usage.as_deref() {
-                append_usage_on_invalid_args(err, usage)
-            } else {
-                err
-            }
-        })?;
-        if result.status != AgentToolStatus::Error {
-            info!(
-                "opendan.tool_call: status=success tool={} call_id={} trace_id={} session_id={} source=bash",
-                tool_name, call_id, ctx.trace_id, ctx.session_id
-            );
-        }
-        Ok(Some(result))
     }
 
     pub async fn call_tool(
@@ -2083,35 +1255,6 @@ pub fn tokenize_bash_command_line(line: &str) -> Result<Vec<String>, AgentToolEr
     Ok(tokens)
 }
 
-fn render_bash_tool_usage(spec: &ToolSpec) -> Option<String> {
-    spec.usage
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-}
-
-fn is_help_flag(tokens: &[String]) -> bool {
-    tokens.len() == 1 && tokens[0] == "--help"
-}
-
-fn append_usage_on_invalid_args(err: AgentToolError, usage: &str) -> AgentToolError {
-    match err {
-        AgentToolError::InvalidArgs(message) => {
-            if message.contains("Usage:") {
-                return AgentToolError::InvalidArgs(message);
-            }
-            let trimmed = message.trim();
-            if trimmed.is_empty() {
-                AgentToolError::InvalidArgs(format!("Usage: {usage}"))
-            } else {
-                AgentToolError::InvalidArgs(format!("{trimmed}\nUsage: {usage}"))
-            }
-        }
-        other => other,
-    }
-}
-
 pub fn parse_default_bash_exec_args(tokens: &[String]) -> Result<Json, AgentToolError> {
     if tokens.is_empty() {
         return Ok(json!({}));
@@ -2167,11 +1310,6 @@ fn parse_default_bash_exec_value(raw: &str) -> Json {
 mod tests {
     use super::*;
 
-    struct EchoTool {
-        name: String,
-        usage: Option<String>,
-    }
-
     struct StaticSessionBackend;
 
     #[async_trait]
@@ -2181,58 +1319,6 @@ mod tests {
                 "session_id": session_id,
                 "status": "wait"
             }))
-        }
-    }
-
-    struct StaticWorklogBackend;
-
-    #[async_trait]
-    impl WorklogActionBackend for StaticWorklogBackend {
-        async fn execute_action(
-            &self,
-            _ctx: &SessionRuntimeContext,
-            args: Json,
-        ) -> Result<Json, AgentToolError> {
-            Ok(json!({
-                "ok": true,
-                "action": args.get("action").cloned().unwrap_or_else(|| json!("list")),
-                "records": []
-            }))
-        }
-    }
-
-    #[async_trait]
-    impl AgentTool for EchoTool {
-        fn spec(&self) -> ToolSpec {
-            ToolSpec {
-                name: self.name.clone(),
-                description: "echo args".to_string(),
-                args_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "range": {"type": "string"}
-                    }
-                }),
-                output_schema: json!({"type":"object"}),
-                usage: self.usage.clone(),
-            }
-        }
-
-        fn calling(&self) -> CallingConventions {
-            CallingConventions::ALL
-        }
-
-        async fn call(
-            &self,
-            _ctx: &SessionRuntimeContext,
-            args: Json,
-        ) -> Result<AgentToolResult, AgentToolError> {
-            Ok(AgentToolResult::from_details(json!({
-                "ok": true,
-                "args": args,
-            }))
-            .with_result("ok"))
         }
     }
 
@@ -2276,54 +1362,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_keeps_registered_tool_name_and_routes_bash_calls() {
-        let mgr = AgentToolManager::new();
-        mgr.register_tool(EchoTool {
-            name: "read_file".to_string(),
-            usage: Some("read_file path=<path>".to_string()),
-        })
-        .expect("register tool");
-
-        assert!(mgr.has_tool("read_file"));
-
-        let result = mgr
-            .call_tool_from_bash_line(&test_call_ctx(), "read_file path=\"a.txt\" range=\"1:2\"")
-            .await
-            .expect("bash call succeeds")
-            .expect("tool matched");
-        assert_eq!(result.details["ok"], true);
-        assert_eq!(result.details["args"]["path"], "a.txt");
-        assert_eq!(result.details["args"]["range"], "1:2");
-    }
-
-    #[tokio::test]
-    async fn manager_help_result_is_marked_as_builtin_tool() {
-        let mgr = AgentToolManager::new();
-        mgr.register_tool(EchoTool {
-            name: "read_file".to_string(),
-            usage: Some("read_file path=<path>".to_string()),
-        })
-        .expect("register tool");
-
-        let result = mgr
-            .call_tool_from_bash_line(&test_call_ctx(), "read_file --help")
-            .await
-            .expect("bash help succeeds")
-            .expect("tool matched");
-
-        assert_eq!(result.agent_tool_protocol, AGENT_TOOL_PROTOCOL_VERSION);
-        assert_eq!(result.summary, "show usage");
-        assert_eq!(
-            result.command_line_text().as_deref(),
-            Some("read_file --help")
-        );
-        assert_eq!(result["tool"], "read_file");
-    }
-
-    #[tokio::test]
     async fn get_session_tool_marks_result_as_builtin_tool() {
         let tool = GetSessionTool::new(Arc::new(StaticSessionBackend));
-        let handle = TypedToolHandle::with_null_host(tool);
+        let handle = TypedToolHandle::new(tool);
         let result = AgentTool::call(
             &handle,
             &test_call_ctx(),
@@ -2339,27 +1380,6 @@ mod tests {
             Some("get_session session-9")
         );
         assert_eq!(result["session"]["session_id"], "session-9");
-    }
-
-    #[tokio::test]
-    async fn worklog_tool_marks_result_as_builtin_tool() {
-        let tool = WorklogTool::new(Arc::new(StaticWorklogBackend));
-        let handle = TypedToolHandle::with_null_host(tool);
-        let result = AgentTool::call(
-            &handle,
-            &test_call_ctx(),
-            json!({ "action": "list_worklog" }),
-        )
-        .await
-        .expect("worklog call");
-
-        assert_eq!(result.agent_tool_protocol, AGENT_TOOL_PROTOCOL_VERSION);
-        assert_eq!(result.summary, "list_worklog");
-        assert_eq!(
-            result.command_line_text().as_deref(),
-            Some("worklog_manage list_worklog")
-        );
-        assert_eq!(result["action"], "list_worklog");
     }
 
     #[test]
@@ -2405,46 +1425,6 @@ mod tests {
     }
 
     #[test]
-    fn render_for_level_standard_agent_tool_uses_summary_and_details() {
-        let result = AgentToolResult::from_details(json!({
-            "ok": true,
-            "path": "demo.txt",
-            "bytes": 12
-        }))
-        .with_cmd_line("read_file demo.txt range=1-2")
-        .with_result("read 12 bytes");
-
-        let min = result.render_for_level(AgentHistoryShowLevel::Min);
-        let mini = result.render_for_level(AgentHistoryShowLevel::Mini);
-        let full = result.render_for_level(AgentHistoryShowLevel::Full);
-
-        assert!(min.contains("read_file demo.txt range=1-2 => success"));
-        assert_eq!(mini, "read 12 bytes");
-        assert!(full.contains("read_file demo.txt range=1-2"));
-        assert!(full.contains("```json"));
-        assert!(full.contains("\"path\": \"demo.txt\""));
-    }
-
-    #[test]
-    fn render_for_level_bash_result_uses_summary_for_compressed_levels() {
-        let result = AgentToolResult::from_details(json!({}))
-            .with_cmd_line("cargo test --package demo")
-            .with_status(AgentToolStatus::Error)
-            .with_return_code(1)
-            .with_result("cargo test failed with exit code 1")
-            .with_output("line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8\nline-9");
-
-        let mini = result.render_for_level(AgentHistoryShowLevel::Mini);
-        let full = result.render_for_level(AgentHistoryShowLevel::Full);
-
-        assert_eq!(mini, "cargo test failed with exit code 1");
-        assert!(full.contains("cargo test --package demo"));
-        assert!(full.contains("```output"));
-        assert!(full.contains("line-1"));
-        assert!(full.contains("line-9"));
-    }
-
-    #[test]
     fn tool_result_view_preserves_protocol_fields() {
         let view = AgentToolResult::from_details(json!({"rows": [1, 2]}))
             .with_cmd_line("read file:///demo.txt")
@@ -2455,7 +1435,8 @@ mod tests {
             .with_pending_reason(AgentToolPendingReason::LongRunning)
             .with_check_after(5000)
             .with_partial_output("partial")
-            .to_tool_result_view();
+            .to_host();
+        let view = ToolResultView::from_host(&Some(view)).expect("envelope");
 
         assert_eq!(view.status, ToolResultStatusView::Pending);
         assert_eq!(view.cmd_name.as_deref(), Some("read"));
@@ -2465,40 +1446,5 @@ mod tests {
         assert_eq!(view.check_after, Some(5000));
         assert_eq!(view.partial_output.as_deref(), Some("partial"));
         assert!(view.detail.is_some());
-    }
-
-    #[test]
-    fn render_for_level_full_non_agent_tool_keeps_512_success_lines() {
-        let output = (1..=600)
-            .map(|idx| format!("line-{idx:03}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let rendered = AgentToolResult::from_details(json!({}))
-            .with_cmd_line("sed -n '1,600p' demo.log")
-            .with_output(output)
-            .render_for_level(AgentHistoryShowLevel::Full);
-
-        assert!(rendered.contains("line-001"));
-        assert!(rendered.contains("line-512"));
-        assert!(!rendered.contains("line-513"));
-        assert!(rendered.contains("showing first 512 lines only"));
-    }
-
-    #[test]
-    fn render_for_last_step_non_agent_tool_keeps_full_output() {
-        let output = (1..=30)
-            .map(|idx| format!("line-{idx:02}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let rendered = AgentToolResult::from_details(json!({}))
-            .with_cmd_line("sed -n '1,30p' demo.log")
-            .with_output(output)
-            .render_for_last_step();
-
-        assert!(rendered.contains("sed -n"));
-        assert!(rendered.contains("demo.log"));
-        assert!(rendered.contains("line-01"));
-        assert!(rendered.contains("line-30"));
-        assert!(!rendered.contains("TRUNCATED"));
     }
 }

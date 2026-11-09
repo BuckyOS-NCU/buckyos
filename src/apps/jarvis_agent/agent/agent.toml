@@ -5,7 +5,11 @@
 language = "zh"
 
 # Base `.llm_context` of the sessions the Loader creates. A behavior lays its
-# own model / loop / tools / budget over it.
+# own model / loop / tools / budget over it. `context_window` is left out on
+# purpose: a run takes the window of the model its alias routes to (AICC
+# `max_context_tokens`, 128k when unknown); set it here (or in a session's
+# `llm_context`) only to override that. Compaction starts at 80% of it
+# (`context_yield_ratio`) and brings the request back to 30%.
 [llm_context]
 model = "llm.chat"
 max_tokens = 8192
@@ -57,24 +61,31 @@ default_cmd_skills = ["ui_core"]
 max_process_depth = 4
 
 # A work session's command manuals are chosen when it is created
-# (`create-worksession --cmd-skill`); there is no default.
+# (`create-worksession --cmd-skill`); there is no default. It has many Turns:
+# every reply closes one (the progress its caller sees), the end of a task it
+# started — or a tick every `tick_secs` while its tasks run — opens the next;
+# only `report(is_end=true)` ends it. By default it is a plan session
+# (`plan_simple`): it keeps a TodoList whose Todos run in work sessions of
+# their own (`work_simple`, `explore`); `--behavior work_simple` makes it one
+# bounded task.
 [session.work]
-default_behavior = "plan"
+default_behavior = "plan_simple"
+completion = "explicit_report"
+tick_secs = 30
 max_process_depth = 8
-# A work session asks its user through a notification and waits this long
-# for the answer (0: work sessions do not ask).
-ask_user_timeout_secs = 10800
 
-# A work session that plans with a TodoList and runs every Todo in a sub
-# session of its own, in one Turn, with native function calls; its result is
-# an explicit final report. Chosen explicitly:
-# `agent-session create-worksession --class plan_simple --objective "..."`.
+# The plan session of a conversation (`--class plan_simple`): its queue
+# brings it the user's messages forwarded from the conversation (it never
+# waits for an answer); it only steers what runs, so its tick is rare (a
+# Todo's end is its input).
 [session.plan_simple]
 base = "work"
 default_behavior = "plan_simple"
-completion = "explicit_report"
+input = "queue"
+tick_secs = 600
 max_process_depth = 8
-ask_user_timeout_secs = 10800
+# A plan sees every runtime and workspace to place its Todos.
+runtime_view = "all"
 
 # Goal Sessions: every activation is one Turn; what a goal leaves out of its
 # budget and schedule comes from here.

@@ -72,25 +72,31 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use llm_context::behavior_loop::{LLMBehaviorResult, LLMResultParser, SendMessageRecord};
+use llm_context::behavior_loop::{LLMBehaviorResult, LLMResultParser};
 use llm_context::deps::{
-    InferenceHook, LLMContextDeps, LlmClient, LlmInferenceRequest, ToolCallCtx, ToolDispatchError,
-    ToolManager, ToolSpecLite, WorkEvent, WorklogSink,
+    CheckpointHook, Injection, LLMContextDeps, LlmClient, LlmInferenceRequest, ToolCallCtx,
+    ToolDispatchError, ToolManager, ToolSpecLite, WorkEvent, WorklogSink,
 };
-use llm_context::error::{ErrorSource, LLMComputeError, ProviderFailure, RefusalKind};
+use llm_context::error::{ErrorSource, LLMComputeError, ProviderFailure};
 use llm_context::observation::Observation;
 use llm_context::outcome::{BudgetKind, ContextOutput, LLMContextOutcome, ResumeFill};
 use llm_context::request::{
-    BudgetSpec, ContextOwnerRef, ContextThreshold, ErrorPolicy, LLMContextRequest, ModelPolicy,
-    OutputSpec, ToolMode, ToolPolicy,
+    BudgetSpec, ContextThreshold, ErrorPolicy, LLMContextRequest, ModelPolicy,
+    OutputSpec, ToolMode, ToolPolicy, DEFAULT_WRAP_UP_ROUNDS,
 };
-use llm_context::state::{LLMContextSnapshot, Suspension};
-use llm_context::tasks::{task_state_observation, RunningTaskResolver};
-use llm_context::{LLMContext, LLMContextInterruptHandle, XmlStepRenderer};
+use llm_context::state::LLMContextSnapshot;
+use crate::result_view::ToolResultView;
+use crate::task_model::{
+    task_state_observation_via, RunningTaskResolver, TaskState, DEFAULT_TASK_WAIT_MS,
+    MAX_IN_TOOL_WAIT_MS,
+};
+use llm_context::{LLMContext, LLMContextInterruptHandle};
 
-use crate::exec_tracking::{HostRunInfo, InflightAction};
+use crate::step_record::XmlStepRenderer;
+
+use crate::exec_tracking::HostRunInfo;
 use crate::llm_bash::{
-    new_run_binding_slot, BashRunner, RunBinding, RunBindingSlot, ShellMode, ShellRuntimeNote,
+    new_run_binding_slot, BashRunner, RunBinding, RunBindingSlot, ShellRuntimeNote,
     DEFAULT_AUTO_WAIT_MS, MAX_AUTO_WAIT_MS,
 };
 use crate::llm_compress::LlmSummarizeCompressor;
@@ -100,9 +106,9 @@ use crate::runtime::files::LocalFileBackend;
 use crate::runtime::{
     AgentRuntime, RuntimeConfig, RuntimeDescriptor, RuntimeInfo, RuntimeOpenCtx, Sandbox,
 };
-use crate::tasks::{
-    task_tools, CompositeTaskResolver, InProcessTaskManager, ShellTaskContext, ShellTaskManager,
-};
+use crate::tasks::{task_tools, CompositeTaskResolver, InProcessTaskManager};
+use crate::hints::{apply_hints, render_with_hints, HintLedger, MemoryHintLedger, HINT_NS_DEDUP};
+use crate::intent::{take_intent, with_intent, IntentPolicy};
 use crate::tool::TypedToolHandle;
 use crate::{
     AgentTool, AgentToolError, AgentToolResult, AgentToolStatus, BinOverlayConfig, EditFileTool,
@@ -126,8 +132,6 @@ pub const DEFAULT_LLM_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_RUNS_DIR: &str = "~/.xllm/runs";
 /// 默认锁目录：启用工具的任务按工作目录互斥，与 Runs 目录无关（F05）。
 pub const DEFAULT_LOCK_DIR: &str = "~/.xllm/locks";
-/// 内置工具组 `bash` 提供的命令执行工具名（`shell`）。
-pub const TOOL_EXEC: &str = TOOL_SHELL;
 pub const BUILTIN_TOOL_GROUP_BASH: &str = "bash";
 /// 内置工具组 `bash_core`：`read`（`read_file` 的超集）/ `write_file` /
 /// `edit_file` / `shell`，不含 task 工具——长命令由 `XllmDeps.task_cli`
@@ -135,9 +139,11 @@ pub const BUILTIN_TOOL_GROUP_BASH: &str = "bash";
 pub const BUILTIN_TOOL_GROUP_BASH_CORE: &str = "bash_core";
 /// 运行时协议版本；resume 时校验当前执行器是否能处理保存的协议。
 pub const RUNTIME_PROTOCOL_VERSION: &str = "xllm/2";
-pub const RUN_RECORD_VERSION: u32 = 6;
-/// 默认 context 压缩阈值（token window 的 75%）。
-pub const DEFAULT_CONTEXT_YIELD_RATIO: f32 = 0.75;
+/// 7：删除 `inflight[]`——派发了什么只看工具调用前的快照；`runtime.task_wait_ms`。
+pub const RUN_RECORD_VERSION: u32 = 7;
+/// 默认 context 压缩阈值（token window 的 80%，`.llm_context` 的
+/// `context_yield_ratio` 可调）。
+pub const DEFAULT_CONTEXT_YIELD_RATIO: f32 = 0.80;
 
 /// The early compaction threshold needs the window; without it only the
 /// provider's structured refusal triggers compaction.
@@ -145,13 +151,49 @@ fn context_yield_threshold(limits: &RunLimits) -> Option<ContextThreshold> {
     limits
         .context_window_tokens
         .map(|_| ContextThreshold::Ratio {
-            value: DEFAULT_CONTEXT_YIELD_RATIO,
+            value: limits
+                .context_yield_ratio
+                .unwrap_or(DEFAULT_CONTEXT_YIELD_RATIO),
         })
+}
+
+/// A `context_yield_ratio` without a `context_window` has no effect; the
+/// warning names the file that set it.
+fn unused_context_yield_ratio(cfg: &EffectiveConfig) -> Option<String> {
+    if cfg.limits.context_yield_ratio.is_none() || cfg.limits.context_window_tokens.is_some() {
+        return None;
+    }
+    let origin = cfg
+        .sources
+        .get("context_yield_ratio")
+        .map(String::as_str)
+        .unwrap_or("config");
+    Some(format!(
+        "context_yield_ratio (from {origin}) has no effect without context_window; only the provider's refusal triggers compaction"
+    ))
 }
 /// 默认连续可纠正错误上限。
 pub const DEFAULT_MAX_CONSECUTIVE_ERRORS: u32 = 3;
 /// 自动压缩目标 token 数兜底。
 pub const DEFAULT_AUTO_COMPRESS_TARGET_TOKENS: u32 = 32_768;
+/// 已知窗口时压回窗口的 30%（与 OpenDAN 架构设计 §4.2 的 80% → 30% 一致）。
+pub const DEFAULT_CONTEXT_TARGET_RATIO: f32 = 0.30;
+
+/// Compaction target of a run: 30% of the window, at most
+/// `DEFAULT_AUTO_COMPRESS_TARGET_TOKENS` and at most half the yield
+/// threshold, so a compaction always lands well below the line that
+/// triggered it (a target above the history makes compaction a no-op).
+fn compaction_target_tokens(limits: &RunLimits) -> u32 {
+    let Some(window) = limits.context_window_tokens else {
+        return DEFAULT_AUTO_COMPRESS_TARGET_TOKENS;
+    };
+    let ratio = limits
+        .context_yield_ratio
+        .unwrap_or(DEFAULT_CONTEXT_YIELD_RATIO);
+    let share = DEFAULT_CONTEXT_TARGET_RATIO.min(ratio / 2.0);
+    ((window as f64 * f64::from(share)).floor() as u32)
+        .clamp(1, DEFAULT_AUTO_COMPRESS_TARGET_TOKENS)
+}
 /// 单个 `--file` 文本材料上限（字节）。
 pub const MAX_TEXT_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 /// 单张图片上限（字节）。
@@ -538,30 +580,20 @@ impl ToolSource {
     }
 }
 
-/// `shell` 工具的执行模式配置（long-tool TODO §5）。
+/// `shell` 工具的时限配置（long-tool TODO §5）。调用内等多久不属于工具，
+/// 是 runtime 的 `task_wait_ms`（freeze TODO F13/F15）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellToolConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<ShellMode>,
-    /// auto 模式：默认在工具内等待的毫秒数。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wait_ms: Option<u64>,
-    /// wait 模式：默认 `timeout_ms`。
+    /// 默认 `timeout_ms`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
-    /// wait 模式：`timeout_ms` 上限；0 = 不限。
+    /// `timeout_ms` 上限；0 = 不限。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_timeout_ms: Option<u64>,
 }
 
 impl ShellToolConfig {
     pub fn merge_over(&mut self, over: &ShellToolConfig) {
-        if over.mode.is_some() {
-            self.mode = over.mode;
-        }
-        if over.wait_ms.is_some() {
-            self.wait_ms = over.wait_ms;
-        }
         if over.timeout_ms.is_some() {
             self.timeout_ms = over.timeout_ms;
         }
@@ -571,10 +603,11 @@ impl ShellToolConfig {
     }
 }
 
-/// `shell` 的生效设置（写入 run.json）。
+/// `shell` 的生效设置（写入 run.json）。`wait_ms` 取自 runtime 的
+/// `task_wait_ms`：命令在调用内等这么久，还没结束就转成任务返回；
+/// `wait_ms >= timeout_ms` 时 shell 等到命令结束或超时。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellSettings {
-    pub mode: ShellMode,
     pub wait_ms: u64,
     pub timeout_ms: u64,
     pub max_timeout_ms: u64,
@@ -583,7 +616,6 @@ pub struct ShellSettings {
 impl Default for ShellSettings {
     fn default() -> Self {
         Self {
-            mode: ShellMode::Auto,
             wait_ms: DEFAULT_AUTO_WAIT_MS,
             timeout_ms: EXEC_DEFAULT_TIMEOUT_MS,
             max_timeout_ms: EXEC_MAX_TIMEOUT_MS,
@@ -592,15 +624,12 @@ impl Default for ShellSettings {
 }
 
 impl ShellSettings {
-    pub fn from_config(cfg: Option<&ShellToolConfig>) -> Self {
-        let mut s = Self::default();
+    pub fn from_config(cfg: Option<&ShellToolConfig>, task_wait_ms: u64) -> Self {
+        let mut s = Self {
+            wait_ms: task_wait_ms.clamp(1, MAX_AUTO_WAIT_MS),
+            ..Self::default()
+        };
         if let Some(c) = cfg {
-            if let Some(m) = c.mode {
-                s.mode = m;
-            }
-            if let Some(w) = c.wait_ms {
-                s.wait_ms = w.clamp(1, MAX_AUTO_WAIT_MS);
-            }
             if let Some(t) = c.timeout_ms {
                 s.timeout_ms = t;
             }
@@ -773,6 +802,10 @@ pub struct LlmContextFile {
     pub llm_timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Share of `context_window` at which the run yields for compaction,
+    /// in `(0, 1]` (default `DEFAULT_CONTEXT_YIELD_RATIO`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_yield_ratio: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -941,6 +974,26 @@ impl<'a> YamlCtx<'a> {
             Some(v) => u32::try_from(v)
                 .map(Some)
                 .map_err(|_| self.err(&join_field(field, key), "value too large")),
+        }
+    }
+
+    fn get_f32(
+        &self,
+        field: &str,
+        m: &serde_yaml::Mapping,
+        key: &str,
+    ) -> Result<Option<f32>, XllmError> {
+        match m.get(key) {
+            None | Some(Yaml::Null) => Ok(None),
+            Some(Yaml::Number(n)) => n
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .map(|v| Some(v as f32))
+                .ok_or_else(|| self.err(&join_field(field, key), "expected a finite number")),
+            Some(other) => Err(self.err(
+                &join_field(field, key),
+                format!("expected a number, got {}", yaml_kind(other)),
+            )),
         }
     }
 }
@@ -1219,24 +1272,9 @@ fn parse_tools_config(ctx: &YamlCtx<'_>, field: &str, v: &Yaml) -> Result<ToolsC
             ctx.check_keys(
                 &f,
                 obj,
-                &["mode", "wait_ms", "timeout_ms", "max_timeout_ms"],
+                &["timeout_ms", "max_timeout_ms"],
             )?;
-            let mode = match ctx.get_str(&f, obj, "mode")? {
-                None => None,
-                Some(s) => Some(match s.trim().to_ascii_lowercase().as_str() {
-                    "wait" => ShellMode::Wait,
-                    "auto" => ShellMode::Auto,
-                    _ => {
-                        return Err(ctx.err(
-                            &join_field(&f, "mode"),
-                            format!("unsupported shell mode `{s}` (supported: wait, auto)"),
-                        ))
-                    }
-                }),
-            };
             Some(ShellToolConfig {
-                mode,
-                wait_ms: ctx.get_u64(&f, obj, "wait_ms")?,
                 timeout_ms: ctx.get_u64(&f, obj, "timeout_ms")?,
                 max_timeout_ms: ctx.get_u64(&f, obj, "max_timeout_ms")?,
             })
@@ -1448,6 +1486,7 @@ pub fn parse_llm_context_file(path: &Path, raw: &str) -> Result<LlmContextFile, 
             "max_tool_iterations",
             "llm_timeout",
             "context_window",
+            "context_yield_ratio",
             "timeout",
             "runs_dir",
             "loop_model",
@@ -1498,6 +1537,10 @@ pub fn parse_llm_context_file(path: &Path, raw: &str) -> Result<LlmContextFile, 
     let max_tool_iterations = ctx.get_u32("", m, "max_tool_iterations")?;
     let llm_timeout = ctx.get_u64("", m, "llm_timeout")?;
     let context_window = ctx.get_u32("", m, "context_window")?;
+    let context_yield_ratio = ctx.get_f32("", m, "context_yield_ratio")?;
+    if context_yield_ratio.is_some_and(|r| !(r > 0.0 && r <= 1.0)) {
+        return Err(ctx.err("context_yield_ratio", "must be in (0, 1]"));
+    }
     let timeout = ctx.get_u64("", m, "timeout")?;
     let runs_dir = match m.get("runs_dir") {
         None => None,
@@ -1645,6 +1688,7 @@ pub fn parse_llm_context_file(path: &Path, raw: &str) -> Result<LlmContextFile, 
         max_tool_iterations,
         llm_timeout,
         context_window,
+        context_yield_ratio,
         timeout,
         runs_dir,
         loop_model,
@@ -1707,6 +1751,10 @@ pub struct MergedConfig {
     pub llm_timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Share of `context_window` at which the run yields for compaction,
+    /// in `(0, 1]` (default `DEFAULT_CONTEXT_YIELD_RATIO`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_yield_ratio: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1804,6 +1852,7 @@ pub fn merge_config_layers(layers: &[ConfigLayer]) -> Result<MergedConfig, XllmE
         scalar!(max_tool_iterations, "max_tool_iterations");
         scalar!(llm_timeout, "llm_timeout");
         scalar!(context_window, "context_window");
+        scalar!(context_yield_ratio, "context_yield_ratio");
         scalar!(timeout, "timeout");
         scalar!(runs_dir, "runs_dir");
         scalar!(loop_model, "loop_model");
@@ -1992,11 +2041,6 @@ impl TaskInput {
         });
         self
     }
-
-    pub fn with_stdin(mut self, text: impl Into<String>) -> Self {
-        self.stdin = Some(text.into());
-        self
-    }
 }
 
 /// 已读取并校验的附件记录（随 Run 保存；图片正文进入消息快照，这里只留摘要）。
@@ -2044,6 +2088,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())
+}
+
+/// What a Session Bin manifest records of a program entry: its length and
+/// modification time, which a hard link shares with the program and a copy
+/// keeps.
+pub fn session_program_stamp(path: &Path) -> std::io::Result<String> {
+    let meta = std::fs::metadata(path)?;
+    let modified = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(format!("{}:{modified}", meta.len()))
 }
 
 /// 读取所有显式附件，保留顺序；任一附件不可用即报错，不会丢弃附件继续。
@@ -2178,7 +2235,7 @@ pub fn load_attachments(
 // =========================================================================
 
 /// 执行限制（F08）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
@@ -2186,11 +2243,15 @@ pub struct RunLimits {
     pub timeout_secs: u64,
     pub llm_timeout_secs: u64,
     /// Model context window in tokens (`context_window`). When set, the run
-    /// yields for compaction at `DEFAULT_CONTEXT_YIELD_RATIO` of it and never
-    /// sends a request that cannot fit; unknown windows only rely on the
+    /// yields for compaction at `context_yield_ratio` of it and never sends
+    /// a request that cannot fit; unknown windows only rely on the
     /// provider's structured refusal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<u32>,
+    /// `context_yield_ratio`; absent means `DEFAULT_CONTEXT_YIELD_RATIO`
+    /// (records written before the key existed included).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_yield_ratio: Option<f32>,
 }
 
 /// 展开后的单个工具。
@@ -2268,6 +2329,17 @@ pub struct EffectiveConfig {
     /// 字段 → 来源（文件路径 / `cli` / `default`）。
     #[serde(default)]
     pub sources: BTreeMap<String, String>,
+}
+
+impl EffectiveConfig {
+    /// 上下文压缩的摘要模型：经 AICC 时用 `llm.summarize` 别名，直连
+    /// OpenAI 兼容端点时只能用本次 Run 的模型。
+    pub fn summary_model(&self) -> String {
+        match self.provider.effective_kind() {
+            ProviderKind::Buckyos => crate::llm_compress::SUMMARIZE_MODEL_ALIAS.to_string(),
+            ProviderKind::Openai => self.model.clone(),
+        }
+    }
 }
 
 /// 计算工具配置（不展开来源）：产品默认 → 顶层 tools → 选中组 tools →
@@ -2714,12 +2786,13 @@ pub fn build_runtime_protocol_for(
             }
             s.push_str("  <report end=\"true\"><![CDATA[the complete final result]]></report>\n</response>\n");
             s.push_str("Rules:\n");
-            s.push_str("- <report> or <report end=\"false\"> submits a progress report and continues the context. Use <report end=\"true\"> only to submit the complete, nonempty final result and request completion. The final report content is delivered verbatim to the caller.\n");
-            s.push_str("- A final report cannot share a reply with actions, sendmsg, native tool calls, or a nonempty next_behavior. Observe action results before submitting it. Use only true or false for end and at most one report per reply.\n");
+            s.push_str("- <report> or <report end=\"false\"> submits a progress report. Use <report end=\"true\"> only to submit the complete, nonempty final result and request completion. The final report content is delivered verbatim to the caller.\n");
+            s.push_str("- A final report cannot share a reply with actions, native tool calls, or a nonempty next_behavior. Observe action results before submitting it. Use only true or false for end and at most one report per reply.\n");
+            s.push_str("- A reply without actions, native tool calls, next_behavior or a final report (a progress report alone, or nothing) yields: this context stops and waits for new input, such as the result of work it started that is still running or a new message. Never yield while there is work you can do now.\n");
             s.push_str("- next_behavior is reserved for host scheduling, including WAIT_USER_MSG; END and done are invalid. A report without end=\"true\" never implies completion.\n");
             if matches!(flavor, HostProtocolFlavor::Session { .. }) {
                 s.push_str("- A report may include sibling <artifacts> containing a JSON array of relative file paths and <result> containing any JSON value. These require a report in the same response. The host validates and persists the submission; completion applies to the current context, with child reports returned to their caller.\n");
-                s.push_str("- A reply whose only content is a progress report (no actions, no sendmsg, no next_behavior) is how you wait while work this session started (sub sessions) is still running: the step ends and the session wakes you when that work reports. When nothing it started is running, the report is only a progress report and you continue.\n");
+                s.push_str("- Yielding is how you wait for work this session started (tasks, sub sessions): the session wakes you with its result. When nothing it started is running, the session ends the Turn instead.\n");
             }
             if has_actions {
                 s.push_str("- To act, put one or more actions inside <actions>; the results come back in the next message. You may include a progress report with end=\"false\".\n");
@@ -2738,7 +2811,7 @@ pub fn build_runtime_protocol_for(
                 // run told it has nothing to act with ends at its first step).
                 s.push_str("- To act, call one or more of the native function-call tools declared for this run (never inside <actions>); their results come back to you and you may call more. Only the declared tools exist.\n");
                 s.push_str("- A failed tool call is not the end of the task: read the error, adjust, and continue within the tool iteration limit.\n");
-                s.push_str("- A reply without tool calls is the <response> document of the step: without <report end=\"true\"> the work continues with the next step. Submit <report end=\"true\"> with the complete final result only after you have done the work and observed the results.\n");
+                s.push_str("- A reply without tool calls is the <response> document of the step: submit <report end=\"true\"> with the complete final result only after you have done the work and observed the results; a reply without it yields.\n");
             } else {
                 s.push_str("- No actions or tools are available in this run: reply with a single <response> whose <report end=\"true\"> contains the complete final result. Do not include <actions>.\n");
             }
@@ -2856,6 +2929,51 @@ pub(crate) fn build_contexts_system_text(
     } else {
         Some(lines.join("\n"))
     }
+}
+
+/// The prompt group a task assembles: `--select` over `prompt.select`; none
+/// in custom mode (`--system`, or `prompt.mode: custom` without `--select`).
+fn select_prompt_group(
+    merged: &MergedConfig,
+    overrides: &TaskOverrides,
+) -> Result<Option<String>, XllmError> {
+    let custom = overrides.system.is_some()
+        || (overrides.select.is_none() && merged.prompt.mode == Some(PromptMode::Custom));
+    if custom {
+        return Ok(None);
+    }
+    let Some(sel) = overrides
+        .select
+        .clone()
+        .or_else(|| merged.prompt.select.clone())
+    else {
+        return Ok(None);
+    };
+    if !merged.prompt.groups.contains_key(&sel) {
+        let available: Vec<String> = merged.prompt.groups.keys().cloned().collect();
+        let src = if overrides.select.is_some() {
+            "cli:--select".to_string()
+        } else {
+            merged
+                .sources
+                .get("prompt.select")
+                .cloned()
+                .unwrap_or_default()
+        };
+        return Err(XllmError::Config {
+            file: src,
+            field: "prompt.select".into(),
+            reason: format!(
+                "prompt group `{sel}` does not exist (available: {})",
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ),
+        });
+    }
+    Ok(Some(sel))
 }
 
 /// 组装参数。
@@ -3540,23 +3658,15 @@ impl LLMResultParser for XllmActionParser {
         let report_artifacts = report_payload("artifacts")?
             .map(serde_json::from_value::<Vec<String>>)
             .transpose()
-            .map_err(|error| format!("report artifacts must be an array of strings: {error}"))?
-            .unwrap_or_default();
-        let report_result = report_payload("result")?;
+            .map_err(|error| format!("report artifacts must be an array of strings: {error}"))?;
+        let report_result = with_report_artifacts(report_payload("result")?, report_artifacts)?;
 
         let mut do_actions = Vec::new();
-        let mut messages_to_send = Vec::new();
         let mut auto_id = 0u32;
         let action_elements: Vec<_> = region_children
             .iter()
             .filter(|el| el.name == "actions")
             .flat_map(XmlElement::children)
-            .chain(
-                region_children
-                    .iter()
-                    .filter(|el| el.name == "sendmsg")
-                    .cloned(),
-            )
             .collect();
         if report_end
             && (!action_elements.is_empty()
@@ -3564,16 +3674,9 @@ impl LLMResultParser for XllmActionParser {
                     .iter()
                     .any(|el| el.name == "actions" && !el.body.trim().is_empty()))
         {
-            return Err("a final report cannot be combined with actions or sendmsg".into());
+            return Err("a final report cannot be combined with actions".into());
         }
         for el in action_elements {
-            if el.name == "sendmsg" && !self.actions.contains_key("sendmsg") {
-                messages_to_send.push(SendMessageRecord {
-                    target: el.attr("target").unwrap_or("user").to_string(),
-                    body: el.text(),
-                });
-                continue;
-            }
             do_actions.push(self.element_to_call(&el, &mut auto_id));
         }
         if !provider_calls.is_empty() {
@@ -3587,13 +3690,63 @@ impl LLMResultParser for XllmActionParser {
             thought,
             self_report,
             report_end,
-            report_artifacts,
             report_result,
-            messages_to_send,
         };
         result.validate()?;
         Ok(result)
     }
+}
+
+/// Key of the report attachments inside `report_result` (`<artifacts>`):
+/// files relative to the work directory or object ids.
+pub const REPORT_ARTIFACTS_KEY: &str = "artifacts";
+
+/// `report_result` with the `<artifacts>` of the same report folded in under
+/// [`REPORT_ARTIFACTS_KEY`]. A `<result>` given together with artifacts must
+/// be a JSON object; `null` counts as no result.
+fn with_report_artifacts(
+    result: Option<Value>,
+    artifacts: Option<Vec<String>>,
+) -> Result<Option<Value>, String> {
+    let Some(artifacts) = artifacts else {
+        return Ok(result);
+    };
+    let mut object = match result {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err("a report result given with artifacts must be a JSON object".into()),
+    };
+    if object.contains_key(REPORT_ARTIFACTS_KEY) {
+        return Err(format!(
+            "report result must not carry `{REPORT_ARTIFACTS_KEY}` when <artifacts> is given"
+        ));
+    }
+    object.insert(REPORT_ARTIFACTS_KEY.to_string(), json!(artifacts));
+    Ok(Some(Value::Object(object)))
+}
+
+/// The report attachments carried in a `report_result` (see
+/// [`REPORT_ARTIFACTS_KEY`]).
+pub fn report_artifacts(result: Option<&Value>) -> Vec<String> {
+    result
+        .and_then(|r| r.get(REPORT_ARTIFACTS_KEY))
+        .and_then(|a| serde_json::from_value(a.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// A `report_result` taken apart again: its attachments and the `<result>`
+/// value without them (`None` when nothing else was given).
+pub fn split_report_result(result: Option<&Value>) -> (Vec<String>, Option<Value>) {
+    let artifacts = report_artifacts(result);
+    let rest = match result {
+        Some(Value::Object(map)) if map.contains_key(REPORT_ARTIFACTS_KEY) => {
+            let mut map = map.clone();
+            map.remove(REPORT_ARTIFACTS_KEY);
+            (!map.is_empty()).then_some(Value::Object(map))
+        }
+        other => other.cloned(),
+    };
+    (artifacts, rest)
 }
 
 // =========================================================================
@@ -3764,9 +3917,6 @@ impl WorklogSink for ObserverWorklog {
             WorkEvent::SelfReportSet { chars, .. } => {
                 Some(RunEvent::Debug(format!("report set ({chars} chars)")))
             }
-            WorkEvent::MessageSent { target, .. } => Some(RunEvent::Debug(format!(
-                "message intent to {target} recorded"
-            ))),
         };
         if let Some(ev) = ev {
             self.observer.on_event(&self.run_id, ev);
@@ -3798,13 +3948,13 @@ pub struct XllmDeps {
     pub buckyos_tasks: Option<Arc<dyn RunningTaskResolver>>,
     /// The task manager of this process (`local:` tasks): one per process,
     /// so a task outlives the run (and the tool set) that handed it over.
+    /// Every `shell` command that outlives its wait becomes a task here; a
+    /// host hands them to the OS before it ends (`release_running`).
     pub local_tasks: Arc<InProcessTaskManager>,
-    /// Where `shell` hands a command that outlived its wait. `None`: the
-    /// process's own task manager (`local_tasks`). A host whose tasks live
-    /// in a task service (the zone's TaskMgr) sets its manager here.
-    pub shell_tasks: Option<Arc<dyn ShellTaskManager>>,
-    /// What a handed-over command belongs to (set by the host per run).
-    pub shell_task_context: ShellTaskContext,
+    /// What the model was already shown of results' hints and dedup keys
+    /// (`once` per session, `dedup` per run). `None`: one in memory per
+    /// tool set.
+    pub hint_ledger: Option<Arc<dyn HintLedger>>,
     pub runtime_env: BTreeMap<String, String>,
     pub runtime_path_prefix: Vec<PathBuf>,
     /// 为 true 时不获取工作目录互斥锁（宿主自行协调，例如 libOpenDAN 的
@@ -3823,6 +3973,10 @@ pub struct XllmDeps {
     /// this run's task resolver through `XLLM_TASK_ENDPOINT`. `None`:
     /// `bash_core` keeps the task tools.
     pub task_cli: Option<String>,
+    /// Reads the URLs `read` does not read itself (`obj://`, `cyfs://`,
+    /// `https://`, another device's `file://`): the host's object resolver.
+    /// `None`: `read` refuses them.
+    pub url_reader: Option<Arc<dyn crate::read_tool::UrlReader>>,
 }
 
 /// The sections xllm appends to a hosted run's system text. A host that
@@ -3869,8 +4023,7 @@ impl Default for XllmDeps {
             node_executor: None,
             buckyos_tasks: None,
             local_tasks: InProcessTaskManager::new(),
-            shell_tasks: None,
-            shell_task_context: ShellTaskContext::default(),
+            hint_ledger: None,
             runtime_env: BTreeMap::new(),
             runtime_path_prefix: Vec::new(),
             skip_workdir_lock: false,
@@ -3878,6 +4031,7 @@ impl Default for XllmDeps {
             host_prompt_sections: HostPromptSections::default(),
             shell_note: None,
             task_cli: None,
+            url_reader: None,
         }
     }
 }
@@ -3931,7 +4085,6 @@ pub struct XllmToolManager {
     runner: Option<Arc<dyn BashRunner>>,
     descriptor: Option<RuntimeDescriptor>,
     info: Option<RuntimeInfo>,
-    tracking: Option<Arc<RunTracking>>,
     tools: BTreeMap<String, Arc<dyn AgentTool>>,
     /// Tool calls dispatched so far (`SessionRuntimeContext.tool_call_index`).
     tool_call_index: AtomicU32,
@@ -3945,6 +4098,23 @@ pub struct XllmToolManager {
     /// The task CLI bridge over `resolver` (`bash_core` with a task
     /// command); served as long as this manager lives.
     task_bridge: Option<crate::task_bridge::TaskBridge>,
+    /// How long a call waits for a task its tool handed the work to before
+    /// it returns "still running" (`RuntimeConfig.task_wait_ms`).
+    task_wait_ms: AtomicU64,
+    /// The call a previous executor may have started (resume, see
+    /// [`XllmToolManager::set_recovering`]): its call id and the runtime's
+    /// account of it.
+    recovering: Mutex<Option<(String, String)>>,
+    /// Hints / dedup keys already shown (see [`crate::hints`]).
+    hints: Arc<dyn HintLedger>,
+    /// Whether a tool's schema offers `intent` (the runtime's standard
+    /// tools: optional); taken out before the tool runs.
+    intent: BTreeMap<String, IntentPolicy>,
+    /// The intent each call stated, by call id.
+    intents: Mutex<BTreeMap<String, String>>,
+    /// Resume: the specs saved with the run, shown instead of the tools'
+    /// own (freeze TODO F6).
+    advertised: Option<BTreeMap<String, ToolSpecLite>>,
 }
 
 impl XllmToolManager {
@@ -3976,7 +4146,6 @@ impl XllmToolManager {
             runner: None,
             descriptor: None,
             info: None,
-            tracking: None,
             tools: BTreeMap::new(),
             tool_call_index: AtomicU32::new(0),
             session_template: SessionRuntimeContext {
@@ -3993,7 +4162,110 @@ impl XllmToolManager {
             run,
             resolver: Arc::new(resolver),
             task_bridge: None,
+            task_wait_ms: AtomicU64::new(DEFAULT_TASK_WAIT_MS),
+            recovering: Mutex::new(None),
+            hints: MemoryHintLedger::new(),
+            intent: BTreeMap::new(),
+            intents: Mutex::new(BTreeMap::new()),
+            advertised: None,
         }
+    }
+
+    /// The ledger hints and dedup keys are kept in.
+    pub fn set_hint_ledger(&mut self, ledger: Arc<dyn HintLedger>) {
+        self.hints = ledger;
+    }
+
+    pub fn hint_ledger(&self) -> Arc<dyn HintLedger> {
+        self.hints.clone()
+    }
+
+    /// The history was rewritten (compression, a derived context): results
+    /// shown before are no longer in it.
+    pub fn clear_dedup(&self) {
+        self.hints.clear(HINT_NS_DEDUP);
+    }
+
+    /// Whether `tool`'s schema offers `intent`.
+    pub fn set_intent_policy(&mut self, tool: &str, policy: IntentPolicy) {
+        if policy == IntentPolicy::Off {
+            self.intent.remove(tool);
+        } else {
+            self.intent.insert(tool.to_string(), policy);
+        }
+    }
+
+    pub fn intent_policy(&self, tool: &str) -> IntentPolicy {
+        self.intent.get(tool).copied().unwrap_or_default()
+    }
+
+    /// The intent call `call_id` stated, if any.
+    pub fn intent_of(&self, call_id: &str) -> Option<String> {
+        self.intents.lock().expect("intents").get(call_id).cloned()
+    }
+
+    /// The runtime's wait budget for a task inside one call.
+    pub fn set_task_wait_ms(&self, ms: u64) {
+        self.task_wait_ms
+            .store(ms.clamp(1, MAX_IN_TOOL_WAIT_MS), Ordering::SeqCst);
+    }
+
+    pub fn task_wait_ms(&self) -> u64 {
+        self.task_wait_ms.load(Ordering::SeqCst)
+    }
+
+    /// Resume: `call_id` may have been started by a previous executor
+    /// (the first call without a result in the resumed snapshot, see
+    /// `exec_tracking::in_flight_call`); `reason` is the runtime's account
+    /// of it. When the waist dispatches it again, the manager first looks
+    /// for the task it became, runs it again only when the tool is
+    /// idempotent, and otherwise answers `Unresolved` with `reason`.
+    pub fn set_recovering(&self, call_id: &str, reason: String) {
+        *self.recovering.lock().expect("recovering") = Some((call_id.to_string(), reason));
+    }
+
+    fn take_recovering(&self, call_id: &str) -> Option<String> {
+        let mut slot = self.recovering.lock().expect("recovering");
+        match slot.as_ref() {
+            Some((id, _)) if id == call_id => slot.take().map(|(_, reason)| reason),
+            _ => None,
+        }
+    }
+
+    /// What became of a call a previous executor may have started: the
+    /// task it became (`shell`: `local:shell:<call_id>`, read from its
+    /// execution directory), `None` to run it again (idempotent tool), or
+    /// `Unresolved` with the runtime's account.
+    async fn recover_call(
+        &self,
+        call: &AiToolCall,
+        tool: &dyn AgentTool,
+        reason: String,
+    ) -> Option<Observation> {
+        if call.name == TOOL_SHELL {
+            let task_id = format!(
+                "{}shell:{}",
+                crate::tasks::LOCAL_TASK_PREFIX,
+                call.call_id
+            );
+            let state = self.resolver.state(&task_id).await;
+            if matches!(state, TaskState::Finished(_)) {
+                return Some(task_state_observation_via(
+                    &call.call_id,
+                    &task_id,
+                    &state,
+                    &self.resolver.followup(),
+                ));
+            }
+        }
+        if tool.idempotent() {
+            return None;
+        }
+        Some(Observation::Unresolved {
+            call_id: call.call_id.clone(),
+            reason,
+            effect_unknown: true,
+        })
     }
 
     /// Serve this run's task resolver to commands (`XLLM_TASK_ENDPOINT`)
@@ -4010,7 +4282,7 @@ impl XllmToolManager {
             }
         }
         self.resolver
-            .set_followup(llm_context::tasks::TaskFollowup::Command(cli.to_string()));
+            .set_followup(crate::task_model::TaskFollowup::Command(cli.to_string()));
         self.task_bridge.as_ref().map(|b| b.endpoint().to_string())
     }
 
@@ -4019,7 +4291,8 @@ impl XllmToolManager {
         self.tasks.clone()
     }
 
-    /// The resolver the waist follows tasks with (background env, fills).
+    /// The resolver this run's tasks are followed with (task tools, task
+    /// CLI bridge, the host after the run).
     pub fn resolver(&self) -> Arc<dyn RunningTaskResolver> {
         self.resolver.clone()
     }
@@ -4028,18 +4301,18 @@ impl XllmToolManager {
         self.run.clone()
     }
 
-    /// Wait for a task inside a call that could not suspend (§4): until the
-    /// task ends, `until_ms`, the 30 minute cap or the run deadline, then
-    /// the task's state; an interrupt / finish cancels the wait only.
+    /// Wait for the task a tool handed its work to: until the task ends,
+    /// `wait_ms`, the 30 minute cap or the run deadline, then the task's
+    /// state ("still running" with how to follow it, when it did not end);
+    /// an interrupt / finish cancels the wait only.
     async fn wait_in_tool(
         &self,
         call_id: String,
         task_id: &str,
-        until_ms: Option<u64>,
+        wait_ms: u64,
         ctx: &ToolCallCtx,
     ) -> Observation {
-        let now = crate::now_ms();
-        let until = ctx.wait_until_ms(until_ms.map(|u| u.saturating_sub(now)));
+        let until = crate::task_model::wait_until_ms(ctx, Some(wait_ms));
         let state = tokio::select! {
             s = self.resolver.wait(task_id, Some(until)) => s,
             cause = ctx.cancelled() => {
@@ -4050,7 +4323,7 @@ impl XllmToolManager {
                 };
             }
         };
-        task_state_observation(&call_id, task_id, &state)
+        task_state_observation_via(&call_id, task_id, &state, &self.resolver.followup())
     }
 
     pub fn register(
@@ -4084,6 +4357,30 @@ impl XllmToolManager {
     pub fn has(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
+
+    /// Show the model `saved` instead of the registered tools' specs; every
+    /// saved tool must be registered. Returns the first one that is not.
+    pub fn advertise_saved<'a>(
+        &mut self,
+        saved: impl IntoIterator<Item = &'a ResolvedTool>,
+    ) -> Result<(), &'a ResolvedTool> {
+        let mut specs = BTreeMap::new();
+        for tool in saved {
+            if !self.has(&tool.name) {
+                return Err(tool);
+            }
+            specs.insert(
+                tool.name.clone(),
+                ToolSpecLite {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    args_schema: tool.args_schema.clone(),
+                },
+            );
+        }
+        self.advertised = Some(specs);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -4104,20 +4401,39 @@ impl ToolManager for XllmToolManager {
                     call.name,
                     self.tools.keys().cloned().collect::<Vec<_>>().join(", ")
                 ),
-                tool_result: None,
+                host: None,
             });
         };
+        // `intent` is host metadata: recorded, never passed to the tool.
+        let call = match take_intent(&call, self.intent_policy(&call.name)) {
+            Ok((exec, intent)) => {
+                if let Some(intent) = intent {
+                    self.intents
+                        .lock()
+                        .expect("intents")
+                        .insert(call_id.clone(), intent);
+                }
+                exec
+            }
+            Err(message) => {
+                return Ok(Observation::Error {
+                    call_id,
+                    message,
+                    host: None,
+                })
+            }
+        };
+        if let Some(reason) = self.take_recovering(&call_id) {
+            if let Some(obs) = self.recover_call(&call, tool.as_ref(), reason).await {
+                return Ok(obs);
+            }
+        }
         let path_arg = call
             .args
             .get("path")
             .and_then(Value::as_str)
             .map(str::to_string);
         let args = Value::Object(call.args.into_iter().collect());
-        if let Some(tracking) = &self.tracking {
-            tracking
-                .inflight(&call_id, &call.name, &args)
-                .map_err(ToolDispatchError::not_started)?;
-        }
         let fut = crate::runtime::CURRENT_TOOL_CTX.scope(
             call_ctx.clone(),
             crate::runtime::CURRENT_TOOL_CALL.scope(call_id.clone(), tool.call(&ctx, args)),
@@ -4143,7 +4459,7 @@ impl ToolManager for XllmToolManager {
                 }
             }
         };
-        Ok(match result {
+        let observation = match result {
             Ok(res) if res.status == AgentToolStatus::Pending => {
                 let Some(task_id) = res.task_id.clone().filter(|t| !t.trim().is_empty()) else {
                     return Ok(Observation::Error {
@@ -4152,25 +4468,19 @@ impl ToolManager for XllmToolManager {
                             "tool `{}` returned a pending result without a task_id",
                             call.name
                         ),
-                        tool_result: Some(res.to_tool_result_view()),
+                        host: Some(res.to_host()),
                     });
                 };
-                let until_ms = res
+                // Every task is waited for within the runtime's budget; a
+                // `check_after` of the tool can only shorten it.
+                let budget = self.task_wait_ms();
+                let wait_ms = res
                     .check_after
-                    .map(|secs| crate::now_ms().saturating_add(secs.saturating_mul(1000)));
-                if call_ctx.allow_deferred {
-                    Observation::Pending {
-                        call_id,
-                        task_id,
-                        until_ms,
-                        tool_result: Some(res.to_tool_result_view()),
-                    }
-                } else {
-                    self.wait_in_tool(call_id, &task_id, until_ms, &call_ctx)
-                        .await
-                }
+                    .map_or(budget, |secs| secs.saturating_mul(1000).min(budget));
+                self.wait_in_tool(call_id, &task_id, wait_ms, &call_ctx)
+                    .await
             }
-            Ok(res) => {
+            Ok(mut res) => {
                 if res.status == AgentToolStatus::Success
                     && matches!(call.name.as_str(), TOOL_WRITE_FILE | TOOL_EDIT_FILE)
                 {
@@ -4187,7 +4497,8 @@ impl ToolManager for XllmToolManager {
                         }
                     }
                 }
-                map_result_to_observation(call_id, res)
+                let shown = apply_hints(&mut res, self.hints.as_ref());
+                map_result_to_observation_with_hints(call_id, res, &shown)
             }
             Err(AgentToolError::Transport {
                 message,
@@ -4209,41 +4520,60 @@ impl ToolManager for XllmToolManager {
             Err(e) => Observation::Error {
                 call_id,
                 message: e.to_string(),
-                tool_result: None,
+                host: None,
             },
+        };
+        // The task a result refers to is followed by this run's resolver
+        // (task tools, the host after the run).
+        if let Some(task_id) = ToolResultView::from_host(match &observation {
+            Observation::Success { host, .. } | Observation::Error { host, .. } => host,
+            _ => &None,
         })
+        .and_then(|v| v.task_id)
+        .filter(|id| !id.trim().is_empty())
+        {
+            self.resolver.watch(&task_id);
+        }
+        Ok(observation)
     }
 
     fn list_tool_specs(&self) -> Vec<ToolSpecLite> {
-        self.tools
-            .values()
-            .map(|t| {
-                let spec = t.spec();
-                ToolSpecLite {
-                    name: spec.name,
-                    description: spec.description,
-                    args_schema: spec.args_schema,
-                }
+        let specs: Vec<ToolSpecLite> = match &self.advertised {
+            Some(saved) => saved.values().cloned().collect(),
+            None => self
+                .tools
+                .values()
+                .map(|t| {
+                    let spec = t.spec();
+                    ToolSpecLite {
+                        name: spec.name,
+                        description: spec.description,
+                        args_schema: spec.args_schema,
+                    }
+                })
+                .collect(),
+        };
+        specs
+            .into_iter()
+            .map(|spec| {
+                let policy = self.intent_policy(&spec.name);
+                with_intent(spec, policy)
             })
             .collect()
     }
 }
 
-fn map_result_to_observation(call_id: String, result: AgentToolResult) -> Observation {
-    let tool_result = Some(result.to_tool_result_view());
+/// The observation of `result`, with the hints shown after its text
+/// (`<output>` / `<runtime_hints>`).
+fn map_result_to_observation_with_hints(
+    call_id: String,
+    mut result: AgentToolResult,
+    hints: &[String],
+) -> Observation {
+    let host = Some(result.to_host());
+    let text = render_with_hints(&result.observation_text(), hints);
     match result.status {
-        AgentToolStatus::Success => {
-            let text = result
-                .output
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| {
-                    if result.summary.trim().is_empty() {
-                        result.details.to_string()
-                    } else {
-                        result.summary.clone()
-                    }
-                });
+        AgentToolStatus::Success | AgentToolStatus::Pending => {
             let bytes = text.len();
             let truncated = result
                 .details
@@ -4255,42 +4585,14 @@ fn map_result_to_observation(call_id: String, result: AgentToolResult) -> Observ
                 content: Value::String(text),
                 bytes,
                 truncated,
-                tool_result,
+                host,
+                images: std::mem::take(&mut result.images),
             }
         }
-        AgentToolStatus::Error => {
-            let summary = result.summary.trim();
-            let output = result
-                .output
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let message = match (summary.is_empty(), output) {
-                (false, Some(out)) => format!("{summary}\n{out}"),
-                (false, None) => summary.to_string(),
-                (true, Some(out)) => out.to_string(),
-                (true, None) => "tool error".to_string(),
-            };
-            Observation::Error {
-                call_id,
-                message,
-                tool_result,
-            }
-        }
-        AgentToolStatus::Pending => match result.task_id.clone().filter(|t| !t.trim().is_empty()) {
-            Some(task_id) => Observation::Pending {
-                call_id,
-                task_id,
-                until_ms: result
-                    .check_after
-                    .map(|secs| crate::now_ms().saturating_add(secs.saturating_mul(1000))),
-                tool_result,
-            },
-            None => Observation::Error {
-                call_id,
-                message: "tool returned a pending result without a task_id".into(),
-                tool_result,
-            },
+        AgentToolStatus::Error => Observation::Error {
+            call_id,
+            message: text,
+            host,
         },
     }
 }
@@ -4507,10 +4809,13 @@ fn shell_runtime_note(descriptor: &RuntimeDescriptor) -> ShellRuntimeNote {
 /// adds to its description.
 #[derive(Clone, Default)]
 struct ShellExtras {
-    followup: llm_context::tasks::TaskFollowup,
+    followup: crate::task_model::TaskFollowup,
     endpoint: Option<String>,
     note: Option<String>,
-    context: ShellTaskContext,
+    run: Option<RunBindingSlot>,
+    /// A session host: the wait is the runtime's, not the model's.
+    expose_wait_ms: bool,
+    urls: Option<Arc<dyn crate::read_tool::UrlReader>>,
 }
 
 /// 内置组 `bash`：`read_file` / `write_file` / `edit_file` / `shell`；
@@ -4523,12 +4828,15 @@ fn builtin_bash_group(
     files: Arc<dyn FileBackend>,
     shell: &ShellSettings,
     runtime: ShellRuntimeNote,
-    tasks: Arc<dyn ShellTaskManager>,
+    tasks: Arc<InProcessTaskManager>,
     core: bool,
     extras: ShellExtras,
 ) -> Vec<Arc<dyn AgentTool>> {
     let mut cfg = FileToolConfig::new(workdir.to_path_buf());
     cfg.backend = files;
+    if runtime.kind == "native" {
+        cfg.dfs_root = Some(buckyos_kit::get_buckyos_root_dir().join("data"));
+    }
     let restrict_cwd = filesystem_policy == FilesystemPolicy::Workspace;
     if !restrict_cwd {
         cfg.allowed_read_roots.clear();
@@ -4543,28 +4851,28 @@ fn builtin_bash_group(
         .with_max_timeout_ms(shell.max_timeout_ms)
         .with_max_output_bytes(EXEC_MAX_OUTPUT_BYTES)
         .with_allow_env(true)
-        .with_mode(shell.mode)
         .with_default_wait_ms(shell.wait_ms)
         .with_runtime_note(runtime)
         .with_tasks(tasks)
-        .with_task_context(extras.context)
+        .with_run(extras.run)
+        .with_expose_wait_ms(extras.expose_wait_ms)
         .with_task_followup(extras.followup)
         .with_task_endpoint(extras.endpoint)
         .with_note(extras.note);
     let reader: Arc<dyn AgentTool> = if core {
-        Arc::new(crate::read_tool::ReadTool::new(cfg.clone()))
+        Arc::new(crate::read_tool::ReadTool::new(cfg.clone()).with_urls(extras.urls.clone()))
     } else {
-        Arc::new(TypedToolHandle::with_null_host(ReadFileTool::new(
-            cfg.clone(),
+        Arc::new(crate::read_tool::DedupReadFile::new(Arc::new(
+            TypedToolHandle::new(ReadFileTool::new(cfg.clone())),
         )))
     };
     vec![
         reader,
-        Arc::new(TypedToolHandle::with_null_host(WriteFileTool::new(
+        Arc::new(TypedToolHandle::new(WriteFileTool::new(
             cfg.clone(),
             audit.clone(),
         ))),
-        Arc::new(TypedToolHandle::with_null_host(EditFileTool::new(
+        Arc::new(TypedToolHandle::new(EditFileTool::new(
             cfg, audit,
         ))),
         match bash_runner {
@@ -4602,33 +4910,39 @@ async fn expand_tool_sources(
                         "unknown builtin tool group `{groupname}` (available: {BUILTIN_TOOL_GROUP_BASH}, {BUILTIN_TOOL_GROUP_BASH_CORE}, executor)"
                     )));
                 }
+                let session = matches!(deps.host_protocol, HostProtocolFlavor::Session { .. });
                 let mut extras = ShellExtras {
                     note: deps.shell_note.clone(),
-                    context: ShellTaskContext {
-                        run: Some(manager.run_binding()),
-                        ..deps.shell_task_context.clone()
-                    },
+                    urls: deps.url_reader.clone(),
+                    run: Some(manager.run_binding()),
+                    expose_wait_ms: !session,
                     ..Default::default()
                 };
                 // `bash_core` follows tasks with the host's command when a
                 // bridge can be served; otherwise with the task tools.
-                let mut task_tools_needed = shell.mode == ShellMode::Auto;
+                let mut task_tools_needed = shell.wait_ms < shell.timeout_ms;
                 if core && task_tools_needed {
                     if let Some(cli) = deps.task_cli.as_deref() {
                         if let Some(endpoint) = manager.serve_task_bridge(cli) {
                             extras.followup =
-                                llm_context::tasks::TaskFollowup::Command(cli.to_string());
+                                crate::task_model::TaskFollowup::Command(cli.to_string());
                             extras.endpoint = Some(endpoint);
                             task_tools_needed = false;
                         }
                     }
                 }
-                // A host's task manager takes the handed-over commands;
-                // without one they stay in this process.
-                let tasks: Arc<dyn ShellTaskManager> = match &deps.shell_tasks {
-                    Some(host) => host.clone(),
-                    None => manager.tasks(),
-                };
+                // A session host follows the tasks itself and brings their
+                // ends back as input: nothing for the model to wait on.
+                if session {
+                    let cli = match &extras.followup {
+                        crate::task_model::TaskFollowup::Command(cli) => Some(cli.clone()),
+                        _ => None,
+                    };
+                    extras.followup = crate::task_model::TaskFollowup::Input(cli);
+                    manager.resolver.set_followup(extras.followup.clone());
+                }
+                // Handed-over commands stay tasks of this process.
+                let tasks = manager.tasks();
                 for t in builtin_bash_group(
                     workdir,
                     filesystem_policy,
@@ -4640,13 +4954,27 @@ async fn expand_tool_sources(
                     core,
                     extras,
                 ) {
-                    out.push(manager.register(t, &desc)?);
+                    // The runtime's standard tools take an optional intent.
+                    let name = t.spec().name;
+                    let r = manager.register(t, &desc)?;
+                    manager.set_intent_policy(&name, IntentPolicy::Optional);
+                    out.push(r);
                 }
                 if task_tools_needed {
                     // The model follows a command that became a task with
                     // these (§4); registered with the group that can create
-                    // tasks.
+                    // tasks. A session brings a task's end back as input and
+                    // shows its new output before every inference: there is
+                    // nothing to wait for or check on (a model offered a
+                    // state tool polls it), only a cancel.
                     for t in task_tools(manager.resolver()) {
+                        let name = t.spec().name;
+                        if session
+                            && (name == crate::tasks::TOOL_WAIT_TASK
+                                || name == crate::tasks::TOOL_GET_TASK_STATE)
+                        {
+                            continue;
+                        }
                         out.push(manager.register(t, &desc)?);
                     }
                 }
@@ -4699,11 +5027,12 @@ pub(crate) async fn build_runtime_toolset(
     files: Arc<dyn FileBackend>,
     descriptor: &RuntimeDescriptor,
     run: RunBindingSlot,
+    task_wait_ms: u64,
 ) -> Result<(EffectiveTools, XllmToolManager), XllmError> {
     let enabled = cfg.enabled.unwrap_or(false);
     let filesystem_policy = cfg.filesystem_policy.unwrap_or_default();
     let tools2actions = cfg.tools2actions.unwrap_or(false);
-    let shell = ShellSettings::from_config(cfg.shell.as_ref());
+    let shell = ShellSettings::from_config(cfg.shell.as_ref(), task_wait_ms);
     let runtime_note = shell_runtime_note(descriptor);
     let mut manager = XllmToolManager::with_run_binding(
         workdir.to_path_buf(),
@@ -4713,6 +5042,10 @@ pub(crate) async fn build_runtime_toolset(
         deps.local_tasks.clone(),
         deps.buckyos_tasks.clone(),
     );
+    manager.set_task_wait_ms(task_wait_ms);
+    if let Some(ledger) = &deps.hint_ledger {
+        manager.set_hint_ledger(ledger.clone());
+    }
     let mut eff = EffectiveTools {
         enabled,
         filesystem_policy,
@@ -5014,6 +5347,12 @@ async fn bootstrap_appclient_session(
     Ok(())
 }
 
+/// `force_json` without a schema: any JSON object. A bare `{"type": "object"}`
+/// gets `{}` from Gemini, so further properties are allowed explicitly.
+fn any_json_object_schema() -> Value {
+    json!({"type": "object", "additionalProperties": true})
+}
+
 /// AICC → `LlmClient` 适配（buckyos Provider）。
 pub struct AiccLlmClient {
     session_token: Option<String>,
@@ -5047,37 +5386,6 @@ impl Default for AiccLlmClient {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[allow(dead_code)]
-fn build_aicc_llm_options(
-    temperature: Option<f32>,
-    max_completion_tokens: Option<u32>,
-    force_json: bool,
-    json_schema: Option<Value>,
-    provider_options: Option<Value>,
-) -> Value {
-    let mut options = serde_json::Map::new();
-    if let Some(temperature) = temperature {
-        options.insert("temperature".into(), json!(temperature));
-    }
-    if let Some(max_completion_tokens) = max_completion_tokens {
-        options.insert("max_tokens".into(), json!(max_completion_tokens));
-    }
-    if force_json {
-        if let Some(schema) = json_schema {
-            options.insert("response_schema".into(), schema);
-        }
-    }
-    if let Some(extra) = provider_options {
-        match extra {
-            Value::Object(extra) => options.extend(extra),
-            extra => {
-                options.insert("provider_options".into(), extra);
-            }
-        }
-    }
-    Value::Object(options)
 }
 
 #[async_trait]
@@ -5152,18 +5460,16 @@ impl AiccLlmClient {
         for feature in disable_capabilities {
             disable.set_feature_disabled(&feature);
         }
-        let response_format = if force_json {
-            match json_schema {
-                Some(schema) => Some(LlmResponseFormat::json_schema(
-                    Some("llm_response".to_string()),
-                    schema,
-                    None,
-                )),
-                None => Some(LlmResponseFormat::json_object()),
+        let response_format = force_json.then(|| match json_schema {
+            Some(schema) => {
+                LlmResponseFormat::json_schema(Some("llm_response".to_string()), schema, None)
             }
-        } else {
-            None
-        };
+            None => LlmResponseFormat::json_schema(
+                Some("llm_response".to_string()),
+                any_json_object_schema(),
+                Some(false),
+            ),
+        });
         let request = LlmChatInvokeRequest {
             trace_id,
             execution_mode: AiccExecutionMode::Immediate,
@@ -5226,7 +5532,7 @@ impl AiccLlmClient {
                 response
                     .error
                     .as_ref()
-                    .and_then(|error| aicc_refusal(error.code))
+                    .and_then(aicc_provider_failure)
                     .unwrap_or(ProviderFailure::Unknown),
                 format!(
                     "aicc {method} failed{}: task_id={}, event_ref={}",
@@ -5246,46 +5552,91 @@ impl AiccLlmClient {
     }
 }
 
-/// `RunErrorRecord.kind` of a refusal (stable names for hosts).
-pub fn refusal_kind_name(kind: RefusalKind) -> &'static str {
-    match kind {
-        RefusalKind::QuotaExhausted => "quota_exhausted",
-        RefusalKind::QuotaBudgetExceeded => "quota_budget_exceeded",
-        RefusalKind::ResourceNotPermitted => "resource_not_permitted",
-        RefusalKind::AttributionUnavailable => "attribution_unavailable",
-    }
-}
+/// `ProviderFailure::Refused.code` of the AICC refusals (AI Center Quota PRD
+/// §7.4); also the `RunErrorRecord.kind` hosts read.
+pub const REFUSED_QUOTA_EXHAUSTED: &str = "quota_exhausted";
+pub const REFUSED_QUOTA_BUDGET_EXCEEDED: &str = "quota_budget_exceeded";
+pub const REFUSED_RESOURCE_NOT_PERMITTED: &str = "resource_not_permitted";
+pub const REFUSED_ATTRIBUTION_UNAVAILABLE: &str = "attribution_unavailable";
+/// The service refused the caller's credentials (kRPC token errors, HTTP
+/// 401 / 403): a run paused on it resumes once the credential is fixed.
+pub const REFUSED_CREDENTIALS: &str = "credentials";
 
 /// AICC 额度与资源策略的拒绝（AI Center Quota PRD §7.4）；暂不可用的额度状态可以稍后重试。
 fn aicc_refusal(code: AiccErrorCode) -> Option<ProviderFailure> {
+    let refused = |code: &str| {
+        Some(ProviderFailure::Refused {
+            code: code.to_string(),
+        })
+    };
     match code {
-        AiccErrorCode::QuotaExhausted => Some(ProviderFailure::Refused(RefusalKind::QuotaExhausted)),
-        AiccErrorCode::QuotaBudgetExceeded => {
-            Some(ProviderFailure::Refused(RefusalKind::QuotaBudgetExceeded))
-        }
-        AiccErrorCode::ResourceNotPermitted => {
-            Some(ProviderFailure::Refused(RefusalKind::ResourceNotPermitted))
-        }
-        AiccErrorCode::AttributionUnavailable => {
-            Some(ProviderFailure::Refused(RefusalKind::AttributionUnavailable))
-        }
+        AiccErrorCode::QuotaExhausted => refused(REFUSED_QUOTA_EXHAUSTED),
+        AiccErrorCode::QuotaBudgetExceeded => refused(REFUSED_QUOTA_BUDGET_EXCEEDED),
+        AiccErrorCode::ResourceNotPermitted => refused(REFUSED_RESOURCE_NOT_PERMITTED),
+        AiccErrorCode::AttributionUnavailable => refused(REFUSED_ATTRIBUTION_UNAVAILABLE),
         AiccErrorCode::QuotaUnavailable => Some(ProviderFailure::Transient),
         _ => None,
     }
 }
 
+/// AICC 失败 → Provider 失败类别：拒绝与上下文超限按错误码；其余以 AICC 的
+/// `retriable` 为准（AICC 已按协议错误种类定了它，并做过同模型重试与 fallback）。
+/// Provider 以 413 拒收请求体与上下文超限同样靠缩小请求补救。
+fn aicc_provider_failure(error: &AiccError) -> Option<ProviderFailure> {
+    aicc_refusal(error.code).or_else(|| {
+        let http_status = error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("http_status"))
+            .and_then(Value::as_u64);
+        if error.code == AiccErrorCode::ContextLengthExceeded || http_status == Some(413) {
+            Some(ProviderFailure::ContextLimit)
+        } else if error.code == AiccErrorCode::Timeout || error.retriable {
+            Some(ProviderFailure::Transient)
+        } else {
+            None
+        }
+    })
+}
+
 /// kRPC 错误 → Provider 失败类别（AICC 的结构化错误码优先）。
 pub fn provider_error_from_rpc(context: &str, err: RPCErrors) -> LLMComputeError {
-    if let Some(failure) = AiccError::from_krpc_error(&err).and_then(|error| aicc_refusal(error.code))
+    if let Some(failure) = AiccError::from_krpc_error(&err)
+        .as_ref()
+        .and_then(aicc_provider_failure)
     {
         return LLMComputeError::provider(failure, format!("{context}: {err}"));
     }
+    let http_status = match &err {
+        RPCErrors::Detailed(detail) if detail.code == "http_error" => detail
+            .data
+            .as_ref()
+            .and_then(|data| data.get("status"))
+            .and_then(Value::as_u64),
+        _ => None,
+    };
+    let credentials = || ProviderFailure::Refused {
+        code: REFUSED_CREDENTIALS.to_string(),
+    };
     let failure = match &err {
+        RPCErrors::HttpTransportError(_) => {
+            if err.is_retryable_transport() {
+                ProviderFailure::Transient
+            } else {
+                ProviderFailure::Permanent
+            }
+        }
+        // 413：请求体超过服务的上限，补救与上下文超限相同（缩小后再发）。
+        RPCErrors::Detailed(_) if http_status == Some(413) => ProviderFailure::ContextLimit,
+        RPCErrors::Detailed(_) if matches!(http_status, Some(408 | 504)) => {
+            ProviderFailure::Transient
+        }
+        RPCErrors::Detailed(_) if matches!(http_status, Some(401 | 403)) => credentials(),
         RPCErrors::S2sTransientError(_) => ProviderFailure::Transient,
-        RPCErrors::InvalidToken(_)
-        | RPCErrors::TokenExpired(_)
-        | RPCErrors::NoPermission(_)
-        | RPCErrors::InvalidPassword
+        RPCErrors::InvalidToken(_) | RPCErrors::TokenExpired(_) | RPCErrors::NoPermission(_) => {
+            credentials()
+        }
+        RPCErrors::InvalidPassword
         | RPCErrors::UserNotFound(_)
         | RPCErrors::UnknownMethod(_)
         | RPCErrors::ServiceNotValid(_)
@@ -5297,6 +5648,33 @@ pub fn provider_error_from_rpc(context: &str, err: RPCErrors) -> LLMComputeError
         | RPCErrors::Detailed(_) => ProviderFailure::Unknown,
     };
     LLMComputeError::provider(failure, format!("{context}: {err}"))
+}
+
+/// The provider failure of a non-2xx OpenAI-compatible response.
+fn openai_http_failure(status: u16, body: &str) -> LLMComputeError {
+    // OpenAI-compatible APIs report a prompt that does not fit with
+    // the structured error code `context_length_exceeded`.
+    let context_limit = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/code")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|c| c == "context_length_exceeded");
+    let failure = match status {
+        _ if context_limit => ProviderFailure::ContextLimit,
+        401 | 403 => ProviderFailure::Refused {
+            code: REFUSED_CREDENTIALS.to_string(),
+        },
+        404 | 400 | 422 => ProviderFailure::Permanent,
+        408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 => ProviderFailure::Transient,
+        _ => ProviderFailure::Unknown,
+    };
+    LLMComputeError::provider(
+        failure,
+        format!("openai http {status}: {}", truncate_chars(body, 512)),
+    )
 }
 
 /// OpenAI 兼容 Chat Completions 客户端（openai Provider）。
@@ -5465,12 +5843,9 @@ impl LlmClient for OpenAiLlmClient {
             body["tool_choice"] = json!("auto");
         }
         if req.force_json {
-            body["response_format"] = match req.json_schema {
-                Some(schema) => {
-                    json!({"type":"json_schema","json_schema":{"name":"xllm_result","schema":schema}})
-                }
-                None => json!({"type":"json_object"}),
-            };
+            let schema = req.json_schema.unwrap_or_else(any_json_object_schema);
+            body["response_format"] =
+                json!({"type":"json_schema","json_schema":{"name":"xllm_result","schema":schema}});
         }
         if let Some(Value::Object(extra)) = req.provider_options {
             for (k, v) in extra {
@@ -5508,27 +5883,7 @@ impl LlmClient for OpenAiLlmClient {
             )
         })?;
         if !status.is_success() {
-            let code = status.as_u16();
-            // OpenAI-compatible APIs report a prompt that does not fit with
-            // the structured error code `context_length_exceeded`.
-            let context_limit = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/code")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .is_some_and(|c| c == "context_length_exceeded");
-            let failure = match code {
-                _ if context_limit => ProviderFailure::ContextLimit,
-                401 | 403 | 404 | 400 | 422 => ProviderFailure::Permanent,
-                408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 => ProviderFailure::Transient,
-                _ => ProviderFailure::Unknown,
-            };
-            return Err(LLMComputeError::provider(
-                failure,
-                format!("openai http {code}: {}", truncate_chars(&text, 512)),
-            ));
+            return Err(openai_http_failure(status.as_u16(), &text));
         }
         let parsed: Value = serde_json::from_str(&text).map_err(|e| {
             LLMComputeError::provider(
@@ -5811,9 +6166,10 @@ pub struct RunRecord {
     /// 非空时任何执行者都不得推理或调用工具（xllm 拒绝接手）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_commit_pending: Option<u64>,
-    /// 已派发、结果尚未随快照持久化的工具动作（X6）。
+    /// Hints of results shown once in this run (`once` keys of the hint
+    /// ledger): a resumed run does not show them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inflight: Vec<InflightAction>,
+    pub hints_once: Vec<String>,
     /// 宿主 Run 停在 behavior 交接点：模型声明了 `next_behavior`，转移由
     /// 宿主 Session 提交。非空时状态为 `paused`，任何执行者都不得继续推理；
     /// 宿主重新打开该 Run 执行时清除。
@@ -5926,6 +6282,7 @@ impl RunRecord {
                     timeout_secs: DEFAULT_TIMEOUT_SECS,
                     llm_timeout_secs: DEFAULT_LLM_TIMEOUT_SECS,
                     context_window_tokens: None,
+                    context_yield_ratio: None,
                 },
                 run_logs: RunLogLevel::Info,
                 result_format: ResultFormat::Raw,
@@ -5965,7 +6322,7 @@ impl RunRecord {
             host: None,
             host_commit_pending: None,
             handover: None,
-            inflight: Vec::new(),
+            hints_once: Vec::new(),
         }
     }
 
@@ -6908,6 +7265,7 @@ impl XllmTask {
                 "llm_timeout"
             ),
             context_window_tokens: merged.context_window,
+            context_yield_ratio: merged.context_yield_ratio,
         };
         let store = match (&overrides.runs_dir, &merged.runs_dir) {
             (Some(p), _) => {
@@ -6930,44 +7288,13 @@ impl XllmTask {
 
         // ---- 模式与选组 ----
         let structured = input.structured.is_some();
-        let custom = overrides.system.is_some()
-            || (overrides.select.is_none() && merged.prompt.mode == Some(PromptMode::Custom));
-        let mut group_name: Option<String> = None;
-        if !structured && !custom {
-            if let Some(sel) = overrides
-                .select
-                .clone()
-                .or_else(|| merged.prompt.select.clone())
-            {
-                if !merged.prompt.groups.contains_key(&sel) {
-                    let available: Vec<String> = merged.prompt.groups.keys().cloned().collect();
-                    let src = if overrides.select.is_some() {
-                        "cli:--select".to_string()
-                    } else {
-                        merged
-                            .sources
-                            .get("prompt.select")
-                            .cloned()
-                            .unwrap_or_default()
-                    };
-                    return Err(XllmError::Config {
-                        file: src,
-                        field: "prompt.select".into(),
-                        reason: format!(
-                            "prompt group `{sel}` does not exist (available: {})",
-                            if available.is_empty() {
-                                "none".to_string()
-                            } else {
-                                available.join(", ")
-                            }
-                        ),
-                    });
-                }
-                if overrides.select.is_some() {
-                    sources.insert("prompt.select".into(), "cli".into());
-                }
-                group_name = Some(sel);
-            }
+        let group_name = if structured {
+            None
+        } else {
+            select_prompt_group(&merged, &overrides)?
+        };
+        if group_name.is_some() && overrides.select.is_some() {
+            sources.insert("prompt.select".into(), "cli".into());
         }
         let group = group_name
             .as_ref()
@@ -7242,6 +7569,83 @@ impl std::fmt::Debug for HostedTask {
     }
 }
 
+/// The loops a hosted run can drive with the sections its host allows.
+fn check_hosted_loop(
+    origin: &str,
+    sections: HostPromptSections,
+    loop_model: LoopModel,
+    json: bool,
+) -> Result<(), XllmError> {
+    if !sections.runtime_protocol && loop_model != LoopModel::FunctionCall {
+        return Err(XllmError::Capability(format!(
+            "{origin}: the runtime protocol defines the reply shape of the behavior loop; only a function call loop can run without it"
+        )));
+    }
+    if json && loop_model != LoopModel::FunctionCall {
+        return Err(XllmError::Capability(format!(
+            "{origin}: a JSON reply (json / json_schema) needs loop_model function_call; a behavior loop reply is its XML step"
+        )));
+    }
+    Ok(())
+}
+
+/// The system prompt of a hosted run (`PromptPlan` pieces).
+struct HostedSystem {
+    /// The host's system text, rendered.
+    custom_system: String,
+    runtime_protocol: String,
+    system_prompt: String,
+    template_vars: BTreeMap<String, String>,
+}
+
+/// The host's system text (rendered with `env`, which a hosted run gives no
+/// `current_time` / `timezone`) followed by the sections the host allows.
+#[allow(clippy::too_many_arguments)]
+fn assemble_hosted_system(
+    host_system: &str,
+    origin: &str,
+    env: &TemplateEnv,
+    sections: HostPromptSections,
+    flavor: &HostProtocolFlavor,
+    loop_model: LoopModel,
+    tools: &EffectiveTools,
+    json: bool,
+) -> Result<HostedSystem, XllmError> {
+    let runtime_protocol = build_runtime_protocol_for(flavor, loop_model, tools, json);
+    let rendered_host_system = env.render(host_system, &format!("host:{origin}"))?;
+    let mut appended = Vec::new();
+    if sections.capabilities {
+        appended.push(format!(
+            "## capabilities\n{}",
+            build_rules_system_text(loop_model, tools).trim_end()
+        ));
+    }
+    if sections.cmd_manual {
+        if let Some(manual) = build_cmd_manual_system_text(tools) {
+            appended.push(format!("## cmd_manual\n{}", manual.trim_end()));
+        }
+    }
+    if sections.runtime_protocol {
+        appended.push(format!("## runtime_protocol\n{}", runtime_protocol.trim_end()));
+    }
+    let mut system = rendered_host_system.trim_end().to_string();
+    for section in appended {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(&section);
+    }
+    if !system.is_empty() {
+        system.push('\n');
+    }
+    Ok(HostedSystem {
+        custom_system: rendered_host_system,
+        runtime_protocol,
+        system_prompt: system,
+        template_vars: env.used_vars(),
+    })
+}
+
 impl XllmTask {
     /// Prepare a host-assembled run. `llm_context` is the JSON form of an
     /// `.llm_context` file (`origin` names it in diagnostics); `host_system`
@@ -7290,17 +7694,8 @@ impl XllmTask {
         };
         let loop_model = merged.loop_model.unwrap_or(LoopModel::FunctionCall);
         let sections = deps.host_prompt_sections;
-        if !sections.runtime_protocol && loop_model != LoopModel::FunctionCall {
-            return Err(XllmError::Capability(format!(
-                "{origin}: the runtime protocol defines the reply shape of the behavior loop; only a function call loop can run without it"
-            )));
-        }
         let json = merged.json == Some(true) || merged.json_schema.is_some();
-        if json && loop_model != LoopModel::FunctionCall {
-            return Err(XllmError::Capability(format!(
-                "{origin}: a JSON reply (json / json_schema) needs loop_model function_call; a behavior loop reply is its XML step"
-            )));
-        }
+        check_hosted_loop(origin, sections, loop_model, json)?;
         let limits = RunLimits {
             max_tokens: merged.max_tokens,
             max_tool_iterations: merged
@@ -7309,6 +7704,7 @@ impl XllmTask {
             timeout_secs: merged.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
             llm_timeout_secs: merged.llm_timeout.unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
             context_window_tokens: merged.context_window,
+            context_yield_ratio: merged.context_yield_ratio,
         };
         let group = merged
             .prompt
@@ -7327,8 +7723,6 @@ impl XllmTask {
             crate::runtime::open_runtime(&runtime_config, &open, &tools_cfg, deps).await?;
         let runtime_config = runtime.config();
         let runtime_descriptor = runtime.descriptor().clone();
-        let runtime_protocol =
-            build_runtime_protocol_for(&deps.host_protocol, loop_model, &tools, json);
         let mut template_env = TemplateEnv::for_new_run(
             manager
                 .runtime_info()
@@ -7336,45 +7730,29 @@ impl XllmTask {
         );
         template_env.runtime.remove("current_time");
         template_env.runtime.remove("timezone");
-        let rendered_host_system = template_env.render(host_system, &format!("host:{origin}"))?;
-        let mut appended = Vec::new();
-        if sections.capabilities {
-            appended.push(format!(
-                "## capabilities\n{}",
-                build_rules_system_text(loop_model, &tools).trim_end()
-            ));
-        }
-        if sections.cmd_manual {
-            if let Some(manual) = build_cmd_manual_system_text(&tools) {
-                appended.push(format!("## cmd_manual\n{}", manual.trim_end()));
-            }
-        }
-        if sections.runtime_protocol {
-            appended.push(format!("## runtime_protocol\n{}", runtime_protocol.trim_end()));
-        }
-        let mut system = rendered_host_system.trim_end().to_string();
-        for section in appended {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(&section);
-        }
-        if !system.is_empty() {
-            system.push('\n');
-        }
+        let hosted = assemble_hosted_system(
+            host_system,
+            origin,
+            &template_env,
+            sections,
+            &deps.host_protocol,
+            loop_model,
+            &tools,
+            json,
+        )?;
         let prompt = PromptPlan {
             mode: PromptMode::Custom,
             group: None,
             loop_model,
             sections: Vec::new(),
-            custom_system: Some(rendered_host_system),
+            custom_system: Some(hosted.custom_system),
             custom_system_source: Some(format!("host:{origin}")),
-            runtime_protocol,
+            runtime_protocol: hosted.runtime_protocol,
             protocol_version: RUNTIME_PROTOCOL_VERSION.into(),
-            system_prompt: system,
+            system_prompt: hosted.system_prompt,
             user_request: None,
             user_request_source: "structured".into(),
-            template_vars: template_env.used_vars(),
+            template_vars: hosted.template_vars,
             runtime_vars: manager
                 .runtime_info()
                 .ok_or_else(|| XllmError::Capability("runtime info unavailable".into()))?
@@ -7397,6 +7775,9 @@ impl XllmTask {
             config_files: vec![origin.to_string()],
             sources,
         };
+        if let Some(warning) = unused_context_yield_ratio(&config) {
+            log::warn!("{warning}");
+        }
         Ok(HostedTask {
             workdir,
             config,
@@ -7455,14 +7836,14 @@ impl HostedTask {
             host: Some(host),
             host_commit_pending: None,
             handover: None,
-            inflight: Vec::new(),
+            hints_once: Vec::new(),
         }
     }
 
     /// Waist request with xllm's tool / budget policy for this config.
     pub fn build_request(
         &self,
-        owner: ContextOwnerRef,
+        owner: Value,
         trace: &str,
         objective: &str,
         behavior_name: &str,
@@ -7531,7 +7912,9 @@ fn restore_host_report_tool(record: &RunRecord, deps: &XllmDeps) -> XllmDeps {
 }
 
 /// Rebuild the tool set of a saved run from its recorded sources and policy
-/// (what `XllmRun::resume` does), bound to the run id.
+/// (what `XllmRun::resume` does), bound to the run id. The model is shown
+/// the specs saved in the record; a saved tool the rebuilt set cannot
+/// dispatch makes the run not resumable.
 pub async fn rebuild_toolset(
     record: &RunRecord,
     deps: &XllmDeps,
@@ -7545,8 +7928,6 @@ pub async fn rebuild_toolset(
         actions: Some(record.config.tools.action_sources.clone()),
         bash_tools: Some(record.config.tools.bash_tools.clone()),
         shell: Some(ShellToolConfig {
-            mode: Some(record.config.tools.shell.mode),
-            wait_ms: Some(record.config.tools.shell.wait_ms),
             timeout_ms: Some(record.config.tools.shell.timeout_ms),
             max_timeout_ms: Some(record.config.tools.shell.max_timeout_ms),
         }),
@@ -7565,6 +7946,16 @@ pub async fn rebuild_toolset(
             "saved runtime target or workdir changed".into(),
         ));
     }
+    let saved = &record.config.tools;
+    manager
+        .advertise_saved(saved.native.iter().chain(saved.actions.iter()))
+        .map_err(|tool| XllmError::NotResumable {
+            run_id: record.run_id.clone(),
+            reason: format!(
+                "saved tool `{}` ({}) is not available on this executor",
+                tool.name, tool.source
+            ),
+        })?;
     manager.bind_run_dir(
         &record.run_id,
         record
@@ -7630,7 +8021,9 @@ fn restore_host_environment(
     }
     let bin: PathBuf =
         serde_json::from_value(check["bin_dir"].clone()).map_err(|e| blocked(e.to_string()))?;
-    if paths.first() != Some(&bin) {
+    // A node runtime has no PATH layers here (its commands are on the node's
+    // own PATH); its overlay is still checked below.
+    if !paths.is_empty() && paths.first() != Some(&bin) {
         return Err(blocked("Session bin path check differs from PATH".into()));
     }
     let manifest: Value = serde_json::from_slice(
@@ -7639,18 +8032,31 @@ fn restore_host_environment(
     )
     .map_err(|e| blocked(e.to_string()))?;
     if manifest["entries"] != check["bin_manifest"]["entries"]
+        || manifest["programs"] != check["bin_manifest"]["programs"]
         || manifest["tool_plan"] != check["bin_manifest"]["tool_plan"]
     {
         return Err(blocked("Session bin manifest changed".into()));
+    }
+    let entry_path = |name: &str| {
+        if name.contains(['/', '\\']) || name == "." || name == ".." {
+            return Err(blocked("invalid Session bin entry".into()));
+        }
+        Ok(bin.join(name))
+    };
+    if let Some(programs) = manifest["programs"].as_object() {
+        for (name, recorded) in programs {
+            let found = session_program_stamp(&entry_path(name)?)
+                .map_err(|e| blocked(format!("Session helper {name} unavailable: {e}")))?;
+            if recorded.as_str() != Some(found.as_str()) {
+                return Err(blocked(format!("Session helper {name} changed")));
+            }
+        }
     }
     let entries = manifest["entries"]
         .as_object()
         .ok_or_else(|| blocked("Session bin manifest entries missing".into()))?;
     for (name, digest) in entries {
-        if name.contains('/') || name == "." || name == ".." {
-            return Err(blocked("invalid Session bin entry".into()));
-        }
-        let path = bin.join(name);
+        let path = entry_path(name)?;
         let content = std::fs::read(&path)
             .map_err(|e| blocked(format!("Session helper {name} unavailable: {e}")))?;
         if digest.as_str() != Some(sha256_hex(&content).as_str()) {
@@ -7689,7 +8095,7 @@ pub async fn create_run_llm(
 /// Waist request for an effective config (same policy as xllm's own runs).
 pub fn hosted_request(
     cfg: &EffectiveConfig,
-    owner: ContextOwnerRef,
+    owner: Value,
     trace: &str,
     objective: &str,
     behavior_name: &str,
@@ -7716,11 +8122,11 @@ pub fn hosted_request(
             0
         },
         max_calls_per_round: 16,
-        max_observation_bytes: 64 * 1024,
         disable_capabilities: cfg.disable_capabilities.clone(),
-        parallel: false,
-        allow_deferred: false,
         finish_grace_ms: 30_000,
+        // Wrap-up tools are the host's (libopendan: `report` / `ask_user`).
+        wrap_up_tools: Vec::new(),
+        wrap_up_rounds: DEFAULT_WRAP_UP_ROUNDS,
     };
     LLMContextRequest {
         owner,
@@ -7764,7 +8170,6 @@ pub fn hosted_request(
             context_yield_threshold: context_yield_threshold(&cfg.limits),
             context_window_tokens: cfg.limits.context_window_tokens,
         },
-        human_policy: Default::default(),
         error_policy: ErrorPolicy {
             max_consecutive_errors: DEFAULT_MAX_CONSECUTIVE_ERRORS,
         },
@@ -7836,6 +8241,181 @@ impl RunOutcome {
             RunStatus::Failed => RunOutcome::Failed(r),
             RunStatus::LimitReached => RunOutcome::LimitReached(r),
         }
+    }
+}
+
+/// `last_error.kind` / message of a run whose context does not fit after
+/// the compactions it may make: the run fails.
+const CONTEXT_CAPACITY_EXHAUSTED: (&str, &str) = (
+    "context_capacity",
+    "the task context still exceeds the model capacity after repeated compaction",
+);
+
+/// What `XllmRun::execute` does with a waist outcome ([`run_step`]).
+#[derive(Debug)]
+enum RunStep {
+    /// The reply is the result.
+    Complete { raw: String, usage: AiUsage },
+    /// A hosted behavior step submitted its final report; the host commits it.
+    HostReport { usage: AiUsage },
+    /// A hosted run hands over to another behavior.
+    Handover { target: String, usage: AiUsage },
+    /// The model yielded, or tasks of this run are still running.
+    Wait {
+        kind: &'static str,
+        message: String,
+        condition: String,
+        usage: AiUsage,
+    },
+    LimitReached { reason: String, usage: AiUsage },
+    /// `keep_context`: the error left the context valid (a runtime failure).
+    Error {
+        error: RunErrorRecord,
+        keep_context: bool,
+        usage: AiUsage,
+    },
+    Interrupted { reason: String, usage: AiUsage },
+    /// The context does not fit: compact it and continue.
+    Compact {
+        snapshot: LLMContextSnapshot,
+        accumulated: Vec<AiMessage>,
+        usage: AiUsage,
+    },
+}
+
+impl RunStep {
+    /// The status the run records (still `running` while compacting).
+    fn status(&self) -> RunStatus {
+        match self {
+            RunStep::Complete { .. } => RunStatus::Completed,
+            RunStep::HostReport { .. } | RunStep::Handover { .. } | RunStep::Wait { .. } => {
+                RunStatus::Paused
+            }
+            RunStep::LimitReached { .. } => RunStatus::LimitReached,
+            RunStep::Error { error, .. } => {
+                if error.recoverable {
+                    RunStatus::Paused
+                } else {
+                    RunStatus::Failed
+                }
+            }
+            RunStep::Interrupted { .. } => RunStatus::Interrupted,
+            RunStep::Compact { .. } => RunStatus::Running,
+        }
+    }
+}
+
+/// How a run ends a command on a waist outcome. `hosted`: the run has a
+/// host (`RunRecord.host`); `running_tasks`: tasks of this run still running
+/// when a function call reply ended it.
+fn run_step(
+    outcome: LLMContextOutcome,
+    hosted: bool,
+    running_tasks: &[String],
+    limits: &RunLimits,
+    provider: &ProviderConfig,
+) -> RunStep {
+    match outcome {
+        LLMContextOutcome::Done {
+            output,
+            usage,
+            response,
+            behavior_result,
+            ..
+        } => {
+            if hosted && behavior_result.as_ref().is_some_and(|result| result.report_end) {
+                return RunStep::HostReport { usage };
+            }
+            // A hosted run that hands over to another behavior is not
+            // finished: it yields at the hand-over point and its host
+            // session commits the transfer.
+            let target = behavior_result
+                .as_ref()
+                .and_then(|b| b.next_behavior.clone())
+                .filter(|b| is_handover_target(b));
+            if let (Some(target), true) = (target, hosted) {
+                return RunStep::Handover { target, usage };
+            }
+            // The loop never waits (freeze TODO F17/F18): a behavior step
+            // that yields, or a reply while tasks of this run are still
+            // running, pauses the run; `resume` (with a message, when there
+            // is something to say) continues the same snapshot.
+            let yielded = behavior_result
+                .as_ref()
+                .is_some_and(|b| !b.report_end && b.next_behavior.is_none());
+            if yielded {
+                return RunStep::Wait {
+                    kind: "yield",
+                    message: behavior_result
+                        .as_ref()
+                        .and_then(|b| b.self_report.clone())
+                        .unwrap_or_else(|| response.message.text_content()),
+                    condition:
+                        "the model stopped to wait for new input; resume with a message to continue"
+                            .to_string(),
+                    usage,
+                };
+            }
+            if !running_tasks.is_empty() {
+                return RunStep::Wait {
+                    kind: "tasks_running",
+                    message: response.message.text_content(),
+                    condition: format!(
+                        "tasks {} are still running; resume once they ended (optionally with a message)",
+                        running_tasks.join(", ")
+                    ),
+                    usage,
+                };
+            }
+            let raw = match &output {
+                ContextOutput::Json { content } => {
+                    let text = response.message.text_content();
+                    if text.trim().is_empty() {
+                        content.to_string()
+                    } else {
+                        text
+                    }
+                }
+                ContextOutput::Text { .. } | ContextOutput::Invalid { .. } => {
+                    response.message.text_content()
+                }
+            };
+            RunStep::Complete { raw, usage }
+        }
+        LLMContextOutcome::BudgetExhausted { which, usage, .. } => RunStep::LimitReached {
+            reason: match which {
+                BudgetKind::ToolIterations => format!(
+                    "tool iteration limit ({}) reached",
+                    limits.max_tool_iterations
+                ),
+                BudgetKind::Wallclock => format!(
+                    "total execution time limit ({}s) reached",
+                    limits.timeout_secs
+                ),
+                BudgetKind::Tokens => "token budget exhausted".to_string(),
+                BudgetKind::CostUnits => "cost budget exhausted".to_string(),
+            },
+            usage,
+        },
+        LLMContextOutcome::Error { error, usage, .. } => RunStep::Error {
+            keep_context: error.source() == ErrorSource::Runtime,
+            error: XllmRun::classify_error(&error, provider),
+            usage,
+        },
+        LLMContextOutcome::Interrupted { reason, usage, .. }
+        | LLMContextOutcome::Settled { reason, usage, .. } => {
+            RunStep::Interrupted { reason, usage }
+        }
+        LLMContextOutcome::ContextLimitReached {
+            accumulated,
+            snapshot,
+            usage,
+            ..
+        } => RunStep::Compact {
+            snapshot,
+            accumulated,
+            usage,
+        },
     }
 }
 
@@ -7925,17 +8505,26 @@ impl SnapshotHook {
         let idx = self.store.put_snapshot(&run_id, snapshot)?;
         let mut rec = self.record.lock().expect("record lock");
         rec.latest_snapshot_idx = Some(idx);
-        let covered = crate::exec_tracking::persisted_outcome_ids(snapshot);
-        rec.inflight.retain(|a| !covered.contains(&a.call_id));
         rec.updated_at_ms = now_ms();
         self.store.write_record(&rec)?;
         Ok(idx)
     }
 }
 
-impl InferenceHook for SnapshotHook {
-    fn before_inference(&self, snapshot: &LLMContextSnapshot) -> Result<(), String> {
+/// The run's checkpoints: the outer snapshot before every tool call (the
+/// single source of truth for what was dispatched) and before every
+/// inference at a boundary.
+#[async_trait]
+impl CheckpointHook for SnapshotHook {
+    async fn before_tool_call(&self, snapshot: &LLMContextSnapshot) -> Result<(), String> {
         self.commit(snapshot).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    async fn before_inference(
+        &self,
+        snapshot: &LLMContextSnapshot,
+    ) -> Result<Option<Injection>, String> {
+        self.commit(snapshot).map(|_| None).map_err(|e| e.to_string())
     }
 }
 
@@ -7981,7 +8570,17 @@ impl XllmRun {
         let mut rec = self.record.lock().expect("record lock");
         f(&mut rec);
         rec.updated_at_ms = now_ms();
-        rec.artifacts = self.manager.artifacts();
+        // The manager only knows this segment's writes; earlier segments'
+        // stay in the record.
+        for a in self.manager.artifacts() {
+            if !rec.artifacts.contains(&a) {
+                rec.artifacts.push(a);
+            }
+        }
+        rec.hints_once = self
+            .manager
+            .hint_ledger()
+            .keys(crate::hints::HINT_NS_ONCE);
         self.store.write_record(&rec)
     }
 
@@ -8037,7 +8636,7 @@ impl XllmRun {
         tools: &EffectiveTools,
         deps: &XllmDeps,
     ) -> LLMContextDeps {
-        let hook: Arc<dyn InferenceHook> = Arc::new(SnapshotHook {
+        let hook: Arc<dyn CheckpointHook> = Arc::new(SnapshotHook {
             store: store.clone(),
             record: record.clone(),
         });
@@ -8047,7 +8646,6 @@ impl XllmRun {
             llm_started_at: Mutex::new(None),
             tool_commands: Mutex::new(HashMap::new()),
         });
-        let resolver = manager.resolver();
         let tools_dyn: Arc<dyn ToolManager> = manager;
         let llm_dyn: Arc<dyn LlmClient> = llm;
         // A hosted run keeps the renderer its host assembled it with: the
@@ -8055,8 +8653,7 @@ impl XllmRun {
         let hosted = record.lock().map(|r| r.host.is_some()).unwrap_or(false);
         let mut d = LLMContextDeps::new(llm_dyn, tools_dyn)
             .with_worklog(worklog)
-            .with_inference_hook(hook)
-            .with_tasks(resolver);
+            .with_checkpoint_hook(hook);
         if loop_model == LoopModel::Behavior {
             d = d
                 .with_result_parser(Arc::new(XllmActionParser::new(&tools.actions)))
@@ -8128,11 +8725,10 @@ impl XllmRun {
             host: None,
             host_commit_pending: None,
             handover: None,
-            inflight: Vec::new(),
+            hints_once: Vec::new(),
         };
         store.write_record(&record)?;
         let record = Arc::new(Mutex::new(record));
-        manager.attach_tracking(store.clone(), record.clone());
         let manager = Arc::new(manager);
         let waist_deps = Self::build_waist_deps(
             &store,
@@ -8164,6 +8760,34 @@ impl XllmRun {
             _run_lock: run_lock,
             _workdir_lock: workdir_lock,
         })
+    }
+
+    /// Give a resumed run a new input (the manual form of what a session
+    /// injects): appended to the saved history at the boundary the run
+    /// stopped at, committed before the run continues.
+    pub fn inject_input(&mut self, text: &str) -> Result<(), XllmError> {
+        let ctx = self.ctx.as_mut().ok_or_else(|| {
+            XllmError::Input(
+                "this run has not reached the model yet; it cannot take a message".into(),
+            )
+        })?;
+        let placed = ctx.inject(Injection {
+            messages: vec![AiMessage::text(AiRole::User, text.to_string())],
+            host: None,
+        });
+        if placed == llm_context::deps::InjectionPosition::None {
+            return Err(XllmError::Input(
+                "the run stopped in the middle of a tool batch; resume it without a message first"
+                    .into(),
+            ));
+        }
+        let snapshot = ctx.snapshot();
+        SnapshotHook {
+            store: self.store.clone(),
+            record: self.record.clone(),
+        }
+        .commit(&snapshot)?;
+        Ok(())
     }
 
     /// 恢复：按编号或当前工作目录最近的未完成任务。终态只返回记录。
@@ -8267,9 +8891,8 @@ impl XllmRun {
             &deps,
         )
         .await?;
-        // Holding the run lock: re-read, then make sure no execution of the
-        // previous executor is still alive and settle in-flight actions.
-        let mut record = store.read_record(&run_id_s)?;
+        // Holding the run lock: re-read.
+        let record = store.read_record(&run_id_s)?;
         ensure_workspace_host_runner(&record)?;
         ensure_host_report_not_pending(&record)?;
         ensure_host_final_step_not_pending(&record, store)?;
@@ -8295,8 +8918,6 @@ impl XllmRun {
         let mut runtime_deps = deps.clone();
         runtime_deps.runtime = Some(runtime.clone());
         let mut manager = rebuild_toolset(&record, &runtime_deps).await?;
-        Self::settle_previous_executor(store, &mut record, runtime.as_ref()).await?;
-        Self::fill_suspended_calls(store, &mut record, manager.resolver().as_ref()).await?;
 
         let mut record = record;
         if let Some(v) = limits.max_tokens {
@@ -8320,17 +8941,35 @@ impl XllmRun {
         let tools = record.config.tools.clone();
         let loop_model = record.config.loop_model;
 
-        // 装回快照（若已进入主模型阶段）。
+        // 装回快照（若已进入主模型阶段）。The first call without a result
+        // in it may have been started by the previous executor: the manager
+        // answers it by call id instead of running it blindly again.
         let snapshot = match record.latest_snapshot_idx {
             Some(idx) => Some(store.get_snapshot(&run_id_s, idx)?),
             None => None,
         };
+        if let Some(call) = snapshot
+            .as_ref()
+            .and_then(crate::exec_tracking::in_flight_call)
+        {
+            let binding = RunBinding {
+                run_id: run_id_s.clone(),
+                run_dir: store.run_dir(&run_id_s),
+            };
+            let reason = runtime.describe_interrupted(&binding, &call).await;
+            manager.set_recovering(&call.call_id, reason);
+        }
         record.status = RunStatus::Running;
         record.pid = std::process::id();
         record.updated_at_ms = now_ms();
         store.write_record(&record)?;
+        if deps.hint_ledger.is_none() && !record.hints_once.is_empty() {
+            manager.set_hint_ledger(MemoryHintLedger::seeded(
+                crate::hints::HINT_NS_ONCE,
+                record.hints_once.iter().cloned(),
+            ));
+        }
         let record = Arc::new(Mutex::new(record));
-        manager.attach_tracking(store.clone(), record.clone());
         let manager = Arc::new(manager);
         let waist_deps = Self::build_waist_deps(
             store,
@@ -8368,14 +9007,7 @@ impl XllmRun {
                     ctx = Some(resumed);
                 }
                 // Saved at the context limit: compacted before continuing.
-                Some(Suspension::ContextLimit { .. }) => limit_snapshot = Some(snap),
-                // Filled by `fill_suspended_calls` before this point.
-                Some(Suspension::PendingTool { .. }) => {
-                    return Err(XllmError::NotResumable {
-                        run_id: run_id_s.clone(),
-                        reason: "the run still waits for a task result".into(),
-                    })
-                }
+                Some(_) => limit_snapshot = Some(snap),
             }
         }
         let interrupter = XllmInterrupter {
@@ -8423,111 +9055,6 @@ impl XllmRun {
         })))
     }
 
-    /// Before continuing a run: turn the in-flight actions of the previous
-    /// executor (dispatched, no persisted result) into explicit
-    /// "interrupted, result unknown" observations, worded by the runtime
-    /// from what it can read (long-tool TODO §3.2). No process is verified
-    /// or stopped; nothing is re-run.
-    async fn settle_previous_executor(
-        store: &RunStore,
-        record: &mut RunRecord,
-        runtime: &dyn AgentRuntime,
-    ) -> Result<(), XllmError> {
-        if !record.inflight.is_empty() {
-            let Some(idx) = record.latest_snapshot_idx else {
-                return Err(XllmError::NotResumable {
-                    run_id: record.run_id.clone(),
-                    reason: "in-flight actions recorded but no snapshot is published".into(),
-                });
-            };
-            let mut snap = store.get_snapshot(&record.run_id, idx)?;
-            let behavior = record.config.loop_model == LoopModel::Behavior;
-            let binding = RunBinding {
-                run_id: record.run_id.clone(),
-                run_dir: store.run_dir(&record.run_id),
-            };
-            let mut reasons = HashMap::new();
-            for action in &record.inflight {
-                reasons.insert(
-                    action.call_id.clone(),
-                    runtime.describe_interrupted(&binding, action).await,
-                );
-            }
-            crate::exec_tracking::materialize_unresolved(
-                &mut snap,
-                &record.inflight,
-                behavior,
-                &reasons,
-            );
-            let new_idx = store.put_snapshot(&record.run_id, &snap)?;
-            record.latest_snapshot_idx = Some(new_idx);
-            record.inflight.clear();
-            record.updated_at_ms = now_ms();
-            store.write_record(record)?;
-        }
-        Ok(())
-    }
-
-    /// A run suspended on a task (`PendingTool`) is taken over without
-    /// waiting: every suspended call is filled with the task's state at this
-    /// moment and the run continues (long-tool TODO §4). Refused when the
-    /// task belongs to a task manager this executor cannot reach.
-    async fn fill_suspended_calls(
-        store: &RunStore,
-        record: &mut RunRecord,
-        resolver: &dyn RunningTaskResolver,
-    ) -> Result<(), XllmError> {
-        let Some(idx) = record.latest_snapshot_idx else {
-            return Ok(());
-        };
-        let snap = store.get_snapshot(&record.run_id, idx)?;
-        let pending = snap.state.pending_calls().to_vec();
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let mut results = Vec::new();
-        for p in &pending {
-            if !resolver.can_resolve(&p.task_id) {
-                return Err(XllmError::NotResumable {
-                    run_id: record.run_id.clone(),
-                    reason: format!(
-                        "the run waits for task {} of a task manager this executor cannot reach",
-                        p.task_id
-                    ),
-                });
-            }
-            let state = resolver.state(&p.task_id).await;
-            results.push((
-                p.call.call_id.clone(),
-                task_state_observation(&p.call.call_id, &p.task_id, &state),
-            ));
-        }
-        // Validate and apply the fill with inert deps; the real context is
-        // built from the published snapshot afterwards.
-        let probe = LLMContextDeps::new(Arc::new(NoopLlm), Arc::new(NoopTools));
-        let probe = if record.config.loop_model == LoopModel::Behavior {
-            probe
-                .with_result_parser(Arc::new(XllmActionParser::new(
-                    &record.config.tools.actions,
-                )))
-                .with_step_renderer(Arc::new(step_renderer(record.host.is_some())))
-        } else {
-            probe
-        };
-        let filled =
-            LLMContext::resume(snap, ResumeFill::ToolResults { results }, probe).map_err(|e| {
-                XllmError::NotResumable {
-                    run_id: record.run_id.clone(),
-                    reason: format!("cannot fill the suspended tool results: {e}"),
-                }
-            })?;
-        let new_idx = store.put_snapshot(&record.run_id, &filled.snapshot())?;
-        record.latest_snapshot_idx = Some(new_idx);
-        record.updated_at_ms = now_ms();
-        store.write_record(record)?;
-        Ok(())
-    }
-
     fn classify_error(err: &LLMComputeError, provider: &ProviderConfig) -> RunErrorRecord {
         let at_ms = now_ms();
         let (recoverable, kind, condition): (bool, &str, Option<String>) = match err {
@@ -8537,60 +9064,44 @@ impl XllmRun {
                 Some("the model request timed out; resume to retry it".into()),
             ),
             LLMComputeError::Cancelled => (true, "cancelled", Some("resume to retry".into())),
-            LLMComputeError::Provider { failure, message } => match failure {
+            LLMComputeError::Provider { failure, .. } => match failure {
                 ProviderFailure::Transient => (
                     true,
                     "provider_transient",
                     Some("wait for the model service to recover, then resume".into()),
                 ),
-                ProviderFailure::Permanent => {
-                    let m = message.to_ascii_lowercase();
-                    let auth = [
-                        "token",
-                        "unauthorized",
-                        "401",
-                        "403",
-                        "auth",
-                        "expired",
-                        "api key",
-                        "permission",
-                        "credential",
-                    ]
-                    .iter()
-                    .any(|k| m.contains(k));
-                    if auth {
-                        let src = provider
-                            .session_token
-                            .as_ref()
-                            .or(provider.api_key.as_ref())
-                            .map(|r| r.describe())
-                            .unwrap_or_else(|| "the current identity".into());
-                        (
-                            true,
-                            "credentials",
-                            Some(format!(
-                                "fix the credential referenced by {src}, then resume"
-                            )),
-                        )
-                    } else {
-                        (false, "provider_permanent", None)
-                    }
-                }
+                ProviderFailure::Permanent => (false, "provider_permanent", None),
                 ProviderFailure::Unknown => (false, "provider_error", None),
                 ProviderFailure::ContextLimit => (false, "context_capacity", None),
-                ProviderFailure::Refused(kind) => (
+                ProviderFailure::Refused { code } if code == REFUSED_CREDENTIALS => {
+                    let src = provider
+                        .session_token
+                        .as_ref()
+                        .or(provider.api_key.as_ref())
+                        .map(|r| r.describe())
+                        .unwrap_or_else(|| "the current identity".into());
+                    (
+                        true,
+                        REFUSED_CREDENTIALS,
+                        Some(format!(
+                            "fix the credential referenced by {src}, then resume"
+                        )),
+                    )
+                }
+                ProviderFailure::Refused { code } => (
                     false,
-                    refusal_kind_name(*kind),
-                    Some(match kind {
-                        RefusalKind::QuotaExhausted | RefusalKind::QuotaBudgetExceeded => {
+                    code.as_str(),
+                    Some(match code.as_str() {
+                        REFUSED_QUOTA_EXHAUSTED | REFUSED_QUOTA_BUDGET_EXCEEDED => {
                             "the AI token quota does not cover this call; wait for it to reset, lower the output budget, or ask an administrator; do not retry right away".into()
                         }
-                        RefusalKind::ResourceNotPermitted => {
+                        REFUSED_RESOURCE_NOT_PERMITTED => {
                             "the model is not permitted to this user; choose a permitted model or ask an administrator".into()
                         }
-                        RefusalKind::AttributionUnavailable => {
+                        REFUSED_ATTRIBUTION_UNAVAILABLE => {
                             "the user whose AI resources this run uses cannot be determined".into()
                         }
+                        _ => "the AI service refused this call under its policy; do not retry right away".into(),
                     }),
                 ),
             },
@@ -8731,6 +9242,9 @@ impl XllmRun {
 
     fn build_initial_context(&mut self) -> Result<(), XllmError> {
         let rec = self.record();
+        if let Some(warning) = unused_context_yield_ratio(&rec.config) {
+            self.emit(RunEvent::Warning(warning));
+        }
         let mut messages = self.initial_messages.clone();
         if let Some(stage) = &rec.file_model_stage {
             // 主模型收到带来源的分析结果，不再直接收到图片。
@@ -8767,11 +9281,10 @@ impl XllmRun {
                 0
             },
             max_calls_per_round: 16,
-            max_observation_bytes: 64 * 1024,
             disable_capabilities: cfg.disable_capabilities.clone(),
-            parallel: false,
-            allow_deferred: false,
             finish_grace_ms: 30_000,
+            wrap_up_tools: Vec::new(),
+            wrap_up_rounds: DEFAULT_WRAP_UP_ROUNDS,
         };
         let output = if cfg.json && cfg.loop_model == LoopModel::FunctionCall {
             OutputSpec::Json {
@@ -8783,9 +9296,7 @@ impl XllmRun {
             OutputSpec::Text
         };
         let request = LLMContextRequest {
-            owner: ContextOwnerRef::OneShot {
-                id: self.run_id.clone(),
-            },
+            owner: json!({"kind": "one_shot", "id": self.run_id}),
             trace: Some(self.run_id.clone()),
             objective: rec.summary.clone(),
             behavior_name: if cfg.loop_model == LoopModel::Behavior {
@@ -8812,8 +9323,7 @@ impl XllmRun {
                 context_yield_threshold: context_yield_threshold(&cfg.limits),
                 context_window_tokens: cfg.limits.context_window_tokens,
             },
-            human_policy: Default::default(),
-            error_policy: ErrorPolicy {
+                error_policy: ErrorPolicy {
                 max_consecutive_errors: DEFAULT_MAX_CONSECUTIVE_ERRORS,
             },
             forbid_next_behavior: false,
@@ -8946,95 +9456,95 @@ impl XllmRun {
                 });
                 return Ok(RunOutcome::Paused(self.record()));
             }
-            match outcome {
+            // Tasks of this run still running when a function call reply
+            // ended it (a behavior step never waits on them here).
+            let running: Vec<String> = match &outcome {
                 LLMContextOutcome::Done {
-                    output,
-                    usage,
-                    response,
-                    behavior_result,
+                    behavior_result: None,
                     ..
-                } => {
-                    if self.record().host.is_some()
-                        && behavior_result
-                            .as_ref()
-                            .is_some_and(|result| result.report_end)
-                    {
-                        let calls = self.llm.calls();
-                        self.update(|record| {
-                            record.status = RunStatus::Paused;
-                            record.last_error = None;
-                            record.usage.main = Some(usage);
-                            record.usage.llm_requests += calls;
-                        })?;
-                        return Ok(RunOutcome::Paused(self.record()));
-                    }
-                    // A hosted run that hands over to another behavior is not
-                    // finished: it yields at the hand-over point and its host
-                    // session commits the transfer.
-                    let target = behavior_result
-                        .as_ref()
-                        .and_then(|b| b.next_behavior.clone())
-                        .filter(|b| is_handover_target(b));
-                    if let (Some(target), true) = (target, self.record().host.is_some()) {
-                        let calls = self.llm.calls();
-                        self.update(|r| {
-                            r.status = RunStatus::Paused;
-                            r.last_error = None;
-                            r.usage.main = Some(usage);
-                            r.usage.llm_requests += calls;
-                            r.handover = Some(RunHandover {
-                                next_behavior: target,
-                                at_ms: now_ms(),
-                            });
-                        })?;
-                        return Ok(RunOutcome::Paused(self.record()));
-                    }
-                    let raw = match &output {
-                        ContextOutput::Json { content } => {
-                            let text = response.message.text_content();
-                            if text.trim().is_empty() {
-                                content.to_string()
-                            } else {
-                                text
-                            }
-                        }
-                        ContextOutput::Text { .. } | ContextOutput::Invalid { .. } => {
-                            response.message.text_content()
-                        }
-                    };
-                    return self.finish_with_response(raw, usage);
-                }
-                LLMContextOutcome::BudgetExhausted { which, usage, .. } => {
+                } => self
+                    .manager
+                    .resolver()
+                    .active()
+                    .await
+                    .into_iter()
+                    .filter(|t| t.status == "running")
+                    .map(|t| t.task_id)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let step = run_step(
+                outcome,
+                self.record().host.is_some(),
+                &running,
+                &self.record().config.limits,
+                &provider,
+            );
+            let status = step.status();
+            match step {
+                RunStep::Complete { raw, usage } => return self.finish_with_response(raw, usage),
+                RunStep::HostReport { usage } => {
                     let calls = self.llm.calls();
-                    let reason = match which {
-                        BudgetKind::ToolIterations => format!(
-                            "tool iteration limit ({}) reached",
-                            self.record().config.limits.max_tool_iterations
-                        ),
-                        BudgetKind::Wallclock => format!(
-                            "total execution time limit ({}s) reached",
-                            self.record().config.limits.timeout_secs
-                        ),
-                        BudgetKind::Tokens => "token budget exhausted".to_string(),
-                        BudgetKind::CostUnits => "cost budget exhausted".to_string(),
-                    };
+                    self.update(|record| {
+                        record.status = status;
+                        record.last_error = None;
+                        record.usage.main = Some(usage);
+                        record.usage.llm_requests += calls;
+                    })?;
+                }
+                RunStep::Handover { target, usage } => {
+                    let calls = self.llm.calls();
                     self.update(|r| {
-                        r.status = RunStatus::LimitReached;
+                        r.status = status;
+                        r.last_error = None;
+                        r.usage.main = Some(usage);
+                        r.usage.llm_requests += calls;
+                        r.handover = Some(RunHandover {
+                            next_behavior: target,
+                            at_ms: now_ms(),
+                        });
+                    })?;
+                }
+                RunStep::Wait {
+                    kind,
+                    message,
+                    condition,
+                    usage,
+                } => {
+                    // The run waits for them: they outlive this process.
+                    self.manager.tasks().release_running().await;
+                    self.ctx = Some(ctx);
+                    let calls = self.llm.calls();
+                    self.update(|r| {
+                        r.status = status;
+                        r.usage.main = Some(usage);
+                        r.usage.llm_requests += calls;
+                        r.last_error = Some(RunErrorRecord {
+                            phase: "model".into(),
+                            kind: kind.into(),
+                            message,
+                            recoverable: true,
+                            condition: Some(condition),
+                            at_ms: now_ms(),
+                        });
+                    })?;
+                }
+                RunStep::LimitReached { reason, usage } => {
+                    let calls = self.llm.calls();
+                    self.update(|r| {
+                        r.status = status;
                         r.usage.main = Some(usage);
                         r.usage.llm_requests += calls;
                         r.limit_reason = Some(reason);
                     })?;
-                    return Ok(RunOutcome::LimitReached(self.record()));
                 }
-                LLMContextOutcome::Error { error, usage, .. } => {
+                RunStep::Error {
+                    error,
+                    keep_context,
+                    usage,
+                } => {
                     let calls = self.llm.calls();
-                    let err = Self::classify_error(&error, &provider);
-                    let status = if err.recoverable {
-                        RunStatus::Paused
-                    } else {
-                        RunStatus::Failed
-                    };
-                    if error.source() == ErrorSource::Runtime {
+                    if keep_context {
                         // 上下文仍有效；本进程不再继续，交给 resume。
                         self.ctx = Some(ctx);
                     }
@@ -9042,46 +9552,22 @@ impl XllmRun {
                         r.status = status;
                         r.usage.main = Some(usage);
                         r.usage.llm_requests += calls;
-                        r.last_error = Some(err);
+                        r.last_error = Some(error);
                     })?;
-                    return Ok(RunOutcome::from_record(self.record()));
                 }
-                LLMContextOutcome::Interrupted { reason, usage, .. }
-                | LLMContextOutcome::Settled { reason, usage, .. } => {
+                RunStep::Interrupted { reason, usage } => {
                     let calls = self.llm.calls();
                     self.update(|r| {
-                        r.status = RunStatus::Interrupted;
+                        r.status = status;
                         r.usage.main = Some(usage);
                         r.usage.llm_requests += calls;
                         r.interrupt_reason = Some(reason);
                     })?;
-                    return Ok(RunOutcome::Interrupted(self.record()));
                 }
-                LLMContextOutcome::PendingTool { .. } => {
-                    // xllm has no Session to wait in (`allow_deferred` is
-                    // off): tools wait inside the call instead.
-                    let calls = self.llm.calls();
-                    self.update(|r| {
-                        r.status = RunStatus::Failed;
-                        r.usage.llm_requests += calls;
-                        r.last_error = Some(RunErrorRecord {
-                            phase: "tool".into(),
-                            kind: "deferred_tool".into(),
-                            message:
-                                "a tool suspended the run on a task, which xllm does not support"
-                                    .into(),
-                            recoverable: false,
-                            condition: None,
-                            at_ms: now_ms(),
-                        });
-                    })?;
-                    return Ok(RunOutcome::Failed(self.record()));
-                }
-                LLMContextOutcome::ContextLimitReached {
-                    accumulated,
+                RunStep::Compact {
                     snapshot,
+                    accumulated,
                     usage,
-                    ..
                 } => {
                     if let Some(outcome) =
                         self.compact_context(snapshot, accumulated, usage).await?
@@ -9091,6 +9577,7 @@ impl XllmRun {
                     continue;
                 }
             }
+            return Ok(RunOutcome::from_record(self.record()));
         }
     }
 
@@ -9128,31 +9615,20 @@ impl XllmRun {
             Ok(Some(RunOutcome::Failed(this.record())))
         };
         if self.record().compactions >= 3 {
-            return fail(
-                self,
-                "context_capacity",
-                "the task context still exceeds the model capacity after repeated compaction"
-                    .into(),
-            );
+            let (kind, message) = CONTEXT_CAPACITY_EXHAUSTED;
+            return fail(self, kind, message.into());
         }
-        let model = self.record().config.model.clone();
         let compressor = LlmSummarizeCompressor::new(
             self.waist_deps.clone().into_traditional(),
-            model,
-            DEFAULT_AUTO_COMPRESS_TARGET_TOKENS,
+            self.record().config.summary_model(),
+            compaction_target_tokens(&self.record().config.limits),
         );
         let rewritten = match compressor
             .compress(history, Path::new(&self.record().workdir))
             .await
         {
             Ok(r) => r,
-            Err(e) => {
-                return fail(
-                    self,
-                    "context_compaction",
-                    format!("context compaction failed: {e}"),
-                )
-            }
+            Err(e) => return fail(self, "context_compaction", e.to_string()),
         };
         // Behavior runs fold the materialized history into the input; the
         // inner transcript of the step in progress is kept by the waist.
@@ -9166,6 +9642,8 @@ impl XllmRun {
         } else {
             ResumeFill::RewrittenHistory { history: rewritten }
         };
+        // Results shown before are no longer in the history.
+        self.manager.clear_dedup();
         let resumed = LLMContext::resume(snapshot, fill, self.waist_deps.clone())
             .map_err(|e| XllmError::Other(format!("resume after compaction failed: {e}")))?;
         let hook = SnapshotHook {
@@ -9183,11 +9661,6 @@ impl XllmRun {
 }
 
 impl XllmToolManager {
-    /// Bind the manager to a run id (trace / session context of tool calls).
-    pub fn set_run_id(&mut self, run_id: &str) {
-        self.bind_run_dir(run_id, None);
-    }
-
     /// Bind the manager to a run: trace / session context of tool calls and
     /// the run directory the `shell` execution directories live under.
     pub fn bind_run_dir(&mut self, run_id: &str, run_dir: Option<PathBuf>) {
@@ -9383,6 +9856,10 @@ pub fn build_result_view(
 // =========================================================================
 
 #[cfg(test)]
+#[path = "xllm_vectors.rs"]
+mod vectors;
+
+#[cfg(test)]
 mod behavior_protocol_tests {
     use super::*;
 
@@ -9438,12 +9915,13 @@ mod behavior_protocol_tests {
         assert!(!p.contains("native function-call tools"), "{p}");
     }
 
-    /// Only a session explains that a progress report alone hands control
-    /// back (and when it is accepted); a one-shot run keeps its rules.
+    /// Every behavior run explains the yield; only a session says what it
+    /// waits for.
     #[test]
-    fn a_progress_report_alone_yields_only_in_a_session() {
+    fn a_progress_report_alone_yields() {
         let p = protocol(&[], &["shell"]);
-        assert!(p.contains("only content is a progress report"), "{p}");
+        assert!(p.contains("yields: this context stops and waits for new input"), "{p}");
+        assert!(p.contains("Yielding is how you wait for work this session started"), "{p}");
         let tools = EffectiveTools {
             enabled: true,
             actions: vec![tool("shell")],
@@ -9451,7 +9929,8 @@ mod behavior_protocol_tests {
         };
         let one_shot =
             build_runtime_protocol_for(&HostProtocolFlavor::OneShot, LoopModel::Behavior, &tools, false);
-        assert!(!one_shot.contains("only content is a progress report"), "{one_shot}");
+        assert!(one_shot.contains("yields: this context stops"), "{one_shot}");
+        assert!(!one_shot.contains("Yielding is how you wait"), "{one_shot}");
     }
 }
 
@@ -9571,7 +10050,7 @@ mod tests {
                 "exact_model",
             ),
         ] {
-            for mode in ["text", "json_object", "json_schema"] {
+            for mode in ["text", "any_json", "json_schema"] {
                 let calls = Arc::new(StdMutex::new(Vec::new()));
                 let response = aicc_success_response();
                 let client = AiccClient::new_in_process(Box::new(RecordingAicc {
@@ -9581,7 +10060,7 @@ mod tests {
                 let mut request = aicc_inference_request(model);
                 request.allow_tool_calls = mode == "json_schema";
                 request.force_json = mode != "text";
-                if mode == "json_object" {
+                if mode == "any_json" {
                     request.json_schema = None;
                 }
                 let result = AiccLlmClient::infer_with_client(&client, request)
@@ -9613,8 +10092,15 @@ mod tests {
                         "type": "json_schema",
                         "json_schema": {"name": "llm_response", "schema": {"type": "object"}}
                     });
-                } else if mode == "json_object" {
-                    expected["response_format"] = json!({"type": "json_object"});
+                } else if mode == "any_json" {
+                    expected["response_format"] = json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "llm_response",
+                            "schema": {"type": "object", "additionalProperties": true},
+                            "strict": false
+                        }
+                    });
                 }
                 if model_field == "logical_model" {
                     expected["requirements"] = json!({});
@@ -9686,6 +10172,7 @@ mod tests {
         model: String,
         messages: Vec<AiMessage>,
         tool_names: Vec<String>,
+        tool_specs: Vec<ToolSpecLite>,
         allow_tool_calls: bool,
         force_json: bool,
     }
@@ -9719,6 +10206,7 @@ mod tests {
                 model: req.model_alias.clone(),
                 messages: req.messages.clone(),
                 tool_names: req.tool_specs.iter().map(|t| t.name.clone()).collect(),
+                tool_specs: req.tool_specs.clone(),
                 allow_tool_calls: req.allow_tool_calls,
                 force_json: req.force_json,
             });
@@ -9737,27 +10225,27 @@ mod tests {
 
     #[async_trait]
     impl RunningTaskResolver for ExternalTasks {
-        async fn state(&self, task_id: &str) -> llm_context::tasks::TaskState {
+        async fn state(&self, task_id: &str) -> crate::task_model::TaskState {
             assert_eq!(task_id, "bucky:42");
-            llm_context::tasks::TaskState::Finished(llm_context::tasks::TaskResult {
+            crate::task_model::TaskState::Finished(crate::task_model::TaskResult {
                 success: true,
                 output: "external task completed".into(),
                 tool_result: None,
             })
         }
 
-        async fn wait(&self, task_id: &str, _: Option<u64>) -> llm_context::tasks::TaskState {
+        async fn wait(&self, task_id: &str, _: Option<u64>) -> crate::task_model::TaskState {
             self.state(task_id).await
         }
 
         async fn cancel(
             &self,
             task_id: &str,
-        ) -> Result<llm_context::tasks::TaskState, llm_context::tasks::CancelUnsupported> {
+        ) -> Result<crate::task_model::TaskState, crate::task_model::CancelUnsupported> {
             Ok(self.state(task_id).await)
         }
 
-        async fn active(&self) -> Vec<llm_context::tasks::TaskBrief> {
+        async fn active(&self) -> Vec<crate::task_model::TaskBrief> {
             Vec::new()
         }
     }
@@ -10071,7 +10559,7 @@ tools:
         // exec 启用：命令手册出现；rules 列出工具。
         assert!(sys.contains("rg -n <pattern>"));
         assert!(sys.contains("Native tools available"));
-        assert!(sys.contains(TOOL_EXEC));
+        assert!(sys.contains(TOOL_SHELL));
         // 组默认任务进入 user。
         let user = user_text(&llm.seen()[0]);
         assert!(user.contains(&format!("Review the code in {}", record.workdir)));
@@ -10422,6 +10910,66 @@ there]]></write_file>
         ));
     }
 
+    #[test]
+    fn a_node_runtime_session_without_path_layers_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join(".runtime").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let manifest = json!({"entries": {}, "tool_plan": null});
+        std::fs::write(bin.join(".manifest.json"), manifest.to_string()).unwrap();
+        let mut record = RunRecord::synthetic("node-run", tmp.path(), RunStatus::Paused);
+        let check = |path_prefix: Vec<PathBuf>| {
+            json!({
+                "runtime": record.config.runtime_descriptor,
+                "env": {},
+                "env_refs": [],
+                "path_prefix": path_prefix,
+                "bin_dir": bin,
+                "bin_manifest": manifest,
+            })
+        };
+        let host = |env_check: Value| HostRunInfo {
+            assembled_by: "libopendan".into(),
+            session_id: Some("session".into()),
+            runtime_kind: Some("remote_node".into()),
+            runtime_id: Some("host".into()),
+            env_check,
+            extra: Value::Null,
+        };
+        let open = || RuntimeOpenCtx::new(tmp.path(), "node-run", LoopModel::FunctionCall);
+
+        record.host = Some(host(check(Vec::new())));
+        let mut opened = open();
+        restore_host_environment(&record, &mut opened).unwrap();
+        assert!(opened.path_prefix.is_empty());
+
+        // With PATH layers the overlay must still come first.
+        let other = tmp.path().join("tools");
+        std::fs::create_dir_all(&other).unwrap();
+        record.host = Some(host(check(vec![other.clone(), bin.clone()])));
+        assert!(matches!(
+            restore_host_environment(&record, &mut open()),
+            Err(XllmError::RecoveryBlocked(_))
+        ));
+        record.host = Some(host(check(vec![bin.clone(), other])));
+        restore_host_environment(&record, &mut open()).unwrap();
+
+        // A program entry is held to its recorded length and mtime.
+        std::fs::write(bin.join("agent-session.exe"), b"program").unwrap();
+        let stamp = session_program_stamp(&bin.join("agent-session.exe")).unwrap();
+        let manifest = json!({"entries": {}, "programs": {"agent-session.exe": stamp}, "tool_plan": null});
+        std::fs::write(bin.join(".manifest.json"), manifest.to_string()).unwrap();
+        let mut env_check = check(Vec::new());
+        env_check["bin_manifest"] = manifest;
+        record.host = Some(host(env_check));
+        restore_host_environment(&record, &mut open()).unwrap();
+        std::fs::write(bin.join("agent-session.exe"), b"another program").unwrap();
+        assert!(matches!(
+            restore_host_environment(&record, &mut open()),
+            Err(XllmError::RecoveryBlocked(_))
+        ));
+    }
+
     #[tokio::test]
     async fn hosted_sections_can_be_disabled() {
         let env = Env::new();
@@ -10486,7 +11034,7 @@ there]]></write_file>
         assert_eq!(hosted.config.json_schema.as_ref(), Some(&schema));
         assert!(hosted.prompt.runtime_protocol.contains("exactly one valid JSON value"));
         let req = hosted.build_request(
-            ContextOwnerRef::OneShot { id: "t".into() },
+            json!({"kind": "one_shot", "id": "t"}),
             "trace",
             "objective",
             "",
@@ -10590,12 +11138,13 @@ there]]></write_file>
         )).unwrap();
         assert!(parsed.report_end);
         assert!(parsed.next_behavior.is_none());
-        assert_eq!(parsed.report_artifacts, vec!["out.txt"]);
-        assert_eq!(parsed.report_result, Some(json!({"ok": true})));
+        assert_eq!(
+            parsed.report_result,
+            Some(json!({"ok": true, "artifacts": ["out.txt"]}))
+        );
+        assert_eq!(report_artifacts(parsed.report_result.as_ref()), vec!["out.txt"]);
         for xml in [
             r#"<response><report end="true">final</report><actions><shell>echo side-effect</shell></actions></response>"#,
-            r#"<response><report end="true">final</report><actions><sendmsg>hello</sendmsg></actions></response>"#,
-            r#"<response><report end="true">final</report><sendmsg>hello</sendmsg></response>"#,
             r#"<response><report end="true">final</report><next_behavior>CHECK</next_behavior></response>"#,
             r#"<response><report end="true">final</report><next_behavior>WAIT_USER_MSG</next_behavior></response>"#,
             r#"<response><report end="true"> </report></response>"#,
@@ -10606,7 +11155,6 @@ there]]></write_file>
             r#"<response><report>first</report><report>second</report></response>"#,
             r#"<response><report>progress</report><next_behavior>END</next_behavior></response>"#,
             r#"<response><report>progress</report><next_behavior>done</next_behavior></response>"#,
-            r#"<response><thinking>finished</thinking></response>"#,
             r#"<response><artifacts>[]</artifacts></response>"#,
             r#"<response><result>null</result></response>"#,
             r#"<response><report>progress</report><artifacts>{}</artifacts></response>"#,
@@ -10879,6 +11427,231 @@ there]]></write_file>
     }
 
     #[tokio::test]
+    async fn rpc_http_timeout_pauses_without_retry_and_preserves_details() {
+        for (status, reason) in [(504, "Gateway Timeout"), (408, "Request Timeout")] {
+            let env = Env::new();
+            let upstream_reason = "response head timeout after 60000ms";
+            let message = format!("rpc call error: HTTP {status} {reason}: {upstream_reason}");
+            let err = provider_error_from_rpc(
+                "aicc helper.llm_chat failed",
+                RPCErrors::Detailed(::kRPC::RPCErrorDetail::new(
+                    "http_error",
+                    message.clone(),
+                    Some(json!({"status": status})),
+                )),
+            );
+            let llm = ScriptedLlm::new(vec![Err(err), text("must not retry automatically")]);
+            let outcome = env
+                .run(
+                    TaskInput::question("read this PDF"),
+                    env.overrides(),
+                    llm.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(outcome, RunOutcome::Paused(_)));
+            let record = outcome.record().last_error.as_ref().unwrap();
+            assert!(record.recoverable);
+            assert_eq!(record.kind, "provider_transient");
+            assert!(record.message.contains("aicc helper.llm_chat failed"));
+            assert!(record.message.contains(&message));
+            assert_eq!(llm.calls(), 1);
+        }
+    }
+
+    #[test]
+    fn rpc_http_timeout_does_not_reclassify_unrelated_errors() {
+        for (code, data) in [
+            ("http_error", Some(json!({"status": 500}))),
+            ("http_error", None),
+            ("other_error", Some(json!({"status": 504}))),
+        ] {
+            let err = provider_error_from_rpc(
+                "aicc helper.llm_chat failed",
+                RPCErrors::Detailed(::kRPC::RPCErrorDetail::new(code, "upstream failed", data)),
+            );
+            assert!(matches!(
+                err,
+                LLMComputeError::Provider {
+                    failure: ProviderFailure::Unknown,
+                    ..
+                }
+            ));
+        }
+    }
+
+    /// The same AICC error both as a kRPC error and as a failed response.
+    async fn aicc_error_both_ways(error: AiccError) -> [LLMComputeError; 2] {
+        let rpc_error =
+            provider_error_from_rpc("aicc helper.llm_chat failed", error.to_krpc_error());
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut response = aicc_success_response();
+        response.status = AiMethodStatus::Failed;
+        response.message = None;
+        response.error = Some(error);
+        let client = AiccClient::new_in_process(Box::new(RecordingAicc {
+            calls: calls.clone(),
+            response,
+        }));
+        let response_error =
+            AiccLlmClient::infer_with_client(&client, aicc_inference_request("llm.chat"))
+                .await
+                .unwrap_err();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        [rpc_error, response_error]
+    }
+
+    #[tokio::test]
+    async fn aicc_retriable_flag_decides_recoverable_in_rpc_and_failed_responses() {
+        for (code, status, retriable, recoverable) in [
+            (AiccErrorCode::Timeout, 504, true, true),
+            (AiccErrorCode::Timeout, 504, false, true),
+            (AiccErrorCode::ProviderError, 504, true, true),
+            (AiccErrorCode::ProviderError, 502, true, true),
+            (AiccErrorCode::ProviderError, 503, true, true),
+            (AiccErrorCode::ProviderError, 503, false, false),
+            (AiccErrorCode::ProviderError, 504, false, false),
+        ] {
+            let message = format!("OpenAI HTTP {status}: server_is_overloaded");
+            let mut error = AiccError::new(code, message.clone());
+            error.retriable = retriable;
+            error.details = Some(json!({"http_status": status, "retry_after_ms": 60000}));
+            for error in aicc_error_both_ways(error).await {
+                let record = XllmRun::classify_error(&error, &ProviderConfig::default());
+                assert_eq!(
+                    record.recoverable, recoverable,
+                    "{code:?} {status} {retriable}"
+                );
+                if recoverable {
+                    assert_eq!(record.kind, "provider_transient");
+                }
+                assert!(record.message.contains(&message));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aicc_refusals_stay_refused_even_when_marked_retriable() {
+        let mut error = AiccError::new(AiccErrorCode::QuotaExhausted, "token quota is exhausted");
+        error.retriable = true;
+        for error in aicc_error_both_ways(error).await {
+            assert!(
+                matches!(
+                    &error,
+                    LLMComputeError::Provider {
+                        failure: ProviderFailure::Refused { code },
+                        ..
+                    } if code == REFUSED_QUOTA_EXHAUSTED
+                ),
+                "{error:?}"
+            );
+            let record = XllmRun::classify_error(&error, &ProviderConfig::default());
+            assert!(!record.recoverable);
+            assert_eq!(record.kind, REFUSED_QUOTA_EXHAUSTED);
+        }
+    }
+
+    #[tokio::test]
+    async fn aicc_context_refusals_are_context_limits() {
+        let context = AiccError::new(AiccErrorCode::ContextLengthExceeded, "context is too long");
+        // A Provider that rejects the body size (AICC marks it retriable).
+        let mut too_large = AiccError::new(AiccErrorCode::ProviderError, "HTTP 413");
+        too_large.retriable = true;
+        too_large.details = Some(json!({"http_status": 413}));
+        for error in [context, too_large] {
+            for error in aicc_error_both_ways(error).await {
+                assert!(
+                    matches!(
+                        error,
+                        LLMComputeError::Provider {
+                            failure: ProviderFailure::ContextLimit,
+                            ..
+                        }
+                    ),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    fn rpc_payload_too_large() -> LLMComputeError {
+        provider_error_from_rpc(
+            "aicc helper.llm_chat failed",
+            RPCErrors::Detailed(::kRPC::RPCErrorDetail::new(
+                "http_error",
+                "rpc call error: 413 Payload Too Large",
+                Some(json!({"status": 413})),
+            )),
+        )
+    }
+
+    #[tokio::test]
+    async fn rpc_payload_too_large_compacts_and_continues_the_same_run() {
+        assert!(matches!(
+            rpc_payload_too_large(),
+            LLMComputeError::Provider {
+                failure: ProviderFailure::ContextLimit,
+                ..
+            }
+        ));
+        let env = Env::new();
+        let llm = ScriptedLlm::new(vec![
+            tool_call(TOOL_SHELL, json!({"command":"echo before-limit"}), "c1"),
+            Err(rpc_payload_too_large()),
+            text("done after compaction"),
+        ]);
+        let overrides = TaskOverrides {
+            tools: Some(true),
+            ..env.overrides()
+        };
+        let o = env
+            .run(TaskInput::question("run it"), overrides, llm.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(o, RunOutcome::Completed(_)),
+            "{:?}",
+            o.record().last_error
+        );
+        assert_eq!(o.record().compactions, 1);
+        assert_eq!(llm.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn aicc_retriable_provider_error_pauses_the_run() {
+        let mut error = AiccError::new(
+            AiccErrorCode::ProviderError,
+            "server_is_overloaded: Please try again later.",
+        );
+        error.retriable = true;
+        error.details = Some(json!({"http_status": 503, "retry_after_ms": 60000}));
+        let rpc_error =
+            provider_error_from_rpc("aicc helper.llm_chat failed", error.to_krpc_error());
+        let env = Env::new();
+        let llm = ScriptedLlm::new(vec![Err(rpc_error)]);
+        let o = env
+            .run(TaskInput::question("hello"), env.overrides(), llm.clone())
+            .await
+            .unwrap();
+        assert!(matches!(o, RunOutcome::Paused(_)));
+        let record = o.record().last_error.as_ref().unwrap();
+        assert!(record.recoverable);
+        assert_eq!(record.kind, "provider_transient");
+        assert_eq!(llm.calls(), 1);
+
+        error.retriable = false;
+        let rpc_error =
+            provider_error_from_rpc("aicc helper.llm_chat failed", error.to_krpc_error());
+        let llm = ScriptedLlm::new(vec![Err(rpc_error)]);
+        let o = env
+            .run(TaskInput::question("hello"), env.overrides(), llm)
+            .await
+            .unwrap();
+        assert!(matches!(o, RunOutcome::Failed(_)));
+        assert!(!o.record().last_error.as_ref().unwrap().recoverable);
+    }
+
+    #[tokio::test]
     async fn transient_provider_error_pauses_and_resume_completes_same_run() {
         let env = Env::new();
         let llm = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
@@ -10991,29 +11764,58 @@ there]]></write_file>
     #[tokio::test]
     async fn permanent_and_credential_errors_are_classified() {
         let env = Env::new();
-        let llm = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
-            ProviderFailure::Permanent,
-            "model xyz not found",
-        ))]);
-        let o = env
-            .run(TaskInput::question("q"), env.overrides(), llm)
-            .await
-            .unwrap();
-        assert!(matches!(o, RunOutcome::Failed(_)));
-        assert!(!o.record().last_error.as_ref().unwrap().recoverable);
+        for message in ["model xyz not found", "max_tokens exceeds the model limit"] {
+            let llm = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
+                ProviderFailure::Permanent,
+                message,
+            ))]);
+            let o = env
+                .run(TaskInput::question("q"), env.overrides(), llm)
+                .await
+                .unwrap();
+            assert!(matches!(o, RunOutcome::Failed(_)), "{message}");
+            let e = o.record().last_error.clone().unwrap();
+            assert!(!e.recoverable);
+            assert_eq!(e.kind, "provider_permanent");
+        }
 
-        let llm = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
-            ProviderFailure::Permanent,
-            "invalid token: expired",
-        ))]);
-        let o = env
-            .run(TaskInput::question("q"), env.overrides(), llm)
-            .await
-            .unwrap();
-        assert!(matches!(o, RunOutcome::Paused(_)));
-        let e = o.record().last_error.clone().unwrap();
-        assert_eq!(e.kind, "credentials");
-        assert!(e.condition.unwrap().contains("credential"));
+        for rpc in [
+            RPCErrors::TokenExpired("expired".into()),
+            RPCErrors::InvalidToken("bad signature".into()),
+            RPCErrors::NoPermission("denied".into()),
+            RPCErrors::Detailed(::kRPC::RPCErrorDetail::new(
+                "http_error",
+                "rpc call error: 401 Unauthorized",
+                Some(json!({"status": 401})),
+            )),
+            RPCErrors::Detailed(::kRPC::RPCErrorDetail::new(
+                "http_error",
+                "rpc call error: 403 Forbidden",
+                Some(json!({"status": 403})),
+            )),
+        ] {
+            let error = provider_error_from_rpc("aicc helper.llm_chat failed", rpc);
+            assert!(
+                matches!(
+                    &error,
+                    LLMComputeError::Provider {
+                        failure: ProviderFailure::Refused { code },
+                        ..
+                    } if code == REFUSED_CREDENTIALS
+                ),
+                "{error:?}"
+            );
+            let llm = ScriptedLlm::new(vec![Err(error)]);
+            let o = env
+                .run(TaskInput::question("q"), env.overrides(), llm)
+                .await
+                .unwrap();
+            assert!(matches!(o, RunOutcome::Paused(_)));
+            let e = o.record().last_error.clone().unwrap();
+            assert!(e.recoverable);
+            assert_eq!(e.kind, REFUSED_CREDENTIALS);
+            assert!(e.condition.unwrap().contains("credential"));
+        }
 
         let llm = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
             ProviderFailure::Unknown,
@@ -11153,7 +11955,7 @@ there]]></write_file>
             .unwrap();
         assert!(snapshot.state.report_end);
         assert_eq!(
-            snapshot.state.steps.last().unwrap().report_artifacts,
+            report_artifacts(snapshot.state.steps.last().unwrap().report_result.as_ref()),
             vec!["missing.txt"]
         );
         assert_eq!(llm.calls(), 1);
@@ -11185,10 +11987,9 @@ there]]></write_file>
             "project/.llm_context",
             "loop_model: behavior\nresult_format: result.report\n",
         );
-        let llm = ScriptedLlm::new(vec![
-            text("<response><report>intermediate finding</report></response>"),
-            text(r#"<response><report end="true">verified final finding</report></response>"#),
-        ]);
+        let llm = ScriptedLlm::new(vec![text(
+            "<response><report>intermediate finding</report></response>",
+        )]);
         let outcome = env
             .run(
                 TaskInput::question("verify it"),
@@ -11197,8 +11998,30 @@ there]]></write_file>
             )
             .await
             .unwrap();
-        assert!(matches!(outcome, RunOutcome::Completed(_)));
-        assert_eq!(llm.calls(), 2);
+        // A progress report alone yields: the run pauses, it is not done.
+        assert!(matches!(outcome, RunOutcome::Paused(_)), "{outcome:?}");
+        let paused = outcome.record();
+        let pause = paused.last_error.as_ref().unwrap();
+        assert_eq!((pause.kind.as_str(), pause.message.as_str()), ("yield", "intermediate finding"));
+        let llm = ScriptedLlm::new(vec![text(
+            r#"<response><report end="true">verified final finding</report></response>"#,
+        )]);
+        let ResumeStart::Run(mut run) = XllmRun::resume(
+            &env.store(),
+            Some(&paused.run_id),
+            None,
+            ResumeLimits::default(),
+            env.deps(llm.clone()),
+        )
+        .await
+        .unwrap() else {
+            panic!("a yielded run is resumable")
+        };
+        run.inject_input("go on and verify").unwrap();
+        let outcome = run.execute().await.unwrap();
+        drop(run);
+        assert!(matches!(outcome, RunOutcome::Completed(_)), "{outcome:?}");
+        assert!(format!("{:?}", llm.seen()[0].messages).contains("go on and verify"));
         let record = outcome.record();
         assert_eq!(
             record.result.as_ref().unwrap().extracted,
@@ -11832,6 +12655,93 @@ there]]></write_file>
         }
     }
 
+    /// Resume (freeze TODO F6): the model is shown the tool specs saved
+    /// in run.json, not the re-expanded ones; a saved tool the executor
+    /// cannot dispatch makes the run not resumable.
+    #[tokio::test]
+    async fn resume_advertises_the_saved_tool_specs() {
+        let description = |req: &SeenRequest| {
+            req.tool_specs
+                .iter()
+                .find(|s| s.name == "read_file")
+                .map(|s| s.description.clone())
+                .expect("read_file advertised")
+        };
+        async fn paused(env: &Env) -> (RunRecord, SeenRequest) {
+            let overrides = TaskOverrides {
+                tools: Some(true),
+                ..env.overrides()
+            };
+            let llm = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
+                ProviderFailure::Transient,
+                "down",
+            ))]);
+            let o = env
+                .run(TaskInput::question("q"), overrides, llm.clone())
+                .await
+                .unwrap();
+            assert!(matches!(o, RunOutcome::Paused(_)));
+            (o.record().clone(), llm.seen()[0].clone())
+        }
+
+        let env = Env::new();
+        let (mut record, first) = paused(&env).await;
+        let store = env.store();
+        record
+            .config
+            .tools
+            .native
+            .iter_mut()
+            .find(|t| t.name == "read_file")
+            .unwrap()
+            .description = "read_file as the run was started".into();
+        store.write_record(&record).unwrap();
+        let llm = ScriptedLlm::new(vec![text("done")]);
+        let ResumeStart::Run(mut run) = XllmRun::resume(
+            &store,
+            Some(&record.run_id),
+            None,
+            ResumeLimits::default(),
+            env.deps(llm.clone()),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected run")
+        };
+        assert!(matches!(run.execute().await.unwrap(), RunOutcome::Completed(_)));
+        assert_ne!(description(&first), "read_file as the run was started");
+        assert_eq!(description(&llm.seen()[0]), "read_file as the run was started");
+        assert_eq!(llm.seen()[0].tool_names, first.tool_names);
+        drop(run);
+
+        let env = Env::new();
+        let (mut record, _) = paused(&env).await;
+        let store = env.store();
+        record
+            .config
+            .tools
+            .native
+            .iter_mut()
+            .find(|t| t.name == "read_file")
+            .unwrap()
+            .name = "read_file_v0".into();
+        store.write_record(&record).unwrap();
+        let err = XllmRun::resume(
+            &store,
+            Some(&record.run_id),
+            None,
+            ResumeLimits::default(),
+            env.deps(ScriptedLlm::new(vec![])),
+        )
+        .await
+        .err()
+        .expect("not resumable");
+        assert!(
+            matches!(&err, XllmError::NotResumable { reason, .. } if reason.contains("read_file_v0")),
+            "{err}"
+        );
+    }
+
     #[test]
     fn xml_scanner_handles_nesting_cdata_and_self_closing() {
         let els = scan_xml_elements(
@@ -12039,11 +12949,11 @@ there]]></write_file>
                         json!({"path": "../fixture.txt", "old_string": "outside-original", "new_string": "outside-edited"}),
                     ),
                     (
-                        TOOL_EXEC,
+                        TOOL_SHELL,
                         json!({"command": if cfg!(windows) { "[Console]::Write((Get-Location).ProviderPath)" } else { "pwd" }, "cwd": outside}),
                     ),
                     (
-                        TOOL_EXEC,
+                        TOOL_SHELL,
                         json!({"command": if cfg!(windows) { "[Console]::Write((Get-Location).ProviderPath)" } else { "pwd" }, "cwd": ".."}),
                     ),
                 ];
@@ -12064,7 +12974,7 @@ there]]></write_file>
                         if name == "read_file" {
                             assert!(content.contains("outside-original"), "{content}");
                         }
-                        if name == TOOL_EXEC {
+                        if name == TOOL_SHELL {
                             assert!(
                                 content
                                     .replace('\\', "/")
@@ -12202,7 +13112,7 @@ there]]></write_file>
                 "edit",
             ),
             tool_call(
-                TOOL_EXEC,
+                TOOL_SHELL,
                 json!({"command": if cfg!(windows) { "[IO.File]::WriteAllText((Join-Path (Get-Location).ProviderPath 'resumed-cwd.txt'), (Get-Location).ProviderPath)" } else { "pwd > resumed-cwd.txt" }, "cwd": ".."}),
                 "exec",
             ),
@@ -12239,8 +13149,9 @@ there]]></write_file>
     fn exec_manager(workdir: &Path) -> XllmToolManager {
         let mut manager =
             XllmToolManager::new(workdir.to_path_buf(), "run-test", LoopModel::FunctionCall);
+        // A budget beyond the timeout: `shell` waits for its command.
         let shell = ShellSettings {
-            mode: ShellMode::Wait,
+            wait_ms: u64::MAX,
             ..Default::default()
         };
         for t in builtin_bash_group(
@@ -12270,9 +13181,175 @@ there]]></write_file>
 
     fn exec_call(command: &str) -> AiToolCall {
         AiToolCall {
-            name: TOOL_EXEC.to_string(),
+            name: TOOL_SHELL.to_string(),
             args: HashMap::from([("command".to_string(), Value::String(command.to_string()))]),
             call_id: "c1".to_string(),
+        }
+    }
+
+    /// Resume (F12): the call a previous executor may have started is
+    /// looked up by call id — a `shell` command that recorded its exit
+    /// answers with that result and does not run again; a tool that is not
+    /// idempotent answers "result unknown"; an idempotent one runs.
+    #[tokio::test]
+    async fn a_recovering_call_is_found_by_call_id_not_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = exec_manager(dir.path());
+        let run_dir = dir.path().join("runs").join("run-test");
+        manager.bind_run_dir("run-test", Some(run_dir.clone()));
+        let exec = run_dir.join("exec").join("c1");
+        std::fs::create_dir_all(&exec).unwrap();
+        std::fs::write(exec.join("command"), "echo done").unwrap();
+        std::fs::write(exec.join("stdout"), "done\n").unwrap();
+        std::fs::write(exec.join("exit"), "0").unwrap();
+        let marker = dir.path().join("ran-again");
+        manager.set_recovering("c1", "unknown".into());
+        let obs = manager
+            .call_tool_t(exec_call(&format!("touch {}", marker.display())))
+            .await
+            .unwrap();
+        let Observation::Success { content, .. } = obs else {
+            panic!("{obs:?}")
+        };
+        assert!(content.as_str().unwrap().contains("exited with code 0"), "{content}");
+        assert!(!marker.exists(), "a found call is not run again");
+
+        std::fs::write(dir.path().join("a.txt"), "old").unwrap();
+        let edit = AiToolCall {
+            name: TOOL_EDIT_FILE.into(),
+            args: HashMap::from([
+                ("path".to_string(), json!("a.txt")),
+                ("old_string".to_string(), json!("old")),
+                ("new_string".to_string(), json!("new")),
+            ]),
+            call_id: "c2".into(),
+        };
+        manager.set_recovering("c2", "edit_file effect unknown".into());
+        let obs = manager.call_tool_t(edit.clone()).await.unwrap();
+        assert!(
+            matches!(&obs, Observation::Unresolved { effect_unknown: true, reason, .. } if reason == "edit_file effect unknown"),
+            "{obs:?}"
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "old");
+        // Only that one dispatch is answered so; the next is a new call.
+        let obs = manager.call_tool_t(edit).await.unwrap();
+        assert!(matches!(obs, Observation::Success { .. }), "{obs:?}");
+
+        let read = AiToolCall {
+            name: "read_file".into(),
+            args: HashMap::from([("path".to_string(), json!("a.txt"))]),
+            call_id: "c3".into(),
+        };
+        manager.set_recovering("c3", "unknown".into());
+        let obs = manager.call_tool_t(read).await.unwrap();
+        assert!(matches!(obs, Observation::Success { .. }), "idempotent: {obs:?}");
+    }
+
+    struct WaitDeadlines(StdMutex<Vec<u64>>);
+
+    #[async_trait]
+    impl RunningTaskResolver for WaitDeadlines {
+        async fn state(&self, _: &str) -> TaskState {
+            TaskState::Running {
+                brief: "remote job".into(),
+                elapsed_ms: 0,
+                output_tail: String::new(),
+                cancellable: false,
+            }
+        }
+
+        async fn wait(&self, task_id: &str, until_ms: Option<u64>) -> TaskState {
+            self.0.lock().unwrap().push(until_ms.expect("wait deadline"));
+            self.state(task_id).await
+        }
+
+        async fn cancel(
+            &self,
+            task_id: &str,
+        ) -> Result<TaskState, crate::task_model::CancelUnsupported> {
+            Err(crate::task_model::CancelUnsupported {
+                task_id: task_id.into(),
+            })
+        }
+
+        async fn active(&self) -> Vec<crate::task_model::TaskBrief> {
+            Vec::new()
+        }
+    }
+
+    struct PendingTool;
+
+    #[async_trait]
+    impl AgentTool for PendingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "pending_tool".into(),
+                description: "hands its work to a task".into(),
+                args_schema: json!({"type": "object"}),
+                output_schema: json!({"type": "object"}),
+                usage: None,
+            }
+        }
+
+        fn calling(&self) -> crate::CallingConventions {
+            crate::CallingConventions::ALL
+        }
+
+        async fn call(
+            &self,
+            _: &SessionRuntimeContext,
+            args: Value,
+        ) -> Result<AgentToolResult, AgentToolError> {
+            let mut res = AgentToolResult::from_details(json!({}))
+                .with_status(AgentToolStatus::Pending)
+                .with_task_id("t-remote");
+            if let Some(secs) = args.get("check_after").and_then(Value::as_u64) {
+                res = res.with_check_after(secs);
+            }
+            Ok(res)
+        }
+    }
+
+    /// `check_after` only shortens the in-call wait: the budget caps a
+    /// larger one, a smaller one takes effect, none waits the budget.
+    #[tokio::test]
+    async fn check_after_takes_the_minimum_with_the_wait_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let deadlines = Arc::new(WaitDeadlines(StdMutex::new(Vec::new())));
+        let mut manager = XllmToolManager::with_run_binding(
+            dir.path().to_path_buf(),
+            "run-test",
+            LoopModel::FunctionCall,
+            new_run_binding_slot(),
+            InProcessTaskManager::new(),
+            Some(deadlines.clone()),
+        );
+        manager.set_task_wait_ms(10_000);
+        manager
+            .register(Arc::new(PendingTool), "name:pending_tool")
+            .unwrap();
+        for (check_after, expected_ms) in [(Some(60), 10_000), (Some(2), 2_000), (None, 10_000)] {
+            let mut args = HashMap::new();
+            if let Some(secs) = check_after {
+                args.insert("check_after".to_string(), json!(secs));
+            }
+            let before = crate::now_ms();
+            let obs = manager
+                .call_tool_t(AiToolCall {
+                    name: "pending_tool".into(),
+                    args,
+                    call_id: "c1".into(),
+                })
+                .await
+                .unwrap();
+            let after = crate::now_ms();
+            assert!(matches!(obs, Observation::Success { .. }), "{obs:?}");
+            let until = deadlines.0.lock().unwrap().pop().unwrap();
+            assert!(
+                until >= before + expected_ms && until <= after + expected_ms,
+                "check_after {check_after:?}: waited {} ms",
+                until - before
+            );
         }
     }
 
@@ -12285,7 +13362,6 @@ there]]></write_file>
         let ctx = ToolCallCtx {
             abort: llm_context::InferenceAbortToken::noop(),
             deadline_ms: Some(crate::now_ms() + 1000),
-            allow_deferred: false,
         };
         let started = std::time::Instant::now();
         let obs = manager
@@ -12319,7 +13395,6 @@ there]]></write_file>
         let ctx = ToolCallCtx {
             abort: handle.token(),
             deadline_ms: None,
-            allow_deferred: false,
         };
         let m = manager.clone();
         let call = tokio::spawn(async move { m.call_tool(exec_call("sleep 30"), ctx).await });
@@ -12348,7 +13423,6 @@ there]]></write_file>
             LoopModel::FunctionCall,
         );
         let shell = ShellSettings {
-            mode: ShellMode::Auto,
             wait_ms: 200,
             ..Default::default()
         };
@@ -12375,18 +13449,16 @@ there]]></write_file>
             )
             .await
             .unwrap();
-        let Observation::Success {
-            content,
-            tool_result,
-            ..
-        } = obs
-        else {
+        let Observation::Success { content, host, .. } = obs else {
             panic!("{obs:?}")
         };
         let text = content.as_str().unwrap();
         assert!(text.contains("still running"), "{text}");
         assert!(text.contains("early"), "{text}");
-        let task_id = tool_result.unwrap().task_id.expect("task id");
+        let task_id = ToolResultView::from_host(&host)
+            .unwrap()
+            .task_id
+            .expect("task id");
         assert_eq!(task_id, "local:shell:c1");
         let obs = manager
             .call_tool(
@@ -12402,14 +13474,12 @@ there]]></write_file>
             )
             .await
             .unwrap();
-        let Observation::Success { content, .. } = obs else {
+        let Observation::Success { content, host, .. } = obs else {
             panic!("{obs:?}")
         };
-        assert!(content.as_str().unwrap().contains("late"), "{content}");
-        assert!(
-            content.as_str().unwrap().contains("exited with code 0"),
-            "{content}"
-        );
+        // The task's end reads like the call had ended within its wait.
+        assert_eq!(content.as_str().unwrap(), "early\nlate\n", "{content}");
+        assert_eq!(ToolResultView::from_host(&host).unwrap().return_code, Some(0));
         let dir_obs = manager
             .call_tool(
                 AiToolCall {
@@ -12432,8 +13502,8 @@ there]]></write_file>
             "tools": {
                 "enabled": true,
                 "tools": [{"groupname": "bash_core"}],
-                "shell": {"mode": "auto", "wait_ms": 200}
-            }
+            },
+            "runtime": {"task_wait_ms": 200}
         });
         // Without a task command the group keeps the task tools.
         let deps = env.deps(ScriptedLlm::new(vec![]));
@@ -12483,10 +13553,11 @@ there]]></write_file>
             .call_tool(call("echo early; sleep 1; echo late", "c1"), ToolCallCtx::noop())
             .await
             .unwrap();
-        let Observation::Success { content, tool_result, .. } = obs else { panic!("{obs:?}") };
+        let Observation::Success { content, host, .. } = obs else { panic!("{obs:?}") };
         let text = content.as_str().unwrap();
-        assert!(text.contains("agent-session task wait local:shell:c1"), "{text}");
-        let task_id = tool_result.unwrap().task_id.unwrap();
+        assert!(text.contains("it continues as task local:shell:c1"), "{text}");
+        assert!(text.contains("<runtime_hints>\n- A task is followed with `agent-session task wait <task_id>"), "{text}");
+        let task_id = ToolResultView::from_host(&host).unwrap().task_id.unwrap();
         let req = |op, wait_ms| crate::task_bridge::TaskBridgeRequest {
             op,
             task_id: task_id.clone(),
@@ -12505,12 +13576,12 @@ there]]></write_file>
         // The very text the task tools return for the same state.
         let state = manager.resolver().state(&task_id).await;
         let Observation::Success { content, .. } =
-            llm_context::tasks::task_state_observation("", &task_id, &state)
+            crate::task_model::task_state_observation("", &task_id, &state)
         else {
             panic!()
         };
         assert_eq!(done.text, content.as_str().unwrap());
-        assert!(done.text.contains("late") && done.text.contains("exited with code 0"));
+        assert!(done.text.contains("late"), "{}", done.text);
         let unknown = crate::task_bridge::call(
             &endpoint,
             &crate::task_bridge::TaskBridgeRequest {
@@ -12529,6 +13600,102 @@ there]]></write_file>
         assert!(crate::task_bridge::call(&endpoint, &req(crate::task_bridge::TaskOp::State, None))
             .await
             .is_err());
+    }
+
+    /// A session host (simple Work Session TODO §3.1 / §3.6 / §3.8): the
+    /// wait is the runtime's (no `wait_ms`, no `wait_task`), the standard
+    /// tools take an optional intent, the task followup is said once and a
+    /// file read again unchanged is one line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_host_shell_is_followed_by_input() {
+        let env = Env::new();
+        std::fs::write(env.workdir.join("notes.txt"), "alpha\nbeta\n").unwrap();
+        let cfg = json!({
+            "tools": { "enabled": true, "tools": [{"groupname": "bash"}] },
+            "runtime": {"task_wait_ms": 200}
+        });
+        let mut deps = env.deps(ScriptedLlm::new(vec![]));
+        deps.host_protocol = HostProtocolFlavor::Session {
+            intro: "intro".into(),
+        };
+        let hosted = XllmTask::prepare_hosted(&env.workdir, &cfg, "s.json", "", &deps)
+            .await
+            .unwrap();
+        let names: Vec<String> = hosted.config.tools.native.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(
+            names,
+            ["read_file", "write_file", "edit_file", "shell", "cancel_task"]
+        );
+        let manager = hosted.manager;
+        let specs = manager.list_tool_specs();
+        let shell = specs.iter().find(|t| t.name == TOOL_SHELL).unwrap();
+        assert!(shell.args_schema["properties"].get("wait_ms").is_none(), "{}", shell.args_schema);
+        assert!(!shell.description.contains("wait_ms"), "{}", shell.description);
+        assert!(shell.description.contains("comes back to you as input"), "{}", shell.description);
+        assert!(shell.args_schema["properties"]["intent"].is_object());
+        assert_eq!(shell.args_schema["required"], json!(["command"]));
+        let cancel = specs.iter().find(|t| t.name == "cancel_task").unwrap();
+        assert!(cancel.args_schema["properties"].get("intent").is_none());
+
+        let call = |command: &str, id: &str, intent: Option<&str>| {
+            let mut args = HashMap::from([("command".to_string(), Value::String(command.into()))]);
+            if let Some(i) = intent {
+                args.insert("intent".to_string(), Value::String(i.into()));
+            }
+            AiToolCall {
+                name: TOOL_SHELL.into(),
+                args,
+                call_id: id.into(),
+            }
+        };
+        // A model-given wait_ms is not the model's to choose here.
+        let mut long = call("sleep 1; echo built", "c1", Some("build it"));
+        long.args.insert("wait_ms".into(), json!(5000));
+        let obs = manager.call_tool(long, ToolCallCtx::noop()).await.unwrap();
+        let Observation::Success { content, host, .. } = obs else { panic!("{obs:?}") };
+        let text = content.as_str().unwrap();
+        assert!(text.contains("it continues as task local:shell:c1"), "{text}");
+        assert!(text.contains("<runtime_hints>") && text.contains("comes back to you as input"), "{text}");
+        assert!(!text.contains("wait_task") && !text.contains("task wait"), "{text}");
+        assert_eq!(manager.intent_of("c1").as_deref(), Some("build it"));
+        assert_eq!(
+            ToolResultView::from_host(&host).unwrap().hint_texts().len(),
+            1,
+            "the hint travels in the envelope too"
+        );
+        let obs = manager
+            .call_tool(call("sleep 1; echo again", "c2", None), ToolCallCtx::noop())
+            .await
+            .unwrap();
+        let Observation::Success { content, .. } = obs else { panic!("{obs:?}") };
+        let text = content.as_str().unwrap();
+        assert!(text.contains("local:shell:c2") && !text.contains("<runtime_hints>"), "said once: {text}");
+        assert!(manager.intent_of("c2").is_none());
+
+        let read = |id: &str| AiToolCall {
+            name: crate::TOOL_READ_FILE.into(),
+            args: HashMap::from([("path".to_string(), Value::String("notes.txt".into()))]),
+            call_id: id.into(),
+        };
+        let first = manager.call_tool(read("r1"), ToolCallCtx::noop()).await.unwrap();
+        let Observation::Success { content, .. } = first else { panic!("{first:?}") };
+        assert!(content.as_str().unwrap().contains("beta"), "{content}");
+        let again = manager.call_tool(read("r2"), ToolCallCtx::noop()).await.unwrap();
+        let Observation::Success { content, .. } = again else { panic!("{again:?}") };
+        assert_eq!(
+            content.as_str().unwrap(),
+            "`notes.txt` is unchanged since you read it earlier in this run; use that content."
+        );
+        std::fs::write(env.workdir.join("notes.txt"), "alpha\ngamma\n").unwrap();
+        let changed = manager.call_tool(read("r3"), ToolCallCtx::noop()).await.unwrap();
+        let Observation::Success { content, .. } = changed else { panic!("{changed:?}") };
+        assert!(content.as_str().unwrap().contains("gamma"), "{content}");
+        // A rewritten history no longer holds the earlier read.
+        manager.clear_dedup();
+        let after = manager.call_tool(read("r4"), ToolCallCtx::noop()).await.unwrap();
+        let Observation::Success { content, .. } = after else { panic!("{after:?}") };
+        assert!(content.as_str().unwrap().contains("gamma"), "{content}");
     }
 
     #[tokio::test]
@@ -12653,6 +13820,130 @@ there]]></write_file>
     }
 
     #[tokio::test]
+    async fn context_yield_ratio_sets_the_compaction_threshold() {
+        for (config, ratio, recorded) in [
+            ("context_window: 100000\ncontext_yield_ratio: 0.5\n", 0.5, Some(0.5)),
+            ("context_window: 100000\n", DEFAULT_CONTEXT_YIELD_RATIO, None),
+        ] {
+            let env = Env::new();
+            env.write("project/.llm_context", config);
+            let llm = ScriptedLlm::new(vec![text("done")]);
+            let o = env
+                .run(TaskInput::question("hello"), env.overrides(), llm)
+                .await
+                .unwrap();
+            assert!(matches!(o, RunOutcome::Completed(_)), "{:?}", o.record().last_error);
+            // Read back from run.json.
+            let rec = env.store().read_record(&o.record().run_id).unwrap();
+            assert_eq!(rec.config.limits.context_yield_ratio, recorded, "{config}");
+            let snap = env
+                .store()
+                .get_snapshot(&rec.run_id, rec.latest_snapshot_idx.unwrap())
+                .unwrap();
+            assert_eq!(
+                snap.request.budget.context_yield_threshold,
+                Some(ContextThreshold::Ratio { value: ratio }),
+                "{config}"
+            );
+        }
+        assert_eq!(DEFAULT_CONTEXT_YIELD_RATIO, 0.8);
+        // A record written before the key existed: the default ratio.
+        let old: RunLimits = serde_json::from_value(json!({
+            "max_tool_iterations": 4, "timeout_secs": 60, "llm_timeout_secs": 60,
+            "context_window_tokens": 1000
+        }))
+        .unwrap();
+        assert_eq!(old.context_yield_ratio, None);
+        assert_eq!(
+            context_yield_threshold(&old),
+            Some(ContextThreshold::Ratio { value: 0.8 })
+        );
+        assert!(!serde_json::to_value(&old)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("context_yield_ratio"));
+    }
+
+    #[test]
+    fn compaction_lands_below_the_yield_threshold() {
+        let limits = |window: Option<u32>, ratio: Option<f32>| RunLimits {
+            max_tokens: None,
+            max_tool_iterations: 4,
+            timeout_secs: 60,
+            llm_timeout_secs: 60,
+            context_window_tokens: window,
+            context_yield_ratio: ratio,
+        };
+        assert_eq!(compaction_target_tokens(&limits(None, None)), 32_768);
+        // 30% of the window, the default cap above it.
+        assert_eq!(compaction_target_tokens(&limits(Some(20_000), None)), 6_000);
+        assert_eq!(compaction_target_tokens(&limits(Some(400_000), None)), 32_768);
+        // Never above half a low yield line.
+        assert_eq!(compaction_target_tokens(&limits(Some(20_000), Some(0.5))), 5_000);
+        assert_eq!(compaction_target_tokens(&limits(Some(20_000), Some(0.4))), 4_000);
+    }
+
+    #[test]
+    fn context_yield_ratio_must_be_in_zero_one() {
+        let path = Path::new(".llm_context");
+        for raw in [
+            "context_yield_ratio: 1.5\n",
+            "context_yield_ratio: 0\n",
+            "context_yield_ratio: -0.2\n",
+            "context_yield_ratio: high\n",
+        ] {
+            let err = parse_llm_context_file(path, raw).unwrap_err();
+            assert!(matches!(err, XllmError::Config { .. }), "{raw}: {err}");
+            assert!(err.to_string().contains("context_yield_ratio"), "{err}");
+        }
+        for (raw, ratio) in [("context_yield_ratio: 1\n", 1.0), ("context_yield_ratio: 0.25\n", 0.25)] {
+            let file = parse_llm_context_file(path, raw).unwrap();
+            assert_eq!(file.context_yield_ratio, Some(ratio));
+        }
+    }
+
+    #[tokio::test]
+    async fn context_yield_ratio_without_a_window_only_warns() {
+        struct Warnings(StdMutex<Vec<String>>);
+        impl RunObserver for Warnings {
+            fn on_event(&self, _run_id: &str, event: RunEvent) {
+                if let RunEvent::Warning(w) = event {
+                    self.0.lock().unwrap().push(w);
+                }
+            }
+        }
+        let env = Env::new();
+        env.write("project/.llm_context", "context_yield_ratio: 0.5\n");
+        let warnings = Arc::new(Warnings(StdMutex::new(Vec::new())));
+        let deps = env
+            .deps(ScriptedLlm::new(vec![text("done")]))
+            .with_observer(warnings.clone());
+        let prepared = XllmTask::prepare(
+            &env.workdir,
+            TaskInput::question("hello"),
+            env.overrides(),
+            &deps,
+        )
+        .await
+        .unwrap();
+        let mut run = XllmRun::start(prepared, deps).await.unwrap();
+        let o = run.execute().await.unwrap();
+        assert!(matches!(o, RunOutcome::Completed(_)), "{:?}", o.record().last_error);
+        let warnings = warnings.0.lock().unwrap().clone();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("context_yield_ratio"), "{}", warnings[0]);
+        assert!(warnings[0].contains("project/.llm_context"), "{}", warnings[0]);
+        let rec = o.record();
+        let snap = env
+            .store()
+            .get_snapshot(&rec.run_id, rec.latest_snapshot_idx.unwrap())
+            .unwrap();
+        assert_eq!(snap.request.budget.context_yield_threshold, None);
+        assert_eq!(snap.request.budget.context_window_tokens, None);
+    }
+
+    #[tokio::test]
     async fn behavior_context_refusal_rewrites_the_materialized_steps() {
         let env = Env::new();
         env.write(
@@ -12690,7 +13981,7 @@ there]]></write_file>
     }
 
     #[tokio::test]
-    async fn resume_takes_over_suspended_snapshots_explicitly() {
+    async fn resume_takes_over_a_context_limit_snapshot() {
         let env = Env::new();
         let llm = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
             ProviderFailure::Transient,
@@ -12713,110 +14004,9 @@ there]]></write_file>
             .get_snapshot(&run_id, o.record().latest_snapshot_idx.unwrap())
             .unwrap();
 
-        // Saved while waiting for a task of a task manager xllm cannot
-        // reach: refused.
-        let pending_call = AiToolCall {
-            name: crate::tasks::TOOL_WAIT_TASK.into(),
-            args: HashMap::from([("task_id".to_string(), Value::String("bucky:42".into()))]),
-            call_id: "c1".into(),
-        };
-        let mut pending = base.clone();
-        pending.state.accumulated.push(AiMessage::new(
-            AiRole::Assistant,
-            vec![AiContent::tool_use(
-                "c1".to_string(),
-                crate::tasks::TOOL_WAIT_TASK.to_string(),
-                pending_call.args.clone(),
-            )],
-        ));
-        pending.state.tool_batch = Some(llm_context::state::ToolBatch::default());
-        pending.state.suspended = Some(Suspension::PendingTool {
-            pending: vec![llm_context::observation::PendingToolCall {
-                call: pending_call.clone(),
-                task_id: "bucky:42".into(),
-                until_ms: None,
-            }],
-            at_ms: now_ms(),
-        });
-        publish(&pending);
-        let err = XllmRun::resume(
-            &store,
-            Some(&run_id),
-            None,
-            ResumeLimits::default(),
-            env.deps(ScriptedLlm::new(vec![])),
-        )
-        .await
-        .err()
-        .expect("a run waiting on an unreachable task manager is not resumable");
-        assert!(err.to_string().contains("cannot reach"), "{err}");
-
-        let llm = ScriptedLlm::new(vec![text("continued external task")]);
-        let mut deps = env.deps(llm.clone());
-        deps.buckyos_tasks = Some(Arc::new(ExternalTasks));
-        let start = XllmRun::resume(&store, Some(&run_id), None, ResumeLimits::default(), deps)
-            .await
-            .unwrap();
-        let ResumeStart::Run(mut run) = start else {
-            panic!("expected run, got {start:?}")
-        };
-        let outcome = run.execute().await.unwrap();
-        assert!(matches!(outcome, RunOutcome::Completed(_)));
-        assert!(format!("{:?}", llm.seen()[0].messages).contains("external task completed"));
-        drop(run);
-        let mut rec = store.read_record(&run_id).unwrap();
-        rec.status = RunStatus::Paused;
-        rec.result = None;
-        store.write_record(&rec).unwrap();
-
-        // Saved while waiting for an in-process task this executor did not
-        // start: filled with the task's state (unknown) and continued.
-        if let Some(Suspension::PendingTool { pending: p, .. }) = pending.state.suspended.as_mut() {
-            p[0].task_id = "local:shell:nope".into();
-        }
-        publish(&pending);
-        let llm = ScriptedLlm::new(vec![text("continued after fill")]);
-        let start = XllmRun::resume(
-            &store,
-            Some(&run_id),
-            None,
-            ResumeLimits::default(),
-            env.deps(llm.clone()),
-        )
-        .await
-        .unwrap();
-        let ResumeStart::Run(mut run) = start else {
-            panic!("expected run, got {start:?}")
-        };
-        let o = run.execute().await.unwrap();
-        assert!(
-            matches!(o, RunOutcome::Completed(_)),
-            "{:?}",
-            o.record().last_error
-        );
-        let seen = llm.seen();
-        let filled = seen[0]
-            .messages
-            .iter()
-            .flat_map(|m| m.content.iter())
-            .find_map(|c| match c {
-                AiContent::ToolResult {
-                    call_id, content, ..
-                } if call_id == "c1" => Some(format!("{content:?}")),
-                _ => None,
-            })
-            .expect("filled result");
-        assert!(filled.contains("state unknown"), "{filled}");
-        drop(run);
-
-        // Saved at the context limit: compacted, then continued. (The run
-        // completed above; put it back into a resumable state first.)
-        let mut rec = store.read_record(&run_id).unwrap();
-        rec.status = RunStatus::Paused;
-        rec.result = None;
-        store.write_record(&rec).unwrap();
+        // Saved at the context limit: compacted, then continued.
         let mut limited = base;
-        limited.state.suspended = Some(Suspension::ContextLimit {
+        limited.state.suspended = Some(llm_context::state::Suspension {
             which: llm_context::outcome::ContextLimitKind::ProviderRefused,
             estimated_tokens: None,
             at_ms: now_ms(),
@@ -12845,6 +14035,202 @@ there]]></write_file>
         assert_eq!(llm.calls(), 1);
     }
 
+    #[tokio::test]
+    async fn a_failing_compaction_reports_its_error_once() {
+        let env = Env::new();
+        let llm = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
+            ProviderFailure::Transient,
+            "aicc down",
+        ))]);
+        let o = env
+            .run(TaskInput::question("hello"), env.overrides(), llm)
+            .await
+            .unwrap();
+        let run_id = o.record().run_id.clone();
+        let store = env.store();
+        let mut limited = store
+            .get_snapshot(&run_id, o.record().latest_snapshot_idx.unwrap())
+            .unwrap();
+        limited
+            .state
+            .accumulated
+            .push(AiMessage::text(AiRole::User, "material ".repeat(40_000)));
+        limited.state.suspended = Some(llm_context::state::Suspension {
+            which: llm_context::outcome::ContextLimitKind::ProviderRefused,
+            estimated_tokens: None,
+            at_ms: now_ms(),
+        });
+        let idx = store.put_snapshot(&run_id, &limited).unwrap();
+        let mut rec = store.read_record(&run_id).unwrap();
+        rec.latest_snapshot_idx = Some(idx);
+        store.write_record(&rec).unwrap();
+        let summarizer = ScriptedLlm::new(vec![Err(LLMComputeError::provider(
+            ProviderFailure::Transient,
+            "summarizer down",
+        ))]);
+        let start = XllmRun::resume(
+            &store,
+            Some(&run_id),
+            None,
+            ResumeLimits::default(),
+            env.deps(summarizer.clone()),
+        )
+        .await
+        .unwrap();
+        let ResumeStart::Run(mut run) = start else {
+            panic!("expected run")
+        };
+        let o = run.execute().await.unwrap();
+        assert!(matches!(o, RunOutcome::Failed(_)), "{:?}", o.status());
+        let err = o.record().last_error.clone().unwrap();
+        assert_eq!(err.kind, "context_compaction");
+        assert_eq!(
+            err.message.matches("context compaction failed").count(),
+            1,
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("summarizer down"), "{}", err.message);
+        assert_eq!(summarizer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_the_artifacts_of_earlier_segments() {
+        let env = Env::new();
+        let overrides = TaskOverrides {
+            tools: Some(true),
+            ..env.overrides()
+        };
+        let llm = ScriptedLlm::new(vec![
+            tool_call("write_file", json!({"path":"a.txt","content":"a"}), "c1"),
+            Err(LLMComputeError::provider(
+                ProviderFailure::Transient,
+                "aicc down",
+            )),
+        ]);
+        let o = env
+            .run(TaskInput::question("write two files"), overrides, llm)
+            .await
+            .unwrap();
+        assert!(matches!(o, RunOutcome::Paused(_)), "{:?}", o.status());
+        assert_eq!(o.record().artifacts.len(), 1);
+        let llm = ScriptedLlm::new(vec![
+            tool_call("write_file", json!({"path":"b.txt","content":"b"}), "c2"),
+            text("both written"),
+        ]);
+        let start = XllmRun::resume(
+            &env.store(),
+            Some(&o.record().run_id),
+            None,
+            ResumeLimits::default(),
+            env.deps(llm),
+        )
+        .await
+        .unwrap();
+        let ResumeStart::Run(mut run) = start else {
+            panic!("expected run")
+        };
+        let done = run.execute().await.unwrap();
+        assert!(
+            matches!(done, RunOutcome::Completed(_)),
+            "{:?}",
+            done.status()
+        );
+        let names: Vec<&str> = done
+            .record()
+            .artifacts
+            .iter()
+            .map(|a| a.rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(names, ["a.txt", "b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn host_wrap_up_tools_round_trip_through_the_run_snapshot() {
+        // A host-assembled run whose host set wrap-up tools: the persisted
+        // request carries them and xllm, resuming the run, honors them.
+        let env = Env::new();
+        let deps = env.deps(ScriptedLlm::new(vec![]));
+        let hosted = XllmTask::prepare_hosted(
+            &env.workdir,
+            &json!({"tools": {"enabled": true}}),
+            "s.json",
+            "HOST",
+            &deps,
+        )
+        .await
+        .unwrap();
+        let mut req = hosted.build_request(
+            json!({"kind": "one_shot", "id": "t"}),
+            "trace",
+            "objective",
+            "",
+            vec![
+                AiMessage::text(AiRole::System, hosted.prompt.system_prompt.clone()),
+                AiMessage::text(AiRole::User, "finish up"),
+            ],
+        );
+        assert!(req.tool_policy.wrap_up_tools.is_empty(), "the host's to set");
+        req.tool_policy.wrap_up_tools = vec![TOOL_SHELL.into()];
+        let mut snap = LLMContextSnapshot {
+            state: llm_context::state::LLMContextState::from_request(&req, now_ms()),
+            request: req,
+        };
+        snap.state.tool_iterations_left = 0;
+
+        let store = env.store();
+        store.ensure_writable().unwrap();
+        let run_id = store.create_run().unwrap();
+        let mut rec = hosted.new_record(
+            &run_id,
+            Some(&env.runs_dir),
+            "finish up",
+            HostRunInfo {
+                assembled_by: "test-host".into(),
+                session_id: None,
+                runtime_kind: None,
+                runtime_id: None,
+                env_check: Value::Null,
+                extra: Value::Null,
+            },
+        );
+        rec.status = RunStatus::Paused;
+        rec.latest_snapshot_idx = Some(store.put_snapshot(&run_id, &snap).unwrap());
+        store.write_record(&rec).unwrap();
+        let saved = store.get_snapshot(&run_id, rec.latest_snapshot_idx.unwrap()).unwrap();
+        assert_eq!(saved.request.tool_policy.wrap_up_tools, [TOOL_SHELL]);
+        assert_eq!(saved.request.tool_policy, snap.request.tool_policy);
+
+        let llm = ScriptedLlm::new(vec![
+            tool_call(TOOL_SHELL, json!({"command": "echo wrapped"}), "c1"),
+            text("done"),
+        ]);
+        let start = XllmRun::resume(
+            &store,
+            Some(&run_id),
+            None,
+            ResumeLimits::default(),
+            env.deps(llm.clone()),
+        )
+        .await
+        .unwrap();
+        let ResumeStart::Run(mut run) = start else {
+            panic!("expected run")
+        };
+        let o = run.execute().await.unwrap();
+        assert!(matches!(o, RunOutcome::Completed(_)), "{:?}", o.record().last_error);
+        let seen = llm.seen();
+        assert_eq!(seen.len(), 2);
+        for req in &seen {
+            assert!(req.allow_tool_calls);
+            assert_eq!(req.tool_names, [TOOL_SHELL], "only the wrap-up tool");
+        }
+        let rec = o.record();
+        let last = store.get_snapshot(&run_id, rec.latest_snapshot_idx.unwrap()).unwrap();
+        assert_eq!(last.state.tool_iterations_left, 0);
+        assert_eq!(last.state.wrap_up_rounds_used, 1);
+    }
+
     /// One-shot HTTP server answering every request with `status` + `body`.
     async fn serve_status(status: u16, body: &'static str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12864,30 +14250,51 @@ there]]></write_file>
         format!("http://{addr}/v1")
     }
 
+    async fn openai_infer_err(base: String) -> LLMComputeError {
+        let client = OpenAiLlmClient::new(Some(base), Some("k".into()), BTreeMap::new()).unwrap();
+        client
+            .infer(LlmInferenceRequest {
+                trace_id: None,
+                messages: vec![AiMessage::text(AiRole::User, "hi")],
+                model_alias: "m".into(),
+                fallbacks: Vec::new(),
+                temperature: None,
+                max_completion_tokens: None,
+                force_json: false,
+                json_schema: None,
+                provider_options: None,
+                disable_capabilities: Vec::new(),
+                tool_specs: Vec::new(),
+                allow_tool_calls: false,
+                abort: llm_context::InferenceAbortToken::noop(),
+            })
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn openai_401_403_are_credential_refusals() {
+        for status in [401, 403] {
+            let err = openai_infer_err(
+                serve_status(status, r#"{"error":{"message":"invalid api key"}}"#).await,
+            )
+            .await;
+            assert!(
+                matches!(
+                    &err,
+                    LLMComputeError::Provider {
+                        failure: ProviderFailure::Refused { code },
+                        ..
+                    } if code == REFUSED_CREDENTIALS
+                ),
+                "{status}: {err:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn openai_context_length_code_is_a_structured_context_limit() {
-        let infer = |base: String| async move {
-            let client =
-                OpenAiLlmClient::new(Some(base), Some("k".into()), BTreeMap::new()).unwrap();
-            client
-                .infer(LlmInferenceRequest {
-                    trace_id: None,
-                    messages: vec![AiMessage::text(AiRole::User, "hi")],
-                    model_alias: "m".into(),
-                    fallbacks: Vec::new(),
-                    temperature: None,
-                    max_completion_tokens: None,
-                    force_json: false,
-                    json_schema: None,
-                    provider_options: None,
-                    disable_capabilities: Vec::new(),
-                    tool_specs: Vec::new(),
-                    allow_tool_calls: false,
-                    abort: llm_context::InferenceAbortToken::noop(),
-                })
-                .await
-                .unwrap_err()
-        };
+        let infer = openai_infer_err;
         let err = infer(
             serve_status(
                 400,
@@ -12948,9 +14355,6 @@ impl XllmToolManager {
     pub fn runtime_info(&self) -> Option<&RuntimeInfo> {
         self.info.as_ref()
     }
-    fn attach_tracking(&mut self, store: RunStore, record: Arc<Mutex<RunRecord>>) {
-        self.tracking = Some(Arc::new(RunTracking { store, record }));
-    }
 }
 
 #[async_trait]
@@ -12977,48 +14381,4 @@ impl Sandbox for XllmToolManager {
     }
 }
 
-struct RunTracking {
-    store: RunStore,
-    record: Arc<Mutex<RunRecord>>,
-}
-impl RunTracking {
-    fn inflight(&self, call_id: &str, name: &str, args: &Value) -> Result<(), String> {
-        if name == "read_file" {
-            return Ok(());
-        }
-        let mut rec = self.record.lock().expect("record");
-        rec.inflight.push(InflightAction {
-            call_id: call_id.into(),
-            tool: name.into(),
-            args: args.clone(),
-            effect: "unknown".into(),
-            idempotency_key: None,
-            step_index: None,
-            started_at_ms: now_ms(),
-        });
-        self.store.write_record(&rec).map_err(|e| e.to_string())
-    }
-}
 
-/// Inert deps used to validate a fill before the real context is built.
-struct NoopLlm;
-#[async_trait]
-impl LlmClient for NoopLlm {
-    async fn infer(&self, _req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
-        Err(LLMComputeError::Internal("inert llm".into()))
-    }
-}
-struct NoopTools;
-#[async_trait]
-impl ToolManager for NoopTools {
-    async fn call_tool(
-        &self,
-        call: AiToolCall,
-        _ctx: ToolCallCtx,
-    ) -> Result<Observation, ToolDispatchError> {
-        Err(ToolDispatchError::not_started(format!(
-            "inert tool manager: {}",
-            call.name
-        )))
-    }
-}

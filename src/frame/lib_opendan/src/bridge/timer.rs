@@ -24,6 +24,8 @@ fn timers_of(cfg: &SessionConfig) -> Vec<(String, String, u64)> {
     cfg.subscriptions
         .iter()
         .filter_map(|s| match &s.source {
+            // Ticked by the runner while the session waits for its work.
+            SubscriptionSource::Timer { name } if name == TASK_WATCH_TIMER => None,
             SubscriptionSource::Timer { name } => {
                 let every = cfg
                     .extensions
@@ -85,6 +87,7 @@ impl EventBridge for TimerBridge {
                         summary: format!("timer {name} fired (every {every}s)"),
                         data_ref: None,
                         terminal: false,
+                        call_id: None,
                     },
                 );
                 match self.agent.sessions().post_input(&sid, &input).await {

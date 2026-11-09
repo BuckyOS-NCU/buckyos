@@ -26,7 +26,7 @@ struct Derived {
     limits: ExecutorLimits,
 }
 
-fn node_ids(input: &HashMap<String, String>) -> Vec<String> {
+pub(crate) fn node_ids(input: &HashMap<String, String>) -> Vec<String> {
     let mut ids: Vec<String> = input
         .keys()
         .filter_map(|k| {
@@ -613,6 +613,7 @@ mod tests {
                     computer,
                     target: AgentRuntimeTarget::Node { node_id: "ood1".into(), node_did: device_did.clone() },
                     baseline: None,
+                    grant: None,
                 },
             )]),
             default_runtime_id: Some("host".into()),

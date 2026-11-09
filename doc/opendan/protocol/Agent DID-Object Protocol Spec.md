@@ -60,7 +60,7 @@ src/frame/agent-did-object-lib:
 | `name-lib::DIDObjectCard` | DID Object Card 结构、`DIDObjectService` 解析、基础校验、JWT encode/decode 入口。 |
 | `name-lib::ObjectProfile` | TD-style Profile 结构、trait/property/action/event 声明解析、默认 endpoint resolution、IndexTrait 基础成员校验。 |
 | `name-client::DIDObjectClient` | 通过 Object URL 获取 Card/Profile，解析 property/action/event endpoint，读取 property，调用 action。 |
-| `buckyos-http-server::DIDObjectHttpServer` | 暴露 `did.json`、`profile.json`、`props/{name}`、`methods/{name}`、`events[/name]` 的 HTTP adapter。 |
+| `buckyos-http-server::DIDObjectHttpServer` | 暴露对象路径本身（Card，`?type=profile` 为 Profile）、目录型 `did.json`、`profile.json`、`props/{name}`、`methods/{name}`、`events[/name]` 的 HTTP adapter；请求头与 query 进入 `DIDObjectRequestContext`，供 Provider 鉴权。 |
 | `DIDObjectServer` trait | 对象服务实现入口：`object_card_for`、`object_profile_for`、`read_property`、`invoke_action`、`handle_event_request`。 |
 | ObjURL pattern | 支持固定 Object URL、`/devices/{camera_id}`、`/devices/:camera_id` 和尾部 `*` pattern，把 path capture 放入 `DIDObjectRequestContext.object_params`。 |
 
@@ -166,11 +166,17 @@ resolve(input: ObjectURL | DID): Promise<ResolvedObjectCard>
 }
 ```
 
-默认 Web-compatible route 已在 `DIDObjectCard::default_card_url` 和 `DIDObjectClient::resolve_card` 中实现：
+默认 Web-compatible route 以基础协议 §6.1 为准（2026-10-29 对齐）：
 
 ```text
-GET {object_url}/did.json
+路径型 Object URL（path 不以 / 结尾）：GET {object_url}，Card 在 body 或 BuckyOS-DID-Document 响应头
+目录型 Object URL（path 以 / 结尾）：  GET {object_url}did.json
+纯 DID（无对象子路径）：               /.well-known/did.json
 ```
+
+分类在拼 URL 之前完成，不能先去掉尾斜杠；query 不参与目录判断。`{object_url}/did.json` 只作为已配置 provider 的兼容路由保留。
+
+**当前实现**（2026-10-29 第 2 段已对齐）：`DIDObjectCard::default_card_url` 先按尾斜杠分类，路径型返回原 URL、目录型补 `did.json`（保留 query）；`DIDObjectClient::resolve_card` 从 `BuckyOS-DID-Document` 响应头或 body（JSON / JWT）取 Card，两者同时出现必须一致；`DIDObjectHttpServer` 对对象路径本身的 GET 返回 Card、`?type=profile` 返回 Profile，`{object}/did.json` 仍作为目录型入口。BuckyOS 服务的 Provider 统一用 `buckyos_api::KrpcObjectProvider`（`/kapi/<host>/obj/<path>`）。
 
 `DIDObjectClient::resolve(object_url)` 当前返回：
 
@@ -184,25 +190,27 @@ ResolvedDIDObject {
 
 其中：
 
-- `object_url` 会做 trim 和去尾部 `/` 的规范化。
-- `object_card` 来自 `GET {object_url}/did.json`，并通过 `DIDObjectCard::validate()` 做基础结构校验。
+- `object_url` 目前会做 trim 和去尾部 `/` 的规范化（与 §6.1 冲突，待改）。
+- `object_card` 按 §4 的发现规则获取（路径型直取、目录型补 `did.json`），并通过 `DIDObjectCard::validate()` 做基础结构校验。
 - `object_profile` 根据 `DIDObjectService.serviceEndpoint` 和 `profile` 解析 URL 后 GET，并通过 `ObjectProfile::validate()` 做基础结构校验。
 
 当前 `DIDObjectClient` 的主入口是 Object URL；DID 解析路径仍主要由 `NameClient` / provider 层处理，例如测试中通过 `NameClient::resolve_did()` 解析 `did:web:127.0.0.1%3A...`。
 
 BuckyOS Runtime MAY 支持 local registry、Zone registry、BNS、DID resolver cache、host manifest 或预配置 DID Object Host。无论 route 如何，最终都必须得到合法且可验证的 DID Object Card。
 
-### 4.1 obj:// 兼容
+### 4.1 obj:// 规则
 
-v1 核心协议不要求 `obj://`。如果 Gateway 层继续使用：
+v1 核心协议不要求 `obj://`。BuckyOS Agent Runtime 使用 `obj://` 作为语义引用，规则定稿在 [key url.md](../../key%20url.md) §4（2026-10-29 裁决 D4 / D5 / D6 / D11）：
 
 ```text
-obj://booking.com/stay.offer/abc123
+obj://<service>/<inner-path>      current zone 的系统服务对象：config / dfs / taskmgr / kmsg / bucket / msg-center / aiworkspace / homestation / opendan ...
+obj://<entity-id>/<inner-path>    实体对象，host 是带 Zone 的 DID canonical hostname，例如 obj://xiaobai.test.buckyos.io/sessions/<sid>
 ```
 
-它必须被视为上层 semantic URI 或 resolver input。进入 `agent-did-object-lib`、DID Object data/control plane 前，Gateway SHOULD 把它解析为 Object URL。
-
-`obj://` MUST NOT 直接作为 property/action/event 的 wire endpoint。
+- 服务名不展开（没有 `obj://config.alice.bns.did/` 形式），只在 current zone 内有意义；跨 Zone 引用服务对象用 https Object URL。
+- 不做类型简写（`obj://task_xxx/` 废弃，写 `obj://taskmgr/task_xxx`）；NamedObject id 不进 host，内容对象用 `cyfs://<objid>/`。
+- Agent 自身对象以 agent-id 为 authority；`agent://self` 废弃。
+- `obj://` 是 resolver input，MUST NOT 直接作为 property/action/event 的 wire endpoint；进入 `agent-did-object-lib`、DID Object data/control plane 前先解析为 Object URL（由服务的 Provider route 或 Card 决定，不从字符串推）。
 
 当前 `buckyos-base` 框架没有实现 `obj://` wire binding；`DIDObjectHttpServer` 的 ObjURL pattern 是 Object URL path pattern，不是 `obj://` scheme。
 
@@ -840,11 +848,7 @@ Resolver 或 Runtime MAY 为 DID Object Card / endpoint response 附加 trust me
 
 核心协议只要求 Runtime 能从 Object URL / DID 得到 verified DID Object Card。resolver 算法是实现细节。
 
-默认 route：
-
-```text
-GET {object_url}/did.json
-```
+默认 route 与基础协议 §6.1 一致（见本文 §4）：路径型 Object URL 直取，目录型补 `did.json`，纯 DID 走 `/.well-known/did.json`；`{object_url}/did.json` 只是兼容路由。
 
 原生 DID Object Host 可以暴露 host-level manifest：
 

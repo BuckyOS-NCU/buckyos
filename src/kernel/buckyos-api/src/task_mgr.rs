@@ -390,14 +390,14 @@ impl FromStr for StorageDomain {
 /// Default policy preset applied when a create request does not name one.
 pub const TASK_POLICY_PRESET_COLLABORATIVE_TREE_V1: &str = "collaborative-tree/v1";
 
-/// KEvent path for a single task's change notifications.
+/// KEvent path for a single task's change notifications: `obj://taskmgr/<task_id>` event `changed`.
 pub fn task_mgr_task_event_path(task_id: &str) -> String {
-    format!("/task_mgr/{}", task_id)
+    crate::obj_event_key("taskmgr", &[task_id], "changed")
 }
 
-/// KEvent path fanning out every event under a task tree.
+/// KEvent path fanning out every event under a task tree: `obj://taskmgr/<root_id>` event `tree`.
 pub fn task_mgr_tree_event_path(root_id: &str) -> String {
-    format!("/task_mgr/tree/{}", root_id)
+    crate::obj_event_key("taskmgr", &[root_id], "tree")
 }
 
 // ---------------------------------------------------------------------------
@@ -443,20 +443,28 @@ pub fn task_mgr_error(code: &str, detail: impl fmt::Display) -> RPCErrors {
     }
 }
 
-/// Extract the stable TaskMgr error code from an RPC error, if present.
+/// Extract the stable TaskMgr error code from an RPC error, if present. The
+/// kRPC client wraps the server's text (`rpc call error: Failed due to
+/// reason: <code>: ...`), so the first code standing as a whole word counts.
 pub fn task_mgr_error_code(err: &RPCErrors) -> Option<&'static str> {
     let text = match err {
         RPCErrors::ReasonError(msg) | RPCErrors::NoPermission(msg) => msg.as_str(),
         _ => return None,
     };
+    let bound = |c: Option<char>| c.map_or(true, |c| c == ':' || c.is_whitespace());
     TASK_ERR_CODES
         .iter()
-        .find(|code| {
-            text.strip_prefix(**code)
-                .map(|rest| rest.is_empty() || rest.starts_with(':'))
-                .unwrap_or(false)
+        .filter_map(|code| {
+            text.match_indices(*code)
+                .map(|(at, _)| at)
+                .find(|&at| {
+                    bound(text[..at].chars().next_back())
+                        && bound(text[at + code.len()..].chars().next())
+                })
+                .map(|at| (at, *code))
         })
-        .copied()
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, code)| code)
 }
 
 // ---------------------------------------------------------------------------
@@ -3303,6 +3311,24 @@ mod tests {
 
         let unrelated = RPCErrors::ReasonError("task_not_found_elsewhere: x".into());
         assert_eq!(task_mgr_error_code(&unrelated), None);
+
+        // As the kRPC client returns a server's error.
+        let over_krpc = |e: RPCErrors| RPCErrors::ReasonError(format!("rpc call error: {e}"));
+        let missing = over_krpc(task_mgr_error(TASK_ERR_NOT_FOUND, "work-981e"));
+        assert_eq!(task_mgr_error_code(&missing), Some(TASK_ERR_NOT_FOUND));
+        let denied = over_krpc(task_mgr_error(TASK_ERR_PERMISSION_DENIED, "no Control action"));
+        assert_eq!(
+            task_mgr_error_code(&denied),
+            Some(TASK_ERR_PERMISSION_DENIED)
+        );
+        let first = over_krpc(task_mgr_error(
+            TASK_ERR_REVISION_CONFLICT,
+            "retry after task_not_found",
+        ));
+        assert_eq!(
+            task_mgr_error_code(&first),
+            Some(TASK_ERR_REVISION_CONFLICT)
+        );
     }
 
     #[test]

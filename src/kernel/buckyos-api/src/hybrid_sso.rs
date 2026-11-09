@@ -23,6 +23,9 @@ pub enum AuthMethod {
     /// An App signed its external customer in with a one-time code it obtained
     /// from Control Panel (self-host-group-extension TODO EXT-09).
     AppAccessToken,
+    /// A device of another Zone vouched for its user or Agent with a signed assertion
+    /// (doc/arch/verify-hub/跨Zone登录断言契约.md).
+    CrossZoneAssertion,
 }
 
 impl AuthMethod {
@@ -33,6 +36,7 @@ impl AuthMethod {
             Self::DidFederation => "did_federation",
             Self::Assertion => "assertion",
             Self::AppAccessToken => "app_access_token",
+            Self::CrossZoneAssertion => "cross_zone_assertion",
         }
     }
 
@@ -43,6 +47,7 @@ impl AuthMethod {
             "did_federation" => Some(Self::DidFederation),
             "assertion" => Some(Self::Assertion),
             "app_access_token" => Some(Self::AppAccessToken),
+            "cross_zone_assertion" => Some(Self::CrossZoneAssertion),
             _ => None,
         }
     }
@@ -64,15 +69,18 @@ pub enum SessionScope {
     /// account may use still comes from the visibility policy of its groups.
     #[serde(rename = "aicc")]
     Aicc,
+    /// Another Zone delivering to an inbox of this Zone (`/kapi/msg-center/<did>/inbox`).
+    MsgInbox,
 }
 
 impl SessionScope {
-    pub const ALL: [SessionScope; 5] = [
+    pub const ALL: [SessionScope; 6] = [
         SessionScope::AccountSelf,
         SessionScope::MsgGroup,
         SessionScope::AiWorkspace,
         SessionScope::HomeStation,
         SessionScope::Aicc,
+        SessionScope::MsgInbox,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -82,6 +90,7 @@ impl SessionScope {
             Self::AiWorkspace => "aiworkspace",
             Self::HomeStation => "homestation",
             Self::Aicc => "aicc",
+            Self::MsgInbox => "msg_inbox",
         }
     }
 
@@ -113,7 +122,14 @@ impl SessionCeiling {
     /// Ceiling of an account session by its current type.
     pub fn for_user_type(user_type: UserType) -> Self {
         match user_type {
-            UserType::Limited => Self::restricted(SessionScope::ALL),
+            // `msg_inbox` belongs to cross-Zone logins only.
+            UserType::Limited => Self::restricted([
+                SessionScope::AccountSelf,
+                SessionScope::MsgGroup,
+                SessionScope::AiWorkspace,
+                SessionScope::HomeStation,
+                SessionScope::Aicc,
+            ]),
             UserType::Admin | UserType::User | UserType::Root => Self::unrestricted(),
         }
     }
@@ -546,7 +562,8 @@ pub struct EntryResource {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_name: Option<String>,
-    /// Zone-relative path of the resource page.
+    /// The resource page: an absolute URL when the resource lives on its own origin (an AI Workspace on
+    /// `aiws-<id>.<zone>`, 内核架构改进 T4-8), else a Zone-relative path.
     pub path: String,
 }
 
@@ -776,7 +793,7 @@ impl ExclusiveInvite {
             return Err(InviteLoginRefusal::Consumed);
         }
         if self.credential.state != InviteCredentialState::Active
-            || !constant_time_eq(self.credential.digest.as_bytes(), digest.as_bytes())
+            || !name_lib::bearer_token::digests_equal(&self.credential.digest, digest)
         {
             return Err(InviteLoginRefusal::LinkReplaced);
         }
@@ -889,11 +906,9 @@ pub fn owner_canonical_zone(owner: &name_lib::OwnerDocument) -> name_lib::DID {
         .unwrap_or_else(|| owner.id.clone())
 }
 
-/// base64url(sha256(secret)) as stored in invite records.
+/// What invite records keep instead of the secret (`name_lib::bearer_token::digest`).
 pub fn invite_secret_digest(secret: &str) -> String {
-    use base64::Engine;
-    use sha2::Digest;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(secret.as_bytes()))
+    name_lib::bearer_token::digest(secret)
 }
 
 #[cfg(test)]

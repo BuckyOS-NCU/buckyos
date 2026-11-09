@@ -65,6 +65,7 @@ import { MobileWindowSheet } from './windows/MobileWindowSheet'
 import {
   desktopAvatarRowHeight,
   desktopWorkspaceInsets,
+  mobilePagerRowHeight,
   mobileStatusBarHeight,
   mobileStatusBarMode,
   type ConnectionState,
@@ -180,7 +181,9 @@ function useGridSpec(
       const entry = entries[0]
       if (!entry) return
       const w = entry.contentRect.width
-      const h = entry.contentRect.height
+      // The mobile slide's own padding is not grid space (desktop reserves room for the dots inside the
+      // slide, so its rows are computed from the whole height as before).
+      const h = entry.contentRect.height - (isMobile ? mobileSlidePaddingY : 0)
       const nextCols = isMobile ? 4 : columnsForWidth(w)
       setCols(nextCols)
       setContainerHeight(h)
@@ -225,6 +228,13 @@ const zeroDeadZone = { top: 0, bottom: 0, left: 0, right: 0 }
 
 // Launcher offset below the mobile home status bar.
 const mobileLauncherTopInset = 42
+// Breathing room of a mobile launcher page: 8px a side (vertical total 16), see the slide below. The side
+// padding is tight on purpose: four columns on a 390px phone leave 89px per cell, which is what an 11px
+// label like "HomeStation" needs on one line.
+const mobileSlidePaddingX = 8
+const mobileSlidePaddingY = 16
+// Selector of the pager row below the launcher; Swiper draws the mobile page dots into it.
+const mobilePagerSelector = '.desktop-mobile-pager'
 
 // Overlap-tolerant compactor: react-grid-layout must NOT displace other
 // items while dragging (its null-compactType collision pass shoves items
@@ -766,11 +776,13 @@ export function DesktopRoute() {
     formFactor === 'mobile'
       ? safeArea.top + (topMobileWindow ? resolvedDeadZone.top : mobileLauncherTopInset)
       : safeArea.top + desktopAvatarRowHeight
+  // On mobile the launcher stops above the pager row (page dots) and the bottom safe area. The row is
+  // reserved even while an app's sheet covers it, so opening an app never re-pages the launcher.
+  const mobilePagerInset = resolvedDeadZone.bottom + safeArea.bottom
+  const workspaceBottomPadding =
+    formFactor === 'mobile' ? mobilePagerInset + mobilePagerRowHeight : resolvedDeadZone.bottom + safeArea.bottom
   const workspaceInnerHeight = Math.max(
-    workspaceSize.height -
-      workspaceTopPadding -
-      resolvedDeadZone.bottom -
-      safeArea.bottom,
+    workspaceSize.height - workspaceTopPadding - workspaceBottomPadding,
     360,
   )
   const shouldLockDesktopViewport = formFactor === 'desktop'
@@ -889,9 +901,10 @@ export function DesktopRoute() {
                 ref={setGridContainer}
                 className="relative overflow-hidden"
                 data-density={density}
+                data-form-factor={formFactor}
                 style={{
                   paddingTop: workspaceTopPadding,
-                  paddingBottom: resolvedDeadZone.bottom + safeArea.bottom,
+                  paddingBottom: workspaceBottomPadding,
                   paddingLeft: resolvedDeadZone.left + safeArea.left + desktopWorkspaceLeftInset,
                   paddingRight: resolvedDeadZone.right + safeArea.right,
                 }}
@@ -912,9 +925,19 @@ export function DesktopRoute() {
                   onSaveNote={handleSaveNote}
                   onViewportProgress={handleViewportProgress}
                   selectedItemId={selectedItemId}
-                  width={workspaceInnerWidth - (isMobile ? 32 : 48)}
+                  width={workspaceInnerWidth - (isMobile ? mobileSlidePaddingX * 2 : 48)}
                 />
               </div>
+
+              {isMobile && (
+                <div
+                  data-testid="mobile-pager"
+                  className="pointer-events-none absolute inset-x-0 z-30"
+                  style={{ bottom: mobilePagerInset, height: mobilePagerRowHeight }}
+                >
+                  <div className="swiper-pagination desktop-mobile-pager pointer-events-auto" style={{ height: mobilePagerRowHeight }} />
+                </div>
+              )}
 
               {!isMobile && (
                 <DesktopWindowLayer
@@ -1158,7 +1181,8 @@ const DesktopPages = memo(function DesktopPages({
     <Swiper
       modules={[Pagination]}
       allowTouchMove={isMobile}
-      pagination={{ clickable: true }}
+      // Mobile dots go into the dock strip (DesktopRoute); desktop keeps them inside the pages.
+      pagination={isMobile ? { clickable: true, el: mobilePagerSelector } : { clickable: true }}
       className="h-full"
       style={{ height }}
       onSwiper={handleSlideSettled}
@@ -1167,7 +1191,7 @@ const DesktopPages = memo(function DesktopPages({
     >
       {layout.pages.map((page, pageIndex) => (
         <SwiperSlide key={page.id} className="h-full">
-          <div className="h-full px-4 pb-16 pt-6 sm:px-6">
+          <div className={isMobile ? 'h-full px-2 py-2' : 'h-full px-6 pb-16 pt-6'}>
             <GridLayoutBase
               className="layout h-full"
               gridConfig={gridConfig}

@@ -79,7 +79,6 @@ pub fn observation_view(o: &Observation) -> (String, String) {
             },
         ),
         Observation::Error { message, .. } => ("error".into(), message.clone()),
-        Observation::Pending { .. } => ("pending".into(), String::new()),
         Observation::Cancelled { reason, .. } => ("cancelled".into(), reason.clone()),
         Observation::Unresolved {
             reason,
@@ -104,6 +103,7 @@ fn action_entries(calls: &[buckyos_api::AiToolCall]) -> Vec<ActionEntry> {
             args: canonical_args(&c.args),
             call_id: c.call_id.clone(),
             tool: c.name.clone(),
+            intent: agent_tool::intent::intent_of(c),
         })
         .collect()
 }
@@ -311,6 +311,8 @@ pub fn run_history_entries(
                             brief: r.parts[n].brief.clone(),
                         });
                     }
+                    // The host's budget lines are the model's view only.
+                    None if super::budget::is_budget_line(&m.text_content()) => {}
                     None => out.push(WorklogBody::UserMessage {
                         run_id: run_id.to_string(),
                         turn,

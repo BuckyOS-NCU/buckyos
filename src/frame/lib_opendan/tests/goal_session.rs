@@ -1,4 +1,4 @@
-//! Goal Sessions (notepads/opendan-goal-session-todo.md, phase 1): Goals and
+//! Goal Sessions (notepads/done/opendan-goal-session-todo.md, phase 1): Goals and
 //! their Goal Sessions hosted by a Supervisor with a hand-moved clock and a
 //! scripted LLM. Acceptance ids (V01…) refer to §5 of the TODO.
 
@@ -33,7 +33,10 @@ struct Hosted {
 }
 
 fn host_deps(env: &Env, llm: Arc<ScriptedLlm>) -> HostDeps {
-    let deps = env.deps(llm);
+    let mut deps = env.deps(llm);
+    // A retryable error is retried almost at once here (the backoff:
+    // tests/retry.rs).
+    deps.options.retry_backoff_base = Duration::from_millis(50);
     HostDeps {
         who: APP.into(),
         agent: deps.agent.clone(),
@@ -44,6 +47,7 @@ fn host_deps(env: &Env, llm: Arc<ScriptedLlm>) -> HostDeps {
         session_cli: None,
         session_helpers: Vec::new(),
         app_tools: Vec::new(),
+        context_windows: None,
         options: deps.options.clone(),
         max_child_concurrency: 4,
         bridges: Vec::new(),
@@ -53,6 +57,7 @@ fn host_deps(env: &Env, llm: Arc<ScriptedLlm>) -> HostDeps {
         notify: None,
         share: None,
         runtime_id: None,
+        notifier: None,
     }
 }
 
@@ -149,6 +154,21 @@ fn is_goal_req(req: &LlmInferenceRequest) -> bool {
     render(&req.messages).contains("(goal session)")
 }
 
+/// The result of `call_id` in the current Activation: the session history
+/// before its header carries the calls of the earlier ones.
+fn this_result(req: &LlmInferenceRequest, call_id: &str) -> Option<String> {
+    let from = req
+        .messages
+        .iter()
+        .rposition(|m| {
+            m.role == buckyos_api::AiRole::User && m.text_content().starts_with("<goal_activation")
+        })
+        .unwrap_or(0);
+    let mut current = req.clone();
+    current.messages = req.messages[from..].to_vec();
+    has_tool_result(&current, call_id)
+}
+
 fn report(result: Value) -> buckyos_api::AiResponse {
     tool_call(
         "r1",
@@ -184,13 +204,26 @@ async fn the_host_creates_one_goal_session_per_goal_and_epoch() {
     let g1 = h.agent.goals().create(&req, &owner()).await.unwrap();
     let g2 = h.agent.goals().create(&req, &owner()).await.unwrap();
     assert_eq!(g1.goal_id, g2.goal_id);
+    assert_eq!(g1.session.sid, g2.session.sid);
     assert_eq!(h.agent.goals().list().await.unwrap().len(), 1);
     // Written, not hosted yet: no session.
     assert!(h.agent.sessions().lookup(&g1.session.sid).await.unwrap().is_none());
     assert_eq!(
         g1.session.sid,
-        libopendan::ids::goal_session_id(AGENT, &g1.goal_id, 1)
+        h.agent
+            .sessions()
+            .reserve_id(
+                SessionKind::Goal,
+                &libopendan::ids::goal_session_key(AGENT, &g1.goal_id, 1),
+                None,
+            )
+            .await
+            .unwrap()
     );
+    let (date, number) = g1.session.sid.strip_prefix("goal-").unwrap().split_once('-').unwrap();
+    assert_eq!(date.len(), 8);
+    assert!(chrono::NaiveDate::parse_from_str(date, "%Y%m%d").is_ok());
+    assert!(number.parse::<u64>().unwrap() > 0);
     h.tick().await;
     h.tick().await;
     let goal_sessions: Vec<RegistryEntry> = h
@@ -205,6 +238,7 @@ async fn the_host_creates_one_goal_session_per_goal_and_epoch() {
     assert_eq!(goal_sessions.len(), 1);
     let e = &goal_sessions[0];
     assert_eq!(e.session_id, g1.session.sid);
+    assert_eq!(Path::new(&e.location).file_name().unwrap().to_str(), Some(e.session_id.as_str()));
     assert_eq!(e.goal_id.as_deref(), Some(g1.goal_id.as_str()));
     assert!(e.origin.is_none(), "a goal session has no parent");
     let cfg = SessionDir::open(&e.location).unwrap().config().unwrap();
@@ -291,7 +325,8 @@ async fn a_scheduled_slot_runs_one_activation_and_no_action_is_valid() {
     h.until("waiting", |h| {
         let s = h.session(&g.goal_id).state().unwrap();
         s.run_state == RunState::Waiting
-            && s.waiting_for.as_ref().map(|w| w.kind) == Some(WaitingKind::Event)
+            && !s.follows_work()
+            && !s.needs_input(true)
             && s.goal.as_ref().is_some_and(|g| !g.needs_flush())
     })
     .await;
@@ -376,7 +411,7 @@ async fn an_activation_out_of_budget_ends_alone() {
 async fn a_wrong_goal_result_is_refused_to_the_model() {
     let env = Env::new();
     let llm = ScriptedLlm::new(|req, _| {
-        match has_tool_result(req, "r1") {
+        match this_result(req, "r1") {
             Some(r) => {
                 assert!(r.contains("decision"), "{r}");
                 tool_call(
@@ -442,7 +477,7 @@ async fn work_created_by_an_activation_is_absorbed_later() {
         if !is_goal_req(req) {
             return work_reply(req, &rel);
         }
-        if act(req) == 1 && has_tool_result(req, "r1").is_none() {
+        if act(req) == 1 && this_result(req, "r1").is_none() {
             let sid = session_id_of(req);
             create_work(&root, &sid, "check item 1", "w1").unwrap();
             create_work(&root, &sid, "check item 2", "w2").unwrap();
@@ -592,12 +627,11 @@ async fn the_period_limit_skips_fires_and_refuses_work_but_absorbs_results() {
         if !is_goal_req(req) {
             return work_reply(req, &rel);
         }
-        let header = header_of(req);
-        if act(req) == 1 && has_tool_result(req, "r1").is_none() {
+        if act(req) == 1 && this_result(req, "r1").is_none() {
             create_work(&root, &session_id_of(req), "check item 1", "w1").unwrap();
             return report(json!({ "decision": "created_work" }));
         }
-        if act(req) == 2 && has_tool_result(req, "r1").is_none() {
+        if act(req) == 2 && this_result(req, "r1").is_none() {
             let err = create_work(&root, &session_id_of(req), "check item 2", "w2").unwrap_err();
             *seen.lock().unwrap() = Some(err.to_json()["kind"].as_str().unwrap().to_string());
         }
@@ -677,7 +711,7 @@ async fn a_paused_goal_holds_its_inputs_until_resumed() {
         if !is_goal_req(req) {
             return work_reply(req, &rel);
         }
-        if act(req) == 1 && has_tool_result(req, "r1").is_none() {
+        if act(req) == 1 && this_result(req, "r1").is_none() {
             create_work(&root, &session_id_of(req), "check item 1", "w1").unwrap();
             return report(json!({ "decision": "created_work" }));
         }
@@ -752,7 +786,7 @@ async fn archive_stops_the_session_and_its_work() {
         if !is_goal_req(req) {
             return work_reply(req, &release);
         }
-        if act(req) == 1 && has_tool_result(req, "r1").is_none() {
+        if act(req) == 1 && this_result(req, "r1").is_none() {
             create_work(&root, &session_id_of(req), "long work", "w1").unwrap();
             return report(json!({ "decision": "created_work" }));
         }
@@ -882,7 +916,7 @@ async fn restart_starts_a_fresh_context_that_takes_over_the_work() {
             return work_reply(req, &rel);
         }
         let header = header_of(req);
-        if header.contains("kind=\"created\"") && has_tool_result(req, "r1").is_none() {
+        if header.contains("kind=\"created\"") && this_result(req, "r1").is_none() {
             create_work(&root, &session_id_of(req), "slow work", "w1").unwrap();
             return report(json!({ "decision": "created_work", "pending": ["context of epoch 1"] }));
         }
@@ -1177,7 +1211,7 @@ async fn skills_control_and_feedback() {
     let root = env.root.clone();
     let llm = ScriptedLlm::new(move |req, _| {
         let header = header_of(req);
-        if act(req) == 1 && has_tool_result(req, "r1").is_none() {
+        if act(req) == 1 && this_result(req, "r1").is_none() {
             let sid = session_id_of(req);
             let queue = {
                 let env = Env::at(&root);
@@ -1522,7 +1556,7 @@ async fn a_run_opportunity_joining_an_open_activation_is_one_of_its_reasons() {
 /// V14 (notify TODO): the questions of an Activation reach the user as
 /// notifications — one per question text, a question that is no longer
 /// asked is canceled; the answer comes back as an `answer` Activation and
-/// the question records it. In a Goal `ask-user` points to `questions`.
+/// the question records it.
 #[tokio::test]
 async fn goal_questions_reach_the_user_and_answers_come_back() {
     use libopendan::notify::{LocalNotify, NotifyAnswer, NotifyHost, NotifyListReq, NotifyStatus};
@@ -1533,17 +1567,8 @@ async fn goal_questions_reach_the_user_and_answers_come_back() {
             return text("not a goal");
         }
         match act(req) {
-            1 if has_tool_result(req, "a1").is_none() => tool_call(
-                "a1",
-                "shell",
-                json!({ "command": "agent-session ask-user 'Which repository?'" }),
-            ),
-            1 => {
-                let r = has_tool_result(req, "a1").unwrap();
-                assert!(r.contains("put the question in `questions`"), "{r}");
-                report(json!({ "decision": "needs_info",
-                               "questions": ["Which repository should I watch?", "How often?"] }))
-            }
+            1 => report(json!({ "decision": "needs_info",
+                                "questions": ["Which repository should I watch?", "How often?"] })),
             2 => report(json!({ "decision": "needs_info",
                                 "questions": ["Which repository should I watch?"] })),
             _ => report(json!({ "decision": "acted", "distance": "watching" })),
@@ -1551,7 +1576,6 @@ async fn goal_questions_reach_the_user_and_answers_come_back() {
     });
     let mut deps = host_deps(&env, llm.clone());
     deps.notify = Some(local.clone());
-    deps.session_cli = Some(std::path::PathBuf::from(env!("CARGO_BIN_EXE_xagent")));
     let clock = ManualClock::at(libopendan::now_ms());
     let mut opts = GoalHostOptions::new(
         env.agent_root.join("sessions"),

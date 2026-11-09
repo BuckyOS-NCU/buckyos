@@ -22,10 +22,6 @@ const ENV_SCENARIO: &str = "LIBOPENDAN_TEST_SCENARIO";
 
 /// Content based scripts (the parent and the child must agree).
 fn script(name: &str) -> Arc<ScriptedLlm> {
-    script_for(name, None)
-}
-
-fn script_for(name: &str, _ctx: Option<(PathBuf, String)>) -> Arc<ScriptedLlm> {
     match name {
         "transient" => ScriptedLlm::fallible(|req: &LlmInferenceRequest, _| {
             if render(&req.messages).contains("second message") {
@@ -58,6 +54,10 @@ fn script_for(name: &str, _ctx: Option<(PathBuf, String)>) -> Arc<ScriptedLlm> {
         }
         "context_limit" => ScriptedLlm::fallible(|req: &LlmInferenceRequest, _| {
             let all = render(&req.messages);
+            // The history compressor of the rewrite.
+            if all.contains("history compressor") {
+                return Ok(text(&json!({ "summary": "ran echo one" }).to_string()));
+            }
             if has_tool_result(req, "c2").is_some() {
                 Ok(text("all done"))
             } else if has_tool_result(req, "c1").is_some() {
@@ -65,7 +65,7 @@ fn script_for(name: &str, _ctx: Option<(PathBuf, String)>) -> Arc<ScriptedLlm> {
                     failure: llm_context::error::ProviderFailure::ContextLimit,
                     message: "context_length_exceeded".into(),
                 })
-            } else if all.contains("<session_history>") && all.contains("[result #c1") {
+            } else if all.contains("<history_summary>") {
                 Ok(tool_call(
                     "c2",
                     "shell",
@@ -100,11 +100,16 @@ fn script_for(name: &str, _ctx: Option<(PathBuf, String)>) -> Arc<ScriptedLlm> {
                 text("<response><next_behavior>research</next_behavior></response>")
             }
         }),
+        // The call registers the branch, which starts once the caller
+        // stops acting; its result is the caller's next input.
         "subcall" => ScriptedLlm::new(|req: &LlmInferenceRequest, _| {
-            if has_tool_result(req, "f1").is_some() {
+            let last = last_user_text(req);
+            if last.contains("<process_result") {
                 text("final answer")
-            } else if last_user_text(req).contains("<sub_task") {
+            } else if last.contains("<sub_task") {
                 text("X is 42")
+            } else if has_tool_result(req, "f1").is_some() {
+                text("waiting for the research")
             } else {
                 tool_call(
                     "f1",
@@ -113,98 +118,8 @@ fn script_for(name: &str, _ctx: Option<(PathBuf, String)>) -> Arc<ScriptedLlm> {
                 )
             }
         }),
-        "ask" => {
-            let (queue_dir, queue) = _ctx.expect("the ask scenario posts the answer");
-            ScriptedLlm::new(move |req: &LlmInferenceRequest, _| {
-                if has_tool_result(req, "f1").is_some() {
-                    text("final answer")
-                } else if let Some(a) = has_tool_result(req, "q1") {
-                    assert!(a.contains("docs only"), "{a}");
-                    text("analysis: docs only")
-                } else if last_user_text(req).contains("<sub_task") {
-                    // The user answers while the question is out (once,
-                    // whichever process gets here).
-                    let marker = queue_dir.join("answered");
-                    if !marker.exists() {
-                        std::fs::write(&marker, "").unwrap();
-                        post_blocking(&queue_dir, &queue, msg("docs only"));
-                    }
-                    tool_call(
-                        "q1",
-                        "shell",
-                        json!({ "command": "agent-session ask-user 'docs or everything?'" }),
-                    )
-                } else {
-                    tool_call("f1", "try_analyze", json!({ "request": "tidy docs" }))
-                }
-            })
-        }
-        "ask_notify" => ScriptedLlm::new(|req: &LlmInferenceRequest, _| {
-            match has_tool_result(req, "q1") {
-                Some(r) => text(&format!("final answer: {r}")),
-                None => tool_call(
-                    "q1",
-                    "shell",
-                    json!({ "command": "agent-session ask-user 'Which one?' --option a=Apple --option b=Banana" }),
-                ),
-            }
-        }),
         other => panic!("unknown scenario {other}"),
     }
-}
-
-/// Outbound sink of the crash tests: what was handed over, appended to a
-/// file both processes share.
-struct FileSink {
-    path: PathBuf,
-}
-
-#[async_trait::async_trait]
-impl libopendan::runner::OutboundSink for FileSink {
-    async fn placeholder(
-        &self,
-        _cfg: &SessionConfig,
-        mut base: ndn_lib::MsgObject,
-        _turn: u64,
-    ) -> Option<ndn_lib::MsgObject> {
-        base.content.content = "working".into();
-        Some(base)
-    }
-
-    async fn send(
-        &self,
-        _sid: &str,
-        record: &libopendan::bridge::OutboundRecord,
-    ) -> libopendan::runner::SendResult {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .unwrap();
-        writeln!(f, "{}", record.key).unwrap();
-        libopendan::runner::SendResult::Sent {
-            msg_id: Some(msg_key(&record.msg)),
-            deliveries: Vec::new(),
-        }
-    }
-}
-
-fn scenario_deps(env: &Env, scenario: &str, llm: Arc<ScriptedLlm>) -> libopendan::runner::RunnerDeps {
-    let mut deps = env.deps(llm);
-    if scenario == "ask_notify" {
-        deps = deps.with_session_cli(PathBuf::from(env!("CARGO_BIN_EXE_xagent")));
-        deps.notify = Some(Arc::new(
-            libopendan::notify::LocalNotify::enable(&env.agent_root, AGENT).unwrap(),
-        ));
-    }
-    if scenario == "ask" {
-        deps = deps.with_session_cli(PathBuf::from(env!("CARGO_BIN_EXE_xagent")));
-        deps.outbound = Some(Arc::new(FileSink {
-            path: env.root.join("sent.log"),
-        }));
-    }
-    deps
 }
 
 /// Child entry point: a no-op unless spawned by `spawn_child`.
@@ -219,18 +134,7 @@ async fn child_driver() {
     };
     let env = Env::at(Path::new(&root));
     let sd = SessionDir::open(&session).unwrap();
-    let deps = scenario_deps(
-        &env,
-        &scenario,
-        script_for(
-            &scenario,
-            sd.config()
-                .unwrap()
-                .channels
-                .kmsg()
-                .map(|(_, q, _)| (env.queue_dir.clone(), q.to_string())),
-        ),
-    );
+    let deps = env.deps(script(&scenario));
     let r = drive(&sd, &deps, StopWhen::Finished).await;
     eprintln!("child drive result: {r:?}");
 }
@@ -387,7 +291,8 @@ async fn crash_after_finish_commit() {
     let e = agent.sessions().lookup(sd.sid()).await.unwrap().unwrap();
     assert_eq!(e.status.run_state, RunState::Finished);
     assert_eq!(e.status.rev, sd.state().unwrap().rev);
-    assert!(agent.perception().last_seq(sd.sid()).await.unwrap() >= 2);
+    // Nothing is backfilled: the Runtime writes no perception.
+    assert!(!agent.layout().perception_file(sd.sid()).exists());
 }
 
 /// Crash inside a mid-run context-limit rewrite, then recover in-process:
@@ -469,14 +374,14 @@ async fn kill_9_during_shell_reports_interrupted_result_and_leaves_the_command_a
     }
     child.kill().unwrap();
     let _ = child.wait();
-    // The runner is gone; its in-flight record is not.
+    // The runner is gone; the checkpoint taken before the call says it may
+    // have been running.
     let st = sd.state().unwrap();
     let live = st.live_run.clone().expect("live run");
-    let rec = sd.runs().record(&live.run_id).unwrap();
     assert_eq!(
-        rec.inflight.len(),
-        1,
-        "inflight persisted before the tool ran"
+        sd.runs().in_flight(&live.run_id).unwrap().map(|c| c.call_id),
+        Some("c1".to_string()),
+        "the call is in the checkpoint taken before it ran"
     );
     // Same identity, other process: takes over without probing or killing
     // anything (standard process semantics, long-tool TODO §3.2).
@@ -497,8 +402,7 @@ async fn kill_9_during_shell_reports_interrupted_result_and_leaves_the_command_a
         WorklogBody::ActionResult { status, .. } if status == "unresolved")));
     assert_worklog_contiguous(&sd);
     let last = sd.state().unwrap().last_run.unwrap();
-    let rec = sd.runs().record(&last).unwrap();
-    assert!(rec.inflight.is_empty());
+    assert!(sd.runs().in_flight(&last).unwrap().is_none());
     // Leave no process behind in the test environment: the orphaned
     // command belongs to nobody, so the test kills it itself.
     let _ = Command::new("pkill")
@@ -635,13 +539,13 @@ async fn xllm_refuses_run_with_pending_host_commit() {
     assert!(err.to_string().contains("not committed"), "{err}");
 }
 
-/// A batch of two messages (semi-subscription snapshot + controlled
-/// input) committed into the snapshot, crash before state.json: recovery
-/// completes state from the receipt — both messages stay once, exactly the
-/// injected state version is cleared, the reply path is restored — without
+/// A batch whose input carries a semi-subscription version as a background
+/// line, committed into the snapshot, crash before state.json: recovery
+/// completes state from the receipt — the message stays once, exactly the
+/// shown state version is cleared, the reply path is restored — without
 /// rendering again or reading the bus.
 #[tokio::test]
-async fn crash_after_snapshot_batch_checkpoint_does_not_reinject() {
+async fn crash_after_background_batch_checkpoint_does_not_reinject() {
     let env = Env::new();
     let mut spec = work_spec("watch");
     spec.subscriptions.push(Subscription {
@@ -713,7 +617,7 @@ async fn crash_after_snapshot_batch_checkpoint_does_not_reinject() {
         .into_iter()
         .filter(|e| matches!(e.body, WorklogBody::UserMessage { .. }))
         .count();
-    assert_eq!(users, 3, "on_init, snapshot, on_input");
+    assert_eq!(users, 2, "on_init, on_input with its background");
     assert_eq!(count_kind(&sd, "turn_started"), 1);
     assert_eq!(count_kind(&sd, "input_batch"), 1);
     assert_worklog_contiguous(&sd);
@@ -927,9 +831,9 @@ fn outcome_kinds(sd: &SessionDir) -> Vec<String> {
 }
 
 /// V7: a crash at every stage of a tool-triggered sub context — after the
-/// caller suspended on the call, while the child's hand-over batch commits,
-/// after the child finished, after its result was filled into the caller —
-/// recovers into the same child / result: one child run, the result handed
+/// caller stopped and handed over to it, while the child's batch commits,
+/// after the child finished, while its result commits as the caller's input
+/// — recovers into the same child / result: one child run, the result handed
 /// back exactly once, the caller's Turn kept.
 #[tokio::test]
 async fn sub_context_call_survives_a_crash_at_every_stage() {
@@ -937,7 +841,7 @@ async fn sub_context_call_survives_a_crash_at_every_stage() {
         ("outcome:after_checkpoint", 2),
         ("input_batch:after_input_checkpoint#2", 2),
         ("finish_run:after_commit", 1),
-        ("sub_return:after_fill", 1),
+        ("input_batch:after_input_checkpoint#3", 1),
     ] {
         let env = Env::new();
         let sd = env.create_work(subcall_spec()).await;
@@ -963,11 +867,12 @@ async fn sub_context_call_survives_a_crash_at_every_stage() {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            results,
-            vec![("f1".to_string(), "X is 42".to_string())],
-            "{fault}: the result is handed back once"
-        );
+        assert_eq!(results.len(), 1, "{fault}: {results:?}");
+        assert_eq!(results[0].0, "f1");
+        assert!(results[0].1.contains("registered"), "{fault}: {results:?}");
+        let t = llm.transcript(llm.count() - 1);
+        assert_eq!(t.matches("<process_result behavior=").count(), 1, "{fault}: the result is handed back once: {t}");
+        assert!(t.contains("X is 42"), "{fault}: {t}");
         let st = sd.state().unwrap();
         assert!(st.process_stack.is_empty() && st.process_result.is_none(), "{fault}");
         assert_eq!((st.turn_seq, st.turns_completed), (1, 1), "{fault}");
@@ -1113,121 +1018,3 @@ async fn xllm_cannot_take_over_a_managed_workspace_run_without_its_writer_gate()
     assert_eq!(llm.count(), 0);
 }
 
-// Asking the user (intent analysis TODO V11) ---------------------------------
-
-fn ask_spec() -> libopendan::api::SessionSpec {
-    let mut spec = work_spec("analyze and ask");
-    spec.prompt.llm_context = json!({
-        "tools": { "enabled": true, "tools": [ { "groupname": "bash" }, { "name": "behavior:analyze" } ] }
-    });
-    spec.extensions.insert(
-        "opendan".into(),
-        json!({ "behaviors": { "analyze": { "mode": "fork", "tool": {
-            "name": "try_analyze", "description": "analyze",
-            "parameters": { "type": "object", "properties": { "request": { "type": "string" } } },
-            "task": "{{args.request}}"
-        } } } }),
-    );
-    spec
-}
-
-/// V11: a crash before the question is committed (the run already
-/// suspended on it), after it was committed but not sent, after the
-/// answer's snapshot was published, and after the answer was committed:
-/// the question leaves once, the answer is consumed and filled once.
-#[tokio::test]
-async fn asking_the_user_survives_a_crash_at_every_stage() {
-    for (fault, left) in [
-        ("outcome:after_checkpoint#2", 2),
-        ("user_input:after_question_commit", 2),
-        ("user_input:after_input_checkpoint", 2),
-        ("user_input:after_state_commit", 2),
-    ] {
-        let env = Env::new();
-        let sd = env.create_work(ask_spec()).await;
-        post_msg(&env, &sd, "m-1", "please tidy the docs").await;
-        let mut child = spawn_child(&env, &sd, "ask", Some(fault));
-        assert!(
-            !wait_exit(&mut child, Duration::from_secs(60)).success(),
-            "{fault}: the fault point was not reached"
-        );
-        let llm = script_for("ask", Some((env.queue_dir.clone(), queue_of(&sd))));
-        let r = drive(&sd, &scenario_deps(&env, "ask", llm.clone()), StopWhen::Finished).await;
-        assert!(r.is_finished(), "{fault}: {r:?}");
-        assert_eq!(llm.count(), left, "{fault}: nothing is inferred twice");
-        assert!(sd.report().unwrap().contains("final answer"), "{fault}");
-        let results: Vec<String> = read_worklog(&sd)
-            .into_iter()
-            .filter_map(|e| match e.body {
-                WorklogBody::ActionResult { call_id, .. } => Some(call_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(results, vec!["q1".to_string(), "f1".to_string()], "{fault}");
-        let st = sd.state().unwrap();
-        let questions: Vec<_> = st
-            .outbox
-            .iter()
-            .filter(|e| e.purpose == OutboxPurpose::Question)
-            .collect();
-        assert_eq!(questions.len(), 1, "{fault}");
-        assert_eq!(questions[0].status, OutboxStatus::Sent, "{fault}");
-        let sent = std::fs::read_to_string(env.root.join("sent.log")).unwrap();
-        let asked: std::collections::BTreeSet<&str> =
-            sent.lines().filter(|k| k.contains(":ask:")).collect();
-        assert_eq!(asked.len(), 1, "{fault}: {sent}");
-        assert_eq!((st.turn_seq, st.turns_completed), (1, 1), "{fault}");
-        assert_eq!(st.source("q").acked_index, 2, "{fault}: request and answer consumed");
-        assert!(st.process_stack.is_empty(), "{fault}");
-        assert_worklog_contiguous(&sd);
-    }
-}
-
-/// V12: a Work asking through a notification dies before the question is
-/// sent (the run suspended on it), after it was sent but before the wait
-/// was committed, and after the commit: one notification, one result.
-#[tokio::test]
-async fn asking_through_a_notification_survives_a_crash_at_every_stage() {
-    use libopendan::notify::{NotifyAnswer, NotifyListReq};
-    for fault in [
-        "outcome:after_checkpoint",
-        "user_input:after_notify_send",
-        "user_input:after_notify_send#2",
-    ] {
-        let env = Env::new();
-        let mut spec = libopendan::SessionTemplate::load("work", None)
-            .unwrap()
-            .spec("pick a fruit");
-        spec.prompt.llm_context = json!({ "tools": { "enabled": true } });
-        let sd = env.create_work(spec).await;
-        let mut child = spawn_child(&env, &sd, "ask_notify", Some(fault));
-        let status = wait_exit(&mut child, Duration::from_secs(60));
-        assert!(!status.success(), "{fault}: the fault point was not reached");
-        let llm = script("ask_notify");
-        let deps = scenario_deps(&env, "ask_notify", llm.clone());
-        let r = drive(&sd, &deps, StopWhen::Idle).await;
-        assert!(matches!(r, DriveResult::Idle { .. }), "{fault}: {r:?}");
-        let local = deps.notify.clone().unwrap();
-        let all = local.list(NotifyListReq::default()).await.unwrap();
-        assert_eq!(all.len(), 1, "{fault}: {all:#?}");
-        local
-            .answer(&all[0].notify_id, NotifyAnswer::option("b"), None)
-            .await
-            .unwrap();
-        let r = drive(&sd, &deps, StopWhen::Finished).await;
-        assert!(r.is_finished(), "{fault}: {r:?}");
-        assert!(sd.report().unwrap().contains("Banana"), "{fault}");
-        // The child inferred the question; the parent only the end.
-        let inferred = 1;
-        assert_eq!(llm.count(), inferred, "{fault}");
-        let results: Vec<String> = read_worklog(&sd)
-            .into_iter()
-            .filter_map(|e| match e.body {
-                WorklogBody::ActionResult { call_id, .. } => Some(call_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(results, vec!["q1".to_string()], "{fault}");
-        assert_worklog_contiguous(&sd);
-    }
-}

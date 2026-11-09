@@ -26,6 +26,7 @@ import type {
 } from '../datamodel/types'
 import type { Did, ObjId } from '../protocol/feed'
 import type { CommentList, EntryDebugView, HomeStationStore, ReadingSummary, StoreDomain, StoreSettings, StoreStatus } from '../store/types'
+import { attachmentKindOf, fileMetaOf } from './fileKind'
 import { setContentHome, type Transport, type UploadMeta } from './transport'
 import { didDisplayName } from '../../../presentation/model'
 
@@ -71,33 +72,11 @@ function hueOf(did: string) {
   return hash % 360
 }
 
-function loadMedia<T>(file: File, tag: 'img' | 'video' | 'audio', read: (element: HTMLImageElement | HTMLMediaElement) => T): Promise<T | undefined> {
-  const url = URL.createObjectURL(file)
-  return new Promise<T | undefined>(resolve => {
-    const element = document.createElement(tag)
-    const done = (value: T | undefined) => {
-      URL.revokeObjectURL(url)
-      resolve(value)
-    }
-    element.addEventListener(tag === 'img' ? 'load' : 'loadedmetadata', () => done(read(element)))
-    element.addEventListener('error', () => done(undefined))
-    if (element instanceof HTMLMediaElement) element.preload = 'metadata'
-    element.src = url
-  })
-}
-
+// A media attachment must be what it claims to be, judged by its bytes.
 async function uploadMeta(file: File, kind: AttachmentInput['kind']): Promise<UploadMeta> {
-  const meta: UploadMeta = { name: file.name, mime: file.type || 'application/octet-stream' }
-  if (kind === 'file' || kind === 'dir') return meta
-  if (!file.size || !file.type.startsWith(`${kind}/`)) throw new Error(`Expected a non-empty ${kind} file.`)
-  if (kind === 'image') {
-    const size = await loadMedia(file, 'img', element => ({ width: (element as HTMLImageElement).naturalWidth, height: (element as HTMLImageElement).naturalHeight }))
-    if (!size || !size.width || !size.height) throw new Error('The image could not be decoded.')
-    return { ...meta, ...size }
-  }
-  const duration = await loadMedia(file, kind, element => (element as HTMLMediaElement).duration)
-  if (!duration || !Number.isFinite(duration)) throw new Error(`The ${kind} could not be decoded.`)
-  return { ...meta, duration_ms: duration * 1000 }
+  const fileMeta = await fileMetaOf(file)
+  if (kind !== 'file' && kind !== 'dir' && (!file.size || attachmentKindOf(fileMeta.mime) !== kind)) throw new Error(`Expected a non-empty ${kind} file.`)
+  return { name: file.name, mime: fileMeta.mime, fileMeta }
 }
 
 let storeCounter = 0

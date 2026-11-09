@@ -19,6 +19,8 @@ pub fn missing() -> RPCErrors {
 pub fn revision() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+pub const GROUP_NOTICE_INTENT: &str = "buckyos.group_invitation";
+
 pub fn session_key(group: &DID, session: Option<&str>) -> Result<String> {
     MailboxAddress::new(group.clone(), session.map(str::to_owned))
         .map(|m| m.to_string())
@@ -183,12 +185,6 @@ pub struct DisplayFile {
     pub obj_id: ObjId,
 }
 impl DisplayConfig {
-    pub fn is_empty(&self) -> bool {
-        self.announcement.is_none()
-            && self.links.is_empty()
-            && self.files.is_empty()
-            && self.featured_members.is_empty()
-    }
     pub fn validate(&self) -> Result<()> {
         if self
             .announcement

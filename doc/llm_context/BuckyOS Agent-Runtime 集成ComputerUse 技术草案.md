@@ -4,7 +4,7 @@
 | --- | --- |
 | 文档版本 | 0.2，已确定 CLI 路线的实施 TODO |
 | 更新日期 | 2026-10-23 |
-| 状态 | daemon 子集已实现；本文的上层 ComputerUse CLI、模型图片桥接及完整验收仍是交付目标 |
+| 状态 | daemon 子集已实现；native runtime 的 `computer` tool 已把截图作为图片放进 tool result（见 §9.3）；本文的上层 ComputerUse CLI、shell `--present` 图片桥接及完整验收仍是交付目标 |
 | 设计基线 | [AgentRuntime 设计](<AgentRuntime 设计.md>)、[Agent Daemon 协议](../arch/agent_daemon.md)及当前工作区源码 |
 | Agent 入口 | 现有 `shell` 工具调用 `buckyos computer …` |
 | 首期目标 | Windows、macOS 用户桌面上的观察—动作—再观察闭环 |
@@ -15,7 +15,7 @@
 >
 > 下文所有 `buckyos computer` 命令均待实现，不能当作当前可执行命令。复选框按完整交付条目记录，仅在对应实现、检查和证据齐备后勾选；daemon 子集的实现及验证进度单独记录，不据此推定完整链路已通过。
 
-> daemon 实施进展：本仓库已实现共享 Computer 协议、复用 Executor 账本的执行入口、macOS 14+ 和 Windows 当前用户会话原生驱动。Windows 提供前台 `.exe` 宿主、ZIP 打包入口、Win32/GDI 主显示器 visual/auto 观察、点击、Unicode 输入、按键、按行滚动与 delay 等待；不提供 Session 0 服务、semantic/hybrid、drag 或像素滚动。Windows x64 已通过相关单元/生命周期测试、真实只读截图和静态 CRT debug 构建及导入核验，release 发行归档尚未构建。实际支持范围及证据见 [macOS ComputerUse](../arch/agent_daemon.md#macos-computeruse)、[Windows ComputerUse](../arch/agent_daemon.md#windows-computeruse) 与 [本机验证入口](../arch/agent_daemon.md#本机验证入口)。本草案仍是完整交付目标；下文的上层 CLI、图片桥接和 T1–T6 整体验收不能据 daemon 子集实现勾选完成，Windows 真实桌面输入与完整 Agent loop 尚未验收。
+> daemon 实施进展：本仓库已实现共享 Computer 协议、复用 Executor 账本的执行入口、macOS 14+ 和 Windows 当前用户会话原生驱动。Windows 提供前台 `.exe` 宿主、ZIP 打包入口、Win32/GDI 主显示器 visual/auto 观察、点击、Unicode 输入、按键、按行滚动与 delay 等待；不提供 Session 0 服务、drag 或像素滚动。Windows（UI Automation）与 macOS（Accessibility）都提供语义树：semantic/hybrid、element target 与 `invoke`/`set_value`（§3.3、§6、§7）。Windows x64 已通过相关单元/生命周期测试、真实只读截图和静态 CRT debug 构建及导入核验，release 发行归档尚未构建。实际支持范围及证据见 [macOS ComputerUse](../arch/agent_daemon.md#macos-computeruse)、[Windows ComputerUse](../arch/agent_daemon.md#windows-computeruse) 与 [本机验证入口](../arch/agent_daemon.md#本机验证入口)。本草案仍是完整交付目标；下文的上层 CLI、图片桥接和 T1–T6 整体验收不能据 daemon 子集实现勾选完成，Windows 真实桌面输入与完整 Agent loop 尚未验收。
 
 ## 0. 已确定的决策
 
@@ -141,6 +141,8 @@ capabilities / policy_version / expires_at
 显式模式不可用时报错，不静默替换。模式只影响观察，不产生权限。首次桌面交付以 `visual` 为必需，semantic/hybrid 根据平台支持逐项完成。
 
 默认模式随 binding 配置，每次 `observe --mode` 或动作 `feedback_mode` 可以覆盖。首期不必增加有状态的 `set_mode` CLI；减少跨调用的隐式状态。
+
+实现状态（2026-11-09，[UIA 语义观察 TODO](../../notepads/computer-use-uia-semantic-todo.md) §7、§8）：Windows（UIA）与 macOS（AX）Driver 都支持全部四种模式，浏览器语义后端未实施。动作的 `feedback_mode` 默认为 `auto`，Driver 不在 binding 上记住上一次的模式。auto 在语义可用、且前台窗口树至少有 10 个返回节点和 5 个可操作节点时选 semantic，否则选 visual；`selection_reason` 为 `semantic_available`、`tree_sparse`、`window_inaccessible`、`accessibility_unavailable`、`backend_timeout` 等。显式 semantic/hybrid 在稀疏或不可访问的窗口上仍返回窗口列表与 coverage，后端失败时报错。
 
 ## 4. CLI 合同
 
@@ -339,6 +341,32 @@ daemon 保存不可变的观察及后端映射。建议结构：
 
 semantic 模式附带格式、文本/结构化节点、引用、coverage 和 truncated；hybrid 同时附带两类内容和采样区间。截图与树通常不是原子快照，检测到导航或明显漂移时重采样/报错。
 
+当前实现的语义载荷（`ComputerObservation.semantic`，截图改为可选的 `screenshot`）：
+
+~~~json
+{
+  "format": "outline-v1",
+  "text": "[e1] window \"Gmail - Google Chrome\" @0,0 1280x1400\n  [e12] tab \"Gmail\" selected (select) @29,0 256x41\n",
+  "windows": [{"ref": "w1", "title": "Gmail - Google Chrome", "process": "chrome.exe", "pid": 4120,
+               "bounds": {"x": 0, "y": 0, "width": 1280, "height": 1400}, "foreground": true, "accessible": true}],
+  "coverage": {"visited": 199, "returned": 149, "truncated": false},
+  "captured_at_ms": 1794000000000
+}
+~~~
+
+大纲每行一个节点：缩进表示层级，`[ref] role "name" #id value="…" 状态… (动作, …) @x,y wxh`；bounds 位于截图坐标空间，与 point 目标同一坐标系。不再重复一份逐节点 JSON，结构化节点与平台原生信息只保留在 Driver 的观察记录中。语义载荷经控制帧传输，单个不超过 256 KiB（`COMPUTER_MAX_SEMANTIC_BYTES`）；固定上限为 400 节点、大纲深度 32、文本 32 KiB、单次快照 3 秒。`observe` 的可选 `scope` 为 `{"kind":"foreground"}`（默认）或 `{"kind":"window","observation_id","ref"}`（取上一次窗口列表中的窗口），不做整桌面全树，observe 不改变焦点；hybrid 的截图与树分别带 `captured_at_ms`。
+
+**跨平台通用语义。** 协议、大纲与命令只使用 `buckyos-api` 中定义的通用名（Rust `ComputerRole` / `ComputerElementState` / `ComputerElementAction`，websdk `COMPUTER_ROLES` / `COMPUTER_ELEMENT_STATES` / `COMPUTER_ELEMENT_ACTIONS`），平台原生名只留在 Driver 观察记录供诊断：
+
+| 类别 | 名称 |
+| --- | --- |
+| role（WAI-ARIA 名） | `window` `dialog` `document` `group` `toolbar` `heading` `button` `link` `tab` `tablist` `menu` `menubar` `menuitem` `checkbox` `radio` `switch` `textbox` `combobox` `slider` `list` `listitem` `tree` `treeitem` `table` `row` `cell` `image` `text`，其余为 `generic` |
+| 状态 | `disabled` `focused` `selected` `checked` `mixed` `expanded` `collapsed` `readonly` |
+| 动作 | `focus` `invoke` `set_value` `toggle` `select` `expand` `collapse` `scroll_into_view` |
+| id | Windows AutomationId；macOS AXIdentifier；浏览器 DOM `id` |
+
+Windows UIA 的 ControlType / AriaRole / pattern 与 macOS AX 的 role / subrole 到通用名的映射与单元测试都在 `src/kernel/computer_driver/src/semantic.rs`；两个原生后端报告同一套 pattern / state 位。浏览器后端实施时复用这套通用名并实测确认映射。大纲省略几乎每个元素都有的 `scroll_into_view`（第二阶段命令），记录中仍保留。
+
 `surface_epoch` 表示交互面身份代次；`interaction_revision` 表示已知的交互变化，不声称覆盖所有动画、DOM 或外部输入。
 
 ### 6.2 Target 类型
@@ -368,16 +396,18 @@ type FocusTarget = {
 - 如果宿主缩放图片，应固定交付版本并维护映射及尺寸；不能让模型看到缩放图却按原图坐标执行。
 - focus 至少核验授权桌面、Surface 和代次；能获取焦点节点/输入上下文时也须核验。弱焦点保护在能力中明确报告。
 - 元素失败不自动猜坐标，坐标失效不自动猜同名元素。
+- 当前实现（macOS AX）：ref 映射到快照保存的 AXUIElement 及其 pid、角色和所在窗口；动作前重新读取属性，元素失效（`kAXErrorInvalidUIElement`）或角色变化即 `stale_element`；pointer 命令沿祖先的 scroll area / web area 求可见部分，用 AX 命中测试判断遮挡。其余规则与 Windows 相同。
+- 当前实现（Windows UIA）：`ref` 为观察内短 id（`e1`、`e2`…），只对该 `observation_id` 有效；Driver 记录 ref → 缓存的 UIA 元素、RuntimeId、pid 和顶层 HWND。动作前重新解析：元素仍存在、RuntimeId 与进程一致、顶层窗口未换主；pointer 命令另要求不在 offscreen、点在主屏内且未被其他顶层窗口遮挡。失败返回 `stale_element`（或 `element_offscreen`、`element_out_of_bounds`、`element_obscured`、`element_disabled`、`element_action_unsupported`），不退化为坐标。`wait_for` 暂不接受 element 目标。
 
 ### 6.3 有效性规则
 
 1. 动作必须引用属于当前授权 binding、Surface、epoch 且未过期的观察。
-2. 自身动作或已检测到的外部交互改变 revision；可能改变 UI 的 move 也默认使旧观察失效。
+2. 自身动作改变 revision；可能改变 UI 的 move 也默认使旧观察失效。
 3. 每一步动作后用 feedback 或 observe 获取新观察。不能把旧坐标换绑到模型未见过的新图上。
 4. 单纯生成只读观察不必使同 revision 的其它观察全部失效，但仍需 TTL 和目标校验。
 5. 动作执行前重新检查真实目标/焦点/坐标映射；校验与输入尽量放在同一临界区。
 6. wait_for 开始时绑定目标，等待过程中按该身份跟踪，不把正常的状态变化全部当作过期；导航或目标被另一个节点替换应结束等待。
-7. 人工接管、锁屏、注销、显示布局改变和不能证明连续性的重连使相关旧观察失效。
+7. 锁屏、注销、显示布局改变、焦点窗口改变和不能证明连续性的重连使相关旧观察失效；人的键鼠操作不使观察失效（见 §8.1）。
 
 观察 ID 不能消除检查—使用之间的 GUI 竞争。资源授权、前置核验、输入后验证仍然必要。
 
@@ -394,6 +424,24 @@ type FocusTarget = {
 | `move` | element/point。可能触发 hover，参与审计和观察失效 |
 | `drag` | from/to、可选 duration_ms/path。同一 Surface 和 Observation，两个目标同为元素或同为坐标；失败报告 partial/unknown 并清理输入 |
 | `wait_for` | condition 为 delay/text/element_state，有界且可取消；不接受任意代码 |
+| `invoke` | element。执行元素的默认动作（UIA Invoke、AX Press、DOM 激活），不移动鼠标，可用于部分遮挡或不在可视区的元素 |
+| `set_value` | element、value（≤16 KiB）。替换整个值（即 `semantic.fill`），执行后回读，回读不一致报 `value_mismatch` |
+
+语义动作分两阶段：第一阶段为 element 目标的 click/type/keypress/scroll 与 `invoke`、`set_value`（Windows、macOS 已实现）；第二阶段视实测效果再加 `toggle`、`select`、`expand`、`collapse`、`scroll_into_view`。每个语义命令只对观察中声明了该动作的元素开放，归入 `computer_act`，只读授权不能调用。`click(element)` 在元素可点击点做物理点击，不等同于 invoke；`type`/`keypress(element)` 先经通用 `focus` 聚焦并回读焦点，再输入；`scroll(element)` 在元素中心滚动。通用动作在各平台的映射：
+
+| 通用动作 | Windows UIA | macOS AX | 浏览器 |
+| --- | --- | --- | --- |
+| `focus` | `SetFocus` | 设置 `AXFocused` | `element.focus()` |
+| `invoke` | InvokePattern.Invoke | `AXPress` | DOM 激活（`element.click()`） |
+| `set_value` | ValuePattern.SetValue | 设置 `AXValue` | 设置 value 并派发 input / change 事件 |
+| `toggle` | TogglePattern.Toggle | checkbox 上的 `AXPress` | `element.click()` |
+| `select` | SelectionItemPattern.Select | 设置 `AXSelected` | 选中 option / 激活 tab |
+| `expand`、`collapse` | ExpandCollapsePattern | 设置 `AXExpanded` / `AXDisclosing` | 激活带 `aria-expanded` 的控件 |
+| `scroll_into_view` | ScrollItemPattern.ScrollIntoView | `AXScrollToVisible` | `element.scrollIntoView()` |
+
+macOS 第一阶段的 `focus`（目标应用不在前台时先激活应用并提升窗口）、`invoke`、`set_value` 已于 2026-11-09 实测；第二阶段各行仍是待实测的规划。实测中 Chrome 的网页节点不声明 `AXPress`，这类链接和按钮只能 `click(element)`。
+
+UIA 调用超时且已开始执行时，元素动作的执行状态为 `unknown`，按原 operation 查询，不盲目重试。macOS 的 `AXPress` 打开模态对话框或菜单时，应用要到它们结束才应答；若此时应用仍应答其他请求，Driver 按已送达处理（执行状态 completed，结果带 `pending`），否则超时同样记为 `unknown`。
 
 补充约束：
 
@@ -414,7 +462,7 @@ type FocusTarget = {
 - 由 daemon 按 `interaction_resource_id` 串行调度写动作；观察与动作协调，避免把拖动中间态当成稳定观察。
 - 模型思考期间不持有不可中断的按键/鼠标锁。binding 的控制租约可以有界保留/续期，但过期后新动作必须重取租约和新观察。
 - helper/worker 校验 fencing token，拒绝旧执行者的迟到请求。仅修改 Broker owner 字段不够。
-- 人工接管暂停新动作、取消队列并清理输入；恢复后重新观察。已送达应用的输入不能撤回。
+- 不检测人工接管：人在 Agent 操作期间移动鼠标、点击或按键，不暂停、不拒绝动作，也不使观察失效，由人适应 AI 的动作。要让 Agent 停手，用显式的暂停入口；暂停取消队列并清理输入，恢复后重新观察。已送达应用的输入不能撤回。
 - 首期可以使用专用测试用户桌面；直接控制用户桌面时必须具备可见状态、暂停/接管和撤销入口。浏览器 Context 不等于 OS 隔离。
 
 ### 8.2 异步批准沿用原操作
@@ -456,6 +504,10 @@ CLI 入口不会削弱授权，function 入口也不会自动提供 OS 隔离。
 `--present` 登记图片不表示 LLM 已在脚本中途看见它。图片在 shell 调用返回或已有任务结果交付点进入模型上下文。
 
 需要模型视觉判断时必须结束当前 shell 调用，等模型看到图像，再执行下一次动作。禁止同一脚本里“截图 → 自动拿一个固定坐标 → 点击”，却声称中间有模型判断。
+
+### 9.3 当前实现：native `computer` tool
+
+native runtime 的 `computer` tool（`agent_tool/src/runtime/computer.rs`）在下载到截图后把 PNG 作为图片附到本次 tool result：`AgentToolResult.images`（`#[serde(skip)]`，只能由进程内 tool 设置，不从命令输出的协议 JSON 解析）→ `Observation::Success.images` → `AiToolResultContent::Image`。function-call loop 中模型在同一次结果里看到图像；context 只保留最新 `MAX_TOOL_RESULT_IMAGES`（3）张，更早的替换为占位文字，快照随之收缩；behavior（文本）loop 不传图片。模型路由需能接收 tool result 图片：OpenAI Responses、Claude Messages、Gemini 已映射，base Chat Completions 会拒绝该请求。
 
 自动脚本可以使用新语义观察和已验证条件继续；视觉坐标必须来自模型实际收到的对应图像。预算导致图像被丢弃/省略时，宿主要明确说明，Agent 不能把它当成已见过的观察。
 
@@ -836,7 +888,7 @@ exit $cuCode
 
 验收：从发行产物安装后，Agent 只靠已有 shell 和 cmd_skill 完成任务；不依赖开发目录中的未分发脚本。
 
-本次 Windows daemon 实现已同步 `buckyos_admin`、`opendan_agent_dev`、`xllm` 和独立包 README 的平台、运行路径、恢复与打包说明。上层 CLI、图片桥接和 `computer_use` 手册仍待交付，不能把草案示例发布为可执行命令。实施完整 T5 时还需同步这些上层能力及其分发产物，并完成示例验收。
+本次 Windows daemon 实现已同步 `buckyos_admin`、`opendan_agent_dev`、`xllm` 和独立包 README 的平台、运行路径、恢复与打包说明。native `computer` tool 的图片结果已交付（§9.3）；上层 CLI、shell `--present` 图片桥接和 `computer_use` 手册仍待交付，不能把草案示例发布为可执行命令。实施完整 T5 时还需同步这些上层能力及其分发产物，并完成示例验收。
 
 ### T6：故障、平台和端到端验收
 

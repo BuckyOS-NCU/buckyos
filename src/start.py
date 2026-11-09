@@ -21,7 +21,7 @@ build_dir = os.path.dirname(os.path.abspath(__file__))
 # after run build.py ,use this script to restart the dev buckyos system
 # 1) killall process
 # 2) update files to /opt/buckyos (--all to update all files to /opt/buckyos)
-# 3) start the system (node_daemon; on macOS the BuckyOS Runtime LaunchAgent)
+# 3) start the system (node_daemon, as root on Linux; on macOS the BuckyOS Runtime LaunchAgent)
 
 
 def _command_names(command: str) -> list[str]:
@@ -55,6 +55,9 @@ def _print_help() -> int:
                 "Stops existing BuckyOS processes, updates installed files by default,",
                 "and starts node_daemon from BUCKYOS_ROOT (on macOS in a GUI session:",
                 "binds the root to you and starts the BuckyOS Runtime LaunchAgent).",
+                "On Linux files are updated as you and node_daemon runs as root through sudo,",
+                "like the packaged system service. --all activates as you: Agents you enable",
+                "for the host run commands on this machine as your account.",
                 "",
                 "Usage:",
                 f"  uv run {script_path.relative_to(SCRIPT_DIR.parent)} [options]",
@@ -64,11 +67,16 @@ def _print_help() -> int:
                 "  --all                 Fresh dev install before startup; preserve etc/devenv.json.",
                 "  --reinstall [GROUP]   Fresh install before startup, optionally running make_config.ts GROUP.",
                 "  --skip-update         Skip file update and only restart BuckyOS.",
+                "  --wipe-data           With --all/--reinstall: also delete data/ and storage/ (user files,",
+                "                        service databases, named store) for an empty Zone; destroys Zone data.",
+                "  --edition full|lite   With --all/--reinstall GROUP: the product edition to install",
+                "                        (lite = BuckyOS Desktop Lite, no containers; default full).",
                 "  -h, --help            Show this help message.",
                 "",
                 "Common examples:",
                 f"  uv run {script_path.relative_to(SCRIPT_DIR.parent)}",
                 f"  uv run {script_path.relative_to(SCRIPT_DIR.parent)} --all",
+                f"  uv run {script_path.relative_to(SCRIPT_DIR.parent)} --all --edition lite",
                 f"  uv run {script_path.relative_to(SCRIPT_DIR.parent)} --reinstall release",
                 f"  uv run {script_path.relative_to(SCRIPT_DIR.parent)} --skip-update",
             ]
@@ -98,6 +106,20 @@ def _sdk_tool_distribution_ready() -> bool:
     return False
 
 
+def _prepare_ext_tools() -> None:
+    subprocess.run([sys.executable, str(SCRIPT_DIR / "tools" / "prepare_ext_tools.py")])
+
+
+def _ext_tools_ready() -> None:
+    """Without the seed the system runs, only without the extension tools: say so and go on."""
+    if not (SCRIPT_DIR / "rootfs" / "bin" / "ext-tools" / "ext_tools.json").is_file():
+        print(
+            "No ext-core seed in rootfs/bin/ext-tools: extended runtimes will miss ffmpeg, pandoc and the rest.\n"
+            f"Get it with `{sys.executable} tools/prepare_ext_tools.py` "
+            "(or build one with publish/exttool/ext-core/build.sh and pass it with --local)."
+        )
+
+
 def _run_command(command: str, args: list[str]) -> int:
     executable = _find_command(command)
     if executable is None:
@@ -113,7 +135,7 @@ def _run_command(command: str, args: list[str]) -> int:
     ).returncode
 
 
-def _run_make_config(config_group_name: str, target_root: Path) -> None:
+def _run_make_config(config_group_name: str, target_root: Path, edition: str | None = None) -> None:
     executable = _find_command("deno")
     if executable is None:
         raise RuntimeError("deno not found. make_config.ts requires Deno >= 2.2")
@@ -129,7 +151,8 @@ def _run_make_config(config_group_name: str, target_root: Path) -> None:
             config_group_name,
             "--rootfs",
             str(target_root),
-        ],
+        ]
+        + (["--edition", edition] if edition else []),
         cwd=build_dir,
         env=env,
         **_windows_subprocess_kwargs(),
@@ -148,7 +171,7 @@ def _windows_subprocess_kwargs(detached: bool = False) -> dict[str, object]:
 
     creationflags = subprocess.CREATE_NO_WINDOW
     if detached:
-        creationflags |= subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
 
     return {
         "startupinfo": startupinfo,
@@ -189,7 +212,7 @@ def resolve_buckyos_root() -> Path:
         return Path(buckyos_root).expanduser()
 
     if platform.system() == "Windows":
-        default_root = os.path.join(os.path.expandvars("%AppData%"), "buckyos")
+        default_root = r"C:\buckyos"
     else:
         default_root = "/opt/buckyos"
 
@@ -226,7 +249,7 @@ def kill_all_processes():
     try:
         import stop
         # Execute the main logic of killall.py
-        stop.kill_all()
+        stop.stop_all()
         print("All processes stopped")
     except ImportError as e:
         print(f"Failed to import killall module: {e}")
@@ -235,7 +258,41 @@ def kill_all_processes():
         print(f"Warning: Some processes may not have been stopped: {e}")
         # Continue execution even if some processes fail to stop
 
-def update_files(install_all=False,config_group_name=None):
+
+def _root_access_ready() -> bool:
+    import stop
+
+    if not stop.needs_root() or subprocess.run(["sudo", "true"]).returncode == 0:
+        return True
+    print("On Linux node_daemon runs as root, like the packaged system service: start.py needs sudo.")
+    return False
+
+
+def take_back_install_tree(buckyos_root: Path, install_all: bool) -> None:
+    import stop
+
+    if not stop.needs_root():
+        return
+    import pwd
+
+    names = (".",) if install_all else ("bin", "libexec", "etc", "data/cache")
+    paths = [str(buckyos_root / name) for name in names if (buckyos_root / name).exists()]
+    if paths:
+        user = pwd.getpwuid(os.getuid())
+        subprocess.run(["sudo", "chown", "-R", f"{user.pw_uid}:{user.pw_gid}", *paths], check=True)
+
+
+def wipe_zone_data(buckyos_root: Path) -> None:
+    """`--wipe-data`: what a fresh install keeps on purpose (data/: user files, RDB
+    `user_data` databases and service homes; storage/: the named store) is deleted too."""
+    for name in ("data", "storage"):
+        target = buckyos_root / name
+        if target.exists():
+            print(f"Wiping {target} ...")
+            shutil.rmtree(target)
+
+
+def update_files(install_all=False,config_group_name=None,edition=None):
     """Update files to installation directory"""
     print("Updating files...")
 
@@ -250,7 +307,7 @@ def update_files(install_all=False,config_group_name=None):
 
         if config_group_name:
            target_root = resolve_buckyos_root()
-           _run_make_config(config_group_name, target_root)
+           _run_make_config(config_group_name, target_root, edition)
         print("Files updated successfully")
     except Exception as e:
         print(f"Failed to update files: {e}")
@@ -351,6 +408,17 @@ def _start_macos_runtime(executable: Path, buckyos_root: Path) -> None:
 
 def start_system():
     """Start BuckyOS system"""
+    import stop
+
+    if stop.needs_root():
+        result = subprocess.run(
+            stop.as_root([sys.executable, "-B", "-c", "import start; start.start_system()"]),
+            cwd=SCRIPT_DIR,
+        )
+        if result.returncode != 0:
+            sys.exit(result.returncode)
+        return
+
     print("Starting BuckyOS system...")
     buckyos_root = resolve_buckyos_root()
     executable = node_daemon_path(buckyos_root)
@@ -391,6 +459,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--all", action="store_true")
     mode.add_argument("--reinstall", nargs="?", const="", metavar="GROUP")
     mode.add_argument("--skip-update", action="store_true")
+    parser.add_argument("--edition", choices=("full", "lite"))
+    parser.add_argument("--wipe-data", action="store_true")
     try:
         options = parser.parse_args(args)
     except SystemExit as error:
@@ -405,17 +475,33 @@ def main(argv: list[str] | None = None) -> int:
         config_group_name = "dev"
     if options.reinstall is not None:
         config_group_name = options.reinstall or None
+    if options.edition and not config_group_name:
+        print("--edition needs --all or --reinstall GROUP: the edition is part of a fresh install")
+        return 2
+    if options.wipe_data and not install_all:
+        print("--wipe-data needs --all or --reinstall: it empties the Zone of a fresh install")
+        return 2
 
     if need_update and not _sdk_tool_distribution_ready():
         return 2
-    
+    if not _root_access_ready():
+        return 2
+    if options.all:
+        _prepare_ext_tools()
+    if need_update:
+        _ext_tools_ready()
+
     with _preserve_devenv_config(options.all) as preserved_devenv:
         # Step 1: Kill all processes
         kill_all_processes()
+        if need_update:
+            take_back_install_tree(resolve_buckyos_root(), install_all)
+        if options.wipe_data:
+            wipe_zone_data(resolve_buckyos_root())
 
         if install_all or need_update:
             # Step 2: Update files
-            update_files(install_all,config_group_name)
+            update_files(install_all,config_group_name,options.edition)
     
     # Step 3: Start system
     start_system()

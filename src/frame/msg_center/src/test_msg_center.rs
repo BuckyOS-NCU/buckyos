@@ -85,7 +85,7 @@ async fn cyfs_dispatch_confirms_only_the_current_receiver_and_survives_restart()
         MsgObjKind::Chat,
     );
     let id = msg.gen_obj_id().0;
-    let target = "cyfs://alice.example/inbox";
+    let target = "https://alice.example/inbox";
     let first = center
         .dispatch_to_receiver(msg.clone(), None, alice.clone(), target.into())
         .await
@@ -104,7 +104,7 @@ async fn cyfs_dispatch_confirms_only_the_current_receiver_and_survives_restart()
         .unwrap()
         .is_none());
     assert!(center
-        .query_cyfs_dispatch(&sender.to_string(), "cyfs://alice.example/other", &id)
+        .query_cyfs_dispatch(&sender.to_string(), "https://alice.example/other", &id)
         .await
         .unwrap()
         .is_none());
@@ -126,7 +126,7 @@ async fn cyfs_dispatch_confirms_only_the_current_receiver_and_survives_restart()
         id
     );
     let second = center
-        .dispatch_to_receiver(msg, None, bob.clone(), "cyfs://alice.example/second".into())
+        .dispatch_to_receiver(msg, None, bob.clone(), "https://alice.example/second".into())
         .await
         .unwrap();
     assert_eq!(second.delivered_recipients, vec![bob]);
@@ -144,7 +144,7 @@ async fn cyfs_dispatch_cached_reports_retry_and_late_failure_cannot_downgrade_ac
     let delivery_id = post.deliveries[0].delivery_id.clone();
     let result = ndn_lib::CyfsDispatchResult::new(
         Some(id.clone()),
-        "cyfs://remote.example/inbox".into(),
+        "https://remote.example/inbox".into(),
         ndn_lib::CyfsDispatchStatus::Cached,
     );
     let report = crate::cyfs_dispatch::delivery_report(result);
@@ -193,7 +193,6 @@ async fn cyfs_dispatch_http_rejects_forged_identity_before_receiving() {
         .method("PUT")
         .uri("/inbox")
         .header("host", "alice.example")
-        .header("cyfs-original-user", "did:bns:sender")
         .header("content-type", ndn_lib::CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON)
         .body(
             Full::new(bytes::Bytes::from_static(b"{}"))
@@ -493,16 +492,30 @@ async fn cyfs_dispatch_verifies_and_keeps_the_jwt_original_of_a_signed_message()
         .to_jwt(&key, &format!("{}#main_key", sender.to_string()))
         .unwrap();
 
-    let signed = crate::cyfs_dispatch::verify_signed_message(&jwt)
+    // Documents come from nowhere: only key-class DIDs resolve.
+    center
+        .custody
+        .set(std::sync::Arc::new(buckyos_api::StaticCustodyResolver::default()));
+    let signed = crate::cyfs_dispatch::verify_signed_message_with(&jwt, &center)
         .await
         .unwrap();
     assert_eq!(signed.obj_id, id);
     assert_eq!(signed.msg, msg);
 
-    // The kid must name a key of `from`.
+    // The kid must name a key that exists, and one that may sign for `from`.
     let forged = msg.to_jwt(&key, "did:bns:someone-else#main_key").unwrap();
     assert_eq!(
-        crate::cyfs_dispatch::verify_signed_message(&forged)
+        crate::cyfs_dispatch::verify_signed_message_with(&forged, &center)
+            .await
+            .unwrap_err()
+            .1,
+        "unknown-signing-key"
+    );
+    let other_dev = msg
+        .to_jwt(&key, "did:dev:11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo#main_key")
+        .unwrap();
+    assert_eq!(
+        crate::cyfs_dispatch::verify_signed_message_with(&other_dev, &center)
             .await
             .unwrap_err()
             .1,
@@ -516,7 +529,7 @@ async fn cyfs_dispatch_verifies_and_keeps_the_jwt_original_of_a_signed_message()
         .to_jwt(&key, &format!("{}#main_key", other.from.to_string()))
         .unwrap();
     assert_eq!(
-        crate::cyfs_dispatch::verify_signed_message(&wrong_key)
+        crate::cyfs_dispatch::verify_signed_message_with(&wrong_key, &center)
             .await
             .unwrap_err()
             .1,
@@ -528,7 +541,7 @@ async fn cyfs_dispatch_verifies_and_keeps_the_jwt_original_of_a_signed_message()
             signed.msg,
             Some(jwt.clone()),
             alice.clone(),
-            "cyfs://alice.example/inbox".into(),
+            "https://alice.example/inbox".into(),
         )
         .await
         .unwrap();
@@ -3630,6 +3643,65 @@ async fn edit_capability_follows_the_post_send_route_of_every_target() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn reactions_and_their_redactions_arrive_read_and_never_count_as_unread() {
+    use ndn_lib::{MsgRelType, MsgRelation, ObjId};
+
+    let (center, _tmp) = new_center("reaction_unread").await;
+    let author = DID::new("bns", "author");
+    let alice = DID::new("bns", "alice");
+    let relation = |rel: MsgRelType, target: &ObjId, key: Option<&str>| {
+        let mut msg = make_msg(author.clone(), vec![alice.clone()], MsgObjKind::Chat);
+        msg.relates_to = Some(MsgRelation { rel, target: target.clone(), key: key.map(str::to_string) });
+        msg
+    };
+    let unread = || {
+        let center = center.clone();
+        let alice = alice.clone();
+        async move {
+            let sessions = center
+                .handle_list_sessions(alice, None, None, None, None, None, None, ctx())
+                .await
+                .unwrap();
+            assert_eq!(sessions.items.len(), 1);
+            sessions.items[0].unread_count
+        }
+    };
+
+    let original = make_msg(author.clone(), vec![alice.clone()], MsgObjKind::Chat);
+    let original_id = original.gen_obj_id().0;
+    center.handle_dispatch(original, None, None, ctx()).await.unwrap();
+    assert_eq!(unread().await, 1);
+
+    // A quick reaction is folded into its target by every client and has no
+    // row of its own to be read with, so it must not raise the unread count.
+    let reaction = relation(MsgRelType::Reaction, &original_id, Some("👍"));
+    let reaction_id = reaction.gen_obj_id().0;
+    center.handle_dispatch(reaction, None, None, ctx()).await.unwrap();
+    assert_eq!(unread().await, 1);
+    // Cancelling the reaction is a redaction of the reaction message.
+    center
+        .handle_dispatch(relation(MsgRelType::Redact, &reaction_id, None), None, None, ctx())
+        .await
+        .unwrap();
+    assert_eq!(unread().await, 1);
+
+    // An edit is still read with the bubble that shows it, so it counts.
+    let mut edit = relation(MsgRelType::Edit, &original_id, None);
+    edit.content.content = "edited".to_string();
+    center.handle_dispatch(edit, None, None, ctx()).await.unwrap();
+    assert_eq!(unread().await, 2);
+
+    let session_id = format!("dm:{}", author.to_string());
+    let timeline = center
+        .handle_list_session(alice.clone(), session_id, None, None, None, Some(false), None, ctx())
+        .await
+        .unwrap();
+    let state_of = |id: &ObjId| timeline.items.iter().find(|item| item.msg_id == *id).unwrap().recipient_state.clone();
+    assert_eq!(state_of(&original_id), Some(RecipientState::Unread));
+    assert_eq!(state_of(&reaction_id), Some(RecipientState::Read));
 }
 
 #[tokio::test]

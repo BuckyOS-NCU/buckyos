@@ -3,20 +3,22 @@ use crate::group_types::*;
 use crate::msg_center::MessageCenter;
 use buckyos_api::{MailboxAddress, MailboxKind, RecipientState};
 use name_lib::DID;
-use ndn_lib::{CyfsNamedObjectEncoding, MsgObject, NamedObject, ObjId, CYFS_HEADER_ORIGINAL_USER};
+use buckyos_api::{CrossZoneRequest, Principal};
+use ndn_lib::{CyfsNamedObjectEncoding, MsgObject, NamedObject, ObjId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JoinedGroupRoute {
     pub owner_did: DID,
     pub group_did: DID,
     pub host: String,
     pub upstream: String,
-    pub authorization: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
 }
 impl std::fmt::Debug for JoinedGroupRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -28,6 +30,18 @@ impl std::fmt::Debug for JoinedGroupRoute {
     }
 }
 impl JoinedGroupRoute {
+    pub(crate) fn message_route(&self, msg: &MsgObject) -> anyhow::Result<crate::cyfs_dispatch::NativeDispatchRoute> {
+        let mailbox = MailboxAddress::new(self.group_did.clone(), msg.to_session.clone())
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let path = match msg.to_session.as_ref() {
+            None => format!("{}/inbox", self.base_path()),
+            Some(_) => format!("{}/sessions/{}/inbox", self.base_path(), mailbox.to_string().split_once('/').unwrap().1),
+        };
+        Ok(crate::cyfs_dispatch::NativeDispatchRoute {
+            target: crate::group_http::group_target(&self.host, &path).map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            upstream: self.upstream.clone(), authorization: self.authorization.clone(), timeout_ms: 15_000, zone: None,
+        })
+    }
     pub fn validate(&self) -> Result<()> {
         let url = reqwest::Url::parse(&self.upstream).map_err(invalid)?;
         if !matches!(url.scheme(), "http" | "https")
@@ -37,8 +51,9 @@ impl JoinedGroupRoute {
             || url.fragment().is_some()
             || !url.username().is_empty()
             || url.password().is_some()
-            || !self.authorization.starts_with("Bearer ")
-            || http::HeaderValue::from_str(&self.authorization).is_err()
+            || self.authorization.as_ref().is_some_and(|value| {
+                !value.starts_with("Bearer ") || http::HeaderValue::from_str(value).is_err()
+            })
         {
             return Err(invalid("invalid-joined-group-route"));
         }
@@ -48,76 +63,97 @@ impl JoinedGroupRoute {
         Ok(())
     }
     pub fn base_path(&self) -> String {
-        format!("/{}", self.group_did.to_string())
+        if self.authorization.is_some() {
+            format!("/{}", self.group_did.to_string())
+        } else {
+            format!("/kapi/msg-center/groups/{}", self.group_did.to_string())
+        }
     }
-    async fn fetch(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
-        let mut url = reqwest::Url::parse(&self.upstream).map_err(invalid)?;
-        url.set_path(path);
-        url.query_pairs_mut()
-            .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(db_error)?;
-        let response = client
-            .get(url)
-            .header("host", &self.host)
-            .header("authorization", &self.authorization)
-            .header(CYFS_HEADER_ORIGINAL_USER, self.owner_did.to_string())
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(db_error)?;
-        if !response.status().is_success() {
-            return Err(kRPC::RPCErrors::ReasonError(format!(
-                "joined-group-host:{}",
-                response.status()
-            )));
-        }
-        if response.content_length().is_some_and(|n| n > 1024 * 1024) {
-            return Err(invalid("group-response-too-large"));
-        }
-        let mut response = response;
-        let mut bytes = vec![];
-        while let Some(chunk) = response.chunk().await.map_err(db_error)? {
+    /// A request to the group host as the member: a configured route's own Bearer, else a
+    /// session of the host Zone obtained by the member's Zone (`CrossZoneClient`).
+    async fn send(&self, center: &MessageCenter, method: reqwest::Method, path_and_query: &str, body: Vec<u8>) -> Result<(http::HeaderMap, Vec<u8>)> {
+        self.validate()?;
+        let unavailable = |_| kRPC::RPCErrors::ReasonError("remote-group-unavailable".into());
+        let timeout = std::time::Duration::from_secs(15);
+        let response = match self.authorization.as_deref() {
+            Some(authorization) => {
+                let url = reqwest::Url::parse(&self.upstream).map_err(invalid)?.join(path_and_query).map_err(invalid)?;
+                let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+                    .build().map_err(db_error)?;
+                let request = client.request(method, url).header("host", &self.host)
+                    .header("authorization", authorization).timeout(timeout);
+                let request = if body.is_empty() { request } else { request.header("content-type", "application/json").body(body) };
+                request.send().await.map_err(unavailable)?
+            }
+            None => {
+                let client = center.cross_zone.get().ok_or_else(|| kRPC::RPCErrors::ReasonError("remote-group-unavailable".into()))?;
+                let mut request = CrossZoneRequest::new(method, path_and_query).timeout(timeout);
+                if !body.is_empty() {
+                    request = request.header("content-type", "application/json").body(body);
+                }
+                let principal = Principal::new(self.owner_did.clone());
+                match client.request_host(&self.host, crate::cyfs_dispatch::MSG_CENTER_SERVICE, &principal, request).await {
+                    Ok(response) => response,
+                    Err(error) if error.is_retryable() => return Err(kRPC::RPCErrors::ReasonError("remote-group-unavailable".into())),
+                    Err(error) => {
+                        log::warn!("group host {} refused {}: {}", self.host, self.owner_did.to_string(), error);
+                        return Err(denied("remote-group-auth-failed"));
+                    }
+                }
+            }
+        };
+        Self::response(response).await
+    }
+    async fn response(mut response: reqwest::Response) -> Result<(http::HeaderMap, Vec<u8>)> {
+        let unavailable = |_| kRPC::RPCErrors::ReasonError("remote-group-unavailable".into());
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(unavailable)? {
             if chunk.len() > (1024_usize * 1024).saturating_sub(bytes.len()) {
                 return Err(invalid("group-response-too-large"));
             }
             bytes.extend_from_slice(&chunk);
         }
+        if !status.is_success() {
+            if status.is_server_error() || status == http::StatusCode::TOO_MANY_REQUESTS {
+                return Err(kRPC::RPCErrors::ReasonError("remote-group-unavailable".into()));
+            }
+            let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let reason = value["error"].as_str().unwrap_or(match status {
+                http::StatusCode::NOT_FOUND => "remote-group-not-found",
+                http::StatusCode::UNAUTHORIZED => "remote-group-auth-required",
+                _ => "remote-group-auth-failed",
+            });
+            return Err(denied(reason));
+        }
+        Ok((headers, bytes))
+    }
+    pub(crate) async fn put(&self, center: &MessageCenter, path: &str, body: &Value) -> Result<Value> {
+        let (_, bytes) = self.send(center, reqwest::Method::PUT, path, serde_json::to_vec(body).map_err(invalid)?).await?;
+        serde_json::from_slice(&bytes).map_err(|_| invalid("invalid-group-response"))
+    }
+    pub(crate) async fn fetch(&self, center: &MessageCenter, path: &str, query: &[(&str, String)]) -> Result<Value> {
+        let mut url = reqwest::Url::parse("http://group.invalid").map_err(invalid)?;
+        url.set_path(path);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+        }
+        let path_and_query = format!("{}{}", url.path(), url.query().map(|q| format!("?{q}")).unwrap_or_default());
+        let (_, bytes) = self.send(center, reqwest::Method::GET, &path_and_query, vec![]).await?;
         serde_json::from_slice(&bytes).map_err(invalid)
     }
-    async fn object(&self, id: &ObjId) -> Result<(MsgObject, Option<String>)> {
-        let mut url = reqwest::Url::parse(&self.upstream).map_err(invalid)?;
-        url.set_path(&format!("{}/objects/{}", self.base_path(), id.to_string()));
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(db_error)?;
-        let response = client
-            .get(url)
-            .header("host", &self.host)
-            .header("authorization", &self.authorization)
-            .header(CYFS_HEADER_ORIGINAL_USER, self.owner_did.to_string())
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(db_error)?
-            .error_for_status()
-            .map_err(db_error)?;
-        let encoding = response
-            .headers()
-            .get("content-type")
+    async fn object(&self, center: &MessageCenter, id: &ObjId) -> Result<(MsgObject, Option<String>)> {
+        let path = format!("{}/objects/{}", self.base_path(), id.to_string());
+        let (headers, bytes) = self.send(center, reqwest::Method::GET, &path, vec![]).await?;
+        let encoding = headers.get("content-type")
             .and_then(|h| h.to_str().ok())
             .and_then(CyfsNamedObjectEncoding::from_content_type)
             .ok_or_else(|| invalid("invalid-group-object-encoding"))?;
-        if response.content_length().is_some_and(|n| n > 65_536) {
+        if bytes.len() > 65_536 {
             return Err(invalid("group-object-too-large"));
         }
-        let raw = response.text().await.map_err(db_error)?;
-        if raw.len() > 65_536 {
-            return Err(invalid("group-object-too-large"));
-        }
+        let raw = String::from_utf8(bytes).map_err(invalid)?;
         let (msg, jwt) = match encoding {
             CyfsNamedObjectEncoding::Json => (
                 MsgObject::from_json_value_checked(serde_json::from_str(&raw).map_err(invalid)?)
@@ -126,7 +162,7 @@ impl JoinedGroupRoute {
                 None,
             ),
             CyfsNamedObjectEncoding::Jwt => {
-                let signed = crate::cyfs_dispatch::verify_signed_message(&raw)
+                let signed = crate::cyfs_dispatch::verify_signed_message_with(&raw, center)
                     .await
                     .map_err(|(_, r)| denied(r))?;
                 (signed.msg, Some(raw))
@@ -197,7 +233,7 @@ impl MessageCenter {
             query.push(("since", t.clone()));
         }
         let changes = route
-            .fetch(&format!("{}/changes", route.base_path()), &query)
+            .fetch(self, &format!("{}/changes", route.base_path()), &query)
             .await?;
         let mut pending = vec![];
         let mut lost_session = false;
@@ -217,6 +253,7 @@ impl MessageCenter {
             }
             if change["action"] == "entity.group_deleted"
                 || (change["session_id"].is_null()
+                    && changes["member"]["state"] != "active"
                     && (change["subject_did"] == json!(route.owner_did)
                         || change["subject_did"].is_null())
                     && ["entity.member_left", "entity.member_removed"]
@@ -260,7 +297,7 @@ impl MessageCenter {
             state.session_cache.clear();
         } else {
             let sessions = route
-                .fetch(&format!("{}/sessions", route.base_path()), &[])
+                .fetch(self, &format!("{}/sessions", route.base_path()), &[])
                 .await?;
             state.session_cache = sessions["items"]
                 .as_array()
@@ -295,7 +332,7 @@ impl MessageCenter {
                 loop {
                     let page = route
                         .fetch(
-                            &inbox,
+                            self, &inbox,
                             &[("after_seq", after.to_string()), ("limit", "100".into())],
                         )
                         .await?;
@@ -336,7 +373,7 @@ impl MessageCenter {
             let object = if redacted {
                 None
             } else {
-                Some(route.object(&id).await?)
+                Some(route.object(self, &id).await?)
             };
             if object
                 .as_ref()
@@ -353,7 +390,7 @@ impl MessageCenter {
                 }
                 let mailbox = MailboxAddress::try_from(session.clone()).map_err(invalid)?;
                 if route
-                    .report_read(mailbox.session_id(), last_read)
+                    .report_read(self, mailbox.session_id(), last_read)
                     .await
                     .is_ok()
                 {
@@ -362,6 +399,7 @@ impl MessageCenter {
             }
         }
         let mut tx = self.msg_box_db.pool().begin().await.map_err(db_error)?;
+        let mut projections = vec![];
         let mut purges = std::collections::BTreeSet::new();
         for (_, _, id, redacted, object, _) in &fetched {
             if *redacted {
@@ -427,7 +465,7 @@ impl MessageCenter {
                     route.owner_did.clone(),
                     MailboxKind::Inbox,
                     msg,
-                    RecipientState::Unread,
+                    Self::inbound_initial_state(msg),
                     None,
                     vec![
                         format!("group:{}", route.group_did.to_string()),
@@ -443,6 +481,7 @@ impl MessageCenter {
                 self.msg_box_db
                     .upsert_record_with_msg_tx(&mut tx, &record, Some(msg))
                     .await?;
+                projections.push(record);
             } else if *redacted {
                 let now = Self::now_ms();
                 let record = buckyos_api::MailboxRecord {
@@ -457,7 +496,8 @@ impl MessageCenter {
                     box_kind: MailboxKind::Inbox,
                     msg_id: id.clone(),
                     msg_kind: ndn_lib::MsgObjKind::GroupMsg,
-                    state: RecipientState::Unread,
+                    // Already withdrawn before this member ever saw it: nothing to read.
+                    state: RecipientState::Read,
                     from: route.group_did.clone(),
                     from_name: None,
                     to: route.group_did.clone(),
@@ -475,6 +515,7 @@ impl MessageCenter {
                 self.msg_box_db
                     .upsert_record_with_msg_tx(&mut tx, &record, None)
                     .await?;
+                projections.push(record);
                 let sql = self
                     .msg_box_db
                     .render_sql("DELETE FROM msg_jwt_originals WHERE msg_id=?");
@@ -491,7 +532,8 @@ impl MessageCenter {
                 .or_insert(*seq);
         }
         for id in purges {
-            for statement in ["UPDATE group_objects SET body_json=NULL,jwt=NULL WHERE obj_id=?","DELETE FROM msg_jwt_originals WHERE msg_id=?","INSERT INTO group_object_purges(obj_id,schema_version) VALUES(?,1) ON CONFLICT(obj_id) DO NOTHING"] {
+            crate::group_store::queue_purge(&self.msg_box_db, &mut tx, &ObjId::new(&id).map_err(invalid)?).await?;
+            for statement in ["UPDATE group_objects SET body_json=NULL,jwt=NULL WHERE obj_id=?","DELETE FROM msg_jwt_originals WHERE msg_id=?"] {
                 let sql=self.msg_box_db.render_sql(statement);sqlx::query(&sql).bind(&id).execute(&mut *tx).await.map_err(db_error)?;
             }
         }
@@ -529,6 +571,9 @@ impl MessageCenter {
             .await
             .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
+        for record in projections {
+            Self::publish_box_changed_event(&record, "upsert");
+        }
         Ok(json!({"synced":fetched.len(),"stopped":state.stopped}))
     }
     pub(crate) fn start_group_sync(&self) {
@@ -547,6 +592,9 @@ impl MessageCenter {
                 }
                 if let Err(e) = center.purge_group_objects().await {
                     log::warn!("group object purge failed: {e}");
+                }
+                if let Err(error) = center.sync_remote_groups().await {
+                    log::warn!("joined group recovery failed: {error}");
                 }
                 let routes = center.cyfs_dispatch.read().unwrap().joined_groups.clone();
                 for route in routes {
@@ -607,46 +655,27 @@ impl MessageCenter {
 }
 
 impl JoinedGroupRoute {
-    async fn report_read(&self, session: Option<&str>, last_read: u64) -> Result<()> {
-        let mut url = reqwest::Url::parse(&self.upstream).map_err(invalid)?;
-        url.set_path(&format!("{}/read_markers", self.base_path()));
-        let response = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(db_error)?
-            .put(url)
-            .header("host", &self.host)
-            .header("authorization", &self.authorization)
-            .header(CYFS_HEADER_ORIGINAL_USER, self.owner_did.to_string())
-            .json(&json!({"session_id":session,"last_read_seq":last_read}))
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(db_error)?;
-        response.error_for_status().map_err(db_error)?;
+    async fn report_read(&self, center: &MessageCenter, session: Option<&str>, last_read: u64) -> Result<()> {
+        self.put(center, &format!("{}/read_markers", self.base_path()),
+            &json!({"session_id":session,"last_read_seq":last_read})).await?;
         Ok(())
     }
 }
 impl MessageCenter {
-    async fn purge_group_objects(&self) -> Result<()> {
-        let Ok(runtime) = buckyos_api::get_buckyos_api_runtime() else {
+    /// Unbinds and removes the messages redactions queued (`queue_purge`).
+    pub(crate) async fn purge_group_objects(&self) -> Result<()> {
+        let Some(buckets) = self.open_buckets().await? else {
             return Ok(());
         };
-        let store = runtime.get_local_named_store().await?;
-        for row in sqlx::query("SELECT obj_id FROM group_object_purges LIMIT 100")
+        for row in sqlx::query("SELECT obj_id,attachment_prefix FROM group_object_purges LIMIT 100")
             .fetch_all(self.msg_box_db.pool())
             .await
             .map_err(db_error)?
         {
             let raw: String = row.try_get("obj_id").map_err(db_error)?;
+            let prefix: Option<String> = row.try_get("attachment_prefix").map_err(db_error)?;
             let id = ObjId::new(&raw).map_err(db_error)?;
-            match store.remove_object(&id).await {
-                Ok(_) => {}
-                Err(e)
-                    if e.to_string().to_lowercase().contains("notfound")
-                        || e.to_string().to_lowercase().contains("not found") => {}
-                Err(e) => return Err(db_error(e)),
-            }
+            self.purge_message(&buckets, &id, prefix).await?;
             let sql = self
                 .msg_box_db
                 .render_sql("DELETE FROM group_object_purges WHERE obj_id=?");

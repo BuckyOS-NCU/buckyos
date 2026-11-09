@@ -1,4 +1,4 @@
-mod attachment_retention;
+mod buckets;
 mod contact_mgr;
 mod contact_lookup;
 mod contact_rpc;
@@ -6,6 +6,7 @@ mod cyfs_dispatch;
 mod friend_service;
 mod group_http;
 mod group_publication;
+mod group_remote;
 mod group_service;
 mod group_store;
 mod group_sync;
@@ -16,13 +17,21 @@ mod msg_center;
 mod msg_tunnel;
 mod notify;
 mod network_directory;
+mod obj_provider;
 mod object_access;
 mod owner_session;
 mod owner_session_db;
+mod remote_attachment;
 #[cfg(test)]
 mod test_contact_network;
 #[cfg(test)]
+mod test_remote_attachment;
+#[cfg(test)]
+mod test_cross_zone;
+#[cfg(test)]
 mod test_group_service;
+#[cfg(test)]
+mod test_group_remote;
 #[cfg(test)]
 mod test_hybrid_sso;
 #[cfg(test)]
@@ -167,6 +176,7 @@ impl Default for TelegramTunnelSettings {
 struct MsgCenterHttpServer {
     rpc_handler: MsgCenterServerHandler<MessageCenter>,
     zone_sync: Arc<ZoneSync>,
+    objects: std::sync::OnceLock<buckyos_http_server::DIDObjectHttpServer<buckyos_api::KrpcObjectProvider>>,
 }
 
 impl MsgCenterHttpServer {
@@ -174,7 +184,13 @@ impl MsgCenterHttpServer {
         Self {
             rpc_handler: MsgCenterServerHandler::new(center),
             zone_sync,
+            objects: std::sync::OnceLock::new(),
         }
+    }
+
+    fn enable_objects(self: &Arc<Self>, zone_did: name_lib::DID) {
+        let provider = obj_provider::provider(Arc::downgrade(self), zone_did);
+        let _ = self.objects.set(provider.into_http_server());
     }
 
     async fn handle_reload_settings(&self) -> std::result::Result<serde_json::Value, RPCErrors> {
@@ -228,6 +244,22 @@ impl RPCHandler for MsgCenterHttpServer {
                     trace_id: req.trace_id,
                 });
             }
+            if req.method == buckyos_api::METHOD_MSG_ATTACHMENT_TICKET {
+                let value = center.attachment_ticket(req.params.clone(), &ctx).await?;
+                return Ok(RPCResponse {
+                    result: RPCResult::Success(value),
+                    seq: req.seq,
+                    trace_id: req.trace_id,
+                });
+            }
+            if req.method == buckyos_api::METHOD_MSG_COLLECT_ATTACHMENT {
+                let value = center.collect_attachment(req.params.clone(), &ctx).await?;
+                return Ok(RPCResponse {
+                    result: RPCResult::Success(value),
+                    seq: req.seq,
+                    trace_id: req.trace_id,
+                });
+            }
             if req.method.starts_with("group.") {
                 let value = center
                     .group_rpc(&req.method, req.params.clone(), ctx)
@@ -257,6 +289,11 @@ impl HttpServer for MsgCenterHttpServer {
             }
             if let Some(response) = object_access::serve(&self.rpc_handler.0, &req).await {
                 return Ok(response);
+            }
+            if let Some(objects) = self.objects.get() {
+                if req.uri().path().starts_with(&format!("{MSG_CENTER_HTTP_PATH}/obj")) {
+                    return objects.serve_request(req, info).await;
+                }
             }
             if *req.method() == Method::POST
                 && (req.uri().path() == MSG_CENTER_HTTP_PATH
@@ -908,6 +945,9 @@ impl ZoneSync {
             .map(|(_, result)| result.clone())
             .unwrap_or_default();
         if let Err(error) = self.sync_contacts(&mut applied, agents, force).await {
+            if force {
+                return Err(error);
+            }
             warn!("zone contact sync failed: {}", error);
         }
         Ok(result)
@@ -1397,19 +1437,17 @@ pub async fn start_msg_center_service() -> Result<()> {
     };
 
     // Native messages of this Zone's users leave signed by the OOD device
-    // (Zone custody); without the key they can only use configured routes.
-    let zone_signer = match runtime.load_device_private_key() {
-        Ok(()) => runtime
-            .device_private_key
-            .clone()
-            .zip(runtime.device_config.as_ref().map(|d| d.id.to_string()))
-            .map(|(key, device)| network_directory::ZoneSigner {
-                key,
-                kid: format!("{device}#main_key"),
-            }),
+    // (Zone custody), which also logs them in at other Zones.
+    let (zone_signer, cross_zone) = match runtime.load_device_private_key() {
+        Ok(()) => (
+            runtime.device_signer(),
+            buckyos_api::CrossZoneClient::from_runtime(&runtime)
+                .map_err(|err| warn!("cross-zone client unavailable: {}", err))
+                .ok(),
+        ),
         Err(err) => {
-            warn!("device key unavailable, native messages stay unsigned: {}", err);
-            None
+            warn!("device key unavailable, native messages stay unsigned and local: {}", err);
+            (None, None)
         }
     };
 
@@ -1423,12 +1461,17 @@ pub async fn start_msg_center_service() -> Result<()> {
     if let Some(signer) = zone_signer {
         center.zone_signer.set(signer);
     }
+    if let Some(client) = cross_zone {
+        let origins = center.cyfs_dispatch.read().unwrap().zone_origins.clone();
+        center
+            .cross_zone
+            .set(std::sync::Arc::new(client.with_origins(origins)));
+    }
+    center.set_bucket_host(buckets::BucketHost::Runtime);
     center.start_idempotency_sweep();
     center.start_friend_request_sweep();
     center.start_notify_sweep();
     center.start_group_sync();
-    center.set_attachment_store(Arc::new(attachment_retention::RuntimeAttachmentStore));
-    center.start_attachment_retention();
 
     let executor_mgr = Arc::new(DeliveryExecutorMgr::new());
     register_message_hub(&center, executor_mgr.as_ref()).await?;
@@ -1449,6 +1492,9 @@ pub async fn start_msg_center_service() -> Result<()> {
     start_zone_sync(zone_sync.clone());
     start_delivery_pump(center.clone(), executor_mgr);
     let server = Arc::new(MsgCenterHttpServer::new(center, zone_sync));
+    if let Ok(runtime) = get_buckyos_api_runtime() {
+        server.enable_objects(runtime.zone_id.clone());
+    }
 
     let runner = Runner::new(MSG_CENTER_SERVICE_PORT);
     if let Err(err) = runner.add_http_server(MSG_CENTER_HTTP_PATH.to_string(), server.clone()) {
@@ -1776,6 +1822,22 @@ mod zone_contact_tests {
     }
 
     #[tokio::test]
+    async fn forced_zone_sync_requires_contact_directory() {
+        let (center, _tmp) = new_center().await;
+        let sync = ZoneSync::new(center, Arc::new(DeliveryExecutorMgr::new()));
+        let settings = json!({"telegram_tunnel": {"enabled": false}});
+        let expected = load_zone_directory().await.unwrap_err().to_string();
+
+        assert_eq!(
+            sync.apply(&settings, &[], true).await.unwrap_err().to_string(),
+            expected
+        );
+        assert!(sync.applied.lock().await.contacts.is_none());
+        assert!(sync.apply(&settings, &[], false).await.is_ok());
+        assert!(sync.applied.lock().await.contacts.is_none());
+    }
+
+    #[tokio::test]
     async fn bot_api_without_bindings_runs_and_rebuilds_only_on_change() {
         let (center, _tmp) = new_center().await;
         let executor_mgr = Arc::new(DeliveryExecutorMgr::new());
@@ -1785,7 +1847,7 @@ mod zone_contact_tests {
             "gateway": {"mode": "bot_api"},
             "bindings": []
         }});
-        let result = sync.apply(&activated, &[], true).await.unwrap();
+        let result = sync.apply(&activated, &[], false).await.unwrap();
         assert_eq!(result["ok"], true);
         assert_eq!(result["tunnel_started"], true);
         assert_eq!(result["bindings"], 0);

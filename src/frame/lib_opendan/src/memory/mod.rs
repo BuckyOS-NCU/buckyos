@@ -46,14 +46,14 @@ pub use consolidation::{
     Batch, BatchOptions, CleanupReport, Consolidator, Material, MaterialState, PendingWork,
     ReviewDue, DEFAULT_BATCH_LIMIT, DEFAULT_CONTEXT_LIMIT,
 };
-pub use hint::{Budget, Hint, HintLayer, HintState};
+pub use hint::{scope_object_url, Budget, Hint, HintLayer, HintState};
 pub use observation::{
     observe, set_topic, Delivery, LastQuery, ObservationState, TopicConfig, TopicOutcome,
     TopicState, TopicTag, TopicUpdate, Valve,
 };
 pub use perception::{PerceptionInput, PerceptionReceipt, ReceiptStatus};
 pub use read::{
-    BasisEntry, CognitionView, PerceptionView, ProvenanceView, ReadView, RevisionEntry,
+    BasisEntry, CognitionView, PerceptionView, ProvenanceView, RevisionEntry,
     SourceAvailability,
 };
 pub use recall::{MemoryQuery, QueryResult, RecallStatus, TopicQuery, TopicResult, TopicScope};

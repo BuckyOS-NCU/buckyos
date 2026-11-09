@@ -7,23 +7,25 @@
 //! result — so the two never drift apart. On top of that:
 //!
 //! - an object id (`cyfile:…`, `chunk:…`: an attachment or a report
-//!   artifact) is read from the object store ([`ObjectReader`]) without
-//!   being copied to disk first;
+//!   artifact) is read from the object store, or a message attachment the
+//!   store refuses through msg-center ([`ObjectReader`]), without being
+//!   copied to disk first;
 //! - `offset` / `limit` (0-based line paging) are accepted as another
-//!   spelling of `range`.
-//!
-//! Other URI schemes are refused.
+//!   spelling of `range`;
+//! - any other URL (`obj://`, `cyfs://`, `https://`, `file://<device_id>/…` of
+//!   another device) is read by the host's [`UrlReader`] and windowed the
+//!   same way. Without one they are refused.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ndn_lib::ObjId;
+use ndn_lib::{FileObject, NdnError, ObjId};
 use serde_json::{json, Value as Json};
 
 use crate::file_tools::{FileToolConfig, ReadFileTool};
 use crate::path_utils::expand_home;
-use crate::runtime::files::{FileBackend, PathType};
+use crate::runtime::files::FileBackend;
 use crate::tool::{CallingConventions, TypedToolHandle};
 use crate::{AgentTool, AgentToolError, AgentToolResult, SessionRuntimeContext, ToolSpec};
 
@@ -35,6 +37,28 @@ pub trait ObjectReader: Send + Sync + std::fmt::Debug {
     async fn read_object(&self, obj_id: &str) -> Result<Vec<u8>, AgentToolError>;
 }
 
+/// A URL `read` does not read itself: rendered by the host's object resolver
+/// (`agent-did-object-lib`), then windowed like a file.
+#[async_trait]
+pub trait UrlReader: Send + Sync + std::fmt::Debug {
+    /// `property`: a property the object's Profile declares, read instead of
+    /// the object's description.
+    async fn read_url(
+        &self,
+        ctx: &SessionRuntimeContext,
+        url: &str,
+        property: Option<&str>,
+    ) -> Result<UrlContent, AgentToolError>;
+}
+
+/// What a [`UrlReader`] read: the text `read` windows, and the identity and
+/// route of what was read (`details.object` of the result).
+#[derive(Debug)]
+pub struct UrlContent {
+    pub text: String,
+    pub details: Json,
+}
+
 /// The zone's NamedStore (through the process's BuckyOS runtime).
 #[derive(Debug, Default)]
 pub struct NamedStoreObjectReader;
@@ -42,25 +66,118 @@ pub struct NamedStoreObjectReader;
 #[async_trait]
 impl ObjectReader for NamedStoreObjectReader {
     async fn read_object(&self, obj_id: &str) -> Result<Vec<u8>, AgentToolError> {
-        use tokio::io::AsyncReadExt;
         let id = ObjId::new(obj_id)
             .map_err(|e| AgentToolError::InvalidArgs(format!("bad object id {obj_id}: {e}")))?;
-        let store = buckyos_api::get_buckyos_api_runtime()
-            .map_err(|e| AgentToolError::ExecFailed(format!("no object store here: {e}")))?
-            .get_named_store()
+        read_named_object(&id)
             .await
-            .map_err(|e| AgentToolError::ExecFailed(format!("object store: {e}")))?;
-        let (mut reader, _) = store
-            .open_reader(&id, None)
-            .await
-            .map_err(|e| AgentToolError::ExecFailed(format!("open {obj_id}: {e}")))?;
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| AgentToolError::ExecFailed(format!("read {obj_id}: {e}")))?;
-        Ok(bytes)
+            .map(|content| content.bytes)
+            .map_err(AgentToolError::ExecFailed)
     }
+}
+
+/// A data object's content and the media type its FileObject or its server
+/// gives, when either does.
+pub struct ObjectContent {
+    pub bytes: Vec<u8>,
+    pub mime: Option<String>,
+}
+
+/// Reads `obj_id` with the process's identity: from the zone's NamedStore, or,
+/// when the store refuses that identity (an attachment of a message, which
+/// only msg-center reads for the members of its conversation), through
+/// msg-center, which finds the message among the caller's own mailboxes.
+pub async fn read_named_object(obj_id: &ObjId) -> Result<ObjectContent, String> {
+    use tokio::io::AsyncReadExt;
+    let runtime = buckyos_api::get_buckyos_api_runtime()
+        .map_err(|e| format!("no object store here: {e}"))?;
+    let store = runtime
+        .get_named_store()
+        .await
+        .map_err(|e| format!("object store: {e}"))?;
+    let mime = match store.get_object(obj_id).await {
+        Ok(body) => file_object_mime(&body),
+        Err(NdnError::PermissionDenied(_)) => return read_message_attachment(runtime, obj_id).await,
+        Err(_) => None,
+    };
+    let (mut reader, _) = match store.open_reader(obj_id, None).await {
+        Ok(opened) => opened,
+        Err(NdnError::PermissionDenied(_)) => return read_message_attachment(runtime, obj_id).await,
+        Err(e) => return Err(format!("open {obj_id}: {e}")),
+    };
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| format!("read {obj_id}: {e}"))?;
+    Ok(ObjectContent { bytes, mime })
+}
+
+fn file_object_mime(body: &str) -> Option<String> {
+    let file: FileObject = serde_json::from_str(body).ok()?;
+    file.meta
+        .get("mime")
+        .and_then(Json::as_str)
+        .map(str::to_string)
+}
+
+const ATTACHMENT_MAX_WAIT_SECS: u64 = 60;
+
+/// `GET <msg-center>/objects/<obj_id>/content`.
+async fn read_message_attachment(
+    runtime: &buckyos_api::BuckyOSRuntime,
+    obj_id: &ObjId,
+) -> Result<ObjectContent, String> {
+    let base = runtime
+        .get_zone_service_url(buckyos_api::MSG_CENTER_SERVICE_NAME, runtime.force_https)
+        .await
+        .map_err(|e| format!("msg-center: {e}"))?;
+    runtime
+        .renew_token_from_verify_hub()
+        .await
+        .map_err(|e| format!("msg-center authentication: {e}"))?;
+    let client = reqwest::Client::new();
+    let mut waited = 0;
+    // An attachment still in another Zone: msg-center says when to ask again.
+    let response = loop {
+        let response = client
+            .get(format!("{base}/objects/{obj_id}/content"))
+            .bearer_auth(runtime.get_session_token().await)
+            .send()
+            .await
+            .map_err(|e| format!("msg-center: {e}"))?;
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|secs| {
+                response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && waited + secs <= ATTACHMENT_MAX_WAIT_SECS
+            });
+        let Some(secs) = retry_after else { break response };
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        waited += secs;
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "{obj_id} is not readable here: the object store refuses this identity, and no message it received references it"
+        ));
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("msg-center refused {obj_id}: HTTP {status}: {body}"));
+    }
+    let mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("read {obj_id} from msg-center: {e}"))?;
+    Ok(ObjectContent { bytes: bytes.to_vec(), mime })
 }
 
 /// A file backend over one object: `read_file`'s window logic applied to
@@ -101,21 +218,13 @@ impl FileBackend for ObjectBackend {
             path.display()
         )))
     }
-    async fn path_type(&self, _path: &Path) -> Result<PathType, AgentToolError> {
-        Ok(PathType::File)
-    }
-    async fn mkdir(&self, path: &Path) -> Result<(), AgentToolError> {
-        Err(AgentToolError::InvalidArgs(format!(
-            "{} is an object store path, not a directory",
-            path.display()
-        )))
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ReadTool {
     cfg: FileToolConfig,
     objects: Arc<dyn ObjectReader>,
+    urls: Option<Arc<dyn UrlReader>>,
 }
 
 impl ReadTool {
@@ -123,6 +232,7 @@ impl ReadTool {
         Self {
             cfg,
             objects: Arc::new(NamedStoreObjectReader),
+            urls: None,
         }
     }
 
@@ -130,20 +240,33 @@ impl ReadTool {
         self.objects = objects;
         self
     }
+
+    pub fn with_urls(mut self, urls: Option<Arc<dyn UrlReader>>) -> Self {
+        self.urls = urls;
+        self
+    }
 }
 
 #[async_trait]
 impl AgentTool for ReadTool {
+    fn idempotent(&self) -> bool {
+        true
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: TOOL_READ.to_string(),
-            description: "Read a file or an object and return LLM-readable text. uri is a path (relative to the working directory or absolute within it), file:///abs/path, or an object id such as cyfile:… (an attachment, a report artifact). range selects 1-based lines: \"120-200\", \"120:$\" (to the end), \"120:+20\" (20 lines from 120), negative numbers count from the end (\"-50:$\" = the last 50); first_chunk starts the read at the first occurrence of that text (range then counts from there). offset (0-based) and limit page by lines instead of range.".to_string(),
+            description: "Read a file or an object and return LLM-readable text. uri is a path (relative to the working directory or absolute within it), file:///abs/path, an object id such as cyfile:… (an attachment, a report artifact), or a URL: obj://<service or agent-id>/… (a BuckyOS object: its description, declared properties, actions and events), cyfs:///path (a Zone file), https://…; property reads one property an object declares. range selects 1-based lines: \"120-200\", \"120:$\" (to the end), \"120:+20\" (20 lines from 120), negative numbers count from the end (\"-50:$\" = the last 50); first_chunk starts the read at the first occurrence of that text (range then counts from there). offset (0-based) and limit page by lines when no range is given.".to_string(),
             args_schema: json!({
                 "type": "object",
                 "properties": {
                     "uri": {
                         "type": "string",
-                        "description": "Path, file:// URI or object id (cyfile:…)."
+                        "description": "Path, file:// URI, object id (cyfile:…) or URL (obj://, cyfs://, https://)."
+                    },
+                    "property": {
+                        "type": "string",
+                        "description": "For an object URL: a property its description declares, read instead of the description."
                     },
                     "range": {
                         "type": "string",
@@ -179,13 +302,33 @@ impl AgentTool for ReadTool {
                 }
             }),
             usage: Some(format!(
-                "{TOOL_READ} uri=\"<path | file:///abs | cyfile:…>\" [range=\"120-200\"] [first_chunk=\"<text>\"]"
+                "{TOOL_READ} uri=\"<path | file:///abs | cyfile:… | obj://… | cyfs:///… | https://…>\" [property=\"<declared property>\"] [range=\"120-200\"] [first_chunk=\"<text>\"]"
             )),
         }
     }
 
     fn calling(&self) -> CallingConventions {
         CallingConventions::ALL
+    }
+
+    /// `read <uri> [key=value …]`: a leading token that is no `key=value` is the uri.
+    fn parse_cli_args(
+        &self,
+        tokens: &[String],
+        _shell_cwd: Option<&Path>,
+    ) -> Result<crate::tool::CliInvocation, AgentToolError> {
+        let mut tokens = tokens.to_vec();
+        if let Some(first) = tokens.first_mut() {
+            let is_pair = first.split_once('=').is_some_and(|(key, _)| {
+                !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+            if !is_pair {
+                *first = format!("uri={first}");
+            }
+        }
+        Ok(crate::tool::CliInvocation::Bash {
+            line: crate::build_bash_cli_line(TOOL_READ, &tokens),
+        })
     }
 
     async fn call(
@@ -216,48 +359,157 @@ impl AgentTool for ReadTool {
         if let Some(r) = range {
             read_args.insert("range".into(), r);
         }
-        if let Some(chunk) = map.get("first_chunk").filter(|v| !v.is_null()) {
+        if let Some(chunk) = given(&map, "first_chunk") {
             read_args.insert("first_chunk".into(), chunk.clone());
         }
-        let (cfg, path) = match parse_read_target(&uri)? {
+        let property = map
+            .get("property")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut object = None;
+        let target = parse_read_target(&uri)?;
+        if property.is_some() && !matches!(target, ReadTarget::Url { .. }) {
+            return Err(AgentToolError::InvalidArgs(format!(
+                "`property` applies to object URLs; `{uri}` is a file or a content object"
+            )));
+        }
+        let (cfg, path) = match target {
             ReadTarget::File { path } => (self.cfg.clone(), path),
-            ReadTarget::Object { obj_id } => {
-                let mut cfg = self.cfg.clone();
-                cfg.backend = Arc::new(ObjectBackend {
-                    reader: self.objects.clone(),
-                });
-                cfg.allowed_read_roots.clear();
-                (cfg, obj_id)
+            ReadTarget::Object { obj_id } => (self.object_cfg(self.objects.clone()), obj_id),
+            ReadTarget::Url { url } => {
+                let reader = self.urls.as_ref().ok_or_else(|| {
+                    AgentToolError::InvalidArgs(format!(
+                        "unsupported read uri `{url}`: this runtime has no object resolver; use a path, file:///abs/path or an object id (cyfile:…)"
+                    ))
+                })?;
+                let content = reader.read_url(ctx, &url, property).await?;
+                object = Some(content.details);
+                let text: Arc<dyn ObjectReader> = Arc::new(FetchedText(content.text));
+                (self.object_cfg(text), url)
             }
         };
+        let window = read_args.get("range").map(|r| r.to_string()).unwrap_or_default();
         read_args.insert("path".into(), Json::String(path));
-        TypedToolHandle::with_null_host(ReadFileTool::new(cfg))
+        let mut result = TypedToolHandle::new(ReadFileTool::new(cfg))
             .call(ctx, Json::Object(read_args))
-            .await
+            .await?;
+        if let (Some(object), Json::Object(details)) = (object, &mut result.details) {
+            details.insert("object".into(), object);
+        }
+        Ok(with_read_dedup(result, &uri, &window))
     }
 }
 
-/// `range` as given, or the `offset` / `limit` page spelled as a range.
+impl ReadTool {
+    fn object_cfg(&self, reader: Arc<dyn ObjectReader>) -> FileToolConfig {
+        let mut cfg = self.cfg.clone();
+        cfg.backend = Arc::new(ObjectBackend { reader });
+        cfg.dfs_root = None;
+        cfg.allowed_read_roots.clear();
+        cfg
+    }
+}
+
+/// The same window of `what` with the same content read again in this
+/// run: the tool manager answers with one line instead of the content
+/// (`dedup`, see [`crate::hints`]).
+pub fn with_read_dedup(result: AgentToolResult, what: &str, window: &str) -> AgentToolResult {
+    if result.status != crate::AgentToolStatus::Success {
+        return result;
+    }
+    let digest = blake3::hash(result.observation_text().as_bytes()).to_hex();
+    let key = format!("read:{what}#{window}:{}", &digest[..16]);
+    result.with_dedup(
+        key,
+        format!("`{what}` is unchanged since you read it earlier in this run; use that content."),
+    )
+}
+
+/// `read_file` of the `bash` group with `read`'s dedup key.
+pub struct DedupReadFile {
+    inner: Arc<dyn AgentTool>,
+}
+
+impl DedupReadFile {
+    pub fn new(inner: Arc<dyn AgentTool>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl AgentTool for DedupReadFile {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+
+    fn calling(&self) -> CallingConventions {
+        self.inner.calling()
+    }
+
+    fn cancellable(&self) -> bool {
+        self.inner.cancellable()
+    }
+
+    fn idempotent(&self) -> bool {
+        self.inner.idempotent()
+    }
+
+    async fn call(
+        &self,
+        ctx: &SessionRuntimeContext,
+        args: Json,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        let what = args
+            .get("path")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let mut window = args.clone();
+        if let Some(m) = window.as_object_mut() {
+            m.remove("path");
+        }
+        let result = self.inner.call(ctx, args).await?;
+        Ok(with_read_dedup(result, &what, &window.to_string()))
+    }
+}
+
+/// The text a [`UrlReader`] rendered, read as one object.
+#[derive(Debug)]
+struct FetchedText(String);
+
+#[async_trait]
+impl ObjectReader for FetchedText {
+    async fn read_object(&self, _obj_id: &str) -> Result<Vec<u8>, AgentToolError> {
+        Ok(self.0.clone().into_bytes())
+    }
+}
+
+/// An argument that is given: not null and not an empty string (a model calling with a strict schema fills every
+/// field, the unused ones with `""`).
+fn given<'a>(map: &'a serde_json::Map<String, Json>, name: &str) -> Option<&'a Json> {
+    map.get(name)
+        .filter(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.trim().is_empty()))
+}
+
+/// `range` as given, or else the `offset` / `limit` page spelled as a range.
 fn window_range(map: &serde_json::Map<String, Json>) -> Result<Option<Json>, AgentToolError> {
+    if let Some(range) = given(map, "range") {
+        return Ok(Some(range.clone()));
+    }
     let offset = parse_u64_arg(map.get("offset"), "offset")?;
     let limit = parse_u64_arg(map.get("limit"), "limit")?;
-    let range = map.get("range").filter(|v| !v.is_null()).cloned();
-    if range.is_some() && (offset.is_some() || limit.is_some()) {
-        return Err(AgentToolError::InvalidArgs(
-            "give either range or offset/limit, not both".to_string(),
-        ));
-    }
     if let Some(0) = limit {
         return Err(AgentToolError::InvalidArgs("`limit` must be at least 1".to_string()));
     }
-    Ok(match (range, offset, limit) {
-        (Some(r), _, _) => Some(r),
-        (None, None, None) => None,
-        (None, offset, Some(limit)) => {
+    Ok(match (offset, limit) {
+        (None, None) => None,
+        (offset, Some(limit)) => {
             let start = offset.unwrap_or(0) + 1;
             Some(Json::String(format!("{start}-{}", start + limit - 1)))
         }
-        (None, Some(offset), None) => Some(Json::String(format!("{}:$", offset + 1))),
+        (Some(offset), None) => Some(Json::String(format!("{}:$", offset + 1))),
     })
 }
 
@@ -290,6 +542,7 @@ fn parse_u64_arg(v: Option<&Json>, name: &str) -> Result<Option<u64>, AgentToolE
 enum ReadTarget {
     File { path: String },
     Object { obj_id: String },
+    Url { url: String },
 }
 
 /// An object id has a type prefix, no path separator and no whitespace
@@ -305,40 +558,22 @@ fn parse_read_target(raw: &str) -> Result<ReadTarget, AgentToolError> {
     if let Some(obj_id) = object_id(raw) {
         return Ok(ReadTarget::Object { obj_id });
     }
-    if let Some((scheme, _)) = raw.split_once("://") {
-        let scheme = scheme.trim();
-        if scheme == "file" {
-            return Ok(ReadTarget::File {
-                path: parse_file_uri_path(raw)?,
-            });
+    if !raw.contains("://") {
+        return Ok(ReadTarget::File {
+            path: expand_home(raw),
+        });
+    }
+    let url = buckyos_api::parse_object_url(raw)
+        .map_err(|e| AgentToolError::InvalidArgs(format!("unsupported read uri `{raw}`: {e}")))?;
+    Ok(match url {
+        // `file:///p` / `file://localhost/p`: this runtime's file (D1).
+        buckyos_api::ObjectUrl::File { device_id: None, path } => ReadTarget::File { path },
+        // `cyfs://<objid>/`: the object itself, like its bare id.
+        buckyos_api::ObjectUrl::CyfsObject { obj_id, source_zone: None, inner_path } if inner_path.is_empty() || inner_path == "/" => {
+            ReadTarget::Object { obj_id: obj_id.to_string() }
         }
-        return Err(AgentToolError::InvalidArgs(format!(
-            "unsupported read uri `{raw}`: use a path, file:///abs/path or an object id (cyfile:…)"
-        )));
-    }
-    Ok(ReadTarget::File {
-        path: expand_home(raw),
+        other => ReadTarget::Url { url: other.to_string() },
     })
-}
-
-/// Parse `file://[host]/abs/path` → `/abs/path`. The host portion is
-/// accepted but ignored (`localhost` and empty both valid, others rejected
-/// to surface typos).
-fn parse_file_uri_path(uri: &str) -> Result<String, AgentToolError> {
-    let rest = uri
-        .strip_prefix("file://")
-        .ok_or_else(|| AgentToolError::InvalidArgs(format!("malformed file uri: {uri}")))?;
-    if let Some(stripped) = rest.strip_prefix("localhost/") {
-        return Ok(format!("/{stripped}"));
-    }
-    if rest.starts_with('/') {
-        return Ok(rest.to_string());
-    }
-    // A host other than localhost is a typo (`file://workspace/x`), not a
-    // host named `workspace`.
-    Err(AgentToolError::InvalidArgs(format!(
-        "file:// uri must be of the form `file:///abs/path` or `file://localhost/abs/path`; got `{uri}`"
-    )))
 }
 
 #[cfg(test)]
@@ -373,7 +608,7 @@ mod tests {
     const TEXT: &str = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
 
     async fn read_file(ws: &Path, args: Json) -> AgentToolResult {
-        TypedToolHandle::with_null_host(ReadFileTool::new(FileToolConfig::new(ws.to_path_buf())))
+        TypedToolHandle::new(ReadFileTool::new(FileToolConfig::new(ws.to_path_buf())))
             .call(&ctx(), args)
             .await
             .unwrap()
@@ -385,10 +620,14 @@ mod tests {
             .await
     }
 
+    /// The same result, apart from `read`'s dedup key.
     fn same(a: &AgentToolResult, b: &AgentToolResult) {
+        let (mut a, mut b) = (a.clone(), b.clone());
+        a.dedup = None;
+        b.dedup = None;
         assert_eq!(
-            serde_json::to_string(a).unwrap(),
-            serde_json::to_string(b).unwrap()
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
         );
     }
 
@@ -427,9 +666,11 @@ mod tests {
             &read(&ws, json!({"uri": "notes.txt", "offset": "3"})).await.unwrap(),
             &read_file(&ws, json!({"path": "notes.txt", "range": "4:$"})).await,
         );
-        assert!(read(&ws, json!({"uri": "notes.txt", "offset": 1, "range": "1-2"}))
-            .await
-            .is_err());
+        // A given range wins over offset / limit.
+        same(
+            &read(&ws, json!({"uri": "notes.txt", "offset": 1, "range": "1-2"})).await.unwrap(),
+            &read_file(&ws, json!({"path": "notes.txt", "range": "1-2"})).await,
+        );
         assert!(read(&ws, json!({"uri": "notes.txt", "limit": 0})).await.is_err());
     }
 
@@ -500,6 +741,20 @@ mod tests {
             parse_read_target("notes:draft.txt").unwrap(),
             ReadTarget::File { .. }
         ));
+        let obj_id = ObjId::new(&id).unwrap();
+        assert_eq!(
+            parse_read_target(&format!("cyfs://{}/", obj_id.to_base32())).unwrap(),
+            ReadTarget::Object { obj_id: id.clone() }
+        );
+        for url in [
+            "obj://msg-center/owners/did:bns:alice/sessions",
+            "cyfs:///home/alice/a.md",
+            "https://test.buckyos.io/home/alice/feed",
+            "file://node2/tmp/a",
+        ] {
+            assert_eq!(parse_read_target(url).unwrap(), ReadTarget::Url { url: url.into() }, "{url}");
+        }
+        assert!(parse_read_target("obj://not-a-service/x").is_err());
         if let Some(home) = std::env::var_os("HOME") {
             assert_eq!(
                 parse_read_target("~/x").unwrap(),
@@ -508,5 +763,76 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn arguments_a_strict_schema_fills_with_blanks_are_absent() {
+        let (_dir, ws) = ws_with_file("a.txt", TEXT);
+        let tool = ReadTool::new(FileToolConfig::new(ws));
+        let blanks = json!({"uri": "a.txt", "range": "", "first_chunk": "", "property": "", "offset": 0, "limit": 2});
+        let r = tool.call(&ctx(), blanks).await.unwrap();
+        assert_eq!(r.details["content"], json!("alpha\nbeta\n"));
+        let both = json!({"uri": "a.txt", "range": "2-3", "first_chunk": "", "property": "", "offset": 0, "limit": 200});
+        let r = tool.call(&ctx(), both).await.unwrap();
+        assert_eq!(r.details["content"], json!("beta\ngamma\n"));
+    }
+
+    #[tokio::test]
+    async fn zone_files_name_their_cyfs_url() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("data");
+        let ws = data.join("home/u/ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a.txt"), "x\n").unwrap();
+        let mut cfg = FileToolConfig::new(ws.clone());
+        cfg.dfs_root = Some(data.clone());
+        let read = ReadTool::new(cfg.clone()).call(&ctx(), json!({"uri": "a.txt"})).await.unwrap();
+        assert_eq!(read.details["cyfs_url"], "cyfs:///home/u/ws/a.txt");
+        let audit = Arc::new(crate::file_tools::NoopFileWriteAudit);
+        let written = TypedToolHandle::new(crate::file_tools::WriteFileTool::new(cfg.clone(), audit))
+            .call(&ctx(), json!({"path": "b c.md", "content": "y"}))
+            .await
+            .unwrap();
+        assert_eq!(written.details["cyfs_url"], "cyfs:///home/u/ws/b%20c.md");
+        // Outside the data root (or with none): nothing to name.
+        cfg.dfs_root = Some(dir.path().join("elsewhere"));
+        let read = ReadTool::new(cfg).call(&ctx(), json!({"uri": "a.txt"})).await.unwrap();
+        assert!(read.details.get("cyfs_url").is_none(), "{:?}", read.details);
+    }
+
+    #[derive(Debug)]
+    struct Urls;
+
+    #[async_trait]
+    impl UrlReader for Urls {
+        async fn read_url(
+            &self,
+            _ctx: &SessionRuntimeContext,
+            url: &str,
+            property: Option<&str>,
+        ) -> Result<UrlContent, AgentToolError> {
+            Ok(UrlContent {
+                text: format!("Object URL: {url}\nline2\nline3\n{}\n", property.unwrap_or("-")),
+                details: json!({ "object_url": url }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn urls_go_to_the_host_reader_and_are_windowed_like_files() {
+        let (_dir, ws) = ws_with_file("a.txt", TEXT);
+        let url = "obj://aiworkspace/ws_1";
+        let without = ReadTool::new(FileToolConfig::new(ws.clone()));
+        let err = without.call(&ctx(), json!({"uri": url})).await.unwrap_err();
+        assert!(err.to_string().contains("no object resolver"), "{err}");
+
+        let tool = ReadTool::new(FileToolConfig::new(ws)).with_urls(Some(Arc::new(Urls)));
+        let result = tool.call(&ctx(), json!({"uri": url, "range": "2-3"})).await.unwrap();
+        assert_eq!(result.details["content"], json!("line2\nline3\n"));
+        assert_eq!(result.details["object"]["object_url"], url);
+        let result = tool.call(&ctx(), json!({"uri": url, "property": "content", "range": "4"})).await.unwrap();
+        assert_eq!(result.details["content"], json!("content\n"));
+        let err = tool.call(&ctx(), json!({"uri": "a.txt", "property": "content"})).await.unwrap_err();
+        assert!(err.to_string().contains("applies to object URLs"), "{err}");
     }
 }

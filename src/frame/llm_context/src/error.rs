@@ -11,7 +11,9 @@ use thiserror::Error;
 /// How a provider failure should be treated by the layer above the waist.
 /// The waist never retries; the adapter decides the class from provider /
 /// transport error codes and the scheduler decides whether to run again.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// The waist only tells retryable, not retryable, refused and context limit
+/// apart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFailure {
     /// Network / rate-limit / temporary unavailability: the adapter's own
@@ -24,38 +26,28 @@ pub enum ProviderFailure {
     Unknown,
     /// The provider refused the request because it does not fit the model's
     /// context window, reported by a structured provider code (e.g. OpenAI
-    /// `context_length_exceeded`). Adapters must not infer it from message
-    /// text or a bare HTTP 400. The waist turns it into
-    /// `Outcome::ContextLimitReached { which: ProviderRefused }`.
+    /// `context_length_exceeded`, AICC `context_length_exceeded`). A
+    /// transport-level HTTP 413 (the request body is over the service's
+    /// limit) also counts: the remedy is the same, a smaller request.
+    /// Adapters must not infer it from message text or a bare HTTP 400. The
+    /// waist turns it into `Outcome::ContextLimitReached { which: ProviderRefused }`.
     ContextLimit,
-    /// The AI service refused the call under the quota or resource policy of
-    /// the user it is charged to, reported by a structured service code
-    /// (AICC `quota_exhausted` etc.). Re-running cannot help until the quota
-    /// recovers, an administrator recharges it or the policy changes; the
-    /// layer above must not retry the same call by itself.
-    Refused(RefusalKind),
-}
-
-/// Why the AI service refused a call (AI Center Quota PRD §7.4).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RefusalKind {
-    /// A token quota rule has nothing left.
-    QuotaExhausted,
-    /// Tokens are left, but fewer than the call reserves.
-    QuotaBudgetExceeded,
-    /// The requested Provider / model is not permitted to the user.
-    ResourceNotPermitted,
-    /// The user whose AI resources a delegated run uses cannot be determined.
-    AttributionUnavailable,
+    /// The AI service refused the call under a policy of the party it is
+    /// charged to (quota, resource permission, ...) or refused the caller's
+    /// credentials (a rejected or expired token, HTTP 401 / 403), reported
+    /// by a structured service code or status. Re-running cannot help until
+    /// that policy or credential changes; the layer above must not retry the
+    /// same call by itself. `code` is defined by the provider adapter and
+    /// opaque to the waist.
+    Refused { code: String },
 }
 
 /// Which persistence checkpoint failed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointStage {
-    /// `InferenceHook::before_inference` refused to commit the pre-inference
-    /// snapshot; no inference was started.
+    /// `CheckpointHook::before_inference` refused to commit the
+    /// pre-inference snapshot; no inference was started.
     BeforeInference,
     BeforeToolCall,
     /// A runtime above the waist failed to commit the outcome boundary.
@@ -239,7 +231,7 @@ impl From<&LLMComputeError> for LLMComputeErrorRepr {
             LLMComputeError::Timeout => Self::Timeout,
             LLMComputeError::Cancelled => Self::Cancelled,
             LLMComputeError::Provider { failure, message } => Self::Provider {
-                failure: *failure,
+                failure: failure.clone(),
                 message: message.clone(),
             },
             LLMComputeError::OutputParse(message) => Self::OutputParse {

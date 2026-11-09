@@ -6,11 +6,12 @@ pub(crate) use schema::{
     family_segment, CatalogBuildOptions, CatalogDocuments, CatalogKind, CurrentCatalogFile,
     KnownProvider, KnownProviderCatalog, LlmModel, ModelDriverCatalog, ModelIdentity,
     ModelMatchFailure, ModelPricingRule, ModelSemantics, ModelStability, Pricing, PricingAddon,
-    PricingRule, PricingTierStep, PricingTiers, PricingTimeWindow, PricingUnit, PricingWeekday, ProviderCredentialDescriptor,
-    ProviderCredentialKind, ProviderExactRule, ProviderFieldMode, ProviderFieldSchema,
-    ProviderModelAccess, ProviderModelMatch, ProviderPatternRule, ProviderRuleAction,
-    ProviderRulesCatalog, ProviderVariantRule, RequestRule, ResolvedModelSemantics,
-    ResolvedProviderConfiguration, ResolvedProviderRule, TierDimension, TierMode,
+    PricingRule, PricingTierStep, PricingTiers, PricingTimeWindow, PricingUnit, PricingWeekday,
+    ProviderCredentialDescriptor, ProviderCredentialKind, ProviderExactRule, ProviderFieldMode,
+    ProviderFieldSchema, ProviderModelAccess, ProviderModelMatch, ProviderPatternRule,
+    ProviderRuleAction, ProviderRulesCatalog, ProviderVariantRule, RequestRule,
+    ResolvedModelSemantics, ResolvedProviderConfiguration, ResolvedProviderRule, TierDimension,
+    TierMode,
 };
 #[cfg(test)]
 pub(crate) use schema::{Effort, ProviderRuleMatchKind};
@@ -140,6 +141,7 @@ struct CompiledProviderRulesCatalog {
     pattern_compiled: Vec<CompiledProviderRule>,
     compiled_access_rules: Vec<CompiledMatchRule>,
     compiled_variants: Vec<CompiledMatchRule>,
+    compiled_model_variants: BTreeMap<String, Vec<CompiledMatchRule>>,
 }
 
 #[derive(Clone, Debug)]
@@ -344,6 +346,44 @@ impl CatalogSnapshot {
         })
     }
 
+    pub(crate) fn instance_rules_id(name: &str) -> String {
+        format!(
+            "instance-{}",
+            name.as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    }
+
+    pub(crate) fn with_instance_catalog(
+        &self,
+        name: &str,
+        value: &Value,
+    ) -> Result<Self, CatalogBuildError> {
+        let mut document: ProviderRulesCatalog =
+            serde_json::from_value(value.clone()).map_err(|source| {
+                CatalogBuildError::InvalidJson {
+                    kind: CatalogKind::ProviderRules,
+                    position: 0,
+                    source,
+                }
+            })?;
+        let id = Self::instance_rules_id(name);
+        document.provider_profile_id = id.clone();
+        document.custom_provider_adapters.clear();
+        validate_provider_rules(&document)?;
+        let compiled = compile_provider_rules(document)?;
+        let mut snapshot = self.clone();
+        snapshot.provider_rules.insert(id, compiled);
+        validate_references(
+            &snapshot.model_drivers,
+            &snapshot.provider_rules,
+            &snapshot.known_provider_catalogs,
+        )?;
+        Ok(snapshot)
+    }
+
     pub(crate) fn provider_rules(&self, id: &str) -> Option<&ProviderRulesCatalog> {
         self.provider_rules.get(id).map(|catalog| &catalog.document)
     }
@@ -404,6 +444,17 @@ impl CatalogSnapshot {
         self.known_provider_catalogs
             .get(catalog_id)
             .and_then(|catalog| catalog.providers.get(*position))
+    }
+
+    pub(crate) fn protocol_default_rules_id(
+        &self,
+        protocol_family_id: &str,
+        protocol_adapter_id: &str,
+    ) -> Option<&str> {
+        self.known_provider(protocol_family_id)
+            .filter(|provider| provider.protocol_adapter_id == protocol_adapter_id)
+            .and_then(|provider| provider.provider_rules_id.as_deref())
+            .filter(|id| self.provider_rules(id).is_some())
     }
 
     pub(crate) fn known_providers(&self) -> impl Iterator<Item = &KnownProvider> {
@@ -489,15 +540,25 @@ impl CatalogSnapshot {
             .ok_or_else(|| CatalogResolveError::UnknownProviderRules {
                 provider_profile_id: provider_profile_id.to_owned(),
             })?;
-        Ok(catalog
-            .document
-            .variants
+        let override_id = context
+            .get("provider_model_id")
+            .and_then(Value::as_str)
+            .filter(|id| catalog.document.model_variants.contains_key(*id));
+        let (variants, compiled) = if let Some(id) = override_id {
+            (
+                &catalog.document.model_variants[id],
+                &catalog.compiled_model_variants[id],
+            )
+        } else {
+            (&catalog.document.variants, &catalog.compiled_variants)
+        };
+        Ok(variants
             .iter()
-            .zip(&catalog.compiled_variants)
+            .zip(compiled)
             .filter_map(|(variant, condition)| {
-                let mut variant_context = context.clone();
-                variant_context.insert("variant".into(), Value::String(variant.variant.clone()));
-                condition.matches(&variant_context).then_some(variant)
+                let mut context = context.clone();
+                context.insert("variant".into(), Value::String(variant.variant.clone()));
+                condition.matches(&context).then_some(variant)
             })
             .collect())
     }
@@ -518,7 +579,7 @@ impl CatalogSnapshot {
             .into_iter()
             .filter(|variant| variant.model_driver == driver)
             .filter(|variant| {
-                llm.is_none_or(|llm| {
+                llm.map_or(!variant.variant.starts_with("reasoning-"), |llm| {
                     llm.semantics
                         .supported_efforts
                         .iter()
@@ -610,6 +671,7 @@ impl CatalogSnapshot {
         unique_identity(matches)
     }
 
+    #[cfg(test)]
     pub(crate) fn find_by_normalized_id(
         &self,
         normalized: &str,
@@ -846,6 +908,22 @@ fn compile_provider_rules(
             CompiledMatchRule::compile(variant.match_rule.clone(), &PROVIDER_RULE_MATCH_SCHEMA)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let compiled_model_variants = document
+        .model_variants
+        .iter()
+        .map(|(id, variants)| {
+            let compiled = variants
+                .iter()
+                .map(|variant| {
+                    CompiledMatchRule::compile(
+                        variant.match_rule.clone(),
+                        &PROVIDER_RULE_MATCH_SCHEMA,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((id.clone(), compiled))
+        })
+        .collect::<Result<BTreeMap<_, _>, MatchCompileError>>()?;
     let compiled_access_rules = document
         .access_rules
         .iter()
@@ -862,6 +940,7 @@ fn compile_provider_rules(
         pattern_compiled,
         compiled_access_rules,
         compiled_variants,
+        compiled_model_variants,
     })
 }
 

@@ -1,5 +1,5 @@
 // Cross-Zone DID federation in a real browser against the `ssotest` VM group
-// (src/dev_configs/ssotest.json; notepads/hybrid-sso-implementation-todo.md SSO-09 / SSO-14): the
+// (src/dev_configs/ssotest.json; notepads/done/hybrid-sso-implementation-todo.md SSO-09 / SSO-14): the
 // owner of the canonical Zone signs in to the target Zone with its DID through the canonical consent
 // page, declines once, and reaches an AI Workspace entry on the target that allows DID login. The
 // host does not use the SN for DNS, so the browser and the Node-side kRPC calls take the Zone
@@ -134,7 +134,7 @@ test('a DID from another Zone reaches an AI Workspace entry on the target', asyn
 
   // Back on the target's entry page as the External identity the DID brought along: the join the
   // visitor chose before leaving runs by itself and opens the workspace.
-  await page.waitForURL(new RegExp(`^https://${zoneB.replaceAll('.', '\\.')}/workspace/${workspaceId}`))
+  await page.waitForURL(new RegExp(`^https://aiws-${workspaceId.replace(/^ws_/, '')}\\.${zoneB.replaceAll('.', '\\.')}/`))
   await expect(page.getByText(`联合入口 ${runId}`)).toBeVisible()
   await expect(page.getByTestId('aiws-open-error')).toHaveCount(0)
 

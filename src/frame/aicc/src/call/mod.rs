@@ -42,6 +42,7 @@ pub(crate) struct ResolvedPricing {
 #[derive(Clone)]
 pub(crate) struct ProviderCallTarget {
     pub provider_rules_id: Option<String>,
+    pub use_server_defaults: bool,
     pub base_url: String,
     pub operation_base_urls: BTreeMap<String, String>,
     pub credential: ResolvedCredential,
@@ -381,7 +382,7 @@ impl<'a> CallResolver<'a> {
                 canonical_fields.extend(request_rule.canonical_fields.clone());
             }
         }
-        let canonical_provider_options =
+        let mut canonical_provider_options =
             apply_canonical_mappings(&mut canonical_json, &mut normalized, &canonical_fields)?;
         merge_user_options(&mut normalized, &canonical_json, option_keys);
         if let Some(rule) = &provider_rule {
@@ -445,6 +446,30 @@ impl<'a> CallResolver<'a> {
                     &mut normalized,
                     &serde_json::json!({"generation_config": config}),
                 );
+            }
+        }
+        if target.use_server_defaults && api_type == ApiType::Llm {
+            for key in [
+                "reasoning",
+                "reasoning_effort",
+                "thinking",
+                "thinking_budget",
+                "enable_thinking",
+                "preserve_thinking",
+            ] {
+                normalized
+                    .as_object_mut()
+                    .expect("normalized object")
+                    .remove(key);
+                canonical_provider_options.remove(key);
+            }
+            if let Some(config) = normalized
+                .get_mut("generation_config")
+                .and_then(Value::as_object_mut)
+            {
+                for key in ["thinking_level", "thinking_budget", "thinking_config"] {
+                    config.remove(key);
+                }
             }
         }
         let descriptor = self
@@ -687,7 +712,20 @@ impl<'a> CallResolver<'a> {
         let Some(variant) = variant else {
             return Ok(BTreeMap::new());
         };
-        let rules_id = rules_id.unwrap_or_default();
+        let rules_id = rules_id
+            .or_else(|| {
+                if selected.provider_profile_id == "custom" || !variant.starts_with("reasoning-") {
+                    return None;
+                }
+                self.catalog
+                    .llm_model(&selected.model_driver_id, &selected.origin_model_id)?;
+                let adapter = self.codecs.adapter(&selected.protocol_adapter_id)?;
+                self.catalog.protocol_default_rules_id(
+                    &adapter.protocol_family_id,
+                    &adapter.protocol_adapter_id,
+                )
+            })
+            .unwrap_or_default();
         let matches = if self.catalog.provider_rules(rules_id).is_some() {
             self.catalog
                 .executable_variants(
@@ -746,7 +784,21 @@ fn select_operation(
                         .iter()
                         .any(|binding| binding.api_type == api_type)
                 })
-                .map(|operation| operation.operation_id.clone())
+                .map(|operation| {
+                    let priority = operation
+                        .bindings
+                        .iter()
+                        .filter(|binding| binding.api_type == api_type)
+                        .map(|binding| binding.default_priority)
+                        .max()
+                        .unwrap_or_default();
+                    (operation.operation_id.clone(), priority)
+                })
+                .collect::<Vec<_>>();
+            let highest_priority = matching.iter().map(|(_, priority)| *priority).max();
+            let matching = matching
+                .into_iter()
+                .filter(|(_, priority)| Some(*priority) == highest_priority)
                 .collect::<Vec<_>>();
             match matching.as_slice() {
                 [] => {
@@ -755,7 +807,7 @@ fn select_operation(
                         api_type: api_name.into(),
                     });
                 }
-                [operation] => operation.clone(),
+                [(operation, _)] => operation.clone(),
                 _ => {
                     return Err(CallLoweringError::AmbiguousDefaultOperation {
                         adapter_id: adapter_id.into(),
@@ -1284,7 +1336,7 @@ fn provider_parameters(
     parameters
 }
 
-fn collect_resource_requirements(value: &Value) -> Vec<ResourceRequirement> {
+pub(crate) fn collect_resource_requirements(value: &Value) -> Vec<ResourceRequirement> {
     fn visit(value: &Value, pointer: &str, output: &mut Vec<ResourceRequirement>) {
         if value.get("kind").and_then(Value::as_str).is_some() {
             if let Ok(resource) = serde_json::from_value::<ResourceRef>(value.clone()) {
@@ -1733,6 +1785,7 @@ mod tests {
     fn target(secret: &str) -> ProviderCallTarget {
         ProviderCallTarget {
             provider_rules_id: Some("openai".into()),
+            use_server_defaults: false,
             base_url: "https://api.openai.test/v1".into(),
             operation_base_urls: BTreeMap::new(),
             credential: ResolvedCredential::bearer("secret://openai/main", secret).unwrap(),
@@ -1759,6 +1812,46 @@ mod tests {
         request.top_p = Some(0.9);
         request.max_output_tokens = Some(200);
         AiccCall::ChatCompletionsCreate(request)
+    }
+
+    #[test]
+    fn issue666_server_default_base_call_does_not_inject_reasoning() {
+        let catalog = catalog();
+        let codecs = codecs();
+        let mut call = call();
+        let AiccCall::ChatCompletionsCreate(request) = &mut call else {
+            unreachable!()
+        };
+        request.exact_model = "gpt-5.2@openai-primary".into();
+        let mut route = decision("gpt-5.2@openai-primary");
+        route.selected.model_uid = "openai:gpt-5.2:openai-responses".into();
+        let mut destination = target("test-secret");
+        destination.use_server_defaults = true;
+        let lowered = CallResolver::new(&catalog, &codecs)
+            .lower(&route, &call, destination)
+            .unwrap();
+        assert!(lowered.variant.is_none());
+        assert!(!lowered.input.resolved_parameters.contains_key("reasoning"));
+        assert!(!lowered.input.resolved_parameters.contains_key("thinking"));
+        assert!(!lowered
+            .input
+            .resolved_parameters
+            .contains_key("reasoning_effort"));
+        let wire = codecs
+            .encode(
+                "openai-responses",
+                &lowered.operation,
+                lowered.api_type,
+                &lowered.input,
+                &lowered.context,
+            )
+            .unwrap();
+        let crate::protocol::HttpBody::Json(body) = wire.body else {
+            panic!("expected JSON")
+        };
+        for key in ["reasoning", "thinking", "reasoning_effort"] {
+            assert!(body.get(key).is_none(), "{body}");
+        }
     }
 
     #[test]
@@ -1816,6 +1909,61 @@ mod tests {
         assert_eq!(golden["execution_mode"], "immediate");
         assert_eq!(golden["credential_kind"], "bearer");
         assert!(!golden.to_string().contains("credential-secret"));
+    }
+
+    #[test]
+    fn custom_provider_reasoning_variants_lower_to_protocol_options() {
+        let catalog = metadata_snapshot();
+        let codecs = all_codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        for (model_id, origin, effort) in [
+            ("gpt-6.1-sol", "gpt-6.1-sol", "medium"),
+            ("ep-custom", "gpt-6-sol", "medium"),
+            ("gpt-6-luna", "gpt-6-luna", "none"),
+        ] {
+            let exact = format!("{model_id}:reasoning-{effort}@custom-provider");
+            let mut route = decision(&exact);
+            route.selected.provider_instance_name = "custom-provider".into();
+            route.selected.provider_profile_id = "custom".into();
+            route.selected.provider_model_id = model_id.into();
+            route.selected.origin_model_id = origin.into();
+            let mut target = target("test-secret");
+            assert!(matches!(
+                resolver.resolve_variant(None, &route.selected, Some(&format!("reasoning-{effort}")), &MatchContext::new()),
+                Err(CallLoweringError::MissingProviderVariant { .. })
+            ));
+            target.provider_rules_id = Some("openai".into());
+            let mut request =
+                LlmChatInvokeRequest::new(exact, vec![AiMessage::text(AiRole::User, "hello")]);
+            request.temperature = Some(0.7);
+            let lowered = resolver
+                .lower(&route, &AiccCall::ChatCompletionsCreate(request), target)
+                .unwrap();
+            assert_eq!(lowered.provider_model_id, model_id);
+            assert_eq!(
+                lowered.input.resolved_parameters["reasoning"],
+                json!({"effort": effort})
+            );
+            assert!(lowered.revisions.provider_rules_revision_seq.is_some());
+            let AiccCall::ChatCompletionsCreate(request) = &lowered.input.canonical_request else {
+                panic!("expected chat request");
+            };
+            assert_eq!(request.temperature, if effort == "none" { Some(0.7) } else { None });
+            let encoded = codecs
+                .encode(
+                    "openai-responses",
+                    "responses.create",
+                    ApiType::Llm,
+                    &lowered.input,
+                    &lowered.context,
+                )
+                .unwrap();
+            let crate::protocol::HttpBody::Json(body) = encoded.body else {
+                panic!("expected JSON body");
+            };
+            assert_eq!(body["model"], model_id);
+            assert_eq!(body["reasoning"]["effort"], effort);
+        }
     }
 
     #[test]
@@ -2347,7 +2495,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_precedence_is_method_then_api_type_then_unique_adapter_default() {
+    fn operation_precedence_is_method_then_api_type_then_preferred_adapter_default() {
         let codecs = codecs();
         let mappings = BTreeMap::from([
             ("images.generate".into(), "images.generate".into()),
@@ -2376,16 +2524,26 @@ mod tests {
             .unwrap(),
             "responses.create"
         );
-        assert!(matches!(
-            select_operation(
-                &codecs,
-                "openai-responses",
-                &BTreeMap::new(),
+        for (api_type, method, expected) in [
+            (
                 ApiType::ImageTextToImage,
                 "images.generate",
+                "images.generate",
             ),
-            Err(CallLoweringError::AmbiguousDefaultOperation { .. })
-        ));
+            (ApiType::ImageImageToImage, "images.edit", "images.edit"),
+        ] {
+            assert_eq!(
+                select_operation(
+                    &codecs,
+                    "openai-responses",
+                    &BTreeMap::new(),
+                    api_type,
+                    method
+                )
+                .unwrap(),
+                expected
+            );
+        }
         assert_eq!(
             select_operation(
                 &codecs,
@@ -2397,6 +2555,108 @@ mod tests {
             .unwrap(),
             "responses.create"
         );
+    }
+
+    #[test]
+    fn custom_provider_lowering_has_a_default_for_every_selectable_binding() {
+        let catalog = metadata_snapshot();
+        let registry = crate::provider::builtin_provider_registry(&catalog).unwrap();
+        let codecs = registry.codecs();
+        for adapter_id in registry.custom_provider_adapter_ids() {
+            let adapter = codecs.adapter(adapter_id).unwrap();
+            for binding in adapter
+                .operations
+                .values()
+                .flat_map(|operation| &operation.bindings)
+            {
+                select_operation(
+                    &codecs,
+                    adapter_id,
+                    &BTreeMap::new(),
+                    binding.api_type,
+                    binding.api_type.typed_method(),
+                )
+                .unwrap_or_else(|error| panic!("{adapter_id}/{:?}: {error}", binding.api_type));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_multi_operation_lowering_preserves_defaults_and_overrides() {
+        let codecs = all_codecs();
+        for (adapter, api_type, expected, alternate) in [
+            (
+                "gemini-interactions",
+                ApiType::Llm,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VisionOcr,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VisionCaption,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VisionDetect,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VisionSegment,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::AudioSpeechRecognition,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VideoGenerate,
+                "models.predictLongRunning",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VideoExtend,
+                "models.predictLongRunning",
+                "interactions.create",
+            ),
+            (
+                "openai-responses",
+                ApiType::ImageTextToImage,
+                "images.generate",
+                "responses.create",
+            ),
+            (
+                "openai-responses",
+                ApiType::ImageImageToImage,
+                "images.edit",
+                "responses.create",
+            ),
+        ] {
+            let method = api_type.typed_method();
+            assert_eq!(
+                select_operation(&codecs, adapter, &BTreeMap::new(), api_type, method).unwrap(),
+                expected
+            );
+            let mappings = BTreeMap::from([(api_type_name(api_type).into(), alternate.into())]);
+            assert_eq!(
+                select_operation(&codecs, adapter, &mappings, api_type, method).unwrap(),
+                alternate
+            );
+        }
     }
 
     #[test]
@@ -2675,7 +2935,7 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         assert_eq!(golden, documented);
-        assert_eq!(golden.len(), 113);
+        assert_eq!(golden.len(), 131);
         assert!(golden.contains(&"typesafe|typesafe-systemone|decision|systemone.evaluate".into()));
         assert!(golden.contains(&"openai|openai-responses|llm|responses.create".into()));
         assert!(
@@ -2708,6 +2968,8 @@ mod tests {
         assert!(golden.contains(&"qwen|qwen-responses|llm|responses.create".into()));
         assert!(golden.contains(&"qwen|qwen-responses|llm|chat.completions.create".into()));
         assert!(golden.contains(&"sn|sn-openai|llm|responses.create".into()));
+        assert!(golden.contains(&"sn|sn-openai|embedding.text|embeddings.create".into()));
+        assert!(golden.contains(&"sn|sn-openai|image.txt2img|images.generate".into()));
     }
     #[test]
     fn request_rewrites_cannot_override_a_selected_effort() {

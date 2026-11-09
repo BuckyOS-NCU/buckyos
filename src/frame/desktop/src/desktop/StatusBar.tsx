@@ -1,10 +1,11 @@
 import { IconButton, Menu, MenuItem } from '@mui/material'
+import clsx from 'clsx'
 import {
   ChevronLeft,
   Ellipsis,
-  Minimize2,
+  Minus,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { useI18n } from '../i18n/provider'
 import { useAppText } from '../presentation/appText'
 import type { AppDefinition, LayoutState, ThemeMode } from '../models/ui'
@@ -16,7 +17,6 @@ import {
   mobileStatusBarHeight,
   mobileStatusBarMode,
   type ConnectionState,
-  useMinuteClock,
 } from './shell'
 import { MessageTray, NotificationTray } from './tray/TrayButtons'
 import type { TraySnapshot } from './tray/trayModel'
@@ -62,27 +62,12 @@ function MobileBackButton({ onClick }: { onClick: () => void }) {
   )
 }
 
-function StatusTray({
-  locale,
-  now,
-  onNavigate,
-  tray,
-}: {
-  locale: string
-  now: Date
-  onNavigate: (path: string) => void
-  tray: TraySnapshot
-}) {
-  const timeLabel = useMemo(
-    () => new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit' }).format(now),
-    [locale, now],
-  )
-
+/** The message and notification trays; the phone's own status bar already shows the time. */
+function StatusTray({ onNavigate, tray }: { onNavigate: (path: string) => void; tray: TraySnapshot }) {
   return (
     <div className="shell-pill ml-auto shrink-0 gap-1.5 px-2 py-1 text-xs">
       <MessageTray onNavigate={onNavigate} snapshot={tray.messages} />
       <NotificationTray onNavigate={onNavigate} snapshot={tray} />
-      <span className="pl-0.5 pr-1 font-medium text-[color:var(--cp-text)]">{timeLabel}</span>
     </div>
   )
 }
@@ -122,29 +107,71 @@ export function StatusBar({
 }) {
   const { locale, t } = useI18n()
   const appText = useAppText()
-  const now = useMinuteClock()
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null)
   const mobileNav = useMobileNavState()
   const activeMode = activeApp ? mobileStatusBarMode(activeApp) : null
   const barHeight = mobileStatusBarHeight(activeApp)
   const totalHeight = safeAreaTop + deadZone.top + barHeight
+  // Only `standard` apps get a bar surface; the home screen and `compact` apps float their controls over
+  // the wallpaper or the app's own content. The surface is opaque on purpose: iOS 26 Safari paints the
+  // system status bar in the colour of a full-width pinned element at the top, treats a translucent one
+  // as opaque anyway, and may render backdrop-filter as solid white.
   const showSurface = activeMode === 'standard'
+  const surfaceColor =
+    showSurface && activeApp ? `color-mix(in srgb, ${activeApp.accent} 14%, var(--cp-surface-2-opaque))` : undefined
+
+  const appControls = (
+    <div
+      className="pointer-events-auto ml-auto flex shrink-0 items-center overflow-hidden rounded-full border border-[color:var(--cp-border)] bg-[color:var(--cp-surface-2-opaque)]"
+    >
+      <IconButton
+        aria-label={t('shell.appMenu', 'App menu')}
+        aria-haspopup="menu"
+        aria-expanded={Boolean(menuAnchor)}
+        size="small"
+        onClick={(event) => setMenuAnchor(event.currentTarget)}
+        sx={{
+          width: 34,
+          height: 32,
+          borderRadius: 0,
+          border: 0,
+          backgroundColor: 'transparent',
+          color: 'var(--cp-text)',
+          '&.Mui-focusVisible': { backgroundColor: 'var(--cp-accent-soft)' },
+        }}
+      >
+        <Ellipsis size={18} />
+      </IconButton>
+      {onMinimizeWindow ? (
+        <>
+          <span aria-hidden="true" className="h-3.5 w-px bg-[color:var(--cp-border)]" />
+          <IconButton
+            aria-label={t('common.minimize')}
+            size="small"
+            onClick={onMinimizeWindow}
+            sx={{
+              width: 34,
+              height: 32,
+              borderRadius: 0,
+              border: 0,
+              backgroundColor: 'transparent',
+              color: 'var(--cp-text)',
+              '&.Mui-focusVisible': { backgroundColor: 'var(--cp-accent-soft)' },
+            }}
+          >
+            <Minus size={18} />
+          </IconButton>
+        </>
+      ) : null}
+    </div>
+  )
 
   return (
     <div
       aria-label={t('common.statusBar')}
-      className="pointer-events-none fixed inset-x-0 top-0 z-50"
-      style={{ height: totalHeight }}
+      className={clsx('fixed inset-x-0 top-0 z-50', showSurface ? 'pointer-events-auto' : 'pointer-events-none')}
+      style={{ height: totalHeight, backgroundColor: surfaceColor }}
     >
-      {showSurface && activeApp ? (
-        <div
-          className="absolute inset-x-0 top-0 backdrop-blur-xl"
-          style={{
-            height: totalHeight,
-            backgroundColor: `color-mix(in srgb, ${activeApp.accent} 14%, var(--cp-surface-2))`,
-          }}
-        />
-      ) : null}
       {showSurface ? (
         <div
           className="absolute inset-x-0 h-px bg-[color:var(--cp-border)]/80"
@@ -190,26 +217,7 @@ export function StatusBar({
                 {mobileNav.titleOverride?.subtitle ?? appText(activeApp).summary}
               </p>
             </div>
-            <div className="ml-auto flex shrink-0 items-center gap-1">
-              <IconButton
-                aria-label={t('shell.appMenu', 'App menu')}
-                size="small"
-                onClick={(event) => setMenuAnchor(event.currentTarget)}
-                sx={{ pointerEvents: 'auto' }}
-              >
-                <Ellipsis className="size-4" />
-              </IconButton>
-              {onMinimizeWindow ? (
-                <IconButton
-                  aria-label={t('common.minimize')}
-                  size="small"
-                  onClick={onMinimizeWindow}
-                  sx={{ pointerEvents: 'auto' }}
-                >
-                  <Minimize2 className="size-4" />
-                </IconButton>
-              ) : null}
-            </div>
+            {appControls}
           </>
         ) : (
           <>
@@ -233,33 +241,9 @@ export function StatusBar({
               ) : null}
             </div>
             {activeMode === 'compact' && activeApp ? (
-              <div className="ml-auto flex shrink-0 items-center gap-1">
-                <IconButton
-                  aria-label={t('shell.appMenu', 'App menu')}
-                  size="small"
-                  onClick={(event) => setMenuAnchor(event.currentTarget)}
-                  sx={{ pointerEvents: 'auto' }}
-                >
-                  <Ellipsis className="size-4" />
-                </IconButton>
-                {onMinimizeWindow ? (
-                  <IconButton
-                    aria-label={t('common.minimize')}
-                    size="small"
-                    onClick={onMinimizeWindow}
-                    sx={{ pointerEvents: 'auto' }}
-                  >
-                    <Minimize2 className="size-4" />
-                  </IconButton>
-                ) : null}
-              </div>
+              appControls
             ) : (
-              <StatusTray
-                locale={locale}
-                now={now}
-                onNavigate={onNavigate}
-                tray={tray}
-              />
+              <StatusTray onNavigate={onNavigate} tray={tray} />
             )}
           </>
         )}

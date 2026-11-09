@@ -389,6 +389,23 @@ pub enum SystemConfigError {
     NoPermission(String),
     #[error("Timeout: {0}")]
     Timeout(String),
+    #[error("Transport error: {0}")]
+    TransportError(String),
+}
+
+impl From<::kRPC::RPCErrors> for SystemConfigError {
+    fn from(error: ::kRPC::RPCErrors) -> Self {
+        if error.is_retryable_transport() {
+            if matches!(&error, ::kRPC::RPCErrors::HttpTransportError(error) if error.is_timeout()) {
+                return Self::Timeout(error.to_string());
+            }
+            return Self::TransportError(error.to_string());
+        }
+        match error {
+            ::kRPC::RPCErrors::NoPermission(reason) => Self::NoPermission(reason),
+            error => Self::ReasonError(error.to_string()),
+        }
+    }
 }
 
 pub type SytemConfigResult<T> = std::result::Result<T, SystemConfigError>;
@@ -423,6 +440,15 @@ impl SystemConfigValue {
 }
 
 impl SystemConfigClient {
+    /// The Zone default device (`system/default_device`, doc/key url.md §3), if set.
+    pub async fn default_device(&self) -> SytemConfigResult<Option<String>> {
+        match self.get(crate::DEFAULT_DEVICE_KEY).await {
+            Ok(value) => Ok(serde_json::from_str::<String>(&value.value).ok().filter(|d| !d.is_empty())),
+            Err(SystemConfigError::KeyNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn get_buckyos_dev_config(&self) -> SytemConfigResult<BuckyOSDevConfig> {
         let value = self.get(BUCKYOS_DEV_CONFIG_KEY).await?;
         let config: BuckyOSDevConfig = serde_json::from_str(&value.value).map_err(|error| {
@@ -485,7 +511,7 @@ impl SystemConfigClient {
             .client
             .call("sys_config_get", json!({"key": key}))
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
 
         if result.is_null() {
             return Ok(None);
@@ -637,7 +663,7 @@ impl SystemConfigClient {
         let _result = client
             .call("sys_config_set", json!({"key": key, "value": value}))
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
 
         self.remove_config_cache(key).await;
         Ok(0)
@@ -656,7 +682,7 @@ impl SystemConfigClient {
                 json!({"key": key, "json_path": json_path, "value": value}),
             )
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
 
         self.remove_config_cache(key).await;
 
@@ -668,7 +694,7 @@ impl SystemConfigClient {
         let _result = client
             .call("sys_config_create", json!({"key": key, "value": value}))
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
 
         self.remove_config_cache(key).await;
         Ok(0)
@@ -679,7 +705,7 @@ impl SystemConfigClient {
         let _result = client
             .call("sys_config_delete", json!({"key": key}))
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
         self.remove_config_cache(key).await;
         Ok(0)
     }
@@ -692,7 +718,7 @@ impl SystemConfigClient {
                 json!({"key": key, "append_value": value}),
             )
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
 
         self.remove_config_cache(key).await;
 
@@ -705,7 +731,7 @@ impl SystemConfigClient {
         client
             .call("sys_config_list", json!({"key": key}))
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))
+            .map_err(SystemConfigError::from)
             .map(|result| {
                 let mut list = Vec::new();
                 for item in result.as_array().unwrap() {
@@ -791,7 +817,7 @@ impl SystemConfigClient {
         client
             .call("sys_config_exec_tx", Value::Object(req_params))
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
 
         for (key, _action) in tx_actions.iter() {
             self.remove_config_cache(key).await;
@@ -804,7 +830,7 @@ impl SystemConfigClient {
         let result = client
             .call("dump_configs_for_scheduler", json!({}))
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
         Ok(result)
     }
 
@@ -813,7 +839,7 @@ impl SystemConfigClient {
         client
             .call("sys_refresh_trust_keys", json!({}))
             .await
-            .map_err(|error| SystemConfigError::ReasonError(error.to_string()))?;
+            .map_err(SystemConfigError::from)?;
         Ok(())
     }
 }

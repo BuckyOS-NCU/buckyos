@@ -1,6 +1,6 @@
 //! Task CLI bridge: the task tools (`wait_task` / `get_task_state` /
 //! `cancel_task`) as a command run through `shell`
-//! (`notepads/llm-context-chat-prompt-prereq-todo.md` P3).
+//! (`notepads/done/llm-context-chat-prompt-prereq-todo.md` P3).
 //!
 //! A run that offers `group:bash_core` with a task command
 //! (`XllmDeps.task_cli`) serves its task resolver on a Unix socket and
@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use llm_context::observation::Observation;
-use llm_context::tasks::{
+use crate::task_model::{
     task_state_observation_via, RunningTaskResolver, TaskFollowup, TaskState, MAX_IN_TOOL_WAIT_MS,
 };
 use serde::{Deserialize, Serialize};
@@ -30,8 +30,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 pub const ENV_TASK_ENDPOINT: &str = "XLLM_TASK_ENDPOINT";
 
 /// Default wait of `wait` when none is given: below the shell's default
-/// wait (30s), so the command returns before it becomes a task itself.
-pub const DEFAULT_CLI_WAIT_MS: u64 = 25_000;
+/// wait ([`crate::task_model::DEFAULT_TASK_WAIT_MS`]), so the command returns before it becomes
+/// a task itself.
+pub const DEFAULT_CLI_WAIT_MS: u64 = crate::task_model::DEFAULT_TASK_WAIT_MS - 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +106,13 @@ pub async fn answer(
     resolver.watch(id);
     match req.op {
         TaskOp::State => response(id, &resolver.state(id).await, &followup),
+        // A session brings a task's end back as input: nothing waits.
+        TaskOp::Wait if matches!(followup, TaskFollowup::Input(_)) => TaskBridgeResponse {
+            state: "refused".into(),
+            text: format!(
+                "task {id}: there is no waiting here — its end comes back to you as input with its full result; reply or go on with other work meanwhile"
+            ),
+        },
         TaskOp::Wait => {
             let wait = req
                 .wait_ms

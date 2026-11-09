@@ -114,6 +114,8 @@ pub struct StateService {
     /// Session processes on other runtimes: their session tokens and
     /// methods (`libopendan::session_context`).
     pub sessions: Option<Arc<SessionService>>,
+    /// The Agent's DID Object Provider (`/kapi/<agent_id>/obj`).
+    pub objects: std::sync::OnceLock<buckyos_http_server::DIDObjectHttpServer<buckyos_api::KrpcObjectProvider>>,
 }
 
 fn param<T: serde::de::DeserializeOwned>(params: &Value, name: &str) -> Result<T, OpenDanError> {
@@ -213,10 +215,18 @@ impl StateService {
         Ok(out)
     }
 
+    async fn work_cards(&self, params: &Value) -> Result<Value, OpenDanError> {
+        let sid: String = param(params, "sid")?;
+        let task_id: String = param(params, "task_id")?;
+        let cards = libopendan::work_card::work_cards(self.agent.as_ref(), &sid, &task_id).await?;
+        serde_json::to_value(&cards).map_err(|e| OpenDanError::Other(format!("encode work cards: {e}")))
+    }
+
+    /// One Turn's records (`turn`), or the whole session in commit order.
     async fn read_worklog(&self, params: &Value) -> Result<Value, OpenDanError> {
         let sid: String = param(params, "sid")?;
-        let turn: u64 = param(params, "turn")?;
-        if turn == 0 {
+        let turn: Option<u64> = param(params, "turn")?;
+        if turn == Some(0) {
             return Err(OpenDanError::InvalidArgument("turn must be positive".into()));
         }
         let entry = self.agent.sessions().lookup(&sid).await?
@@ -230,6 +240,10 @@ impl StateService {
             param(params, "after")?,
             param::<Option<usize>>(params, "limit")?.unwrap_or(50),
         )?;
+        let complete = match turn {
+            Some(turn) => state.turn_seq >= turn && state.open_turn.as_ref().is_none_or(|open| open.index != turn),
+            None => state.is_finished() && page.next_after == state.worklog.committed_bytes,
+        };
         let children = self.agent.sessions().children_of(&[sid.clone()]).await?;
         let links: Vec<Value> = children.iter().filter_map(|child| {
             let origin = child.origin.as_ref()?;
@@ -247,8 +261,8 @@ impl StateService {
             "next_before": page.next_before,
             "next_after": page.next_after,
             "committed": state.worklog.committed_bytes,
-            "complete": state.turn_seq >= turn && state.open_turn.as_ref().is_none_or(|open| open.index != turn),
-            "task_id": state.turn_tasks.iter().find(|t| t.turn == turn).map(|t| &t.task_id),
+            "complete": complete,
+            "task_id": turn.and_then(|turn| state.turn_tasks.iter().find(|t| t.turn == turn)).map(|t| &t.task_id),
             "children": links,
         }))
     }
@@ -301,6 +315,7 @@ impl StateService {
         match method {
             "session.read" => self.read_session(params).await,
             "session.worklog" => self.read_worklog(params).await,
+            "session.work_cards" => self.work_cards(params).await,
             "session.stop" => {
                 let sid: String = param(params, "sid")?;
                 let reason = param::<Option<String>>(params, "reason")?;
@@ -345,16 +360,18 @@ impl StateService {
             "usage.models" => self.home.usage_models(self.agent.as_ref()).await,
             "ui.bindings" => self.home.ui_bindings(self.agent.as_ref()).await,
             "home.workspaces" => self.home.workspaces(self.agent.as_ref()).await,
-            "runtimes.settings" => self.home.runtime_settings().await,
+            "skills.status" => self.home.skills_status(self.agent.as_ref(), params).await,
+            "skills.install_plan" => self.home.skills_install_plan(self.agent.as_ref(), params).await,
+            "runtimes.settings" => self.home.runtime_settings(self.agent.as_ref()).await,
             "runtimes.settings_set" => {
-                let settings = self.home.set_runtime_settings(params).await?;
+                let settings = self.home.set_runtime_settings(self.agent.as_ref(), params).await?;
                 // The projection follows the settings at once (the watcher
                 // would catch up later).
                 if let Some(root) = crate::home::agent_root_of(self.agent.as_ref()) {
                     crate::loader::project_runtimes(self.agent.as_ref(), &root, &settings, who).await;
                     tokio::spawn(crate::loader::check_runtimes(self.agent.clone()));
                 }
-                self.home.runtime_settings().await
+                self.home.runtime_settings(self.agent.as_ref()).await
             }
             "goals.activate" => {
                 let id: String = param(params, "goal_id")?;
@@ -451,6 +468,8 @@ fn is_read(method: &str) -> bool {
             | "behaviors.revision"
             | "behaviors.cmd_skill"
             | "skills.list"
+            | "skills.install_plan"
+            | "runtimes.ext_tools"
             | "goals.list"
             | "goals.get"
             | "goals.revision"
@@ -463,6 +482,7 @@ fn is_read(method: &str) -> bool {
             | "notify.list"
             | "session.read"
             | "session.worklog"
+            | "session.work_cards"
             | "agent.profile"
             | "usage.models"
             | "ui.bindings"
@@ -481,6 +501,7 @@ fn is_operation(method: &str) -> bool {
             | "session.post"
             | "agent.profile_set"
             | "runtimes.settings_set"
+            | "skills.status"
             | "goals.activate"
             | "goals.post"
     )
@@ -538,9 +559,24 @@ impl RPCHandler for StateService {
 impl HttpServer for StateService {
     async fn serve_request(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        mut req: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        if let Some(objects) = self.objects.get() {
+            let base = objects.inner().base_path().to_string();
+            let path = req.uri().path().to_string();
+            let rest = [base.as_str(), &format!("{SERVICE_PATH}/obj"), &format!("{WEB_API_PATH}/obj")]
+                .into_iter()
+                .find_map(|prefix| path.strip_prefix(prefix).filter(|r| r.is_empty() || r.starts_with('/')))
+                .map(str::to_string);
+            if let Some(rest) = rest {
+                let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+                if let Ok(uri) = format!("{base}{rest}{query}").parse() {
+                    *req.uri_mut() = uri;
+                }
+                return objects.serve_request(req, info).await;
+            }
+        }
         if *req.method() == http::Method::POST {
             return serve_http_by_rpc_handler(req, info, self).await;
         }
@@ -603,9 +639,9 @@ mod permission_tests {
             "artifacts.versions", "artifacts.list", "workspaces.lookup", "workspaces.query",
             "workspaces.list", "workspaces.runtime_impact", "runtimes.list", "runtimes.lookup",
             "behaviors.identity", "behaviors.get", "behaviors.list", "behaviors.revision",
-            "behaviors.cmd_skill", "skills.list", "goals.list", "goals.get", "goals.revision",
+            "behaviors.cmd_skill", "skills.list", "skills.install_plan", "runtimes.ext_tools", "goals.list", "goals.get", "goals.revision",
             "goals.changes", "goals.state", "goals.epoch_state", "goals.activations",
-            "goals.schedule", "notify.state", "notify.list", "session.read", "session.worklog",
+            "goals.schedule", "notify.state", "notify.list", "session.read", "session.worklog", "session.work_cards",
             "agent.profile", "usage.models", "ui.bindings", "home.workspaces", "loader.status",
         ] {
             for target in [OWN_APP, OTHER_APP] {
@@ -617,13 +653,13 @@ mod permission_tests {
     #[test]
     fn read_only_agent_writes_only_its_own_state() {
         for method in [
-            "sessions.register", "sessions.post_input", "sessions.verify",
+            "sessions.reserve_id", "sessions.register", "sessions.post_input", "sessions.verify",
             "cognition.notebook_append", "artifacts.decide", "workspaces.create",
             "workspaces.import", "workspaces.discover", "workspaces.check", "workspaces.update",
             "workspaces.archive", "workspaces.unregister", "workspaces.set_runtime_available",
-            "runtimes.register", "runtimes.update", "runtimes.check", "runtimes.unregister",
+            "runtimes.register", "runtimes.update", "runtimes.check", "runtimes.unregister", "runtimes.note_usage",
             "goals.create", "goals.revise", "goals.set_status", "goals.reopen", "goals.restart",
-            "notify.send", "notify.cancel", "notify.answer", "skills.install", "skills.remove",
+            "notify.send", "notify.cancel", "notify.answer", "skills.install", "skills.remove", "skills.status", "runtimes.ext_tools_check",
             "session.stop", "session.decide", "session.post", "goals.activate", "goals.post",
         ] {
             assert!(authorize(Some(AgentPermissionMode::ReadOnly), method, OWN_APP), "{method}");

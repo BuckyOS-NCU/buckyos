@@ -28,7 +28,7 @@ pub use derived::{seg as percent_segment, SQLITE_FILE};
 pub use log::{occasion_digest, tail_seq, ArchiveEntry, ArchiveManifest, Tail};
 pub use model::*;
 pub use recall::{
-    group_by_semantic_kind, item_search_text, AliasCandidate, AmbiguousAlias, FadeConfig, IndexUse,
+    item_search_text, AliasCandidate, AmbiguousAlias, FadeConfig, IndexUse,
     RecallItem, RecallOutcome, RecallQuery, RecallResult, ScoreParts, DEFAULT_BODY_TRUNCATE_BYTES,
     DEFAULT_MAX_BYTES, DEFAULT_MAX_RECORDS,
 };
@@ -757,19 +757,6 @@ impl AgentMemory {
         ))
     }
 
-    /// The result of an earlier commit with this idempotency key.
-    pub fn lookup_commit(&self, key: &str) -> Result<Option<CommitResult>> {
-        let view = self.view()?;
-        Ok(view.occasion_for_key(key).map(|occ| CommitResult {
-            occasion_id: occ.occasion_id.clone(),
-            seq: occ.seq,
-            status: CommitStatus::AlreadyCommitted,
-            report: Self::report_for(&view, occ),
-            derived: DerivedStatus::Current,
-            recovered_torn_tail: false,
-        }))
-    }
-
     /// One occasion, atomically: validate on a copy of the state, append
     /// and fsync (the commit point), then rebuild derived state.
     pub fn commit(&self, actor: &CommitActor, mut req: CommitRequest) -> Result<CommitResult> {
@@ -1446,7 +1433,7 @@ impl AgentMemory {
             // replaces the full one.
             if fs::hard_link(self.log_path(), &dst).is_err() {
                 fs::copy(self.log_path(), &dst)?;
-                fs::File::open(&dst)?.sync_all()?;
+                OpenOptions::new().write(true).open(&dst)?.sync_all()?;
             }
             derived::sync_dir(&dir)?;
             manifest.archives.push(ArchiveEntry {

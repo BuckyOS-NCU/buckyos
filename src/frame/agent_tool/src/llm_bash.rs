@@ -3,15 +3,17 @@
 //! `shell` runs a bash command in the runtime of the current run (native
 //! process, Node Executor or remote host — see `runtime`). Its lifecycle
 //! follows standard parent / child process semantics
-//! (`notepads/llm-context-long-tool-todo.md` §3.2): only the command in
+//! (`notepads/done/llm-context-long-tool-todo.md` §3.2): only the command in
 //! progress is managed; whatever the command leaves behind (`&`, nohup,
 //! setsid, daemons) is not tracked and never killed.
 //!
-//! Two execution modes, chosen by configuration, never by the model (§5):
-//! - `wait`: run to completion or `timeout_ms` (the command is stopped);
-//! - `auto` (default): wait `wait_ms`, then hand the still-running command
-//!   to the in-process task manager and return "still running" with a
-//!   `task_id` the model follows up with `wait_task` / `get_task_state`.
+//! How long the call waits is the runtime's budget (`task_wait_ms`), never
+//! the tool's mode: the command runs until it finishes, `timeout_ms` passes
+//! (it is stopped) or the budget passes — then, with a task manager, the
+//! still-running command is handed to it and the call returns "still
+//! running" with a `task_id` the model follows up with `wait_task` /
+//! `get_task_state`. A budget of at least the timeout, or no task manager,
+//! means the call waits for the command (the former `wait` mode).
 //!
 //! Every runner writes `command`, `stdout`, `stderr` and `exit` into an
 //! execution directory derived from `(run, call_id)`, so a command survives
@@ -25,14 +27,11 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use llm_context::deps::CancelCause;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as Json};
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{timeout as tokio_timeout, Duration};
 
 use crate::path_utils::to_abs_path;
-use crate::tasks::{ShellTaskContext, ShellTaskManager, ShellTask};
+use crate::tasks::{InProcessTaskManager, ShellTask};
 use crate::tool::CallingConventions;
 use crate::{
     build_builtin_tool_result, AgentTool, AgentToolError, AgentToolResult, AgentToolStatus,
@@ -41,30 +40,30 @@ use crate::{
 
 pub const TOOL_SHELL: &str = "shell";
 
-/// `wait` mode: default `timeout_ms`.
+/// Default `timeout_ms`.
 pub const DEFAULT_TIMEOUT_MS: u64 = 30 * 60_000;
-/// `wait` mode: default upper bound of `timeout_ms` (0 = unlimited).
+/// Default upper bound of `timeout_ms` (0 = unlimited).
 pub const DEFAULT_MAX_TIMEOUT_MS: u64 = 60 * 60_000;
-/// `auto` mode: default in-call wait before the command becomes a task.
-pub const DEFAULT_AUTO_WAIT_MS: u64 = llm_context::tasks::DEFAULT_TASK_WAIT_MS;
-/// `auto` mode: upper bound of `wait_ms`.
-pub const MAX_AUTO_WAIT_MS: u64 = llm_context::tasks::MAX_IN_TOOL_WAIT_MS;
+/// Default in-call wait before the command becomes a task.
+pub const DEFAULT_AUTO_WAIT_MS: u64 = crate::task_model::DEFAULT_TASK_WAIT_MS;
+/// Upper bound of `wait_ms`.
+pub const MAX_AUTO_WAIT_MS: u64 = crate::task_model::MAX_IN_TOOL_WAIT_MS;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// Bytes of output kept in a progress / cancel text.
 pub const OUTPUT_TAIL_BYTES: usize = 2048;
 pub(crate) const LOCAL_ENGINE: &str = "native";
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
+/// `once` key of the hint that says how a task is followed.
+pub const SHELL_TASK_FOLLOWUP_HINT: &str = "shell.task_followup";
 const UNLIMITED_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 
-/// How long `shell` waits inside the call.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ShellMode {
-    /// Hard wait: to completion or `timeout_ms` (then the command is
-    /// stopped). Not bound by the 30 minute in-tool wait rule.
+/// How `shell` ends a call (derived from the wait budget, see the module
+/// doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellMode {
+    /// To completion or `timeout_ms` (then the command is stopped).
     Wait,
     /// Wait `wait_ms`, then turn the command into a task and return.
-    #[default]
     Auto,
 }
 
@@ -87,6 +86,9 @@ pub fn new_run_binding_slot() -> RunBindingSlot {
 /// Environment variable carrying the id of the tool call a `shell` command
 /// runs for.
 pub const ENV_CALL_ID: &str = "XLLM_CALL_ID";
+/// Environment variable carrying the id of the run the call belongs to
+/// (with `XLLM_CALL_ID`, an idempotency key of what the command creates).
+pub const ENV_RUN_ID: &str = "XLLM_RUN_ID";
 
 /// `<run_dir>/exec/<call_id>`, the execution directory of one call (native
 /// runtime). `None` without a persistent run directory or call id.
@@ -198,15 +200,6 @@ pub enum BashTarget {
     Unsupported(String),
 }
 
-impl BashTarget {
-    pub fn label(&self) -> &str {
-        match self {
-            BashTarget::Local => "local",
-            BashTarget::Unsupported(value) => value.as_str(),
-        }
-    }
-}
-
 /// PATH overlay: an ordered list of bin directories prepended to `PATH`.
 /// `layers[0]` has the highest precedence.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -263,17 +256,19 @@ pub struct LlmBashConfig {
     pub target: BashTargetSpec,
     pub overlay: BinOverlayConfig,
     pub tool_name: String,
-    pub mode: ShellMode,
-    /// `auto` mode: default `wait_ms`.
+    /// The runtime's in-call wait budget (default `wait_ms`).
     pub default_wait_ms: u64,
     pub runtime: ShellRuntimeNote,
-    /// `auto` mode: where a command that outlives `wait_ms` goes. Without
-    /// it the tool behaves as `wait`.
-    pub tasks: Option<Arc<dyn ShellTaskManager>>,
-    /// What a handed-over command belongs to (session, Turn task, run).
-    pub task_context: ShellTaskContext,
+    /// `auto` mode: the task manager of this process, where a command that
+    /// outlives `wait_ms` goes. Without it the tool behaves as `wait`.
+    pub tasks: Option<Arc<InProcessTaskManager>>,
+    /// The run the commands belong to (`XLLM_RUN_ID`), bound late.
+    pub run: Option<RunBindingSlot>,
+    /// Whether the model may choose `wait_ms`. A session host follows the
+    /// tasks itself: there the wait is the runtime's alone.
+    pub expose_wait_ms: bool,
     /// How the model follows a command that became a task.
-    pub task_followup: llm_context::tasks::TaskFollowup,
+    pub task_followup: crate::task_model::TaskFollowup,
     /// The run's task bridge (`XLLM_TASK_ENDPOINT` of every command).
     pub task_endpoint: Option<String>,
     /// Host facts appended to the description (e.g. what PATH provides).
@@ -292,10 +287,10 @@ impl std::fmt::Debug for LlmBashConfig {
             .field("target", &self.target)
             .field("overlay", &self.overlay)
             .field("tool_name", &self.tool_name)
-            .field("mode", &self.mode)
             .field("default_wait_ms", &self.default_wait_ms)
             .field("runtime", &self.runtime)
             .field("tasks", &self.tasks.is_some())
+            .field("expose_wait_ms", &self.expose_wait_ms)
             .field("task_followup", &self.task_followup)
             .field("task_endpoint", &self.task_endpoint)
             .field("note", &self.note)
@@ -315,12 +310,12 @@ impl LlmBashConfig {
             target: BashTargetSpec::Local,
             overlay: BinOverlayConfig::disabled(),
             tool_name: TOOL_SHELL.to_string(),
-            mode: ShellMode::Wait,
             default_wait_ms: DEFAULT_AUTO_WAIT_MS,
             runtime: ShellRuntimeNote::native(),
             tasks: None,
-            task_context: ShellTaskContext::default(),
-            task_followup: llm_context::tasks::TaskFollowup::Tools,
+            run: None,
+            expose_wait_ms: true,
+            task_followup: crate::task_model::TaskFollowup::Tools,
             task_endpoint: None,
             note: None,
         }
@@ -362,11 +357,6 @@ impl LlmBashConfig {
         self
     }
 
-    pub fn with_mode(mut self, mode: ShellMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
     pub fn with_default_wait_ms(mut self, ms: u64) -> Self {
         self.default_wait_ms = ms.clamp(1, MAX_AUTO_WAIT_MS);
         self
@@ -377,17 +367,22 @@ impl LlmBashConfig {
         self
     }
 
-    pub fn with_tasks(mut self, tasks: Arc<dyn ShellTaskManager>) -> Self {
+    pub fn with_tasks(mut self, tasks: Arc<InProcessTaskManager>) -> Self {
         self.tasks = Some(tasks);
         self
     }
 
-    pub fn with_task_context(mut self, ctx: ShellTaskContext) -> Self {
-        self.task_context = ctx;
+    pub fn with_run(mut self, run: Option<RunBindingSlot>) -> Self {
+        self.run = run;
         self
     }
 
-    pub fn with_task_followup(mut self, followup: llm_context::tasks::TaskFollowup) -> Self {
+    pub fn with_expose_wait_ms(mut self, expose: bool) -> Self {
+        self.expose_wait_ms = expose;
+        self
+    }
+
+    pub fn with_task_followup(mut self, followup: crate::task_model::TaskFollowup) -> Self {
         self.task_followup = followup;
         self
     }
@@ -403,9 +398,10 @@ impl LlmBashConfig {
     }
 
     fn effective_mode(&self) -> ShellMode {
-        match self.mode {
-            ShellMode::Auto if self.tasks.is_some() => ShellMode::Auto,
-            _ => ShellMode::Wait,
+        if self.tasks.is_some() && self.default_wait_ms < self.default_timeout_ms {
+            ShellMode::Auto
+        } else {
+            ShellMode::Wait
         }
     }
 }
@@ -561,14 +557,6 @@ pub(crate) fn wait_duration(ms: u64) -> Duration {
     }
 }
 
-/// Build the env list applied to the spawned shell (overlay layers first).
-pub fn prepare_overlay_env(
-    overlay: &BinOverlayConfig,
-    user_env: &[(String, String)],
-) -> Vec<(String, String)> {
-    prepare_shell_env(overlay, user_env, cfg!(windows))
-}
-
 fn prepare_shell_env(
     overlay: &BinOverlayConfig,
     user_env: &[(String, String)],
@@ -707,19 +695,6 @@ impl OutputCollector {
             format!("{head}\n…[{omitted} bytes omitted]…\n{tail}")
         } else {
             format!("{head}{tail}")
-        }
-    }
-}
-
-pub(crate) async fn drain_pipe<R: AsyncRead + Unpin>(
-    mut reader: R,
-    collector: Arc<Mutex<OutputCollector>>,
-) {
-    let mut buf = [0u8; 8192];
-    loop {
-        match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => collector.lock().expect("bash output lock").push(&buf[..n]),
         }
     }
 }
@@ -1410,10 +1385,6 @@ impl ShellTool {
         Self::new(LlmBashConfig::local_workspace(workspace))
     }
 
-    pub fn config(&self) -> &LlmBashConfig {
-        &self.config
-    }
-
     fn tool_name(&self) -> &str {
         self.config.tool_name.as_str()
     }
@@ -1509,94 +1480,18 @@ impl ShellTool {
         Ok(out)
     }
 
-    fn build_details(&self, command: &str, output: &BashRunOutput) -> Json {
-        json!({
-            "command": command,
-            "cwd": output.cwd.to_string_lossy().to_string(),
-            "exit_code": output.exit_code,
-            "stdout": output.stdout,
-            "stderr": output.stderr,
-            "output": output.output,
-            "output_truncated": output.output_truncated,
-            "timed_out": output.timed_out,
-            "duration_ms": output.duration_ms,
-            "engine": output.engine,
-            "runtime": self.config.runtime.kind,
-        })
-    }
-
-    fn try_forward_inner_agent_tool_result(
-        &self,
-        command: &str,
-        output: &BashRunOutput,
-    ) -> Option<AgentToolResult> {
-        if !command_is_simple_for_protocol_forward(command) {
-            return None;
+    /// What this call's result is built from besides the output.
+    fn shape(&self, timeout_ms: u64) -> ShellResultShape {
+        ShellResultShape {
+            tool_name: self.tool_name().to_string(),
+            runtime: self.config.runtime.clone(),
+            timeout_ms,
+            max_timeout_ms: self.config.max_timeout_ms,
         }
-
-        let stdout = output.stdout.trim();
-        if stdout.is_empty() {
-            return None;
-        }
-
-        let mut result = match serde_json::from_str::<AgentToolResult>(stdout) {
-            Ok(result) => result,
-            Err(_) => return None,
-        };
-
-        if result.status == AgentToolStatus::Pending && result.task_id.is_none() {
-            log::warn!(
-                "shell inner AgentTool returned pending without task_id; falling back to the shell envelope command={}",
-                command
-            );
-            return None;
-        }
-
-        if result.return_code.is_none() && output.exit_code != 0 {
-            result.return_code = Some(output.exit_code);
-        }
-
-        Some(result)
     }
 
     fn finished_result(&self, command: &str, output: BashRunOutput, timeout_ms: u64) -> AgentToolResult {
-        if !output.timed_out {
-            if let Some(result) = self.try_forward_inner_agent_tool_result(command, &output) {
-                return result;
-            }
-        }
-        let summary = if output.timed_out {
-            format!(
-                "timed out after {}ms (timeout_ms={timeout_ms}); the command was stopped. Retry with a larger timeout_ms{}, or start a long-lived service with {} and return at once.",
-                output.duration_ms,
-                if self.config.max_timeout_ms == 0 {
-                    String::new()
-                } else {
-                    format!(" (max {})", self.config.max_timeout_ms)
-                },
-                if self.config.runtime.powershell() { "Start-Process -WindowStyle Hidden without -Wait" } else { "nohup / setsid" }
-            )
-        } else if output.exit_code == 0 {
-            format!("exit=0 in {}ms", output.duration_ms)
-        } else {
-            format!("exit={} in {}ms", output.exit_code, output.duration_ms)
-        };
-        let details = self.build_details(command, &output);
-        let status = if output.exit_code == 0 && !output.timed_out {
-            AgentToolStatus::Success
-        } else {
-            AgentToolStatus::Error
-        };
-        let fallback_cmd_line = format!("{} {}", self.tool_name(), command);
-        let mut result = build_builtin_tool_result(details, fallback_cmd_line, summary)
-            .with_tool(self.tool_name())
-            .with_status(status)
-            .with_return_code(output.exit_code)
-            .refresh_default_title();
-        if !output.output.is_empty() {
-            result = result.with_output(output.output.clone());
-        }
-        result
+        shell_finished_result(&self.shape(timeout_ms), command, output)
     }
 
     /// The command was cancelled by the run (interrupt / finish / deadline):
@@ -1648,32 +1543,35 @@ impl ShellTool {
         }
     }
 
-    /// `auto` mode: the command outlived `wait_ms`; it becomes a task.
+    /// `auto` mode: the command outlived `wait_ms`; it becomes a task of
+    /// this process.
     async fn detach_into_task(
         &self,
         handle: Box<dyn CommandHandle>,
         command: &str,
         call_id: Option<&str>,
         wait_ms: u64,
+        timeout_ms: u64,
     ) -> AgentToolResult {
         let tasks = self.config.tasks.as_ref().expect("auto mode requires tasks");
         let progress = handle.progress().await;
         let cancellable = handle.cancellable();
         let locator = handle.locator();
-        let task = ShellTask::new(command, handle, &self.config.runtime.kind);
-        let task_id = tasks
-            .take_over(&self.config.task_context, call_id, task)
-            .await;
+        let task = ShellTask::new(command, handle, self.shape(timeout_ms));
+        let task_id = tasks.register_shell(call_id, task);
         let mut text = format!(
-            "`{command}` is still running after {wait_ms}ms ({} elapsed); it continues as task {task_id} ({locator}).",
+            "`{command}` is still running after {} ({} elapsed); it continues as task {task_id} ({locator}).",
+            if wait_ms < 1000 {
+                format!("{wait_ms}ms")
+            } else {
+                fmt_elapsed(wait_ms)
+            },
             fmt_elapsed(progress.elapsed_ms)
         );
         if !progress.output_tail.trim().is_empty() {
             text.push_str("\n--- output so far (tail) ---\n");
             text.push_str(progress.output_tail.trim_end());
         }
-        text.push('\n');
-        text.push_str(&self.config.task_followup.hint(&task_id, cancellable));
         let details = json!({
             "command": command,
             "task_id": task_id,
@@ -1692,12 +1590,148 @@ impl ShellTool {
         .with_status(AgentToolStatus::Success)
         .with_task_id(task_id)
         .refresh_default_title()
-        .with_output(text);
+        .with_output(text)
+        // How a task is followed is said once per session.
+        .with_hint(
+            self.config.task_followup.general_hint(),
+            Some(SHELL_TASK_FOLLOWUP_HINT),
+        );
         if !progress.output_tail.is_empty() {
             result = result.with_partial_output(progress.output_tail);
         }
         result
     }
+}
+
+/// What the result of a `shell` call is built from besides the command's
+/// output: the same for a call that ended within its wait and for the task
+/// it became, so both read the same to the model.
+#[derive(Clone, Debug)]
+pub struct ShellResultShape {
+    pub tool_name: String,
+    pub runtime: ShellRuntimeNote,
+    pub timeout_ms: u64,
+    pub max_timeout_ms: u64,
+}
+
+fn build_details(shape: &ShellResultShape, command: &str, output: &BashRunOutput) -> Json {
+    json!({
+        "command": command,
+        "cwd": output.cwd.to_string_lossy().to_string(),
+        "exit_code": output.exit_code,
+        "stdout": output.stdout,
+        "stderr": output.stderr,
+        "output": output.output,
+        "output_truncated": output.output_truncated,
+        "timed_out": output.timed_out,
+        "duration_ms": output.duration_ms,
+        "engine": output.engine,
+        "runtime": shape.runtime.kind,
+    })
+}
+
+fn try_forward_inner_agent_tool_result(
+    command: &str,
+    output: &BashRunOutput,
+) -> Option<AgentToolResult> {
+    if !command_is_simple_for_protocol_forward(command) {
+        return None;
+    }
+
+    let stdout = output.stdout.trim();
+    if stdout.is_empty() {
+        return None;
+    }
+
+    let mut result = match serde_json::from_str::<AgentToolResult>(stdout) {
+        Ok(result) => result,
+        Err(_) => return None,
+    };
+
+    if result.status == AgentToolStatus::Pending && result.task_id.is_none() {
+        log::warn!(
+            "shell inner AgentTool returned pending without task_id; falling back to the shell envelope command={}",
+            command
+        );
+        return None;
+    }
+
+    if result.return_code.is_none() && output.exit_code != 0 {
+        result.return_code = Some(output.exit_code);
+    }
+
+    Some(result)
+}
+
+/// The result of a `shell` command that ended (or timed out and was
+/// stopped).
+pub fn shell_finished_result(
+    shape: &ShellResultShape,
+    command: &str,
+    output: BashRunOutput,
+) -> AgentToolResult {
+    if !output.timed_out {
+        if let Some(result) = try_forward_inner_agent_tool_result(command, &output) {
+            return result;
+        }
+    }
+    let timeout_ms = shape.timeout_ms;
+    let summary = if output.timed_out {
+        format!(
+            "timed out after {}ms (timeout_ms={timeout_ms}); the command was stopped. Retry with a larger timeout_ms{}, or start a long-lived service with {} and return at once.",
+            output.duration_ms,
+            if shape.max_timeout_ms == 0 {
+                String::new()
+            } else {
+                format!(" (max {})", shape.max_timeout_ms)
+            },
+            if shape.runtime.powershell() { "Start-Process -WindowStyle Hidden without -Wait" } else { "nohup / setsid" }
+        )
+    } else if output.exit_code == 0 {
+        format!("exit=0 in {}ms", output.duration_ms)
+    } else {
+        format!("exit={} in {}ms", output.exit_code, output.duration_ms)
+    };
+    let details = build_details(shape, command, &output);
+    let status = if output.exit_code == 0 && !output.timed_out {
+        AgentToolStatus::Success
+    } else {
+        AgentToolStatus::Error
+    };
+    let fallback_cmd_line = format!("{} {}", shape.tool_name, command);
+    let mut result = build_builtin_tool_result(details, fallback_cmd_line, summary)
+        .with_tool(shape.tool_name.as_str())
+        .with_status(status)
+        .with_return_code(output.exit_code)
+        .refresh_default_title();
+    if !output.output.is_empty() {
+        result = result.with_output(output.output.clone());
+    }
+    result
+}
+
+/// The result of a `shell` task that was cancelled.
+pub fn shell_cancelled_result(
+    shape: &ShellResultShape,
+    command: &str,
+    output: BashRunOutput,
+) -> AgentToolResult {
+    let mut details = build_details(shape, command, &output);
+    details["cancelled"] = json!(true);
+    let fallback_cmd_line = format!("{} {}", shape.tool_name, command);
+    let mut result = build_builtin_tool_result(
+        details,
+        fallback_cmd_line,
+        format!("cancelled after {}ms", output.duration_ms),
+    )
+    .with_tool(shape.tool_name.as_str())
+    .with_status(AgentToolStatus::Error)
+    .with_return_code(output.exit_code)
+    .refresh_default_title();
+    if !output.output.is_empty() {
+        result = result.with_output(output.output.clone());
+    }
+    result
 }
 
 pub(crate) fn fmt_elapsed(ms: u64) -> String {
@@ -1787,15 +1821,21 @@ impl AgentTool for ShellTool {
                     format!(", max {}s", max_timeout_ms / 1000)
                 }
             )),
+            ShellMode::Auto if !self.config.expose_wait_ms => description.push_str(&format!(
+                "Waits up to {}s for the command to finish. A command still running then continues as a task: this call returns its task_id with the output so far, and the task's end comes back to you as input with its full result — there is no need to wait for it. ",
+                default_wait_ms / 1000
+            )),
             ShellMode::Auto => description.push_str(&format!(
                 "Waits up to wait_ms (default {}s, max {} min) for the command to finish; a command still running then continues as a task and this call returns its task_id with the output so far — follow up with {}. Raise wait_ms for commands you expect to take long (builds, tests). ",
                 default_wait_ms / 1000,
                 MAX_AUTO_WAIT_MS / 60_000,
                 match &self.config.task_followup {
-                    llm_context::tasks::TaskFollowup::Tools =>
+                    crate::task_model::TaskFollowup::Tools =>
                         "`wait_task` / `get_task_state`".to_string(),
-                    llm_context::tasks::TaskFollowup::Command(cli) =>
+                    crate::task_model::TaskFollowup::Command(cli) =>
                         format!("`{cli} wait <task_id>` / `{cli} state <task_id>`"),
+                    crate::task_model::TaskFollowup::Input(_) =>
+                        "nothing: its end comes back to you as input".to_string(),
                 }
             )),
         }
@@ -1838,6 +1878,9 @@ impl AgentTool for ShellTool {
                     "{name} command='<shell>' [timeout_ms={default_timeout_ms}]",
                     name = self.tool_name()
                 )
+            }
+            ShellMode::Auto if !self.config.expose_wait_ms => {
+                format!("{name} command='<shell>'", name = self.tool_name())
             }
             ShellMode::Auto => {
                 properties["wait_ms"] = json!({
@@ -1929,7 +1972,11 @@ impl AgentTool for ShellTool {
         };
         let mode = self.config.effective_mode();
         let timeout_ms = self.parse_timeout(map.get("timeout_ms"))?;
-        let wait_ms = self.parse_wait(map.get("wait_ms"))?;
+        let wait_ms = if self.config.expose_wait_ms {
+            self.parse_wait(map.get("wait_ms"))?
+        } else {
+            self.config.default_wait_ms
+        };
         let call_id = crate::runtime::CURRENT_TOOL_CALL
             .try_with(|c| c.clone())
             .ok();
@@ -1939,6 +1986,14 @@ impl AgentTool for ShellTool {
         let mut env = env;
         if let Some(id) = call_id.as_ref().filter(|id| !id.is_empty()) {
             env.push((ENV_CALL_ID.to_string(), id.clone()));
+        }
+        if let Some(run) = self
+            .config
+            .run
+            .as_ref()
+            .and_then(|slot| slot.lock().expect("run binding").clone())
+        {
+            env.push((ENV_RUN_ID.to_string(), run.run_id));
         }
         // Commands following this run's tasks reach its resolver here.
         if let Some(endpoint) = &self.config.task_endpoint {
@@ -1976,7 +2031,7 @@ impl AgentTool for ShellTool {
                     Ok(self.finished_result(&command, output, timeout_ms))
                 }
                 ShellMode::Auto => Ok(self
-                    .detach_into_task(handle, &command, call_id.as_deref(), wait_ms)
+                    .detach_into_task(handle, &command, call_id.as_deref(), wait_ms, timeout_ms)
                     .await),
             },
         }
@@ -2191,8 +2246,8 @@ mod tests {
         assert_eq!(result.status, AgentToolStatus::Pending);
         assert_eq!(result.task_id.as_deref(), Some("42"));
         assert_eq!(
-            result.pending_reason,
-            Some(AgentToolPendingReason::LongRunning)
+            result.pending_reason.as_deref(),
+            Some(AgentToolPendingReason::LongRunning.as_str())
         );
         assert_eq!(result.check_after, Some(3));
         assert_eq!(result.details["queued"], true);
@@ -2643,7 +2698,7 @@ mod tests {
 
     #[test]
     fn overlay_env_adds_system_bins_when_path_missing() {
-        let env = prepare_overlay_env(&BinOverlayConfig::disabled(), &[]);
+        let env = prepare_shell_env(&BinOverlayConfig::disabled(), &[], cfg!(windows));
         let path = env
             .iter()
             .find(|(k, _)| k == "PATH")

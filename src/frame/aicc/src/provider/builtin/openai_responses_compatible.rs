@@ -27,9 +27,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const DEEPSEEK_PROFILE_ID: &str = "deepseek";
+#[cfg(test)]
 pub(crate) const DOUBAO_PROFILE_ID: &str = "doubao";
+#[cfg(test)]
 pub(crate) const DOUBAO_AGENT_PLAN_PROFILE_ID: &str = "doubao-agent-plan";
+#[cfg(test)]
 pub(crate) const DOUBAO_SPEECH_PROFILE_ID: &str = "doubao-speech";
+#[cfg(test)]
 pub(crate) const QWEN_PROFILE_ID: &str = "qwen";
 
 #[cfg(test)]
@@ -965,9 +969,9 @@ mod tests {
                 rules.revision_seq,
                 match provider.profile.provider_profile_id.as_str() {
                     DOUBAO_PROFILE_ID => 13,
-                    DOUBAO_AGENT_PLAN_PROFILE_ID => 10,
+                    DOUBAO_AGENT_PLAN_PROFILE_ID => 11,
                     DEEPSEEK_PROFILE_ID => 5,
-                    QWEN_PROFILE_ID => 10,
+                    QWEN_PROFILE_ID => 12,
                     "openai" => 4,
                     _ => 3,
                 }
@@ -995,7 +999,7 @@ mod tests {
             let expected_patterns = match provider.profile.provider_profile_id.as_str() {
                 DOUBAO_PROFILE_ID => 7,
                 DOUBAO_AGENT_PLAN_PROFILE_ID => 12,
-                QWEN_PROFILE_ID => 9,
+                QWEN_PROFILE_ID => 10,
                 _ => 1,
             };
             assert_eq!(rules.patterns.len(), expected_patterns);
@@ -1138,7 +1142,7 @@ mod tests {
                 "deepseek-v4-flash",
                 "doubao-seed-2-0-lite-260215",
                 "doubao-seed-2-0-lite-260428",
-                "qwen3.8-omni-flash",
+                "qwen3.8-flash",
             ])
         {
             let profile_id = provider.profile.provider_profile_id.clone();

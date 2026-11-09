@@ -1,13 +1,15 @@
-#![allow(dead_code)]
 use std::env;
 
 use log::{info, warn};
 
 mod aiworkspace_client;
 mod control_panel;
+mod cross_zone_auth;
+mod cross_zone_client;
 mod device_identity;
 mod group_hook;
 mod homestation_client;
+pub mod bucket_client;
 mod hybrid_sso;
 mod msg_center_client;
 mod msg_contact;
@@ -24,6 +26,8 @@ mod task_dispatcher;
 mod task_mgr;
 mod taskdata;
 mod thunk_object;
+mod json_schema;
+pub mod media_manifest;
 mod user_groups;
 mod verify_hub_client;
 pub mod workflow_dsl;
@@ -44,6 +48,9 @@ mod aicc_usage_log;
 mod aicc_video;
 mod app_availability;
 mod app_doc;
+mod ext_tools;
+pub mod ext_tools_install;
+pub mod pikg;
 mod app_identity;
 pub mod app_install;
 mod app_mgr;
@@ -58,9 +65,13 @@ mod computer;
 pub use computer::*;
 mod node_executor;
 mod node_executor_proto;
+pub mod node_executor_ipc;
 mod opendan_client;
 mod permission;
 mod process_util;
+mod product;
+mod did_object_provider;
+mod object_url;
 mod rbac_config;
 mod rdb_mgr;
 mod repo_client;
@@ -76,10 +87,13 @@ pub use aicc_video::*;
 pub use aiworkspace_client::*;
 pub use app_availability::*;
 pub use app_doc::*;
+pub use ext_tools::*;
 pub use app_identity::*;
 pub use app_install::*;
 pub use app_schema::*;
 pub use control_panel::*;
+pub use cross_zone_auth::*;
+pub use cross_zone_client::*;
 pub use cyfs_gateway_api::{
     generate_sn_device_token, get_real_sn_host_name, sn_auth_login, sn_auth_register,
     sn_register_device_online, sn_resolve_ood_by_did, sn_resolve_ood_by_hostname,
@@ -90,6 +104,11 @@ pub use cyfs_gateway_api::{
 pub use device_identity::*;
 pub use group_hook::*;
 pub use homestation_client::*;
+pub use bucket_client::{
+    bucket_error_code, bucket_event_id, bucket_index_rdb_instance_config, bucket_obj_url, is_no_such_key,
+    is_precondition_failed, parse_bucket_obj_url, validate_app_buckets, BucketClient, BUCKET_DATA_PATH,
+    BUCKET_EVENT_PREFIX, BUCKET_INDEX_RDB_INSTANCE_ID,
+};
 pub use hybrid_sso::*;
 pub use msg_center_client::*;
 pub use msg_contact::*;
@@ -97,7 +116,7 @@ pub use msg_notify::*;
 pub use nfs_copy::*;
 pub use nfs_server_client::*;
 pub use nfs_share::*;
-pub use named_store_client::RuntimeNamedStore;
+pub use named_store_client::{RuntimeContentByteSource, RuntimeNamedStore};
 pub use repo_client::*;
 pub use scheduler_client::*;
 pub use sn_user_client::*;
@@ -106,6 +125,8 @@ pub use task_dispatcher::*;
 pub use task_mgr::*;
 pub use taskdata::*;
 pub use thunk_object::*;
+pub use json_schema::{apply_schema_defaults, validate_json_schema};
+pub use media_manifest::*;
 pub use user_groups::*;
 pub use verify_hub_client::*;
 pub use workflow_dsl::*;
@@ -125,6 +146,9 @@ pub use node_executor_proto::*;
 pub use opendan_client::*;
 pub use permission::*;
 pub use process_util::*;
+pub use product::*;
+pub use did_object_provider::*;
+pub use object_url::*;
 pub use rbac_config::*;
 pub use rdb_mgr::*;
 pub use runtime::*;

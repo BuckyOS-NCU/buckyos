@@ -8,26 +8,6 @@ use buckyos_api::AiMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Owner identity. Used purely for tracing / auditing — waist itself does not
-/// inspect it. Carry whatever the scheduler needs.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ContextOwnerRef {
-    Agent {
-        session_id: String,
-    },
-    Workflow {
-        instance_id: String,
-        node_id: String,
-    },
-    OneShot {
-        id: String,
-    },
-    Other {
-        label: String,
-    },
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ModelPolicy {
@@ -74,10 +54,10 @@ pub enum ToolMode {
 /// * **tools** — provider-native function calls exposed by `ToolManager`.
 ///   Controlled by `mode` + `whitelist`. Filters spec advertisement
 ///   (see [`crate::deps::resolve_tool_specs`]) and gates dispatch.
-/// * **actions** — XML behavior-loop tags (`shell`, `write_file`, …)
-///   parsed out of the LLM response. Controlled by `action_mode` +
-///   `action_whitelist`. Filters dispatch only — the recognized tag set
-///   itself is hardcoded by the XML parser.
+/// * **actions** — behavior-loop actions parsed out of the LLM response by
+///   the host's `LLMResultParser`. Controlled by `action_mode` +
+///   `action_whitelist`. Filters dispatch only — the recognized action set
+///   is the parser's.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ToolPolicy {
@@ -97,21 +77,31 @@ pub struct ToolPolicy {
     /// calls reject the whole batch. Does not limit the actions of a
     /// behavior step.
     pub max_calls_per_round: u32,
-    pub max_observation_bytes: u32,
     pub disable_capabilities: Vec<String>,
-    /// Whether the tool calls of one response may run concurrently.
-    pub parallel: bool,
-    /// Whether ToolManager may return `Observation::Pending`, suspending the
-    /// run with `Outcome::PendingTool` until the scheduler fills the result.
-    /// When `false`, a `Pending` observation is a contract violation: the
-    /// call is recorded with an unknown effect and the run ends with
-    /// `Internal`. Passed to every tool call as `ToolCallCtx.allow_deferred`
-    /// so tools wait for their task inside the call instead.
-    pub allow_deferred: bool,
     /// Graceful finish (`LLMContextInterruptHandle::finish`): how long to
     /// wait for a running tool that cannot cancel its work before the
     /// finish falls back to an interrupt.
     pub finish_grace_ms: u64,
+    /// Tools still offered once `max_tool_iterations` is used up: the model
+    /// can only end (report) or hand over (ask the user). A batch of only
+    /// these tools (the native calls of one response, or the actions of one
+    /// behavior step) is dispatched without consuming an iteration, at most
+    /// `wrap_up_rounds` times per run; a batch with any other tool still
+    /// ends the run with `BudgetExhausted`. Names are tool spec / action
+    /// names. Empty (default) keeps the old behavior: no tools.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wrap_up_tools: Vec<String>,
+    /// How many tool batches may run in wrap-up mode before the context
+    /// gives up with `BudgetExhausted` (`LLMContextState.wrap_up_rounds_used`).
+    #[serde(skip_serializing_if = "is_default_wrap_up_rounds")]
+    pub wrap_up_rounds: u32,
+}
+
+/// Default `ToolPolicy.wrap_up_rounds`.
+pub const DEFAULT_WRAP_UP_ROUNDS: u32 = 2;
+
+fn is_default_wrap_up_rounds(n: &u32) -> bool {
+    *n == DEFAULT_WRAP_UP_ROUNDS
 }
 
 impl Default for ToolPolicy {
@@ -123,11 +113,10 @@ impl Default for ToolPolicy {
             action_whitelist: Vec::new(),
             max_tool_iterations: 8,
             max_calls_per_round: 8,
-            max_observation_bytes: 32 * 1024,
             disable_capabilities: Vec::new(),
-            parallel: false,
-            allow_deferred: false,
             finish_grace_ms: 30_000,
+            wrap_up_tools: Vec::new(),
+            wrap_up_rounds: DEFAULT_WRAP_UP_ROUNDS,
         }
     }
 }
@@ -138,7 +127,8 @@ pub enum OutputSpec {
     /// Free-form text, caller parses it themselves.
     Text,
     /// Force JSON. `schema` is forwarded to the provider adapter, which
-    /// enforces it natively where the provider supports structured output.
+    /// enforces it natively where the provider supports structured output;
+    /// without one the provider is asked for any JSON object.
     ///
     /// Without `max_repairs` the waist only parses: `strict = true` makes a
     /// parse failure an LLM-correctable `OutputParse` error (bounded by
@@ -226,13 +216,6 @@ impl Default for BudgetSpec {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(default)]
-pub struct HumanPolicy {
-    /// Tool/action names that require human approval before dispatch.
-    pub approval_required: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ErrorPolicy {
@@ -281,7 +264,10 @@ impl From<crate::error::LLMComputeError> for ErrorClass {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMContextRequest {
-    pub owner: ContextOwnerRef,
+    /// Who runs this context, for tracing / auditing only: opaque to the
+    /// waist (the scheduler's own identity shape).
+    #[serde(default)]
+    pub owner: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<String>,
 
@@ -293,8 +279,8 @@ pub struct LLMContextRequest {
     pub behavior_name: String,
 
     /// Already-compiled conversation history (system / user / assistant / tool).
-    /// The L4 prompt compiler is responsible for template expansion before
-    /// reaching the waist.
+    /// The host is responsible for template expansion before reaching the
+    /// waist.
     pub input: Vec<AiMessage>,
 
     #[serde(default)]
@@ -306,8 +292,6 @@ pub struct LLMContextRequest {
     #[serde(default)]
     pub budget: BudgetSpec,
     #[serde(default)]
-    pub human_policy: HumanPolicy,
-    #[serde(default)]
     pub error_policy: ErrorPolicy,
 
     /// Hard constraint for Behavior Loop: when `true`, any `<next_behavior>`
@@ -315,9 +299,8 @@ pub struct LLMContextRequest {
     /// as if `next_behavior == None`. Used by fork sub-contexts whose
     /// control flow must end with the run, never jump to another behavior.
     ///
-    /// Default `false` — set via `RequestOverrides.forbid_next_behavior` on
-    /// the snapshot-rebuild path, or directly in the request when building
-    /// a fresh fork context.
+    /// Default `false` — set directly in the request when building a fork
+    /// context.
     #[serde(default)]
     pub forbid_next_behavior: bool,
 }

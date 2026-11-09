@@ -1,6 +1,6 @@
 // Zone DID Resolver —— "伪装成 resolver 的 zone 内权威 cache"
 // （buckyos-base doc/简单介绍resolve-did.md §2.2/§3/§5/§7，速查规则 8；
-//   需求整理 notepads/zone-did-resolver需求.md）。
+//   需求整理 notepads/done/zone-did-resolver需求.md）。
 //
 // 对外两个入口，语义不同（buckyos-base doc/http_did_resolver_api.md §1.1）：
 //   GET /1.0/identifiers/{did}?type={doc_type}   resolver API，回答一律是
@@ -21,7 +21,7 @@
 //   503                            zone 对该名字没有意见（zone 外名字 / zone 身份
 //                                  尚不可用），客户端据此回退本机 cache 与 provider 链；
 //   400                            非法入参（key 类 DID 等，规则 10）；
-//   501 + historicalQuerySupported=false   带 iat 的历史查询：本 resolver 无历史
+//   501 + historicalQuerySupported=false   带 versionId / versionTime 的版本查询：本 resolver 无历史
 //                                  索引，按协议 §7 声明能力缺失，绝不能把当前
 //                                  状态伪装成历史快照；
 //   500                            zone 内条目损坏。注意：当前 ZoneResolverClient
@@ -36,6 +36,11 @@
 //   resolver/cache/{escaped_did}/{doc_type}/state   状态 JSON（见 ResolverCacheState 注释）
 //   resolver/cache/{escaped_did}/{doc_type}/doc     EncodedDocument 字符串（JWT 或 JSON）
 //   resolver/cache/{escaped_did}/{doc_type}/metadata  管理侧自由字段，resolver 不消费
+// did.json（默认 doc_type）登记在 `did` 槽位，发布方优先登记它：只有一种文档的
+// DID（群等 zone 子名字）只写 `did` 槽位，state.doc_type 声明文档的实际类型，按该
+// 类型的显式查询在本类型槽位缺失时也由它回答；有多种类型时各类型分槽登记，`did`
+// 槽位只写 state（doc_type 指向默认类型，不带 doc），did.json 跟随该类型槽位。
+// zone 自身不读 `did` 槽位（§6.3）。
 // escaped_did/doc_type 段的转义规则：'%' -> "%25"，'/' -> "%2F"（合法 DID 本身
 // 不含 '/'，did:web 的端口写法含 '%'，如 did:web:example.com%3A3000）。
 // zone 内短名的 cache 键用规范 DID：did:web:{short}.{zone_host}。
@@ -52,13 +57,12 @@
 // 尚未实现（有真实需求时再补）：Cache-Control 负状态缓存策略、按请求来源的
 // doc_type 可见性分级（需求 §7，需 gateway 注入来源信息后一起设计）。
 
-#![allow(unused)]
 
 use log::*;
 use name_lib::*;
 
 use async_trait::async_trait;
-use buckyos_api::{ZoneConfig, ZONE_OWNER_USER_ID_KEY};
+use buckyos_api::{AgentId, AgentSpec, ZoneConfig, ZONE_OWNER_USER_ID_KEY};
 use buckyos_http_server::{
     server_err, HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo,
 };
@@ -68,7 +72,6 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use jsonwebtoken::jwk::Jwk;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::str::FromStr;
 use url::form_urlencoded;
 
 use crate::SYS_STORE;
@@ -79,6 +82,7 @@ const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_DID_JWT: &str = "application/did+jwt";
 const CONTENT_TYPE_DID_JSON: &str = "application/did+ld+json";
 const RESOLVER_CACHE_PREFIX: &str = "resolver/cache";
+const DEFAULT_CACHE_SLOT: &str = "did";
 
 #[derive(Clone)]
 pub struct ZoneDidResolver {}
@@ -193,6 +197,15 @@ struct PublishedAnswer {
     migration_target: Option<DID>,
 }
 
+// `did` 槽位对一次查询的裁决。
+enum DefaultSlot {
+    Answer(ZoneAnswer),
+    // 多类型 DID：did.json 跟随该类型槽位
+    Follow(DidDocType),
+    // 与本次查询无关，继续结构化查询
+    Pass,
+}
+
 // 一次解析的回答，与文件头的状态码纪律一一对应。
 enum ZoneAnswer {
     Published(PublishedAnswer),
@@ -202,9 +215,45 @@ enum ZoneAnswer {
     Missing(DidDocType),
     NoOpinion(String),
     BadRequest(String),
-    // 带 iat 的历史查询：本 resolver 无历史索引（协议 §7 的 501 分支）
+    // 带 versionId / versionTime 的版本查询：本 resolver 无历史索引（协议 §7.4 的 501 分支）
     HistoricalNotSupported(String),
     Internal(String),
+}
+
+/// Version query of the resolver API (buckyos-base doc/http_did_resolver_api.md §2、§7): `versionId`
+/// asks for the version with exactly that iat, `versionTime` for the closest one before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionQuery {
+    Exact(u64),
+    Closest(u64),
+}
+
+/// `type` and the version query of `/1.0/identifiers/{did}`; `versionId` and `versionTime` are
+/// mutually exclusive iat values.
+fn parse_identifiers_query(
+    query: Option<&str>,
+) -> Result<(Option<String>, Option<VersionQuery>), String> {
+    let mut typ = None;
+    let mut version = None;
+    for (key, value) in form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+        let make: fn(u64) -> VersionQuery = match key.as_ref() {
+            "type" => {
+                typ = Some(value.into_owned());
+                continue;
+            }
+            "versionId" => VersionQuery::Exact,
+            "versionTime" => VersionQuery::Closest,
+            _ => continue,
+        };
+        let iat = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{} must be an iat", key))?;
+        if version.replace(make(iat)).is_some() {
+            return Err("versionId and versionTime are mutually exclusive".to_string());
+        }
+    }
+    Ok((typ, version))
 }
 
 fn is_key_class_method(method: &str) -> bool {
@@ -212,9 +261,6 @@ fn is_key_class_method(method: &str) -> bool {
 }
 
 impl ZoneDidResolver {
-    pub fn new() -> Self {
-        Self {}
-    }
 
     async fn store_get(&self, key: &str) -> Result<Option<String>, String> {
         let store = SYS_STORE.lock().await;
@@ -325,39 +371,65 @@ impl ZoneDidResolver {
 
     async fn load_agent_doc(
         &self,
-        key: &str,
-    ) -> Result<Option<(AgentDocument, EncodedDocument)>, String> {
-        let path = format!("agents/{}/doc", key);
-        let Some(doc_str) = self.store_get(path.as_str()).await? else {
-            return Ok(None);
-        };
-        let encoded = EncodedDocument::from_str(doc_str)
-            .map_err(|e| format!("parse {} failed: {}", path, e))?;
-        let agent_doc = AgentDocument::decode(&encoded, None)
-            .map_err(|e| format!("{} corrupt: {}", path, e))?;
-        Ok(Some((agent_doc, encoded)))
-    }
-
-    // agent 的真实 DID 与 store 短名键无关，按 id 扫描（zone 内 agent 数量很小）。
-    async fn find_agent_doc_by_did(
-        &self,
         did: &DID,
     ) -> Result<Option<(AgentDocument, EncodedDocument)>, String> {
-        let agent_ids = {
+        let agent_id = AgentId::from_agent_did(did)?;
+        let rows = {
             let store = SYS_STORE.lock().await;
-            store
-                .list_direct_children("agents".to_string())
-                .await
-                .map_err(|e| format!("list agents failed: {}", e))?
-        };
-        for agent_id in agent_ids {
-            if let Ok(Some((agent_doc, encoded))) = self.load_agent_doc(agent_id.as_str()).await {
-                if agent_doc.id == *did {
-                    return Ok(Some((agent_doc, encoded)));
-                }
+            let owners = store.list_direct_children("users".to_string()).await
+                .map_err(|e| format!("list users failed: {e}"))?;
+            let mut rows = Vec::new();
+            for owner in owners {
+                let path = buckyos_api::agent_spec_key(&owner, &agent_id);
+                let Some(spec) = store.get(path.clone()).await
+                    .map_err(|e| format!("read {path} failed: {e}"))? else { continue };
+                let owner_doc = store.get(format!("users/{owner}/doc")).await
+                    .map_err(|e| format!("read agent owner {owner} failed: {e}"))?;
+                rows.push((owner, spec, owner_doc));
             }
+            rows
+        };
+        Self::canonical_agent_doc(did, rows)
+    }
+
+    fn canonical_agent_doc(
+        did: &DID,
+        rows: Vec<(String, String, Option<String>)>,
+    ) -> Result<Option<(AgentDocument, EncodedDocument)>, String> {
+        let agent_id = AgentId::from_agent_did(did)?;
+        if rows.len() > 1 {
+            return Err(format!("Agent {agent_id} has multiple canonical owners"));
         }
-        Ok(None)
+        let Some((owner, raw_spec, raw_owner)) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let path = buckyos_api::agent_spec_key(&owner, &agent_id);
+        let spec: AgentSpec = serde_json::from_str(&raw_spec)
+            .map_err(|e| format!("invalid AgentSpec at {path}: {e}"))?;
+        spec.validate().map_err(|e| format!("invalid AgentSpec at {path}: {e}"))?;
+        let raw_owner = raw_owner.ok_or_else(|| format!("Agent owner {owner} has no document"))?;
+        let encoded_owner = EncodedDocument::from_str(raw_owner)
+            .map_err(|e| format!("invalid Agent owner {owner}: {e}"))?;
+        let owner_doc = OwnerDocument::decode(&encoded_owner, None)
+            .map_err(|e| format!("invalid Agent owner {owner}: {e}"))?;
+        if spec.agent_id != agent_id || spec.agent_did != *did
+            || spec.agent_doc.owner != owner_doc.id
+            || spec.binding.target_app_instance_id.owner_user_id() != owner
+        {
+            return Err(format!("AgentSpec at {path} does not match its identity or owner"));
+        }
+        let encoded = EncodedDocument::JsonLd(serde_json::to_value(&spec.agent_doc)
+            .map_err(|e| format!("serialize AgentDocument at {path}: {e}"))?);
+        Ok(Some((spec.agent_doc, encoded)))
+    }
+
+    async fn load_in_zone_agent_doc(
+        &self,
+        zone: &ZoneIdentity,
+        short: &str,
+    ) -> Result<Option<(AgentDocument, EncodedDocument)>, String> {
+        let did = zone_child_did(&zone.zone_doc.id, short).map_err(|e| e.to_string())?;
+        self.load_agent_doc(&did).await
     }
 
     async fn load_device_info(&self, key: &str) -> Result<Option<Value>, String> {
@@ -400,12 +472,20 @@ impl ZoneDidResolver {
         raw.replace('%', "%25").replace('/', "%2F")
     }
 
+    fn cache_slot(doc_type: &DidDocType) -> &str {
+        if *doc_type == DEFAULT_DID_DOC_TYPE {
+            DEFAULT_CACHE_SLOT
+        } else {
+            doc_type.as_str()
+        }
+    }
+
     fn cache_key_base(did: &DID, doc_type: &DidDocType) -> String {
         format!(
             "{}/{}/{}",
             RESOLVER_CACHE_PREFIX,
             Self::escape_cache_segment(did.to_string().as_str()),
-            Self::escape_cache_segment(doc_type.as_str())
+            Self::escape_cache_segment(Self::cache_slot(doc_type))
         )
     }
 
@@ -493,21 +573,100 @@ impl ZoneDidResolver {
         }))
     }
 
-    // 查 cache 登记。Ok(None) = 没有登记，继续结构化查询；Err = 登记存在但坏了
-    //（显式 override 损坏必须大声失败成 500，而不是静默绕过——那可能是一条吊销）。
-    async fn cache_lookup(
+    // `did` 槽位（state + 可选 doc）对一次查询的裁决。纯函数便于单测。
+    // state.doc_type 是 did.json 文档的实际类型，缺省为默认类型；active 且不带
+    // doc 时是多类型 DID 的指针。显式类型查询只认声明了同一类型且自带文档的登记。
+    fn default_slot_answer(
+        state_str: &str,
+        doc_str: Option<String>,
+        requested: &DidDocType,
+    ) -> Result<DefaultSlot, String> {
+        let state: Value = serde_json::from_str(state_str)
+            .map_err(|e| format!("state is not valid json: {}", e))?;
+        let declared = match state.get("doc_type") {
+            None | Some(Value::Null) => DEFAULT_DID_DOC_TYPE,
+            Some(Value::String(t)) => parse_doc_type(Some(t.clone())),
+            Some(_) => return Err("doc_type must be a string".to_string()),
+        };
+        let is_default = *requested == DEFAULT_DID_DOC_TYPE;
+        let active = state.get("document_status").and_then(Value::as_str) == Some("active");
+        if active && doc_str.is_none() && declared != DEFAULT_DID_DOC_TYPE {
+            return Ok(if is_default {
+                DefaultSlot::Follow(declared)
+            } else {
+                DefaultSlot::Pass
+            });
+        }
+        if !is_default && declared != *requested {
+            return Ok(DefaultSlot::Pass);
+        }
+        Self::cache_answer(state_str, doc_str, &declared).map(DefaultSlot::Answer)
+    }
+
+    async fn cache_entry(
         &self,
         did: &DID,
         doc_type: &DidDocType,
-    ) -> Result<Option<ZoneAnswer>, String> {
+    ) -> Result<Option<(String, Option<String>)>, String> {
         let base = Self::cache_key_base(did, doc_type);
         let Some(state_str) = self.store_get(format!("{}/state", base).as_str()).await? else {
             return Ok(None);
         };
         let doc_str = self.store_get(format!("{}/doc", base).as_str()).await?;
+        Ok(Some((state_str, doc_str)))
+    }
+
+    // 只查该类型自己的槽位。Ok(None) = 没有登记，继续结构化查询；Err = 登记存在
+    // 但坏了（显式 override 损坏必须大声失败成 500，而不是静默绕过——那可能是一条吊销）。
+    async fn typed_cache_lookup(
+        &self,
+        did: &DID,
+        doc_type: &DidDocType,
+    ) -> Result<Option<ZoneAnswer>, String> {
+        let Some((state_str, doc_str)) = self.cache_entry(did, doc_type).await? else {
+            return Ok(None);
+        };
         Self::cache_answer(state_str.as_str(), doc_str, doc_type)
             .map(Some)
-            .map_err(|e| format!("resolver cache {} corrupt: {}", base, e))
+            .map_err(|e| {
+                format!(
+                    "resolver cache {} corrupt: {}",
+                    Self::cache_key_base(did, doc_type),
+                    e
+                )
+            })
+    }
+
+    // did.json 优先：显式类型先查本类型槽位，缺失时由声明同一类型的 did.json
+    // 回答；默认查询读 `did` 槽位或它指向的类型槽位。
+    async fn cache_lookup(
+        &self,
+        did: &DID,
+        doc_type: &DidDocType,
+    ) -> Result<Option<ZoneAnswer>, String> {
+        if *doc_type != DEFAULT_DID_DOC_TYPE {
+            if let Some(answer) = self.typed_cache_lookup(did, doc_type).await? {
+                return Ok(Some(answer));
+            }
+        }
+        let Some((state_str, doc_str)) = self.cache_entry(did, &DEFAULT_DID_DOC_TYPE).await?
+        else {
+            return Ok(None);
+        };
+        let base = Self::cache_key_base(did, &DEFAULT_DID_DOC_TYPE);
+        match Self::default_slot_answer(state_str.as_str(), doc_str, doc_type)
+            .map_err(|e| format!("resolver cache {} corrupt: {}", base, e))?
+        {
+            DefaultSlot::Answer(answer) => Ok(Some(answer)),
+            DefaultSlot::Pass => Ok(None),
+            DefaultSlot::Follow(target) => match self.typed_cache_lookup(did, &target).await? {
+                Some(answer) => Ok(Some(answer)),
+                None => Err(format!(
+                    "resolver cache {} points at unpublished doc_type {}",
+                    base, target
+                )),
+            },
+        }
     }
 
     // ---------------- zone owner 的 Root Trust 保护（需求 §6.2） ----------------
@@ -607,18 +766,14 @@ impl ZoneDidResolver {
     // cache 命中同样不能成为替换 Root Trust 的通道：owner/user 类 active 命中若
     // 载荷是当前 zone owner 的 OwnerDocument，key material 一致才原样放行，
     // 否则换成合并文档（state 钉的 doc_hash 随 body 一起失效，改为现算）。
-    fn guard_cache_hit(
-        zone: &ZoneIdentity,
-        answer: ZoneAnswer,
-        doc_type: &DidDocType,
-    ) -> ZoneAnswer {
-        if !matches!(doc_type, DidDocType::Owner | DidDocType::User) {
-            return answer;
-        }
+    // 按回答的实际类型判断：did.json 登记也可能承载 owner 文档。
+    fn guard_cache_hit(zone: &ZoneIdentity, answer: ZoneAnswer) -> ZoneAnswer {
         let ZoneAnswer::Published(mut published) = answer else {
             return answer;
         };
-        if published.status != PublishedStatus::Active {
+        if !matches!(published.doc_type, DidDocType::Owner | DidDocType::User)
+            || published.status != PublishedStatus::Active
+        {
             return ZoneAnswer::Published(published);
         }
         let Some(document) = published.document.as_ref() else {
@@ -694,8 +849,8 @@ impl ZoneDidResolver {
                 // §6.3：zone/boot 只来自 boot 状态机已接受的 boot/config，
                 // cache override 不得绕过 LKGS / smooth upgrade。
                 DidDocType::Zone | DidDocType::Boot => self.resolve_zone_itself(&zone, doc_type),
-                _ => match self.cache_lookup(&zone.zone_doc.id, doc_type).await {
-                    Ok(Some(answer)) => Self::guard_cache_hit(&zone, answer, doc_type),
+                _ => match self.typed_cache_lookup(&zone.zone_doc.id, doc_type).await {
+                    Ok(Some(answer)) => Self::guard_cache_hit(&zone, answer),
                     // owner DID 即 zone DID 时，zone 的 owner doc 就是这个 DID 的 owner doc
                     Ok(None) if zone.self_owned_owner_query(doc_type) => {
                         self.resolve_zone_owner(&zone, &zone.zone_doc.id, doc_type)
@@ -722,7 +877,7 @@ impl ZoneDidResolver {
                     }
                 };
                 match self.cache_lookup(&canonical, doc_type).await {
-                    Ok(Some(answer)) => Self::guard_cache_hit(&zone, answer, doc_type),
+                    Ok(Some(answer)) => Self::guard_cache_hit(&zone, answer),
                     Ok(None) => self.resolve_in_zone(&zone, short.as_str(), doc_type).await,
                     Err(e) => {
                         error!("ZoneDidResolver cache lookup for {} failed: {}", short, e);
@@ -731,7 +886,7 @@ impl ZoneDidResolver {
                 }
             }
             Ok(Target::Foreign(did)) => match self.cache_lookup(&did, doc_type).await {
-                Ok(Some(answer)) => Self::guard_cache_hit(&zone, answer, doc_type),
+                Ok(Some(answer)) => Self::guard_cache_hit(&zone, answer),
                 Ok(None) => self.resolve_foreign(&zone, &did, doc_type).await,
                 Err(e) => {
                     error!(
@@ -805,7 +960,7 @@ impl ZoneDidResolver {
                 return self.resolve_in_zone_owner(zone, short, doc_type).await
             }
             DidDocType::Custom(ref t) if t == AGENT_DOC_TYPE => self
-                .load_agent_doc(short)
+                .load_in_zone_agent_doc(zone, short)
                 .await
                 .map(|doc| doc.map(|(_, encoded)| Self::active(encoded, doc_type, None, true))),
             // 默认 doc_type（zone）：typeless 老客户端把设备逻辑名当默认类型查
@@ -887,7 +1042,7 @@ impl ZoneDidResolver {
         if let Some(encoded) = self.load_device_doc(short).await? {
             return Ok(Some(Self::active(encoded, &DidDocType::Device, None, true)));
         }
-        if let Some((_, encoded)) = self.load_agent_doc(short).await? {
+        if let Some((_, encoded)) = self.load_in_zone_agent_doc(zone, short).await? {
             return Ok(Some(Self::active(
                 encoded,
                 &DidDocType::Custom(AGENT_DOC_TYPE.to_string()),
@@ -944,37 +1099,23 @@ impl ZoneDidResolver {
                         Self::active(encoded, doc_type, Some(owner_doc.id), true)
                     })
             }
-            DidDocType::Custom(ref t) if t == AGENT_DOC_TYPE => {
-                let by_key = self
-                    .load_agent_doc(did.id.as_str())
-                    .await
-                    .ok()
-                    .flatten()
-                    .filter(|(agent_doc, _)| agent_doc.id == *did);
-                let found = match by_key {
-                    Some(found) => Some(found),
-                    None => self.find_agent_doc_by_did(did).await.ok().flatten(),
-                };
-                found.map(|(_, encoded)| Self::active(encoded, doc_type, None, true))
-            }
-            // 默认 doc_type：只保留 typeless 老客户端按真实 DID 找 agent doc 的行为。
-            // 不做 owner doc 兜底——把 (did, zone) 回答成 owner 文档是错误类型的独占
-            // 回答，会堵死客户端对该名字真正 zone 文档的外部解析；owner 文档走显式
-            // type=owner 查询。
-            DidDocType::Zone => {
-                self.find_agent_doc_by_did(did)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|(_, encoded)| {
-                        Self::active(
-                            encoded,
-                            &DidDocType::Custom(AGENT_DOC_TYPE.to_string()),
-                            None,
-                            true,
-                        )
-                    })
-            }
+            DidDocType::Custom(ref t) if t == AGENT_DOC_TYPE => self
+                .load_agent_doc(did)
+                .await
+                .ok()
+                .flatten()
+                .map(|(_, encoded)| Self::active(encoded, doc_type, None, true)),
+            DidDocType::Zone => self
+                .load_agent_doc(did)
+                .await
+                .ok()
+                .flatten()
+                .map(|(_, encoded)| Self::active(
+                    encoded,
+                    &DidDocType::Custom(AGENT_DOC_TYPE.to_string()),
+                    None,
+                    true,
+                )),
             _ => None,
         };
         match hit {
@@ -1169,8 +1310,9 @@ impl ZoneDidResolver {
                     StatusCode::NOT_IMPLEMENTED,
                     CONTENT_TYPE_JSON,
                     json!({
-                        "error": reason,
-                        "buckyos": {"historicalQuerySupported": false},
+                        "didResolutionMetadata": {"error": "historicalQueryNotSupported"},
+                        "didDocument": null,
+                        "didDocumentMetadata": {"buckyos": {"historicalQuerySupported": false}},
                     })
                     .to_string(),
                 )
@@ -1305,7 +1447,7 @@ impl HttpServer for ZoneDidResolver {
     async fn serve_request(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
-        info: StreamInfo,
+        _info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let build_resp = |status: StatusCode,
                           content_type: &str,
@@ -1364,7 +1506,7 @@ impl HttpServer for ZoneDidResolver {
             );
         }
 
-        // GET /1.0/identifiers/{did}?type={doc_type}[&iat={ts}]
+        // GET /1.0/identifiers/{did}?type={doc_type}[&versionId={iat}|&versionTime={iat}]
         let path = req.uri().path().to_string();
         if path.starts_with("/1.0/identifiers/") {
             let did_str = path.trim_start_matches("/1.0/identifiers/").to_string();
@@ -1376,29 +1518,16 @@ impl HttpServer for ZoneDidResolver {
                 );
             }
 
-            let mut typ: Option<String> = None;
-            let mut iat: Option<String> = None;
-            if let Some(query) = req.uri().query() {
-                for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-                    match key.as_ref() {
-                        "type" => typ = Some(value.into_owned()),
-                        "iat" => iat = Some(value.into_owned()),
-                        _ => {}
-                    }
-                }
-            }
-            let doc_type = parse_doc_type(typ);
-
-            // 协议 §7：无历史索引时必须区分"能力缺失"（501）与"历史 missing"
-            //（404）。本 resolver 只有当前状态，任何带 iat 的查询都不能用当前
-            // 结果冒充历史快照。
-            let answer = if let Some(iat) = iat {
-                ZoneAnswer::HistoricalNotSupported(format!(
-                    "zone resolver keeps no historical index (iat={} ignored is unsafe)",
-                    iat
-                ))
-            } else {
-                self.resolve(did_str.as_str(), &doc_type).await
+            // 协议 §7.4：无历史索引时必须区分"能力缺失"（501）与"历史 missing"
+            //（404）。本 resolver 只有当前状态，任何版本查询都不能用当前结果冒充
+            // 历史快照。
+            let answer = match parse_identifiers_query(req.uri().query()) {
+                Err(reason) => ZoneAnswer::BadRequest(reason),
+                Ok((_, Some(version))) => ZoneAnswer::HistoricalNotSupported(format!(
+                    "zone resolver keeps no historical index ({:?})",
+                    version
+                )),
+                Ok((typ, None)) => self.resolve(did_str.as_str(), &parse_doc_type(typ)).await,
             };
             let (status, content_type, body) = Self::answer_to_response(did_str.as_str(), answer);
             return build_resp(status, content_type, body);
@@ -1471,6 +1600,54 @@ impl HttpServer for ZoneDidResolver {
 mod tests {
     use super::*;
 
+    #[test]
+    fn version_queries_use_version_id_and_version_time_only() {
+        assert_eq!(parse_identifiers_query(None), Ok((None, None)));
+        assert_eq!(
+            parse_identifiers_query(Some("type=owner&versionId=7")),
+            Ok((Some("owner".to_string()), Some(VersionQuery::Exact(7))))
+        );
+        assert_eq!(
+            parse_identifiers_query(Some("versionTime=8&type=device")),
+            Ok((Some("device".to_string()), Some(VersionQuery::Closest(8))))
+        );
+        // `iat` is not a query parameter of the resolver API.
+        assert_eq!(
+            parse_identifiers_query(Some("type=owner&iat=7")),
+            Ok((Some("owner".to_string()), None))
+        );
+        for bad in ["versionId=7&versionTime=8", "versionId=7&versionId=8", "versionTime=soon"] {
+            assert!(parse_identifiers_query(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn version_queries_are_answered_501_before_any_lookup() {
+        let resolver = ZoneDidResolver {};
+        let request = |query: &str| {
+            http::Request::builder()
+                .uri(format!("/1.0/identifiers/did:bns:alice?{query}"))
+                .body(
+                    http_body_util::Full::new(bytes::Bytes::new())
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap()
+        };
+        for query in ["type=owner&versionId=7", "type=owner&versionTime=8"] {
+            let response = resolver
+                .serve_request(request(query), StreamInfo::default())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{query}");
+        }
+        let response = resolver
+            .serve_request(request("versionId=7&versionTime=8"), StreamInfo::default())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     const TEST_JWK: &str =
         r#"{"kty":"OKP","crv":"Ed25519","x":"qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM"}"#;
     // 与 TEST_JWK 不同的合法形状 Ed25519 公钥（32 字节全零），模拟权威源 key rotation
@@ -1521,9 +1698,135 @@ mod tests {
         doc
     }
 
+    fn canonical_agent_fixture(host: &str) -> (DID, String, String) {
+        let did = DID::new("web", host);
+        let owner_did = DID::new("web", "alice.test.buckyos.io");
+        let public_key: Jwk = serde_json::from_str(TEST_JWK).unwrap();
+        let mut agent = AgentDocument::new(did.clone(), owner_did.clone(), public_key.clone());
+        agent.iat = 1700000000;
+        agent.exp = 2000000000;
+        let agent_value = serde_json::to_value(&agent).unwrap();
+        let object_id = format!("agentdoc:{}", ZoneDidResolver::sha256_hex(&agent_value.to_string()));
+        let spec = json!({
+            "schema_version": 1,
+            "agent_id": AgentId::from_agent_did(&did).unwrap(),
+            "agent_did": did,
+            "agent_doc_object_id": object_id,
+            "agent_doc": agent_value,
+            "binding": {
+                "schema_version": 1,
+                "agent_did": did,
+                "agent_doc_object_id": object_id,
+                "target_app_instance_id": "shared-runtime.test.buckyos.io@alice",
+                "service_name": "www",
+                "generation": 1
+            },
+            "generation": 1
+        });
+        let mut owner = serde_json::to_value(OwnerDocument::new(owner_did, "alice".into(), "Alice".into(), public_key)).unwrap();
+        owner["binded_zone_list"] = json!(["did:web:test.buckyos.io"]);
+        (did, spec.to_string(), owner.to_string())
+    }
+
+    #[tokio::test]
+    async fn canonical_agent_preserves_document_and_same_zone_custody() {
+        let (did, spec, owner) = canonical_agent_fixture("writer.test.buckyos.io");
+        let (_, document) = ZoneDidResolver::canonical_agent_doc(&did,
+            vec![("alice".into(), spec.clone(), Some(owner.clone()))]).unwrap().unwrap();
+        assert_eq!(document.clone().to_json_value().unwrap(),
+            serde_json::from_str::<Value>(&spec).unwrap()["agent_doc"]);
+        let resolver = buckyos_api::StaticCustodyResolver::default()
+            .with_doc(&did, None, document.to_json_value().unwrap())
+            .with_doc(&DID::new("web", "alice.test.buckyos.io"), Some(DidDocType::Owner), serde_json::from_str(&owner).unwrap());
+        assert_eq!(buckyos_api::canonical_zone_of(&resolver, &did, None).await.unwrap(),
+            Some(DID::new("web", "test.buckyos.io")));
+        let device = DID::new("web", "ood1.test.buckyos.io");
+        let signer = buckyos_api::SignerKey {
+            did: device.clone(), kid: format!("{}#main_key", device.to_string()),
+            key: jsonwebtoken::DecodingKey::from_jwk(&serde_json::from_str::<Jwk>(TEST_JWK).unwrap()).unwrap(),
+            doc: Some(json!({"zone_did": "did:web:test.buckyos.io"})),
+        };
+        assert_eq!(buckyos_api::check_custody(&resolver, &signer, &did, None).await.unwrap(), buckyos_api::Custody::SameZone);
+        let other = buckyos_api::SignerKey { doc: Some(json!({"zone_did":"did:web:other.example"})), ..signer };
+        assert!(buckyos_api::check_custody(&resolver, &other, &did, None).await.is_err());
+    }
+
+    #[test]
+    fn canonical_agent_rejects_inconsistent_or_ambiguous_identity() {
+        let (did, raw, owner) = canonical_agent_fixture("writer.test.buckyos.io");
+        let original: Value = serde_json::from_str(&raw).unwrap();
+        for field in ["schema_version", "generation", "agent_id", "agent_did", "agent_doc_object_id"] {
+            let mut spec = original.clone();
+            spec[field] = match field {
+                "schema_version" | "generation" => json!(0),
+                "agent_id" => json!("impostor.test.buckyos.io"),
+                "agent_did" => json!("did:web:impostor.test.buckyos.io"),
+                _ => json!(format!("agentdoc:{}", "00".repeat(32))),
+            };
+            assert!(ZoneDidResolver::canonical_agent_doc(&did,
+                vec![("alice".into(), spec.to_string(), Some(owner.clone()))]).is_err(), "{field}");
+        }
+        let mut wrong_runtime = original.clone();
+        wrong_runtime["binding"]["target_app_instance_id"] = json!("shared-runtime.test.buckyos.io@bob");
+        assert!(ZoneDidResolver::canonical_agent_doc(&did,
+            vec![("alice".into(), wrong_runtime.to_string(), Some(owner.clone()))]).is_err());
+        let mut wrong_owner: Value = serde_json::from_str(&owner).unwrap();
+        wrong_owner["id"] = json!("did:web:bob.test.buckyos.io");
+        for invalid_owner in [None, Some("broken".into()), Some(wrong_owner.to_string())] {
+            assert!(ZoneDidResolver::canonical_agent_doc(&did,
+                vec![("alice".into(), raw.clone(), invalid_owner)]).is_err());
+        }
+        assert!(ZoneDidResolver::canonical_agent_doc(&did,
+            vec![("alice".into(), "broken".into(), Some(owner.clone()))]).is_err());
+        assert!(ZoneDidResolver::canonical_agent_doc(&did,
+            vec![("alice".into(), raw.clone(), Some(owner.clone())),
+                 ("bob".into(), raw.clone(), Some(owner.clone()))]).is_err());
+        for other in ["writer.foreign.example", "writer.nested.test.buckyos.io", "different.test.buckyos.io"] {
+            assert!(ZoneDidResolver::canonical_agent_doc(&DID::new("web", other),
+                vec![("alice".into(), raw.clone(), Some(owner.clone()))]).is_err(), "{other}");
+        }
+        assert!(ZoneDidResolver::canonical_agent_doc(&did, vec![]).unwrap().is_none());
+    }
+
+    #[test]
+    fn canonical_agent_foreign_and_default_responses_keep_identity() {
+        let (did, raw, owner) = canonical_agent_fixture("writer.foreign.example");
+        let (_, doc) = ZoneDidResolver::canonical_agent_doc(&did,
+            vec![("alice".into(), raw, Some(owner))]).unwrap().unwrap();
+        let resolver = ZoneDidResolver {};
+        assert!(matches!(resolver.classify(&test_zone_identity(), &did.to_string()), Ok(Target::Foreign(_))));
+        let answer = ZoneDidResolver::active(doc, &DidDocType::Custom("agent".into()), None, true);
+        let ZoneAnswer::Published(answer) = answer else { panic!("expected published") };
+        let envelope = ZoneDidResolver::published_envelope(&answer);
+        assert_eq!(envelope["didDocument"]["id"], did.to_string());
+        assert_eq!(envelope["didDocumentMetadata"]["buckyos"]["docType"], "agent");
+        assert_eq!(envelope["didDocumentMetadata"]["buckyos"]["documentStatus"], "active");
+    }
+
+    #[test]
+    fn canonical_agents_from_private_snapshot_keep_all_document_ids() {
+        let Ok(path) = std::env::var("RESOLVER_AGENT_SNAPSHOT") else { return };
+        let facts: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let facts = facts.as_object().unwrap();
+        let mut count = 0;
+        for (path, fact) in facts {
+            let parts: Vec<_> = path.split('/').collect();
+            if parts.len() != 5 || parts[0] != "users" || parts[2] != "agents" || parts[4] != "spec" { continue }
+            let raw = fact["value"].as_str().unwrap();
+            let spec: AgentSpec = serde_json::from_str(raw).unwrap();
+            assert_eq!(spec.agent_id.as_str(), parts[3]);
+            let owner = facts[&format!("users/{}/doc", parts[1])]["value"].as_str().unwrap();
+            let (_, doc) = ZoneDidResolver::canonical_agent_doc(&spec.agent_did,
+                vec![(parts[1].into(), raw.into(), Some(owner.into()))]).unwrap().unwrap();
+            assert_eq!(doc.to_json_value().unwrap(), serde_json::from_str::<Value>(raw).unwrap()["agent_doc"]);
+            count += 1;
+        }
+        assert_eq!(count, 10);
+    }
+
     #[test]
     fn classify_routes_zone_and_namespace_names() {
-        let resolver = ZoneDidResolver::new();
+        let resolver = ZoneDidResolver {};
         let zone = test_zone_identity();
 
         assert!(matches!(
@@ -1562,7 +1865,7 @@ mod tests {
 
     #[test]
     fn classify_rejects_key_class_dids() {
-        let resolver = ZoneDidResolver::new();
+        let resolver = ZoneDidResolver {};
         let zone = test_zone_identity();
         assert!(resolver.classify(&zone, "did:dev:abcdefg").is_err());
         assert!(resolver.classify(&zone, "did:key:z6Mk").is_err());
@@ -1727,14 +2030,17 @@ mod tests {
             ZoneDidResolver::answer_to_response("x", ZoneAnswer::BadRequest("bad".to_string()));
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
-        // iat 历史查询：501 + historicalQuerySupported=false（协议 §7）
+        // 版本查询：501 + historicalQuerySupported=false（协议 §7.4）
         let (status, _, body) = ZoneDidResolver::answer_to_response(
             "x",
             ZoneAnswer::HistoricalNotSupported("no history".to_string()),
         );
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
         let value: Value = serde_json::from_str(body.as_str()).unwrap();
-        assert_eq!(value["buckyos"]["historicalQuerySupported"], false);
+        assert_eq!(
+            value["didDocumentMetadata"]["buckyos"]["historicalQuerySupported"],
+            false
+        );
 
         let (status, _, _) =
             ZoneDidResolver::answer_to_response("x", ZoneAnswer::Internal("boom".to_string()));
@@ -1885,6 +2191,85 @@ mod tests {
         assert!(ZoneDidResolver::cache_answer(state.as_str(), None, &DidDocType::Zone).is_err());
     }
 
+    #[test]
+    fn did_json_slot_is_the_default_entry() {
+        assert_eq!(
+            ZoneDidResolver::cache_key_base(&DID::new("bns", "g1.alice"), &DEFAULT_DID_DOC_TYPE),
+            "resolver/cache/did:bns:g1.alice/did"
+        );
+    }
+
+    #[test]
+    fn did_json_answers_default_and_its_declared_type() {
+        let group = DidDocType::custom("group");
+        let state = json!({"document_status": "active", "doc_type": "group"}).to_string();
+        let doc = json!({"id": "did:bns:g1.alice", "entity_type": "group", "iat": 7}).to_string();
+        for requested in [DEFAULT_DID_DOC_TYPE, group.clone()] {
+            let DefaultSlot::Answer(ZoneAnswer::Published(published)) =
+                ZoneDidResolver::default_slot_answer(&state, Some(doc.clone()), &requested).unwrap()
+            else {
+                panic!("did.json should answer {}", requested);
+            };
+            assert_eq!(published.doc_type, group);
+            let envelope = ZoneDidResolver::published_envelope(&published);
+            assert_eq!(envelope["didDocumentMetadata"]["buckyos"]["docType"], "group");
+        }
+        assert!(matches!(
+            ZoneDidResolver::default_slot_answer(&state, Some(doc), &DidDocType::Owner).unwrap(),
+            DefaultSlot::Pass
+        ));
+    }
+
+    #[test]
+    fn did_json_of_a_multi_type_did_follows_the_default_type() {
+        let state = json!({"document_status": "active", "doc_type": "group"}).to_string();
+        assert!(matches!(
+            ZoneDidResolver::default_slot_answer(&state, None, &DEFAULT_DID_DOC_TYPE).unwrap(),
+            DefaultSlot::Follow(t) if t == DidDocType::custom("group")
+        ));
+        assert!(matches!(
+            ZoneDidResolver::default_slot_answer(&state, None, &DidDocType::custom("group")).unwrap(),
+            DefaultSlot::Pass
+        ));
+        let untyped = json!({"document_status": "active"}).to_string();
+        assert!(ZoneDidResolver::default_slot_answer(&untyped, None, &DEFAULT_DID_DOC_TYPE).is_err());
+    }
+
+    #[test]
+    fn did_json_tombstone_covers_its_declared_type() {
+        let state = json!({"document_status": "tombstoned", "doc_type": "group"}).to_string();
+        for requested in [DEFAULT_DID_DOC_TYPE, DidDocType::custom("group")] {
+            let DefaultSlot::Answer(ZoneAnswer::Published(published)) =
+                ZoneDidResolver::default_slot_answer(&state, None, &requested).unwrap()
+            else {
+                panic!("tombstone should answer {}", requested);
+            };
+            assert_eq!(published.status, PublishedStatus::Tombstoned);
+        }
+    }
+
+    #[test]
+    fn did_json_owner_doc_is_guarded_by_its_actual_type() {
+        let zone = test_zone_identity();
+        let rotated = owner_doc_with_key(OTHER_JWK);
+        let state = json!({"document_status": "active", "doc_type": "owner"}).to_string();
+        let doc = serde_json::to_string(&serde_json::to_value(&rotated).unwrap()).unwrap();
+        let DefaultSlot::Answer(answer) =
+            ZoneDidResolver::default_slot_answer(&state, Some(doc), &DEFAULT_DID_DOC_TYPE).unwrap()
+        else {
+            panic!("did.json should answer");
+        };
+        let ZoneAnswer::Published(published) = ZoneDidResolver::guard_cache_hit(&zone, answer)
+        else {
+            panic!("expected published answer");
+        };
+        let Some(EncodedDocument::JsonLd(merged)) = &published.document else {
+            panic!("expected merged json document");
+        };
+        let expected_jwk: Value = serde_json::from_str(TEST_JWK).unwrap();
+        assert_eq!(merged["verificationMethod"][0]["publicKeyJwk"], expected_jwk);
+    }
+
     // ---------------- zone owner 的 Root Trust 锚定 ----------------
 
     #[test]
@@ -1976,7 +2361,7 @@ mod tests {
         let answer =
             ZoneDidResolver::cache_answer(state.as_str(), Some(doc_str), &DidDocType::Owner)
                 .unwrap();
-        let guarded = ZoneDidResolver::guard_cache_hit(&zone, answer, &DidDocType::Owner);
+        let guarded = ZoneDidResolver::guard_cache_hit(&zone, answer);
         let ZoneAnswer::Published(published) = guarded else {
             panic!("expected published answer");
         };
@@ -2010,7 +2395,7 @@ mod tests {
             &DidDocType::Owner,
         )
         .unwrap();
-        let untouched = ZoneDidResolver::guard_cache_hit(&zone, answer, &DidDocType::Owner);
+        let untouched = ZoneDidResolver::guard_cache_hit(&zone, answer);
         let ZoneAnswer::Published(published) = untouched else {
             panic!("expected published answer");
         };

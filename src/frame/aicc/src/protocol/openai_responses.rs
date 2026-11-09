@@ -31,6 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const OPENAI_RESPONSES_ADAPTER_ID: &str = "openai-responses";
 pub(crate) const OPENAI_RESPONSES_OPERATION_ID: &str = "responses.create";
+pub(crate) const OPENAI_RESPONSES_BACKGROUND_OPERATION_ID: &str = "responses.background";
 pub(crate) const OPENAI_EMBEDDINGS_OPERATION_ID: &str = "embeddings.create";
 pub(crate) const OPENAI_IMAGES_GENERATE_OPERATION_ID: &str = "images.generate";
 pub(crate) const OPENAI_IMAGES_EDIT_OPERATION_ID: &str = "images.edit";
@@ -100,7 +101,7 @@ pub(super) fn openai_responses_adapter_with_reported_cost_currency(
         )],
         false,
     );
-    let images_generate = operation(
+    let mut images_generate = operation(
         OPENAI_IMAGES_GENERATE_OPERATION_ID,
         vec![binding(
             ApiType::ImageTextToImage,
@@ -109,7 +110,7 @@ pub(super) fn openai_responses_adapter_with_reported_cost_currency(
         )],
         false,
     );
-    let images_edit = operation(
+    let mut images_edit = operation(
         OPENAI_IMAGES_EDIT_OPERATION_ID,
         vec![
             binding(
@@ -125,6 +126,11 @@ pub(super) fn openai_responses_adapter_with_reported_cost_currency(
         ],
         false,
     );
+    for operation in [&mut images_generate, &mut images_edit] {
+        for binding in &mut operation.bindings {
+            binding.default_priority = 100;
+        }
+    }
     let audio_speech = operation(
         OPENAI_AUDIO_SPEECH_OPERATION_ID,
         vec![binding(
@@ -380,6 +386,40 @@ impl OperationCodec for OpenAiResponsesCodec {
         ))
     }
 
+    fn continuation_request(
+        &self,
+        response: &HttpResponse,
+        call: &CodecCall<'_>,
+    ) -> ProtocolResultValue<Option<(HttpRequest, Option<AiUsage>)>> {
+        if self.api_type != ApiType::AgentComputerUse || !response.status.is_success() {
+            return Ok(None);
+        }
+        let value: Value = response.json(self.descriptor.max_response_bytes)?;
+        let Some(items) = value.get("output").and_then(Value::as_array) else { return Ok(None) };
+        let calls: Vec<_> = items.iter().filter(|item| item["type"] == "computer_call").collect();
+        if calls.is_empty() { return Ok(None) }
+        let mut outputs = Vec::new();
+        let AiccCall::ComputerUse(request) = &call.input.canonical_request else { return Ok(None) };
+        let image = encode_input_image(&request.environment.screenshot, call)?;
+        for item in calls {
+            let actions = item.get("actions").and_then(Value::as_array).cloned()
+                .or_else(|| item.get("action").cloned().map(|action| vec![action])).unwrap_or_default();
+            if actions.is_empty() || actions.iter().any(|action| action["type"] != "screenshot") {
+                return Ok(None);
+            }
+            if item.get("pending_safety_checks").and_then(Value::as_array).is_some_and(|checks| !checks.is_empty()) {
+                return Err(ProtocolError::invalid_response("computer screenshot requires caller safety approval"));
+            }
+            outputs.push(json!({"type":"computer_call_output",
+                "call_id": required_string(item, "call_id", "computer call")?,
+                "output":{"type":"computer_screenshot", "image_url":image["image_url"], "detail":"original"}}));
+        }
+        let mut body = encode_responses_computer_use(request, call)?;
+        body["previous_response_id"] = Value::String(required_string(&value, "id", "computer response")?);
+        body["input"] = Value::Array(outputs);
+        Ok(Some((json_request(call, Method::POST, "responses", body)?, decode_computer_usage(&value, self.reported_cost_currency)?)))
+    }
+
     async fn decode_stream(
         &self,
         response: StreamingHttpResponse,
@@ -464,9 +504,6 @@ fn encode_responses_llm(
     if let Some(format) = &request.response_format {
         let format = match format.format_type {
             LlmResponseFormatType::Text => json!({"type": "text"}),
-            LlmResponseFormatType::Json | LlmResponseFormatType::JsonObject => {
-                json!({"type": "json_object"})
-            }
             LlmResponseFormatType::JsonSchema => {
                 let schema = format.json_schema.as_ref().ok_or_else(|| {
                     ProtocolError::invalid_request(
@@ -587,7 +624,8 @@ fn encode_responses_computer_use(
         request.task,
         request.allowed_actions.join(", ")
     );
-    let screenshot = encode_input_image(&request.environment.screenshot, call)?;
+    let mut screenshot = encode_input_image(&request.environment.screenshot, call)?;
+    screenshot["detail"] = json!("original");
     let mut body = Map::from_iter([
         ("model".to_string(), Value::String(provider_model_id(call)?)),
         (
@@ -598,9 +636,16 @@ fn encode_responses_computer_use(
             ]}]),
         ),
         ("tools".to_string(), json!([{"type":"computer"}])),
+        ("tool_choice".to_string(), json!("required")),
     ]);
     apply_responses_parameters(&mut body, &call.input.resolved_parameters)?;
     Ok(Value::Object(body))
+}
+
+fn decode_computer_usage(response: &Value, reported_cost_currency: Option<&str>) -> ProtocolResultValue<Option<AiUsage>> {
+    let mut usage = decode_usage(response.get("usage"), reported_cost_currency)?.unwrap_or_default();
+    usage.request_units = Some(1);
+    Ok(Some(usage))
 }
 
 fn decode_computer_use_response(
@@ -618,6 +663,9 @@ fn decode_computer_use_response(
     for item in output {
         if item.get("type").and_then(Value::as_str) != Some("computer_call") {
             continue;
+        }
+        if item.get("pending_safety_checks").and_then(Value::as_array).is_some_and(|checks| !checks.is_empty()) {
+            return Err(ProtocolError::invalid_response("computer action requires caller safety approval"));
         }
         let values = item
             .get("actions")
@@ -639,7 +687,7 @@ fn decode_computer_use_response(
             "actions": actions,
             "requires_next_observation": true
         }),
-        usage: decode_usage(response.get("usage"), reported_cost_currency)?,
+        usage: decode_computer_usage(response, reported_cost_currency)?,
         artifacts: Vec::new(),
     })
 }
@@ -1728,7 +1776,13 @@ fn response_failure(value: &Value) -> ProtocolError {
                 .and_then(Value::as_str)
         })
         .unwrap_or("OpenAI response failed");
-    ProtocolError::new(ProtocolErrorKind::Transport, message)
+    let code = value.pointer("/error/code").and_then(Value::as_str);
+    let kind = super::openai_error_kind(code, ProtocolErrorKind::Transport);
+    // Only the context code changes how AICC treats the failure.
+    ProtocolError::new(kind, message).with_provider_code(
+        code.filter(|_| kind == ProtocolErrorKind::ContextLengthExceeded)
+            .map(str::to_string),
+    )
 }
 
 fn provider_model_id(call: &CodecCall<'_>) -> ProtocolResultValue<String> {
@@ -1835,14 +1889,42 @@ fn openai_http_error(
         .and_then(|value| value.pointer("/error/message"))
         .or_else(|| value.as_ref().and_then(|value| value.get("message")))
         .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .is_none()
+                .then(|| std::str::from_utf8(body).ok())
+                .flatten()
+        })
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
         .unwrap_or("OpenAI request failed");
+    let prefix = message
+        .chars()
+        .take(32)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let message = if prefix.starts_with("<!doctype html") || prefix.starts_with("<html") {
+        "upstream returned an HTML error body (omitted)"
+    } else {
+        message
+    };
+    let redacted = crate::observability::redact(&Value::String(message.to_string()));
+    let message: String = redacted
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .take(512)
+        .collect();
     let label = provider_code
         .as_deref()
         .or(provider_type)
         .unwrap_or("http_error");
     ProtocolError::new(
-        super::protocol_error_kind_from_http_status(status),
-        format!("OpenAI {label}: {message}"),
+        super::openai_error_kind(
+            provider_code.as_deref(),
+            super::protocol_error_kind_from_http_status(status),
+        ),
+        format!("OpenAI HTTP {status} {label}: {message}"),
     )
     .with_provider_code(provider_code)
     .with_http_status(status.as_u16())
@@ -1906,7 +1988,14 @@ fn resource_data_or_url(
         return Ok(url.to_string());
     }
     match source {
-        PublicResourceRef::Url { url, .. } => Ok(url.clone()),
+        PublicResourceRef::Url { url, .. } => match call.context.materialized_resource(source) {
+            Ok(resource) => Ok(format!(
+                "data:{};base64,{}",
+                resource.mime,
+                STANDARD.encode(&resource.bytes)
+            )),
+            Err(_) => Ok(url.clone()),
+        },
         PublicResourceRef::Base64 { mime, data_base64 } => {
             STANDARD
                 .decode(data_base64)
@@ -2721,6 +2810,102 @@ fn audio_format(media_type: &str) -> ProtocolResultValue<&'static str> {
     }
 }
 
+pub(super) fn background_responses_registration() -> (OperationDescriptor, Vec<Arc<dyn NativeTaskCodec>>) {
+    let api_types = [ApiType::VisionOcr, ApiType::ImageTextToImage, ApiType::ImageImageToImage];
+    let descriptor = operation(OPENAI_RESPONSES_BACKGROUND_OPERATION_ID,
+        api_types.into_iter().map(|api_type| binding(api_type, [ExecutionMode::NativeTask],
+            [if api_type == ApiType::VisionOcr { buckyos_api::features::VISION } else { "image_generation" }])).collect(), true);
+    let codecs = api_types.into_iter().map(|api_type| Arc::new(OpenAiBackgroundResponsesCodec {
+        descriptor:descriptor.clone(),api_type,reported_cost_currency:None,
+    }) as Arc<dyn NativeTaskCodec>).collect();
+    (descriptor, codecs)
+}
+
+fn validate_response_id(id: &str) -> ProtocolResultValue<()> {
+    if id.is_empty() || id.len() > 8192 || !id.bytes().all(|byte|
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'=')) {
+        return Err(ProtocolError::invalid_response("invalid background response ID"));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct OpenAiBackgroundResponsesCodec {
+    descriptor: OperationDescriptor,
+    api_type: ApiType,
+    reported_cost_currency: Option<&'static str>,
+}
+
+#[async_trait]
+impl NativeTaskCodec for OpenAiBackgroundResponsesCodec {
+    fn descriptor(&self) -> &OperationDescriptor { &self.descriptor }
+    fn api_type(&self) -> ApiType { self.api_type }
+    fn operations(&self) -> BTreeSet<NativeTaskOperation> {
+        BTreeSet::from([NativeTaskOperation::Submit, NativeTaskOperation::Status,
+            NativeTaskOperation::Result, NativeTaskOperation::Cancel])
+    }
+    fn resource_input_form(&self) -> crate::resource::ResourceInputForm {
+        crate::resource::ResourceInputForm::UrlOrBytes
+    }
+    fn encode_native(&self, input: &NativeTaskInput<'_>) -> ProtocolResultValue<HttpRequest> {
+        if input.operation == NativeTaskOperation::Submit {
+            let codec_input = input.codec_input.ok_or_else(|| ProtocolError::invalid_request("background response requires input"))?;
+            let call = CodecCall { api_type: self.api_type, input: codec_input, context: input.context };
+            let mut body = match &codec_input.canonical_request {
+                AiccCall::VisionOcr(request) => encode_responses_ocr(request, &call)?,
+                AiccCall::ImagesGenerate(request) => encode_responses_image_generate(request, &call)?,
+                AiccCall::ImageToImage(request) => encode_responses_image_edit(request, &call)?,
+                _ => return Err(ProtocolError::invalid_request("unsupported background response input")),
+            };
+            body["background"] = json!(true);
+            body["stream"] = json!(false);
+            return json_request(&call, Method::POST, "responses", body);
+        }
+        let id = input.remote_task_id.ok_or_else(|| ProtocolError::invalid_request("background response ID is missing"))?;
+        validate_response_id(id)?;
+        let (method, suffix) = if input.operation == NativeTaskOperation::Cancel {
+            (Method::POST, "/cancel")
+        } else { (Method::GET, "") };
+        let mut request = HttpRequest::new(method, endpoint(&input.context.base_url, &format!("responses/{id}{suffix}"))?);
+        finish_request(&mut request, input.context)
+    }
+    async fn decode_native(&self, operation: NativeTaskOperation, response: HttpResponse) -> ProtocolResultValue<NativeTaskOutput> {
+        ensure_success(&response)?;
+        let value: Value = response.json(self.descriptor.max_response_bytes)?;
+        let state = match value.get("status").and_then(Value::as_str) {
+            Some("queued") => NativeTaskState::Queued,
+            Some("in_progress") => NativeTaskState::Running,
+            Some("completed") => NativeTaskState::Succeeded,
+            Some("cancelled") => NativeTaskState::Cancelled,
+            Some("failed" | "incomplete") => return Err(response_failure(&value)),
+            _ => return Err(ProtocolError::invalid_response("unknown background response status")),
+        };
+        match operation {
+            NativeTaskOperation::Submit => {
+                if value.get("background").and_then(Value::as_bool) != Some(true) {
+                    return Err(ProtocolError::new(ProtocolErrorKind::UnsupportedOperation,
+                        "Provider did not accept Responses background execution"));
+                }
+                let id = required_string(&value, "id", "background response")?;
+                validate_response_id(&id)?;
+                let mut handle = NativeTaskHandle::new(id)?;
+                handle.state = if state == NativeTaskState::Succeeded { NativeTaskState::Running } else { state };
+                handle.cancel_supported = true;
+                handle.poll_after = response.retry_after.or(Some(Duration::from_secs(1)));
+                Ok(NativeTaskOutput::Submitted(handle))
+            }
+            NativeTaskOperation::Status => Ok(NativeTaskOutput::Status {
+                state, retry_after: response.retry_after.or(Some(Duration::from_secs(1))),
+                result_ref: None, result_usage: None, result_artifacts: BTreeMap::new(),
+            }),
+            NativeTaskOperation::Result if state == NativeTaskState::Succeeded => Ok(NativeTaskOutput::Result(
+                normalize_responses_api_output(decode_response_object(&value, self.reported_cost_currency)?, self.api_type))),
+            NativeTaskOperation::Result => Err(ProtocolError::invalid_response("background response is not completed")),
+            NativeTaskOperation::Cancel => Ok(NativeTaskOutput::Cancelled { accepted: state == NativeTaskState::Cancelled }),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct OpenAiVideoCodec {
     descriptor: OperationDescriptor,
@@ -3144,6 +3329,7 @@ mod tests {
         let (descriptor, codecs) = openai_responses_adapter();
         let mut registry = CodecRegistry::default();
         registry.register_codecs(descriptor, codecs).unwrap();
+        crate::protocol::register_sn_openai_adapter(&mut registry).unwrap();
         registry
     }
 
@@ -3189,6 +3375,89 @@ mod tests {
             &BTreeMap::from([("max_output_tokens".to_string(), json!(0))]),
         )
         .is_err());
+    }
+
+    fn response_fixture(value: Value) -> HttpResponse {
+        ProtocolContractHarness::default().response(StatusCode::OK,
+            &[("content-type", "application/json")], Bytes::from(serde_json::to_vec(&value).unwrap()),
+            "response-test", UNIX_EPOCH).unwrap()
+    }
+
+    #[tokio::test]
+    async fn background_responses_cover_submit_poll_result_cancel_and_failure() {
+        let registry = registry();
+        let context = context();
+        let request = input(AiccCall::ImagesGenerate(TextToImageInvokeRequest::new("test@p", "A blue square")));
+        let parameters = &request.resolved_parameters;
+        let wire = registry.encode_native(crate::protocol::SN_OPENAI_ADAPTER_ID,
+            OPENAI_RESPONSES_BACKGROUND_OPERATION_ID, ApiType::ImageTextToImage,
+            &NativeTaskInput {operation:NativeTaskOperation::Submit,remote_task_id:None,
+                codec_input:Some(&request),resolved_parameters:parameters,context:&context}).unwrap();
+        let HttpBody::Json(body) = wire.body else { panic!("JSON expected") };
+        assert_eq!(body["background"], true);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["tools"][0]["type"], "image_generation");
+        let id = format!("resp_{}=", "x".repeat(512));
+        let NativeTaskOutput::Submitted(handle) = registry.decode_native(crate::protocol::SN_OPENAI_ADAPTER_ID,
+            OPENAI_RESPONSES_BACKGROUND_OPERATION_ID, ApiType::ImageTextToImage, NativeTaskOperation::Submit,
+            response_fixture(json!({"id":id,"status":"queued","background":true}))).await.unwrap() else {panic!("submit expected")};
+        assert_eq!(handle.state, NativeTaskState::Queued);
+        assert!(handle.cancel_supported);
+        assert!(registry.decode_native(crate::protocol::SN_OPENAI_ADAPTER_ID,
+            OPENAI_RESPONSES_BACKGROUND_OPERATION_ID,ApiType::ImageTextToImage,NativeTaskOperation::Submit,
+            response_fixture(json!({"id":id,"status":"completed","background":false}))).await.is_err());
+        for (operation, method, suffix) in [(NativeTaskOperation::Status, Method::GET, ""),
+            (NativeTaskOperation::Result, Method::GET, ""), (NativeTaskOperation::Cancel, Method::POST, "/cancel")] {
+            let wire = registry.encode_native(crate::protocol::SN_OPENAI_ADAPTER_ID, OPENAI_RESPONSES_BACKGROUND_OPERATION_ID,
+                ApiType::ImageTextToImage, &NativeTaskInput {operation, remote_task_id:Some(&id),codec_input:None,
+                    resolved_parameters:parameters,context:&context}).unwrap();
+            assert_eq!(wire.method, method);
+            assert!(wire.url.ends_with(&format!("responses/{id}{suffix}")));
+        }
+        for status in ["failed", "incomplete", "unknown"] {
+            assert!(registry.decode_native(crate::protocol::SN_OPENAI_ADAPTER_ID, OPENAI_RESPONSES_BACKGROUND_OPERATION_ID,
+                ApiType::ImageTextToImage, NativeTaskOperation::Status,
+                response_fixture(json!({"id":id,"status":status,"error":{"code":"server_error","message":"failed"}}))).await.is_err());
+        }
+        let NativeTaskOutput::Result(output) = registry.decode_native(crate::protocol::SN_OPENAI_ADAPTER_ID,
+            OPENAI_RESPONSES_BACKGROUND_OPERATION_ID, ApiType::VisionOcr, NativeTaskOperation::Result,
+            response_fixture(json!({"id":id,"status":"completed","output":[{"type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":"4827"}]}],"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}})))
+            .await.unwrap() else {panic!("result expected")};
+        assert_eq!(output.value["text"], "4827");
+        assert_eq!(output.usage.unwrap().total_tokens, Some(7));
+        assert!(matches!(registry.decode_native(crate::protocol::SN_OPENAI_ADAPTER_ID, OPENAI_RESPONSES_BACKGROUND_OPERATION_ID,
+            ApiType::VisionOcr, NativeTaskOperation::Cancel,
+            response_fixture(json!({"id":id,"status":"cancelled"}))).await.unwrap(), NativeTaskOutput::Cancelled {accepted:true}));
+        assert!(validate_response_id("../other").is_err());
+    }
+
+    #[test]
+    fn computer_observation_handshake_is_correlated_and_never_executes_effects() {
+        let screenshot = PublicResourceRef::base64("image/png".into(), "cG5n".into());
+        let context = context_with_resource(&screenshot, b"png", "image/png", None);
+        let request = input(AiccCall::ComputerUse(ComputerUseRequest::new("test@p", "Click".into(),
+            ComputerEnvironment {environment_id:"browser".into(),session_id:"s".into(),screenshot,
+                viewport:Viewport {width:1280,height:720}}, vec!["left_click".into()])));
+        let registry = registry();
+        let response = response_fixture(json!({"id":"resp_1","status":"completed","output":[
+            {"type":"computer_call","call_id":"call_1","actions":[{"type":"screenshot"}]}],
+            "usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7}}));
+        let (wire, usage) = registry.continuation_request(OPENAI_RESPONSES_ADAPTER_ID, OPENAI_RESPONSES_OPERATION_ID,
+            ApiType::AgentComputerUse, &response, &request, &context).unwrap().unwrap();
+        let HttpBody::Json(body) = wire.body else {panic!("JSON expected")};
+        assert_eq!(body["previous_response_id"], "resp_1");
+        assert_eq!(body["input"][0]["call_id"], "call_1");
+        assert_eq!(body["input"][0]["output"]["type"], "computer_screenshot");
+        assert_eq!(body["input"][0]["output"]["image_url"], "data:image/png;base64,cG5n");
+        assert_eq!(body["input"][0]["output"]["detail"], "original");
+        assert_eq!(usage.unwrap().total_tokens, Some(7));
+        let action = response_fixture(json!({"output":[{"type":"computer_call","actions":[{"type":"click","button":"left","x":640,"y":360}]}]}));
+        assert!(registry.continuation_request(OPENAI_RESPONSES_ADAPTER_ID, OPENAI_RESPONSES_OPERATION_ID,
+            ApiType::AgentComputerUse, &action, &request, &context).unwrap().is_none());
+        let invalid = response_fixture(json!({"id":"resp_1","output":[{"type":"computer_call","actions":[{"type":"screenshot"}]}]}));
+        assert!(registry.continuation_request(OPENAI_RESPONSES_ADAPTER_ID, OPENAI_RESPONSES_OPERATION_ID,
+            ApiType::AgentComputerUse, &invalid, &request, &context).is_err());
     }
 
     #[test]
@@ -3709,9 +3978,34 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(error.kind, ProtocolErrorKind::InvalidRequest);
+        assert_eq!(error.kind, ProtocolErrorKind::ContextLengthExceeded);
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
         assert_eq!(error.request_id.as_deref(), Some("request-context"));
         assert!(error.message.contains("context_length_exceeded"));
+        let public: buckyos_api::AiccError = error.into();
+        assert_eq!(
+            public.code,
+            buckyos_api::AiccErrorCode::ContextLengthExceeded
+        );
+        assert!(!public.retriable);
+
+        // A failed response event carries the same structured code.
+        let failed = response_failure(&json!({
+            "error": {"code": "context_length_exceeded", "message": "context is too long"}
+        }));
+        assert_eq!(failed.kind, ProtocolErrorKind::ContextLengthExceeded);
+        assert_eq!(
+            failed.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+        let failed = response_failure(&json!({
+            "error": {"code": "server_error", "message": "context is too long"}
+        }));
+        assert_eq!(failed.kind, ProtocolErrorKind::Transport);
+        assert_eq!(failed.provider_code, None);
 
         let numeric_error = openai_http_error(
             StatusCode::BAD_GATEWAY,
@@ -3721,6 +4015,38 @@ mod tests {
         );
         assert_eq!(numeric_error.provider_code.as_deref(), Some("502"));
         assert!(numeric_error.message.contains("502"));
+    }
+
+    #[test]
+    fn openai_http_error_keeps_status_and_bounded_redacted_plain_text() {
+        let body = format!(
+            "upstream timed out Bearer secret-value sk-123456789012345 {}",
+            "detail ".repeat(200)
+        );
+        let error = openai_http_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            body.as_bytes(),
+            "request-timeout",
+            None,
+        );
+        assert_eq!(error.kind, ProtocolErrorKind::Timeout);
+        assert_eq!(error.http_status, Some(504));
+        assert!(error.message.contains("HTTP 504 Gateway Timeout"));
+        assert!(error.message.contains("upstream timed out"));
+        assert!(!error.message.contains("secret-value"));
+        assert!(!error.message.contains("sk-123456789012345"));
+        assert!(error.message.len() < 600);
+
+        let error = openai_http_error(
+            StatusCode::BAD_GATEWAY,
+            b"<!DOCTYPE html><html>private upstream error</html>",
+            "request-html",
+            None,
+        );
+        assert!(error.message.contains("HTTP 502 Bad Gateway"));
+        assert!(error.message.contains("HTML error body (omitted)"));
+        assert!(!error.message.contains("private upstream error"));
+        assert!(!error.message.contains('<'));
     }
 
     #[tokio::test]

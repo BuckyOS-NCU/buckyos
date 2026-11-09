@@ -328,6 +328,24 @@ main[data-wallpaper='image'] .swiper-pagination-bullet-active {
   bottom: 18px !important;
 }
 
+/* Mobile: the page dots are drawn into the pager row under the launcher, laid out in flow there. */
+.desktop-mobile-pager.swiper-pagination {
+  position: static;
+  bottom: auto !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+}
+
+/* Phone launcher labels: the phone home-screen size (11px) whatever the density, which only changes the row
+   height there; four columns on a 390px phone give an 89px cell, where 11px keeps "HomeStation" on one line. */
+[data-form-factor='mobile'] {
+  --font-size-label: 11px;
+  --line-height-label: 14px;
+  --label-padding-top: 4px;
+}
+
 .desktop-scrollbar::-webkit-scrollbar,
 .shell-scrollbar::-webkit-scrollbar {
   width: 10px;

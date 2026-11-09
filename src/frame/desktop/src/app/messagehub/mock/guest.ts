@@ -10,13 +10,12 @@
  * (a partial object is merged over the seed), so e2e tests can seed or
  * change it; messages live in memory for the page.
  */
-import { RPCError, type CurrentIdentity } from 'buckyos'
+import { RPCError, type CurrentIdentity, type ndn } from 'buckyos'
 import { loadCurrentIdentity } from '../../../sso/identity'
 import { endSessionInPlace } from '../../../auth/signOut'
 import { waitForMockLatency } from '../../../runtime'
 import type { ObjectAccess } from '../conversation/history/objectAccess'
 import { groupSessionKey } from '../groupModel'
-import type { MsgObject } from '../protocol/msgobj'
 import { ObjectRouteError } from '../api/objects'
 import type { GroupSessionMemberRecord } from '../datamodel/sessionApi'
 import type { GuestApi } from '../guest/api'
@@ -31,7 +30,7 @@ const PANELS = [
   { id: 'orders', title: 'Order status', entryUrl: `${typeof window !== 'undefined' ? window.location.origin : 'http://localhost'}/messagehub/mock-panel.html` },
   { id: 'foreign', title: 'Foreign widget', entryUrl: 'https://widgets.example.net/acme' },
 ]
-const DISPLAY = { announcement: 'Support hours: 9:00–17:00 (Mon–Fri).', links: [{ title: 'Return policy', url: 'https://acme.example/returns' }], files: [], featuredMembers: [STAFF] }
+const DISPLAY = { announcement: 'Support hours: 9:00–17:00 (Mon–Fri).', links: [{ title: 'Return policy', url: 'https://acme.example/returns' }], files: [{ title: 'Return label', objId: 'cyfile:mock-doc-brief' }], featuredMembers: [STAFF] }
 
 type Participation = 'invited' | 'included' | 'removed'
 
@@ -44,7 +43,7 @@ interface MockGuestHost {
   entry: boolean
 }
 
-interface StoredMessage { seq: number; objId: string; msg: MsgObject }
+interface StoredMessage { seq: number; objId: string; msg: ndn.MsgObject }
 
 function seedHost(): MockGuestHost {
   return {
@@ -71,7 +70,7 @@ function saveHost(host: MockGuestHost) {
 }
 
 const now = Date.now()
-const groupMessage = (sessionId: string, from: string, at: number, content: MsgObject['content']): MsgObject => ({ from, to: [MOCK_SUPPORT_GROUP], kind: 'group_msg', to_session: sessionId, created_at_ms: at, content })
+const groupMessage = (sessionId: string, from: string, at: number, content: ndn.MsgObject['content']): ndn.MsgObject => ({ from, to: [MOCK_SUPPORT_GROUP], kind: 'group_msg', to_session: sessionId, created_at_ms: at, content })
 
 const messages: Record<string, StoredMessage[]> = {
   't-123': [
@@ -122,7 +121,9 @@ async function authorizeObject(objId: string, context: string | undefined) {
   const msgId = context?.slice(slash + 1)
   const host = loadHost()
   const message = sessionId ? messages[sessionId]?.find(item => item.objId === msgId) : undefined
-  const referenced = message?.msg.content.refs?.some(ref => ref.target.type === 'data_obj' && ref.target.obj_id === objId)
+  // A display file is read through the display of the Session that shows it.
+  const shown = msgId === '_display' && DISPLAY.files.some(file => file.objId === objId)
+  const referenced = shown || message?.msg.content.refs?.some(ref => ref.target.type === 'data_obj' && ref.target.obj_id === objId)
   if (!sessionId || host.participants[sessionId]?.[did] !== 'included' || !referenced) throw new Error('404 object unavailable')
 }
 

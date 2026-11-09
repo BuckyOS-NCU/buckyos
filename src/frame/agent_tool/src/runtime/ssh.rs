@@ -1,4 +1,4 @@
-use super::files::{check_allowed, FileBackend, PathType};
+use super::files::{check_allowed, FileBackend};
 use super::{shell_quote, ExecDirFacts, RuntimeInfo, SshConfig};
 use crate::llm_bash::{
     sanitize_call_id, BashRunOutput, BashRunRequest, BashRunner, BashTarget, CommandHandle,
@@ -68,7 +68,7 @@ fn probe_script(cwd: &str, env: &BTreeMap<String, String>) -> String {
     s.push_str(PROBE);
     s
 }
-pub(super) fn parse_probe(bytes: &[u8]) -> Result<Probe, XllmError> {
+pub(crate) fn parse_probe(bytes: &[u8]) -> Result<Probe, XllmError> {
     let p = bytes
         .strip_suffix(&[0])
         .unwrap_or(bytes)
@@ -269,7 +269,7 @@ impl SshTransport {
         args
     }
     pub async fn connect(config: &SshConfig) -> Result<Self, XllmError> {
-        let out = Command::new("ssh")
+        let out = buckyos_api::hide_child_console_async(&mut Command::new("ssh"))
             .args(Self::args(config, false))
             .arg("-G")
             .arg(config.host.as_ref().unwrap())
@@ -318,6 +318,7 @@ impl SshTransport {
     }
     pub async fn script(&self, script: &str, effect: bool) -> ToolResult<Vec<u8>> {
         let mut c = Command::new("ssh");
+        buckyos_api::hide_child_console_async(&mut c);
         c.args(self.connection_args(false))
             .arg(self.config.host.as_ref().unwrap())
             .arg("bash --noprofile --norc -s");
@@ -371,6 +372,7 @@ impl SshTransport {
     }
     async fn sftp(&self, batch: &str, effect: bool) -> ToolResult<()> {
         let mut c = Command::new("sftp");
+        buckyos_api::hide_child_console_async(&mut c);
         c.args(self.connection_args(true))
             .args(["-q", "-b", "-"])
             .arg(self.config.host.as_ref().unwrap());
@@ -436,7 +438,7 @@ impl SshTransport {
 
     /// Exit code and output tails of a remote execution directory, `None`
     /// when the host or the directory cannot be read.
-    pub async fn read_exec_dir(&self, dir: &str) -> Option<ExecDirFacts> {
+    pub(crate) async fn read_exec_dir(&self, dir: &str) -> Option<ExecDirFacts> {
         let q = shell_quote(dir);
         let script = format!(
             "if [ -d {q} ]; then echo DIR; else echo NODIR; exit 0; fi\nif [ -f {q}/exit ]; then cat -- {q}/exit; fi\necho '\x01'\nif [ -f {q}/stdout ]; then tail -c {n} -- {q}/stdout; fi\necho '\x01'\nif [ -f {q}/stderr ]; then tail -c {n} -- {q}/stderr; fi\n",
@@ -450,6 +452,7 @@ impl SshTransport {
                 stdout_tail: String::new(),
                 stderr_tail: String::new(),
                 exists: false,
+                started_at_ms: None,
             });
         }
         let rest = text.strip_prefix("DIR\n").unwrap_or(&text);
@@ -464,6 +467,7 @@ impl SshTransport {
             stdout_tail,
             stderr_tail,
             exists: true,
+            started_at_ms: None,
         })
     }
 }
@@ -624,31 +628,6 @@ impl FileBackend for SshTransport {
                 p = shell_quote(&path.display().to_string()),
                 t = shell_quote(&remote.display().to_string())
             ),
-            true,
-        )
-        .await?;
-        Ok(())
-    }
-    async fn path_type(&self, path: &Path) -> ToolResult<PathType> {
-        let b = self
-            .script(
-                &format!(
-                    "p={}\nif [ -d \"$p\" ]; then printf dir; elif [ -f \"$p\" ]; then printf file; elif [ -e \"$p\" ]; then printf other; else printf missing; fi\n",
-                    shell_quote(&path.display().to_string())
-                ),
-                false,
-            )
-            .await?;
-        Ok(match b.as_slice() {
-            b"dir" => PathType::Directory,
-            b"file" => PathType::File,
-            b"missing" => PathType::Missing,
-            _ => PathType::Other,
-        })
-    }
-    async fn mkdir(&self, path: &Path) -> ToolResult<()> {
-        self.script(
-            &format!("mkdir -p -- {}\n", shell_quote(&path.display().to_string())),
             true,
         )
         .await?;

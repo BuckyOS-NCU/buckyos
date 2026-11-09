@@ -34,7 +34,7 @@ pub enum NamedStoreSource {
     Dir(PathBuf),
 }
 
-/// Share module settings (notepads/share-content-mgr-tech-design-todo.md).
+/// Share module settings (notepads/done/share-content-mgr-tech-design-todo.md).
 #[derive(Debug, Clone)]
 pub struct ShareConfig {
     /// Origin of share links, e.g. `https://share.<zone>`; links are `<base>/s/{token}`.
@@ -102,6 +102,18 @@ pub struct ServerConfig {
     pub named_store: NamedStoreSource,
     pub share: ShareConfig,
     pub ndm: NdmConfig,
+    /// Standalone: what each app declares (`--bucket-specs`); service mode reads app specs.
+    pub bucket_specs: std::collections::HashMap<String, crate::bucket::spec::AppBuckets>,
+    /// The GC host may evict class-0 named-store objects (off until every writer retains).
+    pub gc_evict: bool,
+    /// Total size the preview cache keeps (least recently used results go first).
+    pub preview_cache_mib: u64,
+    /// Where to look for ffmpeg/ffprobe instead of the standard search (tests).
+    pub preview_tool_dirs: Option<Vec<PathBuf>>,
+    /// All anonymous `/ndn/` responses together; 0 turns the limit off.
+    pub ndn_anonymous_bytes_per_sec: u64,
+    /// What one app may keep in the `public-cache` bucket.
+    pub public_cache_app_bytes: u64,
 }
 
 impl ServerConfig {
@@ -121,6 +133,12 @@ impl ServerConfig {
             named_store: NamedStoreSource::None,
             share: ShareConfig::default(),
             ndm: NdmConfig::default(),
+            bucket_specs: Default::default(),
+            gc_evict: false,
+            preview_cache_mib: buckyos_api::NfsServerSettings::default().preview_cache_mib,
+            preview_tool_dirs: None,
+            ndn_anonymous_bytes_per_sec: buckyos_api::NfsServerSettings::default().ndn_anonymous_bytes_per_sec,
+            public_cache_app_bytes: buckyos_api::NfsServerSettings::default().public_cache_app_mib * 1024 * 1024,
         }
     }
 

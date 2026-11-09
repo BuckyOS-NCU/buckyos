@@ -20,7 +20,7 @@ use std::sync::Arc;
 pub(crate) const AICC_SETTINGS_KEY: &str = "services/aicc/settings";
 pub(crate) const SYSTEM_CONFIG_METADATA_KEY: &str = "services/aicc/driver_metadata";
 pub(crate) const LOCAL_METADATA_RELATIVE_DIR: &str = "etc/aicc/driver_metadata/local";
-pub(crate) const BUILTIN_CATALOG_REVISION_SEQ: u64 = 16;
+pub(crate) const BUILTIN_CATALOG_REVISION_SEQ: u64 = 21;
 const SYSTEM_CONFIG_METADATA_SCHEMA_VERSION: u32 = 1;
 
 include!(concat!(env!("OUT_DIR"), "/builtin_metadata.rs"));
@@ -332,10 +332,12 @@ pub(crate) trait MetadataOverrideLoader: Send + Sync {
     async fn load(&self) -> Result<MetadataOverrideSnapshot, SettingsError>;
 }
 
+#[cfg(test)]
 pub(crate) struct StaticMetadataOverrideLoader {
     snapshot: MetadataOverrideSnapshot,
 }
 
+#[cfg(test)]
 impl StaticMetadataOverrideLoader {
     pub(crate) fn new(local: Vec<MetadataFile>, system_config: Vec<MetadataFile>) -> Self {
         Self {
@@ -348,6 +350,7 @@ impl StaticMetadataOverrideLoader {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl MetadataOverrideLoader for StaticMetadataOverrideLoader {
     async fn load(&self) -> Result<MetadataOverrideSnapshot, SettingsError> {
@@ -371,6 +374,7 @@ impl ProductionMetadataOverrideLoader {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn local_root(&self) -> &Path {
         &self.local_root
     }

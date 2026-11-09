@@ -2,7 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use buckyos_api::{
-    AgentPermissionMode, AgentSpec, AppType, MailboxAddress, MailboxKind, SelectorType,
+    rbac_literal, AgentPermissionMode, AgentSpec, AppType, MailboxAddress, MailboxKind,
+    SelectorType,
 };
 use log::*;
 use package_lib::PackageId;
@@ -15,17 +16,17 @@ use crate::service::*;
 use crate::system_config_builder::{
     derive_sn_ai_provider_endpoints, reconcile_managed_sn_ai_provider,
 };
-use crate::zone_route_builder::{build_forward_plan, DidIpHint, NodeGatewayRouteCandidate};
+use crate::zone_route_builder::{
+    build_forward_plan, cross_zone_relay_url, DidIpHint, NodeGatewayRouteCandidate,
+};
 use buckyos_api::{
-    app_availability_policy_key, get_buckyos_api_runtime, zone_document_hostname,
-    AppAvailabilityGroupRule, AppAvailabilityPolicy, AppId, AppInstanceId, AppRegistry,
+    app_availability_policy_key, get_buckyos_api_runtime, zone_document_hostname, AppAvailabilityPolicy, AppId, AppInstanceId, AppRegistry,
     AppServiceSpec, AvailabilityEffect, KernelServiceSpec, NodeConfig,
     SchedulerRefreshRbacResponse, ServiceInstanceReportInfo, ServiceState, SystemConfigClient,
     UserSettings, UserState, UserType as ApiUserType, ZoneConfig, ZoneGatewaySettings,
     validate_user_group_id, USER_GROUPS_CONFIG_PREFIX, USER_GROUP_REF_PREFIX, APP_REGISTRY_KEY, CONTROL_PANEL_SERVICE_PORT, NFS_SERVER_SERVICE_NAME,
 };
 use buckyos_kit::*;
-use name_client::*;
 use name_lib::{get_x_from_jwk, DeviceInfo, ZoneDocument};
 
 const SYSTEM_CONFIG_SERVICE_PORT: u16 = 3200;
@@ -94,23 +95,13 @@ fn create_service_spec_by_app_config(
         .then(|| buckyos_api::native_agent_node(input_config, owner_user_id, &app_config.app_id()))
         .flatten();
 
-    let mut need_container = is_agent && native_node.is_none();
-    if !is_agent {
-        need_container = true;
-        if app_config
-            .app_doc
-            .pkg_list
-            .iter()
-            .into_iter()
-            .any(|(_, pkg)| pkg.docker_image_name.is_none())
-            && matches!(
-                app_config.app_doc.author.to_string().as_str(),
-                "did:web:buckyos.ai" | "did:web:buckyos.io" | "did:web:buckyos.org"
-            )
-        {
-            need_container = false;
-        }
-    }
+    // An App with a script package runs in a container or natively,
+    // whichever its node offers (`app_run_mode`); any other App needs one.
+    let need_container = if is_agent {
+        native_node.is_none()
+    } else {
+        app_config.app_doc.pkg_list.script.is_none()
+    };
 
     let service_ports_config = app_config.spec_config.to_service_ports_config();
     ServiceSpec {
@@ -171,7 +162,6 @@ pub fn create_scheduler_by_system_config(
                 error!("serde_json::from_str failed: {:?}", e);
                 e
             })?;
-            let node_item = craete_node_item_by_device_info(device_name, &device_info);
             let node_item = craete_node_item_by_device_info(device_name, &device_info);
             device_list.insert(device_name.to_string(), device_info);
             scheduler_ctx.add_node(node_item);
@@ -348,7 +338,6 @@ pub(crate) fn schedule_action_to_tx_actions(
     device_list: &HashMap<String, DeviceInfo>,
     input_config: &HashMap<String, String>,
     need_update_gateway_node_list: &mut HashSet<String>,
-    need_update_rbac: &mut bool,
 ) -> Result<HashMap<String, KVAction>> {
     let mut result = HashMap::new();
     let zone_config = input_config.get("boot/config");
@@ -357,8 +346,7 @@ pub(crate) fn schedule_action_to_tx_actions(
     }
     let zone_config = zone_config.unwrap();
     let zone_config: ZoneConfig = serde_json::from_str(zone_config.as_str())?;
-    let zone_document = zone_config.zone_document()?;
-    let zone_gateway = zone_document.get_default_zone_gateway();
+    zone_config.zone_document()?;
     match action {
         SchedulerAction::ChangeNodeStatus(node_id, node_status) => {
             let key = format!("nodes/{}/config", node_id);
@@ -391,10 +379,6 @@ pub(crate) fn schedule_action_to_tx_actions(
                 }
             }
         }
-        SchedulerAction::CreateOPTask(_new_op_task) => {
-            //TODO:
-            unimplemented!();
-        }
         SchedulerAction::InstanceReplica(new_instance) => {
             //最复杂的流程,需要根据pod的类型,来执行实例化操作
             let service_spec = scheduler_ctx.get_service_spec(new_instance.spec_id.as_str());
@@ -422,12 +406,8 @@ pub(crate) fn schedule_action_to_tx_actions(
                     let service_config = service_config.unwrap();
                     let service_config: KernelServiceSpec =
                         serde_json::from_str(service_config.as_str())?;
-                    let is_zone_gateway = zone_gateway
-                        .as_ref()
-                        .map(|gw| gw == &new_instance.node_id)
-                        .unwrap_or(false);
                     let instance_action =
-                        instance_service(new_instance, &service_config, is_zone_gateway)?;
+                        instance_service(new_instance, &service_config)?;
                     info!("will instance service pod: {}", new_instance.spec_id);
                     result.extend(instance_action);
                 }
@@ -502,7 +482,7 @@ pub(crate) fn schedule_action_to_tx_actions(
                 return Ok(result);
             }
             let update_action =
-                update_service_info(spec_id.as_str(), service_info, device_list, &input_config)?;
+                update_service_info(spec_id.as_str(), service_info, device_list)?;
             info!("will update service info: {}", spec_id);
             result.extend(update_action);
         }
@@ -518,20 +498,6 @@ pub fn get_spec_id_from_service_info_id(service_info_id: &str) -> (String, Strin
         return (service_info_id.to_string(), "www".to_string());
     }
     (spec_id.to_string(), service_name.to_string())
-}
-
-pub fn get_service_spec_by_spec_id(
-    spec_id: &str,
-    input_system_config: &HashMap<String, String>,
-) -> Result<ServiceSpec> {
-    let key = format!("services/{}/spec", spec_id);
-    let service_spec = input_system_config.get(&key);
-    if service_spec.is_none() {
-        return Err(anyhow::anyhow!("service_spec not found"));
-    }
-    let service_spec = service_spec.unwrap();
-    let service_spec: ServiceSpec = serde_json::from_str(service_spec.as_str())?;
-    Ok(service_spec)
 }
 
 pub fn get_appid_and_userid_from_spec_id(spec_id: &str) -> Result<(String, String)> {
@@ -601,8 +567,13 @@ fn reconcile_app_instance_specs(
                 .to_node_execution_spec()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             // An Agent's run mode follows its owner's runtime choice
-            // (native on the node of its host-native default runtime).
-            let desired_run_mode = crate::app::app_run_mode(node_id, &desired_spec, input_system_config);
+            // (native on the node of its host-native default runtime); an
+            // App keeps the one its node gave it when placed.
+            let desired_run_mode = if desired_spec.app_doc.get_app_type() == AppType::Agent {
+                crate::app::agent_run_mode(node_id, &desired_spec, input_system_config)
+            } else {
+                instance_config.run_mode
+            };
             if instance_config.run_mode != desired_run_mode {
                 set_paths.insert(
                     format!("/apps/{instance_id}/run_mode"),
@@ -783,6 +754,7 @@ impl Default for NodeGatewayAccessMode {
 struct NodeGatewayNodeInfo {
     this_node_id: String,
     this_zone_host: String,
+    cross_zone_relay: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1165,6 +1137,7 @@ pub(crate) async fn update_node_gateway_info(
         node_info: NodeGatewayNodeInfo {
             this_node_id: node_id.to_string(),
             this_zone_host: zone_host.clone(),
+            cross_zone_relay: cross_zone_relay_url(node_id, &zone_config, &zone_host, &device_list),
         },
         app_info: HashMap::new(),
         service_info: HashMap::new(),
@@ -1263,15 +1236,18 @@ pub(crate) async fn update_node_gateway_info(
                 }
             } else if spec_id == NFS_SERVER_SERVICE_NAME {
                 // `share.<zone>/s/{token}`: share links served by nfs-server (its own
-                // origin, apart from the Desktop), see notepads/share-content-mgr-tech-design-todo.md.
+                // origin, apart from the Desktop), see notepads/done/share-content-mgr-tech-design-todo.md.
+                // `s3.<zone>`: the S3 compatible endpoint of application object buckets.
                 if let Some(selector) = selector.as_ref() {
-                    node_gateway_info.app_info.insert(
-                        "share".to_string(),
-                        NodeGatewayAppEntry::Service(NodeGatewayAppServiceInfoEntry {
-                            service_id: spec_id.clone(),
-                            selector: selector.clone(),
-                        }),
-                    );
+                    for host in ["share", "s3"] {
+                        node_gateway_info.app_info.insert(
+                            host.to_string(),
+                            NodeGatewayAppEntry::Service(NodeGatewayAppServiceInfoEntry {
+                                service_id: spec_id.clone(),
+                                selector: selector.clone(),
+                            }),
+                        );
+                    }
                 }
             }
         }
@@ -1406,6 +1382,14 @@ pub(crate) async fn update_node_gateway_infos(
     Ok(result)
 }
 
+/// The SN a node obtains its zone certificates through (DNS-01): the Zone's relay SN,
+/// else the SN the device publishes its address to (`wan_dyn`: DDNS without relay).
+fn node_sn_api_url(zone_sn: Option<&str>, ddns_sn_url: Option<&str>) -> Option<String> {
+    zone_sn
+        .map(|sn_host| format!("https://{}/kapi/sn", sn_host))
+        .or_else(|| ddns_sn_url.map(str::to_string))
+}
+
 pub(crate) async fn update_node_gateway_config(
     need_update_gateway_node_list: &HashSet<String>,
     input_system_config: &HashMap<String, String>,
@@ -1418,14 +1402,14 @@ pub(crate) async fn update_node_gateway_config(
     for node_id in need_update_gateway_node_list.iter() {
         let mut node_gateway_json = json!({});
 
-        if let Some(sn_host) = zone_config.sn.as_ref() {
+        let device_info = device_list.get(node_id);
+        let ddns_sn_url = device_info.and_then(|d| d.device_doc.ddns_sn_url.as_deref());
+        if let Some(sn_url) = node_sn_api_url(zone_config.sn.as_deref(), ddns_sn_url) {
             info!("SN enabled, add acme/tls stack for node {}", node_id);
-            let device_info = device_list
-                .get(node_id)
-                .ok_or_else(|| anyhow::anyhow!("device info {} not found", node_id))?;
+            let device_info =
+                device_info.ok_or_else(|| anyhow::anyhow!("device info {} not found", node_id))?;
             let identity_paths = buckyos_api::device_identity_paths(&device_info.device_doc.id)
                 .map_err(|err| anyhow::anyhow!("build device identity paths failed: {}", err))?;
-            let sn_url = format!("https://{}/kapi/sn", sn_host);
             let zone_hostname = zone_document_hostname(&zone_config);
             let wildcard_zone_domain = format!("*.{}", zone_hostname);
             node_gateway_json = json!({
@@ -1587,7 +1571,7 @@ async fn update_rbac(
         }
     }
 
-    for (spec_id, service_spec) in scheduler_ctx.specs.iter() {
+    for service_spec in scheduler_ctx.specs.values() {
         match service_spec.spec_type {
             ServiceSpecType::App => {
                 if !read_only_apps
@@ -1613,6 +1597,26 @@ async fn update_rbac(
                 );
             }
         }
+    }
+
+    // A static web app has no service spec but acts as its app all the same
+    // (its own settings, uploads and buckets).
+    match get_web_app_list(input_config) {
+        Ok(web_apps) => {
+            let mut lines = web_apps
+                .iter()
+                .filter(|app| !read_only_apps.iter().any(|id| id.as_str() == app.app_id().as_str()))
+                .map(|app| format!("g, app:{}, app", app.app_id().as_str()))
+                .collect::<Vec<_>>();
+            lines.sort();
+            lines.dedup();
+            for line in lines {
+                if !rbac_policy.lines().any(|l| l == line) {
+                    push_policy_line(&mut rbac_policy, line);
+                }
+            }
+        }
+        Err(error) => warn!("web apps left out of the app group: {error}"),
     }
 
     for agent_spec in &agent_specs {
@@ -1642,6 +1646,13 @@ async fn update_rbac(
             rbac_literal(&agent_spec.binding.target_app_instance_id.to_string());
         let mailbox = MailboxAddress::new(agent_spec.agent_did.clone(), None)
             .map_err(anyhow::Error::msg)?;
+        let agent_host = rbac_literal(&agent_spec.agent_did.to_host_name());
+        for resource in [format!("obj://{agent_host}"), format!("obj://{agent_host}/*")] {
+            push_policy_line(
+                &mut rbac_policy,
+                format!("p, {owner}, {resource},read|list|query|subscribe,allow"),
+            );
+        }
         for subject in [&runtime_subject, &agent_subject] {
             for key in ["settings", "profile", "spec", "info"] {
                 push_policy_line(
@@ -1666,10 +1677,23 @@ async fn update_rbac(
             }
             push_policy_line(
                 &mut rbac_policy,
-                format!("p, {subject}, {},read|write,allow", mailbox.owner_resource()),
+                format!(
+                    "p, {subject}, {},read|write,allow",
+                    rbac_literal(&mailbox.owner_resource())
+                ),
             );
+            push_policy_line(
+                &mut rbac_policy,
+                format!(
+                    "p, {subject}, {}/*,read|write,allow",
+                    rbac_literal(&mailbox.owner_resource())
+                ),
+            );
+            for resource in [format!("obj://{agent_host}"), format!("obj://{agent_host}/*")] {
+                push_policy_line(&mut rbac_policy, format!("p, {subject}, {resource},all,allow"));
+            }
             for kind in [MailboxKind::Inbox, MailboxKind::Sent, MailboxKind::RequestBox] {
-                let resource = mailbox.resource(kind);
+                let resource = rbac_literal(&mailbox.resource(kind));
                 for resource in [resource.clone(), format!("{resource}/*")] {
                     push_policy_line(
                         &mut rbac_policy,
@@ -1715,15 +1739,20 @@ pub(crate) async fn update_rbac_for_test(
         .unwrap()
 }
 
-fn rbac_literal(value: &str) -> String {
-    let mut escaped = String::new();
-    for ch in value.chars() {
-        if "\\.^$|?*+()[]{}".contains(ch) {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
+#[cfg(test)]
+mod node_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn a_zone_without_relay_gets_certificates_through_its_ddns_sn() {
+        let ddns = Some("https://sn.devtests.org/kapi/sn");
+        assert_eq!(
+            node_sn_api_url(Some("sn.devtests.org"), None).as_deref(),
+            Some("https://sn.devtests.org/kapi/sn")
+        );
+        assert_eq!(node_sn_api_url(None, ddns).as_deref(), ddns);
+        assert_eq!(node_sn_api_url(None, None), None);
     }
-    escaped
 }
 
 #[cfg(test)]
@@ -2082,6 +2111,9 @@ fn validate_beta22_app_state(input: &HashMap<String, String>) -> Result<()> {
         "sys".to_string(),
         "homestation".to_string(),
         "share".to_string(),
+        "s3".to_string(),
+        // every AI Workspace's own origin folds onto this entry (`aiws-<id>.<zone>`)
+        "aiws".to_string(),
     ]);
     if let Some(raw) = input.get("services/gateway/settings") {
         let settings: ZoneGatewaySettings = serde_json::from_str(raw)?;
@@ -2199,6 +2231,22 @@ pub(crate) mod app_lifecycle_tests {
         }
     }
 
+    #[tokio::test]
+    async fn static_web_apps_act_as_their_app_in_rbac() {
+        let mut spec = app_spec();
+        spec.app_doc.selector_type = SelectorType::Static;
+        let input = HashMap::from([(
+            buckyos_api::user_app_spec_key("alice", spec.app_id()),
+            serde_json::to_string(&spec).unwrap(),
+        )]);
+        let actions = update_rbac_for_test(&input).await;
+        let Some(KVAction::Update(policy)) = actions.get("system/rbac/policy") else {
+            panic!("RBAC policy should be generated");
+        };
+        let line = format!("g, app:{}, app", spec.app_id().as_str());
+        assert_eq!(policy.lines().filter(|l| *l == line).count(), 1, "{policy}");
+    }
+
     fn input_with_instance(
         spec: &AppServiceSpec,
         target_state: ServiceInstanceState,
@@ -2300,6 +2348,7 @@ pub(crate) mod app_lifecycle_tests {
                         computer: ComputerAccess::None,
                         target: AgentRuntimeTarget::Node { node_id: "node1".into(), node_did: device.id.to_string() },
                         baseline: None,
+                        grant: None,
                     },
                 )]),
                 default_runtime_id: default.map(str::to_string),
@@ -2361,6 +2410,70 @@ pub(crate) mod app_lifecycle_tests {
             apply_node_actions(&mut input, actions);
             let node: NodeConfig = serde_json::from_str(&input["nodes/node1/config"]).unwrap();
             assert_eq!(node.apps[&app_instance_id].run_mode, AppRunMode::Container);
+        }
+    }
+
+    /// An App with a script package needs no container: on a node with a
+    /// container runtime its instance runs in a container, on one without
+    /// natively, and it keeps that run mode once placed.
+    #[test]
+    fn a_script_app_runs_in_a_container_where_its_node_has_one_else_natively() {
+        use buckyos_api::AppRunMode;
+        for node_has_containers in [true, false] {
+            let mut spec = app_spec();
+            let owner = DID::new("bns", "alice");
+            spec.app_doc = AppDoc::builder(AppType::AppService, "notes", "0.1.2", "alice", &owner)
+                .script_pkg(
+                    SubPkgDesc::new("all.script.notes.alice.bns.did#0.1.2")
+                        .package_meta_object_id(ndn_lib::ObjId::new_by_raw("pkg".into(), vec![3; 32])),
+                )
+                .service_port("www", 3000)
+                .build()
+                .unwrap();
+            assert_eq!(spec.app_doc.app_did(), &spec.app_did);
+            spec.deployment.app_doc_object_id = spec.app_doc.gen_obj_id().0;
+            spec.state = ServiceState::New;
+            let mut doc = DeviceDocument::new("node1", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into());
+            doc.support_container = node_has_containers;
+            let mut device = DeviceInfo::from_device_doc(&doc);
+            device.arch = "amd64".into();
+            let mut input = HashMap::from([
+                ("devices/node1/info".to_string(), serde_json::to_string(&device).unwrap()),
+                (buckyos_api::user_app_spec_key("alice", spec.app_id()), serde_json::to_string(&spec).unwrap()),
+                (
+                    "nodes/node1/config".to_string(),
+                    json!({"node_id": "node1", "node_did": device.id, "kernel": {}, "frame_services": {},
+                           "state": buckyos_api::NodeState::Running, "apps": {}})
+                    .to_string(),
+                ),
+            ]);
+            let (mut scheduler, devices) = create_scheduler_by_system_config(&input).unwrap();
+            let app_id = spec.app_instance_id.to_string();
+            assert!(!scheduler.get_service_spec(&app_id).unwrap().need_container);
+            let actions = scheduler.schedule(None).unwrap();
+            let instance = actions
+                .iter()
+                .find_map(|a| match a {
+                    SchedulerAction::InstanceReplica(i) => Some(i.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no placement (containers={node_has_containers}): {actions:?}"));
+            assert_eq!(instance.node_id, "node1");
+            let node_actions = instance_app_service(&instance, &devices, &input).unwrap();
+            let Some(KVAction::SetByJsonPath(paths)) = node_actions.get("nodes/node1/config") else {
+                panic!("no node config action")
+            };
+            let mut config: Value = serde_json::from_str(&input["nodes/node1/config"]).unwrap();
+            config["apps"][&app_id] = paths[&format!("/apps/{app_id}")].clone().unwrap();
+            input.insert("nodes/node1/config".into(), config.to_string());
+            let node: NodeConfig = serde_json::from_str(&input["nodes/node1/config"]).unwrap();
+            let expected = if node_has_containers {
+                AppRunMode::Container
+            } else {
+                AppRunMode::Native
+            };
+            assert_eq!(node.apps[&spec.app_instance_id].run_mode, expected);
+            assert!(reconcile_app_instance_specs(&input).unwrap().0.is_empty(), "stable");
         }
     }
 
@@ -2470,6 +2583,7 @@ pub(crate) mod app_lifecycle_tests {
 #[cfg(test)]
 mod beta22_state_tests {
     use super::*;
+    use buckyos_api::AppAvailabilityGroupRule;
 
     #[test]
     fn missing_registry_fails_closed() {
@@ -2706,7 +2820,6 @@ pub(crate) async fn build_schedule_plan(
             &device_list,
             input_system_config,
             &mut need_update_gateway_node_list,
-            &mut need_update_rbac,
         )?;
         extend_kv_action_map(&mut tx_actions, &new_tx_actions);
     }
@@ -2742,6 +2855,10 @@ pub(crate) async fn build_schedule_plan(
         if executor_changed {
             need_update_rbac = true;
         }
+        extend_kv_action_map(
+            &mut tx_actions,
+            &crate::ext_tools_projection::update_ext_tools_projection(input_system_config),
+        );
     }
 
     if need_update_rbac {

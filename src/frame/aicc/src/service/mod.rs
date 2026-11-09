@@ -11,8 +11,8 @@ mod settings_runtime;
 mod video_materials;
 
 use events::AiccEventLog;
-use inference::{inference_error, next_inference_id, now_ms, AuthenticatedResourceAuthorizer};
 pub(crate) use identity::{RuntimeAuthorizer, SystemConfigUserDirectory, UserDirectory};
+use inference::{inference_error, next_inference_id, now_ms, AuthenticatedResourceAuthorizer};
 pub(crate) use inference::{
     DriverMetadataPort, ProviderValidator, RuntimeInferencePort, UsageQueryPort,
 };
@@ -46,7 +46,7 @@ use buckyos_api::{
     ImageUpscaleRequest, ImageUpscaleResponse, ListModelsRequest, LlmChatHelperRequest,
     LlmChatInvokeRequest, LlmChatInvokeResponse, ProtocolAdapterListRequest,
     ProtocolAdapterListResponse, ProviderAddRequest, ProviderAddResponse, ProviderAuthSettings,
-    ProviderCatalogRequest, ProviderCatalogResponse, ProviderCredential,
+    ProviderRulesPreviewRequest, ProviderRulesPreviewResponse, ProviderCatalogRequest, ProviderCatalogResponse, ProviderCredential,
     ProviderCredentialKind as ApiProviderCredentialKind, ProviderCredentials,
     ProviderDeleteRequest, ProviderDeleteResponse, ProviderDiscoverySettings,
     ProviderHealthRequest, ProviderHealthResponse, ProviderInstanceAuthMode,
@@ -56,22 +56,22 @@ use buckyos_api::{
     ProviderRefreshModelsResponse, ProviderReloadResult, ProviderUpdateRequest,
     ProviderUpdateResponse, ProviderValidateRequest, ProviderValidateResponse,
     QueryRouteTraceRequest, QueryRouteTraceResponse, QueryUsageRequest, QueryUsageResponse,
-    QuotaState, RequestControlResult,
-    RequestDelegatedControlReq, RerankRequest, RerankResponse, ResourceRef, RouteFallbackAttempt,
-    RouteResolveRequest, RouteResolveResponse, RouteTrace, RoutingGetRequest, RoutingGetResponse,
-    RoutingPreviewEntry, RoutingPreviewRequest, RoutingPreviewResponse, RoutingUpdateRequest,
-    RoutingUpdateResponse, RunnerWriteEnvelope, ServiceReloadSettingsRequest,
-    ServiceReloadSettingsResponse, SystemConfigClient, SystemConfigError, TaskControlAction,
-    TaskExecutor, TaskManagerClient, TextToImageHelperRequest, TextToImageInvokeRequest,
-    TextToImageInvokeResponse, VideoEditRequest, VideoEditResponse, VideoExtendRequest,
-    VideoExtendResponse, VideoGenerateHelperRequest, VideoGenerateRequest, VideoGenerateResponse,
-    VideoUpscaleRequest, VideoUpscaleResponse, VisionCaptionRequest, VisionCaptionResponse,
-    VisionDetectRequest, VisionDetectResponse, VisionOcrRequest, VisionOcrResponse,
-    VisionSegmentRequest, VisionSegmentResponse, AICC_COMPUTE_TASK_SCHEMA_ID,
+    QuotaState, RequestControlResult, RequestDelegatedControlReq, RerankRequest, RerankResponse,
+    ResourceRef, RouteFallbackAttempt, RouteResolveRequest, RouteResolveResponse, RouteTrace,
+    RoutingGetRequest, RoutingGetResponse, RoutingPreviewEntry, RoutingPreviewRequest,
+    RoutingPreviewResponse, RoutingUpdateRequest, RoutingUpdateResponse, RunnerWriteEnvelope,
+    ServiceReloadSettingsRequest, ServiceReloadSettingsResponse, SystemConfigClient,
+    SystemConfigError, TaskControlAction, TaskExecutor, TaskManagerClient,
+    TextToImageHelperRequest, TextToImageInvokeRequest, TextToImageInvokeResponse,
+    VideoEditRequest, VideoEditResponse, VideoExtendRequest, VideoExtendResponse,
+    VideoGenerateHelperRequest, VideoGenerateRequest, VideoGenerateResponse, VideoUpscaleRequest,
+    VideoUpscaleResponse, VisionCaptionRequest, VisionCaptionResponse, VisionDetectRequest,
+    VisionDetectResponse, VisionOcrRequest, VisionOcrResponse, VisionSegmentRequest,
+    VisionSegmentResponse, AICC_COMPUTE_TASK_SCHEMA_ID,
 };
 use buckyos_http_server::{
-    serve_http_by_rpc_handler, server_err, HttpServer, Runner, ServerError, ServerErrorCode,
-    ServerResult, StreamInfo,
+    serve_http_by_rpc_handler_with_limit, server_err, HttpServer, Runner, ServerError,
+    ServerErrorCode, ServerResult, StreamInfo,
 };
 use buckyos_kit::KVAction;
 use bytes::Bytes;
@@ -92,24 +92,26 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::call::{
     CallResolver, PricingSource as CallPricingSource, ProviderCallTarget, ResolvedPricing,
-    ResolvedProviderCall,
+    ResolvedProviderCall, ResourceRequirement,
 };
 use crate::catalog::CatalogSnapshot;
 use crate::error::{NativeTaskResumeError, QuotaSourceError, ResourceError, RuntimeError};
 use crate::execution::{
     task_result_payload, ExecutionEngine, ExecutionOutput, ExecutionState, NativeTaskPoll,
-    NativeTaskResumeDescriptor, PinnedProviderTask, ProviderExecution, ProviderExecutionPort,
-    ProviderStartFailure, ResumeCredential, ResumeCredentialKind, TaskBinding, TaskManagerPort,
-    TaskSpec,
+    NativeTaskResumeDescriptor, NativeTaskUrlFallback, NativeTaskUrlFallbackTarget,
+    PinnedProviderTask, ProviderExecution, ProviderExecutionPort, ProviderStartFailure,
+    ResumeCredential, ResumeCredentialKind, TaskBinding, TaskManagerPort, TaskRequestView,
+    TaskSpec, task_request_view,
 };
 use crate::health::{HealthFailureKind, ModelHealthRegistry};
 #[cfg(test)]
 use crate::model::{ModelRegistry, ProviderInventory as ModelProviderInventory, RegistryLayers};
 use crate::protocol::{
-    AdapterStatus, CodecContext, CodecLimits, CodecRegistry, CredentialKind, ExecutionMode,
-    HttpTransport, HttpTransportConfig, MaterializedResource as CodecMaterializedResource,
-    NativeTaskInput, NativeTaskOperation, NativeTaskOutput, ProtocolError, ProtocolErrorKind,
-    ProtocolEvent, ProtocolOutput, ProtocolStream,
+    AdapterStatus, CodecContext, CodecInput, CodecLimits, CodecRegistry, CredentialKind,
+    ExecutionMode, HttpTransport, HttpTransportConfig,
+    MaterializedResource as CodecMaterializedResource, NativeTaskHandle, NativeTaskInput,
+    NativeTaskOperation, NativeTaskOutput, ProtocolError, ProtocolErrorKind, ProtocolEvent,
+    ProtocolOutput, ProtocolStream,
 };
 use crate::provider::{
     builtin_provider_codecs, builtin_provider_registry, resolve_sn_provider_instance_with_config,
@@ -121,7 +123,7 @@ use crate::provider::{
 };
 use crate::resource::MaterializedResource as RawMaterializedResource;
 use crate::resource::{
-    ArtifactSpec, DisabledNamedObjectUrlProvider, EmbeddingArtifactMetadata,
+    ArtifactSpec, DisabledNamedObjectUrlProvider, EmbeddingArtifactMetadata, FetchedResource,
     NamedDataMgrResourceStore, NamedObjectUrlProvider, ReqwestUrlResourceFetcher,
     ResourceAccessContext, ResourceAccessOperation, ResourceAuthorizer, ResourceFailure,
     ResourceInputForm, ResourceLimits, ResourceManager, ResourceStore, ResourceTarget,
@@ -129,7 +131,6 @@ use crate::resource::{
 };
 use crate::routing::policy::{
     CredentialScope, ProviderPrivacy, ProviderTrustLevel, ProviderTrustView, ProviderType,
-    ProviderTypeSource,
 };
 use crate::routing::{
     policy_engine_for_route, CallerIdentity, CandidateRuntimeState, ProviderHealthStatus,
@@ -161,6 +162,18 @@ const RESOURCE_SETTINGS: &str = "obj://config/services/aicc/settings";
 const CLOUD_UPDATE_CONFIG_KEY: &str = "services/aicc/driver_metadata_update";
 const ARTIFACT_OPEN_PATH: &str = "/kapi/aicc/artifact/open";
 const MAX_ARTIFACT_OPEN_REQUEST_BYTES: usize = 32 * 1024;
+/// kRPC request body limit of the AICC service itself. The shared default
+/// (`buckyos_http_server::DEFAULT_MAX_RPC_BODY_SIZE`, 1 MiB) is too small for
+/// an LLM request carrying a long tool-using context (~200k estimated tokens
+/// already exceed 1 MiB) or inline media. 32 MiB matches the per-request
+/// ceilings of the upstream providers and sits below the resource layer's
+/// inline totals (`ResourceLimits`: 4 MiB per inline resource, 16 resources).
+/// The body is buffered before the kRPC token inside it is checked, so
+/// concurrency × 32 MiB bounds the memory a caller can pin; AICC is only
+/// reachable inside the Zone, so no admission control is added here.
+/// Results reported to TaskMgr still obey TaskMgr's 1 MiB limit, see
+/// `MAX_TASK_RESULT_PAYLOAD_BYTES` in `execution`.
+pub(crate) const AICC_MAX_RPC_BODY_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -341,7 +354,13 @@ impl HttpServer for AiccHttpServer {
             return self.open_artifact(request).await;
         }
         if request.method() == Method::POST {
-            return serve_http_by_rpc_handler(request, info, self).await;
+            return serve_http_by_rpc_handler_with_limit(
+                request,
+                info,
+                self,
+                AICC_MAX_RPC_BODY_SIZE,
+            )
+            .await;
         }
         Err(server_err!(
             ServerErrorCode::BadRequest,
@@ -503,7 +522,7 @@ pub(crate) async fn run_service() -> anyhow::Result<()> {
     let url_fetcher: Arc<dyn UrlResourceFetcher> =
         Arc::new(ReqwestUrlResourceFetcher::new().context("initialize AICC URL resource fetcher")?);
     let service_runtime: Arc<dyn ServiceRuntime> =
-        Arc::new(RuntimeServiceAdapter::new(runtime.clone(), codecs.clone()));
+        Arc::new(RuntimeServiceAdapter::new(runtime.clone(), codecs.clone(), storage.clone()));
     let model_health = Arc::new(ModelHealthRegistry::default());
     let provider_execution = Arc::new(RuntimeProviderExecutionPort::new(
         runtime.clone(),
@@ -542,6 +561,7 @@ pub(crate) async fn run_service() -> anyhow::Result<()> {
         storage.clone(),
         resource_store,
         url_fetcher,
+        provider_execution.clone(),
         model_health,
         quota_service.clone(),
     ));
@@ -660,6 +680,7 @@ pub(crate) struct RuntimeAdminSnapshot {
 #[async_trait]
 pub(crate) trait ServiceRuntime: Send + Sync {
     async fn capture(&self) -> Result<RuntimeAdminSnapshot, RPCErrors>;
+    async fn preview_provider_rules(&self, request: ProviderRulesPreviewRequest) -> Result<ProviderRulesPreviewResponse, RPCErrors>;
     async fn prepare_settings(
         &self,
         settings: SettingsDocument,
@@ -795,7 +816,7 @@ impl AiccService {
             )
         })?;
         reader
-            .open_artifact_url_reader(&caller.tenant_id, url, artifact_id)
+            .open_artifact_url_reader(&caller.tenant_id, &caller.user_id, url, artifact_id)
             .await
     }
 
@@ -1036,6 +1057,9 @@ fn provider_from_add(
 }
 
 fn apply_provider_update(provider: &mut ProviderSettings, request: ProviderUpdateRequest) {
+    if let Some(rules) = request.provider_rules_id {
+        provider.provider_rules_id = (!rules.trim().is_empty()).then_some(rules);
+    }
     if let Some(enabled) = request.enabled {
         provider.enabled = enabled;
     }
@@ -1150,12 +1174,18 @@ fn replace_resource_ref_value(
     Ok(())
 }
 
-fn append_materialized_artifact_metadata(
-    value: &mut Value,
-    obj_id: String,
-    name: String,
-    mime: Option<String>,
-) {
+/// `extra.materialized_artifacts[]`: each stored artifact by object id, with
+/// the `obj://bucket/...` binding that retains it.
+fn append_materialized_artifact_metadata(value: &mut Value, artifact: &buckyos_api::AiArtifact) {
+    let buckyos_api::ResourceRef::NamedObject { obj_id } = &artifact.resource else {
+        return;
+    };
+    let bucket_ref = artifact
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("bucket_ref"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let Some(root) = value.as_object_mut() else {
         return;
     };
@@ -1172,9 +1202,10 @@ fn append_materialized_artifact_metadata(
         return;
     };
     materialized.push(json!({
-        "obj_id": obj_id,
-        "name": name,
-        "mime": mime,
+        "obj_id": obj_id.to_string(),
+        "name": artifact.name,
+        "mime": artifact.mime,
+        "bucket_ref": bucket_ref,
     }));
 }
 
@@ -1287,6 +1318,159 @@ fn replace_json_value(value: &mut Value, old: &Value, new: &Value) {
     }
 }
 
+fn resolved_provider_model_rules(
+    catalog: &CatalogSnapshot,
+    settings: &ProviderSettings,
+    effective_id: Option<&str>,
+    inventory: Option<&crate::provider::ProviderInventorySnapshot>,
+    ids: &BTreeSet<String>,
+) -> BTreeMap<String, Value> {
+    let models_by_id = inventory
+        .into_iter()
+        .flat_map(|inventory| inventory.models.iter())
+        .map(|model| (model.provider_model_id.as_str(), model))
+        .collect::<BTreeMap<_, _>>();
+    ids.iter()
+        .map(|id| {
+            let model = models_by_id.get(id.as_str()).copied();
+            let override_target = settings
+                .instance_rules
+                .as_ref()
+                .and_then(|rules| rules.model_driver_overrides.get(id));
+            let identity = override_target
+                .and_then(|target| target.split_once('/'))
+                .map(|(driver, model)| crate::catalog::ModelIdentity {
+                    model_driver_id: driver.into(),
+                    model_id: model.into(),
+                })
+                .or_else(|| {
+                    model.map(|model| crate::catalog::ModelIdentity {
+                        model_driver_id: model.model_driver_id.clone(),
+                        model_id: model.origin_model_id.clone(),
+                    })
+                })
+                .or_else(|| {
+                    effective_id
+                        .and_then(|rules| catalog.provider_model_identity_override(rules, id))
+                        .and_then(Result::ok)
+                })
+                .or_else(|| catalog.match_model(id).ok());
+            let mut context =
+                crate::matching::MatchContext::from([("provider_model_id".into(), json!(id))]);
+            for (name, value) in [
+                ("region", &settings.region),
+                ("workspace", &settings.workspace),
+                ("account", &settings.account),
+            ] {
+                if let Some(value) = value {
+                    context.insert(name.into(), json!(value));
+                }
+            }
+            if let Some(value) = settings
+                .instance_rules
+                .as_ref()
+                .and_then(|rules| rules.policy_region.as_ref())
+            {
+                context.insert("policy_region".into(), json!(value));
+            }
+            if let Some(identity) = &identity {
+                context.insert("origin_model_id".into(), json!(identity.model_id));
+                context.insert("model_driver_id".into(), json!(identity.model_driver_id));
+            }
+            let variants = if let Some(model) = model {
+                model.variant_rules.iter().collect::<Vec<_>>()
+            } else {
+                identity
+                    .as_ref()
+                    .and_then(|identity| {
+                        effective_id.and_then(|rules| {
+                            catalog
+                                .executable_variants(
+                                    rules,
+                                    &identity.model_driver_id,
+                                    &identity.model_id,
+                                    &context,
+                                )
+                                .ok()
+                        })
+                    })
+                    .unwrap_or_default()
+            };
+            let rule = effective_id.and_then(|rules| {
+                catalog
+                    .resolve_provider_rule(rules, id, &context)
+                    .ok()
+                    .flatten()
+            });
+            let pricing = model
+                .and_then(|model| model.pricing.as_ref().map(|pricing| &pricing.value))
+                .or_else(|| rule.as_ref().and_then(|rule| rule.action.pricing.as_ref()));
+            let operations = model
+                .map(|model| &model.operations)
+                .or_else(|| rule.as_ref().map(|rule| &rule.action.operations));
+            let mut action = rule
+                .as_ref()
+                .and_then(|rule| serde_json::to_value(&rule.action).ok())
+                .map(|mut action| {
+                    action.as_object_mut().unwrap().remove("pricing");
+                    action
+                });
+            let model_metadata = identity.as_ref().and_then(|identity| {
+                let resolved = catalog
+                    .resolve_model(&identity.model_driver_id, &identity.model_id)
+                    .ok()?;
+                let mut metadata = serde_json::to_value(resolved.semantics).ok()?;
+                let direct_only = catalog
+                    .llm_model(&identity.model_driver_id, &identity.model_id)
+                    .is_some_and(|llm| {
+                        llm.semantics.spec_bindings().any(|(spec, _, _)| {
+                            catalog
+                                .model_driver(&identity.model_driver_id)
+                                .is_some_and(|driver| {
+                                    driver
+                                        .specs
+                                        .iter()
+                                        .any(|item| item.id == spec && item.direct_only)
+                                })
+                        })
+                    });
+                metadata["direct_only"] = json!(direct_only);
+                Some(metadata)
+            });
+            if let Some(api_types) = model_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("api_types"))
+                .and_then(Value::as_array)
+            {
+                if let Some(operations) = action
+                    .as_mut()
+                    .and_then(|action| action.get_mut("operations"))
+                    .and_then(Value::as_object_mut)
+                {
+                    operations.retain(|api_type, _| {
+                        api_types
+                            .iter()
+                            .any(|supported| supported.as_str() == Some(api_type.as_str()))
+                    });
+                }
+            }
+            (
+                id.clone(),
+                json!({
+                    "rule": action,
+                    "operations": operations,
+                    "variants": variants,
+                    "pricing": pricing,
+                    "model_driver": identity.as_ref().map(|identity| &identity.model_driver_id),
+                    "origin_model_id": identity.as_ref().map(|identity| &identity.model_id),
+                    "model_metadata": model_metadata,
+                }),
+            )
+        })
+        .collect()
+}
+
+
 fn runtime_admin_snapshot(
     snapshot: &crate::runtime::RuntimeSnapshot,
     codecs: &CodecRegistry,
@@ -1336,6 +1520,7 @@ fn runtime_admin_snapshot(
             let (inventory, health) = if !settings.enabled {
                 (
                     ProviderInstanceInventoryView {
+                        filtered_capabilities: Vec::new(),
                         unmatched_models: Vec::new(),
                         unavailable_presets: Vec::new(),
                         unpriced_models: Vec::new(),
@@ -1352,6 +1537,7 @@ fn runtime_admin_snapshot(
             } else if let Some(runtime) = runtime {
                 (
                     ProviderInstanceInventoryView {
+                        filtered_capabilities: runtime.inventory.filtered_capabilities.clone(),
                         unmatched_models: runtime
                             .inventory
                             .unmatched_models
@@ -1384,6 +1570,7 @@ fn runtime_admin_snapshot(
             } else {
                 (
                     ProviderInstanceInventoryView {
+                        filtered_capabilities: Vec::new(),
                         unmatched_models: Vec::new(),
                         unavailable_presets: snapshot.provider_metadata
                             .get(&settings.provider_instance_name)
@@ -1402,7 +1589,23 @@ fn runtime_admin_snapshot(
                     },
                 )
             };
+            let rules_catalog = (settings.provider_profile_id == "custom").then(|| {
+                settings.instance_rules.as_ref().and_then(|rules| rules.catalog.clone())
+                    .or_else(|| settings.provider_rules_id.as_deref()
+                        .and_then(|id| snapshot.catalog.provider_rules(id))
+                        .and_then(|rules| serde_json::to_value(rules).ok()))
+            }).flatten();
+            let resolved_model_rules = runtime.filter(|_| settings.provider_profile_id == "custom")
+                .map(|provider| resolved_provider_model_rules(
+                    &snapshot.catalog, settings, provider.config.provider_rules_id.as_deref(),
+                    Some(&provider.inventory), &provider.inventory.discovered_model_ids,
+                )).unwrap_or_default();
             ProviderInstanceView {
+                resolved_model_rules,
+                discovered_model_ids: runtime.map(|provider| provider.inventory.discovered_model_ids.clone()).unwrap_or_default(),
+                rules_catalog,
+                provider_rules_id: settings.provider_rules_id.clone(),
+                instance_rules: settings.instance_rules.clone(),
                 provider_instance_name: settings.provider_instance_name.clone(),
                 provider_type: settings.provider_type.clone(),
                 provider_profile_id: settings.provider_profile_id.clone(),
@@ -1453,6 +1656,15 @@ fn runtime_admin_snapshot(
                     dynamic_login_behavior_id: provider.dynamic_login_behavior_id.clone(),
                     connection_behavior_id: provider.connection_behavior_id.clone(),
                     provider_rules_id: provider.provider_rules_id.clone(),
+                    rules_catalog: provider.provider_rules_id.as_deref()
+                        .and_then(|id| snapshot.catalog.provider_rules(id))
+                        .and_then(|rules| serde_json::to_value(rules).ok()),
+                    model_driver_overrides: provider
+                        .provider_rules_id
+                        .as_deref()
+                        .and_then(|id| snapshot.catalog.provider_rules(id))
+                        .map(|rules| rules.model_driver_overrides.clone())
+                        .unwrap_or_default(),
                     ui_hints: provider.ui_hints.clone(),
                 })
                 .collect(),
@@ -1677,6 +1889,12 @@ fn protocol_adapter_response(
         adapters: codecs
             .adapters()
             .map(|adapter| buckyos_api::ProtocolAdapterView {
+                default_operations: adapter.operations.values().flat_map(|operation| operation.bindings.iter())
+                    .filter_map(|binding| {
+                        let api_type = serde_json::to_value(binding.api_type).ok()?.as_str()?.to_string();
+                        let operation = crate::provider::resolve_operation(adapter, &BTreeMap::new(), None, binding.api_type, &api_type, None).ok()??;
+                        Some((api_type, operation))
+                    }).collect(),
                 protocol_family_id: adapter.protocol_family_id.clone(),
                 protocol_adapter_id: adapter.protocol_adapter_id.clone(),
                 custom_provider_selectable: custom_provider_adapter_ids
@@ -1795,4 +2013,13 @@ pub(crate) fn builtin_registry_for_test(
         },
     )
     .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn issue666_test_definitions() -> Vec<crate::model::LogicalModelDefinition> {
+    builtin_logical_model_definitions()
+}
+#[cfg(test)]
+pub(crate) fn issue666_test_overlay() -> buckyos_api::AiccRouteOverlay {
+    builtin_logical_tree_overlay()
 }

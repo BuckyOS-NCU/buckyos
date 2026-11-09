@@ -27,13 +27,15 @@
 
 ## 使用
 
+自动 Session ID 与目录名均为 `<kind前缀>-YYYYMMDD-N`（如 `work-20260110-23`），保持 `sessions/<session_id>/` 布局。日期取分配主机本地日期，同一 Agent 按当天已有目录、登记和预留记录的最大编号加 1；幂等身份键到短 ID 的映射保存在 `state/sessions/.ids/`，重试和跨日恢复沿用原 ID。节点工作目录同样使用短 Session ID；长期 Workspace 使用创建或导入时显式指定的目录。
+
 ```rust
 let channels = Arc::new(KmsgChannels::new(kmsg_client));          // 或 KmsgChannels::dir(dev_dir)
 let agent = Arc::new(FsAgentStateClient::open(agent_root, agent_did, Some(channels.client()), None)?);
 let sd = libopendan::create_session(&app_dir, SessionSpec::work("…"), agent.as_ref(), "app:app2@alice", channels.as_ref()).await?;
 let deps = RunnerDeps::new("app:app2@alice", agent, channels,
                            Arc::new(NativeRuntime::local("rt-app2", "app:app2")), XllmDeps::default());
-let result = SessionRunner::new(deps).drive(&sd, StopWhen::Finished).await;
+let result = libopendan::runner::drive(&sd, &deps, StopWhen::Finished).await;
 ```
 
 LLM Provider 由 `session_config.prompt.llm_context`（xllm `.llm_context` 的 JSON 形式）决定，工具预算键为 `max_tool_iterations`。`StopWhen::MaxOutcomes { n }` 让 drive 处理 n 个 `LLMContext` outcome（每个启动或恢复的 run 段一个，任何种类）后返回 `DriveResult::OutcomesHandled`；它不是 Round（推理）数、`run()` 调用数，也不是 Turn 数。Session 的结束条件另由 `end_condition`（如 `max_turns`）按已完成的 Turn 计。Round / Step / Turn 的定义见 [LLM Context readme](../../../doc/llm_context/readme.md)。
@@ -45,6 +47,10 @@ RunnerDeps.runtime 使用 agent_tool::runtime::AgentRuntime；.llm_context.runti
 宿主已注册 BuckyOS runtime 时，Session 环境与每次 native 命令执行前都会续期并读取当前 session token，注入 `BUCKYOS_APPCLIENT_SESSION_TOKEN`，覆盖父进程、Session 配置或单次调用中的旧值。续期失败或 token 为空时阻止执行；工具沿用宿主身份，不需要 owner 私钥。run 的环境核验记录只保存凭据变量名，不保存 token 值。未注册 runtime 的独立开发形态仍可显式传入该环境变量。
 
 Session 的宿主 `report` 工具提交阶段报告或以 `is_end=true` 请求完成；Behavior XML 用 `<report end="true">`，结束与动作/切换互斥。`session.policy.completion = explicit_report` 可要求显式完成（默认 natural）；无输入队列时漏报会失败，有输入队列的普通 Done 关闭 Turn 并等待。报告、显式稳定产物和可选 JSON result 统一持久化，恢复不重执行报告、不新增推理；子 context 的结束只交回调用方。持久身份、提交窗口与历史投影见 [Session Directory Protocol §7.1](<../../../doc/opendan/protocol/Session Directory Protocol.md>)。
+
+UI Session 的结构化回复只交付 `reply` 正文，`topic` 和 `artifacts` 分别更新话题和附件；空正文不回退到 JSON 原文。格式或附件校验纠正一次后仍失败时，Turn 以 `output_format` 错误结束，由宿主发送失败提示，原文保留在 run / worklog 中供诊断。恢复已结束的 run 时执行相同的校验和交付规则。
+
+UI Session 的 `function_call` context 在已关闭的 Turn 之后继续同一 context、继承 `recent_dialogue` 且尚未生成摘要时，从 `last_run` 快照的 `accumulated` 原样继承非 system 消息列表，保留角色、工具调用与结果、媒体等内容，不机械截断或包装成 `<session_history>`。新 run 的快照保存完整历史前缀，之后清理旧 run 不影响续聊。原始历史超过 `history_budget_tokens` 时先实际压缩；压缩后，以及 behavior loop / context 切换的历史装配，仍使用 `<session_history>` 中的摘要与机械渲染 worklog。持久格式不变，见 [Session Directory Protocol §6](<../../../doc/opendan/protocol/Session Directory Protocol.md>)。
 
 ## xagent
 
@@ -69,7 +75,9 @@ xagent behaviors [--frozen <sid>] ; xagent xllm <sid> ; xagent schema <dir>
 
 驱动命令的 stdout 是一个带 `kind` 的 `DriveResult` JSON（`new` 另带 `session_id` / `path`，仍有未结束的子 Session 时带 `children`），日志与诊断在 stderr。退出码：0 完成，1 失败，2 参数 / 配置错误，3 未完成（idle、Turn 仍打开、input_full），4 被 stop / 中断，5 Busy，6 阻塞（非驱动者、未登记、绑定、runtime 不符、RecoveryBlocked、只读）。SIGINT 对 `new` / `run` 是对所驱动 Session 的 stop；对 `serve` 只结束托管。
 
-推进时 xagent 把自身包装成 session 的 `.runtime/bin/agent-session`，`shell` 里的命令用它访问本 Session 与 Agent State：`agent-session ctl activity --touch ws:foo`、`ctl perceive "…"`、`recall <tag>…`、`note <text>`、`sessions [--children] [--active]`、`read-session <sid>`、`artifact head|list`、`create-worksession --objective … [--behavior <b>] [--runtime <id>] [--report final|progress|none] [--wait] [--interactive]`、`wait <sid>`、`post <sid> --msg …`、`runtime list|get|check`、`ask-user "<问题>" [--option <id>=<label>]... [--allow-text]`（打印 `Pending{userinput:<call_id>}`；ui 类 Session 把问题以 `thread → 占位` + `agent_ask` 发给用户，下一条用户消息回填为这次调用的结果；没有队列的 Work 在宿主有通知服务时把问题作为 `input` 通知发出，有界等待其结果，见 [Session Input Protocol](<../../../doc/opendan/protocol/Session Input Protocol.md>) §9）、`notify send|list|show|answer|ack|cancel`（Session 内：发告知、列出本 Agent 的通知、代用户回答 / 确认在本会话呈现过的通知，不能处理本 Session 发起的；`xagent notify …` 在 Session 外扮演用户，供 `--dev` 与测试）。
+推进时 xagent 把自身包装成 session 的 `.runtime/bin/agent-session`（Windows 上是 `xagent.exe` 本身以 `agent-session.exe` 为名的硬链接或副本，PowerShell、`cmd`、`Start-Process` 与直接创建进程都执行它，不经文件关联；`llm_understand_media.exe` 同样是 `agent_tool.exe`，按调用名运行该子命令；tool plan 墓碑在 Windows 上是 `.cmd`），`shell` 里的命令用它访问本 Session 与 Agent State：`agent-session ctl activity --touch ws:foo`、`ctl perceive "…"`、`recall <tag>…`、`note <text>`、`sessions [--children] [--active]`、`read-session <sid>`、`artifact head|list`、`create-worksession --objective … [--class <c>] [--behavior <b>] [--runtime <id>] [--report final|progress|none] [--interactive]`（子的结束作为输入回来，没有 `wait`）、`post <sid> --msg …`、`todo add|explore|update|pause|resume|stop|retry|cancel|list|show`（plan session 的 TodoList，就绪的 Todo 由宿主自动派发，见 [Agent TodoList](<../../../doc/opendan/Agent TodoList.md>)）、`runtime list|get|check`、`ask-user "<问题>" [--option <id>=<label>]... [--allow-text]`（打印 `Pending{userinput:<call_id>}`；ui 类 Session 把问题以 `thread → 占位` + `agent_ask` 发给用户，下一条用户消息回填为这次调用的结果；没有队列的 Work 在宿主有通知服务时把问题作为 `input` 通知发出，有界等待其结果，见 [Session Input Protocol](<../../../doc/opendan/protocol/Session Input Protocol.md>) §9）、`notify send|list|show|answer|ack|cancel`（Session 内：发告知、列出本 Agent 的通知、代用户回答 / 确认在本会话呈现过的通知，不能处理本 Session 发起的；`xagent notify …` 在 Session 外扮演用户，供 `--dev` 与测试）。
+
+`workspace list`、`runtime list`、`sessions` 默认输出带标题的简洁文本列表，适合终端与 LLM 阅读；加 `--json` 返回原有 JSON 数组（Workspace / Runtime 完整记录、Session 摘要）。过滤参数在两种格式下相同；程序解析这些列表时应显式传入 `--json`。`workspace get` / `runtime get` 仍返回完整 JSON 记录。`xagent` 与 `agent-session` 使用同一实现，内部 `AgentToolResult` 协议不变。
 
 behavior 可以用 `[tool]` 把自己（`create_sub_context` / `fork`）声明为调用方模型看到的具名函数，调用方在 `tool_whitelist` 写 `behavior:<name>`；运行时由 `runner::tools::BehaviorTool` 生成（通用的 `call_behavior` 也是它），内部协议同 `call_behavior`。fork 目标的 `[budget]` 作用于分支的 run。
 
@@ -93,6 +101,7 @@ cargo test -p libopendan -- --test-threads=1
 | `tests/runtimes.rs` | Runtime 登记（V01–V04）：内建补建与保留 owner 修改、内建不可删、CAS、kRPC 署名、Workspace 按登记判断（`local` 即 `container`、`host` 拒绝）、`create-worksession --runtime` 查登记 |
 | `tests/session_runtime.rs` | session-runtime 与 Workspace 解耦（primary-runtime TODO）：Workspace 不选 runtime、子 Session 换 runtime 继承 Workspace、默认 cwd 与提示词里的 Workspace、cmd_skills 按声明基线 / 平台过滤与显式指定被拒、session token 与 `session.helper / task / token_refresh`（真实 `xagent`）、Session ↔ Workspace 的复制（中文路径、9 MiB、重试不重复、`--replace`、目录目标、拒绝的情形）与 `agent-session copy` |
 | `tests/outbound.rs` | 回复随 Turn 提交并沿来路发出、sink 不可达时保留并原样重发（同键同 ObjId）、被拒与路由不一致只记录不重试、没有 sink 时不产生 outbox |
+| `tests/plan_simple.rs`、`tests/plan_simple_async.rs` | plan session（真实 Jarvis 包）：类与函数契约、只读 Workspace、注入前后崩溃恢复；一口气建列表与依赖顺序、上游结束先于 plan 推理派下游、验证 Todo、上游失败 → blocked → retry、结束时停止在跑的工作、并发闸挡住与补派、用户消息 → `todo update` → work session 取入更新、`todo pause/resume/stop`、plan 暂停时输入积压与级联 |
 | `tests/fixtures.rs` | 参考实现在 `doc/opendan/protocol/fixtures` 每个场景上满足 `expected.json`；`14_input_bus` 的记录处理、拒绝原因与逐字节渲染 |
 | `tests/xagent_lib.rs` | 无队列 work Session 与 `prompt.initial_inputs`、`WAIT_USER_MSG` 的模板语义、`TurnClosed` / `TurnOpen`、behavior 冻结 / 补冻结 / 缺失冻结、三种 Agent State 实现结果一致、Sub Session（父等待汇报、`session:<sid>` 回填、数量与深度、交互式子提问、stop 级联、进度半订阅）、驱动者停止请求、on_context_switch 前的半订阅快照、timer bridge |
 | `tests/xagent_cli.rs` | `xagent` 可执行文件（本地 OpenAI 兼容 mock）：`new --no-run` / `run` / `post` / `ctl` / `status` / `list` / `xllm` / `schema` 的退出码与 stdout 单个 JSON、无队列投递拒绝、ui 模板等输入与同一 Turn 续答、经 `shell` 的 `agent-session create-worksession --wait`、xllm 接手后由 xagent 提交结束、第二个驱动者 Busy 与 SIGINT、`serve` |

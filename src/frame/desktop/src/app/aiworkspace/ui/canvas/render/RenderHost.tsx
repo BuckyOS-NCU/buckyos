@@ -29,11 +29,25 @@
  * tool draws one anywhere; a dragged end snaps to a side midpoint (`point`) or to the Block under it (`auto`).
  * A selected line shows its end, bend, segment and label handles and a halo instead of a box. While Blocks
  * move, resize or turn, the lines bound to them are re-routed and repainted per frame without React; dragging
- * near the edge of the canvas pans it. */
+ * near the edge of the canvas pans it.
+ *
+ * Writing (手写笔 TODO D1, D2): with the pen or the eraser as the tool the canvas is a writing area. It takes every
+ * press before Blocks, editors and handles do; a pen or the mouse writes or erases (ink/input.ts), touches follow the
+ * writing rules of touch.ts, the camera stays put while a stroke runs, and the stroke is drawn on two screen-space
+ * canvases above the content until its Block has drawn it (ink/paint.ts). Ink Blocks are drawn wherever they cross
+ * the view (no mount budget, no placeholder) and hit where their line is, not anywhere in their box.
+ *
+ * Block-controls (脑图方案 §6–§7): a control's frame draws its chrome (a mind map's implicit edges, fold handles, pins)
+ * under its Blocks; the control is sized by its layout (no resize handles) and moved by pressing its box or its root.
+ * Dragging a node moves its subtree and asks the control where it would hang — on a node: as its child, or before /
+ * after it near an edge; on the map's blank space: pinned there (a free topic, R16); outside the map: refused (R9). The
+ * other nodes show the proposed layout while the pointer moves. Resizing a node writes its size only; nodes do not turn. */
 
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { Lock, RotateCw } from 'lucide-react'
-import type { Placement } from '../../../api/types'
+import { COMPOSITE, isTextView } from '@controls/contract'
+import { placeControl, type ControlSource } from '@controls/solve'
+import type { EntityEnvelope, StoredPlacement } from '../../../api/types'
 import { ConnectorFrame } from '../connectors/ConnectorFrame'
 import { LineRegistry } from '../connectors/registry'
 import { findAnchor, SIDE_VEC, type Shape } from '../connectors/anchors'
@@ -56,9 +70,17 @@ import { FreshnessBadge } from '../../sources/FreshnessBadge'
 import { anchorName } from '../drawioText'
 import { angleFrom, centerOf, containsPoint, corners, normalizeRotation, resizeRotated, rotatePoint } from '../geometry'
 import { groupAt, movedPlacement, relativeTo, topLevel, type Laid } from '../layout'
+import { foldBook } from '../../controls/folds'
+import { nodeMeasurer } from '../../controls/measure'
+import { isFixedComposite } from '../../controls/composite/model'
+import { controlRegistry, type ControlChromeProps } from '../../controls/registry'
 import { Camera, intersects, type Rect } from './camera'
 import { SpatialIndex } from './spatialIndex'
 import { TouchGestures, type OneFingerDrag, type Point, type TouchActions } from './touch'
+import { inkBook } from '../../../ink/book'
+import { ERASER_PX, InkInput, type InkControl, type InkHost } from '../../../ink/input'
+import { INK_VIEW, touches, widePoints, type InkStyle } from '../../../ink/model'
+import { InkCanvas } from '../../../ink/paint'
 
 /** Blocks within this many viewports of the visible area stay mounted; within the next band they stay in the DOM but hidden. */
 const MOUNT_MARGIN = 0.5
@@ -90,8 +112,18 @@ const EDGE_PX = 24
 const EDGE_SPEED = 0.6
 /** Two presses on a handle within this time are a double click (pointer capture keeps dblclick away from it). */
 const DOUBLE_PRESS_MS = 400
+const FALLBACK_INK: InkStyle = { color: '#111827', width: 2, pressure: true }
 
-export interface LayoutChange { id: string; placement: Placement; parentId?: string }
+export interface LayoutChange { id: string; placement: StoredPlacement; parentId?: string }
+/** A node re-hung inside its control, or a Block of the canvas dragged onto a node (脑图方案 §7.2): under `parentId`,
+ * before `beforeId` (null: last). */
+export interface NodeMove { id: string; parentId: string; beforeId: string | null }
+/** Where a dragged node would go: under a node, beside one, pinned on the map's blank space, or nowhere (outside). */
+type NodeDrop = { kind: 'child'; parent: string } | { kind: 'before' | 'after'; sibling: string; parent: string } | { kind: 'pin' } | { kind: 'outside' }
+type HangDrop = Extract<NodeDrop, { parent: string }>
+/** Blocks hung into a control by a drag (its own nodes, or Blocks dragged onto one of its nodes): what moves (`affected`:
+ * with their subtrees), where it would go, and the nodes moved aside to show it (`shown`). */
+interface Hang { control: string; ids: string[]; affected: string[]; dx: number; dy: number; drop: NodeDrop | null; shown: string[] }
 
 export interface RenderHostProps {
   surfaceId: string
@@ -106,14 +138,19 @@ export interface RenderHostProps {
   /** Can this user move, resize and rotate the Block (the canvas's editors: all; a commenter: its own notes)? */
   canLayout: (id: string) => boolean
   onCommitLayout: (changes: LayoutChange[]) => void
+  /** Nodes re-hung inside their control, or Blocks dragged onto a node, by one drag (one commit). */
+  onMoveNodes?: (moves: NodeMove[]) => void
   onContextMenu: (point: { screenX: number; screenY: number; worldX: number; worldY: number }, blockId: string | null) => void
   onOpenEntity: (entityId: string) => void
   /** Rendered in screen space above the selection (the near toolbar). */
   renderNear?: (bbox: Rect) => ReactNode
   /** Something outside the canvas wants the pointer (e.g. an open menu): gestures are refused. */
   gesturesPaused?: boolean
-  /** The pointer tool (UI improvement §7.2): `hand` pans with the primary button and never selects; `connector` draws a line. */
-  tool?: 'select' | 'hand' | 'connector'
+  /** The pointer tool (UI improvement §7.2): `hand` pans with the primary button and never selects; `connector` draws a line;
+   * `pen` writes and `eraser` erases whole strokes (手写笔 TODO). */
+  tool?: 'select' | 'hand' | 'connector' | 'pen' | 'eraser'
+  /** The pen's style and the touch lock while writing; `control` lets the view ask whether a stroke runs, and drop it. */
+  ink?: { style: InkStyle; touchLock: boolean; control: InkControl } | null
   /** A one-shot placement: the pointer carries a preview of this size; a primary click places it. */
   placing?: { w: number; h: number; label: string } | null
   onPlace?: (world: { x: number; y: number }) => void
@@ -139,8 +176,9 @@ interface Snap { id: string; anchor: Anchor; point: Point; target: TargetGeom; e
 
 type Drag =
   | { kind: 'pan'; lastX: number; lastY: number; moved: boolean }
-  /** `lines`: lines re-routed per frame (bound to a moved Block, or moved with a bound end). */
-  | { kind: 'move'; ids: string[]; affected: string[]; lines: string[]; shifted: ReadonlySet<string>; startX: number; startY: number; dx: number; dy: number; moved: boolean; clicked: string; additive: boolean; wasSelected: boolean; ghost?: boolean }
+  /** `lines`: lines re-routed per frame (bound to a moved Block, or moved with a bound end). `hangable`: the Blocks may
+   * be dropped onto a node of a control to become its children (`hang`: the node under the pointer). */
+  | { kind: 'move'; ids: string[]; affected: string[]; lines: string[]; shifted: ReadonlySet<string>; startX: number; startY: number; dx: number; dy: number; moved: boolean; clicked: string; additive: boolean; wasSelected: boolean; ghost?: boolean; hangable: boolean; hang: Hang | null }
   | { kind: 'resize'; id: string; handle: string; startX: number; startY: number; start: Rect; rotation: number; aspect: 'free' | 'locked'; current: Rect; lines: string[]; backing?: string }
   | { kind: 'rotate'; id: string; center: Point; startAngle: number; start: number; current: number; lines: string[] }
   | { kind: 'marquee'; startX: number; startY: number; current: Rect | null; additive: boolean; moved: boolean }
@@ -153,6 +191,8 @@ type Drag =
    * a press on the line's body that does not move is a click (`clicked`). */
   | { kind: 'bend'; id: string; mode: 'move' | 'segment'; base: Point[]; index: number; press: Point; working: Point[] | null; startX: number; startY: number; moved: boolean; clicked: boolean; additive: boolean; wasSelected: boolean }
   | { kind: 'label'; id: string; startX: number; startY: number; label: { t: number; offset: number } | null; moved: boolean }
+  /** Dragging nodes of a control (`ids`, their subtrees in `affected`); `shown`: frames moved to the proposed layout. */
+  | { kind: 'node'; control: string; ids: string[]; affected: string[]; lines: string[]; startX: number; startY: number; dx: number; dy: number; moved: boolean; clicked: string; additive: boolean; wasSelected: boolean; drop: NodeDrop | null; shown: string[] }
 
 /** What a gesture shows next to the pointer: the size while resizing, the angle while rotating. */
 interface Hint { x: number; y: number; text: string }
@@ -222,14 +262,15 @@ function scrollerWithin(target: Element | null, frame: HTMLElement | undefined):
 
 /** Three culling levels with hysteresis (§9.3 rule 3): mounted near the viewport, hidden in the DOM further out, unmounted beyond. */
 function computeMounts(prev: Map<string, MountState>, camera: Camera, laid: Map<string, Laid>, index: SpatialIndex, pinned: Set<string>): Map<string, MountState> {
+  const free = (item: { id: string; line?: unknown }) => Boolean(item.line) || laid.get(item.id)?.entity.view_type === INK_VIEW
   const near = camera.visibleWorld(MOUNT_MARGIN)
   const far = camera.visibleWorld(HIDE_MARGIN)
   const center = { x: near.x + near.w / 2, y: near.y + near.h / 2 }
   const next = new Map<string, MountState>()
   const candidates: { id: string; dist: number }[] = []
   for (const item of index.query(far)) {
-    // a line has no Renderer to budget: it stays drawn wherever it crosses the view (连接线方案 §9.4)
-    if (item.line && intersects(item.rect, near)) next.set(item.id, 'mounted')
+    // a line or ink has no Renderer to budget: it stays drawn wherever it crosses the view (连接线方案 §9.4)
+    if (free(item) && intersects(item.rect, near)) next.set(item.id, 'mounted')
     else if (intersects(item.rect, near)) candidates.push({ id: item.id, dist: Math.hypot(item.rect.x + item.rect.w / 2 - center.x, item.rect.y + item.rect.h / 2 - center.y) })
     else next.set(item.id, 'hidden')
   }
@@ -274,12 +315,34 @@ export function RenderHost(props: RenderHostProps) {
   const [resizePreview, setResizePreview] = useState<{ id: string; rect: Rect } | null>(null)
   const [rotatePreview, setRotatePreview] = useState<{ id: string; rotation: number } | null>(null)
   const [hint, setHint] = useState<Hint | null>(null)
+  /** A node drag's proposed layout: the control's chrome draws it, the overlay marks where the node would go. */
+  const [nodePreview, setNodePreview] = useState<{ control: string; drop: NodeDrop; preview: NonNullable<ControlChromeProps['preview']> } | null>(null)
   const [, forceOverlay] = useState(0)
   const [settled, setSettled] = useState(0)
   const pointerTypeRef = useRef('mouse')
   const pointer = usePointerType()
   const sizes = HANDLES[pointer]
   const [touch] = useState(() => new TouchGestures(camera))
+  // ---- writing: the input, the live layer, the strokes being erased
+  const inkOn = props.tool === 'pen' || props.tool === 'eraser'
+  const book = inkBook(store)
+  const [inkCanvas] = useState(() => new InkCanvas({ toScreen: (x, y) => camera.toScreen(x, y), zoom: () => camera.zoom }))
+  const [inkHost] = useState<InkHost>(() => ({
+    toWorld: (x, y) => ({ x, y }), zoom: () => 1, tool: () => 'pen', style: () => FALLBACK_INK, capture: () => undefined, release: () => undefined, interrupt: () => undefined,
+    begin: () => undefined, draw: () => undefined, stroke: () => undefined, dropped: () => undefined, erase: () => undefined, eraseEnd: () => undefined,
+  }))
+  const [input] = useState(() => new InkInput(inkHost))
+  const inkBaseRef = useRef<HTMLCanvasElement>(null)
+  const inkTailRef = useRef<HTMLCanvasElement>(null)
+  /** Strokes hidden by the eraser: until their deletion is back, or put back when it is refused or cancelled. */
+  const [erasing, setErasing] = useState<ReadonlySet<string>>(() => new Set())
+  const eraseRun = useRef<{ ids: Set<string>; strokes: Set<string> } | null>(null)
+  /** The segments of each logical stroke on this canvas (a long stroke is several Blocks). */
+  const strokeCells = useMemo(() => {
+    const map = new Map<string, string[]>()
+    for (const [id, l] of laid) { const stroke = l.entity.ink_stroke; if (stroke) { const list = map.get(stroke); if (list) list.push(id); else map.set(stroke, [id]) } }
+    return map
+  }, [laid])
   const [metaSink] = useState(() => new BlockMetaSink())
   useSyncExternalStore(metaSink.subscribe, metaSink.snapshot)
   // ---- connectors: mounted line frames (for repainting during gestures), which lines end on which Block
@@ -333,12 +396,12 @@ export function RenderHost(props: RenderHostProps) {
     camera.attach(worldRef.current)
     const root = rootRef.current
     if (root) camera.setViewportSize(root.clientWidth, root.clientHeight)
-    const observer = root ? new ResizeObserver(() => { camera.setViewportSize(root.clientWidth, root.clientHeight); setSettled((n) => n + 1) }) : null
+    const observer = root ? new ResizeObserver(() => { camera.setViewportSize(root.clientWidth, root.clientHeight); setSettled((n) => n + 1); inkCanvas.redraw() }) : null
     if (root && observer) observer.observe(root)
     // a show's stage draws no overlay: a flight moves the transform only, React renders nothing per frame (第三期规划 §9.3)
     const offChange = mode === 'show' ? () => undefined : camera.onChange(() => forceOverlay((n) => n + 1))
     return () => { offChange(); observer?.disconnect(); camera.attach(null) }
-  }, [camera, mode])
+  }, [camera, mode, inkCanvas])
 
   // ---- culling with hysteresis (recomputed when the camera settles or the layout changes)
   const { prefetch } = props
@@ -357,6 +420,8 @@ export function RenderHost(props: RenderHostProps) {
   if (inputsSeen.laid !== laid || inputsSeen.index !== index || inputsSeen.pinned !== pinned) {
     setInputsSeen({ laid, index, pinned })
     setMounts((prev) => computeMounts(prev, camera, laid, index, pinned))
+    // erased strokes leave the hidden set once they left the layout
+    if ([...erasing].some((id) => !laid.has(id))) setErasing(new Set([...erasing].filter((id) => laid.has(id))))
   }
   // frames in a stable DOM order (by id): mounting, culling or a reorder inserts and removes, never moves
   const frameOrder = useMemo(() => [...mounts.keys()].sort(), [mounts])
@@ -373,7 +438,11 @@ export function RenderHost(props: RenderHostProps) {
       if (l && !l.isGroup && !l.connector && !blockRegistry.get(l.entity.view_type ?? '')?.pureUi && lodFor(l.rect, zoom, pinned.has(id)) === 'placeholder') placeholders += 1
       else mounted += 1
     }
-    hooks.canvas = { surfaceId: props.surfaceId, blocks: laid.size, mounted, hidden, placeholders, editors: budget.used('editors'), html: budget.used('html'), zoom, mode }
+    const { surfaceId } = props
+    const erasingSize = erasing.size
+    hooks.canvas = { surfaceId: props.surfaceId, blocks: laid.size, mounted, hidden, placeholders, editors: budget.used('editors'), html: budget.used('html'), zoom, mode,
+      // read when the hooks are read (a pointer event changes it without a render)
+      get ink() { return { busy: input.busy(), waiting: book.waitingOn(surfaceId).length, erasing: erasingSize } } }
   })
 
   // ---- helpers
@@ -386,6 +455,142 @@ export function RenderHost(props: RenderHostProps) {
     for (const [cid, l] of laid) { let cur: string | undefined = l.parentId; while (cur) { if (cur === id) { out.push(cid); break } cur = laid.get(cur)?.parentId } }
     return out
   }, [laid])
+  /** What a press on a Block moves: a control's root stands for the control (dragging the root moves the map). */
+  const pressTarget = (id: string): string => { const n = laid.get(id)?.node; return n && n.parent === null && laid.get(n.control)?.control?.kind !== COMPOSITE ? n.control : id }
+  /** Where nodes dragged to world point `w` would go (脑图方案 §7.2): on a node — its child, or beside it near an edge
+   * across the growth; a group or a nested control as a node takes no children (beside only); on the map's blank
+   * space — pinned; further out — nowhere (R9). */
+  /** The top-most node at world point `w` (of `control`, or of any control) that is not one of `moving`. */
+  const nodeUnder = (w: Point, moving: ReadonlySet<string>, control?: string): Laid | null => {
+    let over: Laid | null = null
+    for (const l of laid.values()) {
+      if (!l.node || (control !== undefined && l.node.control !== control) || moving.has(l.entity.entity_id)) continue
+      const r = l.rect
+      if (w.x < r.x || w.x > r.x + r.w || w.y < r.y || w.y > r.y + r.h) continue
+      if (!over || l.paint > over.paint) over = l
+    }
+    return over
+  }
+  /** Dropped at `w` on node `over`: its child, or beside it near an edge across the growth; a group or a nested
+   * control as a node takes no children (beside it only; on a root, nowhere). */
+  const dropOnNode = (over: Laid, w: Point): HangDrop | null => {
+    const node = over.node
+    if (!node) return null
+    const id = over.entity.entity_id
+    const t = node.grow === 'down' ? (w.x - over.rect.x) / Math.max(1, over.rect.w) : (w.y - over.rect.y) / Math.max(1, over.rect.h)
+    // a composite's children are leaves in slots (扩展控件 P1): beside one, never under it
+    if (laid.get(node.control)?.control?.kind === COMPOSITE) return { kind: t < 0.5 ? 'before' : 'after', sibling: id, parent: over.parentId }
+    const root = node.parent === null
+    if (over.isGroup) return root ? null : { kind: t < 0.5 ? 'before' : 'after', sibling: id, parent: over.parentId }
+    if (!root && t < 0.25) return { kind: 'before', sibling: id, parent: over.parentId }
+    if (!root && t > 0.75) return { kind: 'after', sibling: id, parent: over.parentId }
+    return { kind: 'child', parent: id }
+  }
+  /** The top-most composite whose box holds world point `w` (not one of `moving`): Blocks dropped there join it. */
+  const compositeUnder = (w: Point, moving: ReadonlySet<string>): Laid | null => {
+    let over: Laid | null = null
+    for (const l of laid.values()) {
+      if (l.control?.kind !== COMPOSITE || moving.has(l.entity.entity_id) || l.locked) continue
+      const r = l.rect
+      if (w.x < r.x || w.x > r.x + r.w || w.y < r.y || w.y > r.y + r.h) continue
+      if (!over || l.paint > over.paint) over = l
+    }
+    return over
+  }
+  const nodeDropAt = (drag: Extract<Drag, { kind: 'node' }>, w: Point): NodeDrop => {
+    const over = nodeUnder(w, new Set(drag.affected), drag.control)
+    if (over) return dropOnNode(over, w) ?? { kind: 'pin' }
+    // inside a stacking composite, blank space appends to it; a fixed one keeps the Block where it is dropped
+    const host = laid.get(drag.control)
+    if (host?.control?.kind === COMPOSITE && !isFixedComposite(store, drag.control)) {
+      const r = host.rect
+      if (w.x >= r.x && w.x <= r.x + r.w && w.y >= r.y && w.y <= r.y + r.h) return { kind: 'child', parent: drag.control }
+    }
+    const box = laid.get(drag.control)?.rect
+    const m = 40 / camera.zoom
+    if (box && w.x >= box.x - m && w.x <= box.x + box.w + m && w.y >= box.y - m && w.y <= box.y + box.h + m) return { kind: 'pin' }
+    return { kind: 'outside' }
+  }
+  /** The control's layout with the dragged nodes where `drop` puts them (world rectangles of the others, and the slot
+   * the first dragged node would take). */
+  const proposedLayout = (drag: Hang, drop: NodeDrop): { rects: Map<string, Rect>; slot: Rect | null } => {
+    const out = new Map<string, Rect>()
+    let slot: Rect | null = null
+    const c = laid.get(drag.control)
+    const def = controlRegistry.get(c?.control?.kind)
+    if (!c?.control || !def || drop.kind === 'outside') return { rects: out, slot }
+    const moved = new Set(drag.ids)
+    /** A dragged Block as the drop will write it (the layout reads the placement of the children it is given). */
+    const asDropped = (e: EntityEnvelope): EntityEnvelope => {
+      if (!moved.has(e.entity_id)) return e
+      const l = laid.get(e.entity_id)
+      // pinned where it was dropped: its siblings close the gap
+      if (drop.kind === 'pin') return l ? { ...e, placement: movedPlacement(laid, l, drag.dx, drag.dy) } : e
+      // hung under a node it is laid out at its own size
+      return { ...e, placement: { x: 'auto', y: 'auto', w: e.placement?.w ?? 'auto', h: e.placement?.h ?? 'auto' } }
+    }
+    const src: ControlSource = {
+      get: (id) => { const e = store.outline.get(id); return e && asDropped(e) },
+      childrenOf: (id) => {
+        if (drop.kind === 'pin') return store.outline.childrenOf(id).map(asDropped)
+        const list = store.outline.childrenOf(id).filter((e) => !moved.has(e.entity_id))
+        if (id !== drop.parent) return list
+        const add = drag.ids.flatMap((m) => { const e = store.outline.get(m); return e ? [asDropped(e)] : [] })
+        if (drop.kind === 'child') return [...list, ...add]
+        const i = list.findIndex((e) => e.entity_id === drop.sibling)
+        list.splice(drop.kind === 'before' ? i : i + 1, 0, ...add)
+        return list
+      },
+    }
+    const book = foldBook(store)
+    const solved = def.layout.solve(src, drag.control, { measurer: nodeMeasurer, collapsed: (id) => book.folded(id), fallbackSize: (e) => blockRegistry.get(e.view_type ?? '')?.defaultSize ?? { w: 160, h: 90 } })
+    for (const n of placeControl(solved, c.control.origin).nodes.values()) {
+      if (n.id === drag.ids[0]) slot = { x: n.x, y: n.y, w: n.w, h: n.h }
+      if (!drag.affected.includes(n.id)) out.set(n.id, { x: n.x, y: n.y, w: n.w, h: n.h })
+    }
+    return { rects: out, slot }
+  }
+  /** Show `drop` while dragging: the other nodes move to the proposed layout, the chrome draws its edges. */
+  const showDrop = (drag: Hang, drop: NodeDrop) => {
+    const { rects, slot } = proposedLayout(drag, drop)
+    const shown: string[] = []
+    for (const id of drag.shown) if (!rects.has(id)) setTransform([id], 0, 0)
+    for (const [id, r] of rects) {
+      const l = laid.get(id)
+      if (!l) continue
+      const dx = r.x - l.rect.x, dy = r.y - l.rect.y
+      if (Math.abs(dx) + Math.abs(dy) < 0.5) { if (drag.shown.includes(id)) setTransform([id], 0, 0); continue }
+      setTransform([id], dx, dy)
+      shown.push(id)
+    }
+    drag.shown = shown
+    // a re-hung node shows the slot it would take and its edge from the new parent; a pinned one is where it is dropped
+    const parent = drop.kind === 'child' || drop.kind === 'before' || drop.kind === 'after' ? drop.parent : null
+    setNodePreview({ control: drag.control, drop, preview: { rects, dragged: new Set(drag.affected), parent: parent && laid.get(parent)?.node ? parent : null, at: parent ? slot : null } })
+  }
+  /** Over a node of a control, Blocks dragged from the canvas show where they would hang; elsewhere they move as usual. */
+  const trackHang = (drag: Extract<Drag, { kind: 'move' }>, point: { clientX: number; clientY: number }) => {
+    const p = screenPoint(point)
+    const w = camera.toWorld(p.x, p.y)
+    const over = nodeUnder(w, drag.shifted)
+    const box = over ? null : compositeUnder(w, drag.shifted)
+    const drop: HangDrop | null = over ? dropOnNode(over, w) : box ? { kind: 'child', parent: box.entity.entity_id } : null
+    const control = over?.node?.control ?? box?.entity.entity_id
+    if (drag.hang && (!drop || drag.hang.control !== control)) {
+      setTransform(drag.hang.shown, 0, 0)
+      setNodePreview(null)
+      drag.hang = null
+    }
+    if (!drop || !control) return
+    if (!drag.hang) drag.hang = { control, ids: drag.ids, affected: [...drag.shifted], dx: drag.dx, dy: drag.dy, drop: null, shown: [] }
+    if (JSON.stringify(drop) !== JSON.stringify(drag.hang.drop)) { drag.hang.drop = drop; showDrop(drag.hang, drop) }
+  }
+  /** `ids` hung where `drop` says: under its parent, before the sibling it names (or last). */
+  const hangMoves = (ids: string[], drop: HangDrop): NodeMove[] => {
+    const siblings = store.outline.childrenOf(drop.parent).filter((c) => !ids.includes(c.entity_id))
+    const beforeId = drop.kind === 'before' ? drop.sibling : drop.kind === 'after' ? siblings[siblings.findIndex((c) => c.entity_id === drop.sibling) + 1]?.entity_id ?? null : null
+    return ids.map((id) => ({ id, parentId: drop.parent, beforeId }))
+  }
   // `translate` composes with a Block's own `rotate` (it is applied after it), unlike `transform`
   const setTransform = (ids: Iterable<string>, dx: number, dy: number) => {
     for (const id of ids) { const el = frameEl(id); if (el) el.style.translate = dx === 0 && dy === 0 ? '' : `${dx}px ${dy}px` }
@@ -474,7 +679,7 @@ export function RenderHost(props: RenderHostProps) {
       const px = state.vx * dt
       const py = state.vy * dt
       camera.panBy(px, py)
-      if (d.kind === 'move' || d.kind === 'resize' || d.kind === 'marquee') { d.startX += px; d.startY += py }
+      if (d.kind === 'move' || d.kind === 'node' || d.kind === 'resize' || d.kind === 'marquee') { d.startX += px; d.startY += py }
       trackPointer(state.clientX, state.clientY)
       state.raf = requestAnimationFrame(step)
     }
@@ -513,18 +718,41 @@ export function RenderHost(props: RenderHostProps) {
     setDragging(false)
     worldRef.current?.classList.remove('is-moving')
     if (!drag) return
-    /** A press that did not move: select (shift toggles). */
+    /** A press that did not move: select (shift toggles; a pen stroke of several segments as a whole). */
     const click = (id: string, additive: boolean, wasSelected: boolean) => {
       const next = new Set(additive ? selection : [])
-      if (additive && wasSelected) next.delete(id)
+      const stroke = laid.get(id)?.entity.ink_stroke
+      const unit = (stroke ? strokeCells.get(stroke) : undefined) ?? [id]
+      if (additive && wasSelected) for (const c of unit) next.delete(c)
       else next.add(id)
       props.onSelectionChange(next)
+    }
+    if (drag.kind === 'node') {
+      setTransform([...drag.affected, ...drag.shown], 0, 0)
+      restoreLines(drag.lines)
+      selectionLayerRef.current?.removeAttribute('transform')
+      setNodePreview(null)
+      if (cancel) return
+      if (!drag.moved) { click(drag.clicked, drag.additive, drag.wasSelected); return }
+      const drop = drag.drop
+      // a Block stays in its control (R9): to put it elsewhere, copy and paste it
+      if (!drop || drop.kind === 'outside') { store.notify('info', aiwsT('aiworkspace.mindmap.cannotLeave')); return }
+      if (drop.kind === 'pin') {
+        props.onCommitLayout(drag.ids.flatMap((id) => { const l = laid.get(id); return l ? [{ id, placement: movedPlacement(laid, l, drag.dx, drag.dy) }] : [] }))
+        return
+      }
+      props.onMoveNodes?.(hangMoves(drag.ids, drop))
+      return
     }
     if (drag.kind === 'move') {
       if (drag.ghost) { for (const gid of [...drag.affected, ...drag.lines]) { const el = frameEl(gid); if (el) el.style.visibility = '' } } else setTransform(drag.affected, 0, 0)
       restoreLines(drag.lines)
       selectionLayerRef.current?.removeAttribute('transform')
-      if (!cancel && drag.moved) {
+      const hang = drag.hang
+      if (hang) { setTransform(hang.shown, 0, 0); setNodePreview(null) }
+      const into = hang?.drop && hang.drop.kind !== 'pin' && hang.drop.kind !== 'outside' ? hang.drop : null
+      if (!cancel && drag.moved && into) props.onMoveNodes?.(hangMoves(drag.ids, into))
+      else if (!cancel && drag.moved) {
         const changes: LayoutChange[] = []
         const moving = new Set(drag.affected.concat(drag.ids))
         for (const id of drag.ids) {
@@ -547,7 +775,11 @@ export function RenderHost(props: RenderHostProps) {
       const bl = drag.backing ? laid.get(drag.backing) : undefined
       if (back && bl) { back.style.left = `${bl.rect.x}px`; back.style.top = `${bl.rect.y}px`; back.style.width = `${bl.rect.w}px`; back.style.height = `${bl.rect.h}px` }
       if (!cancel && l && (drag.current.w !== drag.start.w || drag.current.h !== drag.start.h || drag.current.x !== drag.start.x || drag.current.y !== drag.start.y)) {
-        props.onCommitLayout([{ id: drag.id, placement: relativeTo(laid, l.parentId, drag.current, l.rotation) }])
+        // a node is placed by its control: its size is written, a text node's height keeps following its text
+        const stored = l.entity.placement
+        props.onCommitLayout([{ id: drag.id, placement: l.node
+          ? { x: stored?.x ?? 'auto', y: stored?.y ?? 'auto', w: Math.round(drag.current.w), h: isTextView(l.entity.view_type) ? stored?.h ?? 'auto' : Math.round(drag.current.h) }
+          : relativeTo(laid, l.parentId, drag.current, l.rotation) }])
       }
     } else if (drag.kind === 'rotate') {
       setRotatePreview(null)
@@ -609,7 +841,20 @@ export function RenderHost(props: RenderHostProps) {
       if (!cancel && drag.moved && drag.label) props.onConnectorChange?.(drag.id, { kind: 'label', label: drag.label })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the helpers it calls are rebuilt with `laid` / `props`, which are listed
-  }, [laid, selection, props, camera, index])
+  }, [laid, selection, props, camera, index, strokeCells])
+
+  // ---- writing: the writing area takes every press first — Blocks, editors and handles get none
+  const onPointerDownCapture = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!inkOn) return
+    event.stopPropagation()
+    pointerTypeRef.current = event.pointerType
+    if (event.pointerType === 'touch') { event.preventDefault(); touch.down(event.nativeEvent); return }
+    if (props.gesturesPaused) return
+    // the middle button, or Space with the primary one, still pans
+    if (event.pointerType === 'mouse' && (event.button === 1 || (event.button === 0 && spaceHeld.current))) { if (!dragRef.current && !input.busy()) beginPointer(event); return }
+    // a pen landing ends whatever else runs (a pan): `interrupt` cancels it
+    if (input.down(event.nativeEvent)) event.preventDefault()
+  }
 
   // ---- pointer gestures
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -657,16 +902,33 @@ export function RenderHost(props: RenderHostProps) {
         // a second press soon after the first edits the label (the first one shows handles that would take a dblclick)
         if (lineEditable(id) && !additive && secondPress(`line:${id}`, event)) { setDragging(false); props.onEditingChange(id); return }
         if (lineEditable(id)) beginBend(event, id, null, w, { clicked: true, additive, wasSelected })
-        else dragRef.current = { kind: 'move', ids: [], affected: [], lines: [], shifted: new Set(), startX: event.clientX, startY: event.clientY, dx: 0, dy: 0, moved: false, clicked: id, additive, wasSelected }
+        else dragRef.current = { kind: 'move', ids: [], affected: [], lines: [], shifted: new Set(), startX: event.clientX, startY: event.clientY, dx: 0, dy: 0, moved: false, clicked: id, additive, wasSelected, hangable: false, hang: null }
         return
       }
-      // locked Blocks are selected but never moved, also as part of a selection (§7.2)
-      const ids = policy.layout ? topLevel(laid, wasSelected && !additive ? new Set(selection) : new Set([id])).filter((moved) => !laid.get(moved)?.locked && canLayout(moved)) : []
+      // a node of a control is dragged within it (脑图方案 §7.2): its subtree follows, the control says where it would hang
+      const target = laid.get(pressTarget(id))
+      if (target?.node && policy.layout) {
+        const control = target.node.control
+        const picked = wasSelected && !additive ? [...selection].map(pressTarget) : [target.entity.entity_id]
+        const ids = topLevel(laid, new Set(picked)).filter((moved) => laid.get(moved)?.node?.control === control && !laid.get(moved)?.locked && canLayout(moved))
+        const affected = ids.flatMap((moved) => [moved, ...descendantsOf(moved)])
+        const touching = linesTouching(affected)
+        if (!wasSelected && !additive) props.onSelectionChange(new Set([id]))
+        dragRef.current = { kind: 'node', control, ids, affected: affected.filter((a) => !touching.includes(a)), lines: touching, startX: event.clientX, startY: event.clientY, dx: 0, dy: 0, moved: false, clicked: id, additive, wasSelected, drop: null, shown: [] }
+        return
+      }
+      // locked Blocks are selected but never moved, also as part of a selection (§7.2); a pen stroke moves whole; a
+      // control's root moves its control
+      const stroke = laid.get(id)?.entity.ink_stroke
+      const unit = (stroke ? strokeCells.get(stroke) : undefined) ?? [id]
+      const ids = policy.layout ? topLevel(laid, new Set((wasSelected && !additive ? [...selection] : unit).map(pressTarget))).filter((moved) => !laid.get(moved)?.locked && canLayout(moved)) : []
       const affected = ids.flatMap((moved) => [moved, ...descendantsOf(moved)])
       const touching = linesTouching(affected)
       if (!wasSelected && !additive) props.onSelectionChange(new Set([id]))
+      // Blocks of the canvas (not lines, pen strokes or nodes) may be dropped onto a node to hang under it (脑图方案 §7.2)
+      const hangable = ids.length > 0 && ids.every((moved) => { const l = laid.get(moved); return Boolean(l && !l.node && !l.connector && l.entity.view_type !== 'ink') })
       // re-routed lines are repainted, not translated
-      dragRef.current = { kind: 'move', ids, affected: affected.filter((a) => !touching.includes(a)), lines: touching, shifted: new Set(affected), startX: event.clientX, startY: event.clientY, dx: 0, dy: 0, moved: false, clicked: id, additive, wasSelected }
+      dragRef.current = { kind: 'move', ids, affected: affected.filter((a) => !touching.includes(a)), lines: touching, shifted: new Set(affected), startX: event.clientX, startY: event.clientY, dx: 0, dy: 0, moved: false, clicked: id, additive, wasSelected, hangable, hang: null }
       return
     }
     if (editing) endEditing()
@@ -768,6 +1030,11 @@ export function RenderHost(props: RenderHostProps) {
 
   const ghostRef = useRef<HTMLDivElement>(null)
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (input.owns(event.pointerId)) { input.move(event.nativeEvent); return }
+    if (inkOn && !dragRef.current) {
+      if (props.tool === 'eraser' && event.pointerType !== 'touch') inkCanvas.setRing({ at: screenPoint(event), r: ERASER_PX })
+      return
+    }
     if (event.pointerType === 'touch') return // window listeners follow touches
     shiftHeld.current = event.shiftKey
     const drag = dragRef.current
@@ -819,6 +1086,24 @@ export function RenderHost(props: RenderHostProps) {
         current.lastX = point.x; current.lastY = point.y; current.moved = true
         return
       }
+      if (current.kind === 'node') {
+        const dx = (point.x - current.startX) / camera.zoom
+        const dy = (point.y - current.startY) / camera.zoom
+        if (!current.moved && Math.hypot(point.x - current.startX, point.y - current.startY) < 3) return
+        if (current.ids.length === 0) return
+        current.moved = true
+        current.dx = dx; current.dy = dy
+        worldRef.current?.classList.add('is-moving')
+        setTransform(current.affected, dx, dy)
+        const moved = new Set(current.affected)
+        const shift = (id: string) => { const l = laid.get(id); return l ? { rect: { ...l.rect, x: l.rect.x + dx, y: l.rect.y + dy }, rotation: l.rotation } : undefined }
+        rerouteLines(current.lines, (id) => (moved.has(id) ? shift(id) : undefined))
+        selectionLayerRef.current?.setAttribute('transform', `translate(${dx * camera.zoom}, ${dy * camera.zoom})`)
+        const p = screenPoint({ clientX: point.x, clientY: point.y })
+        const drop = nodeDropAt(current, camera.toWorld(p.x, p.y))
+        if (JSON.stringify(drop) !== JSON.stringify(current.drop)) { current.drop = drop; showDrop(current, drop) }
+        return
+      }
       if (current.kind === 'move') {
         const dx = (point.x - current.startX) / camera.zoom
         const dy = (point.y - current.startY) / camera.zoom
@@ -839,6 +1124,7 @@ export function RenderHost(props: RenderHostProps) {
         }
         // the selection outlines follow in the DOM: no React work per frame (§9.3)
         selectionLayerRef.current?.setAttribute('transform', `translate(${dx * camera.zoom}, ${dy * camera.zoom})`)
+        if (current.hangable) trackHang(current, { clientX: point.x, clientY: point.y })
         return
       }
       if (current.kind === 'resize') {
@@ -957,6 +1243,7 @@ export function RenderHost(props: RenderHostProps) {
   useLayoutEffect(() => { flushMoveRef.current = flushMove })
 
   const onPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (input.owns(event.pointerId)) { input.up(event.nativeEvent); return }
     if (event.pointerType === 'touch' || !dragRef.current) return
     try { event.currentTarget.releasePointerCapture(event.pointerId) } catch { /* already released */ }
     finishDrag(false)
@@ -967,6 +1254,8 @@ export function RenderHost(props: RenderHostProps) {
     if (!root) return
     const onWheel = (event: WheelEvent) => {
       if (event.defaultPrevented) return
+      // the camera stays put while a stroke runs (its points are where the pen was on the page)
+      if (input.busy()) { event.preventDefault(); return }
       const target = event.target instanceof Element ? event.target : null
       const scrollable = target?.closest<HTMLElement>('.aiws-table-scroll, .aiws-prose-host, textarea, .aiws-html-host')
       const dx = event.shiftKey ? event.deltaY : event.deltaX
@@ -981,7 +1270,7 @@ export function RenderHost(props: RenderHostProps) {
     }
     root.addEventListener('wheel', onWheel, { passive: false })
     return () => root.removeEventListener('wheel', onWheel)
-  }, [camera])
+  }, [camera, input])
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
@@ -1004,6 +1293,8 @@ export function RenderHost(props: RenderHostProps) {
     props.onContextMenu({ screenX: p.x, screenY: p.y, worldX: w.x, worldY: w.y }, hit?.id ?? null)
   }
   const onContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+    // writing: no menu from a long press or a pen's barrel button
+    if (inkOn) { event.preventDefault(); return }
     if (insideEditor(event.target)) return
     event.preventDefault()
     // a long touch opens the menu itself (touch.ts); the browser's own long-press menu is dropped
@@ -1071,6 +1362,104 @@ export function RenderHost(props: RenderHostProps) {
     }
   }, [touch])
 
+  // ---- writing: what the input does here (the host object is refreshed after every render, like the touch actions)
+  /** Hide the strokes the eraser's path from `a` to `b` touches: their line, not their box; all segments of each. */
+  const eraseAlong = (a: Point, b: Point, r: number) => {
+    const run = eraseRun.current ?? (eraseRun.current = { ids: new Set(), strokes: new Set() })
+    inkCanvas.setRing({ at: camera.toScreen(b.x, b.y), r: ERASER_PX })
+    const box = { x: Math.min(a.x, b.x) - r, y: Math.min(a.y, b.y) - r, w: Math.abs(a.x - b.x) + 2 * r, h: Math.abs(a.y - b.y) + 2 * r }
+    const added: string[] = []
+    for (const item of index.query(box)) {
+      const l = laid.get(item.id)
+      if (!l || l.entity.view_type !== INK_VIEW || run.ids.has(item.id) || erasing.has(item.id) || l.locked || !canLayout(item.id) || !l.entity.capabilities.includes('delete')) continue
+      const pts = book.world(item.id, l.rect, l.rotation)
+      if (!pts || !touches(pts, a, b, r)) continue
+      const stroke = l.entity.ink_stroke ?? item.id
+      run.strokes.add(stroke)
+      for (const id of strokeCells.get(stroke) ?? [item.id]) { run.ids.add(id); added.push(id) }
+    }
+    if (added.length > 0) setErasing((prev) => new Set([...prev, ...added]))
+  }
+  const endErase = (cancel: boolean) => {
+    inkCanvas.setRing(null)
+    const run = eraseRun.current
+    eraseRun.current = null
+    if (!run || run.ids.size === 0) return
+    const putBack = () => setErasing((prev) => new Set([...prev].filter((id) => !run.ids.has(id))))
+    if (cancel) { putBack(); return }
+    void book.erase([...run.ids], run.strokes.size).then((ok) => { if (!ok) putBack() })
+  }
+  useLayoutEffect(() => {
+    let style = FALLBACK_INK
+    Object.assign(inkHost, {
+      toWorld: (clientX: number, clientY: number) => { const p = screenPoint({ clientX, clientY }); return camera.toWorld(p.x, p.y) },
+      zoom: () => camera.zoom,
+      tool: () => (props.tool === 'eraser' ? 'eraser' : 'pen'),
+      style: () => props.ink?.style ?? FALLBACK_INK,
+      capture: (pointerId: number) => { try { rootRef.current?.setPointerCapture(pointerId) } catch { /* the pointer is gone already */ } },
+      release: (pointerId: number) => { try { if (rootRef.current?.hasPointerCapture(pointerId)) rootRef.current.releasePointerCapture(pointerId) } catch { /* released */ } },
+      interrupt: () => {
+        touch.penDown()
+        if (dragRef.current) finishDrag(true)
+        stopEdgePan()
+        camera.stopAnimation()
+        window.getSelection()?.removeAllRanges()
+        changeHover(null)
+      },
+      begin: (next: InkStyle) => { style = next; inkCanvas.begin(next.color) },
+      draw: (points, predicted) => inkCanvas.add(widePoints(points, style), widePoints(predicted, style)),
+      stroke: (points, used, zoom, split) => {
+        // waiting for its Block before the live stroke goes: drawn all along
+        try {
+          book.write(points, used, zoom, props.surfaceId, laid)
+        } catch (error) {
+          store.notify('error', aiwsT('aiworkspace.canvas.ink.strokeRefused', { code: error instanceof Error ? error.message : String(error) }))
+        } finally {
+          inkCanvas.end()
+        }
+        if (split) store.notify('info', aiwsT('aiworkspace.canvas.ink.split'))
+      },
+      dropped: () => inkCanvas.end(),
+      erase: eraseAlong,
+      eraseEnd: endErase,
+    } satisfies InkHost)
+    props.ink?.control.attach(input)
+    touch.setInk({ on: inkOn, locked: Boolean(props.ink?.touchLock), busy: () => input.busy() })
+  })
+  // another tool, another canvas or unmounting drops the stroke under way (saved strokes stay)
+  useEffect(() => () => input.cancel(), [input, props.tool, props.surfaceId])
+  useEffect(() => {
+    if (!inkOn) inkCanvas.setRing(null)
+  }, [inkOn, inkCanvas])
+  useEffect(() => {
+    // a hidden page: lifts may never come, the stroke is dropped and the touches forgotten
+    const hidden = () => { if (document.visibilityState === 'hidden') { input.cancel(); touch.forget() } }
+    document.addEventListener('visibilitychange', hidden)
+    return () => document.removeEventListener('visibilitychange', hidden)
+  }, [input, touch])
+  useLayoutEffect(() => {
+    inkCanvas.attach(inkBaseRef.current, inkTailRef.current)
+    return () => inkCanvas.attach(null, null)
+  }, [inkCanvas])
+  useEffect(() => camera.onChange(() => inkCanvas.redraw()), [camera, inkCanvas])
+  useEffect(() => {
+    // the device pixel ratio changed (another screen, browser zoom): the canvases are redrawn sharp
+    let query: MediaQueryList | null = null
+    const changed = () => { inkCanvas.redraw(); watch() }
+    const watch = () => { query?.removeEventListener('change', changed); query = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`); query.addEventListener('change', changed) }
+    watch()
+    return () => query?.removeEventListener('change', changed)
+  }, [inkCanvas])
+  useEffect(() => {
+    const update = () => inkCanvas.setWaiting(book.waitingOn(props.surfaceId).map((w) => ({ points: w.points, color: w.color })))
+    update()
+    return book.subscribeWaiting(update)
+  }, [book, inkCanvas, props.surfaceId])
+  useEffect(() => {
+    // a waiting stroke whose Blocks are laid out but not mounted (panned away) is not drawn by anyone: let it go
+    for (const w of book.waitingOn(props.surfaceId)) if (w.cells.every((c) => laid.has(c)) && w.cells.some((c) => mounts.get(c) !== 'mounted')) book.drop(w.stroke)
+  }, [book, laid, mounts, props.surfaceId])
+
   /** Double-clicking the rotation handle turns the Block back upright. */
   const resetRotation = (id: string) => {
     const l = laid.get(id)
@@ -1127,6 +1516,12 @@ export function RenderHost(props: RenderHostProps) {
   const zoom = camera.settledZoom
   // lines depend on the zoom only through screen-sized details (1 px minimum width, markers): steps of 25 % re-render them
   const lineZoom = Math.pow(1.25, Math.round(Math.log(zoom) / Math.log(1.25)))
+  /** What a control draws under its Blocks (its edges). */
+  const chromeOf = (l: Laid): ReactNode => {
+    const Chrome = controlRegistry.get(l.control?.kind)?.Chrome
+    if (!Chrome) return null
+    return <Chrome container={l} laid={laid} mode={mode} zoom={zoom} preview={nodePreview?.control === l.entity.entity_id ? nodePreview.preview : null} />
+  }
   const frameList: ReactNode[] = []
   for (const id of frameOrder) {
     const state = mounts.get(id)
@@ -1146,7 +1541,7 @@ export function RenderHost(props: RenderHostProps) {
       <div
         key={id}
         ref={(el) => { if (el) frames.current.set(id, el); else frames.current.delete(id) }}
-        className={`aiws-frame-block${l.isGroup ? ' is-group' : ''}${selection.has(id) ? ' is-selected' : ''}${hover === id ? ' is-hovered' : ''}${editing === id ? ' is-editing' : ''}`}
+        className={`aiws-frame-block${l.isGroup ? ' is-group' : ''}${l.control ? ' is-control' : ''}${l.node ? ' is-node' : ''}${selection.has(id) ? ' is-selected' : ''}${hover === id ? ' is-hovered' : ''}${editing === id ? ' is-editing' : ''}`}
         data-block-id={id}
         data-testid={`aiws-canvas-block-${id}`}
         data-lod={lod}
@@ -1155,17 +1550,22 @@ export function RenderHost(props: RenderHostProps) {
         data-locked={l.locked ? 'true' : undefined}
         data-view={l.entity.view_type ?? undefined}
         data-chrome={l.isGroup ? undefined : blockRegistry.get(l.entity.view_type ?? '', l.entity.view_version ?? undefined)?.chrome ?? 'clip'}
-        style={{ left: l.rect.x, top: l.rect.y, width: l.rect.w, height: l.rect.h, rotate: l.rotation ? `${l.rotation}deg` : undefined, display: state === 'hidden' ? 'none' : undefined, visibility: props.hidden?.has(id) ? 'hidden' : undefined, zIndex: editing === id ? laid.size + 1 : l.paint + 1 }}
+        style={{ left: l.rect.x, top: l.rect.y, width: l.rect.w, height: l.rect.h, rotate: l.rotation ? `${l.rotation}deg` : undefined, display: state === 'hidden' ? 'none' : undefined, visibility: props.hidden?.has(id) || erasing.has(id) ? 'hidden' : undefined, zIndex: editing === id ? laid.size + 1 : l.paint + 1 }}
       >
         {l.isGroup ? (
-          // an untitled group (an imported container, a swimlane: its frame shows the title) draws no label
-          l.entity.title ? <div className="aiws-group-chrome"><span className="aiws-group-title">{l.entity.title}</span></div> : null
+          l.control ? chromeOf(l)
+            // an untitled group (an imported container, a swimlane: its frame shows the title) draws no label; a kind
+            // this client does not know is said so (R12)
+            : l.entity.title || l.unknownKind ? <div className="aiws-group-chrome"><span className="aiws-group-title">{l.entity.title}</span>
+              {l.unknownKind && <span className="aiws-group-unknown" data-testid={`aiws-unknown-kind-${id}`} title={t('aiworkspace.mindmap.unknownKind', { kind: l.unknownKind })}>{l.unknownKind}</span>}</div> : null
         ) : lod === 'placeholder' ? (
           <div className="aiws-block-placeholder" data-testid={`aiws-placeholder-${id}`}>{l.entity.title ?? l.entity.view_type ?? ''}</div>
         ) : (
           <BlockHost cellId={id} mode={mode} view="canvas" selected={selection.has(id)} hovered={hover === id} editorActive={editing === id}
             onActivate={handlersFor(id).onActivate} onDeactivate={handlersFor(id).onDeactivate} size={sizeFor(id, l.rect.w, l.rect.h)} zoom={zoom} lod={lod} />
         )}
+        {/* a free topic (placed by hand) is marked in its corner, over the node */}
+        {l.node?.pinned && <span className="aiws-pin-mark" title={t('aiworkspace.mindmap.pinned')} data-testid={`aiws-pin-${id}`} />}
       </div>,
     )
   }
@@ -1191,14 +1591,15 @@ export function RenderHost(props: RenderHostProps) {
   const hoverLaid = hover && !selection.has(hover) ? laid.get(hover) : undefined
   const hoverShape = hoverLaid ? shapeFor(hoverLaid.entity.entity_id) : null
   const hoverMeta = hover ? metaSink.get(hover) : undefined
-  const single = selected.length === 1 && policy.layout && canLayout(selected[0].id) && !selected[0].locked && !selected[0].line && editing !== selected[0].id && !dragging ? selected[0] : null
+  // a control is sized by its layout: no handles of its own
+  const single = selected.length === 1 && policy.layout && canLayout(selected[0].id) && !selected[0].locked && !selected[0].line && !laid.get(selected[0].id)?.control && editing !== selected[0].id && !dragging ? selected[0] : null
   const singleLaid = single ? laid.get(single.id) : undefined
   const handles = single ? (['nw', 'ne', 'se', 'sw'] as const).map((h, i) => ({ h, ...corners(single.rect, single.rotation)[i] })) : []
   const edges = single ? (['n', 'e', 's', 'w'] as const).map((h, i) => {
     const pts = corners(single.rect, single.rotation)
     return { h, a: pts[i], b: pts[(i + 1) % 4] }
   }) : []
-  const rotateAt = single && singleLaid && !singleLaid.isGroup ? (() => {
+  const rotateAt = single && singleLaid && !singleLaid.isGroup && !singleLaid.node ? (() => {
     const sw = corners(single.rect, single.rotation)[3]
     return rotatePoint({ x: sw.x - sizes.rotateOffset * 0.72, y: sw.y + sizes.rotateOffset * 0.72 }, sw, single.rotation)
   })() : null
@@ -1250,8 +1651,8 @@ export function RenderHost(props: RenderHostProps) {
   // the label's handle wins over a bend handle under it (a bend is still added by dragging the line elsewhere)
   const underLabel = (p: Point) => Boolean(lineLabel && p.x >= lineLabel.x - 6 && p.x <= lineLabel.x + lineLabel.w + 6 && p.y >= lineLabel.y - 6 && p.y <= lineLabel.y + lineLabel.h + 6)
   // connection handles: just outside the anchor each side starts from — n, e, s, w unless the Block declares its
-  // own (mouse only, §4.3)
-  const connectHandles = single && singleLaid && !singleLaid.isGroup && pointer === 'mouse' && props.onConnectorCreate && props.tool !== 'connector' ? (() => {
+  // own (mouse only, §4.3); a mind map node has its fold handle there (a relation line is drawn with the line tool)
+  const connectHandles = single && singleLaid && !singleLaid.isGroup && !singleLaid.node && pointer === 'mouse' && props.onConnectorCreate && props.tool !== 'connector' ? (() => {
     const target = targetOf(single.id)
     if (!target) return []
     return (['n', 'e', 's', 'w'] as const).flatMap((side) => {
@@ -1276,11 +1677,23 @@ export function RenderHost(props: RenderHostProps) {
     for (const h of connectHandles) keep(h.x, h.y, CONNECT_DOT + 4)
     return { x, y, w: x2 - x, h: y2 - y }
   }
+  // fold handles of mind map nodes (脑图方案 §7.3): screen-sized, just past the side the branch grows from, outside the
+  // resize zones; shown on the hovered and selected nodes and always on folded ones. Folding is the reader's own state:
+  // every mode may fold (not a show's stage, not while writing or dragging).
+  const folds = mode === 'show' || inkOn || dragging || props.placing ? [] : [...laid.values()].flatMap((l) => {
+    const n = l.node
+    const id = l.entity.entity_id
+    if (!n?.hasChildren || !(n.collapsed || hover === id || selection.has(id))) return []
+    const r = camera.rectToScreen(l.rect)
+    const gap = sizes.edge / 2 + 3
+    const at = n.grow === 'down' ? { left: r.x + r.w / 2 - 9, top: r.y + r.h + gap } : n.grow === 'left' && n.parent !== null ? { left: r.x - gap - 18, top: r.y + r.h / 2 - 9 } : { left: r.x + r.w + gap, top: r.y + r.h / 2 - 9 }
+    return [{ id, control: n.control, collapsed: n.collapsed, color: n.color, at }]
+  })
   const cutShapes = props.cutIds ? [...props.cutIds].flatMap((id) => { const s = shapeFor(id); return s ? [{ id, ...s, line: Boolean(laid.get(id)?.connector) }] : [] }) : []
   return (
     <div
       ref={rootRef}
-      className={`aiws-canvas aiws-canvas-mode-${mode}${props.background ? ` ${backgroundTheme(props.background)}` : ''}${props.tool === 'hand' ? ' is-hand' : ''}${props.placing ? ' is-placing' : ''}${hover && laid.get(hover)?.connector && !dragging && policy.select ? ' is-line-hover' : ''}`}
+      className={`aiws-canvas aiws-canvas-mode-${mode}${props.background ? ` ${backgroundTheme(props.background)}` : ''}${props.tool === 'hand' ? ' is-hand' : ''}${inkOn ? ` is-inking is-${props.tool}` : ''}${props.placing ? ' is-placing' : ''}${hover && laid.get(hover)?.connector && !dragging && policy.select ? ' is-line-hover' : ''}`}
       data-testid="aiws-canvas"
       data-surface-id={props.surfaceId}
       data-mode={mode}
@@ -1290,24 +1703,34 @@ export function RenderHost(props: RenderHostProps) {
       data-pointer={pointer}
       data-background={props.background ?? undefined}
       style={props.background ? { backgroundColor: props.background } : undefined}
+      onPointerDownCapture={onPointerDownCapture}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
-      onPointerCancel={(event) => { if (event.pointerType !== 'touch') finishDrag(true) }}
-      onDragStart={(event) => { if (!insideEditor(event.target)) event.preventDefault() }}
+      onPointerCancel={(event) => {
+        if (input.owns(event.pointerId)) { input.cancelPointer(event.pointerId); return }
+        if (event.pointerType !== 'touch') finishDrag(true)
+      }}
+      onLostPointerCapture={(event) => input.lost(event.pointerId)}
+      onClickCapture={(event) => { if (inkOn) { event.stopPropagation(); event.preventDefault() } }}
+      onDragStart={(event) => { if (inkOn || !insideEditor(event.target)) event.preventDefault() }}
       onContextMenu={onContextMenu}
       onPointerLeave={() => {
         if (!dragRef.current) { changeHover(null); setToolSnap(null) }
         if (ghostRef.current) ghostRef.current.style.visibility = 'hidden'
+        if (!input.busy()) inkCanvas.setRing(null)
       }}
       onDoubleClick={(event) => {
+        if (inkOn) return
         // pointer capture retargets clicks to the root: the double-click is resolved geometrically here
-        if (!policy.editContent || insideEditor(event.target) || (event.target as Element).closest('.aiws-overlay-html') || event.timeStamp - handleDownAt.current < 600) return
+        if (insideEditor(event.target) || (event.target as Element).closest('.aiws-overlay-html') || event.timeStamp - handleDownAt.current < 600) return
         const p = screenPoint(event)
         const w = camera.toWorld(p.x, p.y)
         const hit = hitAt(w.x, w.y)
         const l = hit ? laid.get(hit.id) : undefined
         if (!hit || !l || l.isGroup) return
+        // reading: a media Block opens — plays in place, or shows its preview (多媒体对象 §4.1)
+        if (!policy.editContent) { if (l.entity.view_type === 'asset') requestIntent(hit.id, 'open'); return }
         // a line's label is typed in place (标准对象的交互改进 §4.4)
         if (l.connector && !lineEditable(hit.id)) return
         // rich text opens with the caret where the double-click was (§4.4)
@@ -1320,6 +1743,8 @@ export function RenderHost(props: RenderHostProps) {
       <BlockMetaContext.Provider value={metaSink}>
         <div ref={worldRef} className="aiws-world" data-testid="aiws-world">{frameList}</div>
       </BlockMetaContext.Provider>
+      <canvas ref={inkBaseRef} className="aiws-ink-live" data-testid="aiws-ink-live" aria-hidden="true" />
+      <canvas ref={inkTailRef} className="aiws-ink-live" aria-hidden="true" />
       <svg className="aiws-overlay" data-testid="aiws-overlay">
         {cutShapes.map(({ id, rect, rotation, line }) => line
           ? <path key={`cut:${id}`} className="aiws-cut-outline" data-testid={`aiws-cut-${id}`} d={linePath(id)} strokeWidth={haloWidth(id, 6)} />
@@ -1344,6 +1769,22 @@ export function RenderHost(props: RenderHostProps) {
           ))}
         </g>
         {marquee && <rect className="aiws-marquee" data-testid="aiws-marquee" x={marquee.x} y={marquee.y} width={marquee.w} height={marquee.h} />}
+        {nodePreview && (() => {
+          const drop = nodePreview.drop
+          if (drop.kind === 'outside') { const box = laid.get(nodePreview.control); if (!box) return null; const r = camera.rectToScreen(box.rect); return <rect className="aiws-drop-refused" data-testid="aiws-drop-refused" x={r.x - 4} y={r.y - 4} width={r.w + 8} height={r.h + 8} rx={10} /> }
+          if (drop.kind === 'child') { const t = laid.get(drop.parent); if (!t) return null; const r = camera.rectToScreen(nodePreview.preview.rects.get(drop.parent) ?? t.rect); return <rect className="aiws-drop-target" data-testid={`aiws-drop-child-${drop.parent}`} x={r.x - 3} y={r.y - 3} width={r.w + 6} height={r.h + 6} rx={8} /> }
+          if (drop.kind === 'before' || drop.kind === 'after') {
+            const t = laid.get(drop.sibling)
+            if (!t) return null
+            const r = camera.rectToScreen(nodePreview.preview.rects.get(drop.sibling) ?? t.rect)
+            const down = t.node?.grow === 'down'
+            const before = drop.kind === 'before'
+            return down
+              ? <line className="aiws-drop-line" data-testid={`aiws-drop-${drop.kind}-${drop.sibling}`} x1={before ? r.x - 6 : r.x + r.w + 6} y1={r.y} x2={before ? r.x - 6 : r.x + r.w + 6} y2={r.y + r.h} />
+              : <line className="aiws-drop-line" data-testid={`aiws-drop-${drop.kind}-${drop.sibling}`} x1={r.x} y1={before ? r.y - 5 : r.y + r.h + 5} x2={r.x + r.w} y2={before ? r.y - 5 : r.y + r.h + 5} />
+          }
+          return null
+        })()}
         {snapShape && snap && (
           <g className="aiws-snap" data-testid={`aiws-snap-${snap.id}`} data-anchor={snap.anchor.id} data-exact={snap.exact ? 'true' : 'false'}>
             <Outline shape={snapShape.shape} rect={snapShape.rect} transform={turned(snapShape.rect, snapShape.rotation)} className="aiws-snap-outline" />
@@ -1394,6 +1835,13 @@ export function RenderHost(props: RenderHostProps) {
             <RotateCw size={pointer === 'touch' ? 18 : 14} aria-hidden="true" />
           </div>
         )}
+        {folds.map((f) => (
+          <button key={`fold:${f.id}`} type="button" className={`aiws-fold${f.collapsed ? ' is-folded' : ''}`} style={{ ...f.at, borderColor: f.color ?? undefined }} data-testid={`aiws-fold-${f.id}`} aria-expanded={!f.collapsed}
+            aria-label={t(f.collapsed ? 'aiworkspace.mindmap.unfold' : 'aiworkspace.mindmap.fold')} title={t(f.collapsed ? 'aiworkspace.mindmap.unfold' : 'aiworkspace.mindmap.fold')}
+            onPointerDown={(event) => event.stopPropagation()} onClick={() => foldBook(store).toggle(f.control, f.id)}>
+            {f.collapsed ? store.outline.descendants(f.id).filter((d) => d.type_id === 'buckyos.cell' || d.type_id === 'buckyos.container').length : '−'}
+          </button>
+        ))}
         {lockBadge && <div className="aiws-lock-badge" data-testid="aiws-lock-badge" title={t('aiworkspace.canvas.lockedBadge')} style={{ left: lockBadge.x, top: lockBadge.y }}><Lock size={12} aria-hidden="true" /></div>}
         {affordMeta && affordances.map(({ a, at }) => a.kind === 'label' ? (
           <div key={a.id} className={`aiws-afford aiws-afford-label at-${a.at}`} data-testid={`aiws-afford-${a.id}`} style={at}>

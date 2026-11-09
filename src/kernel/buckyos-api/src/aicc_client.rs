@@ -20,6 +20,34 @@ pub const AICC_SERVICE_UNIQUE_ID: &str = "aicc";
 pub const AICC_SERVICE_SERVICE_NAME: &str = "aicc";
 pub const AICC_SERVICE_SERVICE_PORT: u16 = 4040;
 
+/// `user/aicc/<user>/outputs`: what a call produced for its user, kept
+/// [`AICC_OUTPUTS_TTL_DAYS`]; whoever keeps a result longer copies it into its own bucket.
+pub const AICC_BUCKET_OUTPUTS: &str = "outputs";
+/// `user/aicc/<user>/inputs`: files uploaded for a call or derived from its inputs.
+pub const AICC_BUCKET_INPUTS: &str = "inputs";
+pub const AICC_OUTPUTS_TTL_DAYS: u32 = 7;
+pub const AICC_INPUTS_TTL_DAYS: u32 = 1;
+/// Per-user app pool over `outputs` + `inputs`.
+pub const AICC_STORAGE_QUOTA_MIB: u64 = 8192;
+
+pub fn aicc_bucket_decls() -> HashMap<String, crate::bucket_client::BucketDecl> {
+    use crate::bucket_client::{BucketDecl, BucketKind, BucketScope, DataPolicy};
+    let temp = |days| BucketDecl {
+        kind: BucketKind::Data,
+        data_policy: DataPolicy::Temp,
+        scope: BucketScope::User,
+        versioning: None,
+        quota_mib: None,
+        max_objects: None,
+        default_ttl_days: Some(days),
+        lifecycle: Vec::new(),
+    };
+    HashMap::from([
+        (AICC_BUCKET_OUTPUTS.to_string(), temp(AICC_OUTPUTS_TTL_DAYS)),
+        (AICC_BUCKET_INPUTS.to_string(), temp(AICC_INPUTS_TTL_DAYS)),
+    ])
+}
+
 pub mod ai_methods {
     pub const ROUTE_RESOLVE: &str = "route.resolve";
     pub const CHAT_COMPLETIONS_CREATE: &str = "chat.completions.create";
@@ -59,6 +87,7 @@ pub mod ai_methods {
     pub const ROUTING_UPDATE: &str = "routing.update";
     pub const ROUTING_PREVIEW: &str = "routing.preview";
     pub const EVENTS_LIST: &str = "events.list";
+    pub const PROVIDER_PREVIEW_RULES: &str = "provider.preview_rules";
     pub const PROVIDER_CATALOG: &str = "provider.catalog";
     pub const PROTOCOL_ADAPTER_LIST: &str = "protocol_adapter.list";
     pub const PROVIDER_VALIDATE: &str = "provider.validate";
@@ -119,6 +148,7 @@ pub mod ai_methods {
                 | ROUTING_UPDATE
                 | ROUTING_PREVIEW
                 | EVENTS_LIST
+                | PROVIDER_PREVIEW_RULES
                 | PROVIDER_CATALOG
                 | PROTOCOL_ADAPTER_LIST
                 | PROVIDER_VALIDATE
@@ -141,6 +171,29 @@ mod canonical_contract_tests {
 
     fn named_object() -> ResourceRef {
         ResourceRef::named_object(ObjId::new("chunk:123456").unwrap())
+    }
+
+    #[test]
+    fn provider_rule_preview_request_is_strict() {
+        let value = json!({"provider_instance_name":"custom-test", "rules_catalog":{}, "model_ids":["openai/gpt-6-sol"]});
+        let request: ProviderRulesPreviewRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        let mut invalid = value;
+        invalid["credential"] = json!("must-not-be-sent");
+        assert!(serde_json::from_value::<ProviderRulesPreviewRequest>(invalid).is_err());
+        assert!(ai_methods::is_management_method(ai_methods::PROVIDER_PREVIEW_RULES));
+    }
+
+    #[test]
+    fn aicc_buckets_are_valid_service_declarations() {
+        let decls = aicc_bucket_decls();
+        assert_eq!(
+            crate::validate_app_buckets(&decls, Some(AICC_STORAGE_QUOTA_MIB)),
+            Vec::<String>::new()
+        );
+        assert_eq!(crate::validate_app_buckets(&decls, None).len(), 1);
+        assert_eq!(decls[AICC_BUCKET_OUTPUTS].default_ttl_days, Some(7));
+        assert_eq!(decls[AICC_BUCKET_INPUTS].default_ttl_days, Some(1));
     }
 
     #[test]
@@ -466,6 +519,23 @@ mod canonical_contract_tests {
     }
 
     #[test]
+    fn context_length_exceeded_has_its_own_wire_code() {
+        let error = AiccError::new(AiccErrorCode::ContextLengthExceeded, "context is too long");
+        assert_eq!(
+            error.to_task_event_data()["code"],
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            serde_json::to_value(AiccErrorCode::ContextLengthExceeded).unwrap(),
+            AiccErrorCode::ContextLengthExceeded.as_str()
+        );
+        assert_eq!(
+            AiccError::from_krpc_error(&error.to_krpc_error()),
+            Some(error)
+        );
+    }
+
+    #[test]
     fn canonical_reload_is_the_only_reload_method() {
         assert_eq!(
             ai_methods::SERVICE_RELOAD_SETTINGS,
@@ -555,6 +625,7 @@ mod canonical_contract_tests {
     #[test]
     fn management_requests_are_strict_and_methods_are_canonical() {
         for method in [
+            ai_methods::PROVIDER_PREVIEW_RULES,
             ai_methods::PROVIDER_CATALOG,
             ai_methods::PROTOCOL_ADAPTER_LIST,
             ai_methods::PROVIDER_VALIDATE,
@@ -739,7 +810,10 @@ mod canonical_contract_tests {
         assert_eq!(AiccError::from_krpc_error(&wire), Some(error));
         let other = AiccError::new(AiccErrorCode::ProviderError, "upstream failed");
         assert!(matches!(other.to_krpc_error(), RPCErrors::ReasonError(_)));
-        assert_eq!(AiccError::from_krpc_error(&other.to_krpc_error()), Some(other));
+        assert_eq!(
+            AiccError::from_krpc_error(&other.to_krpc_error()),
+            Some(other)
+        );
     }
 
     #[test]
@@ -782,6 +856,11 @@ mod canonical_contract_tests {
 
     fn provider_instance_view(enabled: bool) -> ProviderInstanceView {
         ProviderInstanceView {
+            resolved_model_rules: BTreeMap::new(),
+            discovered_model_ids: BTreeSet::new(),
+            rules_catalog: None,
+            provider_rules_id: None,
+            instance_rules: None,
             provider_instance_name: "openai-main".to_string(),
             provider_type: ProviderInstanceType::CloudApi,
             provider_profile_id: "openai".to_string(),
@@ -795,6 +874,7 @@ mod canonical_contract_tests {
                 configured: true,
             },
             inventory: ProviderInstanceInventoryView {
+                filtered_capabilities: Vec::new(),
                 unmatched_models: Vec::new(),
                 unavailable_presets: Vec::new(),
                 unpriced_models: Vec::new(),
@@ -1291,8 +1371,6 @@ pub mod features {
 #[serde(rename_all = "snake_case")]
 pub enum LlmResponseFormatType {
     Text,
-    Json,
-    JsonObject,
     JsonSchema,
 }
 
@@ -1319,13 +1397,6 @@ impl LlmResponseFormat {
     pub fn text() -> Self {
         Self {
             format_type: LlmResponseFormatType::Text,
-            json_schema: None,
-        }
-    }
-
-    pub fn json_object() -> Self {
-        Self {
-            format_type: LlmResponseFormatType::JsonObject,
             json_schema: None,
         }
     }
@@ -1406,6 +1477,10 @@ pub enum AiccErrorCode {
     ResourceNotPermitted,
     /// The AICC user of a delegated run cannot be determined.
     AttributionUnavailable,
+    /// The request does not fit the model's context window: the Provider
+    /// refused it with a structured code, or no candidate's window holds the
+    /// estimated request. Shrinking the input is the remedy; never retriable as is.
+    ContextLengthExceeded,
 }
 
 impl AiccErrorCode {
@@ -1447,6 +1522,7 @@ impl AiccErrorCode {
             Self::QuotaUnavailable => "quota_unavailable",
             Self::ResourceNotPermitted => "resource_not_permitted",
             Self::AttributionUnavailable => "attribution_unavailable",
+            Self::ContextLengthExceeded => "context_length_exceeded",
         }
     }
 }
@@ -4339,6 +4415,10 @@ pub struct ProviderCatalogEntry {
     pub connection_behavior_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_rules_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_catalog: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_driver_overrides: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ui_hints: BTreeMap<String, Value>,
 }
@@ -4349,6 +4429,21 @@ pub struct ProviderCatalogResponse {
     pub catalog_revision: u64,
     #[serde(default)]
     pub providers: Vec<ProviderCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRulesPreviewRequest {
+    pub provider_instance_name: String,
+    pub rules_catalog: Value,
+    pub model_ids: BTreeSet<String>,
+}
+impl_request_json!(ProviderRulesPreviewRequest);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRulesPreviewResponse {
+    pub resolved_model_rules: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -4397,6 +4492,8 @@ pub struct ProtocolAdapterOperation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProtocolAdapterView {
+    #[serde(default)]
+    pub default_operations: BTreeMap<String, String>,
     pub protocol_family_id: String,
     pub protocol_adapter_id: String,
     #[serde(default)]
@@ -4605,9 +4702,30 @@ pub struct ProviderValidationErrorDetail {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FilteredProviderCapability {
+    pub provider_model_id: String,
+    pub protocol_adapter_id: String,
+    pub api_type: String,
+    pub operation_id: Option<String>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderValidateResponse {
+    pub filtered_capabilities: Vec<FilteredProviderCapability>,
+    #[serde(default)]
+    pub models_recognized: Vec<String>,
+    #[serde(default)]
+    pub unmatched_models: Vec<Value>,
+    #[serde(default)]
+    pub unavailable_presets: Vec<Value>,
+    #[serde(default)]
+    pub routing_candidates: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub base_url_reachable: bool,
     pub auth_valid: bool,
     #[serde(default)]
@@ -4833,6 +4951,10 @@ pub enum ProviderInstanceType {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderInstanceRules {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_default_routes: BTreeMap<String, BTreeSet<String>>,
     /// Legal/account residency used by Provider metadata policy matching.
     /// `unknown` deliberately remains routable unless a rule explicitly denies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4852,6 +4974,7 @@ pub struct ProviderInstanceRules {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderInstanceInventoryView {
+    pub filtered_capabilities: Vec<FilteredProviderCapability>,
     pub unmatched_models: Vec<Value>,
     pub unavailable_presets: Vec<Value>,
     pub unpriced_models: Vec<String>,
@@ -4885,6 +5008,16 @@ pub struct ProviderInstanceHealthView {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderInstanceView {
+    #[serde(default)]
+    pub resolved_model_rules: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub discovered_model_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_catalog: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_rules: Option<ProviderInstanceRules>,
     pub provider_instance_name: String,
     pub provider_type: ProviderInstanceType,
     pub provider_profile_id: String,
@@ -4931,6 +5064,8 @@ pub struct ProviderHealthResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderUpdateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_id: Option<String>,
     pub provider_instance_name: String,
     pub settings_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4958,6 +5093,7 @@ impl_request_json!(ProviderUpdateRequest);
 impl ProviderUpdateRequest {
     pub fn new(provider_instance_name: impl Into<String>, settings_revision: u64) -> Self {
         Self {
+            provider_rules_id: None,
             provider_instance_name: provider_instance_name.into(),
             settings_revision,
             enabled: None,
@@ -5895,6 +6031,13 @@ impl AiccClient {
         QueryRouteTraceResponse
     );
     client_typed_method!(
+        preview_provider_rules,
+        handle_preview_provider_rules,
+        ai_methods::PROVIDER_PREVIEW_RULES,
+        ProviderRulesPreviewRequest,
+        ProviderRulesPreviewResponse
+    );
+    client_typed_method!(
         provider_catalog,
         handle_provider_catalog,
         ai_methods::PROVIDER_CATALOG,
@@ -6409,6 +6552,10 @@ pub trait AiccHandler: Send + Sync {
         ))
     }
 
+    async fn handle_preview_provider_rules(&self, _request: ProviderRulesPreviewRequest, _ctx: RPCContext) -> std::result::Result<ProviderRulesPreviewResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(ai_methods::PROVIDER_PREVIEW_RULES.to_string()))
+    }
+
     async fn handle_provider_catalog(
         &self,
         _request: ProviderCatalogRequest,
@@ -6817,6 +6964,11 @@ impl<T: AiccHandler> AiccServerHandler<T> {
                     .handle_query_trace(QueryRouteTraceRequest::from_json(req.params)?, ctx)
                     .await?
             )),
+            ai_methods::PROVIDER_PREVIEW_RULES => {
+                let request = ProviderRulesPreviewRequest::from_json(req.params)?;
+                let result = self.0.handle_preview_provider_rules(request, ctx).await?;
+                RPCResult::Success(json!(result))
+            }
             ai_methods::PROVIDER_CATALOG => RPCResult::Success(json!(
                 self.0
                     .handle_provider_catalog(ProviderCatalogRequest::from_json(req.params)?, ctx)

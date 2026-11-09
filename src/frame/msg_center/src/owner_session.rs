@@ -331,6 +331,9 @@ const OWN_CONTACT_METHODS: &[&str] = &[
 fn method_scope(method: &str) -> Option<SessionScope> {
     if method.starts_with("group.") || method == "msg.post_send" {
         Some(SessionScope::MsgGroup)
+    } else if method == buckyos_api::METHOD_MSG_ATTACHMENT_TICKET {
+        // Asked from another Zone for a recipient of a message sent from here.
+        Some(SessionScope::MsgInbox)
     } else if OWN_CONTACT_METHODS.contains(&method) {
         Some(SessionScope::AccountSelf)
     } else {
@@ -554,7 +557,7 @@ impl TokenVerifierSlot {
         self.0.read().unwrap().clone()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn set(&self, verifier: Arc<dyn SessionTokenVerifier>) {
         *self.0.write().unwrap() = Arc::new(RequestScopedVerifier(verifier));
     }
@@ -657,7 +660,7 @@ fn normalize_title(raw: Option<String>) -> std::result::Result<Option<String>, R
 }
 
 impl MessageCenter {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn set_token_verifier(&self, verifier: Arc<dyn SessionTokenVerifier>) {
         self.token_verifier.set(verifier);
     }
@@ -781,68 +784,113 @@ impl MessageCenter {
         Ok(self.token_verifier.get().agent_owner(owner).await?.as_ref() == Some(viewer))
     }
 
-    /// Read access of the caller to `owner`'s mailbox / sessions.
+    /// Who a non-external, unrestricted caller acts as: its own mailbox
+    /// owner, the user it may observe through (an Agent's owner), and whether
+    /// it may also observe that user's other zone Agents.
+    async fn caller_mailbox_identity(
+        &self,
+        caller: &CallerIdentity,
+    ) -> std::result::Result<Option<(DID, Option<DID>, bool)>, RPCErrors> {
+        match caller.principal_kind {
+            TokenPrincipalKind::User => Ok(caller.user_did.clone().map(|did| (did, None, true))),
+            TokenPrincipalKind::Agent => {
+                let agent = DID::from_str(&caller.user_id)
+                    .map_err(|e| permission_denied(format!("agent token subject is no DID: {e}")))?;
+                let owner = self.token_verifier.get().agent_owner(&agent).await?;
+                Ok(Some((agent, owner, false)))
+            }
+            TokenPrincipalKind::App => {
+                let user = self.token_verifier.get().resolve_user_did(&caller.user_id).await?;
+                let app_id = caller
+                    .authorization_key
+                    .strip_prefix("app:")
+                    .unwrap_or(&caller.authorization_key);
+                match self.agent_of_app(app_id, Some(&user)).await {
+                    Some(agent) => Ok(Some((agent, Some(user), false))),
+                    None => Ok(Some((user, None, true))),
+                }
+            }
+            TokenPrincipalKind::System | TokenPrincipalKind::Device => Ok(None),
+        }
+    }
+
+    /// UI state without an explicit owner: a user, App or Agent caller means its own
+    /// mailbox owner's state; Zone services, devices and in-process calls (tunnels)
+    /// keep the shared namespace guarded by `obj://msg-center/ui-state`.
+    pub(crate) async fn caller_ui_state_owner(
+        &self,
+        ctx: &RPCContext,
+    ) -> std::result::Result<Option<DID>, RPCErrors> {
+        let Some(caller) = self.caller_identity(ctx).await? else {
+            return Ok(None);
+        };
+        if caller.external {
+            return Err(external_denied());
+        }
+        Ok(self.caller_mailbox_identity(&caller).await?.map(|(own, _, _)| own))
+    }
+
+    /// Read access of the caller to `owner`'s mailbox / sessions. In-process
+    /// calls (`caller_identity` is `None`) and Zone services read any owner.
     async fn authorize_owner_read_identity(
         &self,
         ctx: &RPCContext,
         owner: &DID,
     ) -> std::result::Result<(), RPCErrors> {
-        match self.caller_identity(ctx).await? {
-            None => Ok(()),
-            Some(caller) if caller.external => Err(external_denied()),
-            Some(caller) if caller.restricted() => Err(gate_denial(
-                DenyReason::SessionKindNotAllowed,
-                &caller.user_id,
-            )),
-            Some(caller) => match caller.principal_kind {
-                TokenPrincipalKind::User => {
-                    if caller.user_did.as_ref() == Some(owner)
-                        || self
-                            .user_may_observe(caller.user_did.as_ref(), owner)
-                            .await?
-                    {
-                        Ok(())
-                    } else {
-                        Err(permission_denied(format!(
-                            "user {} may not read mailbox of {}",
-                            caller.user_id,
-                            owner.to_string()
-                        )))
-                    }
-                }
-                _ => Ok(()),
-            },
+        let caller = match self.caller_identity(ctx).await? {
+            None => return Ok(()),
+            Some(caller) if caller.external => return Err(external_denied()),
+            Some(caller) if caller.restricted() => {
+                return Err(gate_denial(
+                    DenyReason::SessionKindNotAllowed,
+                    &caller.user_id,
+                ))
+            }
+            Some(caller) => caller,
+        };
+        let Some((own, observed, observe_agents)) = self.caller_mailbox_identity(&caller).await?
+        else {
+            return Ok(());
+        };
+        if &own == owner
+            || observed.as_ref() == Some(owner)
+            || (observe_agents && self.user_may_observe(Some(&own), owner).await?)
+        {
+            return Ok(());
         }
+        Err(permission_denied(format!(
+            "{} may not read mailbox of {}",
+            own.to_string(),
+            owner.to_string()
+        )))
     }
 
-    /// Write access: a zone user may only act as themselves. Agent observation
-    /// is read-only by design (`Message Center.md` §5.6).
+    /// Write access: a caller only acts as its own mailbox owner. Agent
+    /// observation is read-only by design (`Message Center.md` §5.6).
     async fn authorize_owner_write_identity(
         &self,
         ctx: &RPCContext,
         owner: &DID,
     ) -> std::result::Result<(), RPCErrors> {
-        match self.caller_identity(ctx).await? {
+        let caller = match self.caller_identity(ctx).await? {
+            None => return Ok(()),
+            Some(caller) if caller.external => return Err(external_denied()),
+            Some(caller) if caller.restricted() => {
+                return Err(gate_denial(
+                    DenyReason::SessionKindNotAllowed,
+                    &caller.user_id,
+                ))
+            }
+            Some(caller) => caller,
+        };
+        match self.caller_mailbox_identity(&caller).await? {
             None => Ok(()),
-            Some(caller) if caller.external => Err(external_denied()),
-            Some(caller) if caller.restricted() => Err(gate_denial(
-                DenyReason::SessionKindNotAllowed,
-                &caller.user_id,
-            )),
-            Some(caller) => match caller.principal_kind {
-                TokenPrincipalKind::User => {
-                    if caller.user_did.as_ref() == Some(owner) {
-                        Ok(())
-                    } else {
-                        Err(permission_denied(format!(
-                            "user {} may not write as {}",
-                            caller.user_id,
-                            owner.to_string()
-                        )))
-                    }
-                }
-                _ => Ok(()),
-            },
+            Some((own, _, _)) if &own == owner => Ok(()),
+            Some((own, _, _)) => Err(permission_denied(format!(
+                "{} may not write as {}",
+                own.to_string(),
+                owner.to_string()
+            ))),
         }
     }
 

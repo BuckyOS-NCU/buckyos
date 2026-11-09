@@ -96,8 +96,14 @@ export interface ShapeLook {
   labelPosition: LabelPosition
   wrap: boolean
   labelFill: string | null
+  /** Line height as a multiple of the font size (null: the canvas default), the font family (null: the theme's). */
+  lineHeight: number | null
+  fontFamily: FontFamily | null
   svg: SvgBody | null
 }
+
+export type FontFamily = 'sans' | 'serif' | 'mono'
+export const FONT_FAMILIES: readonly FontFamily[] = ['sans', 'serif', 'mono']
 
 type Config = Record<string, unknown> | null | undefined
 
@@ -118,6 +124,8 @@ export function readSvg(v: unknown): SvgBody | null {
   return { viewBox: s.viewBox.trim(), body: s.body, aspect: s.aspect === 'fixed' ? 'fixed' : 'stretch' }
 }
 
+export const clampShapeFontSize = (size: number) => Math.min(400, Math.max(4, size))
+
 export function readLook(config: Config, title?: string | null): ShapeLook {
   const c = config ?? {}
   const kind = (typeof c.shape === 'string' && KINDS.has(c.shape) ? c.shape : 'rect') as ShapeKind
@@ -135,7 +143,7 @@ export function readLook(config: Config, title?: string | null): ShapeLook {
     flipV: c.flip_v === true,
     size: finite(c.shape_size) ? Math.max(0, c.shape_size) : null,
     text: typeof c.text === 'string' ? c.text : (title ?? ''),
-    fontSize: finite(c.font_size) ? Math.min(400, Math.max(4, c.font_size)) : DEFAULT_FONT_SIZE,
+    fontSize: finite(c.font_size) ? clampShapeFontSize(c.font_size) : DEFAULT_FONT_SIZE,
     fontColor: colorOf(c.font_color, '', false),
     bold: c.bold === true,
     italic: c.italic === true,
@@ -145,6 +153,8 @@ export function readLook(config: Config, title?: string | null): ShapeLook {
     labelPosition: c.label_position === 'top' || c.label_position === 'bottom' || c.label_position === 'left' || c.label_position === 'right' ? c.label_position : 'inside',
     wrap: c.wrap !== false,
     labelFill: typeof c.label_fill === 'string' && (HEX.test(c.label_fill) || c.label_fill === 'auto') ? c.label_fill : null,
+    lineHeight: finite(c.line_height) ? Math.min(3, Math.max(0.8, c.line_height)) : null,
+    fontFamily: typeof c.font_family === 'string' && (FONT_FAMILIES as readonly string[]).includes(c.font_family) ? c.font_family as FontFamily : null,
     svg: kind === 'svg' ? readSvg(c.svg) : null,
   }
 }

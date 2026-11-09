@@ -35,6 +35,8 @@ pub struct InputInfo {
     pub type_id: String,
     /// table inputs: record ids present in the snapshot
     pub records: Option<BTreeSet<String>>,
+    /// a control or a Block laid out by one (a mind map node): the control's kind
+    pub control: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,6 +51,8 @@ pub struct Collector {
     pub finished: Option<Value>,
     /// Program results stay; written results are kept as they are (program re-run).
     pub program_only: bool,
+    /// The composite control definitions of the Workspace by identity: `(entity id, composition)` (扩展控件 P3).
+    pub composites: BTreeMap<String, (String, Value)>,
 }
 
 fn contract_results(contract: &Value) -> Vec<Value> {
@@ -66,10 +70,11 @@ fn is_datetime(s: &str) -> bool {
 
 /// Field type of a column from its values (declared types win).
 pub fn infer_type<'a>(values: impl Iterator<Item = &'a Value>) -> &'static str {
-    let (mut n, mut nums, mut bools, mut dates, mut dts, mut arrays) = (0, 0, 0, 0, 0, 0);
+    let (mut n, mut nums, mut bools, mut dates, mut dts, mut arrays, mut money) = (0, 0, 0, 0, 0, 0, 0);
     for v in values {
         match v {
             Value::Null => continue,
+            v if is_money(v) => money += 1,
             Value::Number(_) => nums += 1,
             Value::Bool(_) => bools += 1,
             Value::String(s) if is_date(s) => dates += 1,
@@ -92,12 +97,25 @@ pub fn infer_type<'a>(values: impl Iterator<Item = &'a Value>) -> &'static str {
         "datetime"
     } else if arrays == n {
         "multi_select"
+    } else if money == n {
+        "currency"
     } else {
         "text"
     }
 }
 
-const FIELD_TYPES: &[&str] = &["text", "number", "decimal", "boolean", "date", "datetime", "select", "multi_select"];
+const FIELD_TYPES: &[&str] = &["text", "number", "decimal", "currency", "boolean", "date", "datetime", "select", "multi_select"];
+
+/// `{ amount, currency }`: an amount (number or numeric text) with a three-letter code (表格导入 TODO §6).
+pub fn is_money(v: &Value) -> bool {
+    let Some(o) = v.as_object() else { return false };
+    let amount = match o.get("amount") {
+        Some(Value::Number(n)) => n.as_f64().is_some_and(f64::is_finite),
+        Some(Value::String(s)) => super::profile::numeric_text(s).is_some(),
+        _ => false,
+    };
+    amount && o.len() == 2 && o.get("currency").and_then(Value::as_str).is_some_and(|c| c.len() == 3 && c.chars().all(|c| c.is_ascii_alphabetic()))
+}
 
 /// `{ name: type }` or `[{ name, type, options?, scale? }]` → `[{ name, type, options?, scale? }]`.
 fn declared_fields(v: Option<&Value>) -> Result<Vec<Value>, String> {
@@ -125,6 +143,9 @@ pub fn check_value(ty: &str, v: &Value) -> bool {
         (_, Value::Null) => true,
         ("number" | "decimal", Value::Number(n)) => n.as_f64().is_some_and(f64::is_finite),
         ("number" | "decimal", Value::String(s)) => super::profile::numeric_text(s).is_some(),
+        ("currency", Value::Number(n)) => n.as_f64().is_some_and(f64::is_finite),
+        ("currency", Value::String(s)) => super::profile::numeric_text(s).is_some(),
+        ("currency", v @ Value::Object(_)) => is_money(v),
         ("boolean", Value::Bool(_)) => true,
         ("date", Value::String(s)) => is_date(s) || is_datetime(s),
         ("datetime", Value::String(s)) => is_datetime(s) || is_date(s),
@@ -260,6 +281,7 @@ impl Collector {
             "file" | "image" | "asset" => "file",
             "html" => "html",
             "video" => "video",
+            "control" => "control",
             other => return Err(vec![format!("Result \"{name}\" has unsupported type {other}")]),
         };
         let contract_ty = contract.as_ref().and_then(|c| c["type"].as_str()).unwrap_or("").to_string();
@@ -504,6 +526,10 @@ impl Collector {
                 out["html"] = json!({ "html": html, "css": raw.get("css").cloned().unwrap_or(json!("")), "js": raw.get("js").cloned().unwrap_or(json!("")), "bindings": bindings });
                 "html"
             }
+            "control" => {
+                self.control(&name, raw, contract.as_ref(), &mut out, &mut errs);
+                "control"
+            }
             _ => {
                 errs.push("video results need a real media tool and are not supported in the first version".into());
                 "video"
@@ -518,6 +544,128 @@ impl Collector {
         } else {
             Err(errs)
         }
+    }
+
+    /// A control result (脑图 TODO M3): `{ kind, config?, children: <Markdown outline> | [{ text, children }], under? }`
+    /// → `control: { kind, config, nodes: [{ text, children }], under?, under_id? }`. The tree is bounded and its
+    /// titles fit the core; `under` names an input that is a control or one of its nodes.
+    fn control(&self, name: &str, raw: &Value, contract: Option<&Value>, out: &mut Value, errs: &mut Vec<String>) {
+        if raw.get("def").is_some_and(|d| !d.is_null()) || contract.is_some_and(|c| c.get("def").is_some()) {
+            return self.composite(name, raw, contract, out, errs);
+        }
+        let kind = raw["kind"].as_str().unwrap_or("");
+        if !aiworkspace_core::types::is_control_kind(kind) {
+            errs.push(format!("Control result \"{name}\" needs kind, a control of catalog/controls.json (not {kind:?})"));
+            return;
+        }
+        if let Some(k) = contract.and_then(|c| c["kind"].as_str()).filter(|k| *k != kind) {
+            errs.push(format!("Control result \"{name}\" is contracted as a {k}, not a {kind}"));
+        }
+        let mut config = Map::new();
+        match raw.get("config") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(c)) => {
+                config = c.clone();
+                // the attributes a control defines; the core checks their values again
+                if kind == "mindmap" {
+                    config.retain(|k, _| matches!(k.as_str(), "direction" | "edge" | "spacing" | "branch_colors"));
+                }
+                let size = aiworkspace_core::canonical::canonical_json(&Value::Object(config.clone())).map_or(usize::MAX, |s| s.len());
+                if size > aiworkspace_core::types::MAX_CONFIG_BYTES {
+                    errs.push(format!("The config of control result \"{name}\" exceeds {} KiB", aiworkspace_core::types::MAX_CONFIG_BYTES / 1024));
+                } else if let Err(e) = aiworkspace_core::types::check_control_config(kind, &config) {
+                    errs.push(format!("Control result \"{name}\": {}", e.detail));
+                }
+            }
+            Some(_) => errs.push(format!("The config of control result \"{name}\" must be an object")),
+        }
+        let tree = match super::outline::result_tree(raw.get("children")) {
+            Ok(t) => t,
+            Err(e) => {
+                errs.push(format!("Control result \"{name}\" {e}"));
+                Vec::new()
+            }
+        };
+        let mut c = json!({ "kind": kind, "config": config, "nodes": tree.iter().map(super::outline::OutlineNode::to_json).collect::<Vec<_>>() });
+        match raw.get("under").filter(|u| !u.is_null()) {
+            None => {}
+            Some(u) => match u.as_str().and_then(|n| self.inputs.get(n).map(|i| (n, i))) {
+                Some((n, i)) if i.control.as_deref() == Some(kind) => {
+                    c["under"] = json!(n);
+                    c["under_id"] = json!(i.entity_id);
+                }
+                Some((n, _)) => errs.push(format!("under: input {n} of control result \"{name}\" is not a {kind} or one of its nodes")),
+                None => errs.push(format!("under: {u} of control result \"{name}\" is not an input name")),
+            },
+        }
+        out["control"] = c;
+    }
+
+    /// A composite result (扩展控件 P3): `{ def: "<ident>", config?, slots: { <slot>: [ "result:<n>" | "input:<n>" |
+    /// { view: "richtext", markdown } ] }, under?: { input, slot } }` → `control: { kind: composite, def, def_id, config,
+    /// slots, under?, under_id?, under_slot? }`. The definition must be in the Workspace; the slots its composition's.
+    fn composite(&self, name: &str, raw: &Value, contract: Option<&Value>, out: &mut Value, errs: &mut Vec<String>) {
+        let ident = raw["def"].as_str().or_else(|| contract.and_then(|c| c["def"].as_str())).unwrap_or("");
+        if let Some(d) = contract.and_then(|c| c["def"].as_str()).filter(|d| *d != ident) {
+            errs.push(format!("Control result \"{name}\" is contracted as an instance of {d}, not {ident}"));
+        }
+        let Some((def_id, composition)) = self.composites.get(ident) else {
+            errs.push(format!("Control result \"{name}\" names the composite control {ident:?}, which is not in this Workspace: import it first (buckyos aiws ext-import)"));
+            return;
+        };
+        let slots_def = composition.get("slots").and_then(Value::as_object).cloned().unwrap_or_default();
+        let mut config = Map::new();
+        match raw.get("config") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(c)) if aiworkspace_core::canonical::canonical_json(&Value::Object(c.clone())).map_or(usize::MAX, |s| s.len()) <= aiworkspace_core::types::MAX_CONFIG_BYTES => config = c.clone(),
+            Some(_) => errs.push(format!("The config of control result \"{name}\" must be an object of at most {} KiB", aiworkspace_core::types::MAX_CONFIG_BYTES / 1024)),
+        }
+        let mut slots = Map::new();
+        let mut items = 0;
+        for (slot, list) in raw.get("slots").and_then(Value::as_object).into_iter().flatten() {
+            if !slots_def.contains_key(slot) {
+                errs.push(format!("Control result \"{name}\": {slot} is not a slot of {ident} ({})", slots_def.keys().cloned().collect::<Vec<_>>().join(", ")));
+                continue;
+            }
+            let Some(list) = list.as_array() else {
+                errs.push(format!("Control result \"{name}\": slots.{slot} must be a list"));
+                continue;
+            };
+            for it in list {
+                items += 1;
+                let ok = match it {
+                    Value::String(s) => match s.split_once(':') {
+                        Some(("result", r)) => is_result_name(r) && r != name,
+                        Some(("input", i)) => self.inputs.contains_key(i),
+                        _ => false,
+                    },
+                    Value::Object(o) => o.get("view").and_then(Value::as_str) == Some("richtext") && o.get("markdown").and_then(Value::as_str).is_some_and(|m| m.chars().count() <= MAX_DIRECT_CHARS),
+                    _ => false,
+                };
+                if !ok {
+                    errs.push(format!("Control result \"{name}\": slots.{slot} item {it} must be \"result:<another result>\", \"input:<an input>\" or {{ view: \"richtext\", markdown }}"));
+                }
+            }
+            slots.insert(slot.clone(), list.clone().into());
+        }
+        if items == 0 {
+            errs.push(format!("Control result \"{name}\" puts nothing into the slots of {ident}"));
+        }
+        if items > 64 {
+            errs.push(format!("Control result \"{name}\" puts more than 64 Blocks into {ident}"));
+        }
+        let mut c = json!({ "kind": aiworkspace_core::types::COMPOSITE, "def": ident, "def_id": def_id, "config": config, "slots": slots });
+        if let Some(u) = raw.get("under").filter(|u| !u.is_null()) {
+            match (u["input"].as_str().and_then(|n| self.inputs.get(n).map(|i| (n, i))), u["slot"].as_str()) {
+                (Some((n, i)), Some(slot)) if i.type_id == aiworkspace_core::model::TYPE_CONTAINER && i.control.as_deref() == Some(aiworkspace_core::types::COMPOSITE) => {
+                    c["under"] = json!(n);
+                    c["under_id"] = json!(i.entity_id);
+                    c["under_slot"] = json!(slot);
+                }
+                _ => errs.push(format!("under: control result \"{name}\" goes into {{ input, slot }}: an input that is a composite, and one of its slots")),
+            }
+        }
+        out["control"] = c;
     }
 
     /// The results now held (program first), by name.
@@ -577,6 +725,17 @@ impl Collector {
             }
             "image" | "asset" => p["file"] = json!({ "media_type": r["file"]["media_type"], "size": r["file"]["size"], "image": r["file"].get("image") }),
             "html" => p["html"] = json!({ "bytes": r["html"]["html"].as_str().map_or(0, str::len), "bindings": r["html"]["bindings"] }),
+            "control" if r["control"]["kind"] == aiworkspace_core::types::COMPOSITE => {
+                let c = &r["control"];
+                p["control"] = json!({ "kind": c["kind"], "def": c["def"], "config": c["config"], "under": c.get("under"),
+                                       "slots": c["slots"].as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), json!(v.as_array().map_or(0, Vec::len)))).collect::<Map<String, Value>>()) });
+            }
+            "control" => {
+                let c = &r["control"];
+                let tree = super::outline::tree_of(&c["nodes"]);
+                p["control"] = json!({ "kind": c["kind"], "config": c["config"], "nodes": super::outline::count(&tree), "under": c.get("under"),
+                                       "outline": super::outline::format_markdown_outline(&tree).chars().take(400).collect::<String>() });
+            }
             _ => {}
         }
         if let Some(b) = prev {
@@ -785,6 +944,12 @@ mod tests {
         assert_eq!(infer_type([json!(1), json!(2.5), Value::Null].iter()), "number");
         assert_eq!(infer_type([json!("2026-07-01"), json!("2026-08-01")].iter()), "date");
         assert_eq!(infer_type([json!("a"), json!(1)].iter()), "text");
+        assert_eq!(infer_type([json!({"amount": 12.5, "currency": "USD"}), json!({"amount": "3", "currency": "CNY"})].iter()), "currency");
+        assert_eq!(infer_type([json!({"amount": 12.5, "currency": "USD"}), json!(3)].iter()), "text");
+        assert!(check_value("currency", &json!({"amount": "12.50", "currency": "EUR"})));
+        assert!(check_value("currency", &json!(12)));
+        assert!(!check_value("currency", &json!({"amount": "x", "currency": "EUR"})));
+        assert!(!check_value("currency", &json!("twelve")));
         let (m, d) = sniff_file(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360"></svg>"#);
         assert_eq!((m.as_str(), d), ("image/svg+xml", Some((640, 360))));
     }

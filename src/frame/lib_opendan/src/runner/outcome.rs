@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use agent_tool::xllm::RunStatus;
+use agent_tool::xllm::{RunStatus, REFUSED_CREDENTIALS};
 use buckyos_api::AiUsage;
 use llm_context::error::{ErrorSource, LLMComputeError, ProviderFailure};
 use llm_context::outcome::{ContextOutput, LLMContextOutcome};
@@ -15,20 +15,53 @@ use crate::error::Result;
 use crate::protocol::*;
 use crate::session::runs::RunHandle;
 use crate::session::Session;
-use crate::state::run_digest;
 
 use super::flush::{run_history_entries, FlushMarks};
 use super::history::maybe_compact;
 use super::inputs::side_effects_from_worklog;
 use super::live::{live_from_frame, remove_if_safe, suspend_run};
 use super::shared::{commit_and_report, report, ClosedTurn, LiveCtx, Shared};
-use super::tools::pending_sub_call;
 
 const WAIT_USER_MSG: &str = "WAIT_USER_MSG";
 
+/// Interrupt reason of a run stopped by `control(pause)`.
+pub(super) const PAUSE_REASON: &str = "session paused";
+
+/// A yield waits for the sub sessions the session must hear from; with
+/// none, a progress report alone does not finish the session.
+async fn settle_yield(sh: &Shared, next: &mut Next, site: &CallSite<'_>, yielded: bool) -> Result<()> {
+    if site.child || !yielded {
+        return Ok(());
+    }
+    let children = super::children::unsettled_children(sh).await?;
+    if !children.is_empty() {
+        next.kind = FinishKind::Wait;
+        next.run_ended = true;
+        next.suspended = false;
+        next.finished = false;
+        next.outcome = None;
+        next.waiting = true;
+        next.turn_end = None;
+        next.next_behavior = None;
+        next.call = None;
+        next.error = None;
+        next.wait_children = children;
+    } else if next.finished && next.outcome == Some(Outcome::Succeeded) {
+        next.kind = FinishKind::Error;
+        next.outcome = Some(Outcome::Failed);
+        next.turn_end = Some(TurnStatus::Failed);
+        next.error = Some(json!({
+            "kind": "missing_end_report",
+            "message": "a progress report alone does not finish the session; nothing it started is running",
+            "recoverable": false,
+        }));
+    }
+    Ok(())
+}
+
 /// How a run segment ended: the `kind` of a [`Next`], persisted in
 /// run.json (`host.extra.finish`) and written as the worklog `outcome`
-/// entry's kind. Serialized in snake_case (`process_done`, `pending_tool`,
+/// entry's kind. Serialized in snake_case (`process_done`, `wait`,
 /// `context_limit`, ...).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,7 +72,8 @@ pub(super) enum FinishKind {
     /// A sub context (create-sub-context / fork child) returned to its
     /// caller.
     ProcessDone,
-    /// `WAIT_USER_MSG`: the run ended waiting for input.
+    /// `WAIT_USER_MSG`: the run ended waiting for input; or the run is kept
+    /// waiting for the work it started (`run_ended = false`).
     Wait,
     /// Hand-over to another behavior: the run is suspended into
     /// `process_stack` (parked, or as the caller of a sub context).
@@ -48,10 +82,11 @@ pub(super) enum FinishKind {
     Error,
     Stopped,
     Interrupted,
-    /// Paused on a deferred tool result.
-    PendingTool,
     /// Paused at the context limit (compactions exhausted).
     ContextLimit,
+    /// `control(pause)` stopped the run at an inference boundary: kept at
+    /// its checkpoint, the Turn stays open, `resume` runs it on.
+    Paused,
 }
 
 impl FinishKind {
@@ -66,8 +101,8 @@ impl FinishKind {
             FinishKind::Error => "error",
             FinishKind::Stopped => "stopped",
             FinishKind::Interrupted => "interrupted",
-            FinishKind::PendingTool => "pending_tool",
             FinishKind::ContextLimit => "context_limit",
+            FinishKind::Paused => "paused",
         }
     }
 }
@@ -100,8 +135,15 @@ pub(super) struct Next {
     /// with the result.
     pub(super) child_status: Option<String>,
     /// The session would finish, but sub sessions it must hear from are not
-    /// settled: the run ends, the Turn stays open waiting for them.
+    /// settled: the run is kept, the Turn stays open waiting for them.
     pub(super) wait_children: Vec<String>,
+    /// Tasks this run started that are still running: the run is kept and
+    /// their ends come back as its input.
+    pub(super) wait_tasks: Vec<String>,
+    /// A multi-Turn Work Session's reply that neither ended it nor waits
+    /// for anything: the run is kept and gets this correction count's
+    /// nudge as its next input (once per Turn).
+    pub(super) nudge: u8,
     /// The Turn ended on a question nobody answers now
     /// (`wait_user_msg = end_turn`).
     pub(super) needs_input: bool,
@@ -113,9 +155,10 @@ pub(super) struct Next {
     pub(super) reply_artifacts: Vec<ReportArtifact>,
     /// Structured reply: what the conversation is about now.
     pub(super) topic: Option<Topic>,
-    /// The reply broke its contract after the allowed repair: the raw text
-    /// went out as it was, and this is why (recorded in the worklog).
     pub(super) reply_error: Option<String>,
+    /// A retryable error kept the run: when it infers again
+    /// (`state.retry`; every other outcome clears it).
+    pub(super) retry: Option<RetryState>,
 }
 
 /// A UI session's structured reply `{reply, topic, artifacts}` (`topic` may be
@@ -166,6 +209,65 @@ impl StructuredReply {
     }
 }
 
+pub(super) fn is_ui_reply(
+    cfg: &SessionConfig,
+    snapshot: &LLMContextSnapshot,
+    child: bool,
+) -> bool {
+    !child
+        && cfg.session.kind == SessionKind::Ui
+        && matches!(
+            snapshot.request.output,
+            llm_context::OutputSpec::Json { max_repairs: Some(_), .. }
+        )
+}
+
+pub(super) async fn apply_ui_reply(
+    sh: &Arc<Shared>,
+    run: &RunHandle,
+    cfg: &SessionConfig,
+    next: &mut Next,
+    output: &ContextOutput,
+) {
+    if next.report.is_some() {
+        return;
+    }
+    match output {
+        ContextOutput::Json { content } => {
+            let r = StructuredReply::parse(content);
+            next.answer = Some(r.reply);
+            next.topic = r.topic;
+            if !r.artifacts.is_empty() {
+                let id = crate::ids::h(&[run.run_id(), "structured_reply"]);
+                match super::reports::store_artifacts(sh, &id, &r.artifacts).await {
+                    Ok(a) => next.reply_artifacts = a,
+                    Err(e) => {
+                        log::warn!("session {}: reply artifacts not delivered: {e}", sh.dir.sid());
+                        next.reply_error = Some(format!("artifacts not delivered: {e}"));
+                    }
+                }
+            }
+        }
+        ContextOutput::Invalid { error, .. } => {
+            *next = Next {
+                kind: FinishKind::Error,
+                run_ended: true,
+                turn_end: Some(TurnStatus::Failed),
+                usage: next.usage.take(),
+                reply_error: Some(error.clone()),
+                error: Some(json!({
+                    "kind": "output_format",
+                    "message": error,
+                    "recoverable": false,
+                })),
+                ..Default::default()
+            };
+            fail_unattended(cfg, next);
+        }
+        ContextOutput::Text { .. } => {}
+    }
+}
+
 /// `error.kind` of a Turn the AI service refused under the AI quota or
 /// resource policy of the Agent's owner.
 pub const AI_QUOTA_ERROR_KIND: &str = "ai_quota";
@@ -203,6 +305,23 @@ pub(super) fn decide_end(cfg: &SessionConfig, next: &mut Next, completed: u64) {
             }
         }
     }
+}
+
+/// Nobody answers the session: it has no queue, or its queue only brings it
+/// events, never an answer it waits for (a plan's forwarded user messages,
+/// a Todo's updates).
+fn nobody_answers(cfg: &SessionConfig) -> bool {
+    cfg.channels.inputs.is_empty() || cfg.session.policy.wait_user_msg != WaitPolicy::Allowed
+}
+
+/// A multi-Turn Work Session (simple Work Session TODO §3.3): every reply
+/// closes a Turn, the work it started opens the next ones, and only an
+/// explicit final report ends it.
+pub(super) fn multi_turn_work(cfg: &SessionConfig) -> bool {
+    cfg.session.kind == SessionKind::Work
+        && cfg.session.policy.completion == CompletionPolicy::ExplicitReport
+        && cfg.session.end_condition.kind == EndConditionType::MaxTurns
+        && nobody_answers(cfg)
 }
 
 /// The run produced a Self Report (`<report>`).
@@ -378,7 +497,6 @@ pub(super) fn classify_done(
                         behavior: b.to_string(),
                         trigger: CallTrigger::Behavior,
                         task: None,
-                        todo: None,
                     });
                 }
             }
@@ -397,7 +515,7 @@ pub(super) fn classify_done(
         }
         _ if explicit_end => decide_end(cfg, &mut next, completed + 1),
         _ if cfg.session.policy.completion == CompletionPolicy::ExplicitReport => {
-            if cfg.channels.inputs.is_empty() {
+            if nobody_answers(cfg) {
                 next.finished = true;
                 next.kind = FinishKind::Error;
                 next.outcome = Some(Outcome::Failed);
@@ -436,15 +554,18 @@ pub(super) async fn hand_over(
     next: &mut Next,
 ) -> Result<()> {
     let target = next.next_behavior.clone().unwrap_or_default();
-    super::todos::bind_serial(sh, next, run.run_id(), snapshot).await?;
     suspend_run(sh, run, behavior, snapshot, &target, next.call.clone()).await?;
+    if run.sub_call().is_some() {
+        // Handed over: the call is with the caller's frame now.
+        run.set_sub_call(None)?;
+    }
     next.suspended = true;
     Ok(())
 }
 
 /// A session that would finish successfully while sub sessions it must hear
 /// from are not settled does not finish: the run ends, the Turn stays open
-/// (`waiting_for = children`); their end arrives as input of the same Turn
+/// (`wait_children`); their end arrives as input of the same Turn
 /// and the agent concludes then (xAgent §4.15).
 pub(super) async fn hold_for_children(sh: &Shared, next: &mut Next) -> Result<()> {
     if next.report.is_some()
@@ -504,6 +625,9 @@ pub(super) async fn handle_context_outcome(
     };
     let mut next = Next::default();
     let mut snapshot = lc.ctx.snapshot();
+    // An inference of this segment succeeded: a retryable error now starts
+    // a new series of retries.
+    let progressed = lc.rounds.take_progress();
     let (child, depth) = call_site_of(sh, lc.run.run_id()).await;
     let entry_cfg = cfg.clone();
     let assembler = sh.deps.assembler.clone();
@@ -522,9 +646,6 @@ pub(super) async fn handle_context_outcome(
             response,
             ..
         } => {
-            // A reply contract: a UI conversation's reply is structured
-            // (`{reply, topic, artifacts}`); a reply that broke the
-            // contract twice goes out as it is.
             let contract = matches!(
                 snapshot.request.output,
                 llm_context::OutputSpec::Json {
@@ -532,17 +653,8 @@ pub(super) async fn handle_context_outcome(
                     ..
                 }
             );
-            let mut structured = None;
             let mut reply_error = None;
             let text = match &output {
-                ContextOutput::Json { content }
-                    if contract && !site.child && cfg.session.kind == SessionKind::Ui =>
-                {
-                    let r = StructuredReply::parse(content);
-                    let reply = r.reply.clone();
-                    structured = Some(r);
-                    reply
-                }
                 ContextOutput::Invalid { content, error } if contract => {
                     log::warn!(
                         "session {}: the reply of run {} does not meet its contract: {error}",
@@ -567,10 +679,7 @@ pub(super) async fn handle_context_outcome(
                     text
                 }
             }));
-            let replied = has_report(&snapshot)
-                || behavior_result
-                    .as_ref()
-                    .is_some_and(|b| !b.messages_to_send.is_empty());
+            let replied = has_report(&snapshot);
             lc.run.checkpoint_with_results(&snapshot, None)?;
             super::rounds::flush_counts(sh, &lc.run, &lc.rounds).await?;
             super::reports::sync_xml(sh, &lc.run, &snapshot).await?;
@@ -593,27 +702,32 @@ pub(super) async fn handle_context_outcome(
             next.report = final_report;
             next.usage = Some(usage);
             next.reply_error = reply_error;
-            if let Some(r) = structured {
-                next.topic = r.topic;
-                if !r.artifacts.is_empty() {
-                    let id = crate::ids::h(&[lc.run.run_id(), "structured_reply"]);
-                    match super::reports::store_artifacts(sh, &id, &r.artifacts).await {
-                        Ok(a) => next.reply_artifacts = a,
-                        // Checked before the reply was accepted; gone since.
-                        Err(e) => {
-                            log::warn!("session {}: reply artifacts not delivered: {e}", sh.dir.sid());
-                            next.reply_error = Some(format!("artifacts not delivered: {e}"));
-                        }
-                    }
-                }
+            if is_ui_reply(&cfg, &snapshot, site.child) {
+                apply_ui_reply(sh, &lc.run, &cfg, &mut next, &output).await;
             }
             let yielded = behavior_result.as_ref().and_then(|b| b.decision())
                 == Some(llm_context::StepDecision::Yield);
-            super::todos::settle(sh, &mut next, &site, yielded, lc.run.run_id(), &snapshot).await?;
+            settle_yield(sh, &mut next, &site, yielded).await?;
             hold_for_children(sh, &mut next).await?;
+            if let Some(call) = lc.run.sub_call() {
+                // A sub context a call of this run asked for: the session
+                // hands over to it now; its result comes back as input.
+                let usage = next.usage.take();
+                next = Next {
+                    kind: FinishKind::Switch,
+                    next_behavior: Some(call.behavior.clone()),
+                    call: Some(call),
+                    usage,
+                    ..Default::default()
+                };
+            } else {
+                keep_while_running(sh, lc, &cfg, site.child, &mut next, yielded).await;
+            }
             status = match next.kind {
-                // Suspended into process_stack: never terminal.
+                // Suspended into process_stack, or kept for the work it
+                // started: never terminal.
                 FinishKind::Switch => RunStatus::Paused,
+                _ if !next.run_ended => RunStatus::Paused,
                 FinishKind::Error => RunStatus::Failed,
                 _ => RunStatus::Completed,
             };
@@ -627,7 +741,7 @@ pub(super) async fn handle_context_outcome(
                 returns(
                     &mut next,
                     "failed",
-                    Some(format!("{} ({which:?})", super::todos::SUB_CONTEXT_BUDGET)),
+                    Some(format!("the sub context ran out of budget ({which:?})")),
                 );
             } else {
                 next.kind = FinishKind::Budget;
@@ -640,16 +754,16 @@ pub(super) async fn handle_context_outcome(
         LLMContextOutcome::Error { error, usage, .. } => {
             next.usage = Some(usage);
             next.kind = FinishKind::Error;
-            let retry = is_retryable_error(&error);
+            let mut retry = is_retryable_error(&error);
             next.error = Some(match &error {
                 // AI Center Quota PRD §9.6: the session learns only that the
                 // Agent is limited; the rules and balances stay with its owner.
                 LLMComputeError::Provider {
-                    failure: ProviderFailure::Refused(refusal),
+                    failure: ProviderFailure::Refused { code },
                     ..
-                } => json!({
+                } if code != REFUSED_CREDENTIALS => json!({
                     "kind": AI_QUOTA_ERROR_KIND,
-                    "refusal": refusal,
+                    "refusal": code,
                     "message": "the AI service refused the call under the quota or resource policy of the Agent's owner",
                     "recoverable": false,
                 }),
@@ -659,6 +773,45 @@ pub(super) async fn handle_context_outcome(
                     "recoverable": retry,
                 }),
             });
+            if retry {
+                let (prev, applied) = {
+                    let s = sh.session.lock().await;
+                    let applied = s
+                        .state
+                        .live_run
+                        .as_ref()
+                        .filter(|l| l.run_id == lc.run.run_id())
+                        .map(|l| l.applied_input_seq)
+                        .unwrap_or(0);
+                    (s.state.retry.clone().filter(|_| !progressed), applied)
+                };
+                let mut event = json!({
+                    "session_id": sh.dir.sid(),
+                    "run_id": lc.run.run_id(),
+                    "error_kind": format!("{:?}", error.source()).to_lowercase(),
+                });
+                match super::retry::on_retryable(
+                    prev.as_ref(),
+                    &sh.deps.options,
+                    crate::now_ms(),
+                    applied,
+                    &error.to_string(),
+                ) {
+                    super::retry::Retry::Scheduled(r) => {
+                        event["attempts"] = json!(r.attempts);
+                        event["not_before_ms"] = json!(r.not_before_ms);
+                        log::warn!("opendan.run.retry_scheduled {event}");
+                        next.retry = Some(r);
+                    }
+                    super::retry::Retry::Exhausted(e) => {
+                        event["attempts"] = e["attempts"].clone();
+                        event["since_ms"] = e["since_ms"].clone();
+                        log::error!("opendan.run.retries_exhausted {event}");
+                        next.error = Some(e);
+                        retry = false;
+                    }
+                }
+            }
             if retry {
                 // Retryable: the run is kept and the Turn stays open.
                 status = RunStatus::Paused;
@@ -715,28 +868,14 @@ pub(super) async fn handle_context_outcome(
                 next.turn_end = Some(TurnStatus::Stopped);
                 next.error = Some(json!({ "kind": "stopped", "message": reason, "recoverable": false }));
                 status = RunStatus::Interrupted;
+            } else if reason == PAUSE_REASON {
+                // Kept at its checkpoint, the Turn open: `resume` runs it on.
+                next.kind = FinishKind::Paused;
+                status = RunStatus::Paused;
             } else {
                 next.kind = FinishKind::Interrupted;
                 next.error = Some(json!({ "kind": "interrupted", "message": reason }));
                 status = RunStatus::Interrupted;
-            }
-        }
-        LLMContextOutcome::PendingTool { snapshot: s, .. } => {
-            snapshot = s;
-            status = RunStatus::Paused;
-            let behaviors = cfg.behaviors().map_err(crate::error::OpenDanError::InvalidArgument)?;
-            match pending_sub_call(&snapshot, &behaviors, &entry)? {
-                // Suspended on `call_behavior`: the run becomes the caller
-                // of that sub context; its batch / step stays with it.
-                Some(call) => {
-                    next.kind = FinishKind::Switch;
-                    next.next_behavior = Some(call.behavior.clone());
-                    next.call = Some(call);
-                }
-                None => {
-                    next.kind = FinishKind::PendingTool;
-                    next.waiting = true;
-                }
             }
         }
         LLMContextOutcome::ContextLimitReached {
@@ -758,8 +897,8 @@ pub(super) async fn handle_context_outcome(
         super::rounds::flush_counts(sh, &lc.run, &lc.rounds).await?;
         crate::fault::point("report:after_paired_checkpoint");
     }
-    // 1. results and snapshot first; only covered in-flight markers clear. A
-    //    run that ends records the decision in the same run.json write.
+    // 1. results and snapshot first. A run that ends records the decision in
+    //    the same run.json write.
     if next.run_ended {
         let finish = serde_json::to_value(&next).unwrap_or(Value::Null);
         lc.run.checkpoint_finish(&snapshot, status, finish)?;
@@ -768,6 +907,9 @@ pub(super) async fn handle_context_outcome(
         // commits the transfer instead of inferring again.
         let target = next.next_behavior.clone().unwrap_or_default();
         lc.run.checkpoint_handover(&snapshot, &target)?;
+    } else if next.waiting && next.kind == FinishKind::Wait {
+        let kept = serde_json::to_value(&next).unwrap_or(Value::Null);
+        lc.run.checkpoint_kept(&snapshot, kept)?;
     } else {
         lc.run.checkpoint_with_results(&snapshot, Some(status))?;
     }
@@ -794,45 +936,205 @@ pub(super) async fn handle_context_outcome(
         finish_run(sh, &lc.run, &snapshot, lc.behavior, next.clone()).await?;
         return Ok(next);
     }
-    // Run kept (paused / waiting on a tool): state only. Questions asked
-    // through a notification leave before the wait is committed.
-    if next.waiting {
-        Box::pin(super::ask::send_notify_questions(sh, &lc.run, &snapshot)).await;
-        crate::fault::point("user_input:after_notify_send");
+    commit_kept(sh, &lc.run, &snapshot, lc.behavior, &next).await?;
+    if next.turn_end.is_some() {
+        // The Turn this keep closed: its reply and its task.
+        super::outbound::flush_outbox(sh).await;
+        super::turn_task::flush_turn_tasks(sh).await;
     }
+    Ok(next)
+}
+
+/// State of a run that is kept: paused (an error the runtime retries), or
+/// waiting for the work it started — the session follows those tasks and
+/// brings their ends back as input of this same run (freeze TODO F18). In a
+/// multi-Turn Work Session the reply that keeps the run closes the Turn
+/// (`next.turn_end`): the run stays, the next input opens a Turn in it
+/// (simple Work Session TODO Q12). Redone by recovery from the run's `kept`
+/// record.
+pub(super) async fn commit_kept(
+    sh: &Arc<Shared>,
+    run: &RunHandle,
+    snapshot: &LLMContextSnapshot,
+    behavior: bool,
+    next: &Next,
+) -> Result<()> {
+    let run_id = run.run_id().to_string();
     let mut s = sh.session.lock().await;
+    // What the run did so far goes to the worklog, closed by the wait.
+    let turn = s.state.current_turn();
+    let mut bodies = Vec::new();
+    if let Some(live) = s.state.live_run.clone().filter(|l| l.run_id == run_id) {
+        let (history, marks) =
+            run_history_entries(&run_id, snapshot, behavior, FlushMarks::of(&live), turn);
+        bodies = history;
+        bodies.push(WorklogBody::Outcome {
+            run_id: run_id.clone(),
+            turn,
+            kind: next.kind.as_str().into(),
+            next_behavior: None,
+            report: next.answer.clone(),
+        });
+        if let Some(l) = s.state.live_run.as_mut() {
+            marks.apply(l);
+        }
+    }
+    if let Some(status) = next.turn_end {
+        if close_open_turn(sh, &mut s, &run_id, turn, status, next).await?.is_some() {
+            bodies.push(WorklogBody::TurnEnded {
+                run_id: run_id.clone(),
+                turn,
+                status,
+                at_ms: crate::now_ms(),
+            });
+            s.state.one_line_status = one_line(next);
+        }
+    }
+    s.append_worklog(&sh.lease, bodies)?;
     s.state.run_state = if next.waiting {
         RunState::Waiting
     } else {
         RunState::Ready
     };
-    let mut asked = false;
     if next.waiting {
-        // Generated from the snapshot's suspended calls (status display and
-        // event matching); the calls and their deadlines live in the
-        // snapshot only. A question to the user leaves with this commit.
-        asked = Box::pin(super::ask::queue_questions(sh, &mut s, &lc.run, &snapshot)).await;
-        s.state.waiting_for = Some(super::ask::waiting_for(&snapshot, &lc.run));
+        for task in &next.wait_tasks {
+            if !s.state.watched_tasks.contains(task) {
+                s.state.watched_tasks.push(task.clone());
+            }
+        }
+        s.state.wait_children = next.wait_children.clone();
+        // Ticks are counted from the moment the session began waiting.
+        if !next.wait_tasks.is_empty() || !next.wait_children.is_empty() {
+            s.state.task_watch.last_tick_ms = crate::now_ms();
+        }
+    }
+    if next.nudge > 0 {
+        s.state.nudge.count = s.state.nudge.count.max(next.nudge);
+        s.state.nudge.pending = true;
+    }
+    if next.kind == FinishKind::Paused {
+        // A resume that arrived meanwhile runs it on at once.
+        match s.state.paused.as_mut() {
+            Some(p) => p.in_run = true,
+            None => s.state.resume_run = true,
+        }
     }
     s.state.last_error = next.error.clone();
-    commit_and_report(sh, &mut s).await?;
-    drop(s);
-    if asked {
-        crate::fault::point("user_input:after_question_commit");
-        Box::pin(super::outbound::flush_outbox(sh)).await;
+    s.state.retry = next.retry.clone();
+    super::turn_task::note_live_line(&mut s, None, None);
+    commit_and_report(sh, &mut s).await
+}
+
+/// The loop never waits (freeze TODO F17 / F18): a behavior step that
+/// yields, or a reply of the function call loop, while work this run started
+/// is still running (its tasks, the sub sessions the session must hear from)
+/// keeps the run — it is not ended, and the ends of that work come back as
+/// input of this same run. That work comes first: a reply that could not
+/// finish the session without a final report (`missing_end_report`) waits
+/// for it too. With nothing running the decision stands as it is (a yield's
+/// report is the reply).
+///
+/// A multi-Turn Work Session ([`multi_turn_work`], not inside a sub
+/// context): the reply that keeps the run closes the Turn — it is the
+/// progress its caller sees — and with nothing running a reply that did not
+/// end the session gets one correction (`nudge`) before it fails.
+async fn keep_while_running(
+    sh: &Arc<Shared>,
+    lc: &LiveCtx,
+    cfg: &SessionConfig,
+    child: bool,
+    next: &mut Next,
+    yielded: bool,
+) {
+    let missing_end = next
+        .error
+        .as_ref()
+        .and_then(|e| e.get("kind"))
+        .and_then(Value::as_str)
+        == Some("missing_end_report");
+    let plain_reply = !lc.behavior
+        && (next.kind == FinishKind::Done || missing_end)
+        && next.report.is_none()
+        && next.next_behavior.is_none();
+    if !(yielded || plain_reply || next.kind == FinishKind::Wait && !next.wait_children.is_empty()) {
+        return;
     }
-    Ok(next)
+    if next.finished && next.outcome != Some(Outcome::Succeeded) && !missing_end {
+        return;
+    }
+    let multi_turn = !child && multi_turn_work(cfg);
+    // Sub sessions report through the session's own channel
+    // (`poll_children`); other tasks are followed by id: those running, and
+    // those that ended without the model having their end yet (it comes
+    // back as input).
+    let recent = sh.session.lock().await.state.recent_keys.clone();
+    let mut tasks = Vec::new();
+    let mut own_children = Vec::new();
+    for task_id in lc.run.noted_tasks() {
+        if let Some(sid) = task_id.strip_prefix(super::children::SESSION_TASK_PREFIX) {
+            own_children.push(sid.to_string());
+            continue;
+        }
+        let running = matches!(
+            lc.resolver.state(&task_id).await,
+            agent_tool::TaskState::Running { .. }
+        );
+        let undelivered = !lc.resolver.result_seen(&task_id)
+            && !recent.contains(&super::receipts::internal_task_key(&task_id));
+        if running || (multi_turn && undelivered) {
+            tasks.push(task_id);
+        }
+    }
+    // A multi-Turn Work Session waits for every sub session it must hear
+    // from; otherwise for those this run started.
+    let mut children = next.wait_children.clone();
+    if multi_turn || !own_children.is_empty() {
+        for sid in super::children::unsettled_children(sh).await.unwrap_or_default() {
+            if (multi_turn || own_children.contains(&sid)) && !children.contains(&sid) {
+                children.push(sid);
+            }
+        }
+    }
+    if tasks.is_empty() && children.is_empty() {
+        if next.kind == FinishKind::Wait && next.run_ended {
+            next.wait_children.clear();
+        }
+        if multi_turn && missing_end && sh.session.lock().await.state.nudge.count == 0 {
+            let usage = next.usage.take();
+            let answer = next.answer.take();
+            *next = Next {
+                kind: FinishKind::Wait,
+                waiting: true,
+                usage,
+                answer,
+                nudge: 1,
+                ..Default::default()
+            };
+        }
+        return;
+    }
+    let usage = next.usage.take();
+    let answer = next.answer.take();
+    *next = Next {
+        kind: FinishKind::Wait,
+        waiting: true,
+        usage,
+        wait_children: children,
+        wait_tasks: tasks,
+        ..Default::default()
+    };
+    if multi_turn {
+        // The reply closes this Turn; the end of that work, or a tick while
+        // it runs, opens the next one in this same run.
+        next.turn_end = Some(TurnStatus::Completed);
+        next.answer = answer;
+    }
 }
 
 /// What the end-of-run commit leaves for the work after it.
 struct RunEnded {
     run_id: String,
     sid: String,
-    turn: u64,
-    /// The Turn closed by this commit, if any.
-    turn_closed: Option<TurnStatus>,
-    /// Perception seq of the run digest (`+ 1` is the task outcome record).
-    digest_seq: u64,
     /// The run this one replaced as `last_run` (cleanup candidate).
     prev: Option<String>,
 }
@@ -899,67 +1201,29 @@ async fn commit_run_end(
     if let Some(topic) = &next.topic {
         s.state.topic = topic.clone();
     }
-    // Close the Turn before the report renders the counters.
-    let turn_closed = match (next.turn_end, s.state.open_turn.take()) {
-        (Some(status), Some(open)) => {
-            // A delivered final report is the reply: its text, its artifacts
-            // as attachments.
-            let delivered = next.report.as_ref().filter(|_| next.kind != FinishKind::ProcessDone);
-            super::outbound::queue_reply(
-                sh,
-                s,
-                &run_id,
-                super::outbound::TurnReply {
-                    turn,
-                    status,
-                    answer: delivered.map(|r| r.report.clone()).or_else(|| next.answer.clone()),
-                    artifacts: delivered
-                        .map(|r| r.artifacts.clone())
-                        .unwrap_or_else(|| next.reply_artifacts.clone()),
-                    workdir: None,
-                    inputs: open.inputs,
-                    has_msg: open.has_msg,
-                    error: next.error.clone(),
-                    has_placeholder: false,
+    // A plan that ends: what still runs of its TodoList ends stopped, and
+    // where every Todo stands is recorded with the end (never a gate).
+    if next.finished && !super::goal::is_goal(&s.config) {
+        super::todos::stop_open(sh, next.outcome);
+        let list = super::todos::load(sh);
+        if !list.todos.is_empty() {
+            let summary = list.summary();
+            bodies.push(WorklogBody::ControlApplied {
+                input: InputRef {
+                    src: "_runner".into(),
+                    index: 0,
+                    key: format!("todo_summary@{run_id}"),
+                    kind: INPUT_TYPE_CONTROL.into(),
                 },
-            )
-            .await;
-            super::turn_task::close_turn_task(
-                s,
-                turn,
-                status,
-                next.answer.as_deref(),
-                next.error.as_ref(),
-            );
-            if status == TurnStatus::Completed {
-                s.state.turns_completed += 1;
-            }
-            s.state.turn_stop_requested = false;
-            // The Activation ends with its Turn, in the same commit.
-            Box::pin(super::goal::close_activation(
-                sh,
-                s,
-                super::goal::TurnEnd {
-                    status,
-                    needs_input: next.needs_input,
-                    answer: next.answer.as_deref(),
-                    report: next.report.as_ref(),
-                    error: next.goal_error.as_ref().or(next.error.as_ref()),
-                },
-            ))
-            .await?;
-            crate::fault::point("goal:after_activation_close");
-            *sh.turn_closed.lock().expect("turn closed") = Some(ClosedTurn {
-                turn,
-                status,
-                answer: next.answer.clone(),
+                command: "todo_summary".into(),
+                detail: json!({ "summary": summary.line(), "todos": summary }),
             });
-            Some(status)
         }
-        (_, open) => {
-            s.state.open_turn = open;
-            None
-        }
+    }
+    // Close the Turn before the report renders the counters.
+    let turn_closed = match next.turn_end {
+        Some(status) => close_open_turn(sh, s, &run_id, turn, status, next).await?,
+        None => None,
     };
     let mut artifact_ref = None;
     if next.finished {
@@ -988,28 +1252,6 @@ async fn commit_run_end(
             &render_report(s, next.answer.as_deref().unwrap_or_default(), next),
         )?;
     }
-    // A returning sub context that executed a serial Todo: the attempt's
-    // result is written back before this commit (idempotent); its caller
-    // and the history get a brief, the report is read on demand.
-    let todo_brief = match s
-        .state
-        .process_stack
-        .last()
-        .filter(|f| next.kind == FinishKind::ProcessDone && f.role == FrameRole::Caller)
-        .and_then(|f| f.call.as_ref())
-        .and_then(|c| c.todo.clone())
-    {
-        Some(b) => Some(super::todos::serial_returned(
-            sh,
-            s,
-            &b,
-            &run_id,
-            next.child_status.as_deref(),
-            next.report.as_ref(),
-            next.answer.as_deref(),
-        )?),
-        None => None,
-    };
     // Flush the run's unwritten history into the worklog.
     bodies.push(WorklogBody::Outcome {
         run_id: run_id.clone(),
@@ -1019,9 +1261,8 @@ async fn commit_run_end(
         report: if next.report.is_some() && next.kind != FinishKind::ProcessDone {
             None
         } else {
-            todo_brief
+            next.answer
                 .clone()
-                .or_else(|| next.answer.clone())
                 .map(|a| match &next.reply_error {
                     Some(e) => format!("[reply not in the required format: {e}] {a}"),
                     None => a,
@@ -1045,10 +1286,12 @@ async fn commit_run_end(
     s.state.last_run = Some(run_id.clone());
     s.state.one_line_status = one_line(next);
     s.state.last_error = next.error.clone();
-    s.state.waiting_for = None;
+    s.state.retry = None;
+    s.state.wait_children.clear();
     s.state.activity.touching.clear();
     if next.finished {
         s.state.run_state = RunState::Finished;
+        s.state.finished_at_ms = Some(crate::now_ms());
         s.state.process_stack.clear();
         s.state.outcome = next.outcome;
         s.state.stop_requested = false;
@@ -1076,36 +1319,17 @@ async fn commit_run_end(
         }
         s.state.result = Some(result);
     } else if next.waiting {
+        // What it waits for follows from these (between Activations a Goal
+        // Session waits for its next run opportunity, not for a person).
         s.state.run_state = RunState::Waiting;
-        s.state.waiting_for = Some(if next.wait_children.is_empty() {
-            WaitingFor {
-                // Between Activations a Goal Session waits for its next
-                // run opportunity, not for a person.
-                kind: if super::goal::is_goal(&s.config) {
-                    WaitingKind::Event
-                } else {
-                    WaitingKind::Input
-                },
-                refs: Vec::new(),
-                deadline_ms: None,
-                human_tasks: Vec::new(),
-            }
-        } else {
-            WaitingFor {
-                kind: WaitingKind::Children,
-                refs: next.wait_children.clone(),
-                deadline_ms: None,
-                human_tasks: Vec::new(),
-            }
-        });
+        s.state.wait_children = next.wait_children.clone();
     } else {
         s.state.run_state = RunState::Ready;
     }
     if next.kind == FinishKind::ProcessDone {
         // A sub context ended: its caller becomes live again in this same
-        // commit (same Turn), with the child's result — rendered into the
-        // caller's hand-over batch (behavior trigger) or filled as the tool
-        // result of the call when the caller's run is opened (tool trigger).
+        // commit (same Turn), with the child's result rendered into the
+        // caller's hand-over batch.
         if let Some(f) = s
             .state
             .process_stack
@@ -1113,31 +1337,27 @@ async fn commit_run_end(
         {
             let entry = f.entry.clone();
             let trigger = f.call.as_ref().map(|c| c.trigger.clone());
-            let bound = f.call.as_ref().and_then(|c| c.todo.clone());
             s.state.live_run = Some(live_from_frame(f));
             let named = Some(entry.clone()).filter(|e| !e.is_empty());
             s.state.process_entry = named.clone();
             s.state.current_behavior = named;
             let mut result = json!({
                 "behavior": child_behavior.unwrap_or_default(),
-                "result": todo_brief.clone().or_else(|| next.answer.clone()).unwrap_or_default(),
+                "result": next.answer.clone().unwrap_or_default(),
                 "status": next.child_status.clone().unwrap_or_else(|| "ok".into()),
                 // Keep action / step ids unique after the return.
                 "next_action_id": snapshot.state.next_action_id,
                 "next_step_index": snapshot.state.next_step_index,
             });
-            if let Some(todo) = &bound {
-                result["todo"] = json!({ "todo_id": todo.todo_id, "attempt": todo.attempt });
-            } else if let Some(report) = &next.report {
+            if let Some(report) = &next.report {
                 result["submission"] = serde_json::to_value(report).unwrap_or(Value::Null);
             }
-            match trigger {
-                Some(CallTrigger::Tool { call_id, .. }) => {
-                    result["call_id"] = json!(call_id);
-                    s.state.internal_continuation = None;
-                }
-                _ => s.state.internal_continuation = Some(entry),
+            // Whatever triggered it, the result reaches the caller as its
+            // hand-over batch (a tool trigger names its call).
+            if let Some(CallTrigger::Tool { call_id, .. }) = trigger {
+                result["call_id"] = json!(call_id);
             }
+            s.state.internal_continuation = Some(entry);
             s.state.process_result = Some(result);
         }
     }
@@ -1164,7 +1384,10 @@ async fn commit_run_end(
         // which no tool result records).
         let seen = sh.tasks.lock().expect("tasks").clone();
         for task_id in run.noted_tasks() {
-            if seen.as_ref().is_some_and(|r| r.result_seen(&task_id)) {
+            // Sub sessions report through `poll_children`.
+            if task_id.starts_with(super::children::SESSION_TASK_PREFIX)
+                || seen.as_ref().is_some_and(|r| r.result_seen(&task_id))
+            {
                 continue;
             }
             if !s.state.watched_tasks.contains(&task_id) {
@@ -1172,22 +1395,91 @@ async fn commit_run_end(
             }
         }
     }
-    let digest_seq = s.state.perception_seq + 1;
-    // The consolidation Goal's session leaves no material: no seq is
-    // reserved for it either (nothing for `catch_up` to backfill).
-    if super::consolidation::caps(sh).records_perception {
-        s.state.perception_seq = digest_seq + u64::from(next.finished);
-    }
+    // No Runtime perception is written at the end of a run (no run digest,
+    // no task outcome): progress stays in the Task / Goal, Memory material
+    // comes from `ctl perceive` only.
+    sh.hints.store(&mut s.state);
     s.commit_state(&sh.lease)?; // commit point
     crate::fault::point("finish_run:after_commit");
     Ok(RunEnded {
         run_id,
         sid,
-        turn,
-        turn_closed,
-        digest_seq,
         prev,
     })
+}
+
+/// Close the open Turn with `status` in the commit being prepared: its
+/// reply (outbox), its task, the counters and a Goal's Activation. `None`
+/// when no Turn is open.
+async fn close_open_turn(
+    sh: &Arc<Shared>,
+    s: &mut Session,
+    run_id: &str,
+    turn: u64,
+    status: TurnStatus,
+    next: &Next,
+) -> Result<Option<TurnStatus>> {
+    let Some(open) = s.state.open_turn.take() else {
+        return Ok(None);
+    };
+    // A delivered final report is the reply: its text, its artifacts as
+    // attachments.
+    let delivered = next.report.as_ref().filter(|_| next.kind != FinishKind::ProcessDone);
+    super::outbound::queue_reply(
+        sh,
+        s,
+        run_id,
+        super::outbound::TurnReply {
+            turn,
+            status,
+            answer: delivered.map(|r| r.report.clone()).or_else(|| next.answer.clone()),
+            artifacts: delivered
+                .map(|r| r.artifacts.clone())
+                .unwrap_or_else(|| next.reply_artifacts.clone()),
+            workdir: None,
+            inputs: open.inputs,
+            has_msg: open.has_msg,
+            error: next.error.clone(),
+            has_placeholder: false,
+        },
+    )
+    .await;
+    // The Turn that ends a plan tells where its Todos stand.
+    let todos = next
+        .finished
+        .then(|| super::todos::load(sh))
+        .filter(|l| !l.todos.is_empty())
+        .map(|l| l.summary().line());
+    let task_summary = match (todos, next.answer.as_deref()) {
+        (Some(t), Some(a)) => Some(format!("{t}\n{a}")),
+        (t, a) => t.or(a.map(str::to_string)),
+    };
+    super::turn_task::close_turn_task(s, turn, status, task_summary.as_deref(), next.error.as_ref());
+    if status == TurnStatus::Completed {
+        s.state.turns_completed += 1;
+    }
+    s.state.turn_stop_requested = false;
+    s.state.nudge = Nudge::default();
+    // The Activation ends with its Turn, in the same commit.
+    Box::pin(super::goal::close_activation(
+        sh,
+        s,
+        super::goal::TurnEnd {
+            status,
+            needs_input: next.needs_input,
+            answer: next.answer.as_deref(),
+            report: next.report.as_ref(),
+            error: next.goal_error.as_ref().or(next.error.as_ref()),
+        },
+    ))
+    .await?;
+    crate::fault::point("goal:after_activation_close");
+    *sh.turn_closed.lock().expect("turn closed") = Some(ClosedTurn {
+        turn,
+        status,
+        answer: next.answer.clone(),
+    });
+    Ok(Some(status))
 }
 
 /// After the commit (none of this is redone by reconcile): cleanup of the
@@ -1202,14 +1494,7 @@ async fn after_run_end(
     next: &Next,
     ended: RunEnded,
 ) -> Result<()> {
-    let RunEnded {
-        run_id,
-        sid,
-        turn,
-        turn_closed,
-        digest_seq,
-        prev,
-    } = ended;
+    let RunEnded { run_id, sid, prev } = ended;
     // Cleanup of the replaced run.
     if let Some(p) = prev.filter(|p| p != &run_id && !s.state.references(p)) {
         if let Err(e) = remove_if_safe(sh, &p).await {
@@ -1227,9 +1512,12 @@ async fn after_run_end(
         .prompt
         .compact_ratio
         .unwrap_or(sh.deps.options.compact_ratio);
-    let summarizer = sh.deps.summarizer.clone();
+    let summarizer = sh.deps.summarizer.clone().map(|llm| super::history::Summarizer {
+        llm,
+        model: run.record().config.summary_model(),
+    });
     if let Some(sm) = summarizer {
-        if let Err(e) = maybe_compact(&mut s, &sh.lease, Some(sm.as_ref()), budget, ratio).await {
+        if let Err(e) = maybe_compact(&mut s, &sh.lease, Some(&sm), budget, ratio).await {
             log::warn!("compaction of {sid}: {e}");
         }
     } else {
@@ -1257,53 +1545,15 @@ async fn after_run_end(
             st.cost += u.reported_cost.unwrap_or(0.0);
         }
     });
-    // Registry, perception, notification (catch-up later).
-    let mut recs = vec![run_digest(
-        &sid,
-        digest_seq,
-        &run_id,
-        turn,
-        turn_closed,
-        &s.state.topic,
-        s.config.artifact_id.iter().map(|a| format!("artifact:{a}")).collect(),
-        &s.state.one_line_status,
-        s.state.worklog.committed_seq,
-    )];
-    // What a Goal Session perceives belongs to its Goal.
-    if let Some(b) = super::goal::binding(&s.config) {
-        let mut source = agent_tool::agent_memory::SourceRef::event(
-            agent_tool::agent_memory::SourceType::System,
-            format!("goal:{}:{}:turn:{turn}", b.goal_id, b.epoch),
-        );
-        source.session_id = Some(sid.clone());
-        source.goal_ref = Some(format!("goal:{}", b.goal_id));
-        source.actor_kind = Some(agent_tool::agent_memory::ActorKind::Runtime);
-        recs[0].source_ref = Some(source);
-    }
-    if next.finished {
-        recs.push(PerceptionRecord {
-            seq: digest_seq + 1,
-            at_ms: crate::now_ms(),
-            session_id: sid.clone(),
-            kind: "task_outcome".into(),
-            source: "session".into(),
-            tags: s.state.topic.tags.clone(),
-            objects: Vec::new(),
-            summary: s.state.one_line_status.clone(),
-            payload: json!({ "outcome": next.outcome, "acceptance": s.state.acceptance }),
-            refs: Value::Null,
-            ..Default::default()
-        });
-    }
-    // The consolidation Goal writes no material of its own (anti echo).
-    if super::consolidation::caps(sh).records_perception {
-        if let Err(e) = sh.agent().perception().append(&sh.lease, &sid, recs).await {
-            log::warn!("perception of {sid}: {e}");
-        }
-    }
+    // Registry and notification (catch-up later).
     let status = s.status(sh.lease.epoch());
     drop(s);
     report(sh, status).await;
+    if next.finished && !super::goal::is_goal(&cfg) {
+        // Nothing hears the sub sessions of a finished session any more:
+        // they are stopped with it (its TodoList says so already).
+        super::drive::stop_children(sh, next.outcome).await;
+    }
     super::share::after_finish(sh, run, next, super::share::Finished { config: cfg, turns });
     super::outbound::flush_outbox(sh).await;
     super::turn_task::flush_turn_tasks(sh).await;
@@ -1386,11 +1636,8 @@ fn register_outputs(
         outputs = report
             .artifacts
             .iter()
-            // A file by its stable copy, an object by its id.
-            .map(|a| match &a.obj_id {
-                Some(id) if a.reference.is_empty() => id.clone(),
-                _ => a.reference.clone(),
-            })
+            // An object by its id, a file the host kept no object of by its stable copy.
+            .map(|a| a.obj_id.clone().unwrap_or_else(|| a.reference.clone()))
             .collect();
     } else if let Ok(rd) = std::fs::read_dir(s.dir.path()) {
         for e in rd.flatten() {

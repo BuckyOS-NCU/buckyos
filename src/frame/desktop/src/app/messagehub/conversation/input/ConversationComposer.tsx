@@ -27,8 +27,10 @@ import {
   X,
 } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
+import { LinkifiedText } from '../history/MessageMarkdown'
 import { displayedContent, effectiveContent, messageObjId } from '../history/relations'
-import { agentAskQuestionText, buildAgentAskAnswer, getMessageSenderName, type MachineContent, type MessageObject, type MsgMentions, type MsgRelation, type VoiceNote } from '../../protocol/msgobj'
+import type { ndn } from 'buckyos'
+import { agentAskQuestionText, buildAgentAskAnswer, getMessageSenderName, type MessageObject, type VoiceNote } from '../../protocol/msgobj'
 import { formatVoiceDuration, voiceRecordingSupported } from '../media/voice'
 import { EmojiPanel } from './EmojiPanel'
 import { VoiceRecorder } from './VoiceRecorder'
@@ -64,11 +66,11 @@ export interface ConversationComposerSubmitPayload {
   attachments: ComposerAttachmentItem[]
   content: string
   /** MsgObject v2 `relates_to` of a reply (`thread`) or an edit of an own message. */
-  relatesTo?: MsgRelation
+  relatesTo?: ndn.MsgRelation
   /** Structured mentions picked in the composer; absent when none. */
-  mentions?: MsgMentions
+  mentions?: ndn.MsgMentions
   /** `content.machine`: an answer that picked an option (`agent_ask.answer`). */
-  machine?: MachineContent
+  machine?: ndn.MachineContent
   /** The only attachment is a voice note recorded in the composer. */
   voice?: VoiceNote
   localId?: string
@@ -409,7 +411,7 @@ const ConversationComposerInner = forwardRef<
     // In the answer state everything typed answers the question, except a
     // bare `/stop`, which the Agent takes as a command on its own.
     const reply = answer && !(isStopCommand(text) && items.length === 0) ? buildAgentAskAnswer(answer.question, answer.ask, { text }) : undefined
-    const relatesTo: MsgRelation | undefined = answer ? reply?.relates_to : relation && target ? { rel: relation.kind === 'edit' ? 'edit' : 'thread', target } : undefined
+    const relatesTo: ndn.MsgRelation | undefined = answer ? reply?.relates_to : relation && target ? { rel: relation.kind === 'edit' ? 'edit' : 'thread', target } : undefined
     const mentions = mergeMentions(collectMentions(text, picked, mentionAll), answer?.mentions)
     const editing = relation?.kind === 'edit'
     const voice = !editing && items.length === 1 ? items[0].voice : undefined
@@ -721,7 +723,7 @@ const ConversationComposerInner = forwardRef<
             <span className="min-w-0 flex-1 truncate font-semibold" style={{ color: 'var(--cp-accent)' }}>{t('messagehub.answer.banner', undefined, { name: choice.askerName })}</span>
             {stopButton}
           </div>
-          {questionText ? <p className="max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-[14px] leading-[1.45]" style={{ color: 'var(--cp-text)' }} data-testid="answer-question">{questionText}</p> : null}
+          {questionText ? <p className="max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-[14px] leading-[1.45]" style={{ color: 'var(--cp-text)' }} data-testid="answer-question"><LinkifiedText text={questionText} /></p> : null}
           <div role="group" aria-label={t('messagehub.answer.options')} className="flex max-h-60 flex-col gap-1.5 overflow-y-auto">
             {choice.ask.input.options.map(option => {
               const sending = directSend === `option:${option.id}`

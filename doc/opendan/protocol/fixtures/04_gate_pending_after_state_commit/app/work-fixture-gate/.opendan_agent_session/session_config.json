@@ -6,7 +6,7 @@
     "agent_did": "did:bns:jarvis.alice",
     "kind": "work",
     "class": "work",
-    "created_at_ms": 1792976020384,
+    "created_at_ms": 1793864755740,
     "created_by": {
       "principal": "app:app2@alice",
       "via": "app"
@@ -29,12 +29,11 @@
         "enabled": true
       }
     },
-    "mechanical_compress": {
-      "recent_full_responses": 2,
-      "summary_chars": 280,
-      "max_result_chars": 4096,
+    "history_render": {
       "drop_kinds": [
         "created",
+        "turn_started",
+        "input_batch",
         "decide",
         "compaction",
         "input_rejected",
@@ -46,19 +45,41 @@
   "runtime": {
     "requirement": {},
     "frozen": {
-      "runtime_id": "container",
-      "kind": "container",
-      "exec": {
-        "kind": "native"
+      "runtime_id": "private",
+      "connector": {
+        "type": "native"
       },
       "revision": 0,
-      "selected_by": "default",
-      "computer": "none",
-      "baseline": "extended",
-      "platform": {
+      "selected_by": "private",
+      "caps": {
         "os": "linux",
         "arch": "x86_64",
-        "shell": "bash"
+        "shell": "bash",
+        "desktop": false,
+        "baseline": "extended"
+      },
+      "grant": {
+        "ops": [
+          "open_stream",
+          "describe",
+          "exec",
+          "read",
+          "write",
+          "edit",
+          "mkdir",
+          "stat",
+          "rename",
+          "remove",
+          "computer_inspect",
+          "computer_observe",
+          "computer_act",
+          "query",
+          "cancel"
+        ],
+        "roots": [],
+        "computer": "none",
+        "install": "system",
+        "workspace": true
       }
     }
   },
@@ -67,8 +88,8 @@
       {
         "kind": "kmsg",
         "id": "q",
-        "queue": "app2::alice::opendan.session.work-fixture-gate",
-        "subscriber": "opendan.jarvis.alice.work-fixture-gate"
+        "queue": "app2::alice::opendan.session.985854e9e898e292e14611297bac29eb00cacaf621bdce3a24876c4aab5d0851",
+        "subscriber": "opendan.985854e9e898e292e14611297bac29eb00cacaf621bdce3a24876c4aab5d0851"
       }
     ],
     "wake_event": "/opendan/jarvis.alice/session/work-fixture-gate/input"

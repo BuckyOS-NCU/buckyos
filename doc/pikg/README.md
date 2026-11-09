@@ -15,6 +15,8 @@
 | 系统构建集成 | [Module type/format](../CI/module_build_type_and_format.md) | builder/formatter、PIKG rootfs 落位 |
 | SDK/Tool 分发 | [WebSDK distribution](https://github.com/buckyos/buckyos-websdk/blob/main/doc/distribution.md) | npm 与系统入口、runtime、产物完整性和更新归属 |
 | Agent skill 生命周期 | [OpenDAN 开发指南](../sdk/OpenDAN_Agent_Dev_Guide.md) | cmd_skills/goal_skills、安装接口、Session 冻结 |
+| 扩展工具包（`app_type=ext_tools`） | [PIKG 格式 §5.1](format.md) | `ext-manifest.json`、按平台的子包键、payload 布局；期望状态与安装见 [扩展包 TODO](../../notepads/opendan-exttools-cross-platform-todo.md) |
+| AI Workspace 控件包（`app_type=aiws`） | [aiworkspace README “Extension controls”](../../src/frame/aiworkspace/README.md) | AIWS 清单、`component.json`、`ext.install` 本机库与引入；设计见 [扩展实现思路](../workspace/BuckyOS%20AI%20Workspace%20扩展实现思路.md) §6.9 |
 
 “当前权威”表示该领域的文档维护位置，不能覆盖实现证据。若规范与代码冲突，应在该文档明确差异并修正，不能从历史方案补出一项尚未交付的能力。尤其 `info` 内容通过、Owner 签名、BNS 当前发布和实际运行成功是不同证据。
 
@@ -23,6 +25,8 @@
 - 开发普通 App：[快速入门](../sdk/app-dev-quickstart.md)，结合 [Installer 样例](../../test/app_installer_test/pikg_samples/README.md)。
 - 开发 Agent：[Agent 手册](../../src/apps/jarvis_agent/agent/cmd_skills/opendan_agent_dev.md) 与 [Jarvis](../../src/apps/jarvis_agent/README.md)。
 - 独立 skill 包：[最小样例](../../test/skills_pikg_sample/README.md)。
+- AI Workspace 控件包：`buckyos pikg init --kind aiws-controls` 生成带一个 declarative 控件的骨架；从 Workspace 导出用 `buckyos aiws ext-export --pikg`，Agent 手册见 `aiworkspace_template_dev.md` “控件开发”。
+- 扩展工具包：`buckyos pikg init --kind ext-tools` 生成本机平台的骨架，`pikg doctor --catalog <目录>` 校验；官方包样例 [ext-core](../../publish/exttool/ext-core)。
 - 运行安装测试：[Installer DV](../../test/app_installer_test/README.md)。带日期旧结果已移出当前步骤。
 - 系统与企业部署：[企业部署指南](../sdk/buckyos-deploy.md)。行业项目专用配置与操作说明留在所属业务仓库。
 
@@ -33,6 +37,7 @@
 - [历史摘要与原稿映射](history/README.md)：旧 Installer/预装/Tool 清单、权限配置目标稿、Skills Mgr 研究和旧 DV 结果。
 - `notepads/`：任务记录，可含已完成与未完成项，不是当前协议；不能因旧 checkbox 未勾选就判断实现状态。
 - `product/`、讨论稿及未交付设计：说明产品意图，不作为已存在命令/字段的依据。
+- [Workspace 控件与模板包设计](<../workspace/BuckyOS AI Workspace 扩展实现思路.md>) §6.9：待实现的 Workspace 资源用途、控件包支持与模板超集结构预留；当前格式和安装能力仍以本页权威文档及源码为准。
 - 架构与 UI 的周边文档：各自负责相邻领域；PIKG 字段发生冲突时回到上表指定文档。
 
 原 TODO 全文通过历史摘要的 Git 原文链接保留，当前树不保留重复规范或失效执行清单。历史文档中出现的旧错误码、目录、RPC 和测试数字不向当前版本继承。
@@ -88,13 +93,13 @@
 
 ### 任务记录与旧工作背景
 
-- [notepads/app-id-simplification-todo.md](../../notepads/app-id-simplification-todo.md)
-- [notepads/app-service-beta2.2-prototype-todo.md](../../notepads/app-service-beta2.2-prototype-todo.md)
+- [notepads/done/app-id-simplification-todo.md](../../notepads/done/app-id-simplification-todo.md)
+- [notepads/done/app-service-beta2.2-prototype-todo.md](../../notepads/done/app-service-beta2.2-prototype-todo.md)
 - [notepads/buckyos-tool-app-control-panel-todo.md](../../notepads/buckyos-tool-app-control-panel-todo.md)
 - [notepads/opendan-builtin-cmd-skills-todo.md](../../notepads/opendan-builtin-cmd-skills-todo.md)
 - [notepads/opendan-cmd-skill-todo.md](../../notepads/opendan-cmd-skill-todo.md)
-- [notepads/opendan-goal-session-todo.md](../../notepads/opendan-goal-session-todo.md)
-- [notepads/share-content-mgr-tech-design-todo.md](../../notepads/share-content-mgr-tech-design-todo.md)
+- [notepads/done/opendan-goal-session-todo.md](../../notepads/done/opendan-goal-session-todo.md)
+- [notepads/done/share-content-mgr-tech-design-todo.md](../../notepads/done/share-content-mgr-tech-design-todo.md)
 
 ### 历史参考
 

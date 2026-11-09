@@ -25,7 +25,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use llm_context::{escape_xml_attr, EngineConfig, NullValueLoader, PromptRenderEngine, RenderVars};
+use agent_tool::escape_xml_attr;
+use agent_tool::prompt_engine::{EngineConfig, NullValueLoader, PromptRenderEngine, RenderVars};
 use serde_json::{json, Value};
 
 use crate::error::{OpenDanError, Result};
@@ -53,8 +54,6 @@ pub struct InputMaterial {
     /// The session's TodoList in its compact view, when it changed since
     /// the top-level context last saw it.
     pub todos: Option<String>,
-    /// The serial Todo a hand-over to the Todo executor would run now.
-    pub current_todo: Value,
     /// Chat format (UI sessions): the background context lines this batch
     /// shows (already reduced to what changed).
     pub background: Vec<super::background::BackgroundLine>,
@@ -75,16 +74,6 @@ pub trait SessionAssembler: Send + Sync {
         templates: &InputTemplates,
         m: &InputMaterial,
     ) -> Result<Option<String>>;
-    /// The semi-subscription snapshot message placed before a controlled
-    /// input (`prompt.semi_subscription_snapshot`), for the pending state
-    /// versions selected for this batch. `None` when there are none.
-    async fn render_semi_subscription_snapshot(
-        &self,
-        templates: &InputTemplates,
-        events: &[EventView],
-    ) -> Result<Option<String>> {
-        default_snapshot(templates, events).await
-    }
     /// A path the agent can read in this session's runtime for the data
     /// object `obj_id`, when the host has one. Not a download: only an
     /// existing mapping.
@@ -169,35 +158,6 @@ fn strip_block_tag_lines(template: &str) -> String {
     out
 }
 
-/// Built-in snapshot body: one `<event>` element per state version.
-pub fn render_snapshot_events(events: &[EventView]) -> String {
-    events
-        .iter()
-        .map(render_event_xml)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-async fn default_snapshot(
-    templates: &InputTemplates,
-    events: &[EventView],
-) -> Result<Option<String>> {
-    if events.is_empty() {
-        return Ok(None);
-    }
-    let text = render_snapshot_events(events);
-    let rendered = match &templates.semi_subscription_snapshot {
-        Some(tpl) => {
-            render_template(
-                tpl,
-                json!({ "snapshot": { "events": events, "text": text } }),
-            )
-            .await?
-        }
-        None => format!("<semi_subscription_snapshot>\n{text}\n</semi_subscription_snapshot>"),
-    };
-    Ok(Some(rendered).filter(|t| !t.trim().is_empty()))
-}
 
 pub const AVOIDANCE_RULE: &str = "Other sessions of this agent may be running at the same time. Before modifying a file, object or artifact, check <active_sessions>: do not modify what another active session is writing. Wait for it (its state is visible), work on another part first, or explain the conflict in your report.";
 
@@ -268,12 +228,46 @@ pub struct DefaultAssembler {
     pub extra_constraints: Vec<String>,
     /// Host mapping of attachments to readable paths.
     pub attachment_paths: Option<AttachmentPathFn>,
+    /// The host's `read` reaches the Zone's objects: name the ones a session starts from (`## Objects`).
+    pub known_objects: bool,
+}
+
+/// `## Objects`: what a session of a Zone host starts from, one line each (agent-object-url TODO A5); `read`
+/// describes each object and how to go further. Stable for the session.
+fn objects_section(cfg: &SessionConfig) -> String {
+    use buckyos_api::{obj_entity_url, obj_service_url};
+    let Ok(agent) = name_lib::DID::from_str(&cfg.session.agent_did) else {
+        return String::new();
+    };
+    let agent_did = agent.to_string();
+    let mut lines = vec![
+        (obj_entity_url(&agent, &[] as &[&str]), "you: your sessions, workspaces, goals and artifacts".to_string()),
+        (obj_entity_url(&agent, &["sessions", cfg.session.session_id.as_str()]), "this session".to_string()),
+    ];
+    if let Some(ws) = &cfg.workspace {
+        lines.push((obj_entity_url(&agent, &["workspaces", ws.workspace_id.as_str()]), "this session's workspace".to_string()));
+    }
+    lines.push((obj_service_url("msg-center", &["owners", agent_did.as_str(), "sessions"]), "your message sessions".to_string()));
+    if let Some(owner) = cfg.session.owner.as_deref().filter(|o| !o.is_empty()) {
+        let account = did_account(owner);
+        lines.push((obj_service_url("msg-center", &["owners", owner, "sessions"]), "your owner's message sessions (read only)".to_string()));
+        lines.push((obj_service_url("homestation", &["home", account.as_str()]), "your owner's home: published feed and inbox".to_string()));
+        lines.push((format!("cyfs:///home/{account}/"), "your owner's files".to_string()));
+    }
+    lines.push((obj_service_url("aiworkspace", &[] as &[&str]), "the AI Workspaces you can see".to_string()));
+    let mut s = String::from("## Objects\nObjects to start from. `read` one to see what it offers (properties, actions, events) and how to read further:\n");
+    for (url, what) in lines {
+        s.push_str(&format!("- {url} — {what}\n"));
+    }
+    s.push('\n');
+    s
 }
 
 impl std::fmt::Debug for DefaultAssembler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DefaultAssembler")
             .field("extra_constraints", &self.extra_constraints)
+            .field("known_objects", &self.known_objects)
             .finish()
     }
 }
@@ -362,6 +356,9 @@ impl SessionAssembler for DefaultAssembler {
             }
             s.push('\n');
         }
+        if self.known_objects {
+            s.push_str(&objects_section(cfg));
+        }
         // 6. cmd_skills
         s.push_str(&commands_section(cfg, false));
         Ok(s.trim_end().to_string())
@@ -420,8 +417,6 @@ impl SessionAssembler for DefaultAssembler {
                 "objective": cfg.session.objective,
                 "timezone": cfg.session.timezone,
                 "is_bootstrap": first,
-                // The serial Todo the Todo executor would run now.
-                "current_todo": m.current_todo,
                 "todos": m.todos,
                 "background_hint_changed": false,
                 "default_changed_background_hint_text": "",
@@ -439,7 +434,7 @@ impl SessionAssembler for DefaultAssembler {
             "active_sessions_text": blocks.active,
             "runtime_text": blocks.runtime,
             "background": m.background,
-            "background_text": super::background::render(&m.background),
+            "background_context": super::background::render(&m.background),
             "builtin": builtin,
         });
         let text = render_template(template, vars).await?;
@@ -448,7 +443,7 @@ impl SessionAssembler for DefaultAssembler {
 }
 
 fn esc(s: &str) -> String {
-    llm_context::escape_xml_text(s)
+    agent_tool::escape_xml_text(s)
 }
 
 /// The per-batch material of the built-in templates, block by block (each
@@ -468,8 +463,14 @@ impl Blocks {
         if let Some(b) = &state.internal_continuation {
             handover.push_str(&format!("<context_switch to=\"{}\"/>\n", escape_xml_attr(b)));
             if let Some(r) = &state.process_result {
+                // The call that asked for the sub context, when one did.
+                let call = r
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(|c| format!(" call_id=\"{}\"", escape_xml_attr(c)))
+                    .unwrap_or_default();
                 handover.push_str(&format!(
-                    "<process_result behavior=\"{}\" status=\"{}\">{}</process_result>\n",
+                    "<process_result behavior=\"{}\" status=\"{}\"{call}>{}</process_result>\n",
                     escape_xml_attr(r.get("behavior").and_then(Value::as_str).unwrap_or_default()),
                     escape_xml_attr(r.get("status").and_then(Value::as_str).unwrap_or("ok")),
                     r.get("submission")
@@ -482,12 +483,10 @@ impl Blocks {
             }
             // A sub context being entered: its task, and what it returns to.
             if let Some(call) = state.child_call().filter(|c| &c.behavior == b) {
-                let asking = if super::ask::allowed(cfg) {
-                    "To ask the user, run `agent-session ask-user`; its result is the user's answer."
-                } else if super::ask::via_notify(cfg, true) {
-                    "Ask the user only when one answer decides the rest: `agent-session ask-user` reaches the user as a notification, and the user may answer late or not at all."
-                } else {
+                let asking = if cfg.session.kind == SessionKind::Goal {
                     "Do not ask the user."
+                } else {
+                    "Ask the user only when one answer decides the rest: `ask_user` reaches the user as a notification and its answer comes back to you as `<<task_result>>`; the user may answer late or not at all."
                 };
                 handover.push_str(&format!(
                     "<sub_task mode=\"{}\">{}\nYour result returns to the caller: finish with your report. {asking}</sub_task>\n",
@@ -519,8 +518,13 @@ impl Blocks {
         if !m.hints.is_empty() {
             hints.push_str("<hints>\n");
             for h in &m.hints {
+                let object = h
+                    .object
+                    .as_deref()
+                    .map(|o| format!(" object=\"{}\"", escape_xml_attr(o)))
+                    .unwrap_or_default();
                 hints.push_str(&format!(
-                    "<hint id=\"{}\" time=\"{}\">{}</hint>\n",
+                    "<hint id=\"{}\" time=\"{}\"{object}>{}</hint>\n",
                     escape_xml_attr(&h.id),
                     escape_xml_attr(&h.time),
                     esc(&h.sentence)
@@ -536,10 +540,29 @@ impl Blocks {
         let active = render_active_sessions(&m.active)
             .map(|a| format!("{a}\n"))
             .unwrap_or_default();
+        // `<runtime>`: this session's working runtime (and what it knows of
+        // the private one); a plan also gets the whole table as `<runtimes>`
+        // lines (runtime lifecycle TODO M6).
         let runtime = if m.runtime_status.is_null() {
             String::new()
         } else {
-            format!("<runtime>{}</runtime>\n", m.runtime_status)
+            let mut status = m.runtime_status.clone();
+            let lines = status
+                .get_mut("runtimes")
+                .and_then(Value::as_object_mut)
+                .and_then(|r| r.remove("lines"))
+                .and_then(|l| l.as_array().cloned())
+                .unwrap_or_default();
+            let mut s = format!("<runtime>{status}</runtime>\n");
+            if !lines.is_empty() {
+                s.push_str("<runtimes>\n");
+                for l in lines {
+                    s.push_str(l.as_str().unwrap_or_default());
+                    s.push('\n');
+                }
+                s.push_str("</runtimes>\n");
+            }
+            s
         };
         Self {
             handover,
@@ -569,15 +592,17 @@ impl Blocks {
         s.trim_end().to_string()
     }
 
-    /// The built-in template of every hook: the `<session_input>` element
-    /// with the hand-over state, the bootstrap task, the selected inputs and
-    /// the material computed for this batch.
+    /// The built-in template of every hook: the background lines that
+    /// changed, then the `<session_input>` element with the hand-over state,
+    /// the bootstrap task, the selected inputs and the material computed for
+    /// this batch.
     fn builtin(&self, m: &InputMaterial) -> String {
-        let mut s = format!(
+        let mut s = super::background::render(&m.background);
+        s.push_str(&format!(
             "<session_input hook=\"{}\" time=\"{}\">\n",
             escape_xml_attr(&m.hook),
             m.input.time
-        );
+        ));
         s.push_str(&self.handover);
         s.push_str(&self.task);
         if !m.input.text.is_empty() {
@@ -594,11 +619,6 @@ impl Blocks {
 }
 
 impl DefaultAssembler {
-    pub fn with_attachment_paths(mut self, f: AttachmentPathFn) -> Self {
-        self.attachment_paths = Some(f);
-        self
-    }
-
     /// The sections of a UI session after its identity: constraints,
     /// objective, the application prompt (its own headings), initial
     /// context, and the frozen cmd_skill.
@@ -620,6 +640,9 @@ impl DefaultAssembler {
                 s.push_str(c.trim());
                 s.push_str("\n\n");
             }
+        }
+        if self.known_objects {
+            s.push_str(&objects_section(cfg));
         }
         s.push_str(&commands_section(cfg, true));
         s.trim_end().to_string()
@@ -657,6 +680,12 @@ fn commands_section(cfg: &SessionConfig, ui: bool) -> String {
         }
         s.push_str(k.text.trim());
         s.push_str("\n\n");
+        if !k.missing_commands.is_empty() {
+            s.push_str(&format!(
+                "This runtime has no `{}`: the steps that need them cannot run here. The owner can enable an extension package that provides them (`buckyos ext-tools list`), or they can be installed on this runtime some other way.\n\n",
+                k.missing_commands.join("`, `")
+            ));
+        }
     }
     if !unavailable.is_empty() {
         s.push_str("Not available on this session's runtime (work that needs them goes to a session on a runtime that has them):\n");

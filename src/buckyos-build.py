@@ -19,6 +19,51 @@ SDK_TOOL_INPUTS = {
 }
 
 
+BUILD_HELP = """usage: buckyos-build.py [-h] [--agent-daemon] [--skip-web]
+                        [--timings] [--timings-dir DIR]
+                        [--app APP [APP ...]] [-s [MODULE ...]]
+                        [--target=TARGET] [amd64|aarch64]
+
+Prepare the SDK/CLI and agent tools, build BuckyOS modules via devkit,
+then assemble the macOS runtime bundle.
+
+options:
+  -h, --help             Show this help and exit without building anything
+  --agent-daemon         Build only buckyos_agent_daemon; skip SDK/CLI, agent
+                         tools and runtime assembly. Cannot combine with -s,
+                         --select or --app
+  --skip-web             Skip web modules (still prepares SDK/CLI)
+  --timings              Generate Cargo timings reports
+  --timings-dir DIR      Generate Cargo timings reports and copy them to DIR
+  --app APP [APP ...]    Build modules used by the specified apps;
+                         app names may also be comma-separated
+  -s, --select [MODULE ...]
+                         Select modules from bucky_project.yaml; omit names
+                         for interactive selection in a terminal
+  --target=TARGET        Override the Rust target triple
+  amd64                  Build for x86_64-unknown-linux-musl
+  aarch64                Build for aarch64-unknown-linux-musl
+
+SDK/CLI environment:
+  BUCKYOS_SDK_TOOL_SOURCE
+      Local buckyos-websdk checkout (defaults to the sibling repository).
+      If absent, use published buckyos@latest; local build failures stop.
+  BUCKYOS_SDK_TOOL_DENO
+      Deno executable path (otherwise discovered on PATH for local builds).
+  BUCKYOS_SDK_TOOL_ARTIFACT, BUCKYOS_SDK_TOOL_RELEASE_MANIFEST,
+  BUCKYOS_SDK_TOOL_SBOM
+      Prebuilt distribution inputs. Setting any of these requires all three
+      plus BUCKYOS_SDK_TOOL_DENO. Setting Deno alone keeps source/published mode.
+
+Examples:
+  uv run buckyos-build.py -s scheduler
+  uv run buckyos-build.py --skip-web
+  uv run buckyos-build.py --agent-daemon --target=x86_64-unknown-linux-musl
+
+Other arguments are forwarded unchanged to devkit's buckyos-build.
+"""
+
+
 def _command_names(command: str) -> list[str]:
     if os.name == "nt":
         return [f"{command}.exe", f"{command}.cmd", f"{command}.bat", command]
@@ -155,28 +200,55 @@ def _build_sdk_tool_distribution(env: dict[str, str]) -> int:
     return result
 
 
-def _prepare_agent_tools(source: Path | None = None, target: Path | None = None) -> int:
+# Shared TypeScript modules the buckyos-agent commands import from the source tree (`../../frame/…` in its
+# deno.json): copied beside them as `vendor/frame/…`, so the readable sources travel with the commands.
+AGENT_TOOL_SHARED_MODULES = ("frame/aiworkspace/import-table", "frame/aiworkspace/import-drawio", "frame/aiworkspace/import-pdf", "frame/aiworkspace/import-office")
+
+
+def _prepare_agent_tools(source: Path | None = None, target: Path | None = None, src_root: Path | None = None) -> int:
     """Host copy of the buckyos-agent commands (libexec/buckyos-agent): the
     standard AICC commands a host session-runtime runs on the Tool's Deno,
     importing the Tool's SDK beside it."""
     here = Path(__file__).resolve().parent
     source = source or here / "tools" / "buckyos-agent"
     target = target or here / "rootfs" / "libexec" / "buckyos-agent"
+    src_root = src_root or here
     if not (source / "aicc-tool.ts").is_file():
         print(f"buckyos-agent sources not found: {source}")
         return 2
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(source, target)
+    for module in AGENT_TOOL_SHARED_MODULES:
+        if (src_root / module).is_dir():
+            shutil.copytree(src_root / module, target / "vendor" / module, ignore=shutil.ignore_patterns("*_test.ts", "README.md"))
     config_path = target / "deno.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    config.setdefault("imports", {})["buckyos"] = "../buckyos-tool/dist/node.mjs"
+    imports = config.setdefault("imports", {})
+    imports["buckyos"] = "../buckyos-tool/dist/node.mjs"
+    for key, value in list(imports.items()):
+        if isinstance(value, str) and value.startswith("../../frame/"):
+            imports[key] = "./vendor/" + value[len("../../"):]
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
 
 
+def _prepare_ext_tools(env: dict[str, str]) -> int:
+    # A release payload carries only the pin CI writes into it: installers fetch the tar it names.
+    if env.get("BUCKYOS_EXT_TOOLS_SKIP"):
+        return 0
+    return subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parent / "tools" / "prepare_ext_tools.py")],
+        env=env,
+    ).returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else list(argv)
+    if any(arg in ("-h", "--help") for arg in args):
+        print(BUILD_HELP)
+        return 0
+
     standalone_daemon = "--agent-daemon" in args
     if standalone_daemon:
         args.remove("--agent-daemon")
@@ -198,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         result = _prepare_agent_tools()
         if result != 0:
             return result
+        # A machine without it runs fine, only without the extension tools: not a build failure.
+        _prepare_ext_tools(env)
 
     env["BUCKYOS_PIKG_COMMAND"] = json.dumps([
         _find_command("node") or "node",

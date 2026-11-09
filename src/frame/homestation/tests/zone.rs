@@ -33,8 +33,8 @@ async fn every_user_has_a_home() {
     let (status, located) = get_json(&net, &format!("{}/home/?did={}", lin.base, kai.did), None).await;
     assert_eq!(status, 200);
     assert_eq!(located["user"], "kai");
-    assert_eq!(located["stream"], "cyfs://lin.test/home/kai/feed");
-    assert_eq!(located["inbox"], "cyfs://lin.test/home/kai/inbox");
+    assert_eq!(located["stream"], "https://lin.test/home/kai/feed");
+    assert_eq!(located["inbox"], "https://lin.test/home/kai/inbox");
     assert_eq!(net.get(&format!("{}/home/?did={}", lin.base, alice.did), None).await.0, 404);
     assert_eq!(net.get(&format!("{}/home/nobody/feed", lin.base), None).await.0, 404);
     let (_, profile) = get_json(&net, &format!("{}/profile", kai.home), None).await;
@@ -57,7 +57,7 @@ async fn every_user_has_a_home() {
     let accepted: i64 = kai
         .station
         .db
-        .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM outbox WHERE state='accepted'", [], |r| r.get(0))?))
+        .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM outbox WHERE state='accepted' AND owner=?1", [c.owner], |r| r.get(0))?))
         .await
         .unwrap();
     assert!(accepted >= 2, "object and Head accepted by lin's inbox");
@@ -68,9 +68,9 @@ async fn every_user_has_a_home() {
 
     // Audience per reader: a friend reads the friends-only post, another user of the zone does not.
     let feed = format!("{}/feed?mode=display", kai.home);
-    let (_, as_mia) = get_json(&net, &feed, Some(net.proof("mia", "lin"))).await;
+    let (_, as_mia) = get_json(&net, &feed, Some(net.proof("mia", "lin").await)).await;
     assert_eq!(as_mia["items"].as_array().unwrap().len(), 0);
-    let (_, as_lin) = get_json(&net, &feed, Some(net.proof("lin", "lin"))).await;
+    let (_, as_lin) = get_json(&net, &feed, Some(net.proof("lin", "lin").await)).await;
     assert_eq!(as_lin["items"].as_array().unwrap().len(), 1);
     let (_, as_lin_session) = get_json(&net, &format!("{feed}&access={}", lin.token), None).await;
     assert_eq!(as_lin_session["items"].as_array().unwrap().len(), 1);
@@ -79,7 +79,7 @@ async fn every_user_has_a_home() {
     publish(&net, "lin", "l1", text_input("lin's own post", public())).await;
     let own = net.rpc("kai", "published.list", json!({})).await;
     assert_eq!(own["entries"].as_array().unwrap().len(), 1);
-    assert!(own["entries"][0]["entry"].as_str().unwrap().starts_with("cyfs://lin.test/home/kai/feed/@/"));
+    assert!(own["entries"][0]["entry"].as_str().unwrap().starts_with("https://lin.test/home/kai/feed/@/"));
     net.rpc("kai", "prefs.set_default_audience", json!({ "audience": { "kind": "friends" } })).await;
     assert_eq!(net.rpc("lin", "prefs.get", json!({})).await["defaultAudience"]["kind"], "public");
     assert_eq!(net.rpc("mia", "ui.bootstrap", json!({})).await["home"]["user"], "mia");
@@ -120,7 +120,7 @@ async fn zone_feed_lists_and_follows_changes() {
     let (lin, kai, alice) = (net.n("lin"), net.n("kai"), net.n("alice"));
     let (_, index) = get_json(&net, &format!("{}/home/", lin.base), None).await;
     assert_eq!(index["defaultFeed"], "~zone");
-    assert_eq!(index["zoneFeed"]["stream"], "cyfs://lin.test/home/~zone/feed");
+    assert_eq!(index["zoneFeed"]["stream"], "https://lin.test/home/~zone/feed");
 
     // Writers list public posts; others and restricted posts are refused before publishing.
     let mut input = text_input("kai on the zone page", public());
@@ -133,7 +133,7 @@ async fn zone_feed_lists_and_follows_changes() {
     let err = net.try_rpc("kai", "publish.create", json!({ "key": "k2", "input": restricted })).await.unwrap_err();
     assert!(err.contains("zoneFeedPublic"), "{err}");
     assert!(net.rpc("mia", "published.list", json!({})).await["entries"].as_array().unwrap().is_empty());
-    let (image_id, _) = lin.station.store_file("p.png", "image/png", vec![7u8; 64], json!({ "width": 4, "height": 3 })).await.unwrap();
+    let (image_id, _) = lin.station.store_file("uploads/p.png", "p.png", "image/png", vec![7u8; 64], json!({ "width": 4, "height": 3 })).await.unwrap();
     let image = json!({ "objId": image_id });
     let lin_post = publish(
         &net,

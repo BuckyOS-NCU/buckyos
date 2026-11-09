@@ -224,8 +224,6 @@ impl OutboundTexts {
 pub struct MsgCenterSink {
     pub mail: Arc<dyn MailService>,
     pub texts: OutboundTexts,
-    /// The agent's owner: the one a question in a group is addressed to.
-    pub owner: Option<DID>,
 }
 
 impl MsgCenterSink {
@@ -345,21 +343,6 @@ impl OutboundSink for MsgCenterSink {
         }
     }
 
-    async fn question(&self, _cfg: &SessionConfig, mut msg: MsgObject) -> MsgObject {
-        // Only the owner's requests reach a group session: the question is
-        // theirs to answer, and MessageHub turns answer mode on for the
-        // members a question mentions.
-        if msg.kind == MsgObjKind::GroupMsg && msg.mentions.is_none() {
-            if let Some(owner) = &self.owner {
-                msg.mentions = Some(ndn_lib::MsgMentions {
-                    dids: vec![owner.clone()],
-                    all: false,
-                });
-            }
-        }
-        msg
-    }
-
     async fn send(&self, _sid: &str, record: &OutboundRecord) -> SendResult {
         match self.mail.post_send(record.msg.clone(), &record.key).await {
             Ok(r) if r.ok => SendResult::Sent {
@@ -415,9 +398,9 @@ pub struct UiModule {
     scan: Mutex<UiStatus>,
 }
 
-/// Session id of generation `generation` of the inbox `route_key`. The
+/// Reservation key of generation `generation` of the inbox `route_key`. The
 /// address itself has `:`, `/` and `%`; a session id goes into kevent paths.
-pub fn ui_session_id(agent_did: &str, route_key: &str, generation: usize) -> String {
+pub fn ui_session_key(agent_did: &str, route_key: &str, generation: usize) -> String {
     format!(
         "ui-{}",
         libopendan::ids::h(&["ui", agent_did, route_key, &generation.to_string()])
@@ -517,7 +500,16 @@ impl UiModule {
         // The objective is the conversation's design intent; whose
         // conversation it is stays in the route key.
         let mut spec = template.spec(template.objective_or_default(on == ON_MSG_GROUP));
-        spec.session_id = Some(ui_session_id(self.agent.agent_did(), route_key, bound.len()));
+        spec.session_id = Some(
+            self.agent
+                .sessions()
+                .reserve_id(
+                    SessionKind::Ui,
+                    &ui_session_key(self.agent.agent_did(), route_key, bound.len()),
+                    Some(&self.sessions_dir),
+                )
+                .await?,
+        );
         spec.route_key = Some(route_key.to_string());
         spec.owner = Some(self.owner.to_string());
         spec.driver = Some(self.who.clone());
@@ -750,7 +742,8 @@ impl UiModule {
     pub async fn run(self: Arc<Self>, waker: Arc<dyn Waker>, poll: Duration) {
         let pattern = parse_did(self.agent.agent_did())
             .ok()
-            .map(|d| format!("/msg_center/{}/INBOX/**", d.to_raw_host_name()));
+            .and_then(|d| buckyos_api::MailboxAddress::new(d, None).ok())
+            .map(|mailbox| mailbox.owner_event_pattern());
         let mut backoff = Duration::from_secs(1);
         loop {
             let result = self.scan().await;

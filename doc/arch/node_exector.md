@@ -7,8 +7,8 @@
 > 首期裁决：Linux 形态 A + hosted xllm；严格的一对一 App/Agent 身份映射；设备准入由 cyfs-gateway process-chain 完成，Executor 不接收 remote device 身份；授权快照、跨 Stream 操作归属、持久 store_id 与最小恢复链路一起交付。远端 PromptExec 首期关闭。
 > 来源：
 > 1. 本文件旧版（node_Executor 需求）：执行 Scheduler 下发的 ThunkObject（Function Instance）。
-> 2. `notepads/node-agent-runtime-todo.md`（2026-10-13）：Agent 在指定 Node 上执行 shell/文件工具的 `remote_node` 运行时。
-> 3. `notepads/BuckyOS Node Executor设计思路.md`（2026-10-18）：两种执行模式、轻量 Agent Daemon、最终恢复通道。
+> 2. `notepads/done/node-agent-runtime-todo.md`（2026-10-13）：Agent 在指定 Node 上执行 shell/文件工具的 `remote_node` 运行时。
+> 3. `notepads/done/BuckyOS Node Executor设计思路.md`（2026-10-18）：两种执行模式、轻量 Agent Daemon、最终恢复通道。
 > 相关文档：`doc/BuckyOS 系统故障的诊断和恢复(beta3).md`（故障分层、第二诊断链路、Agent 修复前置条件）、`doc/arch/Reset & Unbind.md`（物理控制权、Headless）、`doc/arch/BuckyOS Security Arch.md`（L0–L3 用户层级、S0–S3 软件层级、Client Device）、`doc/task_mgr/task_mgr.md`（谁创建谁执行）、`doc/workflow/executor list.md`（func:: / optask::）、`cyfs-gateway/doc/rtcp/rtcp.md` 与 `rtcp rely.md`。
 
 ---
@@ -116,14 +116,16 @@
 | B. Agent Daemon 独立服务 | 独立常驻进程，内含 cyfs-gateway-lib + node_executor | 没有安装 BuckyOS 节点、但能装后台服务的电脑/终端 | ②（③ 看是否有后台保障） | 安装时授予 |
 | C. Agent Daemon 嵌入 App | 单进程 App 内以 Library 形式嵌入 | Android/iOS/盒子等不便装服务的设备 | ② | 不超过 App 自身权限 |
 
-形态 A 按 node_daemon 的运行身份分两种模式（2026-10-23 裁决，见 [集成 TODO §0](../../notepads/agent-runtime-session-workspace-integration-todo.md)）：
+形态 A 按 node_daemon 的运行身份分两种模式（2026-10-23 裁决，见 [集成 TODO §0](../../notepads/done/agent-runtime-session-workspace-integration-todo.md)）：
 
 | 模式 | node_daemon 运行方式 | identity_mode | profile `run_as` | 桌面能力 | 适用 |
 | --- | --- | --- | --- | --- | --- |
 | A-system | 系统服务（root / LocalSystem），开机即起 | SwitchUser | 必填，worker 降权到专用账号（§7.5） | 无（Linux 服务器没有 GUI） | OOD、Node 服务器、Linux |
 | A-desktop | 随用户登录启动，运行在该用户的交互会话中 | CurrentUser | 必须省略，以登录用户身份执行 | 注入与 agent-daemon 共用的桌面 Driver（macOS 14+、Windows），ComputerInspect/Observe/Act 随 Driver readiness 开放 | Desktop 版：Windows 现状即如此；macOS 上 node_daemon 是 `BuckyOS Runtime.app` 的主程序，作为绑定用户的 LaunchAgent（`gui/<uid>`、Aqua）运行（§17.10）；以 root 运行的 node_daemon 仍按 A-system 处理 |
 
-模式由 node_daemon 启动时按“进程是否 root / 是否位于交互会话”判定并写入 describe 结果，不按安装包类型猜。A-desktop 的权限边界与 §16 对 Windows 的说明一致：Agent 拥有该桌面用户的全部权限，roots 只约束 cwd 与内置文件工具。Desktop 版 owner 的电脑因此用 A-desktop 作为 Agent 的 `host` 目标，不要求再安装独立 agent-daemon；形态 B 保留给不装节点的设备。同一台电脑上 A-desktop 与形态 B 并存时，桌面输入协调锁按用户会话共用，互斥而不是各自一份。
+Linux 系统服务默认不向 owner 的 Agent 开放（常规生产环境大家都在容器里）。Owner 把这台设备也用于别的事、要让 Agent 维护它时，在激活时指定一个 OS 账号，确定 Zone owner 的同时确定它在这台设备上的身份：`commit_active` 的 `system_settings.host_account` 写入节点本地的 `etc/host_account.json`（`make_config.ts` 是开发环境的无 UI 激活，`dev` / `devtest_ood1` 把运行它的用户写入同一文件），之后 node_daemon 只写一次 `owner_agents`。普通账号走 SwitchUser，`run_as` 为该账号，默认 root 是它的 home，并按 §7.5 降权，所以 Agent 里用不了 sudo 和附加组；选 root 时走 CurrentUser，省略 `run_as`，以 node_daemon 身份执行，roots 为 `/root` 与 `/`，权限边界同 A-desktop。root 的决定只在节点本地，`run_as` 仍不允许为 0，Zone 配置无法把节点变成 root。激活服务尚未认证请求，抢先激活者也能选 root，与抢先激活本身是同一风险。
+
+模式由 node_daemon 启动时按“进程是否 root / 是否位于交互会话 / 激活时选择的账号”判定并写入 describe 结果，不按安装包类型猜。A-desktop 的权限边界与 §16 对 Windows 的说明一致：Agent 拥有该桌面用户的全部权限，roots 只约束 cwd 与内置文件工具。Desktop 版 owner 的电脑因此用 A-desktop 作为 Agent 的 `host` 目标，不要求再安装独立 agent-daemon；形态 B 保留给不装节点的设备。同一台电脑上 A-desktop 与形态 B 并存时，桌面输入协调锁按用户会话共用，互斥而不是各自一份。
 
 ```text
 形态 C（单进程）
@@ -136,6 +138,10 @@
 ```
 
 运行一个本机 Gateway 或嵌入 Gateway Library，不等于承担 Zone 网关角色，也不因此成为 OOD。
+
+Desktop Lite 中，Agent Service 与 owner 在同一节点、同一 OS 执行身份下运行时，Agent 的 `private` 和 owner default 指向同一个 native runtime；`host` 只保留为设置中的角色引用，由 registry 解析到 `private`。容器、其他节点，以及 Linux 上需要切换 OS 账号的执行环境仍分别登记。
+
+该 native runtime 的 shell、文件、工作区和工具检查直接在本机执行。PATH 在 Session/Agent skill 工具之后加入 `$BUCKYOS_ROOT/tools/bin` 与 `$BUCKYOS_ROOT/bin/agent-tools`。ComputerUse 单独通过本机 IPC 复用 node_daemon 已打开的 NodeExecutor/ComputerDriver：Unix 为 `$BUCKYOS_ROOT/local/node_daemon/executor/computer.sock`（0600），Windows 为按安装目录生成的本地 named pipe（拒绝远程客户端）。协议、Agent token、profile、授权快照、撤权、桌面锁、operation ledger 和截图 content 通道均复用现有实现，不经过 gateway/SOCKS/RTCP。语义观察（Windows UIA；`observation.semantic` 的大纲、窗口列表与 coverage）随结果走控制帧，单个载荷不超过 `COMPUTER_MAX_SEMANTIC_BYTES`（256 KiB），只有截图使用 content 通道；结果给模型时大纲以纯文本行展示，没有截图时不附图片。IPC 或桌面权限失败仅影响桌面能力，不改变 native shell/file 的可用性。
 
 ### 4.3 能力声明
 
@@ -223,7 +229,7 @@ Scheduler 是正常体系的最高配置来源；Owner 是正常体系之外的�
     "limits": {
       "max_streams": 4, "max_concurrency": 2,
       "max_execution_ms": 3600000, "max_output_bytes_per_stream": 8388608,
-      "max_file_bytes": 1048576,
+      "max_file_bytes": 1048576, "max_computer_image_bytes": 8388608,
       "result_retention_secs": 604800, "max_records": 100000,
       "max_store_bytes": 2147483648
     }
@@ -261,9 +267,19 @@ Executor 是系统服务时可具有被授予的系统能力；嵌入普通 App 
 
 ---
 
-## 6. 来源①：ThunkObject（整体后置，待 FunctionObject 定义）
+## 6. 来源①：ThunkObject（分布式执行后置；本地 Native 子集已落地）
 
-本节保留后续设计输入。FunctionObject 的 Rust 类型已存在，但代码/包的解析、运行环境、权限、输入输出及副作用语义尚未形成完整契约。Thunk 的 schema 接线、scheduler 派发、节点 runner、TaskMgr 回报与端到端验收整体后置，完成 §6.2 后再单独排期；不列入 P0/P1/P2 的交付要求。这与 `doc/workflow/executor list.md` 将 `func::` / `optask::` 列为后续阶段的方向一致。
+本节保留后续设计输入。2026-11-05 起 FunctionObject / Thunk 通道在 **workflow 进程内的本地 Native 子集**上首次真实落地（[notepads/llm-media-pipeline-workflow-todo.md](../../notepads/llm-media-pipeline-workflow-todo.md)，`src/kernel/workflow/src/{function_registry,native,local_thunk_runner}.rs`）。该子集对 §6.2 五项条件的回答只对“同进程、同宿主、Native 实现”成立，不能据此标成通用分布式执行已解决：
+
+| §6.2 条件 | 本地 Native 子集的回答 | 分布式（Scheduler + Node Executor）仍待定 |
+| --- | --- | --- |
+| 定义与代码绑定 | `FunctionObject.content = "<name>/impl-<n>"` 指向进程内注册的 Rust 实现；`fun_id` 由 JCS hash 得到，registry 在编译期把 `/tool/<name>@<version>` 绑定为 `func::<obj_id>`，并把 FunctionObject 发布到 Named Store | `ExecPkg` / `Script` / `OPTask` 的 `content` 格式、包解析与入口；Zone 级 registry |
+| 运行环境与权限 | 宿主上的 workflow 服务身份执行；工具由启动时探测的 `ToolEnvironment` 提供，版本进指纹；请求者授权只用于输入读取与结果交付，不传给执行 | 解释器 / 依赖 / cwd / env / 容器选择 / OS 身份；提交者对目标节点的授权；OPTask 宿主权限 |
+| 输入输出契约 | `params_schema` / `result_schema` 在执行前后强制校验；`CheckByRunner("file_content")` 引用由 runner 按 content id 读 Named Store；结果为 `Fixed` / `Object`（Named Object + 产物 FileObject）；超时单位秒；错误 `{code, message, details, retryable}` | `Stream` / `Iterator` 结果的传输；跨节点数据访问 |
+| 副作用与实例语义 | `is_pure` 进 hash 决定缓存资格（与 Step `idempotent` 分离）；thunk ID 只由 `fun_id + params` 决定；一次执行以 `execution_id = <run_id>/<node_id>/<attempt>` 标识，回执按它去重；同一 thunk 允许在多个 Run 同时执行（不做 single-flight）；取消 = 置标志 + kill/wait 子进程 + 清理临时目录 | 跨节点唯一派发记录、丢回执后的重试不在另一节点再次执行 |
+| 任务归属与回报 | workflow 既是 Task creator 也是 runner：创建 `workflow/thunk` Task，runner 更新 queued / running / 终态；`requested_by` 随 TaskData 展示 | scheduler 与 workflow 谁绑定 TaskMgr runner、TaskId 类型统一 |
+
+以下候选方案仍是分布式路径的设计输入，与 `doc/workflow/executor list.md §7` 的“后续”范围一致。
 
 ### 6.1 三条路径的脚本执行能力对比
 
@@ -728,7 +744,7 @@ cargo check --workspace
 
 ## 16. 与来源文档的关系
 
-- 本文发布后，`notepads/node-agent-runtime-todo.md` 与 `notepads/BuckyOS Node Executor设计思路.md` 降为历史输入；与本文冲突处以本文为准。本次已将 TODO §6–§8 中仍适用的操作归属、持久 starting、崩溃窗口、输出游标、store_id 和墓碑规则纳入 §7/§11；不沿用 S2S peer 绑定、离线 spool/queued 恢复或 node_daemon 依赖 libopendan 的旧方案。CodeAgent 固化 wire 编码与 DTO 时遵循本次裁决，不能重新选择这些语义。
+- 本文发布后，`notepads/done/node-agent-runtime-todo.md` 与 `notepads/done/BuckyOS Node Executor设计思路.md` 降为历史输入；与本文冲突处以本文为准。本次已将 TODO §6–§8 中仍适用的操作归属、持久 starting、崩溃窗口、输出游标、store_id 和墓碑规则纳入 §7/§11；不沿用 S2S peer 绑定、离线 spool/queued 恢复或 node_daemon 依赖 libopendan 的旧方案。CodeAgent 固化 wire 编码与 DTO 时遵循本次裁决，不能重新选择这些语义。
 - Thunk 的后置范围与 `doc/workflow/executor list.md` 的后续阶段方向一致；本文 §6.3–6.6 保留旧执行器方案作比较输入，待 §6.2 定稿后更新，不作为首期实施契约。
 - `BuckyOS 系统故障的诊断和恢复(beta3).md` §10.3 的第二诊断链路由本文 §9 具体化；该文 §11 的 Agent 修复前置条件对本文来源①的 OPTask 与来源②的修复类命令同样适用。
 - `Reset & Unbind.md` §2.3 的物理控制权要求对应本文 §9.1 本地触发；§7.1 对远程擦除的保守态度同样适用于远程恢复脚本的能力边界。
@@ -779,10 +795,10 @@ P0-A（配置与权限）与 P0-B（Command Stream 最小闭环，Linux 形态 A
 - 账本 `$BUCKYOS_ROOT/local/node_daemon/executor/`：`meta.json`、`owner.lock`（flock 单写者）、`operations/<key-hash>/{request.json,state.json,result.json,stdout,stderr,content,upload}`、`tombstones/<key-hash>.json`、`tmp/`。key-hash = sha256(`["op", store_id, agent_did, app_instance_id, profile, runtime_id, op_id]`)，另以 run/call 元组做第二唯一键。记录在 tmp 下写全并 fsync 后整目录 rename 发布，之后才回复 accepted；result.json 写一次。重启时 starting/running 而无结果的记 unknown（effect_unknown），meta 缺失但有记录、node_did 不符、记录损坏均拒绝打开（节点日志报错，执行器保持关闭）。
 - exec：先以目标身份跑一次 worker 解析 cwd（须在 roots 内），再在串行控制门内检查取消、直接 spawn `bash --noprofile --norc -c <wrapper>`（独立进程组；pre_exec 内显式 setgroups([gid])/setgid/setuid 并核对，以目标身份 chdir，继承的 fd 置 CLOEXEC（Linux 用 `close_range`，macOS 或 close_range 不可用时按 RLIMIT_NOFILE 逐个 fcntl）；Linux 另设 no_new_privs、清 ambient caps），脚本经 stdin 读入后 stdin 改为 /dev/null，不进 argv。**差异**：shell 进程本身就是降权 worker，没有再套一层持有 shell 的 worker。stdout/stderr 各保留前 N 字节、超出继续 drain；leader 退出后最多再等 500 ms 读管道；超时/取消对进程组 SIGTERM，2 s 后 SIGKILL，以 wait 确认后才发布 timed_out/cancelled；正常结束不清理后台进程。
 - 文件操作：node_daemon 以 `--executor-worker` 重入自身、以 profile 身份执行；路径在打开后的 fd（Linux `/proc/self/fd`，macOS `F_GETPATH`）上校验是否在 roots 内；写入为同目录临时文件 + fsync + renameat + 目录 fsync（`append` 例外：`O_APPEND` 原地追加后 fsync，不受 max_file_bytes 对整文件的限制，只限单次上传；给出 expected_hash 时流式计算已有内容摘要）；rename/remove 在已校验的父目录句柄上 `renameat`/`linkat`/`unlinkat`；`write` 可创建 roots 内缺失的父目录；同一 canonical 路径的写串行（rename 同时锁定两端）；expected_hash / expected_size 不符为 Conflict。read/edit 的内容快照写入 `content`，query 读取的是快照而非现场文件。文件操作一旦开始不可中断，取消请求之后按自然结果发布。
-- 容量：准入前按操作预留空间（exec 为 2×输出上限，文件为 max_file_bytes），计入 max_records（含墓碑）与 max_store_bytes，超出 CapacityExceeded；GC 每 60 s 先写墓碑再删目录，墓碑不按 TTL 删除。
+- 容量：准入前按操作预留空间（exec 为 2×输出上限，文件为 max_file_bytes，Computer 为 max_computer_image_bytes），计入 max_records（含墓碑）与 max_store_bytes，超出 CapacityExceeded；GC 每 60 s 先写墓碑再删目录，墓碑不按 TTL 删除。
 - 非 root 的 daemon 只声明 open_stream/describe/query/cancel，exec/read/write/edit/mkdir/stat/rename/remove 返回 Capability。
 - `describe` 的 `target` 另带 `workdir_roots`（profile 的 roots：控制侧据此放 Session 默认目录 `<root0>/.opendan/<agent>/sessions/<sid>`），`info` 另带 `identity_mode`（`current_user | switch_user`）与注入 Driver 时的 `desktop`（`ui/capture/input/accessibility` readiness）：A-system 与 A-desktop 由此区分，不猜安装形态。
-- node_daemon 桌面模式（A-desktop）：`--desktop_daemon` 构建、平台有 Driver（macOS/Windows）且进程非 root 时，以 `CurrentUser` 打开并注入 `computer_driver` crate 的共享 Driver（与 agent-daemon 同一实现、同一用户会话输入协调锁）；Linux 与 root 场景保持 A-system。
+- node_daemon 桌面模式（A-desktop）：`--desktop_daemon` 构建、平台有 Driver（macOS/Windows）且进程非 root 时，以 `CurrentUser` 打开并注入 `computer_driver` crate 的共享 Driver（与 agent-daemon 同一实现、同一用户会话输入协调锁）；Linux 与 root 场景保持 A-system。两平台的 Driver 都提供语义观察（semantic/hybrid/auto）、element target 与 `invoke`/`set_value`：Windows 基于 UI Automation，macOS 基于 Accessibility（与输入共用辅助功能权限），`desktop.accessibility` 报其就绪（行为与限制见 [agent_daemon.md](agent_daemon.md) 的 macOS 与 Windows ComputerUse 两节）。
 
 ### 17.5 gateway 与 Agent 侧
 
@@ -855,5 +871,8 @@ DV 中发现并已修正：SOCKS hook 对 IP 目标只有 `REQ.target.type = "ip
 - 退出：SIGTERM（bootout、`kickstart -k`）先 `NodeExecutor::shutdown()`（至多 20 s，plist `ExitTimeOut=30`），再退出；run item 不随之停止，崩溃仍走账本恢复。
 - 环境：Executor 在 profile 未设 PATH 时的 macOS 默认值加入 `/opt/homebrew/bin` 与 sbin 目录；daemon 的服务 PATH 由 LaunchAgent 单独给出。
 - 权限：Runtime 的 app 入口（Finder 打开或 `open -n … --args --request_permissions`）由 Runtime 进程自己请求屏幕录制与辅助功能；常驻进程每 30 s 把 Driver readiness 写到 `local/node_daemon/desktop_status.json`，供 `node_control` check 与托盘呈现。
+- 焦点：macOS daemon 在主线程初始化 AppKit，再启动异步服务；缺少初始化时系统级 AX 焦点查询会返回 CannotComplete。Driver 通过系统 AX 元素的 `kAXFocusedApplicationAttribute` 读取当前应用及焦点元素；daemon 不运行 AppKit 主事件循环，不能依赖 `NSWorkspace.frontmostApplication` 的缓存。切换应用、焦点元素或显示器仍使旧观察失效。
+- 开发签名：ad-hoc 构建的 code hash 会变化。若系统权限开关开启但 Runtime 仍被拒绝，检查 TCC 日志的 code requirement mismatch；只重置 `com.buckyos.runtime` 的 ScreenCapture / Accessibility 授权，重新请求并由用户授权当前构建，再重启验证。
 - 已验证（macOS 15.8.1 arm64，ad-hoc 签名、开发构建）：bundle 组装/签名/复制后校验；含空格的自定义 root 下直接运行 bundle 内主程序，根路径发现、单实例锁、绑定其他 uid 时拒绝、SIGTERM 有界退出均符合预期；Runtime 报告 uid 501、GUI audit session 与两项权限缺失；未绑定时 `service start` 拒绝；`stop_osx.sh` 只停该 root 的进程。
-- 未验证：真实 LaunchAgent 的注册/登录启动/注销/Login Items 禁用、正式签名与 TCC 归属及升级连续性、本地网络权限、pkg 安装与覆盖升级、Intel 与 macOS 14、GUI DV。
+- 已验证（2026-11-08，macOS 15.8.1 arm64，Desktop Lite 开发环境）：用户为当前签名授权后，LaunchAgent Runtime 经本机 Unix socket 完成 1620×1080 截图、按钮点击、光标移动、文本输入与退格；临时应用回读确认点击计数和文本结果，原有文本保留。切换应用后的焦点元素及显示器范围校验通过；runtime 刷新为单一 native、桌面 ready，无 desktop_error。
+- 未验证：登录启动/注销/Login Items 禁用、正式签名与 TCC 归属及升级连续性、本地网络权限、pkg 安装与覆盖升级、Intel 与 macOS 14、其他桌面应用的完整 GUI 任务。

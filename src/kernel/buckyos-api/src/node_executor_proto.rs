@@ -423,10 +423,18 @@ pub struct ExecutorRuntimeInfo {
     pub time_ms: u64,
     #[serde(default)]
     pub path: Option<String>,
+    /// Home directory of the OS account operations run as: where the
+    /// Agent's directory on this host is placed (`.opendan/<agent_id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
     /// `current_user` (form A-desktop, form B/C) or `switch_user` (form
     /// A-system): how the host executes.
     #[serde(default)]
     pub identity_mode: Option<String>,
+    /// `$BUCKYOS_ROOT` of a BuckyOS node: where its managed commands are.
+    /// Absent on a host without a managed install (form B/C).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buckyos_root: Option<String>,
     /// The desktop Driver's capabilities (`ui`, `capture`, `input`,
     /// `accessibility`, each `{supported, ready, reason?}`) when one is
     /// injected; absent on hosts without ComputerUse.

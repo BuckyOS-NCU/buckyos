@@ -16,6 +16,11 @@ import {
 export interface PreviewThumbnailRequest {
   width: number
   height: number
+  /**
+   * `pipeline`: a derived JPEG even when the Runtime decodes the original
+   * (feeds: less traffic, HEIC/HEVC alike); the original only when no Pipeline answers.
+   */
+  prefer?: 'pipeline'
 }
 
 export interface PreviewThumbnail {
@@ -69,7 +74,7 @@ function sizeBucket(request: PreviewThumbnailRequest): string {
 }
 
 export function previewThumbnailKey(source: ContentRef, request: PreviewThumbnailRequest): string {
-  return `${refIdentity(source)}|${sizeBucket(request)}`
+  return `${refIdentity(source)}|${sizeBucket(request)}${request.prefer ? `|${request.prefer}` : ''}`
 }
 
 export function ensurePreviewThumbnail(
@@ -180,7 +185,8 @@ async function buildThumbnail(
   const direct = decideDirect(classification, resolved.size, runtime)
   const renderer = classification.rendererType
 
-  if (direct.ok && (renderer === 'image' || renderer === 'svg')) {
+  const directImage = direct.ok && (renderer === 'image' || renderer === 'svg')
+  if (directImage && !(request.prefer === 'pipeline' && renderer === 'image')) {
     return {
       url: urlOf(resolved.readRef, own),
       mediaType: classification.mediaType,
@@ -192,7 +198,7 @@ async function buildThumbnail(
 
   let pipelineError: unknown = null
   try {
-    const result = await pipelineThumbnail(resolved, request, signal)
+    const result = await pipelineThumbnail(resolved, classification.mediaType, request, signal)
     if (result) {
       return {
         url: urlOf(result.readRef, own),
@@ -210,6 +216,16 @@ async function buildThumbnail(
     pipelineError = err
   }
 
+  if (directImage) {
+    return {
+      url: urlOf(resolved.readRef, own),
+      mediaType: classification.mediaType,
+      contentRenderer: renderer,
+      contentMediaType: classification.mediaType,
+      via: 'direct',
+    }
+  }
+
   if (renderer === 'video' && direct.ok) {
     const frame = await runCapture(() => captureVideoFrame(resolved.readRef, request, signal, own), signal)
     return { ...frame, contentRenderer: renderer, contentMediaType: classification.mediaType, via: 'runtime-capture' }
@@ -225,6 +241,7 @@ function contentLabel(classification: MediaClassification): string {
 
 async function pipelineThumbnail(
   resolved: ResolvedPreviewSource,
+  mediaType: string,
   request: PreviewThumbnailRequest,
   signal: AbortSignal,
 ): Promise<PreviewResult | null> {
@@ -232,6 +249,7 @@ async function pipelineThumbnail(
   const runtime = await ensureRuntimeProfile()
   const ensured = await withTimeout(provider.ensurePreviewWork({
     source: resolved,
+    mediaType,
     runtimeProfile: { ...runtime, acceptTypes: ['image'] },
     targetProfile: {
       purpose: 'thumbnail',
@@ -308,7 +326,7 @@ function mediaEvent(video: HTMLVideoElement, event: 'loadedmetadata' | 'loadedda
     }
     const onError = () => {
       cleanup()
-      reject(new PreviewError('CORRUPTED', 'The video could not be decoded'))
+      reject(new PreviewError('UNSUPPORTED', 'This browser could not decode the video'))
     }
     const onAbort = () => {
       cleanup()

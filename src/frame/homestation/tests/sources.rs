@@ -62,13 +62,13 @@ async fn offline_recipient_retry() {
     let row: (String, i64, String) = alice
         .station
         .db
-        .call(|c| Ok(c.query_row("SELECT state, attempts, last_result FROM outbox WHERE purpose='object'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?))
+        .call(|c| Ok(c.query_row("SELECT state, attempts, last_result FROM outbox WHERE purpose='object' AND owner=?1", [c.owner], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?))
         .await
         .unwrap();
     assert_eq!((row.0.as_str(), row.1), ("pending", 1));
     assert!(row.2.contains("no_response"), "{}", row.2);
     bob.start().await;
-    alice.station.db.call(|c| Ok(c.execute("UPDATE outbox SET next_at=0", [])?)).await.unwrap();
+    alice.station.db.call(|c| Ok(c.execute("UPDATE outbox SET next_at=0 WHERE owner=?1", [c.owner])?)).await.unwrap();
     net.deliver_all().await;
     let task = net.rpc("alice", "publish.task", json!({ "key": "p1" })).await;
     assert_eq!(task["delivery"]["state"], "delivered");
@@ -94,7 +94,7 @@ async fn spider_private_captures_and_share() {
     assert_eq!(added[0]["url"], format!("{site}/feed.xml"));
     net.rpc("bob", "admin.run", json!({ "task": "pull" })).await;
     net.rpc("bob", "admin.run", json!({ "task": "pull" })).await;
-    let captures: i64 = bob.station.db.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM candidates WHERE private_capture=1 AND selection!='dropped'", [], |r| r.get(0))?)).await.unwrap();
+    let captures: i64 = bob.station.db.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM candidates WHERE private_capture=1 AND selection!='dropped' AND owner=?1", [c.owner], |r| r.get(0))?)).await.unwrap();
     assert_eq!(captures, 2, "each item once");
     net.rpc("bob", "admin.run", json!({ "task": "selection" })).await;
     let page = net.rpc("bob", "reading.list", json!({ "query": { "filter": "news", "topicId": null, "search": "", "showFiltered": false } })).await;
@@ -106,15 +106,15 @@ async fn spider_private_captures_and_share() {
     assert_eq!(card["repostBlockedReason"], "private_capture");
     // Selection replaced the link card by a snapshot-wrapping object (§18.1 step 4).
     assert_eq!(card["item"]["contentType"], "article");
-    assert_eq!(card["item"]["wrappedFile"]["meta"]["mime"], "text/html");
+    assert_eq!(card["item"]["wrappedFile"]["mime"], "text/html");
     let body = net.rpc("bob", "item.wrapped_body", json!({ "objId": card["item"]["objId"] })).await;
     assert_eq!(body["state"], "ready");
     assert!(body["markdown"].as_str().unwrap().contains("Build four boxes"));
     // Private captures are not in Bob's stream (A72).
-    let (_, stream, _) = net.get(&format!("{}/feed?mode=display", bob.home), Some(net.proof("carol", "bob"))).await;
+    let (_, stream, _) = net.get(&format!("{}/feed?mode=display", bob.home), Some(net.proof("carol", "bob").await)).await;
     assert_eq!(serde_json::from_str::<Value>(&stream).unwrap()["items"].as_array().unwrap().len(), 0);
     let capture_id = card["item"]["objId"].as_str().unwrap().to_string();
-    assert_eq!(net.get(&format!("{}/objects/{capture_id}", bob.home), Some(net.proof("carol", "bob"))).await.0, 404);
+    assert_eq!(net.get(&format!("{}/objects/{capture_id}", bob.home), Some(net.proof("carol", "bob").await)).await.0, 404);
 
     // Sharing publishes Bob's own object wrapping the snapshot, with the source kept as data.
     let task = net.rpc("bob", "publish.share_capture", json!({ "objId": capture_id })).await;
@@ -128,7 +128,7 @@ async fn spider_private_captures_and_share() {
     assert_eq!(again["sharedAs"], task["objId"]);
     // Carol fetches the snapshot from Bob once it is part of a visible publication.
     let snapshot = shared["item"]["object"]["wraps"].as_str().unwrap().to_string();
-    assert_eq!(net.get(&format!("{}/objects/{snapshot}", bob.home), Some(net.proof("carol", "bob"))).await.0, 200);
+    assert_eq!(net.get(&format!("{}/objects/{snapshot}", bob.home), Some(net.proof("carol", "bob").await)).await.0, 200);
 }
 
 /// §7.6, A34, A36: Message Center friends follow each other by default; losing the friend
@@ -210,8 +210,8 @@ async fn friends_without_homestation() {
     assert!(err.contains("noHome"), "{err}");
     publish(&net, "alice", "p1", text_input("friends only", json!({ "kind": "friends" }))).await;
     let queued: Vec<String> = alice.station.db.call(|c| {
-        let mut stmt = c.prepare("SELECT DISTINCT recipient FROM outbox")?;
-        let rows = stmt.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+        let mut stmt = c.prepare("SELECT DISTINCT recipient FROM outbox WHERE owner=?1")?;
+        let rows = stmt.query_map([c.owner], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
         Ok(rows)
     }).await.unwrap();
     assert_eq!(queued, vec![bob.did.clone()]);

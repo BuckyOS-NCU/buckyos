@@ -7,10 +7,11 @@ import {
   type PreviewSessionItemInput,
   type ResolvedPreviewSource,
 } from '../../../../components/preview/types'
-import { getMessageStableId, messageObjId, type MessageObject, type RefItem } from '../../protocol/msgobj'
+import type { ndn } from 'buckyos'
+import { getMessageStableId, messageObjId, type MessageObject } from '../../protocol/msgobj'
 import { effectiveContent, messageRelations } from '../history/relations'
 import type { ConversationMessageReader } from '../history/types'
-import { getObjectAccess, type ObjectInfo } from '../history/objectAccess'
+import { getObjectAccess, objectFailure, type ObjectInfo } from '../history/objectAccess'
 
 export const MESSAGEHUB_OBJECT_SOURCE = 'messagehub-object'
 
@@ -82,17 +83,18 @@ export function isInlineImageType(mediaType: string | undefined): boolean {
 }
 
 /**
- * msg-center `context_path` of the objects a message of a hosted group session
- * shows (`ui_group_session` names the session's MailboxAddress): the session
- * plus the message that carries the refs, which is the latest edit once one
- * replaced the content. Other messages are read without one.
+ * msg-center `context_path` of the objects a message shows: the message that
+ * carries the refs, which is the latest edit once one replaced the content;
+ * msg-center serves an attachment only through the binding of that message.
+ * A message of a hosted group session (`ui_group_session` names the
+ * session's MailboxAddress) is prefixed with the session.
  */
 export function objectContextOf(message: MessageObject): string | undefined {
-  const session = message.ui_group_session
-  if (typeof session !== 'string' || !session) return undefined
   const edited = messageRelations(message)?.edited
   const holder = edited ? edited.edits.findLast(edit => edit.at === edited.at)?.id : messageObjId(message)
-  return holder ? `${session}/${holder}` : undefined
+  if (!holder) return undefined
+  const session = message.ui_group_session
+  return typeof session === 'string' && session ? `${session}/${holder}` : holder
 }
 
 export function messageAttachments(message: MessageObject, indexHint: number): MessageAttachment[] {
@@ -108,7 +110,7 @@ export function messageAttachments(message: MessageObject, indexHint: number): M
   return out
 }
 
-export function attachmentOfRef(ref: RefItem, id: string, context?: string, hasAccess = getObjectAccess() !== null): MessageAttachment | null {
+export function attachmentOfRef(ref: ndn.RefItem, id: string, context?: string, hasAccess = getObjectAccess() !== null): MessageAttachment | null {
   const target = ref.target
   if (target.type !== 'data_obj') return null
   const hint = target.uri_hint?.trim()
@@ -132,12 +134,16 @@ function valueOf(source: ContentRef): MessageObjectSourceValue {
 
 function accessError(error: unknown): PreviewError {
   const text = error instanceof Error ? error.message : String(error)
-  const status = Number(text.split(' ')[0])
-  if (status === 401 || status === 403) return new PreviewError('PERMISSION_DENIED', 'You do not have access to this attachment', { detail: text })
-  if (status === 404) return new PreviewError('NOT_FOUND', 'This attachment is no longer available', { detail: text })
-  if (status === 413) return new PreviewError('TOO_LARGE', 'This attachment is too large to open here', { detail: text })
-  if (status === 415) return new PreviewError('UNSUPPORTED', 'This attachment has no downloadable content', { detail: text })
-  return new PreviewError('NETWORK', 'The attachment could not be loaded', { detail: text, retryable: true })
+  switch (objectFailure(error)) {
+    case 'awaiting_acceptance': return new PreviewError('PERMISSION_DENIED', 'Accept the sender to view this attachment', { detail: text })
+    case 'denied': return new PreviewError('PERMISSION_DENIED', 'You do not have access to this attachment', { detail: text })
+    case 'not_found': return new PreviewError('NOT_FOUND', 'This attachment is no longer available', { detail: text })
+    case 'too_large': return new PreviewError('TOO_LARGE', 'This attachment is too large to open here', { detail: text })
+    case 'directory': return new PreviewError('UNSUPPORTED', 'Folders from other Zones cannot be opened yet', { detail: text })
+    case 'unsupported': return new PreviewError('UNSUPPORTED', 'This attachment has no downloadable content', { detail: text })
+    case 'corrupt': return new PreviewError('NETWORK', 'This attachment failed verification', { detail: text })
+    default: return new PreviewError('NETWORK', 'The attachment could not be loaded', { detail: text, retryable: true })
+  }
 }
 
 async function resolveMessageObject(source: ContentRef): Promise<ResolvedPreviewSource> {

@@ -62,6 +62,10 @@ pub struct GlobOutput {
 
 #[async_trait]
 impl TypedTool for GlobTool {
+    fn idempotent(&self) -> bool {
+        true
+    }
+
     type Args = GlobArgs;
     type Output = GlobOutput;
 
@@ -639,7 +643,7 @@ mod tests {
         std_fs::write(dir.path().join("src/nested/mod.rs"), "mod").expect("write");
         std_fs::write(dir.path().join("src/readme.md"), "md").expect("write");
 
-        let tool = TypedToolHandle::with_null_host(
+        let tool = TypedToolHandle::new(
             GlobTool::new(FileToolConfig::new(dir.path())).with_max_results(1),
         );
         let result = AgentTool::call(

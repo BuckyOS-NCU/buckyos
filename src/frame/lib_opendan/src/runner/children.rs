@@ -13,14 +13,14 @@
 //!   committed; the receipt records the delivered state per child
 //!   (`subscription_cursors["_child:<sid>"].attention`).
 //!
-//! A suspended call waiting for `session:<sid>` is answered by
-//! [`SessionTaskResolver`] from the same registry state; that child's state
-//! is then the call's tool result and is not delivered as an event too.
+//! A call's `session:<sid>` task (`create-worksession`) is answered by
+//! [`SessionTaskResolver`] from the same registry state; the child's end
+//! reaches the session through the poll above, not as a task result.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use llm_context::tasks::{
+use agent_tool::task_model::{
     CancelUnsupported, RunningTaskResolver, TaskBrief, TaskResult, TaskState,
 };
 use serde_json::{json, Value};
@@ -31,7 +31,7 @@ use crate::state::AgentStateClient;
 
 use super::shared::{commit_and_report, Shared};
 
-/// Task id prefix of a suspended call waiting for a sub session.
+/// Task id prefix of a sub session as a task (`session:<sid>`).
 pub const SESSION_TASK_PREFIX: &str = "session:";
 
 pub(super) const ATTENTION_FINISHED: &str = "finished";
@@ -58,12 +58,6 @@ fn attention_of(state: &SessionState, sid: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The end of sub session `sid` reached this session (delivered as an
-/// input, as a waited call's result, or shown after tool results).
-pub(super) fn end_delivered(state: &SessionState, sid: &str) -> bool {
-    attention_of(state, sid).as_deref() == Some(ATTENTION_FINISHED)
-}
-
 pub(super) fn set_attention(state: &mut SessionState, sid: &str, attention: Option<&str>) {
     let c = state
         .subscription_cursors
@@ -81,13 +75,24 @@ fn attention_now(e: &RegistryEntry) -> Option<&'static str> {
         Some(ATTENTION_FINISHED)
     } else if e.status.pending_decision.is_some() {
         Some(ATTENTION_DECISION)
-    } else if e.status.run_state == RunState::Waiting
-        && e.status.waiting_for == Some(WaitingKind::Input)
-    {
+    } else if e.status.needs_input {
         Some(ATTENTION_INPUT)
     } else {
         None
     }
+}
+
+/// The state of sub session `task_id` (`session:<sid>`) was the result of a
+/// call: what it shows now is not reported as an event too.
+pub(super) async fn mark_heard(sh: &Shared, task_id: &str) -> Result<()> {
+    let Some(sid) = task_id.strip_prefix(SESSION_TASK_PREFIX) else {
+        return Ok(());
+    };
+    let Some(a) = sh.agent().sessions().lookup(sid).await?.as_ref().and_then(attention_now) else {
+        return Ok(());
+    };
+    set_attention(&mut sh.session.lock().await.state, sid, Some(a));
+    Ok(())
 }
 
 fn reports(e: &RegistryEntry) -> Option<ReportMode> {
@@ -108,27 +113,20 @@ fn cut(mut text: String) -> String {
     text
 }
 
-/// The Todo attempt a sub session executes, as the parent's list binds it.
-struct TodoOf {
-    todo_id: String,
-    attempt: u32,
-    summary: Option<String>,
-}
-
-/// `brief`: one line only — a UI parent shows the end in its background
-/// context and reads the report on demand (`agent-session read-session`).
+/// `brief`: one line only — a UI parent reads the report on demand
+/// (`agent-session read-session`).
 fn summary_of(
     e: &RegistryEntry,
     attention: Option<&str>,
-    todo: Option<&TodoOf>,
+    todo: Option<&super::todos::BoundChild>,
     brief: bool,
 ) -> String {
     let st = &e.status;
-    // An exploration's end is told through its Todo: a line, and where the
-    // report is; the report itself is read on demand.
+    // A Todo's work session ends as its attempt: a line, what became of the
+    // Todos after it, and where the report is (read on demand).
     if let (Some(t), Some(ATTENTION_FINISHED)) = (todo, attention) {
-        return cut(format!(
-            "sub session {} of todo {} (attempt {}) finished ({}): {}\nRead the report with `agent-session todo show {} --report`, then review it.",
+        let mut text = format!(
+            "work session {} of todo {} (attempt {}) finished ({}): {}",
             e.session_id,
             t.todo_id,
             t.attempt,
@@ -136,8 +134,15 @@ fn summary_of(
                 .map(|o| format!("{o:?}").to_lowercase())
                 .unwrap_or_else(|| "no outcome".into()),
             t.summary.clone().unwrap_or_else(|| st.one_line_status.clone()),
+        );
+        if !t.dependents.is_empty() {
+            text.push_str(&format!("\nTodos after it: {}.", t.dependents.join(", ")));
+        }
+        text.push_str(&format!(
+            "\nRead the report with `agent-session todo show {} --report` when you need more than this line.",
             t.todo_id
         ));
+        return cut(text);
     }
     let mut text = match attention {
         Some(ATTENTION_FINISHED) => format!(
@@ -163,6 +168,12 @@ fn summary_of(
         let mut line = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if line.chars().count() > 300 {
             line = format!("{}…", line.chars().take(299).collect::<String>());
+        }
+        if attention == Some(ATTENTION_FINISHED) {
+            line.push_str(&format!(
+                " — read: agent-session read-session {} --report",
+                e.session_id
+            ));
         }
         return line;
     }
@@ -226,8 +237,8 @@ async fn watched_children(sh: &Shared) -> Result<Vec<RegistryEntry>> {
 
 /// One look at the session's sub sessions. Progress is saved as
 /// semi-subscription state (and committed here); what needs the parent's
-/// attention is returned as input candidates. `pending_tasks`: task ids the
-/// suspended calls of the live run wait for.
+/// attention is returned as input candidates. `pending_tasks`: sub session
+/// tasks not to report (none any more: every end is an input).
 pub(super) async fn poll_children(
     sh: &Arc<Shared>,
     pending_tasks: &[String],
@@ -237,10 +248,7 @@ pub(super) async fn poll_children(
         return Ok(Vec::new());
     }
     let mut inputs = Vec::new();
-    let todos: Vec<(String, TodoOf)> = super::todos::bound_children(sh)
-        .into_iter()
-        .map(|(sid, todo_id, attempt, summary)| (sid, TodoOf { todo_id, attempt, summary }))
-        .collect();
+    let todos = super::todos::bound_children(sh);
     let mut s = sh.session.lock().await;
     if s.state.is_finished() {
         return Ok(inputs);
@@ -267,11 +275,12 @@ pub(super) async fn poll_children(
                     summary: summary_of(
                         e,
                         Some(a),
-                        todos.iter().find(|(c, _)| c == sid).map(|(_, t)| t),
+                        todos.iter().find(|t| t.child_sid == sid),
                         brief,
                     ),
                     data_ref: None,
                     terminal: a == ATTENTION_FINISHED,
+                    call_id: None,
                 };
                 inputs.push(FetchedInput {
                     src: INTERNAL_CHILD_SRC.to_string(),
@@ -313,6 +322,7 @@ pub(super) async fn poll_children(
                     summary: summary_of(e, None, None, false),
                     data_ref: None,
                     terminal: false,
+                    call_id: None,
                 };
                 merge_pending_event(
                     &mut s.state.pending_events,
@@ -341,7 +351,10 @@ pub(super) async fn poll_children(
 
 /// Answers for `session:<sid>` tasks from the registry (read-only); any
 /// other task id goes to `inner`. Depends on the Agent State only, never on
-/// runner memory.
+/// runner memory. A wait for a sub session answers at once: the session
+/// follows its sub sessions outside the loop (their ends are inputs), and
+/// one it delegated its workspace to cannot write while a call of the
+/// caller is in flight (freeze TODO §3.2.1, like `subctx:`).
 pub struct SessionTaskResolver {
     agent: Arc<dyn AgentStateClient>,
     inner: Option<Arc<dyn RunningTaskResolver>>,
@@ -410,52 +423,61 @@ impl SessionTaskResolver {
             },
         }
     }
+
+    fn inner_for(&self, task_id: &str) -> Option<&Arc<dyn RunningTaskResolver>> {
+        self.inner.as_ref().filter(|i| i.can_resolve(task_id))
+    }
+
+    /// A task id no task manager of this runner answers for: a bare session
+    /// id is told how a session is waited for.
+    async fn not_a_task(&self, task_id: &str) -> TaskState {
+        let reason = match self.agent.sessions().lookup(task_id).await {
+            Ok(Some(_)) => format!(
+                "{task_id} is a session id, not a task id; wait for that session as task {SESSION_TASK_PREFIX}{task_id}"
+            ),
+            _ => "no task manager of this runner knows the task".into(),
+        };
+        TaskState::Unknown { reason }
+    }
 }
 
 #[async_trait]
 impl RunningTaskResolver for SessionTaskResolver {
     async fn state(&self, task_id: &str) -> TaskState {
-        match (task_id.strip_prefix(SESSION_TASK_PREFIX), &self.inner) {
-            (Some(sid), _) => self.session_state(sid).await,
-            (None, Some(inner)) => inner.state(task_id).await,
-            (None, None) => TaskState::Unknown {
-                reason: "no task manager of this runner knows the task".into(),
-            },
+        if let Some(sid) = task_id.strip_prefix(SESSION_TASK_PREFIX) {
+            return self.session_state(sid).await;
+        }
+        match self.inner_for(task_id) {
+            Some(inner) => inner.state(task_id).await,
+            None => self.not_a_task(task_id).await,
         }
     }
 
     async fn wait(&self, task_id: &str, until_ms: Option<u64>) -> TaskState {
-        let Some(sid) = task_id.strip_prefix(SESSION_TASK_PREFIX) else {
-            return match &self.inner {
+        match task_id.strip_prefix(SESSION_TASK_PREFIX) {
+            Some(sid) => self.session_state(sid).await,
+            None => match self.inner_for(task_id) {
                 Some(inner) => inner.wait(task_id, until_ms).await,
-                None => self.state(task_id).await,
-            };
-        };
-        loop {
-            let state = self.session_state(sid).await;
-            if !matches!(state, TaskState::Running { .. })
-                || until_ms.is_some_and(|t| crate::now_ms() >= t)
-            {
-                return state;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                None => self.not_a_task(task_id).await,
+            },
         }
     }
 
     async fn cancel(&self, task_id: &str) -> std::result::Result<TaskState, CancelUnsupported> {
-        match (task_id.strip_prefix(SESSION_TASK_PREFIX), &self.inner) {
-            // Waiting for a session is not owning it: stopping it is an
-            // explicit `ctl <sid> stop`.
-            (Some(_), _) | (None, None) => Err(CancelUnsupported {
+        // Waiting for a session is not owning it: stopping it is an explicit
+        // `ctl <sid> stop`.
+        match self.inner_for(task_id) {
+            Some(inner) if !task_id.starts_with(SESSION_TASK_PREFIX) => {
+                inner.cancel(task_id).await
+            }
+            _ => Err(CancelUnsupported {
                 task_id: task_id.to_string(),
             }),
-            (None, Some(inner)) => inner.cancel(task_id).await,
         }
     }
 
     fn can_resolve(&self, task_id: &str) -> bool {
-        task_id.starts_with(SESSION_TASK_PREFIX)
-            || self.inner.as_ref().is_some_and(|i| i.can_resolve(task_id))
+        task_id.starts_with(SESSION_TASK_PREFIX) || self.inner_for(task_id).is_some()
     }
 
     fn result_seen(&self, task_id: &str) -> bool {
@@ -476,26 +498,3 @@ impl RunningTaskResolver for SessionTaskResolver {
     }
 }
 
-/// After the suspended calls of a run were answered: a sub session whose
-/// state was the answer is not reported as an event too.
-pub(super) async fn mark_waited(sh: &Shared, task_ids: &[String]) -> Result<bool> {
-    let mut marks = Vec::new();
-    for t in task_ids {
-        let Some(sid) = t.strip_prefix(SESSION_TASK_PREFIX) else {
-            continue;
-        };
-        if let Some(e) = sh.agent().sessions().lookup(sid).await? {
-            if let Some(a) = attention_now(&e) {
-                marks.push((sid.to_string(), a));
-            }
-        }
-    }
-    if marks.is_empty() {
-        return Ok(false);
-    }
-    let mut s = sh.session.lock().await;
-    for (sid, a) in marks {
-        set_attention(&mut s.state, &sid, Some(a));
-    }
-    Ok(true)
-}

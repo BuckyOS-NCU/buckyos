@@ -8,7 +8,7 @@ use aiworkspace_core::{Code, Deny, WsError};
 use common::*;
 use serde_json::{json, Value};
 
-const GUEST_TOKEN: &str = "gt_abcdefghijklmnopqrstuvwxyz";
+const GUEST_TOKEN: &str = "gt_YWl3cy1ndWVzdC10b2tlbi1maXh0dXJlLTMyYnl0ZXM";
 
 fn limited(id: &str) -> Caller {
     Caller::account(id, true)
@@ -314,8 +314,8 @@ fn entry_ids_and_methods() {
     assert_eq!(parse_entry_methods(&json!({ "guest": true, "did_login": true })).unwrap(), ENTRY_GUEST | ENTRY_DID_LOGIN);
     assert!(parse_entry_methods(&json!({ "wallet": true })).is_err());
     assert!(parse_entry_methods(&json!({ "guest": "yes" })).is_err());
-    assert!(split_entry_id("ws_aaaaaaaaaaaaaaaaaaaaaaaaaa~se_bbbbbbbbbbbbbbbbbbbbbbbbbb").is_some());
-    for bad in ["ws_aaaaaaaaaaaaaaaaaaaaaaaaaa", "se_bbbbbbbbbbbbbbbbbbbbbbbbbb", "ws_x~se_y", "ws_aaaaaaaaaaaaaaaaaaaaaaaaaa~ws_bbbbbbbbbbbbbbbbbbbbbbbbbb"] {
+    assert!(split_entry_id("ws_2611a0b3~se_bbbbbbbbbbbbbbbbbbbbbbbbbb").is_some());
+    for bad in ["ws_2611a0b3", "se_bbbbbbbbbbbbbbbbbbbbbbbbbb", "ws_x~se_y", "ws_2611a0b3~ws_bbbbbbbbbbbbbbbbbbbbbbbbbb"] {
         assert!(split_entry_id(bad).is_none(), "{bad}");
     }
 }
@@ -333,7 +333,7 @@ fn restore_keeps_grants_and_entries() {
         let h = env.svc.workspace(&id).unwrap();
         let mut ws = h.lock().unwrap();
         let r = ws.export(&alice(), "personal_backup", true, None).unwrap();
-        std::path::PathBuf::from(r["path"].as_str().unwrap())
+        fetched(&ws.objects, &r)
     };
     env.svc.import(&alice(), &pkg, "restore", true).unwrap();
     let h = env.svc.workspace(&id).unwrap();

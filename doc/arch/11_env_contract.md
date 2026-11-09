@@ -24,7 +24,7 @@
 
 | 变量 | 来源 | 消费方 | 语义 |
 | --- | --- | --- | --- |
-| `BUCKYOS_ROOT` | 用户、安装脚本、`start.py`、`node_control` | 路径工具、node-daemon、OpenDAN、安装/卸载脚本 | BuckyOS host 运行时根目录。类 Unix 默认 `/opt/buckyos`；Windows 默认 `%APPDATA%/buckyos`，部分工具再回退到 `%USERPROFILE%/buckyos`。 |
+| `BUCKYOS_ROOT` | 用户、安装脚本、`start.py`、`node_control` | 路径工具、node-daemon、OpenDAN、安装/卸载脚本 | BuckyOS host 运行时根目录。类 Unix 默认 `/opt/buckyos`；Windows 默认 `C:\buckyos`。 |
 | `BUCKYOS_BUILD_ROOT` | 用户或打包命令 | `make_local_pkg.py`、`src/publish/make_local_*` | 本地打包/发布 staging root，默认类 Unix `/opt/buckyosci`，Windows `C:\opt\buckyosci`。 |
 | `BUCKYOS_DEV_HOME` | 开发者 | `buckyos-api` AppClient runtime | AppClient 开发态配置目录覆盖；存在时优先于 `$BUCKYOS_ROOT/etc` 加载 runtime 配置。 |
 | `APPDATA` / `USERPROFILE` / `LOCALAPPDATA` | OS | Windows 路径解析与打包变量展开 | Windows 平台默认目录和 installer 模板展开使用。 |
@@ -91,6 +91,7 @@ aios entrypoint 派生或兼容变量：
 | `UV_CACHE_DIR` | aios entrypoint | uv cache，默认 `$BUCKYOS_INSTANCE_VOLUME/uv-cache`。 |
 | `NPM_CONFIG_CACHE` | aios entrypoint | npm cache，默认 `$BUCKYOS_INSTANCE_VOLUME/npm-cache`。 |
 | `PIP_CACHE_DIR` | aios entrypoint | pip cache，默认 `$BUCKYOS_INSTANCE_VOLUME/pip-cache`。 |
+| `LLM_UNDERSTAND_MEDIA_CATALOG_DIR` | aios entrypoint | `llm_understand_media` 展开长文档目录的位置，默认 `$BUCKYOS_INSTANCE_VOLUME/media-catalog`；是缓存，可随时删除。 |
 | `SCRIPT_APP_ID` | aios entrypoint | 旧 script-service 兼容变量，值来自 `BUCKYOS_APP_ID`。 |
 | `SCRIPT_PACKAGE_ROOT` | aios entrypoint | 旧 script-service 兼容变量，值来自 `BUCKYOS_PKG_DIR`。 |
 | `SCRIPT_DATA_ROOT` | aios entrypoint | 旧 script-service 兼容变量，值来自 `BUCKYOS_DATA_DIR`。 |
@@ -117,9 +118,6 @@ AgentTool 新实现目标是只依赖 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID
 | 变量 | 模块 | 语义 |
 | --- | --- | --- |
 | `BUCKYOS_CONTENT_MGR_DB_PATH` | control-panel share content manager | 覆盖 share content manager SQLite/DB 路径。 |
-| `BUCKYOS_TG_API_ID` | msg-center Telegram tunnel | Telegram API id，启用 grammers gateway 时必填。 |
-| `BUCKYOS_TG_API_HASH` | msg-center Telegram tunnel | Telegram API hash，启用 grammers gateway 时必填。 |
-| `BUCKYOS_TG_SESSION_DIR` | msg-center Telegram tunnel | Telegram session 目录覆盖。 |
 | `BUCKYOS_KEVENT_RINGBUFFER_PATH` | kevent shared ringbuffer | 覆盖共享 ringbuffer 文件路径，POSIX 默认 `/tmp/buckyos_kevent_ringbuffer_v2.shm`，Windows 默认 `$BUCKYOS_ROOT\tmp\buckyos_kevent_ringbuffer_v2.shm`（`/tmp` 在 Windows 是盘符相对路径，会按启动方 cwd 所在盘分裂成多份）。节点内所有进程必须解析到同一个文件，否则事件总线会静默裂开；测试中需要串行管理。 |
 | `BUCKYOS_KEVENT_KMSG_CASES` | `test/kevent_kmsg` | 选择 kevent/kmsg 测试 case。 |
 | `BUCKYOS_WEBSDK_ROOT` | sys_test | 覆盖 web sdk 搜索目录。 |
@@ -171,7 +169,6 @@ AgentTool 新实现目标是只依赖 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID
 
 | 变量 | 当前状态 |
 | --- | --- |
-| `BUCKYOS_KRPC_TIMEOUT_SECS` / `BUCKYOS_KRPC_TIMEOUT_SECS_<SERVICE>` | `buckyos-api` 中有常量声明，但当前 `get_zone_service_krpc_client_with_default_timeout()` 没有读取环境变量；不要依赖它们。 |
 | `BUCKYOS_TEST_SYSTEM_CONFIG_URL` / `BUCKYOS_TEST_VERIFY_HUB_URL` | 只在 `test/test_helpers/buckyos_client.ts` 注释中出现，当前 helper 实现没有读取；测试覆盖应优先使用实际读取的 `BUCKYOS_SYSTEM_CONFIG_URL` / `BUCKYOS_VERIFY_HUB_URL`。 |
 | `BUCKYOS_RUNTIME`、`BUCKYOS_FILE`、`BUCKYOS_SESSION_TOKEN`、`BUCKYOS_THIS_DEVICE_INFO` | 当前搜索只看到零散历史/文档/构建产物痕迹，未形成明确 runtime 契约。新增代码不要使用。 |
 | `loca_app_instance_config` | 拼写错误兼容变量，只为旧实现保留。 |

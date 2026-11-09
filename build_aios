@@ -16,11 +16,17 @@ SUPPORTED_ARCHES=("amd64" "aarch64")
 # use uv with this system Python 3.12; Node.js comes from the official tarball
 # (NODE_VERSION in the Dockerfile), not Debian's EOL nodejs/npm. pandoc is a
 # tool package of the ExtTool volume (publish/exttool/install_pandoc.sh).
+# ffmpeg / poppler-utils / LibreOffice headless / fonts / locales are the
+# workflow media tool baseline (doc/workflow/media tool baseline.md); the
+# workflow host must carry the same set, the image alone does not satisfy it.
+# Only what is not an extension package's: the tools of ext-core come from the node's
+# tools volume (doc/app_service/paios容器需求.md §6.4 table B). The second group is the
+# planned ext-office (table C).
 RUNTIME_PACKAGES=(
-  "bash" "ca-certificates" "curl" "git" "jq" "rsync"
-  "tree" "unzip" "xz-utils"
-  "python3"
-  "ffmpeg" "imagemagick" "poppler-utils" "tesseract-ocr"
+  "bash" "ca-certificates" "rsync"
+  "libreoffice-core-nogui" "libreoffice-writer-nogui" "libreoffice-impress-nogui" "libreoffice-calc-nogui"
+  "fonts-dejavu-core" "fonts-liberation" "fonts-noto-core" "fonts-noto-cjk"
+  "locales"
 )
 EXTRA_APT_PACKAGES=()
 SELECTED_ARCHES=()
@@ -138,6 +144,35 @@ done
 
 log() {
   printf '[build_aios] %s\n' "$*"
+}
+
+DOCKER_NEEDS_SUDO=0
+
+docker() {
+  if [[ "$DOCKER_NEEDS_SUDO" -eq 1 ]]; then
+    sudo "$(type -P docker)" "$@"
+  else
+    command docker "$@"
+  fi
+}
+
+resolve_docker_access() {
+  local probe
+  if [[ "$(id -u)" -eq 0 ]] || ! type -P docker >/dev/null; then
+    return
+  fi
+  probe="$(command docker version 2>&1 || true)"
+  if [[ "$probe" == *"permission denied"* ]]; then
+    DOCKER_NEEDS_SUDO=1
+    log "This user cannot reach the Docker socket; docker commands run through sudo"
+    if ! sudo true; then
+      echo "Docker access needs sudo on this machine, and sudo was refused" >&2
+      exit 1
+    fi
+    if [[ "$PUSH" -eq 1 ]]; then
+      log "--push then uses root's registry login (sudo docker login)"
+    fi
+  fi
 }
 
 resolve_build_metadata() {
@@ -418,7 +453,13 @@ use_image_in_local_buckyos() {
     return
   fi
 
-  "$python_bin" - "$devenv_path" "$IMAGE_NAME" <<'PY'
+  local -a python_cmd=("$python_bin")
+  if [[ -e "$devenv_path" && ! -w "$devenv_path" ]] || [[ ! -e "$devenv_path" && ! -w "$buckyos_root/etc" ]]; then
+    log "Updating $devenv_path needs root; using sudo"
+    python_cmd=(sudo "$python_bin")
+  fi
+
+  "${python_cmd[@]}" - "$devenv_path" "$IMAGE_NAME" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -482,6 +523,12 @@ prepare_buckyos_agent_package() {
   fi
   mkdir -p "$output_dir"
   cp -R "$BUCKYOS_AGENT_TOOLS_SOURCE/." "$output_dir/"
+  # shared modules the commands import from the source tree (deno.json `../../frame/…`), beside them as vendor/frame/…
+  for module in frame/aiworkspace/import-table frame/aiworkspace/import-drawio frame/aiworkspace/import-pdf frame/aiworkspace/import-office; do
+    mkdir -p "$output_dir/vendor/$module"
+    cp -R "$SRC_DIR/$module/." "$output_dir/vendor/$module/"
+    find "$output_dir/vendor/$module" -name '*_test.ts' -delete
+  done
 
   log "Fetching buckyos-websdk ref $BUCKYOS_WEBSDK_REF for the AICC tool build checks"
   git init -q "$sdk_checkout"
@@ -507,7 +554,11 @@ from pathlib import Path
 
 config_path = Path(sys.argv[1])
 config = json.loads(config_path.read_text(encoding="utf-8"))
-config.setdefault("imports", {})["buckyos"] = "/opt/buckyos/libexec/buckyos-tool/dist/node.mjs"
+imports = config.setdefault("imports", {})
+imports["buckyos"] = "/opt/buckyos/libexec/buckyos-tool/dist/node.mjs"
+for key, value in list(imports.items()):
+    if isinstance(value, str) and value.startswith("../../frame/"):
+        imports[key] = "./vendor/" + value[len("../../"):]
 config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -522,18 +573,23 @@ render_dockerfile() {
 
   {
     cat <<'EOF'
+# The standard layer's own Deno: what the Agent commands run on, pinned here and
+# found by absolute path, so that no extension package can take its place.
+FROM ubuntu:24.04 AS core-deno
+ARG DENO_VERSION=v2.9.2
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip && \
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/core sh -s -- "${DENO_VERSION}"
+
 FROM ubuntu:24.04
 
 ARG TARGET_ARCH
 ARG OPENDAN_SHA256
-ARG DENO_VERSION=v2.9.2
-ARG NODE_VERSION=v24.21.0
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime + predefined worker CLI tools (see container spec §6.3). The GPU /
-# LLVM stack that ffmpeg's SDL/GL dependencies drag in is never linked by the
-# headless tools, so it is dropped in the same layer (~190 MB).
+# What the worker needs that is no extension tool (see container spec §6.4). The
+# GPU / LLVM stack that LibreOffice's dependencies drag in is never linked by the
+# headless tools, so it is dropped in the same layer.
 RUN apt-get update && apt-get install -y --no-install-recommends \
 EOF
 
@@ -547,43 +603,34 @@ EOF
        /usr/lib/*-linux-gnu/libGLX_mesa.so* \
     && rm -rf /usr/lib/*-linux-gnu/dri
 
+# UTF-8 locale for soffice (document -> PDF) and the other media tools; en_US.UTF-8
+# is generated so LibreOffice has a full locale besides C.UTF-8.
+RUN sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen en_US.UTF-8
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-# Node.js LTS (official build; npm/npx/corepack included).
-RUN case "${TARGET_ARCH}" in amd64) node_arch=x64 ;; aarch64) node_arch=arm64 ;; *) exit 1 ;; esac && \
-    node_tar="node-${NODE_VERSION}-linux-${node_arch}.tar.xz" && \
-    curl -fsSLO "https://nodejs.org/dist/${NODE_VERSION}/${node_tar}" && \
-    curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt" | grep " ${node_tar}\$" | sha256sum -c - && \
-    tar -xJf "${node_tar}" -C /usr/local --strip-components=1 --no-same-owner \
-      --exclude='*/include' --exclude='*/share/doc' --exclude='*/CHANGELOG.md' --exclude='*/README.md' && \
-    rm -f "${node_tar}" && \
-    node --version && npm --version
-
-# uv — dependency installer used by Script apps, on the system Python 3.12.
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
-
-# Deno — TypeScript runtime used by Script apps and Worker-layer Agents.
-RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- "${DENO_VERSION}" && \
-    deno --version
+COPY --from=core-deno /core/bin/deno /opt/buckyos/bin/opendan/deno
+ENV PATH="/opt/buckyos/bin/opendan:${PATH}"
 
 ENV BUCKYOS_ROOT=/opt/buckyos
 WORKDIR /opt/buckyos
 
-# BuckyOS Agent AICC CLI tools. Keep these outside /opt/buckyos/tools because
-# that path is shadowed by the shared ExtTool volume at runtime.
+# BuckyOS Agent AICC CLI tools, in the same directory as on a host
+# (bin/agent-tools): a standard command is one under $BUCKYOS_ROOT. Keep these
+# outside /opt/buckyos/tools because that path is shadowed by the shared ExtTool
+# volume at runtime.
 # They and the `buckyos` launcher run on the host's Tool scripts and SDK,
 # which node_daemon mounts read-only at /opt/buckyos/libexec/buckyos-tool.
 # The checks below borrow a build-time SDK through a bind mount, so no SDK
 # lands in the image.
 COPY buckyos-agent /opt/buckyos/bin/opendan/buckyos-agent
-COPY aicc-tool-launcher /usr/local/bin/aicc-tool
-COPY buckyos-launcher /usr/local/bin/buckyos
+COPY aicc-tool-launcher /opt/buckyos/bin/agent-tools/aicc-tool
+COPY buckyos-launcher /opt/buckyos/bin/agent-tools/buckyos
+ENV PATH="/opt/buckyos/bin/agent-tools:${PATH}"
 RUN --mount=type=bind,source=buckyos-tool-check-dist,target=/opt/buckyos/libexec/buckyos-tool/dist \
-    chmod 755 /usr/local/bin/aicc-tool /usr/local/bin/buckyos && \
+    chmod 755 /opt/buckyos/bin/agent-tools/aicc-tool /opt/buckyos/bin/agent-tools/buckyos && \
     for command_path in /opt/buckyos/bin/opendan/buckyos-agent/commands/*.ts; do \
       command_name="$(basename "$command_path" .ts)"; \
-      ln -sf aicc-tool "/usr/local/bin/$command_name"; \
+      ln -sf aicc-tool "/opt/buckyos/bin/agent-tools/$command_name"; \
     done && \
     deno check \
       --config /opt/buckyos/bin/opendan/buckyos-agent/deno.json \
@@ -606,10 +653,9 @@ RUN --mount=type=bind,source=buckyos-tool-check-dist,target=/opt/buckyos/libexec
     edit_image --help >/dev/null && \
     rm -rf /root/.cache/deno
 
-# ExtTool Volume mount point — kept empty in the Worker image. The real
-# payload (pre-warmed uv/deno caches, optional tool packages) ships in the
-# separate paios/exttool image and lands in the buckyos-exttool-<image id>
-# named volume, which node_daemon mounts here ro at run time (§6.3 of paios容器需求.md).
+# The node's tools volume mounts here read-only at run time, kept empty in the
+# image (§6.4 of paios容器需求.md): extension packages, and the pre-warmed uv/deno
+# caches of the paios/exttool seed image.
 RUN mkdir -p \
     /opt/buckyos/bin/opendan \
     /opt/buckyos/data \
@@ -629,6 +675,7 @@ RUN printf '%s  %s\n' "${OPENDAN_SHA256}" /opt/buckyos/bin/opendan/opendan | sha
 # Unified entrypoint: instance-volume bootstrap + file-level upstream sync +
 # agent/script/custom dispatch.
 COPY --chmod=755 entrypoint.sh /opt/buckyos/entrypoint.sh
+COPY sync_tree.ts /opt/buckyos/sync_tree.ts
 
 ENV AIOS_TARGET_ARCH="${TARGET_ARCH}" \
     BUCKYOS_INSTANCE_VOLUME=/opt/buckyos/instance \
@@ -636,7 +683,9 @@ ENV AIOS_TARGET_ARCH="${TARGET_ARCH}" \
     BUCKYOS_EXTTOOL_DIR=/opt/buckyos/tools \
     DENO_DIR=/opt/buckyos/instance/deno-cache \
     UV_CACHE_DIR=/opt/buckyos/instance/uv-cache \
+    UV_PYTHON_INSTALL_DIR=/opt/buckyos/instance/uv-python \
     NPM_CONFIG_CACHE=/opt/buckyos/instance/npm-cache \
+    NPM_CONFIG_PREFIX=/opt/buckyos/instance/npm-prefix \
     PIP_CACHE_DIR=/opt/buckyos/instance/pip-cache \
     PATH="/opt/buckyos/tools/bin:/opt/buckyos/bin/opendan:${PATH}"
 
@@ -1170,6 +1219,7 @@ build_runtime_binaries() {
   fi
   cp "$ENTRYPOINT_SOURCE" "$context_dir/entrypoint.sh"
   chmod 755 "$context_dir/entrypoint.sh"
+  cp "$ROOT_DIR/publish/aios/sync_tree.ts" "$context_dir/sync_tree.ts"
 }
 
 docker_platform_for_arch() {
@@ -1389,6 +1439,7 @@ main() {
   fi
 
   if [[ -z "$PREPARE_CONTEXT_DIR" ]]; then
+    resolve_docker_access
     prepare_docker_config "$tmp_root"
     ensure_buildx_support "${target_arches[@]}"
   fi

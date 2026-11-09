@@ -14,8 +14,17 @@ base64 = { workspace = true }
 rand = { workspace = true }
 log = { workspace = true }
 zip = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 loro = "1.16"
+tokio = { workspace = true }
+async-trait = { workspace = true }
+ndn-lib = { workspace = true }
+ndn-toolkit = { workspace = true }
+named_store = { workspace = true }
+bucket_store = { workspace = true }
+name-lib = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-ndn-lib = { workspace = true }
+buckyos-api = { path = "../../../kernel/buckyos-api" }

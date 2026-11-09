@@ -17,7 +17,7 @@
  */
 
 use buckyos_api::{
-    get_rdb_instance_in, msg_center_default_rdb_instance_config, DeliveryEnvelope, DeliveryError,
+    get_rdb_instance_in, DeliveryEnvelope, DeliveryError,
     DeliveryRecord, DeliveryState, IngressContext, MailboxKind, MailboxRecord, RdbBackend,
     RdbPartition, RecipientState, UiSessionStateEntry, MSG_CENTER_RDB_INSTANCE_ID,
     MSG_CENTER_RDB_SCHEMA_POSTGRES, MSG_CENTER_RDB_SCHEMA_SQLITE, MSG_CENTER_SERVICE_NAME,
@@ -37,14 +37,6 @@ static INSTALL_DRIVERS: Once = Once::new();
 
 fn ensure_any_drivers_installed() {
     INSTALL_DRIVERS.call_once(install_default_drivers);
-}
-
-/// Per-session aggregate used by `list_sessions`.
-#[derive(Debug, Clone)]
-pub struct SessionIndexEntry {
-    pub session_id: String,
-    pub updated_at_ms: u64,
-    pub unread_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -155,12 +147,12 @@ impl MsgBoxDbMgr {
         .await
     }
 
-    /// Test / fallback entry: build a default instance config (sqlite) against
-    /// the given connection string. The schema DDL comes from the compiled-in
-    /// default for the chosen backend.
-    #[allow(dead_code)]
+    /// Test entry: build a default instance config (sqlite) against the given
+    /// connection string. The schema DDL comes from the compiled-in default for
+    /// the chosen backend.
+    #[cfg(test)]
     pub async fn open_default_sqlite(connection: &str) -> std::result::Result<Self, RPCErrors> {
-        let cfg = msg_center_default_rdb_instance_config();
+        let cfg = buckyos_api::msg_center_default_rdb_instance_config();
         let schema = cfg.schema.get(&RdbBackend::Sqlite).cloned();
         Self::open(connection, RdbBackend::Sqlite, schema.as_deref()).await
     }
@@ -487,93 +479,35 @@ ON CONFLICT(delivery_id) DO NOTHING
     // Mailbox records
     // ------------------------------------------------------------------
 
+    #[cfg(test)]
     pub async fn upsert_record(
         &self,
         record: &MailboxRecord,
     ) -> std::result::Result<(), RPCErrors> {
-        self.upsert_record_with_msg(record, None).await
-    }
-
-    pub async fn upsert_record_with_msg(
-        &self,
-        record: &MailboxRecord,
-        msg: Option<&MsgObject>,
-    ) -> std::result::Result<(), RPCErrors> {
-        self.upsert_record_row(record, msg).await?;
-        self.touch_message(&record.owner, &record.msg_id, record.created_at_ms)
-            .await?;
-        Ok(())
-    }
-
-    async fn upsert_record_row(
-        &self,
-        record: &MailboxRecord,
-        msg: Option<&MsgObject>,
-    ) -> std::result::Result<(), RPCErrors> {
-        let tags_json = serde_json::to_string(&record.tags).map_err(|error| {
-            RPCErrors::ReasonError(format!(
-                "failed to encode tags of mailbox record {}: {}",
-                record.record_id, error
-            ))
+        let mut tx = self.pool().begin().await.map_err(|error| {
+            RPCErrors::ReasonError(format!("begin mailbox record transaction failed: {error}"))
         })?;
-        let ingress_json =
-            encode_optional_json(record.ingress.as_ref(), &record.record_id, "ingress")?;
-        let msg_from = Some(
-            msg.map(|obj| obj.from.clone())
-                .unwrap_or_else(|| record.from.clone())
-                .to_string(),
-        );
-        let msg_to = Some(
-            msg.and_then(|obj| obj.to.first().cloned())
-                .unwrap_or_else(|| record.to.clone())
-                .to_string(),
-        );
-        let msg_kind = msg.map(|obj| obj.kind).unwrap_or(record.msg_kind);
+        self.upsert_record_with_msg_tx(&mut tx, record, None).await?;
+        tx.commit().await.map_err(|error| {
+            RPCErrors::ReasonError(format!("commit mailbox record transaction failed: {error}"))
+        })
+    }
 
-        let sql = self.render_sql(&format!(
-            r#"
-INSERT INTO mailbox_records ({MAILBOX_COLUMNS})
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(owner, record_id) DO UPDATE SET
-    box_kind = excluded.box_kind,
-    msg_id = excluded.msg_id,
-    msg_kind = COALESCE(excluded.msg_kind, mailbox_records.msg_kind),
-    msg_from = COALESCE(excluded.msg_from, mailbox_records.msg_from),
-    msg_to = COALESCE(excluded.msg_to, mailbox_records.msg_to),
-    state = excluded.state,
-    session_id = excluded.session_id,
-    sort_key = excluded.sort_key,
-    tags_json = excluded.tags_json,
-    ingress_json = COALESCE(excluded.ingress_json, mailbox_records.ingress_json),
-    created_at_ms = mailbox_records.created_at_ms,
-    updated_at_ms = excluded.updated_at_ms
-"#
-        ));
-
-        sqlx::query(&sql)
-            .bind(record.owner.to_string())
-            .bind(record.record_id.clone())
-            .bind(mailbox_kind_name(&record.box_kind).to_string())
-            .bind(record.msg_id.to_string())
-            .bind(Some(msg_obj_kind_name(&msg_kind).to_string()))
-            .bind(msg_from)
-            .bind(msg_to)
-            .bind(recipient_state_name(&record.state).to_string())
-            .bind(record.session_id.clone())
-            .bind(to_sql_i64(record.sort_key))
-            .bind(tags_json)
-            .bind(ingress_json)
-            .bind(to_sql_i64(record.created_at_ms))
-            .bind(to_sql_i64(record.updated_at_ms))
-            .execute(self.pool())
-            .await
-            .map_err(|error| {
-                RPCErrors::ReasonError(format!(
-                    "failed to upsert mailbox record {}: {}",
-                    record.record_id, error
-                ))
-            })?;
-        Ok(())
+    #[cfg(test)]
+    pub async fn touch_message(
+        &self,
+        owner: &DID,
+        msg_id: &ObjId,
+        created_at_ms: u64,
+    ) -> std::result::Result<(), RPCErrors> {
+        let mut tx = self.pool().begin().await.map_err(|error| {
+            RPCErrors::ReasonError(format!("begin message ref transaction failed: {error}"))
+        })?;
+        self.touch_message_tx(&mut tx, owner, msg_id, created_at_ms)
+            .await?;
+        tx.commit().await.map_err(|error| {
+            RPCErrors::ReasonError(format!("commit message ref transaction failed: {error}"))
+        })
     }
 
     pub async fn get_record(
@@ -763,71 +697,6 @@ LIMIT ?
         rows.iter().map(row_to_mailbox_record).collect()
     }
 
-    /// Session index for `list_sessions`: per session id, last activity and
-    /// unread count, newest first, cursor on (updated_at_ms, session_id).
-    pub async fn list_session_index(
-        &self,
-        owner: &DID,
-        limit: usize,
-        cursor_updated_at_ms: Option<u64>,
-        cursor_session_id: Option<&str>,
-    ) -> std::result::Result<Vec<SessionIndexEntry>, RPCErrors> {
-        let cursor_sql = if cursor_updated_at_ms.is_some() {
-            "HAVING (MAX(updated_at_ms) < ? OR (MAX(updated_at_ms) = ? AND session_id < ?))"
-        } else {
-            ""
-        };
-        let sql = self.render_sql(&format!(
-            r#"
-SELECT
-    session_id,
-    MAX(updated_at_ms) AS last_updated_at_ms,
-    SUM(CASE WHEN state = 'UNREAD' THEN 1 ELSE 0 END) AS unread_count
-FROM mailbox_records
-WHERE owner = ? AND session_id IS NOT NULL AND state != 'DELETED'
-GROUP BY session_id
-{cursor_sql}
-ORDER BY last_updated_at_ms DESC, session_id DESC
-LIMIT ?
-"#
-        ));
-
-        let mut query = sqlx::query(&sql).bind(owner.to_string());
-        if let Some(cursor) = cursor_updated_at_ms {
-            let session_id = cursor_session_id.unwrap_or("").to_string();
-            query = query
-                .bind(to_sql_i64(cursor))
-                .bind(to_sql_i64(cursor))
-                .bind(session_id);
-        }
-        let rows = query
-            .bind(limit as i64)
-            .fetch_all(self.pool())
-            .await
-            .map_err(|error| {
-                RPCErrors::ReasonError(format!("failed to list session index: {}", error))
-            })?;
-
-        let mut entries = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            let session_id: String = row
-                .try_get("session_id")
-                .map_err(|e| decode_err("session_id", &e))?;
-            let updated_at_ms: i64 = row
-                .try_get("last_updated_at_ms")
-                .map_err(|e| decode_err("last_updated_at_ms", &e))?;
-            let unread_count: i64 = row
-                .try_get("unread_count")
-                .map_err(|e| decode_err("unread_count", &e))?;
-            entries.push(SessionIndexEntry {
-                session_id,
-                updated_at_ms: updated_at_ms.max(0) as u64,
-                unread_count: unread_count.max(0) as u64,
-            });
-        }
-        Ok(entries)
-    }
-
     // ------------------------------------------------------------------
     // Delivery queue
     // ------------------------------------------------------------------
@@ -891,7 +760,7 @@ WHERE delivery_records.state <> 'SENT' OR excluded.state = 'SENT'
 
     /// Insert-if-absent for `post_send`: an existing delivery (idempotent
     /// resubmission) keeps its current state/attempts untouched.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn create_delivery_if_absent(
         &self,
         record: &DeliveryRecord,
@@ -1040,32 +909,6 @@ LIMIT 1
     // Message refs + ui session state (unchanged model)
     // ------------------------------------------------------------------
 
-    pub async fn touch_message(
-        &self,
-        owner: &DID,
-        msg_id: &ObjId,
-        created_at_ms: u64,
-    ) -> std::result::Result<(), RPCErrors> {
-        let sql = self.render_sql(
-            "INSERT INTO msg_refs(owner, msg_id, created_at_ms) VALUES(?, ?, ?)
-             ON CONFLICT(owner, msg_id) DO NOTHING",
-        );
-        sqlx::query(&sql)
-            .bind(owner.to_string())
-            .bind(msg_id.to_string())
-            .bind(to_sql_i64(created_at_ms))
-            .execute(self.pool())
-            .await
-            .map_err(|error| {
-                RPCErrors::ReasonError(format!(
-                    "failed to persist message ref {}: {}",
-                    msg_id.to_string(),
-                    error
-                ))
-            })?;
-        Ok(())
-    }
-
     pub async fn get_idempotency_result<T: DeserializeOwned>(
         &self,
         scope: &str,
@@ -1106,7 +949,7 @@ LIMIT 1
         Ok(Some(IdempotencyStoredResult { result }))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn upsert_idempotency_result<T: Serialize>(
         &self,
         scope: &str,
@@ -2358,39 +2201,6 @@ mod tests {
             .unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].state, RecipientState::Unread);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn session_index_groups_by_session() {
-        let (mgr, _tmp) = setup_test_mgr().await;
-        let owner = sample_owner();
-        let mut r1 = sample_record(&owner, MailboxKind::Inbox, "one");
-        r1.session_id = Some("s-a".to_string());
-        let mut r2 = sample_record(&owner, MailboxKind::Sent, "two");
-        r2.session_id = Some("s-a".to_string());
-        r2.state = RecipientState::Read;
-        r2.updated_at_ms += 10;
-        let mut r3 = sample_record(&owner, MailboxKind::Inbox, "three");
-        r3.session_id = Some("s-b".to_string());
-        r3.updated_at_ms += 20;
-        for r in [&r1, &r2, &r3] {
-            mgr.upsert_record(r).await.unwrap();
-        }
-
-        let index = mgr
-            .list_session_index(&owner, 10, None, None)
-            .await
-            .unwrap();
-        assert_eq!(index.len(), 2);
-        assert_eq!(index[0].session_id, "s-b");
-        assert_eq!(index[1].session_id, "s-a");
-        assert_eq!(index[1].unread_count, 1);
-
-        let page = mgr
-            .list_session_records(&owner, "s-a", 10, None, None, true)
-            .await
-            .unwrap();
-        assert_eq!(page.len(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]

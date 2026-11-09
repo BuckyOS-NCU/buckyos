@@ -33,7 +33,7 @@ type StartupOptions = {
   opendanArgs: string[]
 }
 
-const DEFAULT_BUCKYOS_ROOT = '/opt/buckyos'
+const DEFAULT_BUCKYOS_ROOT = Deno.build.os === 'windows' ? 'C:\\buckyos' : '/opt/buckyos'
 const SYSTEM_CONFIG_BOOTSTRAP_AUDIENCE = 'system-config-bootstrap'
 const DEFAULT_OPENDAN_SERVICE_PORT = 4060
 const DEFAULT_HOST_SCRIPT_SERVICE_PORT = 3000
@@ -763,7 +763,7 @@ async function buildLaunchContext(options: StartupOptions) {
   if (hasAgentPkg(appDoc)) {
     const agentPackage = await resolveAgentPackageRoot(buckyosRoot, appDoc, options.agentPackageRoot)
     const opendanBinary = await resolveOpendanBinary(buckyosRoot, options.opendanBinary)
-    const agentEnvRoot = getAppDataDir(buckyosRoot, options.appId, options.ownerUserId)
+    const agentEnvRoot = joinPath(buckyosRoot, 'data', 'home', options.ownerUserId, 'agents', options.appId)
     await Deno.mkdir(agentEnvRoot, { recursive: true })
     const servicePort = selectAgentServicePort(appDoc, appInstanceConfig, options.port)
 
@@ -779,6 +779,7 @@ async function buildLaunchContext(options: StartupOptions) {
       opendanArgs: options.opendanArgs,
       env: {
         ...env,
+        BUCKYOS_DATA_DIR: agentEnvRoot,
         app_media_info: JSON.stringify({
           pkg_id: agentPackage.pkgId,
           full_path: agentPackage.fullPath,

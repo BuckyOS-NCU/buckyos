@@ -258,9 +258,27 @@ pub(crate) enum ProtocolErrorKind {
     DuplicateAdapter,
     UnknownAdapter,
     UnsupportedOperation,
-    DeadlineExceeded,
     Cancelled,
-    WebhookRejected,
+    /// The Provider refused the request because it does not fit the model's
+    /// context window, reported by a structured provider code.
+    ContextLengthExceeded,
+}
+
+/// The structured `error.code` OpenAI-compatible APIs answer a request with
+/// when it does not fit the model's context window.
+pub(crate) const OPENAI_CONTEXT_LENGTH_EXCEEDED: &str = "context_length_exceeded";
+
+/// Kind of an OpenAI-compatible error: the structured context-window code
+/// decides before the HTTP status (the status of that refusal is a plain 400).
+pub(crate) fn openai_error_kind(
+    provider_code: Option<&str>,
+    otherwise: ProtocolErrorKind,
+) -> ProtocolErrorKind {
+    if provider_code == Some(OPENAI_CONTEXT_LENGTH_EXCEEDED) {
+        ProtocolErrorKind::ContextLengthExceeded
+    } else {
+        otherwise
+    }
 }
 
 pub(crate) fn protocol_error_kind_from_http_status(
@@ -342,7 +360,6 @@ pub(crate) struct ResourceError {
     pub(crate) message: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum RoutingError {
     InvalidRequest(String),
@@ -357,7 +374,6 @@ pub(crate) enum RoutingError {
     },
     FallbackNotAllowed(String),
     InvalidFallback(String),
-    FallbackLoop(String),
     FallbackDepthExceeded(usize),
     Registry(ModelRegistryError),
 }
@@ -556,7 +572,6 @@ impl ProtocolError {
                 self.kind,
                 ProtocolErrorKind::Transport
                     | ProtocolErrorKind::Timeout
-                    | ProtocolErrorKind::DeadlineExceeded
                     | ProtocolErrorKind::InvalidResponse
             ) || self.retry_after.is_some())
     }
@@ -601,23 +616,19 @@ impl From<ProtocolError> for AiccError {
     fn from(error: ProtocolError) -> Self {
         let retriable = matches!(
             error.kind,
-            ProtocolErrorKind::Transport
-                | ProtocolErrorKind::Timeout
-                | ProtocolErrorKind::DeadlineExceeded
+            ProtocolErrorKind::Transport | ProtocolErrorKind::Timeout
         );
         let code = match error.kind {
             ProtocolErrorKind::InvalidConfiguration
             | ProtocolErrorKind::DuplicateAdapter
             | ProtocolErrorKind::UnknownAdapter => AiccErrorCode::InternalError,
             ProtocolErrorKind::InvalidRequest => AiccErrorCode::InvalidRequest,
+            ProtocolErrorKind::ContextLengthExceeded => AiccErrorCode::ContextLengthExceeded,
             ProtocolErrorKind::UnsupportedOperation => AiccErrorCode::UnsupportedOperation,
             ProtocolErrorKind::Authentication | ProtocolErrorKind::ProviderRejected => {
                 AiccErrorCode::ProviderError
             }
-            ProtocolErrorKind::WebhookRejected => AiccErrorCode::PolicyDenied,
-            ProtocolErrorKind::Timeout | ProtocolErrorKind::DeadlineExceeded => {
-                AiccErrorCode::Timeout
-            }
+            ProtocolErrorKind::Timeout => AiccErrorCode::Timeout,
             ProtocolErrorKind::Cancelled => AiccErrorCode::Cancelled,
             ProtocolErrorKind::Transport
             | ProtocolErrorKind::ResponseTooLarge
@@ -626,10 +637,14 @@ impl From<ProtocolError> for AiccError {
         let mut mapped = AiccError::new(code, error.message);
         mapped.provider_code = error.provider_code;
         mapped.retriable = retriable;
-        mapped.details = (error.request_id.is_some() || error.retry_after.is_some()).then(|| {
+        mapped.details = (error.request_id.is_some()
+            || error.retry_after.is_some()
+            || error.http_status.is_some())
+        .then(|| {
             serde_json::json!({
                 "request_id": error.request_id,
                 "retry_after_ms": error.retry_after.map(|duration| duration.as_millis() as u64),
+                "http_status": error.http_status,
             })
         });
         mapped
@@ -650,6 +665,41 @@ mod tests {
 
         let configuration: AiccError = ProtocolError::invalid_configuration("bad adapter").into();
         assert_eq!(configuration.code, AiccErrorCode::InternalError);
+
+        let context: AiccError = ProtocolError::new(
+            ProtocolErrorKind::ContextLengthExceeded,
+            "context is too long",
+        )
+        .with_provider_code(Some(OPENAI_CONTEXT_LENGTH_EXCEEDED.to_owned()))
+        .with_http_status(400)
+        .into();
+        assert_eq!(context.code, AiccErrorCode::ContextLengthExceeded);
+        assert!(!context.retriable);
+        assert_eq!(
+            context.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+        let context = ProtocolError::new(ProtocolErrorKind::ContextLengthExceeded, "too long");
+        assert!(!context.retry_same_model());
+        assert!(!context.allows_model_failover());
+    }
+
+    #[test]
+    fn protocol_http_status_survives_public_error_conversion() {
+        let error: AiccError = ProtocolError::new(
+            ProtocolErrorKind::Timeout,
+            "OpenAI HTTP 504 Gateway Timeout: upstream timed out",
+        )
+        .with_http_status(504)
+        .into();
+        assert_eq!(error.code, AiccErrorCode::Timeout);
+        assert!(error.retriable);
+        assert_eq!(error.details.as_ref().unwrap()["http_status"], 504);
+        assert!(error.message.contains("HTTP 504 Gateway Timeout"));
+        assert_eq!(
+            AiccError::from_krpc_error(&error.to_krpc_error()),
+            Some(error)
+        );
     }
 
     #[test]

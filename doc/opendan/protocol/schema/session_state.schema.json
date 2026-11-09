@@ -207,7 +207,7 @@
           "type": "object"
         },
         {
-          "description": "A tool call / behavior action: the caller is suspended on `PendingTool`, the result is filled as the tool result of `call_id`.",
+          "description": "A tool call / behavior action (`call_behavior` or a behavior's named function): the call returned at once, the session handed over when the caller's run segment ended; the result returns as `process_result` (naming `call_id`) in the caller's hand-over batch.",
           "properties": {
             "call_id": {
               "type": "string"
@@ -267,22 +267,11 @@
           "description": "`create_sub_context | fork` (how the child was constructed)."
         },
         "task": {
-          "description": "Task given to the child (tool trigger: the call's `task` argument; a Todo executor: the admitted Todo's body).",
+          "description": "Task given to the child (tool trigger: the call's `task` argument).",
           "type": [
             "string",
             "null"
           ]
-        },
-        "todo": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/TodoBinding"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The serial Todo attempt this call executes."
         },
         "trigger": {
           "$ref": "#/definitions/CallTrigger"
@@ -1348,6 +1337,22 @@
       },
       "type": "object"
     },
+    "Nudge": {
+      "description": "[`SessionState::nudge`].",
+      "properties": {
+        "count": {
+          "description": "Corrections given in the open Turn.",
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pending": {
+          "description": "A correction waits to be taken in (`system:runner`, `nudge`).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "OpenActivation": {
       "description": "The Activation in progress of a Goal Session (= its open Turn).",
       "properties": {
@@ -1536,13 +1541,6 @@
             "final_edit"
           ],
           "type": "string"
-        },
-        {
-          "description": "A question to the user while the Turn is open (`ask-user`): a `thread` message on the placeholder, carrying `agent_ask`.",
-          "enum": [
-            "question"
-          ],
-          "type": "string"
         }
       ]
     },
@@ -1577,6 +1575,35 @@
         "stopped"
       ],
       "type": "string"
+    },
+    "Paused": {
+      "description": "[`SessionState::paused`].",
+      "properties": {
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "by": {
+          "default": "",
+          "description": "Who asked (the poster of the control).",
+          "type": "string"
+        },
+        "in_run": {
+          "description": "The pause stopped a run inside its open Turn.",
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "at_ms"
+      ],
+      "type": "object"
     },
     "PendingEvent": {
       "description": "Semi-subscription state waiting to be injected: the newest version of one `(subscription_id, source)`, its terminal event kept separately. Saved when received (the delivery is then consumed); cleared only by the receipt of the batch that injected exactly these versions, by `unsubscribe`, or replaced by a newer version.",
@@ -1921,7 +1948,7 @@
       ]
     },
     "ReportArtifact": {
-      "description": "One artifact of a report: a file of the work directory (`path`, copied to `reference`) or a named object (`path` is its id). `obj_id` is what leaves the session: the submitted id, or the file put into the host's object store (`None`: the host has no object store).",
+      "description": "One artifact of a report: a file of the work directory (`path`, copied to `reference`), a named object (`path` is its id) or a bucket object (`path` is its `obj://bucket/...`). `obj_id` is what leaves the session: the submitted id, or what the host's object store keeps (`None`: the host has no object store); `url` is the host's bucket binding that retains it, after which the copy at `reference` is removed.",
       "properties": {
         "digest": {
           "type": "string"
@@ -1937,6 +1964,12 @@
         },
         "reference": {
           "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -2027,6 +2060,42 @@
       ],
       "type": "object"
     },
+    "RetryState": {
+      "description": "[`SessionState::retry`]: the host's retries of a run that stopped on a retryable error (a provider that is unavailable for a while). Not the run's own error policy (llm_context `error_policy.max_consecutive_errors`).",
+      "properties": {
+        "applied_input_seq": {
+          "default": 0,
+          "description": "`live_run.applied_input_seq` when the error happened: a batch the run took in since (a user message's) is retried at once, also after a crash before that inference.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "attempts": {
+          "description": "Retries scheduled in a row.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "not_before_ms": {
+          "description": "The run infers again from then on (epoch ms); a user message in an input batch retries earlier.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "since_ms": {
+          "description": "When the first of these errors happened (epoch ms; time the host was down counts).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "attempts",
+        "not_before_ms",
+        "since_ms"
+      ],
+      "type": "object"
+    },
     "RunState": {
       "enum": [
         "created",
@@ -2070,22 +2139,16 @@
       },
       "type": "object"
     },
-    "TodoBinding": {
-      "description": "A sub context call bound to a serial Todo attempt (TodoList §2.1): its result is written back to that attempt when the call returns.",
+    "TaskWatch": {
+      "description": "[`SessionState::task_watch`].",
       "properties": {
-        "attempt": {
-          "format": "uint32",
+        "last_tick_ms": {
+          "description": "When the last tick was taken in, or the session began waiting for its work (epoch ms): the next tick is `tick_secs` after it.",
+          "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
-        },
-        "todo_id": {
-          "type": "string"
         }
       },
-      "required": [
-        "attempt",
-        "todo_id"
-      ],
       "type": "object"
     },
     "Topic": {
@@ -2267,48 +2330,6 @@
       ],
       "type": "object"
     },
-    "WaitingFor": {
-      "properties": {
-        "deadline_ms": {
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "human_tasks": {
-          "description": "TaskMgr human tasks the wait depends on: questions asked through a notification (`ask-user` of a Work).",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "kind": {
-          "$ref": "#/definitions/WaitingKind"
-        },
-        "refs": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "type": "object"
-    },
-    "WaitingKind": {
-      "description": "What a waiting session waits for (`waiting_for.kind`).",
-      "enum": [
-        "input",
-        "tool",
-        "event",
-        "children"
-      ],
-      "type": "string"
-    },
     "WorklogBoundary": {
       "properties": {
         "committed_bytes": {
@@ -2386,7 +2407,7 @@
       "additionalProperties": {
         "type": "string"
       },
-      "description": "Chat input format (UI sessions): the background context lines last shown, `key → digest` (`time` → the epoch ms it was shown at). A line is shown again only when its digest changes; the time line at most every [`BACKGROUND_TIME_STEP_MS`].",
+      "description": "The background context lines last shown in an input, `key → digest` (`time` → `<epoch ms>|<zone>`; `task:<id>` → how far its output was shown, `<stdout bytes>,<stderr bytes>`). A line is shown again only when its digest changes; the time line at most every [`BACKGROUND_TIME_STEP_MS`].",
       "type": "object"
     },
     "bootstrap_done": {
@@ -2409,6 +2430,15 @@
         }
       ]
     },
+    "finished_at_ms": {
+      "description": "When the commit that finished the session was made.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
     "goal": {
       "anyOf": [
         {
@@ -2419,6 +2449,14 @@
         }
       ],
       "description": "Goal Sessions: the Goal State it owns and the Activation in progress."
+    },
+    "hints_once": {
+      "description": "Result hints shown once per session (`once` keys of the hint ledger, see `agent_tool::hints`).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
     },
     "inputs": {
       "additionalProperties": {
@@ -2464,6 +2502,14 @@
       ],
       "default": null
     },
+    "nudge": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Nudge"
+        }
+      ],
+      "description": "Corrections the runner gave the open Turn (a reply that neither ends the session nor waits for anything): at most one per Turn."
+    },
     "one_line_status": {
       "default": "",
       "type": "string"
@@ -2496,6 +2542,17 @@
         }
       ]
     },
+    "paused": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Paused"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`control(pause)`: the session infers no more — no Turn opens, a run in progress stops at its next inference boundary (its checkpoint) — until `control(resume)`. Tasks it follows run on."
+    },
     "pending_decision": {
       "description": "Decisions seen in the queue but not applied yet (UI display)."
     },
@@ -2519,7 +2576,7 @@
       ]
     },
     "process_result": {
-      "description": "Result of a sub context, handed to its caller: `{behavior, result, status: ok | failed | needs_user_input, next_action_id, next_step_index}`. Behavior trigger: rendered into the caller's hand-over batch. Tool trigger: carries `call_id` and is filled as that call's tool result when the caller's run is opened."
+      "description": "Result of a sub context, handed to its caller: `{behavior, result, status: ok | failed | needs_user_input, next_action_id, next_step_index}`, rendered into the caller's hand-over batch (a tool trigger carries its `call_id`)."
     },
     "process_stack": {
       "items": {
@@ -2553,6 +2610,21 @@
       "type": "integer"
     },
     "result": true,
+    "resume_run": {
+      "description": "A run a pause stopped inside its Turn goes on from its checkpoint (set by `resume`, cleared when it runs again).",
+      "type": "boolean"
+    },
+    "retry": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RetryState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The live run stopped on retryable errors in a row and infers again once their backoff passed; any other outcome clears it."
+    },
     "rev": {
       "format": "uint64",
       "minimum": 0.0,
@@ -2573,6 +2645,14 @@
       "additionalProperties": true,
       "description": "Pull-mode cursors only (registry rev of session subscriptions).",
       "type": "object"
+    },
+    "task_watch": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TaskWatch"
+        }
+      ],
+      "description": "Multi-Turn Work Sessions: the timer that opens a Turn while the session waits for the work it started (`timer:` subscriptions)."
     },
     "todo_view_rev": {
       "description": "Revision of the TodoList (`todos.json`) last shown to the session's top-level context in an input batch: the compact view is rendered again only when the list changed since (0: never shown).",
@@ -2621,15 +2701,12 @@
       "minimum": 0.0,
       "type": "integer"
     },
-    "waiting_for": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/WaitingFor"
-        },
-        {
-          "type": "null"
-        }
-      ]
+    "wait_children": {
+      "description": "Sub sessions a waiting session must hear from before it goes on (its run kept for them, or its end held for them).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "watched_tasks": {
       "description": "Background tasks of ended runs the runner follows for this session (implicit active subscriptions on `task:<task_id>`): when one ends, its completion is handled like a subscribed event.",

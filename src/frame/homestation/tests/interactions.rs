@@ -110,15 +110,15 @@ async fn restricted_targets() {
     // Alice got both; the collector got nothing.
     assert_eq!(net.rpc("alice", "comments.list", json!({ "objId": f1, "view": "local", "type": "like" })).await["stats"]["likes"], 1);
     let index = net.n("index");
-    let collected: i64 = index.station.db.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM collector_index", [], |r| r.get(0))?)).await.unwrap();
+    let collected: i64 = index.station.db.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM collector_index WHERE owner=?1", [c.owner], |r| r.get(0))?)).await.unwrap();
     assert_eq!(collected, 0);
     // Bob's public stream does not show the comment; Alice (its audience) can read it.
     let (_, body, _) = net.get(&format!("{}/feed?mode=display", bob.home), None).await;
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["items"].as_array().unwrap().len(), 0);
-    let (_, body, _) = net.get(&format!("{}/feed?mode=display", bob.home), Some(net.proof("alice", "bob"))).await;
+    let (_, body, _) = net.get(&format!("{}/feed?mode=display", bob.home), Some(net.proof("alice", "bob").await)).await;
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["items"].as_array().unwrap().len(), 1);
     // Carol cannot even read the original through Bob or Alice.
-    assert_eq!(net.get(&format!("{}/objects/{f1}", alice.home), Some(net.proof("carol", "alice"))).await.0, 404);
+    assert_eq!(net.get(&format!("{}/objects/{f1}", alice.home), Some(net.proof("carol", "alice").await)).await.0, 404);
 }
 
 /// E11, E12, E13, A11, A28, A40, A49, A74: private bookmarks stay local; public bookmark and
@@ -137,7 +137,7 @@ async fn bookmarks_reposts_quotes() {
 
     let private = net.rpc("bob", "interact.bookmark", json!({ "objId": p1, "on": true, "public": false })).await;
     assert_eq!(private["bookmark"], json!({ "on": true, "visibility": "private", "delivery": "none" }));
-    let outbox: i64 = bob.station.db.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?)).await.unwrap();
+    let outbox: i64 = bob.station.db.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM outbox WHERE owner=?1", [c.owner], |r| r.get(0))?)).await.unwrap();
     assert_eq!(outbox, 0, "a private bookmark is never sent");
     let made_public = net.rpc("bob", "interact.bookmark", json!({ "objId": p1, "on": true, "public": true })).await;
     assert_eq!(made_public["bookmark"]["visibility"], "public");

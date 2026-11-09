@@ -1,4 +1,4 @@
-import { buckyos } from 'buckyos'
+import { bucket, buckyos } from 'buckyos'
 import { callRpc, type RpcCallOptions } from './rpc.ts'
 import { isMockRuntime } from '../runtime.ts'
 
@@ -212,6 +212,42 @@ export interface ZoneOverviewResponse {
 export const fetchZoneOverview = async (): RpcResult<ZoneOverviewResponse> =>
   callSettingsRpc<ZoneOverviewResponse>('zone.overview')
 
+// ---- Storage ----
+
+/** The signed-in user's buckets, across the apps that keep data for them (installed or not). */
+export interface StorageOverview {
+  user: string
+  buckets: bucket.BucketInfo[]
+}
+
+export const fetchStorageOverview = async (): RpcResult<StorageOverview> => {
+  if (isMockRuntime()) {
+    const { mockStorageOverview } = await import('./settings_mock.ts')
+    return { data: mockStorageOverview(), error: null }
+  }
+  try {
+    const user = (await buckyos.getAccountInfo())?.user_id
+    if (!user) throw new Error('not signed in')
+    const buckets = await buckyos.getBucketClient().list({ scope: 'user' })
+    return { data: { user, buckets: buckets.filter((item) => item.owner === user) }, error: null }
+  } catch (error) {
+    return { data: null, error }
+  }
+}
+
+/** Deletes one bucket; a documents or collected bucket needs the user's sudo session. */
+export const deleteStorageBucket = async (bucketId: string, sessionToken: string | null): RpcResult<{ deleted: boolean }> => {
+  if (isMockRuntime()) {
+    const { deleteMockStorageBucket } = await import('./settings_mock.ts')
+    return { data: deleteMockStorageBucket(bucketId), error: null }
+  }
+  try {
+    return { data: await buckyos.getBucketClient().deleteBucket(bucketId, { sessionToken }), error: null }
+  } catch (error) {
+    return { data: null, error }
+  }
+}
+
 // ---- Developer tools ----
 
 export interface ConfigFileSummary {
@@ -265,3 +301,59 @@ export const requestLogDownload = async (
   since: string,
 ): RpcResult<LogDownloadTicket> =>
   callSettingsRpc<LogDownloadTicket>('system.logs.download', { services, since, mode: 'filtered' })
+
+export type ExtToolsStage = 'queued' | 'downloading' | 'verifying' | 'staging' | 'checking' | 'active' | 'removing' | 'removed' | 'failed' | 'unsupported'
+
+export interface ExtToolsManifest {
+  id: string
+  version: string
+  requires?: Array<{ id: string; version: string }>
+  provides: Array<{ command: string }>
+  platforms: string[]
+  size_bytes?: Record<string, number>
+  license?: string
+  desc?: string
+}
+
+export interface ExtToolsCatalogEntry {
+  manifest: ExtToolsManifest
+  pikg_digest: string
+  content_id: string
+}
+
+export interface ExtToolsNodeStatus {
+  version: string
+  stage: ExtToolsStage
+  error?: string | null
+  targets?: Record<string, { stage: ExtToolsStage; version?: string | null; error?: string | null }>
+}
+
+export interface ExtToolsPackage {
+  id: string
+  latest: ExtToolsCatalogEntry | null
+  versions: string[] | null
+  desired: { version: string; enabled: boolean } | null
+  nodes: Record<string, ExtToolsNodeStatus> | null
+  /** command -> the installed skills that rely on it. */
+  skills?: Record<string, string[]> | null
+}
+
+export interface ExtToolsStatusResponse {
+  packages: ExtToolsPackage[]
+  nodes: Array<{ id: string; platform?: string | null; containers?: boolean }>
+}
+
+export interface ExtToolsPlan {
+  enable: ExtToolsCatalogEntry[]
+  disable: string[]
+  errors: string[]
+}
+
+export const fetchExtToolsStatus = async (): RpcResult<ExtToolsStatusResponse> =>
+  callSettingsRpc<ExtToolsStatusResponse>('ext_tools.status')
+
+export const fetchExtToolsPlan = async (id: string, enabled: boolean, version?: string): RpcResult<ExtToolsPlan> =>
+  callSettingsRpc<ExtToolsPlan>('ext_tools.plan', { id, enabled, ...(version ? { version } : {}) })
+
+export const setExtToolsDesired = async (id: string, enabled: boolean, version?: string): RpcResult<{ ok: boolean; plan: ExtToolsPlan }> =>
+  callSettingsRpc<{ ok: boolean; plan: ExtToolsPlan }>('ext_tools.set_desired', { id, enabled, ...(version ? { version } : {}) })

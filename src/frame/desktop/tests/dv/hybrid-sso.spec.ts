@@ -1,4 +1,4 @@
-// Hybrid SSO in a real browser against a running Zone (notepads/hybrid-sso-implementation-todo.md
+// Hybrid SSO in a real browser against a running Zone (notepads/done/hybrid-sso-implementation-todo.md
 // SSO-14): real cookies, the invite link with its fragment secret, the Message Hub guest page and the
 // share entry page. Run: BUCKYOS_TEST_ZONE_HOST=test.buckyos.io BUCKYOS_TEST_ADMIN_PASSWORD=bucky2025 \
 //   pnpm exec playwright test --config=playwright.dv.config.ts tests/dv/hybrid-sso.spec.ts
@@ -108,7 +108,7 @@ test('a guest entry of an AI Workspace opens the workspace without an account', 
   await expect(page.getByTestId('sso-entry-method-self_register')).toBeVisible()
   await expect(page.getByTestId('sso-entry-method-did_login')).toHaveCount(0)
   await page.getByTestId('sso-entry-method-guest').click()
-  await page.waitForURL(new RegExp(`/workspace/${workspaceId}`))
+  await page.waitForURL(new RegExp(`^https://aiws-${workspaceId.replace(/^ws_/, '')}\\.`))
   await expect(page.getByTestId('aiws-open-error')).toHaveCount(0)
   await context.close()
 

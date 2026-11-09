@@ -9,7 +9,7 @@ use common::*;
 use libopendan::api::{InputChannel, SessionSpec};
 use libopendan::lock::Acquire;
 use libopendan::protocol::*;
-use libopendan::runner::history::read_window;
+use libopendan::runner::history::{read_window, HistoryShape};
 use libopendan::runner::{drive, DriveResult, StopWhen};
 use libopendan::{SessionDir, SessionTemplate};
 use serde_json::{json, Value};
@@ -119,10 +119,11 @@ fn assert_one_completion(sd: &SessionDir, report: &str, rounds: u64) {
         panic!("finished session is still held");
     };
     let session = sd.load(&lease).unwrap();
-    let history = read_window(&session, &session.summary().unwrap(), 100_000)
-        .unwrap()
-        .lines
-        .join("\n");
+    let history = render(
+        &read_window(&session, &session.summary().unwrap(), HistoryShape::Native, Some(100_000))
+            .unwrap()
+            .messages,
+    );
     assert_eq!(history.matches(report).count(), 1, "{history}");
 }
 
@@ -254,7 +255,7 @@ async fn accepted_final_report_preserves_prior_effects_and_pairs_skipped_calls()
         .load_checked(state.last_run.as_ref().unwrap())
         .unwrap();
     let snapshot = snapshot.unwrap();
-    assert!(snapshot.state.pending_calls().is_empty());
+    assert!(snapshot.state.suspended.is_none());
     assert_one_completion(&sd, "delivered in one round", 1);
 }
 
@@ -347,23 +348,29 @@ async fn final_report_from_sub_context_returns_to_its_parent() {
                 json!({ "command": "echo resumed > parent.marker" }),
             ),
         ]),
-        1 => tool_call(
+        // The call is registered; the sub context starts once the parent
+        // stops acting.
+        1 => {
+            assert!(has_tool_result(req, "child").unwrap().contains("registered"));
+            assert!(has_tool_result(req, "parent-after").is_some());
+            text("waiting for the research")
+        }
+        2 => tool_call(
             "child-final",
             "report",
             json!({ "report": "child found 42", "result": { "answer": 42 }, "is_end": true }),
         ),
-        2 => {
+        3 => {
             let state = SessionDir::open(&session_path).unwrap().state().unwrap();
             assert_eq!(
                 state.latest_report.unwrap().report,
                 "parent progress before delegation"
             );
             assert!(state.final_report.is_none());
-            let child: Value =
-                serde_json::from_str(&has_tool_result(req, "child").unwrap()).unwrap();
-            assert_eq!(child["submission"]["report"], "child found 42");
-            assert_eq!(child["submission"]["result"], json!({ "answer": 42 }));
-            assert!(has_tool_result(req, "parent-after").is_some());
+            // The child's submission is the parent's input, naming the call.
+            let input = last_user_text(req);
+            assert!(input.contains("<process_result") && input.contains("call_id=\"child\""), "{input}");
+            assert!(input.contains("child found 42") && input.contains("answer"), "{input}");
             assert!(has_tool_result(req, "child-final").is_none());
             tool_call(
                 "parent-final",
@@ -381,36 +388,32 @@ async fn final_report_from_sub_context_returns_to_its_parent() {
     );
     assert!(sd.state().unwrap().process_stack.is_empty());
     assert_eq!(sd.statistics().unwrap().runs, 2);
-    assert_one_completion(&sd, "parent approved 42", 3);
+    assert_one_completion(&sd, "parent approved 42", 4);
 }
 
+/// F17: a behavior step with a stage report and no action is a Yield — the
+/// run ends at once. With nothing to wait for and nobody to answer, the
+/// stage report cannot finish a work session: it fails, saying why.
 #[tokio::test]
-async fn behavior_stage_report_continues_until_an_explicit_final_report() {
+async fn behavior_stage_report_is_a_yield_that_ends_the_run() {
     let env = Env::new();
     let mut spec = report_spec("behavior report intent");
     spec.prompt.llm_context["loop_model"] = json!("behavior");
     let sd = env.create_work(spec).await;
-    let session_path = sd.path().to_path_buf();
     let llm = ScriptedLlm::new(move |_, n| match n {
         0 => text("<response><report>stage without end</report></response>"),
-        1 => {
-            let state = SessionDir::open(&session_path).unwrap().state().unwrap();
-            assert_eq!(state.latest_report.unwrap().report, "stage without end");
-            assert!(state.final_report.is_none());
-            text("<response><report end=\"false\">stage with false</report></response>")
-        }
-        2 => {
-            let state = SessionDir::open(&session_path).unwrap().state().unwrap();
-            assert_eq!(state.latest_report.unwrap().report, "stage with false");
-            text("<response><report end=\"true\">behavior delivery</report></response>")
-        }
         _ => panic!("unexpected inference {n}"),
     });
     let result = drive(&sd, &env.deps(llm.clone()), StopWhen::Finished).await;
     assert!(result.is_finished(), "{result:?}");
+    let state = sd.state().unwrap();
+    assert_eq!(llm.count(), 1, "a yield is not inferred on again");
+    assert_eq!(state.latest_report.as_ref().unwrap().report, "stage without end");
+    assert!(state.final_report.is_none());
+    assert!(state.live_run.is_none());
+    assert_eq!(state.outcome, Some(Outcome::Failed));
+    assert_eq!(state.last_error.as_ref().unwrap()["kind"], "missing_end_report");
     assert_eq!(deliveries(&sd, "stage without end"), 0);
-    assert_eq!(deliveries(&sd, "stage with false"), 0);
-    assert_one_completion(&sd, "behavior delivery", 3);
 }
 
 #[tokio::test]
@@ -608,6 +611,91 @@ async fn invalid_behavior_artifact_is_reported_back_for_correction() {
     assert!(result.is_finished(), "{result:?}");
     assert_one_completion(&sd, "corrected behavior artifact", 2);
     assert_eq!(deliveries(&sd, "invalid artifact delivery"), 0);
+}
+
+#[tokio::test]
+async fn behavior_artifact_storage_failure_recovers_without_inference_or_reexecution() {
+    use libopendan::runner::{ObjectStore, StoredObject};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const BUCKET_URL: &str = "obj://bucket/user/agentx/alice/artifacts/0001/answer.txt";
+
+    #[derive(Default)]
+    struct UnavailableOnce(AtomicUsize);
+
+    impl UnavailableOnce {
+        fn store(&self) -> Result<StoredObject, String> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("HTTP transport error: bucket service unreachable".into());
+            }
+            Ok(StoredObject {
+                obj_id: ndn_lib::ObjId::new_by_raw("cyfile".into(), vec![1; 32]),
+                url: Some(BUCKET_URL.into()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for UnavailableOnce {
+        async fn put_file(&self, path: &Path, name: &str) -> Result<StoredObject, String> {
+            assert_eq!(name, "answer.txt");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "stable artifact\n");
+            self.store()
+        }
+
+        async fn retain_url(&self, url: &str) -> Result<StoredObject, String> {
+            assert_eq!(url, BUCKET_URL);
+            self.store()
+        }
+    }
+
+    for artifact in ["answer.txt", BUCKET_URL] {
+        let env = Env::new();
+        let mut spec = report_spec("recover an unavailable artifact store");
+        spec.prompt.llm_context["loop_model"] = json!("behavior");
+        spec.prompt.llm_context["tools"]["tools2actions"] = json!(true);
+        let sd = env.create_work(spec).await;
+        std::fs::write(sd.path().join("answer.txt"), "stable artifact\n").unwrap();
+        let llm = ScriptedLlm::new(move |_, n| match n {
+            0 => text("<response><actions><shell><![CDATA[echo once >> artifact.marker]]></shell></actions></response>"),
+            1 => text(&format!("<response><report end=\"true\">recovered artifact delivery</report><artifacts>{}</artifacts></response>", json!([artifact]))),
+            _ => panic!("unexpected inference {n}"),
+        });
+        let objects = Arc::new(UnavailableOnce::default());
+        let mut deps = env.deps(llm.clone());
+        deps.objects = Some(objects.clone());
+        let result = drive(&sd, &deps, StopWhen::Finished).await;
+        assert!(matches!(&result, DriveResult::Error { error, .. } if error["kind"] == "artifact"), "{result:?}");
+        let state = sd.state().unwrap();
+        assert_eq!(state.last_error.as_ref().unwrap()["kind"], "artifact");
+        assert!(state.live_run.is_some());
+        assert!(state.latest_report.is_none());
+        assert!(state.final_report.is_none());
+        assert_eq!(deliveries(&sd, "recovered artifact delivery"), 0);
+        assert_eq!(llm.count(), 2);
+
+        let resumed_llm = ScriptedLlm::new(|_, n| panic!("artifact recovery must not infer: {n}"));
+        let mut resumed_deps = env.deps(resumed_llm.clone());
+        resumed_deps.objects = Some(objects.clone());
+        let result = drive(&sd, &resumed_deps, StopWhen::Finished).await;
+        assert!(result.is_finished(), "{result:?}");
+        assert_eq!(resumed_llm.count(), 0);
+        assert_eq!(objects.0.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read_to_string(sd.path().join("artifact.marker")).unwrap(), "once\n");
+        assert_eq!(std::fs::read_to_string(sd.path().join("answer.txt")).unwrap(), "stable artifact\n");
+        assert_one_completion(&sd, "recovered artifact delivery", 2);
+        let report = sd.state().unwrap().final_report.unwrap();
+        assert_eq!(report.artifacts.len(), 1);
+        assert_eq!(report.artifacts[0].url.as_deref(), Some(BUCKET_URL));
+        if artifact == "answer.txt" {
+            assert!(!sd.path().join(&report.artifacts[0].reference).exists());
+        }
+        let entries = read_worklog(&sd);
+        assert!(drive(&sd, &resumed_deps, StopWhen::Idle).await.is_finished());
+        assert_eq!(read_worklog(&sd), entries);
+        assert_eq!(objects.0.load(Ordering::SeqCst), 2);
+    }
 }
 
 #[tokio::test]
@@ -1045,8 +1133,8 @@ async fn final_report_recovers_without_inference_or_duplicate_delivery_at_commit
                 tokio::time::sleep(Duration::from_millis(20)).await;
             };
             assert!(!status.success(), "fault not reached: {fault}");
-            let llm = ScriptedLlm::new(|_, n| {
-                panic!("submitted final report must recover without inference: {n}")
+            let llm = ScriptedLlm::new(move |_, n| {
+                panic!("{mode} {fault}: submitted final report must recover without inference: {n}")
             });
             let deps = env.deps(llm.clone());
             let result = drive(&sd, &deps, StopWhen::Finished).await;
@@ -1065,7 +1153,8 @@ async fn final_report_recovers_without_inference_or_duplicate_delivery_at_commit
                 .unwrap();
             assert_eq!(reports.len(), 1, "{fault}");
             let final_report = state.final_report.as_ref().unwrap();
-            assert_eq!(final_report.result, Some(Value::Null), "{fault}");
+            // `null` is no result (folded with the XML <artifacts>, it is dropped).
+            assert!(final_report.result.as_ref().is_none_or(Value::is_null), "{fault}");
             assert_eq!(final_report.artifacts.len(), 1);
             assert_eq!(
                 std::fs::read_to_string(sd.path().join(&final_report.artifacts[0].reference))

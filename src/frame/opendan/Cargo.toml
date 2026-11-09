@@ -28,8 +28,12 @@ buckyos-api = { path = "../../kernel/buckyos-api" }
 llm_context = { path = "../llm_context" }
 agent_tool = { path = "../agent_tool" }
 agent_tool_cli_dev = { path = "../agent_tool_cli_dev" }
+agent-did-object-lib = { path = "../agent-did-object-lib" }
 libopendan = { path = "../lib_opendan" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 base64 = { workspace = true }
+axum = { workspace = true }
+named_store = { workspace = true }
+nfs_server = { path = "../nfs_server" }

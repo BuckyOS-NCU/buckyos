@@ -149,6 +149,13 @@ export interface UserCreateResponse extends SimpleOkResponse {
   warning?: string
 }
 
+export interface UserStateChangeResponse extends SimpleOkResponse {
+  user_id: string
+  state: UserStateString
+  rbac_refreshed: boolean
+  warning?: string
+}
+
 export interface UserProfileResponse {
   user_id: string
   profile: UserProfile | Record<string, unknown>
@@ -400,10 +407,10 @@ export interface AgentCreateResponse {
 // ---------------------------------------------------------------------------
 
 /** List all users visible to the caller. */
-export const fetchUserList = async (): Promise<{
+export const fetchUserList = async (options: { includeDeleted?: boolean } = {}): Promise<{
   data: UsersListResponse | null
   error: unknown
-}> => callControlPanel<UsersListResponse>('user.list', {})
+}> => callControlPanel<UsersListResponse>('user.list', options.includeDeleted ? { include_deleted: true } : {})
 
 /** Get a single user's detail. Defaults to the caller when `user_id` omitted. */
 export const fetchUserDetail = async (
@@ -440,7 +447,7 @@ export const createUser = async (input: {
   if (input.allowContactEdit !== undefined) {
     params.allow_contact_edit = input.allowContactEdit
   }
-  return callRpc<UserCreateResponse>('user.create', params, options)
+  return callControlPanel<UserCreateResponse>('user.create', params, options)
 }
 
 /** Update basic user profile fields (currently `display_name`, via `show_name` RPC param). */
@@ -638,8 +645,9 @@ export const acceptUserInvite = async (input: {
 /** Soft-delete a user (state → `deleted`). Admin-only; cannot delete root or self. */
 export const deleteUser = async (
   userId: string,
-): Promise<{ data: SimpleOkResponse | null; error: unknown }> =>
-  callRpc<SimpleOkResponse>('user.delete', { user_id: userId })
+  options: RpcCallOptions = {},
+): Promise<{ data: UserStateChangeResponse | null; error: unknown }> =>
+  callControlPanel<UserStateChangeResponse>('user.delete', { user_id: userId }, options)
 
 /** Change a user's password hash. Allowed for self or admin. */
 export const changeUserPassword = async (input: {
@@ -657,11 +665,11 @@ export const changeUserPassword = async (input: {
 export const changeUserState = async (input: {
   userId: string
   state: UserStateString
-}): Promise<{ data: SimpleOkResponse | null; error: unknown }> =>
-  callRpc<SimpleOkResponse>('user.change_state', {
+}, options: RpcCallOptions = {}): Promise<{ data: UserStateChangeResponse | null; error: unknown }> =>
+  callControlPanel<UserStateChangeResponse>('user.change_state', {
     user_id: input.userId,
     state: input.state,
-  })
+  }, options)
 
 /** Change a user's type between Admin, User and Limited. Admin-only; the owner record cannot change. */
 export const changeUserType = async (input: {
@@ -849,6 +857,23 @@ export const updateAgent = async (input: {
 }
 
 /** The machines the caller's Agents may run on; with `agentId`, that Agent's choice too. */
+/** The installation's product edition (`system.product.get`). */
+export interface ProductInfo {
+  edition: 'full' | 'lite'
+  capabilities: {
+    container: boolean
+    user_service_apps: boolean
+    static_web_apps: boolean
+    max_running_agents: number | null
+  }
+  preinstalled_script_apps: Array<{ app_did: string; version: string; services: string[] }>
+  /** The Agent holding the one run slot of a product that runs one Agent. */
+  agent_slot: { owner_user_id: string; agent_id: string; acquired_at: number } | null
+}
+
+export const fetchProductInfo = async (): Promise<{ data: ProductInfo | null; error: unknown }> =>
+  callControlPanel<ProductInfo>('system.product.get', {})
+
 export const fetchAgentRuntimeDirectory = async (
   agentId?: string,
 ): Promise<{ data: AgentRuntimeDirectory | null; error: unknown }> =>

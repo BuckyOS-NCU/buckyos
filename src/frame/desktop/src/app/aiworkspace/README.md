@@ -1,4 +1,4 @@
-# AI Workspace — Desktop app (phase one + phase two UI framework + UI improvement + standard object interaction + connectors + presentation)
+# AI Workspace — Desktop app (phase one + phase two UI framework + UI improvement + standard object interaction + connectors + presentation + handwriting)
 
 Front end of the `aiworkspace` service (`src/frame/aiworkspace`). Design:
 `doc/workspace/BuckyOS AI Workspace 第一期内置对象详细设计.md` ("the design" below),
@@ -10,7 +10,7 @@ its source directory and Desktop entry have been removed. Current test routing i
 There is **no mock backend**. In the Desktop's mock runtime the app says so and stays empty unless the
 dev override below points it at a real backend process.
 
-File/folder import is available in the data tree and canvas insert catalog. `OnlineWorkspaceSession.importAssets` uses SDK NDM import → ready → `asset.import_object`, preserving the selected directory root and mapping leaves to workspace AssetRefs. `importedAssetOps` builds one structure commit; canvas imports add matching groups/cells. Each asset keeps the existing 32 MiB limit and local ObjectStore ID, so exports and prepared offline replicas continue to contain the bytes. Image replacement and derived snapshots use `uploadAsset`, which shares this NDM path. Offline sessions reject imports while disconnected; cancellation or refresh does not preserve browser File handles, and retry requires reselecting the source. FileList pickers cannot represent empty folders, as stated beside the picker.
+File/folder import is available in the data tree and canvas insert catalog. `OnlineWorkspaceSession.importAssets` uses SDK NDM import → ready → `asset.import_object { obj_id }` (the service binds each FileObject into the Workspace owner's `assets` bucket), preserving the selected directory root and mapping leaves to workspace AssetRefs. `importedAssetOps` builds one structure commit; canvas imports add matching groups/cells. Each asset keeps the 32 MiB limit; its id is the uploaded FileObject's, so exports and prepared offline replicas contain the bytes. Image replacement and derived snapshots use `uploadAsset` (`api/session.ts` `uploadWorkspaceAsset`): one file uploaded with `bind` into the caller's own `user/aiworkspace/<user>/assets`, then `asset.import_object { bucket_id, key }`. Export packages and replica databases are fetched from `/bucket/v1/<bucket_id>/<key>?token=` (the `download` of `doc.export` / `replica.bootstrap`; `Transport.fetchDownload`); a package to import is uploaded with `bind` into the caller's own `exports` bucket (`uploadWorkspacePackage`). Offline sessions reject imports while disconnected; cancellation or refresh does not preserve browser File handles, and retry requires reselecting the source. FileList pickers cannot represent empty folders, as stated beside the picker.
 
 `tests/aiworkspace/features.spec.ts` exercises a real browser, isolated NDM and AIWorkspace processes: nested Chinese/space paths, equal-content files in different folders, zero-byte assets, byte readback, ID deduplication and refresh. The existing image replacement/embed/link regression runs against the same fixture.
 
@@ -19,8 +19,13 @@ File/folder import is available in the data tree and canvas insert catalog. `Onl
 ```text
 AIWorkspaceAppPanel.tsx   entry: what opens (Desktop window: most recent workspace > list; tab: the address),
                           the leave check, the Desktop close / logout guard, the tab's beforeunload
-AIWorkspaceRoute.tsx      the browser tab of its own: Desktop route `/workspace/:workspaceId?`
-links.ts                  the only definition of the tab / share address `/workspace/<id>?surface=&block=`
+AIWorkspaceRoute.tsx      Desktop route `/workspace`: the signed-in user's list in a tab (the phone's entry); opening goes to the workspace's origin
+standalone/StandalonePage.tsx
+                          the workspace's own page on `aiws-<id>.<zone>` (entry src/aiws.tsx → aiws.html, served by the service, T4-8)
+links.ts                  the only definition of the addresses: `https://aiws-<id>.<zone>/<workspace slug>/<surface slug>?id=&block=`, the Zone origin
+launch.ts                 going to a workspace's origin signed in (Control Panel `auth.prepare_app_launch { service_id: 'aiworkspace' }`)
+ui/controls/              Block-controls (the mind map): registry, folds, node measuring — see "Block-controls" below
+ui/extensions/            HTML / declarative hosts, and extension controls (dialog, instance form, home sources, define as control) — see "Extension controls"
 i18n.ts, useAiwsText.ts   the app's text in the Desktop's language — see "Language" below
 api/
   transport.ts            the only module that knows how to reach the service (zone path / dev override)
@@ -89,7 +94,17 @@ ui/
                           InsertCatalog + catalog.ts (the one insert catalog), clipboard.ts, surfaceManage.tsx
                           (rename / icon / delete pre-check), icons.tsx (preset canvas icons), FlowSurface +
                           flowOps.ts (the page as a document: handles, drag, insert after, continue writing), layout.ts,
-                          tools.tsx (near toolbar, context menu, inspector)
+                          tools.tsx (near toolbar, context menu, inspector); pdfImport.ts + ImportPdfDialog.tsx +
+                          pdfImportRequest.ts (PDF pages → a new canvas with a presentation path, doc/workspace/BuckyOS
+                          AI Workspace PDF 导入与放映方案讨论.md; the converter is ../aiworkspace/import-pdf, `@pdf/*`)
+  import/                 table data import (notepads/done/aiworkspace-table-import-todo.md; the importer is
+                          ../aiworkspace/import-table, `@table/*`): tableImportRequest.ts (request sink: source, ask /
+                          wizard, canvas or data folder), TableImportDialog.tsx (ask step, one-screen wizard, progress,
+                          report; mounted at the shell so the data tree can open it), tableImport.ts (plans checked by
+                          WASM normalize_value, commits of ≤ 20 000 rows / 6 MiB, the original file kept),
+                          tabularFiles.ts + tableReader.worker.ts (CSV here; xlsx and SQLite — sqlite-wasm
+                          `sqlite3_deserialize` — in a Worker), clipboardTable.ts (is a paste a table), copyTable.ts
+                          ("copy as table": TSV + HTML with data-aiws-table / data-aiws-value)
   canvas/render/          RenderHost (world layer + camera transform, three-level culling with hysteresis, LOD
                           placeholders, mount budget, overlay, gestures that commit once; painting and hit testing
                           share one order, BlockTree pre-order as a z-index, frames in a stable DOM order by id),
@@ -99,6 +114,17 @@ ui/
                           context), builtin.tsx (table / richtext / record / asset / note /
                           frame / shape), editors.tsx (the data editors shared with the data-source view), samples.tsx
                           (extension sample 1: metric, bar chart, frame-sequence video)
+ink/                      pen handwriting (notepads/aiworkspace-handwriting-todo.md) — see "Handwriting" below:
+                          model.ts (format, width curve, sampling, simplification, segments, geometry, hit tests),
+                          input.ts (one stroke per pointer), paint.ts (the live layer), book.ts (decoded strokes, strokes
+                          waiting for their Blocks, writing and erasing), inkBlock.tsx (the `ink` Block), InkBar.tsx,
+                          prefs.ts (`ui:ink`)
+  media/                  media assets (doc/workspace/BuckyOS AI Workspace 多媒体对象.md): kinds.ts, poster.ts
+                          (poster and facts of a file: video frame, PDF first page via pdfDoc.ts — pdf.js with the CMaps and
+                          standard fonts the build serves under aiworkspace/pdfjs/ —, audio cover via
+                          audioCover.ts), stage.ts (file + poster upload, Block size), source.ts (Preview Source
+                          Resolver `aiworkspace-asset`, the Surface's media session), AssetMedia.tsx (picture /
+                          poster / card, in-place playback and the preview dialog with the system Preview component)
   extensions/             declarative.tsx (interpreter of `buckyos.block-def` declarative definitions),
                           HtmlBlockHost.tsx + htmlRuntime.ts + bridge.ts (HTML extension Blocks: same-origin iframe,
                           `window.aiws` v2 API — named bindings, watch, typed writes in one batch —, snapshots,
@@ -204,8 +230,8 @@ text typed offline survives as pending rows (there is no separate `richtext_work
 
 **Application resources.** A production build has `sw.js` next to `index.html` (scope = the Desktop's
 directory, so the control-panel directory handler needs no extra headers). It precaches every built
-file into a cache named by a hash of the build, serves the entry — the Desktop root and the tab addresses
-`/workspace`, `/workspace/…` — network-first with the cached index.html as fallback, built files
+file into a cache named by a hash of the build, serves the entry — the Desktop root and `/workspace`, and on a
+workspace's own origin (`aiws-<id>.<zone>`) every navigation, with aiws.html — network-first with the cached entry as fallback, built files
 cache-first, and touches nothing else. The build's `base` is `/` (absolute asset URLs), so the entry
 works under a two-level path. A new build installs in the background
 and takes over when the old pages are closed (or on "现在更新并重新载入"); old caches are deleted on
@@ -229,15 +255,18 @@ AIWS_BACKEND=http://127.0.0.1:4120 pnpm run dev
 ```
 
 Open `http://localhost:5174/?scenario=normal&aiwsDevToken=tok-alice` and start "AI Workspace" from the
-desktop, or `http://localhost:5174/workspace?aiwsDevToken=tok-alice` for the app in a tab of its own. `aiwsDevToken` stores `localStorage['aiworkspace.dev'] = {"token":"tok-alice"}` (optional
+desktop, `http://localhost:5174/workspace?aiwsDevToken=tok-alice` for the list in a tab of its own, or
+`http://aiws-<id without ws_>.localhost:5174/w?aiwsDevToken=tok-alice` for a workspace's own page (the dev server serves aiws.html for
+`aiws-*` hosts; `--public-base http://aiws-{workspace_id}.localhost:5174` on the backend makes its links point there). `aiwsDevToken` stores `localStorage['aiworkspace.dev'] = {"token":"tok-alice"}` (optional
 `baseUrl`, `principal`); remove that key to go back to the zone path. `{"guest":true}` instead of a
 token plays a visitor of a public link (no identity of its own; see below). Without `AIWS_BACKEND` the
 Vite config is unchanged.
 
 In a real zone nothing is configured: the app uses `buckyos.getServiceRpcClient('aiworkspace')` and
-sends `Authorization: Bearer <session token>` to the upload / asset / export routes. Without a signed-in
-account (`/workspace/<id>` is a login-optional route) it sends a guest token instead — `gt_` + 26 base32
-chars kept in `localStorage['aiworkspace.guest']` — which reaches a workspace's `public` grant only (the
+sends `Authorization: Bearer <session token>` to the asset route (uploads go through NDM, downloads through
+`/bucket/v1`; the dev server forwards both to `VITE_NFS_PROXY`). Without a signed-in
+account (a workspace's page never requires one) it sends a guest token instead — `gt_` + base64url of 32
+random bytes (the zone's bearer token form, `name_lib::bearer_token`) kept in `localStorage['aiworkspace.guest']` — which reaches a workspace's `public` grant only (the
 "一键公开分享" of the share panel); a guest whose link is not public is sent to `/login` and comes back.
 
 ## Tests
@@ -292,7 +321,7 @@ own origin, i.e. its own OPFS, service worker and localStorage.
 ## UI improvement (doc/workspace/BuckyOS AI Workspace UI改进.md)
 
 - **What opens.** The usual way is a browser tab of its own: `https://<zone host>/workspace` (the list) or
-  `/workspace/<workspace>` (one workspace, also the share link, with `?surface=<surface>&block=<block>`; the
+  `https://aiws-<id>.<zone host>/<workspace slug>/<surface slug>?id=<surface>&block=<block>` (one workspace on its own origin, also the share link; the
   two are removed from the address once the workspace is open). In a tab the address is the state: opening,
   switching and closing change it (after the leave check), back / forward / reload follow it, and nothing is
   restored automatically. In a Desktop window a normal start reopens the workspace this identity last opened
@@ -387,6 +416,39 @@ own origin, i.e. its own OPFS, service worker and localStorage.
   keeps only bindings inside the copied set; flow pages neither show nor accept lines; a line drawn to blank
   canvas offers the "next object" (note, text, shape, wish) bound to its end.
 
+## Block-controls and mind maps (doc/workspace/脑图对象方案讨论.md; notepads/done/aiworkspace-mindmap-todo.md)
+
+- **Registry** (`ui/controls/registry.ts`): a `ContainerDefinition` per control kind — attributes (`configSchema`),
+  child rules, the named layout (`layout.solve`, from the shared `@controls/*` module), the `Chrome` drawn in the
+  container's frame under its Blocks, the flow-page rendering, `create` (the insert catalog entry: container and a
+  first Block to type into), the near toolbar, the keys while it or one of its Blocks is selected, and the `agent`
+  self-description (the shared catalogue). A kind with no definition is drawn as a group with a note (R12).
+- **Layout** (`ui/canvas/layout.ts`): a control is solved from the outline alone (nested controls first, R24), its
+  `Laid.rect` is its box and `Laid.origin` what its stored x / y name; every node's `Laid.node` says its control,
+  depth, growth side, pin, fold and branch colour. Folded nodes (`ui/controls/folds.ts`, user state
+  `mindmap:collapsed:<container>`, R8) and their subtrees are not laid out. `nodeMeasurer` measures text with the
+  canvas's fonts; the `mindnode` Block draws exactly the measured lines.
+- **Mind map** (`ui/controls/mindmap/`): `definition.tsx` (toolbar: direction, edges, spacing, outline; keys: Tab
+  child, Enter sibling, arrows walk the tree, Ctrl+/ fold, Ctrl+D duplicate in `CanvasView`), `nodeBlock.tsx` (the
+  text node: inline Markdown title, typed in place, Tab saves and adds a child; its toolbar's Insert opens the insert
+  catalog for it — the entry is created as its child, x / y "auto", a nested control "auto" all over, any other Block
+  at the entry's size; no placing by click, no bulk imports, no lines), `Chrome.tsx` (implicit edges in one
+  SVG, pins, the proposed layout while dragging), `ops.ts` (tree operations, navigation), `convert.ts` (rich text ⇄
+  map, Markdown / OPML export, outline files dropped on a canvas), `FlowMindmap.tsx` (a map on a flow page: static
+  SVG, pan and zoom).
+- **Gestures** (`RenderHost.tsx`): a node drag moves its subtree; on a node it hangs as its child (beside it near an
+  edge across the growth), on the map's blank space it is pinned (R16), outside the map it is refused (R9) — the other
+  nodes show the proposed layout meanwhile. Blocks of the canvas (not lines or pen strokes) dragged onto a node hang
+  the same way (child, or beside it), laid out at their own size; elsewhere they move as before. A root's drag moves
+  its map. Controls have no resize handles, nodes do
+  not turn and have no connection handles (their fold handle is there; relation lines are drawn with the line
+  tool). Fold handles are screen-sized overlay buttons.
+- **Clipboard** (`ui/canvas/clipboard.ts`): a node is copied with its subtree and its "auto" placement; pasted with
+  a node selected it hangs under it, pasted on the canvas nodes become a new map; a whole control is placed by its
+  origin.
+- **Exports**: draw.io materialises maps (shapes and real lines, `@controls/drawio`); duplicating a canvas copies
+  controls whole.
+
 ## Block extension contract
 
 Register a `BlockDefinition` in `ui/blocks/registry.ts`. `useBlockContext` loads the Cell payload and key
@@ -409,6 +471,109 @@ follow Cell read permissions and travel through export/import and offline prepar
 normal asset-size limit). `aiws.snapshot()` reports failed saves and refuses writes in view mode. HTML
 startup timeouts, crashes and disposal reject waiting calls and release the iframe; retry creates a new runtime.
 
+## Extension controls (notepads/done/aiworkspace-extension-p0-todo.md, p1-todo.md; backend README “Extension controls”)
+
+A control is a `buckyos.block-def` built from a source folder in the user's home (`component.json` + entry files;
+sub-folders allowed, file names are relative paths) by `ext.build`; the Desktop drives the same code as the CLI
+(buckyos-websdk `buckyos/aiws_ext`) over the Files app's NFSP client (`ui/extensions/controlSources.ts`) and this
+Workspace's session. Files beyond the 4 MiB a build carries inline are uploaded first as assets of the Workspace and
+sent by reference (`assetUploader`, Q22).
+
+- **Workspace controls dialog** (`ui/extensions/ExtensionsDialog.tsx`; main menu Insert → Extension controls → “Workspace controls…” (not a top-level item: the main menu must fit a small window), the insert
+  catalog's extension tab, a definition's data-source detail): the definitions with identity, kind (declarative, HTML,
+  composite), build revision, source (package, local build, inline), what it builds on (`deps`) and instance count
+  (Cells and composite containers); per definition: edit source (pulls a working copy into
+  `/home/<user>/AI Workspace/<workspace>/controls/<name>` when there is none, then opens Files there), build, pull,
+  build on save (a watch per definition that outlives the dialog), last build and its diagnostics (instances and the
+  definitions that build on it, `dependents`), a note when the home folder holds changes that were not built (L3),
+  instances, insert an instance (the canvas opens its catalog at the definition, `ui/extensions/extEvents.ts`),
+  remove (refused while instances use it); new control (skeleton in home + build: declarative, HTML or composite); add
+  from my library (`ext.import`; what a control builds on comes along); import a `.pikg` file (uploaded into my own
+  `exports` bucket, then `ext.install`, Q21); export the ticked controls to my library (`ext.install` from the
+  Workspace), as a bundle folder in my home, or as a `.pikg` the service packs (`ext.pack`, Q20) — then download it or
+  put it straight into my library. Exports name the controls whose home folder has unbuilt changes and go on. The
+  folder each person builds from is their `user_state` `aiws:src:<def>`; `.aiws-build.json` in it keeps the base of
+  the next build.
+- The home folder is reached on a Workspace's own host (`aiws-<id>.<zone>`) as on the Desktop: the gateway gives
+  `/nfs/v1` to the file service whatever the host (Q24). Phones list only.
+- **Instance initialization** (`ui/extensions/InstanceForm.tsx`, `controls.ts`): the insert catalog shows a control's
+  properties (`config_schema`, the A7 subset, validated with `z.fromJSONSchema`; only changed values are stored) and
+  its named bindings (required ones block insertion); the new Cell (or composite container) gets `config` overrides
+  and `bindings`.
+- **Declarative named bindings** (Q18): an item's `bind: "<binding>.<expr>"` reads that binding's data (watched like
+  the main source); other binds read the main source as before.
+- **HTML assets** (host API 2, additive): `aiws.asset(name)` answers a blob URL of a file the definition's
+  `component.json` lists in `assets`; the host reads it from the source snapshot (`bridge.ts`), the iframe makes the
+  URL in its own realm and revokes it when it unloads (`htmlRuntime.ts`).
+
+### Composite controls (P1)
+
+- **Host** (`ui/controls/composite/`): one `ContainerDefinition` for the container kind `composite` (registered beside
+  the mind map). Which control an instance is, is its `def_ref`; the layout is the shared solver
+  (`@controls/composite`, `solveComposite`: `stack` column / row with spacing and padding, slots in `top` → `stack` →
+  `bottom` order, or `fixed` where every child keeps its x / y), read from the outline (the core projects a composite
+  definition's `composition` and `config_defaults`, `state/outline.ts` mirrors it). `Chrome.tsx` draws the background,
+  radius, border, the title band (`{{config.<key>}}` from the instance over the defaults; hidden while the title's slot
+  holds something) and the `empty` text. The properties are the definition's form (`Inspector.tsx`, side panel).
+- **Insert**: composite definitions are extension entries of the catalogue (`ui/canvas/catalog.ts`); inserting one
+  creates the container and, for each slot with `min`, Blocks of the first kind it accepts (`model.ts`
+  `compositeCreate`). The bare host is never offered.
+- **Slots** (`model.ts`): what a slot accepts (`cell:<ident>`, a view type, `container`; none: anything) and `max` are
+  checked here (Q15: the core only checks that a child's `slot` names a slot). Dragging Blocks onto a composite's
+  Block puts them beside it in its slot, onto blank space of a stacking composite appends them, and a Block no slot
+  takes is refused with a note (`RenderHost.tsx`, `CanvasView.tsx` `moveNodes`; `tree.move` carries `slot`).
+- **Copy / paste / duplicate** (`ui/canvas/clipboard.ts`): a composite instance whose source is still here is pasted
+  with `tree.clone` (ids known beforehand through the WASM `clone_id`); a composite's Blocks pasted on the canvas stay
+  ordinary Blocks (only a tree control's nodes get a mind map around them); a Block pasted into a composite takes the
+  slot of the Block it follows, else the first that accepts it.
+- **Define as control…** (selection → more actions; `ui/extensions/DefineControlDialog.tsx`): one slot per selected
+  Block (accepting what it is), `fixed` or `stack`, component.json + composition.json + AGENT.md written into home and
+  built; optionally the selection is replaced by an instance in one Commit (container, `tree.clone` of each Block into
+  its slot, the originals deleted).
+- A flow page shows a composite as a group (its Blocks in order; Blocks are added on the canvas). Phones show
+  instances read-only and do not offer “Define as control…”.
+
+### P2 / P3 (notepads/done/aiworkspace-extension-p2p3-todo.md; backend README “Extension controls P2 / P3”)
+
+- **Per-property writes** (Q28/Q29, `ui/blocks/ops.ts` `submitProps` / `setCellConfig`): the instance Inspector
+  (`ui/controls/composite/Inspector.tsx` `InstanceInspector`, for composite containers and control Cells), the
+  declarative Inspector fields, Block tools and the HTML snapshot write only the changed properties of `config` /
+  `bindings` / `on` as `entity.set_props`, each with `expect` from `key_revs["p:<key>.<name>"]` (0 when absent); text
+  and number fields of the Inspector write when left (blur, Enter). Every write to an instance carries the Commit
+  precondition on its definition's `content_rev` (outline); a refusal naming the definition (online, or an offline
+  submission replayed) says “the control was updated…” and re-reads the form (`state/store.ts` `definitionChanged`).
+  The outline mirrors `set_props`, `def_events` and `on_events`.
+- **Design / run mode** (Q27, `state/runMode.ts`, `ui/canvas/tools.tsx` `RunModeToggle` on the view toolbar): a local
+  ▶ / ✎ switch per canvas sub-mode (edit designs, view runs; path editing, guests and phones off and locked), handed to
+  Blocks through `RunModeContext` → `RenderContext.interactive`. A non-public show runs the Blocks marked operable on
+  stage (`StageView`); a public session and its replay provide nothing, so nothing runs (HTML Blocks show their
+  snapshot). In run mode a click on an HTML Block mounts it (view mode too, within the `html` budget), a declarative
+  `button` is enabled, and writes of handlers and of `aiws.record().set` etc. pass in view mode with `update` on the
+  target (`bridge.ts` `writeAllowed`). The flow page no longer mounts HTML Blocks by itself (“Run once”, or run mode).
+- **Events** (Q26, `ui/extensions/events.ts`): `raiseEvent` checks the definition declares the event; in design mode
+  it leaves a corner note (`EventNote`), in run mode it runs the instance's `on` in order — every `write` (the typed
+  writes of `bridge.ts` `typedWriter`) as one undoable Commit keyed `evt/<instance>/<event>/<event_id>`, a `wish` with
+  the same key and `request.event`, `open` / `notify` here, `{{event.*}}` / `{{config.*}}` filled — then re-raises it
+  through the composites around the instance (`events.<name>.from`). Raised by `aiws.emit` (host API 3; refused before
+  the first trusted pointer / key gesture in the iframe; a disposed runtime's late call is dropped) and by the
+  declarative `button`. The instance Inspector's Events page (`EventsForm.tsx`) binds handlers per declared event.
+- **Host API 3** (`htmlRuntime.ts`): 2 and 3 run (`aiws.version` = the declared one), 3 adds `emit` and
+  `context.interactive`; `createBlock { parent: "self" | <id> | { binding }, slot }` is pre-checked here (a composite
+  needs one of its slots that takes the Block, `self` only inside a mind map) and laid out `"auto"` under a control. A
+  definition above this host shows its snapshot with “needs host API n”.
+- **Layouts** (`@controls/composite`): `grid { columns, gap }`; an unknown algorithm is laid out as a group and the
+  Chrome says “layout <name> needs a newer host”.
+- **Upgrades** (Q30, `ExtensionsDialog.tsx` `UpgradeControl`): a definition from a package whose library version
+  differs offers “Upgrade…”; the view compares the interfaces (the new files from `ext.library_bundle`), lists the
+  instances and unbuilt home changes, takes a minimal migration (rename / drop properties and bindings, values for new
+  required ones, slot moves, dropped events), dry-runs `ext.upgrade`, shows `EXT_LOCAL_CHANGES` files with “replace my
+  changes”, then upgrades in one Commit. “Add from my library” offers the upgrade for an identity already here (and
+  on `EXT_IDENT_EXISTS`), marks packages newer than this host (`needs_newer`, manifest > 3) and lists templates.
+- **Templates** (Q32): Export → “Save as template…” (`SaveTemplateDialog.tsx`: Surfaces, id, title, params, tables
+  that start empty) into the library (`ext.install { from: { templates } }`) or as a `.pikg` (`ext.pack { templates }`);
+  the New dialog's template tab lists the library's templates beside the built-in ones with a parameter form
+  (`ext.create_from_template`).
+
 ## What is implemented
 
 - Registration as a built-in app; workspace list with create, sample, open, import (semantics must be
@@ -424,8 +589,8 @@ startup timeouts, crashes and disposal reject waiting calls and release the ifra
 - RichText: ProseMirror + Loro (`loro-prosemirror` sync plugin), confirmed + working documents,
   debounced updates (500 ms), remote updates into both documents (deferred during IME composition),
   block_id plugin, object_embed node view (read-only cell), object_link, refused update → draft.
-- Record, Asset (upload, authenticated fetch → blob URL, availability), Annotation (table cell / block,
-  anchor state).
+- Record, Asset (upload with a poster, authenticated fetch → blob URL, availability; videos and sounds play in
+  place, other files open the Preview dialog), Annotation (table cell / block, anchor state).
 - UndoCoordinator: one stack of editor steps and commits, Ctrl/Cmd+Z pops exactly one, redo.
 - Save states and conflict UI: my input is kept until I choose; unknown results can be resent.
 - Offline replica (previous section): explicit preparation, cold start without the network, the four
@@ -495,6 +660,67 @@ startup timeouts, crashes and disposal reject waiting calls and release the ifra
 - The app's own UI text is Chinese only (the app name and summary are in the Desktop dictionaries).
 - The zone transport follows the SDK's normal service path but has only been type-checked here; the e2e
   suite runs through the dev override.
+
+## Handwriting (notepads/aiworkspace-handwriting-todo.md)
+
+- **Entry**: the object toolbar's pen and eraser (free canvas, edit mode, insert permission; `P` / `E`), which show the
+  writing bar at the bottom: pen / eraser, six colours, three widths (2 / 4 / 8 canvas units), the pressure switch,
+  the canvas touch lock, done (`Esc` drops a running stroke, else puts the pen down). The settings are the user's own
+  (`ui:ink` in the user work state); a stroke stores the colour, width and pressure it was written with.
+- **Writing area**: with the pen or the eraser the RenderHost takes every press in the capture phase (Blocks,
+  editors, handles, iframes get nothing: the world layer has no pointer events), clears selection and editing,
+  suppresses text selection, drags and the context menu; `touch-action: none` is set before any gesture.
+  `ink/input.ts` binds a stroke to one pointer id (capture, coalesced samples or the event itself, duplicates
+  dropped, the up's position at the pressure the pen had); a second pen and other pointers' events change nothing.
+  pointercancel, a capture lost before the up, `Esc`, another tool or canvas, lost permission (the tool is put down),
+  a hidden page and unmounting drop the stroke under way. While a stroke runs the wheel does nothing and touches
+  are ignored; every point is mapped with the camera of its moment.
+- **Touch** (`touch.ts`): a finger never writes. One finger does nothing (no tap, drag, scroll, menu); two fingers
+  pan and zoom when no stroke runs and touch is not locked; the finger left from a pinch does nothing until it lifts.
+  A pen landing stops the running gesture, an object drag, a glide and timers, and leaves every finger then down —
+  and those that land while it writes — alone until each lifts, also after the pen lifted. With the touch lock no
+  finger moves the canvas. A palm the system reports as two contacts before the pen is detected still pans in the
+  default mode: that edge is the touch lock's job (palms are not recognised).
+- **Drawing**: `paint.ts` draws the stroke being written on two screen-space canvases above the content — finished
+  pieces once each, the open end and the predicted samples (Pointer Events `getPredictedEvents`, never stored) on
+  a tail canvas cleared per sample; a pan, a resize or a new pixel ratio redraws. A saved stroke stays on the live
+  layer until its Block has drawn it (`book.rendered`), so it neither blinks nor doubles. The `ink` Block draws the
+  same pieces (quadratic through midpoints, round caps) as SVG paths, one per 8 % step of width; zoomed out it draws
+  fewer points. Ink Blocks are never placeholders and are not counted by the mount budget; they hit (select, the
+  eraser) on their line, not their box. `pointerrawupdate`, desynchronized canvases and the Ink API are not used.
+- **Pressure**: width = base × (0.3 + 1.4 p): half pressure is the base width, zero stays visible. A stroke whose pen
+  only reported 0.5 (no pressure hardware) and a mouse stroke are stored without `p`; tilt is kept only when reported.
+- **Data** (format in the backend README "Ink"): world samples are simplified (RDP over position and pressure,
+  0.25 screen px at the zoom written at, windows of 2048 points), cut into segments of at most 60 KiB of canonical
+  JSON (measured, not estimated) and created in one commit (`store.submit`, one undo step) under the group under the
+  stroke's centre; order keys follow the strokes written before even when those are not back yet. A stroke whose raw
+  samples pass 8 × 60 KiB × 0.9 is saved there and goes on as a new stroke from the same point (a notice says so).
+- **Logical strokes**: the outline's `ink_stroke` groups the segments of one stroke: a click selects all of them (and
+  takes all of them out), copy/paste gives the copy a new stroke id, the eraser and Delete remove all of them in one
+  commit, flow pages refuse pasted or moved ink. A stroke of several segments has no resize or rotation handles (a
+  selection of several Blocks); a one-segment stroke resizes (proportions kept) and turns like any Block.
+- **Ordering**: ordinary tail insertion uses dense base-36 keys, initially eight digits, within the existing
+  64-character limit. A saturated parent is rebalanced in its current sibling order using `tree.place` with
+  structure revisions and a `tree_children` membership precondition. This maintenance commit is not on the
+  handwriting undo stack. New strokes remain visible and exportable while waiting for the backend to accept
+  the rebalance; offline local acceptance alone does not release them into the new ordering space.
+- **Saving**: ordinary strokes submit immediately, reserving keys while earlier strokes are pending. A refused
+  stroke remains visible and exportable with a retry action; dismissing its save-state entry removes it. Unknown
+  or failed storage submissions retry the same operations with the same idempotency key. Failed allocations do
+  not reserve a tail key. Erasing hides strokes at once and restores them if deletion is refused or cancelled.
+- **Offline**: no offline path of its own. In a window holding a prepared replica (where the replica works, see
+  Offline) strokes, their undo and erases queue like any edit, survive a cold start and go out once on reconnect;
+  undoing a stroke still in the queue takes it out (the replica reports the creation as gone). Without a replica,
+  writing needs the connection like any other edit; online writing does not depend on the replica's browser support.
+- **Stage**: `presentation/overlays.tsx` (board marks) uses the same input and painter; its strokes stay in the
+  show's memory (page turns, undo, clear, gone on exit); a finger writes there too.
+- **Tests**: `tests/datamodel/aiworkspace-ink.test.ts` (Deno: format, simplification, segments, decoding, hit tests,
+  the input state machine; writes `../aiworkspace/fixtures/ink/strokes.json` with `AIWS_REGEN=1`),
+  `tests/datamodel/aiworkspace-ink-book.test.ts` (real WASM allocation, pending and failure recovery),
+  `tests/aiworkspace/handwriting-order.spec.ts` (400 pen strokes, saturation recovery and independent undo),
+  `tests/aiworkspace/handwriting.spec.ts` (H01–H09, H11, H-scale → `test-results/aiworkspace-ink-scale.json`),
+  `offline-handwriting.spec.ts` (H10). Pens are CDP pointer events with pressure, fingers CDP touches; a second pen
+  and cancels are synthetic events. Real devices are not verified (the TODO's device matrix).
 
 ## Presentation (doc/workspace/BuckyOS AI Workspace 第三期规划.md)
 

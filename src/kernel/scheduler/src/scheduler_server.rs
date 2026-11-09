@@ -1,12 +1,10 @@
 use ::kRPC::*;
 use async_trait::async_trait;
 use buckyos_api::*;
-use buckyos_http_server::*;
 use buckyos_http_server::{
     serve_http_by_rpc_handler, server_err, HttpServer, ServerError, ServerErrorCode, ServerResult,
     StreamInfo,
 };
-use buckyos_kit::buckyos_get_unix_timestamp;
 use bytes::Bytes;
 use http::{Method, Version};
 use http_body_util::combinators::BoxBody;
@@ -54,7 +52,7 @@ impl RPCHandler for SchedulerServer {
                     })?;
                 let response = self
                     .thunk_runner
-                    .run_thunk(run_req.task_id, run_req.thunk, run_req.function_object)
+                    .run_thunk(run_req.task_id, run_req.thunk, run_req.function_object, run_req.registration)
                     .await
                     .map_err(|err| RPCErrors::ReasonError(err.to_string()))?;
                 RPCResult::Success(json!(response))

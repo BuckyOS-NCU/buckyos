@@ -22,15 +22,13 @@ use serde_json::json;
 fn lab(baseline: RuntimeBaseline, default: bool) -> RuntimeRegister {
     RuntimeRegister {
         runtime_id: "lab".into(),
-        kind: RuntimeKind::RemoteNode,
+        connector: RuntimeConnector::node("did:dev:lab", AGENT),
         name: "Lab node".into(),
-        description: String::new(),
-        exec: Some(node_exec("did:dev:lab", AGENT)),
-        roots: vec![],
-        capabilities: json!({}),
+        desc: String::new(),
+        enabled: true,
         default,
-        computer: Default::default(),
         baseline,
+        grant: RuntimeGrant { roots: vec!["/lab".into()], ..Default::default() },
     }
 }
 
@@ -45,36 +43,88 @@ fn skill(env: &Env, name: &str, front: &str) {
 }
 
 #[tokio::test]
+async fn native_owner_alias_freezes_to_private_and_keeps_workspace_local() {
+    let env = Env::new();
+    let agent = env.agent();
+    let mut runtimes = builtin_runtimes(&Default::default(), AGENT, &PrivateRuntimeInfo::default());
+    runtimes.truncate(1);
+    runtimes[0].default = true;
+    runtimes[0].connector = RuntimeConnector::Native { aliases: vec!["host".into()], computer: None };
+    agent.runtimes().ensure_builtin(&runtimes, APP).await.unwrap();
+    let workspace = agent.workspaces().create(&WorkspaceCreate {
+        operation_id: "native-alias".into(), name: "Native workspace".into(), description: String::new(),
+        url: None, location: WorkspaceLocation { runtime_id: "host".into(), directory: env.root.join("native-workspace") },
+        usage: WorkspaceUsage::Private, source_session: None, policy_ref: None,
+    }, APP).await.unwrap();
+    assert_eq!(workspace.location.runtime_id, "private");
+    let mut spec = work_spec("owner work locally");
+    spec.runtime.requirement.runtime_id = Some("host".into());
+    spec.workspace = Some(WorkspaceRef { workspace_id: workspace.workspace_id, access: WorkspaceAccess::ReadWrite });
+    let sd = env.create_work(spec).await;
+    let cfg = sd.config().unwrap();
+    assert_eq!(cfg.runtime.runtime_id(), "private");
+    assert!(!cfg.runtime.is_node());
+    let mut chat = cfg.clone();
+    chat.session.policy.runtime_view = RuntimeView::Chat;
+    let view = libopendan::runtime::runtimes_view(agent.as_ref(), &chat).await;
+    assert_eq!(view["private"]["id"], "private");
+    assert_eq!(view["owner_default"]["id"], "private");
+    assert_eq!(libopendan::runtime::workspace_view(&cfg).unwrap()["same_runtime"], true);
+}
+
+#[tokio::test]
 async fn the_workspace_never_chooses_the_session_runtime() {
     let env = Env::new();
     let agent = env.agent();
+    mock_node(&["/lab"], "/lab/home");
     agent.runtimes().register(&lab(RuntimeBaseline::Standard, true), APP).await.unwrap();
     let directory = env.root.join("project");
     std::fs::create_dir(&directory).unwrap();
     let workspace = env.workspace(&directory).await;
 
-    // The agent's default runtime, with a workspace on the container.
-    let mut spec = work_spec("default runtime, container workspace");
+    // Nobody placed the work: it runs on the private runtime, never on the
+    // owner's default (`lab`), with a workspace on the private runtime.
+    let mut spec = work_spec("unplaced work, private workspace");
     spec.workspace = Some(workspace.clone());
     let sd = env.create_work(spec).await;
     let cfg = sd.config().unwrap();
     let frozen = cfg.runtime.frozen.clone().unwrap();
-    assert_eq!((frozen.runtime_id.as_str(), frozen.selected_by), ("lab", RuntimeSelection::Default));
-    assert_eq!(frozen.baseline, RuntimeBaseline::Standard);
+    assert_eq!((frozen.runtime_id.as_str(), frozen.selected_by), ("private", RuntimeSelection::Private));
+    assert_eq!(frozen.baseline(), RuntimeBaseline::Extended);
     assert_eq!(cfg.workspace_binding.as_ref().unwrap().location.runtime_id, "local");
     let view = libopendan::runtime::workspace_view(&cfg).unwrap();
-    assert_eq!(view["runtime_id"], "container");
-    assert_eq!(view["same_runtime"], false);
+    assert_eq!(view["runtime_id"], "private");
+    assert_eq!(view["same_runtime"], true);
 
-    // An explicit runtime with the same workspace: no conflict.
+    // The owner's default runtime, named explicitly, with the same workspace
+    // on the private runtime: no conflict.
+    let mut spec = work_spec("lab runtime");
+    spec.workspace = Some(workspace.clone());
+    spec.runtime.requirement.runtime_id = Some("lab".into());
+    let on_lab = env.create_work(spec).await;
+    let lcfg = on_lab.config().unwrap();
+    assert_eq!(lcfg.runtime.runtime_id(), "lab");
+    assert_eq!(lcfg.runtime.frozen.as_ref().unwrap().baseline(), RuntimeBaseline::Standard);
+    assert_eq!(libopendan::runtime::workspace_view(&lcfg).unwrap()["same_runtime"], false);
+    // The former name of the private runtime is still understood.
     let mut spec = work_spec("container runtime");
     spec.workspace = Some(workspace.clone());
     spec.runtime.requirement.runtime_id = Some("container".into());
     let parent = env.create_work(spec).await;
     let pcfg = parent.config().unwrap();
-    assert_eq!(pcfg.runtime.runtime_id(), "container");
-    assert_eq!(pcfg.runtime.frozen.as_ref().unwrap().baseline, RuntimeBaseline::Extended);
+    assert_eq!(pcfg.runtime.runtime_id(), "private");
+    assert_eq!(pcfg.runtime.frozen.as_ref().unwrap().selected_by, RuntimeSelection::Explicit);
     assert_eq!(libopendan::runtime::workspace_view(&pcfg).unwrap()["same_runtime"], true);
+
+    // A chat always runs on the private runtime, whatever the default.
+    let mut chat = work_spec("chat");
+    chat.kind = SessionKind::Ui;
+    chat.class = "ui".into();
+    let chat = env.create_work(chat).await;
+    let ccfg = chat.config().unwrap();
+    assert_eq!(ccfg.runtime.runtime_id(), "private");
+    assert_eq!(ccfg.runtime.frozen.as_ref().unwrap().selected_by, RuntimeSelection::Private);
+    assert!(ccfg.runtime.is_private());
 
     // A sub session inherits the workspace and names another runtime; the
     // parent keeps both of its own.
@@ -108,7 +158,7 @@ async fn the_workspace_never_chooses_the_session_runtime() {
     .await
     .unwrap();
     let icfg = inherited.config().unwrap();
-    assert_eq!(icfg.runtime.runtime_id(), "container");
+    assert_eq!(icfg.runtime.runtime_id(), "private");
     assert_eq!(icfg.runtime.frozen.as_ref().unwrap().selected_by, RuntimeSelection::Inherited);
 }
 
@@ -137,10 +187,12 @@ async fn a_session_works_in_its_own_directory_and_is_told_where_the_workspace_is
 async fn cmd_skills_follow_the_session_runtimes_declared_baseline() {
     let env = Env::new();
     let agent = env.agent();
+    mock_node(&["/lab"], "/lab/home");
     agent.runtimes().register(&lab(RuntimeBaseline::Standard, false), APP).await.unwrap();
     skill(&env, "plain", "");
     skill(&env, "media", "baseline: extended\n");
-    skill(&env, "mac_only", "platforms: macos\n");
+    let other_platform = if cfg!(target_os = "macos") { "linux" } else { "macos" };
+    skill(&env, "other_platform", &format!("platforms: {other_platform}\n"));
     let mut spec = work_spec("standard runtime");
     spec.runtime.requirement.runtime_id = Some("lab".into());
     spec.prompt.cmd_skills = vec!["plain".into(), "media".into()];
@@ -152,15 +204,14 @@ async fn cmd_skills_follow_the_session_runtimes_declared_baseline() {
     assert_eq!(frozen.unavailable_cmd_skills[0].name, "media");
     assert!(frozen.unavailable_cmd_skills[0].reason.contains("extended"));
 
-    // The container is extended and runs Linux: `media` applies, `mac_only`
-    // does not.
+    // The local runtime is extended: `media` applies, the other platform does not.
     let mut spec = work_spec("container");
-    spec.prompt.cmd_skills = vec!["media".into(), "mac_only".into()];
+    spec.prompt.cmd_skills = vec!["media".into(), "other_platform".into()];
     spec.freeze = true;
     let parent = env.create_work(spec).await;
     let frozen = parent.config().unwrap().prompt.frozen.unwrap();
     assert_eq!(frozen.cmd_skills.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["media"]);
-    assert!(frozen.unavailable_cmd_skills[0].reason.contains("macos"));
+    assert!(frozen.unavailable_cmd_skills[0].reason.contains(other_platform));
 
     // Work that names its manuals is refused on a runtime that cannot use
     // them; inherited manuals are resolved again for the child's runtime.
@@ -204,7 +255,7 @@ async fn cmd_skills_follow_the_session_runtimes_declared_baseline() {
     let listed = agent.behaviors().skills(Some(SkillKind::Cmd)).await.unwrap();
     let media = listed.iter().find(|s| s.name == "media").unwrap();
     assert_eq!(media.baseline, RuntimeBaseline::Extended);
-    assert_eq!(listed.iter().find(|s| s.name == "mac_only").unwrap().platforms, ["macos"]);
+    assert_eq!(listed.iter().find(|s| s.name == "other_platform").unwrap().platforms, [other_platform]);
     let pkg = libopendan::skills::SkillPackage {
         package: "bad".into(),
         files: [(
@@ -231,6 +282,61 @@ async fn helper_env() -> (Env, libopendan::SessionDir, SessionService) {
     let sd = env.create_work(spec).await;
     let svc = SessionService::new(&env.agent_root, Some(PathBuf::from(env!("CARGO_BIN_EXE_xagent")))).unwrap();
     (env, sd, svc)
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn forwarded_helpers_work_in_a_long_windows_session_directory() {
+    use std::os::windows::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut root = tmp.path().canonicalize().unwrap();
+    while root.as_os_str().encode_wide().count() < 280 {
+        root = root.join("session helper 中文 directory");
+    }
+    let env = Env::at(&root);
+    let agent = env.agent();
+    mock_node(&["/lab"], "/lab/home");
+    agent.runtimes().register(&lab(RuntimeBaseline::Standard, false), APP).await.unwrap();
+    let sd = env.create_work(work_spec("long helper directory")).await;
+    assert!(sd.path().as_os_str().encode_wide().count() > 260);
+    let cli = Path::new(env!("CARGO_BIN_EXE_xagent"));
+    let run = |argv: Vec<String>| libopendan::session_context::HelperRequest {
+        argv,
+        stdin: None,
+        call_id: None,
+    };
+    let out = libopendan::session_context::run_helper(
+        agent.as_ref(),
+        cli,
+        sd.sid(),
+        &run(vec!["runtime".into(), "list".into()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.exit_code, 0, "{out:?}");
+    assert!(out.stdout.contains("lab"), "{out:?}");
+
+    std::fs::write(sd.path().join("任务.txt"), "content from the session directory").unwrap();
+    let out = libopendan::session_context::run_helper(
+        agent.as_ref(),
+        cli,
+        sd.sid(),
+        &run(vec![
+            "todo".into(),
+            "add".into(),
+            "relative file".into(),
+            "--content-file".into(),
+            "任务.txt".into(),
+            "--queue-dir".into(),
+            env.queue_dir.to_str().unwrap().into(),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.exit_code, 0, "{out:?}");
+    let list = libopendan::todos::store_of(&sd).load().unwrap();
+    assert_eq!(list.todos[0].content, "content from the session directory");
 }
 
 #[tokio::test]
@@ -265,7 +371,12 @@ async fn a_session_token_reaches_only_its_own_session_methods() {
             agent.as_ref(),
             &claims,
             "session.helper",
-            &json!({ "request": { "argv": ["todo", "add", "first", "--content", "-"], "stdin": "from stdin" } }),
+            &json!({
+                "request": {
+                    "argv": ["todo", "add", "first", "--content", "-", "--queue-dir", env.queue_dir],
+                    "stdin": "from stdin"
+                }
+            }),
         )
         .await
         .unwrap(),
@@ -274,6 +385,7 @@ async fn a_session_token_reaches_only_its_own_session_methods() {
     assert_eq!(out.exit_code, 0, "{out:?}");
     let list = libopendan::todos::store_of(&sd).load().unwrap();
     assert!(list.render_view().contains("first"));
+    assert_eq!(list.todos[0].content, "from stdin");
 
     let other = svc
         .call(agent.as_ref(), &claims, "session.helper", &json!({ "sid": "another", "request": { "argv": ["sessions"] } }))
@@ -291,6 +403,73 @@ async fn a_session_token_reaches_only_its_own_session_methods() {
         .unwrap();
     let fresh = renewed["token"].as_str().unwrap();
     assert_eq!(svc.authenticate(agent.agent_id(), fresh).unwrap().session_id, sd.sid());
+}
+
+#[tokio::test]
+async fn live_task_lookups_are_scoped_to_the_agent() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use agent_tool::task_bridge::{TaskBridgeRequest, TaskOp};
+    use async_trait::async_trait;
+    use buckyos_api::AiResponse;
+    use libopendan::api::create_session;
+    use libopendan::runner::answer_session_task;
+    use libopendan::FsAgentStateClient;
+    use llm_context::deps::{LlmClient, LlmInferenceRequest};
+    use llm_context::error::LLMComputeError;
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct WaitingLlm {
+        entered: Notify,
+        finish: Notify,
+    }
+
+    #[async_trait]
+    impl LlmClient for WaitingLlm {
+        async fn infer(&self, _: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
+            self.entered.notify_one();
+            self.finish.notified().await;
+            Ok(text("done"))
+        }
+    }
+
+    let first = Env::new();
+    let second = Env::new();
+    let sid = "work-20260101-1";
+    let mut runs = Vec::new();
+    for (env, did) in [(&first, "did:bns:first.alice"), (&second, "did:bns:second.alice")] {
+        let channels = env.channels();
+        let agent = Arc::new(FsAgentStateClient::open(
+            &env.agent_root,
+            did,
+            Some(channels.client()),
+            None,
+        ).unwrap());
+        let mut spec = work_spec("stay live until released");
+        spec.session_id = Some(sid.into());
+        let sd = create_session(&env.app_dir, spec, agent.as_ref(), APP, channels.as_ref()).await.unwrap();
+        let llm = Arc::new(WaitingLlm::default());
+        let mut deps = env.deps(llm.clone());
+        deps.agent = agent;
+        let task = tokio::spawn(async move { drive(&sd, &deps, StopWhen::Finished).await });
+        tokio::time::timeout(Duration::from_secs(10), llm.entered.notified()).await.unwrap();
+        runs.push((did, llm, task));
+    }
+    let request = TaskBridgeRequest { op: TaskOp::State, task_id: "absent".into(), wait_ms: None };
+    for (did, _, _) in &runs {
+        assert!(answer_session_task(did, sid, &request).await.is_some());
+    }
+    assert!(answer_session_task("did:bns:unknown.alice", sid, &request).await.is_none());
+    let (second_did, second_llm, second_task) = runs.pop().unwrap();
+    second_llm.finish.notify_one();
+    assert!(second_task.await.unwrap().is_finished());
+    assert!(answer_session_task(second_did, sid, &request).await.is_none());
+    let (first_did, first_llm, first_task) = runs.pop().unwrap();
+    assert!(answer_session_task(first_did, sid, &request).await.is_some());
+    first_llm.finish.notify_one();
+    assert!(first_task.await.unwrap().is_finished());
 }
 
 fn endpoint(s: &str) -> Endpoint {
@@ -323,7 +502,7 @@ async fn files_are_copied_between_the_session_and_its_workspace() {
     assert_eq!((got.size, got.bytes_done), (payload.len() as u64, payload.len() as u64));
     assert_eq!(std::fs::read(sd.path().join("in/a.bin")).unwrap(), payload);
     assert!(got.hash.as_deref().unwrap().starts_with("sha256:"));
-    assert_eq!(got.to.runtime_id, "container");
+    assert_eq!(got.to.runtime_id, "private");
     assert_eq!(status(&sd, &got.transfer_id).unwrap(), got);
     // The same call again: the committed copy is checked, not redone.
     let again = copy(agent.as_ref(), &sd, &req("workspace:素材 a.bin", "session:in/a.bin", false, Some("c1")))

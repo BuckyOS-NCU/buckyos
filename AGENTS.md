@@ -32,6 +32,8 @@ uv run start.py
 uv run start.py --skip-update
 # 全新安装，生成 dev 配置并启动（devtest / test.buckyos.io）
 uv run start.py --all
+# 同上，并删除 data/ 与 storage/（用户文件、服务库、named store），得到空 Zone
+uv run start.py --all --wipe-data
 # 全新安装，生成 release 配置并启动，进入待激活状态
 uv run start.py --reinstall release
 # 检查激活状态、进程、端口和日志
@@ -42,9 +44,15 @@ uv run check.py
 uv run stop.py
 ```
 
+Linux 上 node_daemon 以 root 运行，与打包后的系统服务一致：非 root 开发者运行 `start.py` / `stop.py` 时，停止和启动通过 `sudo` 执行（只透传 `BUCKYOS_*`，`PATH`、`HOME` 用 sudo 的默认值），不需要 docker 组或 `newgrp`；文件更新和 `make_config.ts` 仍以开发者身份运行，更新前把涉及路径的属主收回给开发者。`local/node_daemon/executor` 要求属主是 node_daemon 的 euid，不要手工 chown。
+
+host-runtime 分两层身份：Agent Service（opendan Loader）与 node_daemon 相同，Linux 上是 root；它在宿主机执行的命令和文件操作由 Node Executor 决定。Linux 上默认不开放，由 owner 在激活时指定 OS 账号（写入节点本地的 `etc/host_account.json`）：普通账号降权到该账号，选 root 则以 root 执行，见 `doc/arch/node_exector.md` §4.2。`make_config.ts` 是开发环境的无 UI 激活，`dev` / `devtest_ood1` 把运行它的用户当作激活时选择的账号：`uv run start.py --all` 之后，选了 host-runtime 的 Agent 以当前开发者的账号执行命令，可读写其 home；以 root 运行则以 root 执行。
+
+开发脚本一律以普通用户运行，不要用 `sudo` 包住整个脚本（否则仓库、`~/.cache/deno` 等处会留下 root 属主的文件）；脚本只在确实需要 root 的那一步内部调用 `sudo`。`build_aios`、`build_exttool`、`build.py`、`make_local_pkg.py`、`debug_jarvis.sh` 先直接用 docker，只有报 `permission denied` 时才改用 `sudo docker`，此时用 root 的 Docker 配置，`--push` 要先 `sudo docker login`；在 docker 组里的用户全程不会用到 sudo。新增脚本遵循同样的做法。
+
 macOS 上 node_daemon 是 `bin/node-daemon/BuckyOS Runtime.app` 的主程序（构建后由 `tools/macos_runtime_bundle.py assemble` 组装签名；直接跑 devkit `buckyos-build` 需补这一步），以绑定用户的 LaunchAgent `com.buckyos.runtime` 运行：`start.py` 在 GUI 会话中为当前用户注册并启动它，sudo/SSH 下退回直接启动且没有桌面能力；管理与诊断用 bundle 内 `node_daemon service status|start|stop|restart|autostart on|off`。
 
-`start.py` 默认要求 `rootfs/libexec/buckyos-tool/` 中已有构建生成的分发包。`--all` 与 `--reinstall` 走全新安装流程，清理范围由 `bucky_project.yaml` 的模块映射和 `clean_paths` 决定，不能当成普通重启；`data/home/`、`data/srv/`、`storage/` 属于保留数据。`start.py` 会调用 `stop.py`：后者按进程名停止服务、删除 `buckyos-app-*` 容器，并在非 Windows 平台停止 `devtest-*` 容器。
+`start.py` 默认要求 `rootfs/libexec/buckyos-tool/` 中已有构建生成的分发包。`--all` 与 `--reinstall` 走全新安装流程，清理范围由 `bucky_project.yaml` 的模块映射和 `clean_paths` 决定，不能当成普通重启；`data/`（含 `data/home/`、`data/srv/` 与 RDB `user_data` 分区的 `data/<appid>/`）和 `storage/` 属于保留数据，旧格式数据会带进新 Zone，需要空 Zone 时加 `--wipe-data`。`start.py` 会调用 `stop.py`：后者按进程名停止服务、删除 `buckyos-app-*` 容器，并在非 Windows 平台停止 `devtest-*` 容器。
 
 `cyfs-gateway` 需要单独构建和安装；仅构建本仓库不会生成网关可执行文件。以下命令从 `buckyos/src/` 出发，在同级网关仓库中运行（Bash）：
 
@@ -73,7 +81,9 @@ uv run src/start.py --skip-update
 
 node-daemon 从不拉取 paios 镜像。开发安装（没有 `$BUCKYOS_ROOT/bin/paios-images/paios_images.json`）直接使用本地的 `<repo>:latest-<arch>`，缺失时 deploy 报错；`uv run build.py` 会预拉取 `paios/aios`、`paios/exttool` 的 `latest-<arch>`（被 `devenv.json` 覆盖的除外），`start.py` 启动后发现缺镜像会打印 `docker pull` 命令。更新到新的 `latest` 用 `docker pull`；镜像变化后重启或等下一次状态检查，Worker 容器会按新镜像重建。正式安装包带清单和镜像 tar，锁定到配套镜像（见 `doc/app_service/rust_app_loader.md` §9.1.1）。
 
-修改 ExtTool 内容时，使用 `./build_exttool --image local/exttool-test --arch amd64`（ARM64 使用 `aarch64`），并在运行时 `devenv.json` 设置 `exttool`。ExtTool 卷按镜像 id 命名（`buckyos-exttool-<id12>`），镜像重建后下一次 deploy 会自动播种新卷，旧卷不再使用，可在确认无容器使用后删除。
+扩展工具包（`ffmpeg`、`pandoc`、`python3` 这一层）不在工作镜像里，来自节点的 `$BUCKYOS_ROOT/tools`（Linux 上 Docker 卷 `buckyos-tools` 就是这个目录，容器只读挂到 `/opt/buckyos/tools`），由 node_daemon 的 reconciler 按 Zone 的期望状态安装（`buckyos ext-tools`、Desktop “设置 > 扩展工具”）。首次安装从 `$BUCKYOS_ROOT/bin/ext-tools/` 的种子解包。开发环境里种子由 `src/tools/prepare_ext_tools.py` 准备到 `src/rootfs/bin/ext-tools/`（`buckyos-build.py`、`start.py --all` 会调用，已有就不重下；发布构建设 `BUCKYOS_EXT_TOOLS_SKIP=1` 跳过，payload 只带 CI 写入的钉版清单）。修改 `ext-core` 本身时：`publish/exttool/ext-core/build.sh --platform linux-x86_64`（macOS 的 payload 只能在 Mac 上构建），`uv run src/tools/prepare_ext_tools.py --local <payload 目录>`，删除 `$BUCKYOS_ROOT/tools/installs/ext-core.json` 后重启即重新播种。
+
+修改 ExtTool 种子镜像（预热的 uv / deno 缓存）时，使用 `./build_exttool --image local/exttool-test --arch amd64`（ARM64 使用 `aarch64`），并在运行时 `devenv.json` 设置 `exttool`。卷只在新建时从种子镜像填充一次，要换内容就在确认无容器使用后 `docker volume rm buckyos-tools` 再启动。
 
 ### 测试与验证
 
@@ -131,12 +141,12 @@ WebUI 在各自目录运行 `pnpm install`、`pnpm build`。Desktop 和 OpenDAN 
 
 ### BuckyOS 运行时目录 `$BUCKYOS_ROOT`
 
-优先使用 `BUCKYOS_ROOT` 环境变量；默认是 `/opt/buckyos/`，Windows 开发脚本默认使用 `%APPDATA%\buckyos`。排查时以 `check.py` 输出和实际进程环境为准。
+优先使用 `BUCKYOS_ROOT` 环境变量；默认是 `/opt/buckyos/`，Windows 默认使用 `C:\buckyos`。排查时以 `check.py` 输出和实际进程环境为准。
 
 - **`logs/`**：服务日志；**`etc/`**：配置、`node_identity.json` 等；**`security/`**：私钥、keyref 等身份材料。
 - **`data/home/`**：用户数据；**`data/srv/`**：服务持久数据及 Zone 共享数据；**`storage/`**：内核持久存储。
 - **`data/var/`**、**`data/cache/`**、**`local/`**：服务运行数据、缓存、本机服务数据，生命周期与持久用户数据不同。
-- **`data/home/<owner_user_id>/.local/share/<app_id>/agents/<agent_id>/`**：宿主机上的 OpenDAN AgentRootFS。每个 Agent 基于模板构造一个独立 App，其 AppId 等于 AgentId（如 `xiaobai.test.buckyos.io`），AppInstanceId 为 `<agent_id>@<owner>`；AgentId 从实际 `AgentSpec` 读取，不能用短名代替。
+- **`data/home/<owner_user_id>/agents/<agent_id>/`**：宿主机上的 OpenDAN AgentRootFS。每个 Agent 基于模板构造一个独立 App，其 AppId 等于 AgentId（如 `xiaobai.test.buckyos.io`），AppInstanceId 为 `<agent_id>@<owner>`；AgentId 从实际 `AgentSpec` 读取，不能用短名代替。
 
 路径与容器映射详见 `doc/path_usage.md`，Agent 路径装配见 `src/frame/opendan/src/main.rs`。诊断先运行 `check.py`：未激活时重点检查 `3182`，已激活时检查网关 `80/3180`、system-config `3200`、verify-hub `3300`、control-panel `4020`。脚本退出码为 0 也可能只是 `Activation Ready`，执行 DV 前还需确认输出中的激活状态和服务状态。
 

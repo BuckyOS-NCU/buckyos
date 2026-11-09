@@ -2,7 +2,7 @@
 
 > **文档定位**：描述 OpenDAN Agent 与 MessageCenter 之间消息协议的**当前实际设计**。每一节先写现在代码怎么做，再列出与早期规划的差异。尚未落地的规划和已知缺口统一放在 §7。
 >
-> **实现范围**：`msg_parser` 属于 `llm_context`，是共享的协议边界。OpenDAN 一侧（pump、分发、session 输入组装、出站信封）描述的是旧 opendan Runtime 的代码，待按 libopendan 的 Session / Turn 抽象重写；libopendan 的输入批次与 Turn 规则见 [readme.md](readme.md)。出站附件（§3.3–§3.6）已按当前 libopendan 与 OpenDAN Loader 改写（2026-10-11）。
+> **实现范围**：`msg_parser` 属于 libopendan（`libopendan::msg_parser`），是共享的协议边界；llm_context 只认 `AiMessage`，不认识 `MsgObject`。OpenDAN 一侧（pump、分发、session 输入组装、出站信封）描述的是旧 opendan Runtime 的代码，待按 libopendan 的 Session / Turn 抽象重写；libopendan 的输入批次与 Turn 规则见 [readme.md](readme.md)。出站附件（§3.3–§3.6）已按当前 libopendan 与 OpenDAN Loader 改写（2026-10-11）。入站转换与命令识别（§2.2、§4.1）的 `msg_parser` 函数已随旧 Runtime 删除（2026-11-03）：`msg_parser` 现在只有出站转换 `ai_message_to_msg_object_with_base_validated_async` 和附件类型推断 `attachment_kind` / `attachment_mime`；入站消息由 libopendan `runner::input_view::message_view` 渲染进输入批次。
 >
 > **名词说明**：“Agent Message”不是一种独立的消息类型。系统里只有两个消息模型：`MsgObject`（投递与存储）和 `AiMessage`（推理，LLMContext 直接使用）。本文描述的是二者之间的转换规则，以及 OpenDAN 在转换两侧附加的路由、命令和附件策略。
 >
@@ -30,7 +30,7 @@
 | 投递任务 | `DeliveryRecord`（`DeliveryState`），存于 `DELIVERY_QUEUE` | 同上；`frame/msg_center/src/msg_box_db.rs` |
 | 入站元数据 | `IngressContext` | 同上 |
 | 推理消息 | `AiMessage` / `AiContent` / `AiRole` | `kernel/buckyos-api/src/aicc_client.rs` |
-| 协议边界 | `msg_parser`（不含任何 OpenDAN 策略） | `frame/llm_context/src/msg_parser.rs` |
+| 协议边界 | `msg_parser`（不含任何 OpenDAN 策略） | `frame/lib_opendan/src/msg_parser.rs` |
 | 入站 pump | `msg_center_pump::run` | `frame/opendan/src/msg_center_pump.rs` |
 | 分发 | `AIAgent::dispatch_inbound` | `frame/opendan/src/agent.rs` |
 | Session 输入队列 | `PendingInput` / `SessionMeta.pending_inputs` | `frame/opendan/src/session_model.rs` |
@@ -55,7 +55,7 @@ Telegram update
        1v1：contact_mgr.check_access_permission 决定 INBOX / REQUEST_BOX / 丢弃
        群聊：写群 DID 名下的 GROUP_INBOX 记录，并扇出到各成员的 INBOX（tag "group:<gid>"）
        MailboxRecord{state = Unread, session_id = derive_session_id(..)}
-       -> 发布 kevent "/msg_center/<owner>/<BOX>/..."
+       -> 发布 kevent "/obj/msg-center/owners/<owner>/sessions[/<sid>]/<box>"
   -> OpenDAN msg_center_pump（kevent 加速 + 1s 超时全量扫描）
        list_mailboxes + get_next(box, [Unread], lock_on_take=true, with_object=true)
        （记录 Unread -> Reading）
@@ -99,7 +99,7 @@ Telegram update
 
 `msg_center_pump` 是一个**纯 fetcher**：
 
-- **订阅**：订阅 kevent `/msg_center/<owner>/{INBOX,GROUP_INBOX,REQUEST_BOX}/**`。kevent 只起加速作用；1 秒超时、reader 失效或未知事件时，都回退到三个 box 的全量扫描。
+- **订阅**：订阅 kevent `/obj/msg-center/owners/<owner>/**`（box 为事件名 `inbox` / `group_inbox` / `request_box` / `sent`）。kevent 只起加速作用；1 秒超时、reader 失效或未知事件时，都回退到三个 box 的全量扫描。
 - **取记录**：`get_next(mailbox, box_kind, [Unread], lock_on_take=true, with_object=true)`，每个 box 每次拉取最多取 128 条。
 - **不 ack**：ack 由 dispatcher 在 session 把输入持久化之后执行。进程在中途崩溃时，记录会停在 `Reading`，由 msg-center 的 lease 恢复机制重新投递。
 - **`from_name`**：优先用 `MailboxRecord.from_name`，缺失时查 `ContactLookup.from_name`。这是一个带缓存的 `get_contact` 查询（命中缓存 300s，未命中缓存 60s）。
@@ -107,9 +107,9 @@ Telegram update
 - **`group_id`**：当 `record.msg_kind == GroupMsg` 时，取 `msg.to[0]`；退路是 tag `group:<gid>`。
 - **群消息来源**：Agent 实际是从**自己的 INBOX** 收到群消息的，因为 msg-center 已经把群消息扇出到各成员的 INBOX。`GROUP_INBOX` 记录的 owner 是群 DID。
 
-### 2.2 形态转换：`parse_msg_object_structured`
+### 2.2 形态转换：`parse_msg_object_structured`（旧 Runtime，已删除）
 
-pump 使用的是 `*_structured` 版本：
+旧 pump 使用的是 `*_structured` 版本：
 
 - 先做命令识别（§4）。
 - 未命中命令时，调用 `msg_object_to_ai_message_structured`，生成一条 `role = User` 的 `AiMessage`。
@@ -279,17 +279,17 @@ OpenDAN Loader 的对象库是 `objects::NamedStoreObjects`，用 `cacl_file_obj
 
 | 概念 | 是什么 | 谁产生 / 谁判定 |
 |---|---|---|
-| 消息 | 入站 `MsgObject` 转成的 user `AiMessage`；出站的 assistant 文本或 `<sendmsg>` | `msg_parser` 转换；投递由 Session / msg-center 负责 |
+| 消息 | 入站 `MsgObject` 渲染成的输入；出站的是 Session 交付的回复（assistant 文本或报告正文） | 入站由 `runner::input_view` 渲染，出站由 `msg_parser` 转换；投递由 Session / msg-center 负责 |
 | 决策（Step） | Behavior Loop 中一次 LLM 决策连同动作结果，记为一个 `StepRecord`；内部可以有多个 Round。function_call Loop 没有 Step | llm_context |
-| 动作批次 | 一个 Step 的 `<actions>`，按序派发，带 action 的 Step 扣一次工具迭代额度。`<sendmsg>` 写在 `<actions>` 里，但 llm_context 只把它记进 `messages_sent` 并发出 `WorkEvent::MessageSent`，不负责投递（xllm 把 `sendmsg` 显式配置为 action 时除外） | llm_context |
+| 动作批次 | 一个 Step 的 `<actions>`，按序派发，带 action 的 Step 扣一次工具迭代额度。Action 都经 ToolManager 派发，没有由模型指定收件方的消息 Action | llm_context |
 | `<report>` | 更新 `LLMContextState.last_report`；缺省 / false 不投递、不结束，end=true 由宿主接受完成提交 | llm_context 写入；Session 决定如何上交 |
-| behavior Done | `report_end=true` 或生效的 `next_behavior`（WAIT_USER_MSG / 跳转目标）使 `LLMContext::run()` 以 `Done` 返回；空决策纠错；function_call 模式下是最后一个没有 tool call 的 Round | llm_context 返回，含义由 Session 解释 |
+| behavior Done | 没有 action 的 Step 使 `LLMContext::run()` 以 `Done` 返回：`report_end=true`、`next_behavior`（WAIT_USER_MSG / 跳转目标），或让出（不结束、不交接，可带阶段报告）；function_call 模式下是最后一个没有 tool call 的 Round | llm_context 返回，含义由 Session 解释 |
 | Turn 完成 | 一次逻辑输入得到结果 | 只由 Session 关闭（libopendan `finish_run`，worklog `turn_ended`） |
 
 要点：
 
-- 发出一条消息（旧 Runtime 的 `post_outbound_message`、Step 里的 `<sendmsg>`）本身不等于 Turn 完成；中间的 `<report>` 也不是。
-- libopendan 的规则：交付了结果的 Done（最终回答 / report）使 Turn `completed`；`WAIT_USER_MSG` 只有在本 run 有 `<report>`（`last_report`）或最后一个 Step 有 `<sendmsg>` 时才完成 Turn，否则 Turn 保持打开，下一条输入并入；behavior 切换和 fork 返回让 Turn 保持打开；不可重试错误、预算耗尽、stop 分别以 `failed` / `budget_exhausted` / `stopped` 关闭 Turn。
+- 发出一条消息（旧 Runtime 的 `post_outbound_message`）本身不等于 Turn 完成；中间的 `<report>` 也不是。
+- libopendan 的规则：交付了结果的 Done（最终回答 / report）使 Turn `completed`；`WAIT_USER_MSG` 只有在本 run 有 `<report>`（`last_report`）时才完成 Turn，否则 Turn 保持打开，下一条输入并入；本 run 启动的任务 / 子 session 未结束时 run 保留、Turn 保持打开，它们的结局作为输入回来；behavior 切换和 fork 返回让 Turn 保持打开；不可重试错误、预算耗尽、stop 分别以 `failed` / `budget_exhausted` / `stopped` 关闭 Turn。
 - 旧 opendan Runtime 不按 Turn 收口：UI session 的每次 `Done` 都直接把最终 assistant message 发出站。按 Turn 收口出站待下一阶段 opendan 重构接入。
 
 ---
@@ -298,7 +298,7 @@ OpenDAN Loader 的对象库是 `objects::NamedStoreObjects`，用 `cacl_file_obj
 
 ### 4.1 识别规则
 
-识别由 `msg_parser::msg_object_control_command` 完成。一条消息同时满足以下条件，才会被识别为命令：
+旧 Runtime 由 `msg_parser::msg_object_control_command` 识别（该函数已于 2026-11-03 随旧 Runtime 删除）。一条消息同时满足以下条件，才会被识别为命令：
 
 - `content.format` 为空或属于纯文本类：plain / markdown / html / css / xml。
 - 没有 `refs`，也没有 `machine`。
@@ -403,7 +403,7 @@ pub enum SessionKind { Ui, Work, SelfCheck, SelfImprove }
 
 ### 5.4 `from_user_did`：工具调用的发起人
 
-- **注入**：由 runtime 强制注入，LLM 无法控制。`OpendanToolAdapter::call_tool`（同步工具）、异步 PendingTool 分发，以及 fork 子上下文（`ForkSubContextInput.from_user_did`），都会**覆盖**写入 `args["from_user_did"]`；没有值时则删除该字段，防止 LLM 伪造。
+- **注入**：由 runtime 强制注入，LLM 无法控制。`OpendanToolAdapter::call_tool`（工具调用），以及 fork 子上下文（`ForkSubContextInput.from_user_did`），都会**覆盖**写入 `args["from_user_did"]`；没有值时则删除该字段，防止 LLM 伪造。
 - **不可见**：工具 schema 不暴露这个字段。注入发生在副本上，所以 history 里的 `ToolUse` 不含它；step 渲染时也会跳过它。
 - **取值**：`current_from_user_did()` 返回 `meta.peer_did`，也就是**本 session 最近一条入站消息的 `from_did`**。对 Telegram 来说，这是发送者的 `did:msgtunnel:*` 影子 DID。它不是 owner DID，也不是“@ agent 的那个人”。Work / 自主 session 没有 peer，取值为 `None`。
 - **消费方**：目前**没有任何工具读取**这个字段。
@@ -476,7 +476,7 @@ pub enum SessionKind { Ui, Work, SelfCheck, SelfImprove }
 1. **群聊回复发错对象**：`post_outbound_message` 把回复发给 `meta.peer_did`，也就是最后一个发言者的影子 DID，并且 `kind = Chat`。这违反了 §6.1 “回复群写群 DID”的规则，群里的回复可能被当作私聊发给最后发言的人。
 2. **群内命令找不到群 session**：命令按 `tunnel_to_ui_session[from]` 查找 session，而群 class（`per_group`）从不写入这张绑定表。所以群里发 `/stop`、`/info` 等命令，只会作用于发送者自己绑定的私聊 session，或者直接报“未绑定”。
 3. **`from_user_did` 语义偏差**：在群聊里，它取的是批次中最后一条消息的发送者，不一定是实际触发请求的人。
-4. **`from_user_did` 可能导致工具调用失败**：`agent_tool` 里有若干参数结构带 `#[serde(deny_unknown_fields)]`，包括 `GrepArgs`、`GlobArgs`、`GetSessionArgs`、`BindExternalWorkspaceArgs`、`ListExternalWorkspacesArgs` 和 `agent_attention_signal` 的 Discover* 系列。当 session 有 `peer_did` 且这些工具以 function tool 方式调用时，注入的字段可能导致 `InvalidArgs`。
+4. **`from_user_did` 可能导致工具调用失败**：`agent_tool` 里有若干参数结构带 `#[serde(deny_unknown_fields)]`，包括 `GrepArgs`、`GlobArgs`、`GetSessionArgs`、`BindExternalWorkspaceArgs`、`ListExternalWorkspacesArgs`。当 session 有 `peer_did` 且这些工具以 function tool 方式调用时，注入的字段可能导致 `InvalidArgs`。
 5. **`inject_background_environment` 不生效**（§2.4）。
 6. **群聊 session 没有环境注入**：`groupchat_route` 没有配置 `on_wakeup`（§2.4）。
 7. **群聊 session 用的是 `[session.ui].driver`**，而不是 `[session.group].driver`（§5.1）。
@@ -521,8 +521,8 @@ pub enum SessionKind { Ui, Work, SelfCheck, SelfImprove }
 | 功能 | 入口 |
 |---|---|
 | 入站拉取 | `msg_center_pump::{run, drain_box, deliver_record, lower_inbound_message}` |
-| MsgObject → AiMessage | `msg_parser::{parse_msg_object_structured, msg_object_to_ai_message_structured}` |
-| 命令识别 | `msg_parser::msg_object_control_command` |
+| MsgObject → 输入批次 | `libopendan::runner::input_view::message_view`（旧 `msg_parser::{parse_msg_object_structured, msg_object_to_ai_message_structured}` 已删除） |
+| 命令识别 | 旧 `msg_parser::msg_object_control_command`（已删除） |
 | 命令执行与回复 | `command_dispatcher::run_command`、`AIAgent::dispatch_command_reply` |
 | 分发与 session 解析 | `AIAgent::{dispatch_inbound, route_msg, resolve_msg_session_id, get_or_create_session}` |
 | 队列与上限 | `AgentSession::enqueue_pending`、`enforce_pending_queue_limit` |

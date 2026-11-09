@@ -165,15 +165,6 @@ fn default_sub_sessions() -> u8 {
 fn default_session_depth() -> u8 {
     2
 }
-fn default_ask_user_timeout() -> u64 {
-    DEFAULT_ASK_USER_TIMEOUT_SECS
-}
-
-/// How long a Work waits for the answer to a question it asked through a
-/// notification (`[session.work] ask_user_timeout_secs`; 0: Works do not
-/// ask).
-pub const DEFAULT_ASK_USER_TIMEOUT_SECS: u64 = 10_800;
-
 /// `session.policy`: the session template resolved at creation (xAgent
 /// §4.7) and frozen with the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -195,10 +186,26 @@ pub struct SessionPolicy {
     /// Nesting depth of sub sessions below this session's root.
     #[serde(default = "default_session_depth")]
     pub max_session_depth: u8,
-    /// A session without a user reading it (a Work) asks through a
-    /// notification and waits at most this long for the answer.
-    #[serde(default = "default_ask_user_timeout")]
-    pub ask_user_timeout_secs: u64,
+    /// While the session waits for the work it started, its `timer:`
+    /// subscriptions tick this often (0: never).
+    #[serde(default = "default_tick_secs")]
+    pub tick_secs: u64,
+    /// Which runtimes the session's prompt knows (runtime lifecycle TODO
+    /// §0.3, three levels).
+    #[serde(default)]
+    pub runtime_view: RuntimeView,
+}
+
+/// What a session is told about the agent's runtimes: a chat knows two
+/// (its private runtime and the owner's default), work knows its working
+/// runtime and the private one, a plan sees the whole table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeView {
+    Chat,
+    #[default]
+    Work,
+    All,
 }
 
 impl Default for SessionPolicy {
@@ -211,9 +218,17 @@ impl Default for SessionPolicy {
             max_process_depth: default_process_depth(),
             max_sub_sessions: default_sub_sessions(),
             max_session_depth: default_session_depth(),
-            ask_user_timeout_secs: default_ask_user_timeout(),
+            tick_secs: default_tick_secs(),
+            runtime_view: RuntimeView::default(),
         }
     }
+}
+
+/// Default [`SessionPolicy::tick_secs`].
+pub const DEFAULT_TICK_SECS: u64 = 30;
+
+fn default_tick_secs() -> u64 {
+    DEFAULT_TICK_SECS
 }
 
 impl SessionPolicy {
@@ -286,6 +301,23 @@ pub struct Acl {
     pub agent_access: AgentAccess,
 }
 
+/// Longest session title (chars).
+pub const TITLE_MAX_CHARS: usize = 60;
+
+/// A title on one line, cut to [`TITLE_MAX_CHARS`]; `None` when empty.
+pub fn clip_title(title: &str) -> Option<String> {
+    let one = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.is_empty() {
+        return None;
+    }
+    if one.chars().count() <= TITLE_MAX_CHARS {
+        return Some(one);
+    }
+    let mut out: String = one.chars().take(TITLE_MAX_CHARS - 1).collect();
+    out.push('…');
+    Some(out)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSection {
     pub session_id: String,
@@ -306,6 +338,9 @@ pub struct SessionSection {
     pub origin: Option<Origin>,
     #[serde(default)]
     pub objective: String,
+    /// A short name of the work (Work sessions created by another session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default)]
     pub end_condition: EndCondition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -337,35 +372,19 @@ fn default_class() -> String {
     "work".to_string()
 }
 
-/// Mechanical compression parameters for rendering worklog history (§4.4).
+/// How worklog history is rebuilt into messages (§4.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct MechanicalCompress {
-    /// Model responses rendered in full, counted from the newest: the unit
-    /// is one recorded response, i.e. a behavior `step` or a function call
-    /// `assistant_message` (with the entries after it). Older entries are
-    /// cut to `summary_chars`.
-    #[serde(default = "default_recent_full_responses")]
-    pub recent_full_responses: u32,
-    #[serde(default = "default_summary_chars")]
-    pub summary_chars: u32,
-    #[serde(default = "default_max_result_chars")]
-    pub max_result_chars: u32,
+pub struct HistoryRender {
+    /// Entry kinds that never enter the history (audit only).
     #[serde(default = "default_drop_kinds")]
     pub drop_kinds: Vec<String>,
 }
 
-fn default_recent_full_responses() -> u32 {
-    2
-}
-fn default_summary_chars() -> u32 {
-    280
-}
-fn default_max_result_chars() -> u32 {
-    4096
-}
 pub fn default_drop_kinds() -> Vec<String> {
     vec![
         "created".to_string(),
+        "turn_started".to_string(),
+        "input_batch".to_string(),
         "decide".to_string(),
         "compaction".to_string(),
         "input_rejected".to_string(),
@@ -374,12 +393,9 @@ pub fn default_drop_kinds() -> Vec<String> {
     ]
 }
 
-impl Default for MechanicalCompress {
+impl Default for HistoryRender {
     fn default() -> Self {
         Self {
-            recent_full_responses: default_recent_full_responses(),
-            summary_chars: default_summary_chars(),
-            max_result_chars: default_max_result_chars(),
             drop_kinds: default_drop_kinds(),
         }
     }
@@ -427,7 +443,7 @@ pub struct PromptSection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<String>,
     #[serde(default)]
-    pub mechanical_compress: MechanicalCompress,
+    pub history_render: HistoryRender,
     /// Context budget (tokens) available to the history section when the
     /// next llm_context is assembled. `None` → runner default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,6 +452,12 @@ pub struct PromptSection {
     /// budget (`maybe_compact`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_ratio: Option<f32>,
+    /// A mid-run rewrite at the context limit brings the request back to
+    /// this share of the model's window (system prefix included;
+    /// `history_budget_tokens` is the floor of its history). `None` →
+    /// runner default (0.30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_target_ratio: Option<f32>,
 }
 
 /// How a behavior is entered when a hand-over (`next_behavior`) or a
@@ -499,9 +521,6 @@ pub struct InputTemplates {
     /// Hand-over into the target context (switch, sub context, its return).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_context_switch: Option<String>,
-    /// The snapshot message placed before a controlled input.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semi_subscription_snapshot: Option<String>,
     /// Goal Sessions: the Goal header placed before the first batch of an
     /// Activation (variable `goal`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -518,10 +537,6 @@ impl InputTemplates {
                 .on_context_switch
                 .clone()
                 .or_else(|| base.on_context_switch.clone()),
-            semi_subscription_snapshot: self
-                .semi_subscription_snapshot
-                .clone()
-                .or_else(|| base.semi_subscription_snapshot.clone()),
             goal_activation: self
                 .goal_activation
                 .clone()
@@ -544,8 +559,6 @@ pub struct BehaviorPrompt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_context_switch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semi_subscription_snapshot: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_activation: Option<String>,
 }
 
@@ -559,7 +572,6 @@ impl BehaviorPrompt {
             on_init: self.on_init.clone(),
             on_input: self.on_input.clone(),
             on_context_switch: self.on_context_switch.clone(),
-            semi_subscription_snapshot: self.semi_subscription_snapshot.clone(),
             goal_activation: self.goal_activation.clone(),
         }
     }
@@ -592,20 +604,6 @@ pub enum InputMedia {
 /// Image / document blocks one batch may carry (`input.media = inline`).
 pub const MAX_INLINE_MEDIA: usize = 8;
 
-/// What the host shows a context besides its inputs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum InputBackground {
-    /// Only what an input batch carries (the chat format's background).
-    #[default]
-    Batch,
-    /// Also after every batch of tool results (behavior loop: every step
-    /// with action results): the TodoList and sub session lines that
-    /// changed since they were last shown, as a `<<background_context>>`
-    /// message before the next inference.
-    AfterTools,
-}
-
 /// Input consumption policy of a context (separate from its templates).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -614,8 +612,6 @@ pub struct InputSection {
     pub mode: InputMode,
     #[serde(default)]
     pub media: InputMedia,
-    #[serde(default)]
-    pub background: InputBackground,
 }
 
 impl InputSection {
@@ -646,10 +642,6 @@ pub struct BehaviorEntry {
     /// `behavior:<name>` as a named function running this sub context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<super::behavior::BehaviorToolConfig>,
-    /// The behavior executes the session's serial Todos: a `next_behavior`
-    /// hand-over to it admits the next one (TodoList, `[entry] todo`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub todo: bool,
     /// `[reply]`: the context's final reply is a JSON value of this
     /// contract (function call loop only). A fork may declare its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -678,11 +670,6 @@ impl BehaviorEntry {
     }
 
     pub fn validate(&self, name: &str) -> std::result::Result<(), String> {
-        if self.todo && self.mode != ContextMode::CreateSubContext {
-            return Err(format!(
-                "behavior `{name}`: a Todo executor (`[entry] todo = true`) is entered as create_sub_context"
-            ));
-        }
         if let Some(t) = &self.tool {
             if !self.mode.is_sub_context() {
                 return Err(format!(
@@ -752,8 +739,8 @@ pub struct RuntimeRequirement {
     pub app_tools: Vec<String>,
 }
 
-/// How a session's session-runtime was chosen (primary-runtime TODO §3):
-/// the workspace never chooses it.
+/// How a session's working runtime was chosen (runtime lifecycle TODO
+/// §0.3): the workspace never chooses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSelection {
@@ -761,32 +748,46 @@ pub enum RuntimeSelection {
     Explicit,
     /// The parent session's frozen runtime.
     Inherited,
-    /// The agent's default runtime.
-    Default,
+    /// Where the commands of a named cmd_skill are installed.
+    Skill,
+    /// The agent's private runtime: every chat, and any session nobody
+    /// placed elsewhere.
+    Private,
 }
 
-/// The session-runtime a session was frozen to at creation: the
-/// registration it resolved to and how that runtime is reached, so a
-/// restart or a changed default never moves the session to another target.
+/// The working runtime a session was frozen to at creation (where `shell`
+/// runs): the registration it resolved to and how that runtime is reached,
+/// so a restart or a changed default never moves the session to another
+/// target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FrozenRuntime {
     pub runtime_id: String,
-    pub kind: super::RuntimeKind,
-    /// The registration's `exec` (`agent_tool` RuntimeConfig) at selection.
-    #[serde(default)]
-    pub exec: Option<serde_json::Value>,
+    pub connector: super::RuntimeConnector,
     /// `RuntimeRecord.revision` the selection was read from.
     pub revision: u64,
     pub selected_by: RuntimeSelection,
+    /// What the runtime can do at selection (declared baseline, platform as
+    /// far as learned): decides the session's cmd_skills.
     #[serde(default)]
-    pub computer: buckyos_api::ComputerAccess,
-    /// The registration's declared baseline: which cmd_skills the session
-    /// takes.
-    pub baseline: buckyos_api::RuntimeBaseline,
-    /// What is known of its platform at selection (empty fields: not yet
-    /// learned from the runtime).
+    pub caps: super::RuntimeCaps,
+    /// What the agent may do there at selection.
     #[serde(default)]
-    pub platform: super::RuntimePlatform,
+    pub grant: super::RuntimeGrant,
+}
+
+impl FrozenRuntime {
+    /// The `agent_tool` RuntimeConfig the session executes through.
+    pub fn exec(&self) -> serde_json::Value {
+        self.connector.exec()
+    }
+
+    pub fn baseline(&self) -> buckyos_api::RuntimeBaseline {
+        self.caps.baseline
+    }
+
+    pub fn is_node(&self) -> bool {
+        self.connector.is_node()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -804,18 +805,24 @@ pub struct RuntimeSection {
 }
 
 impl RuntimeSection {
-    /// The runtime the session is frozen to (`container` when none).
+    /// The runtime the session is frozen to (`private` when none).
     pub fn runtime_id(&self) -> &str {
         self.frozen
             .as_ref()
             .map(|f| f.runtime_id.as_str())
             .or(self.requirement.runtime_id.as_deref())
-            .unwrap_or(super::CONTAINER_RUNTIME)
+            .unwrap_or(super::PRIVATE_RUNTIME)
     }
 
     /// Whether the session executes through a Node Executor.
     pub fn is_node(&self) -> bool {
-        self.frozen.as_ref().is_some_and(|f| f.kind.is_node())
+        self.frozen.as_ref().is_some_and(|f| f.is_node())
+    }
+
+    /// A session whose working runtime is the private one: it has
+    /// `agent-session` and reaches other runtimes with `run` / `copy`.
+    pub fn is_private(&self) -> bool {
+        self.frozen.as_ref().is_none_or(|f| f.connector.is_native())
     }
 }
 
@@ -919,6 +926,13 @@ pub const USER_TIMEZONE_SOURCE_ID: &str = "user_timezone";
 /// shown in their conversation (`source = system:notify:<notify_id>`; a
 /// `system:<id>` subscription also takes the sub ids `<id>:<sub>`).
 pub const NOTIFY_SUBSCRIPTION: &str = "_notify";
+
+/// Id of a Work Session's implicit timer subscription: while the session
+/// waits for the work it started, the runner ticks it every
+/// `policy.tick_secs` and the tick opens a Turn.
+pub const TASK_WATCH_SUBSCRIPTION: &str = "_task_watch_timer";
+/// Name of that timer (`timer:task_watch`).
+pub const TASK_WATCH_TIMER: &str = "task_watch";
 pub const NOTIFY_SOURCE_ID: &str = "notify";
 /// Event of a notification that reached the session's conversation.
 pub const NOTIFY_EVENT_DELIVERED: &str = "delivered";
@@ -941,14 +955,6 @@ pub enum InputSourceConfig {
         queue: String,
         subscriber: String,
     },
-}
-
-impl InputSourceConfig {
-    pub fn id(&self) -> &str {
-        match self {
-            InputSourceConfig::Kmsg { id, .. } => id,
-        }
-    }
 }
 
 /// Reply coordinates of a session bound to one conversation.
@@ -1128,7 +1134,6 @@ impl SessionConfig {
                 llm_context: Value::Null,
                 inherit: InheritMode::RecentDialogue,
                 tool: None,
-                todo: false,
                 reply: None,
                 call_intent: false,
             });

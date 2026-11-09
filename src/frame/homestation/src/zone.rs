@@ -1,36 +1,13 @@
 //! Zone feed list (§4.6): an aggregate list maintained by the zone. A user who may write to it
 //! chooses, when posting, to also list the post here. Items stay the publishers' own signed
 //! Heads in their own streams; the zone only keeps which entries are listed and a change
-//! sequence, so readers verify every item exactly like items of a personal stream.
+//! sequence, so readers verify every item exactly like items of a personal stream. Its tables
+//! (`zone_feed`, `zone_changes`) are the zone's own rows of the HomeStation database.
 
 use crate::db::Db;
 use crate::error::HsResult;
 use crate::now_ms;
 use rusqlite::{params, OptionalExtension};
-use std::path::Path;
-
-const SCHEMA_VERSION: i64 = 1;
-
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS zone_feed (
-  entry TEXT PRIMARY KEY,
-  user TEXT NOT NULL,
-  publisher TEXT NOT NULL,
-  iat INTEGER NOT NULL,
-  listed INTEGER NOT NULL DEFAULT 1,
-  listed_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS zone_feed_order ON zone_feed(listed, iat, entry);
-CREATE TABLE IF NOT EXISTS zone_changes (
-  cursor INTEGER PRIMARY KEY AUTOINCREMENT,
-  entry TEXT NOT NULL,
-  user TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  at INTEGER NOT NULL
-);
-"#;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZoneRow {
@@ -54,8 +31,8 @@ pub struct ZoneFeed {
 }
 
 impl ZoneFeed {
-    pub fn open(path: &Path) -> HsResult<Self> {
-        Ok(Self { db: Db::open_schema(path, SCHEMA, SCHEMA_VERSION)? })
+    pub fn new(db: &Db) -> Self {
+        Self { db: db.for_owner("") }
     }
 
     /// List or unlist an entry; returns whether anything changed.
@@ -163,19 +140,19 @@ mod tests {
     #[tokio::test]
     async fn listing_orders_and_records_changes() {
         let dir = tempfile::tempdir().unwrap();
-        let feed = ZoneFeed::open(&dir.path().join("zone.db")).unwrap();
-        assert!(feed.set_listed("alice", "did:a", "cyfs://z/home/alice/feed/@/p1", 10, true).await.unwrap());
-        assert!(!feed.set_listed("alice", "did:a", "cyfs://z/home/alice/feed/@/p1", 10, true).await.unwrap());
-        assert!(feed.set_listed("bob", "did:b", "cyfs://z/home/bob/feed/@/p2", 20, true).await.unwrap());
-        assert!(!feed.set_listed("bob", "did:b", "cyfs://z/home/bob/feed/@/never", 30, false).await.unwrap());
+        let feed = ZoneFeed::new(&Db::open(&dir.path().join("homestation-main.db")).unwrap());
+        assert!(feed.set_listed("alice", "did:a", "https://z/home/alice/feed/@/p1", 10, true).await.unwrap());
+        assert!(!feed.set_listed("alice", "did:a", "https://z/home/alice/feed/@/p1", 10, true).await.unwrap());
+        assert!(feed.set_listed("bob", "did:b", "https://z/home/bob/feed/@/p2", 20, true).await.unwrap());
+        assert!(!feed.set_listed("bob", "did:b", "https://z/home/bob/feed/@/never", 30, false).await.unwrap());
         let page = feed.page(None, 10).await.unwrap();
         assert_eq!(page.iter().map(|r| r.user.as_str()).collect::<Vec<_>>(), ["bob", "alice"]);
         let next = feed.page(Some((page[0].iat, page[0].entry.clone())), 10).await.unwrap();
         assert_eq!(next.len(), 1);
-        feed.touch("cyfs://z/home/alice/feed/@/p1", "head").await.unwrap();
-        feed.touch("cyfs://z/home/alice/feed/@/unlisted", "head").await.unwrap();
-        assert!(feed.set_listed("alice", "did:a", "cyfs://z/home/alice/feed/@/p1", 10, false).await.unwrap());
-        assert!(!feed.is_listed("cyfs://z/home/alice/feed/@/p1").await.unwrap());
+        feed.touch("https://z/home/alice/feed/@/p1", "head").await.unwrap();
+        feed.touch("https://z/home/alice/feed/@/unlisted", "head").await.unwrap();
+        assert!(feed.set_listed("alice", "did:a", "https://z/home/alice/feed/@/p1", 10, false).await.unwrap());
+        assert!(!feed.is_listed("https://z/home/alice/feed/@/p1").await.unwrap());
         let kinds: Vec<String> = feed.changes(0, 10).await.unwrap().into_iter().map(|c| c.kind).collect();
         assert_eq!(kinds, ["listed", "listed", "head", "unlisted"]);
         assert_eq!(feed.count().await.unwrap(), 1);

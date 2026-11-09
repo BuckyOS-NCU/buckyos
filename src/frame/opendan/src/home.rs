@@ -195,11 +195,13 @@ impl Home {
 
     /// The owner's runtime choice for this agent (`AgentSettings.runtimes`,
     /// `default_runtime_id`), as the WebUI edits it.
-    pub async fn runtime_settings(&self) -> Result<Value, OpenDanError> {
+    pub async fn runtime_settings(&self, agent: &dyn AgentStateClient) -> Result<Value, OpenDanError> {
         let settings = records::settings(self.records.as_ref()).await.map_err(store_err)?;
+        let default = agent.runtimes().lookup(settings.effective_default_runtime()).await?
+            .map(|r| r.runtime_id).unwrap_or_else(|| settings.effective_default_runtime().into());
         Ok(json!({
             "runtimes": settings.runtimes,
-            "default_runtime_id": settings.effective_default_runtime(),
+            "default_runtime_id": default,
         }))
     }
 
@@ -207,13 +209,19 @@ impl Home {
     /// disable, ComputerUse, declared baseline, default). Adding a runtime target is the
     /// control panel's (`agent.update` / `agent.runtime_directory`): this
     /// side never invents a target. Returns the new settings.
-    pub async fn set_runtime_settings(&self, params: &Value) -> Result<buckyos_api::AgentSettings, OpenDanError> {
+    pub async fn set_runtime_settings(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<buckyos_api::AgentSettings, OpenDanError> {
         let invalid = |m: String| OpenDanError::InvalidArgument(m);
         let mut settings = records::settings(self.records.as_ref()).await.map_err(store_err)?;
         let runtime_id = text_param(params, "runtime_id")?
             .filter(|s| !s.is_empty())
             .ok_or_else(|| invalid("param `runtime_id` is required".into()))?;
-        if runtime_id != buckyos_api::CONTAINER_RUNTIME_ID {
+        let runtime_id = match agent.runtimes().lookup(&runtime_id).await?.map(|r| r.connector) {
+            Some(RuntimeConnector::Native { aliases, .. }) if !aliases.is_empty() => aliases[0].clone(),
+            _ => runtime_id,
+        };
+        let private = libopendan::protocol::is_private_runtime(&runtime_id);
+        let runtime_id = if private { buckyos_api::CONTAINER_RUNTIME_ID.to_string() } else { runtime_id };
+        if !private {
             let entry = settings.runtimes.get_mut(&runtime_id).ok_or_else(|| {
                 invalid(format!(
                     "runtime `{runtime_id}` is not one of this agent's runtimes; the control panel adds runtimes (agent.update)"
@@ -231,6 +239,15 @@ impl Home {
             if let Some(baseline) = params.get("baseline") {
                 entry.baseline = serde_json::from_value(baseline.clone())
                     .map_err(|_| invalid("param `baseline` takes standard | extended | null".into()))?;
+            }
+            // The owner's grant beyond the node policy (install, workspaces,
+            // narrowed roots, term): the Agent State projects it as is.
+            if let Some(grant) = params.get("grant") {
+                entry.grant = if grant.is_null() {
+                    None
+                } else {
+                    Some(serde_json::from_value(grant.clone()).map_err(|e| invalid(format!("param `grant`: {e}")))?)
+                };
             }
         }
         if let Some(default) = params.get("default").and_then(Value::as_bool) {
@@ -251,6 +268,57 @@ impl Home {
             .await
             .map_err(store_err)?;
         Ok(settings)
+    }
+
+    /// `skills.status`: each cmd_skill's commands on a runtime, and which extension package would bring what is missing.
+    /// The check runs now, so a package that just went active or away shows at once. The package catalog is the Zone's: an
+    /// Agent that cannot reach it still knows what is missing, only not what would bring it.
+    pub async fn skills_status(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<Value, OpenDanError> {
+        let runtime_id = text_param(params, "runtime_id")?.filter(|id| !id.is_empty()).unwrap_or_else(|| "private".to_string());
+        let skills = agent.behaviors().skills(Some(SkillKind::Cmd)).await?;
+        let mut wanted: Vec<String> = skills.iter().flat_map(|s| s.commands.iter().cloned()).collect();
+        wanted.sort();
+        wanted.dedup();
+        let record = agent.runtimes().check(&runtime_id, &wanted, false).await?;
+        let mut resolved = record.caps.baseline_check.as_ref().map(|b| b.resolved.clone()).unwrap_or_default();
+        if let Some(tools) = record.caps.tools_check.as_ref() {
+            resolved.extend(tools.resolved.clone());
+        }
+        let (catalog, desired) = zone_ext_tools().await;
+        let reports: Vec<Value> = skills
+            .iter()
+            .filter(|s| !s.commands.is_empty())
+            .map(|s| json!({"name": s.name, "status": libopendan::skills::commands_status(&s.commands, &resolved, &catalog, &desired)}))
+            .collect();
+        Ok(json!({"runtime_id": record.runtime_id, "skills": reports}))
+    }
+
+    /// `skills.install_plan`: before a skill package goes in, what its manuals rely on against a runtime. Advice only: an
+    /// install never fails for a missing command.
+    pub async fn skills_install_plan(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<Value, OpenDanError> {
+        let package: libopendan::skills::SkillPackage = serde_json::from_value(params.get("package").cloned().unwrap_or(Value::Null))
+            .map_err(|e| OpenDanError::InvalidArgument(format!("param `package`: {e}")))?;
+        let runtime_id = text_param(params, "runtime_id")?.filter(|id| !id.is_empty()).unwrap_or_else(|| "private".to_string());
+        let mut skills = Vec::new();
+        for (path, file) in &package.files {
+            let Some(name) = path.strip_prefix("cmd_skills/").and_then(|p| p.strip_suffix(".md")) else { continue };
+            let text = String::from_utf8(file.bytes()?).map_err(|_| OpenDanError::InvalidArgument(format!("{path} is not UTF-8 text")))?;
+            skills.push(libopendan::protocol::skill_meta(SkillKind::Cmd, name, &text));
+        }
+        let mut wanted: Vec<String> = skills.iter().flat_map(|s| s.commands.iter().cloned()).collect();
+        wanted.sort();
+        wanted.dedup();
+        let record = agent.runtimes().lookup(&runtime_id).await?.ok_or_else(|| OpenDanError::InvalidArgument(format!("no runtime `{runtime_id}`")))?;
+        let mut resolved = record.caps.baseline_check.as_ref().map(|b| b.resolved.clone()).unwrap_or_default();
+        if let Some(tools) = record.caps.tools_check.as_ref() {
+            resolved.extend(tools.resolved.clone());
+        }
+        let (catalog, desired) = zone_ext_tools().await;
+        let reports: Vec<Value> = skills
+            .iter()
+            .map(|s| json!({"name": s.name, "commands": s.commands, "status": libopendan::skills::commands_status(&s.commands, &resolved, &catalog, &desired)}))
+            .collect();
+        Ok(json!({"runtime_id": record.runtime_id, "skills": reports}))
     }
 
     pub async fn workspaces(&self, agent: &dyn AgentStateClient) -> Result<Value, OpenDanError> {
@@ -275,6 +343,35 @@ impl Home {
             "last_error": record.last_error,
         })).collect::<Vec<_>>()))
     }
+}
+
+/// The Zone's extension package catalog and desired state, from control-panel. Empty outside a Zone or when it does not
+/// answer: advice goes missing, nothing else.
+async fn zone_ext_tools() -> (Vec<buckyos_api::ExtToolsCatalogEntry>, std::collections::BTreeMap<String, buckyos_api::ExtToolsDesired>) {
+    let answer = async {
+        let runtime = buckyos_api::get_buckyos_api_runtime().map_err(|e| e.to_string())?;
+        let client = runtime.get_zone_service_krpc_client("control-panel").await.map_err(|e| e.to_string())?;
+        client.call("ext_tools.status", json!({})).await.map_err(|e| e.to_string())
+    }
+    .await;
+    let status: Value = match answer {
+        Ok(status) => status,
+        Err(error) => {
+            log::warn!("extension package catalog unavailable: {error}");
+            return Default::default();
+        }
+    };
+    let mut catalog = Vec::new();
+    let mut desired = std::collections::BTreeMap::new();
+    for package in status["packages"].as_array().into_iter().flatten() {
+        if let Ok(entry) = serde_json::from_value(package["latest"].clone()) {
+            catalog.push(entry);
+        }
+        if let Ok(state) = serde_json::from_value(package["desired"].clone()) {
+            desired.insert(package["id"].as_str().unwrap_or_default().to_string(), state);
+        }
+    }
+    (catalog, desired)
 }
 
 /// Where the home page reads its agent root from (for re-projection).

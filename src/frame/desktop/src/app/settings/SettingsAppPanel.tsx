@@ -6,22 +6,28 @@ import type { SettingsPage } from './components/layout/navigation'
 import { GeneralPage } from './pages/GeneralPage'
 import { AppearancePage } from './pages/AppearancePage'
 import { ClusterManagerPage } from './pages/ClusterManagerPage'
+import { ExtToolsPage } from './pages/ExtToolsPage'
 import { PrivacyPage } from './pages/PrivacyPage'
 import { FilePermissionsPage } from './pages/FilePermissionsPage'
 import { DeveloperModePage } from './pages/DeveloperModePage'
 import { ZonePage } from './pages/ZonePage'
 import { SsoPage } from './pages/SsoPage'
+import { StoragePage } from './pages/StoragePage'
 
 function PageRouter({ page, appProps }: { page: SettingsPage; appProps: AppContentLoaderProps }) {
   switch (page) {
     case 'general':
       return <GeneralPage />
+    case 'storage':
+      return <StoragePage />
     case 'appearance':
       return <AppearancePage appProps={appProps} />
     case 'zone':
       return <ZonePage />
     case 'cluster':
       return <ClusterManagerPage />
+    case 'ext-tools':
+      return <ExtToolsPage />
     case 'privacy':
       return <PrivacyPage />
     case 'file-permissions':

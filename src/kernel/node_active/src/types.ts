@@ -137,6 +137,10 @@ export type DomainBindingState =
   | { state: "verified"; domain: string; verified_at: number };
 
 export type ActiveWizzardData = {
+  /** `full` | `lite`, from the node's installed product profile. */
+  product_edition: string;
+  /** Whether this node runs containers (false on BuckyOS Desktop Lite). */
+  support_container: boolean;
   gatewy_type: GatewayType;
   port_mapping_mode: "full" | "rtcp_only";
   rtcp_port: number;
@@ -154,6 +158,9 @@ export type ActiveWizzardData = {
   admin_password_hash: string;
   friend_passcode: string;
   enable_guest_access: boolean;
+  /** OS accounts this node can offer its owner's Agents; empty when it offers none. */
+  host_accounts: string[];
+  host_account: string;
   owner_document: BuckyOSOwnerDocument | null;
   evm_address: string;
   web_owner_material: WebOwnerMaterial | null;

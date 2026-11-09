@@ -3,6 +3,7 @@
 > **版本**：v0.2
 > **日期**：2026-10-09
 > **v0.2 变更**：一个服务进程服务 Zone 的所有用户（每人独立的发表流、投递入口与数据库），协议路径改为 `/home/<用户名>/...`；新增 DID 查询、Zone 汇总列表、默认发表流、门户 kRPC（`portal.*`）与 Zone 托管签名；删除“每 Zone 只为 owner 发表、同 Zone 用户不派生关注”的旧限制。
+> **2026-10-26**：存储改为 RDB Instance + 应用对象桶（Named Bucket 迁移 P1-3 / P2-2 / P3-2）：所有用户与 Zone 汇总列表共用一个 rdb_mgr 实例 `homestation-main`（`owner` 列隔离）；发表的版本与附件绑定在 `user/homestation/<user>/{entries,published}`，预取在 `following-entries` / `following`（ambient），上传与抓取在 `scratch`（temp 7 天）；删除自管 pin（`retention.rs`、`homestation:<entry>`）与单机 `chunks/` 目录，单机与测试用独立 nfs-server。格式见《HomeStation Durable Data Schema》（§6）。
 > **2026-10-17**：关系改读 Message Center 的 `friend_state` 与用户 tag（`Contact.groups` 已删除）；主动关注写回 `homestation.following` tag；好友同步由联系人变更事件驱动，不再每小时轮询；`sources.resolve {kind: follow}` 只接受 DID（§5.5）。
 > **文档定位**：《BuckyOS HomeStation 架构设计》v0.7 的首版实现说明，面向实现与联调团队。记录线格式、跨节点接口、Owner kRPC、持久数据、运行方式与验证方法，以及对架构 §21 待定项采取的实现选择。
 > **代码**：`src/frame/homestation`（crate `homestation`）；Desktop 前端在 `src/frame/desktop/src/app/homestation`。
@@ -10,12 +11,12 @@
 
 ## 1. 范围与落点
 
-首版在一个服务进程内实现架构 §4.3 的全部逻辑模块。进程服务 Zone 的所有用户：`Host`（`host.rs`）持有用户表与 Zone 级状态，每个用户一个 `Station`（发表流、投递入口、待读管线、设置与评价，独立数据库），首次用到时打开，服务启动时打开全部用户。按文件划分：
+首版在一个服务进程内实现架构 §4.3 的全部逻辑模块。进程服务 Zone 的所有用户：`Host`（`host.rs`）持有用户表与 Zone 级状态，每个用户一个 `Station`（发表流、投递入口、待读管线、设置与评价；数据库里属于该用户的行与该用户的桶），首次用到时打开，服务启动时打开全部用户。按文件划分：
 
 | 模块（架构 §4.3） | 文件 | 说明 |
 | --- | --- | --- |
 | Zone 服务 | `host.rs`、`users.rs`、`zone.rs` | 用户表（system config `users/*`）、按用户打开 Station、DID 查询、门户 kRPC、Zone 汇总列表与默认发表流 |
-| 对象与校验 | `protocol.rs`、`objects.rs`、`sign.rs` | Feed Object / Head / 关注声明 / 消费证明 / 共享评价；ObjId、JWT、入口命名空间校验；本地对象库与 chunk 存储 |
+| 对象与校验 | `protocol.rs`、`objects.rs`、`sign.rs` | Feed Object / Head / 关注声明 / 消费证明 / 共享评价；ObjId、JWT、入口命名空间校验；本地对象库；`Storage`（named store 与用户桶） |
 | 定位与密钥 | `directory.rs` | DID → Zone → HTTP 源站；签名者授权；单机配置与名字服务两种实现 |
 | Publish Service | `publish.rs` | 签发对象与 Head（串行 seq）、发表流变化序列、读取授权、发布任务 |
 | 发表流读取 | `stream.rs` | 展示读取、变化读取、条目 Head、对象 / chunk、作者评论视图、门户资料、收录索引 |
@@ -33,11 +34,11 @@
 运行形态（`main.rs`）：
 
 - **BuckyOS 服务模式**：kernel service `homestation`，端口 4130；kRPC 经网关通用路由 `/kapi/homestation`；协议路径 `/home/*` 由 `boot_gateway.yaml` 转发到本服务。
-- **单机模式**：`homestation --data-dir <dir> --config <json>`，Zone、用户、密钥、对端与联系人都写在配置里（§7.2），用于开发与多节点测试。
+- **单机模式**：`homestation --data-dir <dir> --config <json>`，Zone、用户、密钥、对端、联系人与该 Zone 的 nfs-server 都写在配置里（§7.2），用于开发与多节点测试。
 
 Zone 的每个用户都是一个发表者：服务模式下用户来自 system config 的 `users/<id>`（`profile.did`、显示名，`settings.state` 不是 active 的不服务），用户名就是 `/home/<用户名>` 与门户 `/homestation/<用户名>` 的路径段。同 Zone 用户之间的关注、投递与读取与跨 Zone 相同；Zone 内的请求走本机监听（§3.1）。
 
-Zone 的 Agent 也是发表者（2026-10-23）：`users/<owner>/agents/<agent_id>/{spec,settings,profile}` 中有 spec、`settings.enabled && settings.homestation` 的 Agent 以短名（AgentDID 的第一段，与用户名共享命名空间）作路径段 `/home/<短名>`，DID 取 `spec.agent_doc.id`，显示名取 profile，默认不进 Zone 汇总列表（`zone_feed_writer=false`，可由 `zone_feed_writers` 覆盖）。用户表每 60 秒刷新（`Host::refresh_users`）：新建的 Agent 无需重启即被服务，用户集合变化时每个站点重新派生 zone 依据的关注（§5.5）。资料（`/home/<user>/profile`、`profile.get`、`GET /home/?did=`）带 `kind: person | agent`，Agent 另带 `owner`。Agent 的运行 App 以 Agent 身份调用 kRPC（§4 路由）；Agent 没有自己的 Message Center 联系人，受众只用 `public`。关 `homestation` 或删除 Agent 后它从用户表消失，站点数据库留在 `users/<短名>/`。
+Zone 的 Agent 也是发表者（2026-10-23）：`users/<owner>/agents/<agent_id>/{spec,settings,profile}` 中有 spec、`settings.enabled && settings.homestation` 的 Agent 以短名（AgentDID 的第一段，与用户名共享命名空间）作路径段 `/home/<短名>`，DID 取 `spec.agent_doc.id`，显示名取 profile，默认不进 Zone 汇总列表（`zone_feed_writer=false`，可由 `zone_feed_writers` 覆盖）。用户表每 60 秒刷新（`Host::refresh_users`）：新建的 Agent 无需重启即被服务，用户集合变化时每个站点重新派生 zone 依据的关注（§5.5）。资料（`/home/<user>/profile`、`profile.get`、`GET /home/?did=`）带 `kind: person | agent`，Agent 另带 `owner`。Agent 的运行 App 以 Agent 身份调用 kRPC（§4 路由）；Agent 没有自己的 Message Center 联系人，受众只用 `public`。关 `homestation` 或删除 Agent 后它从用户表消失，它的行（`owner = <短名>`）与桶留在原处。
 
 ## 2. 对象与线格式
 
@@ -55,7 +56,7 @@ Zone 的 Agent 也是发表者（2026-10-23）：`users/<owner>/agents/<agent_id
 | `cyfollow` | `follow` | 关注声明（E17） |
 | `cyfproof` | `consumption_proof` | 消费证明（§11.3） |
 | `cyfeval` | `evaluation` | 对外共享的评价（§6.5） |
-| `cyfile` / `cydir` / ChunkList | — | 标准文件、目录和分块依赖；SDK canonical 对象不增加展示字段，上传展示元数据保存在本用户 `import_metadata` |
+| `cyfile` / `cydir` / ChunkList | — | 标准文件、目录和分块依赖。常用 meta（`mime`、尺寸、时长、拍摄信息等，《CYFS 标准对象》§10.1）写进 `cyfile`，随内容分发；HomeStation 接口的 `file` 字段就是标准 `cyfile` JSON |
 
 ### 2.2 Feed Object（`cyfeed`）
 
@@ -78,7 +79,9 @@ Zone 的 Agent 也是发表者（2026-10-23）：`users/<owner>/agents/<agent_id
 
 ### 2.4 入口与键
 
-- 入口 URL：`cyfs://<zone>/home/<user>/<namespace>/@/<key>`，user 为用户名（`[A-Za-z0-9_.-]`，`~zone` 保留给汇总列表、不能作入口），namespace 为 `feed`（正文、评论、引用转发）、`reactions`（点赞、点踩、公开收藏、普通转发）、`follows`（关注声明）。键字符集 `[A-Za-z0-9._-]{1,128}`。DID 形式的入口（E08）只接受名字系统解析出 `owner == publisher` 的内容 DID。
+- 入口 URL：`https://<zone>/home/<user>/<namespace>/@/<key>`，user 为用户名（`[A-Za-z0-9_.-]`，`~zone` 保留给汇总列表、不能作入口），namespace 为 `feed`（正文、评论、引用转发）、`reactions`（点赞、点踩、公开收藏、普通转发）、`follows`（关注声明）。键字符集 `[A-Za-z0-9._-]{1,128}`。DID 形式的入口（E08）只接受名字系统解析出 `owner == publisher` 的内容 DID。
+- 引用形式（2026-10-29，[key url.md](../key%20url.md) §6 / 裁决 D10、D11）：入口、发表流、投递入口、Follow 等跨 Zone 持久引用一律是 `https://<zone>/home/<user>/...`，它也是这些对象的默认 Object URL；本 Zone 内 `obj://homestation/home/<user>/...`（含 `obj://homestation/home/~zone`）是同一对象的别名，只在输入时归一化为 https 形式（`evaluation::path_to_entry`），不写入签名内容。旧的 `cyfs://<zone>/home/...` 形式不再解析。
+- DID Object Provider：`/kapi/homestation/obj/home/<user>[/feed[/@/<key>]|/inbox]`（`src/obj_provider.rs`），Card 的 `alsoKnownAs` 依次为 https 默认 URL、Provider 端点与 `obj://` 别名，Profile 在 `?type=profile`；读取走 `/home/<user>/...` 协议路径的同一读者规则（会话令牌）。inbox 投递动作仍是 CYFS dispatch 的 `PUT https://<zone>/home/<user>/inbox`，Provider 只暴露其 target。
 - 发表时的键：正文 `p-<随机>`、评论 `c-…`、引用转发 `q-…`、分享抓取 `clip-…`。
 - **互动键摘要**（§21）：`<type>-` + `hex(sha256("homestation/reaction/v1\n<互动者 DID>\n<目标 ObjId>\n<type>"))` 的前 16 字节；关注键 `f-` + `hex(sha256("homestation/follow/v1\n<关注者>\n<被关注者>"))` 前 16 字节。
 - 入口归属（§5.4 规则 2）：`home_of(publisher) == 入口的 (zone, user)`；同 Zone 其他用户的路径不算。不满足时对象按终态对象处理，Head 直接拒绝（A46）。
@@ -87,11 +90,11 @@ Zone 的 Agent 也是发表者（2026-10-23）：`users/<owner>/agents/<agent_id
 ### 2.5 关注声明、消费证明、共享评价
 
 ```json
-{ "kind": "follow", "publisher": "<Bob>", "iat": 1791421200, "entry": "cyfs://<Bob Zone>/home/bob/follows/@/f-…", "target": { "publisher": "<Alice>", "stream": "cyfs://<Alice Zone>/home/alice/feed" } }
+{ "kind": "follow", "publisher": "<Bob>", "iat": 1791421200, "entry": "https://<Bob Zone>/home/bob/follows/@/f-…", "target": { "publisher": "<Alice>", "stream": "https://<Alice Zone>/home/alice/feed" } }
 { "kind": "consumption_proof", "publisher": "<Bob>", "iat": …, "target": "<ObjId>", "action": "video_complete", "result": { … }, "receiver": "<DID>", "agreement": "agr-…", "nonce": "…" }
 ```
 
-共享评价把置信度写成整数千分比 `confidence_permille`（对象内不允许浮点数）。
+共享评价把置信度写成整数千分比 `confidence_permille`（HomeStation 自己的对象内不允许浮点数；`cyfile` 是 CYFS 标准对象，常用 meta 里的 `geo`、`exposure` 带浮点数，不受此限）。
 
 ## 3. 跨节点协议
 
@@ -102,17 +105,16 @@ DID → 主页（zone + 用户名）：
 - 本 Zone 用户：查用户表（DID 的主机名落在本 Zone 下而查不到时，最多每 5 秒重新加载一次用户表）。本 Zone 内找不到的身份没有 HomeStation（`NotFound`）。
 - 其他身份：先得到 Zone（owner document 的 `binded_zone_list` 第一项；列表为空时取 owner DID 本身，支持自托管 Zone；owner document 解析失败时使用输入 DID），经 `DID::to_host_name()` 转为主机名，再问该 Zone：`GET https://<zone>/home/?did=<DID>` → `{ did, user, stream, inbox }`，404 表示该 Zone 不托管这个 DID。正反结果都缓存 10 分钟；网络失败不缓存。单机模式查配置（`directory.identities.<did>.user`）。
 
-Zone → HTTP 源站：`https://<zone>`，可在服务 settings 的 `peers` 或单机配置的 `directory.zones` 声明；**本 Zone 映射到本机监听**（服务模式 `http://127.0.0.1:4130`），同 Zone 用户之间的读取与投递不绕公网网关。发表流 `cyfs://<zone>/home/<user>/feed`，投递入口 `cyfs://<zone>/home/<user>/inbox`，`GET /home/<user>/profile` 也返回这两个地址。
+Zone → HTTP 源站：`https://<zone>`，可在服务 settings 的 `peers` 或单机配置的 `directory.zones` 声明；**本 Zone 映射到本机监听**（服务模式 `http://127.0.0.1:4130`），同 Zone 用户之间的读取与投递不绕公网网关。发表流 `https://<zone>/home/<user>/feed`，投递入口 `https://<zone>/home/<user>/inbox`，`GET /home/<user>/profile` 也返回这两个地址。
 
 ### 3.2 读者身份
 
 | 方式 | 头 | 读者 |
 | --- | --- | --- |
 | 无 | — | 匿名，只得公开条目 |
-| 读者证明 | `Authorization: DID <JWT>` | 其他 Zone 的用户 |
-| 会话令牌 | `Authorization: Bearer <session token>` 或 `?access=<token>` | 同 Zone 用户；读自己的主页得到所有者视图 |
+| 会话令牌 | `Authorization: Bearer <session token>` 或 `?access=<token>` | 同 Zone 用户，读自己的主页得到所有者视图；其他 Zone 的用户持目标 Zone 签发的 External 会话 |
 
-读者证明是自签 JWT：`{ "iss": "<读者 DID>", "aud": "cyfs://<被读 zone>/home", "iat", "exp" (≤ iat+600), "jti" }`，签名者须被 `iss` 授权（含 Zone 托管）。证明面向整个 Zone，读同一 Zone 内任何用户的主页都可用。HomeStation 代表某个用户 Pull 时以该用户为 `iss`、用 Zone 的签名者签发。**实现选择**：架构 §21 的“读者身份认证方式”在接入 CYFS 跨 Zone 身份机制前采用这一格式；证明在有效期内可以重放，只用于幂等读取。
+其他 Zone 的用户持目标 Zone verify-hub 签发的 External 会话读取，读者是会话主体的 DID。HomeStation 代表某个用户 Pull 时，经 `CrossZoneClient` 以该用户身份换取会话（`pull.rs`）；门户预览则匿名读取。其他 `Authorization` 方案会被拒绝（`auth.rs` 的 `reader_from_request`）。
 
 ### 3.3 HTTP 路径
 
@@ -134,13 +136,14 @@ Zone 级：
 | `GET /home/<user>/feed?mode=changes&since=<cursor>[&limit=&objects=1]` | 变化读取：`since` 之后的 Head 变化（含受众变化，`kind=audience`）；游标早于压缩点时 `resync: true` |
 | `GET /home/<user>/<feed\|reactions\|follows>/@/<key>` | 条目当前 Head（JWT）；不存在与无权读取同为 404 |
 | `GET /home/<user>/objects/<ObjId>` | 对象（JWT 或 canonical JSON）；受限条目附 `hs-audience: restricted` |
-| `GET /home/<user>/objects/<cyfile ObjId>/content` | 单 chunk 文件的内容，供媒体元素使用 |
+| `GET /home/<user>/objects/<cyfile ObjId>/content` | 文件内容（Range），供媒体元素使用。这个路由和 Desktop 同源，活动类型不会在这里执行：只有图片、音视频、PDF、纯文本内联，其余 `application/octet-stream` 加下载，都带 `nosniff`、CSP、`no-referrer` |
+| `GET /home/<user>/objects/<cyfile ObjId>/ref` | 文件在 nfs-server 数据面上的绑定和只读令牌。令牌是持有即可读的链接，所以只对公开条目和 owner 发放；受限条目的读者走 `/content`，每次按受众判定 |
 | `GET /home/<user>/chunks/<ChunkId>` | chunk 数据，接收方按 ChunkId 校验 |
 | `GET /home/<user>/comments?target=<ObjId>[&type=]` | 作者视图（目标是该用户的版本）或收录者视图（收录模式） |
 | `GET /home/<user>/profile` | 门户资料：DID、用户名、名称、简介、`avatar`（Message Center 中本人联系人的公开头像，可无）、发表流 / 投递入口、关注者数、作品精选（按读者过滤） |
 | `GET /home/<user>/index/recent?since=&limit=` | 收录者最近收到的公开发表（冷启动） |
 | `PUT /home/<user>/inbox` | CYFS dispatch 投递（§3.4） |
-| `GET /home/<user>/inbox?dispatch-status=<ObjId>` | dispatch 状态查询 |
+| `GET /home/<user>/inbox?dispatch-status=<ObjId>` | dispatch 状态查询：要求认证，只回答投递方和 owner，其他人一律 `unknown-dispatch` |
 
 列表响应不签名，条目是签名的 Head。展示 / 变化读取的 `objects` 是“随附”：读者有权读的对象及其部件（ObjId → JWT/JSON），接收方逐个按 ObjId 校验（§5.5）。条目的 `restricted` 与 `tier`（`public`/`followers`/`friends`/`group`/`dids`）是不签名的附带信息。
 
@@ -210,11 +213,11 @@ Push 对象（§13.1）：
 | 关注补看 | `candidates.list {cursor, includeRead, limit}`、`candidates.open {objId}`、`candidates.admit {objId}` |
 | 条目与资源 | `item.get {objId, reader?}`、`item.cards {objIds}`、`item.wrapped_body`、`item.retry_resources`、`item.fetch {objId, from}` |
 | 评论 | `comments.list {objId, view: local\|author\|collector:<did>, type}`、`comments.set_listing {target, commentId, listed}`、`comments.sync` |
-| 发表流 | `published.list {owner, reader, kind, cursor, limit}`（自己的条目带 `zoneFeed: true` 表示已列入汇总列表）、`published.changes {reader, after}`、`published.entries`（Head 调试）。owner 不是自己时远程读取对方发表流：读者为自己时带读者证明，否则匿名读取；以第三人的身份读取无法实现，按匿名返回并标 `readerApproximated: true`；非所有者读者的卡片不含 `personal`/`reading` |
+| 发表流 | `published.list {owner, reader, kind, cursor, limit}`（自己的条目带 `zoneFeed: true` 表示已列入汇总列表）、`published.changes {reader, after}`、`published.entries`（Head 调试）。owner 不是自己时远程读取对方发表流：读者为自己时带跨 Zone 会话，否则匿名读取；以第三人的身份读取无法实现，按匿名返回并标 `readerApproximated: true`；非所有者读者的卡片不含 `personal`/`reading` |
 | Zone 汇总列表 | `zone.set_listing {entry, listed}`：列入或移出自己的一条公开正文 / 引用转发；无写权限 `homestation.zoneFeed.notWriter`，非公开 `homestation.validation.zoneFeedPublic`，已撤回 `homestation.zoneFeed.withdrawn` |
 | 互动 | `interact.like / bookmark {public} / read_later / dislike / repost {objId, on}`、`interact.quote {objId, text, audience}`、`interact.comment {objId, text}` |
 | 条目 | `entry.withdraw`、`entry.edit {entry, text}`、`entry.set_audience {entry, audience}`、`entry.retry_delivery` |
-| 发布 | `publish.create {key, input}`（`input.zoneFeed: true` 同时列入汇总列表，只限公开受众，无写权限时在发表前拒绝）、`publish.retry {key}`、`publish.share_capture {objId}`、`publish.task {key}`、`publish.link_preview {url}`；附件由 SDK 上传并登记后调用 `object.register {objId, metadata:{name,mime,width?,height?,duration_ms?}}`，旧 Blob 上传路由已删除 |
+| 发布 | `publish.create {key, input}`（`input.zoneFeed: true` 同时列入汇总列表，只限公开受众，无写权限时在发表前拒绝）、`publish.retry {key}`、`publish.share_capture {objId}`、`publish.task {key}`、`publish.link_preview {url}`；附件：`object.upload_target {name}` → `{bucketId, key}`（本人 `scratch` 桶里的新 key），SDK 上传时在 finalize 绑定到那里（`auto_bind`），再 `object.register {objId, key, metadata:{name,mime,width?,height?,duration_ms?}}`；不带 `key` 的登记（Agent 的产物）改由调用者自己的会话经 NDM 证明可读。旧 Blob 上传路由已删除 |
 | 收藏 | `saved.list {kind: bookmark\|read_later}` |
 | 门户 | `profile.get {did?, reader?}`（返回含 `avatar`：本人取自 Message Center 中本人联系人的公开头像，他人取自其公开资料）、`profile.set {name, bio}`、`profile.set_featured {order}` |
 | 来源 | `sources.list`、`sources.resolve {kind: follow\|url\|natural, text}`、`sources.follow {resolution}`、`sources.unfollow {sourceId}`、`sources.pause {sourceId, paused}`、`sources.sync {sourceId?}` |
@@ -229,7 +232,9 @@ Push 对象（§13.1）：
 
 ### 5.1 受众（§4.5）
 
-受众只存在于 `published.audience`。判定：匿名只看公开；关注者受众给已收到有效关注声明的人（好友也算，好友默认互相关注）；好友（`friend_state = friend`）与分组（用户 tag）按读取时的 Message Center 关系（缓存 30 秒，联系人变更事件到达时作废）；指定 DID 按名单；owner 看全部。点赞默认公开；目标受限时，评论、点赞、公开收藏的受众固定为原作者，且不投递收录者；受限对象不能普通转发或引用转发（`repost_blocked:restricted`）。受众调整不签发 Head，只追加 `audience` 变化；扩大后新读者在变化读取里看到该条目，并收到一次 Push。
+受众只存在于 `published.audience`。判定：匿名只看公开；关注者受众给已收到有效关注声明的人（好友也算，好友默认互相关注）；好友（`friend_state = friend`）与分组（用户 tag）按读取时的 Message Center 关系（缓存 30 秒，联系人变更事件到达时作废）；指定 DID 按名单；owner 看全部。点赞默认公开；目标受限时，评论、点赞、公开收藏的受众固定为原作者，且不投递收录者；受限对象不能普通转发或引用转发（`repost_blocked:restricted`）。受众调整不签发 Head，只追加 `audience` 变化；扩大后新读者在变化读取里看到该条目，并收到一次 Push。公开收窄为受限时，撤销已发给读者的 `/ref` 令牌。
+
+公开条目的文件附件同时在 `https://<zone>/ndn/<file_id>` 匿名可读（应用对象桶设计 §4.6.5）：`publish_version` 时经 `bucket.provide_public` 提供（`requested_by` 是 owner，要求 owner 持有整棵对象树；Station 自己产生的字节如长文正文、网页快照没有这个证明，只留在 `/objects/<id>/content`），条目撤回或受众收窄时 `bucket.withdraw_public`，启动时 `reconcile_public_provision` 对账。
 
 ### 5.2 待读管线（§8）
 
@@ -245,7 +250,7 @@ Push 对象（§13.1）：
 
 ### 5.3 评价服务（§6）
 
-- **目标**：`identity`（DID）；`content` 的 `object_id`、`object_path`（`cyfs://`/`https://` 的入口路径，先取得并验证 Head，固定当前版本）或 `root_object_id + inner_path`（JSON Pointer；成员是 ObjId 时固定为该对象，否则按“根 + 路径”评价，作用范围 `part`）。路径不存在、已撤回或解析失败返回 `state: unknown` 与 `failure`，不作负面判断（A62）。缺本地对象时向入口发表者取证。
+- **目标**：`identity`（DID）；`content` 的 `object_id`、`object_path`（`https://` 入口路径、本 Zone 别名 `obj://homestation/home/...` 或门户链接，先取得并验证 Head，固定当前版本）或 `root_object_id + inner_path`（JSON Pointer；成员是 ObjId 时固定为该对象，否则按“根 + 路径”评价，作用范围 `part`）。路径不存在、已撤回或解析失败返回 `state: unknown` 与 `failure`，不作负面判断（A62）。缺本地对象时向入口发表者取证。
 - **档案**：`rules`（修订号 `rules-1`）与 `model`（AICC `helper.llm_chat`，修订号 `model-1:<逻辑模型>`，需在 settings 配置 `evaluation_model`）。规则档案只在有证据时下判断：作者声明为 `declared`，规则推断为 `inferred` 并带置信度与依据；没有证据的维度列入 `unknown_dimensions`。
 - **复用**：同一目标键、档案与修订号、维度覆盖、未超过 `max_age` / `refresh_after` 时复用；`refresh` 生成新记录，并以 `supersedes` 链接旧记录。
 - **修正**：`add`/`remove`/`replace`/`confirm`，作用域为 `global` 或 `app:<id>`；修正不改评价记录，自动重算不会覆盖修正（A53）。变化流 `eval.changes` 记录新结果与修正。
@@ -261,7 +266,7 @@ Push 对象（§13.1）：
 ### 5.5 来源与关注（§7.6、§7.7）
 
 - Follow：`sources.resolve {kind: follow}` 只接受 DID（不是 DID 返回 `homestation.validation.did`），名称取自 Message Center 联系人；按名称找人由前端调用 Message Center 的 `contact.lookup`。读取对方 `/home/<user>/profile` 补充名称；已知没有 HomeStation 的身份返回 `homestation.follow.noHome`；建立来源后发表关注声明并投递，变化读取同步对方发表流（首次用展示读取回填）。
-- 好友：Message Center 中 `friend_state = friend` 且未拉黑的联系人（含同 Zone 用户）派生 `friend` 依据并发表关注声明，没有 HomeStation 的好友跳过；好友解除后移除该依据，没有其他依据时撤回关注声明并删除来源（A36）。同步在服务启动时做一次，之后每当 Message Center 发出该用户的联系人变更事件（kevent `/msg_center/*/CONTACTS/**`，一秒内的连续事件合并处理）时重做，不再每小时轮询。只有好友依据的来源不能单独取消关注，返回 `friend_basis`，界面引导改用“不看”。
+- 好友：Message Center 中 `friend_state = friend` 且未拉黑的联系人（含同 Zone 用户）派生 `friend` 依据并发表关注声明，没有 HomeStation 的好友跳过；好友解除后移除该依据，没有其他依据时撤回关注声明并删除来源（A36）。同步在服务启动时做一次，之后每当 Message Center 发出该用户的联系人变更事件（kevent `/obj/msg-center/owners/*/contacts/changed`，一秒内的连续事件合并处理）时重做，不再每小时轮询。只有好友依据的来源不能单独取消关注，返回 `friend_basis`，界面引导改用“不看”。
 - Zone 关系：`zone` 依据与 `friend` 同类（系统派生、`sources.unfollow` 返回 `zone_basis`）。Agent 关注它的主人与同 Zone 的其他 Agent，人关注自己名下的 Agent；期望集合之外的 `zone` 依据被移除，没有其他依据时撤回关注声明并删除来源。在服务启动、用户集合变化（§1）与 `admin.run friends` 时重做。主人 → Agent 还会经 Message Center 的 Agent 联系人（`friend_state = friend`）得到 `friend` 依据，两种依据并存。
 - 我关注的人：以主动依据（`active`）关注某人时，给该联系人加应用 tag `homestation.following`（Message Center `contact.update_tags`，联系人不存在时以陌生人创建；需要 RBAC `obj://msg-center/contact_tags/homestation` 的 write），取消主动关注时移除；好友派生的关注不打这个 tag。`sources` 表是关注的真相源，tag 只是投影：写失败只记日志；服务启动、每次联系人变更事件与 `admin.run friends` 时按 `sources` 对账，只写差异。
 - URL：先探测是否是 HomeStation 页面（`/homestation/<user>` 或 `/home/<user>/…` 取该用户的 `/home/<user>/profile`；`www.`/`homestation.` 短域名或 Zone 根的 `/` 取 `GET /home/` 的默认发表流；`profile.did` 给出 DID；汇总列表不按人关注），再识别 RSS/Atom 或网页声明的 feed，否则作为网站链接卡片来源；这些来源的通知状态为 `unsupported`（A45）。
@@ -283,7 +288,12 @@ RSS/Atom 条目与网页形成**私人抓取**：owner 名义、无入口、仅�
 
 ## 6. 持久数据
 
-SQLite（WAL）。每个用户一个数据库 `<data dir>/users/<user>/homestation.db`（`meta.schema_version = 2`，下表）；Zone 级 `<data dir>/zone.db`（汇总列表，§5.7）。chunk 是内容寻址的，全 Zone 共用：单机模式存在 `<data dir>/chunks/`，服务模式使用 Zone 命名对象存储（NDM）；读取授权仍按各用户的 `object_grants`。处于开发期，格式变化直接升版本、不做迁移：v0.1 的单用户库 `<data dir>/homestation.db`（入口没有用户段）不再使用。
+格式、桶、key 方案与谁绑定见《HomeStation Durable Data Schema》（同目录）。要点：
+
+- **一个 RDB Instance**：rdb_mgr 实例 `homestation-main`（scheduler `add_homestation()` 登记，schema `buckyos_api::HOMESTATION_RDB_SCHEMA_SQLITE`，`meta.schema_version = 3`），所有用户的表都以 `owner`（用户名）开头，Zone 汇总列表（§5.7）也在同库。单机模式是 `<data-dir>/homestation-main.db`。
+- **对象与字节在 Zone named store，保留经用户桶**：`user/homestation/<user>/entries`（本人条目各版本，documents）、`published`（这些版本的附件，documents，key `<namespace>/<entry key>/<version>/<n>`，撤回 = 解绑）、`following-entries` / `following`（别人动态与附件的预取副本，ambient，带 `origin`，离开待读 / 候选 / 收藏后解绑）、`scratch`（上传、长文正文、网页快照，temp 7 天）、`cache`（派生物，声明未用）。读取授权仍按各用户的 `object_grants`。
+- RDB `objects` 是本地已验对象缓存（含签名 JWT，供投递与同步读取）；本人发表的版本另以规范 JSON 绑定在 `entries`。
+- 处于开发期，格式变化直接升版本、不做迁移；旧的 `users/<user>/homestation.db`、`zone.db`、单机 `chunks/` 不再使用。
 
 | 表 | 内容 | 分类 |
 | --- | --- | --- |
@@ -298,13 +308,14 @@ SQLite（WAL）。每个用户一个数据库 `<data dir>/users/<user>/homestati
 | `eval_records`、`eval_tasks`、`tag_overrides`、`eval_changes` | 评价记录、任务、修正、变化流 | 持久 |
 | `behavior_events` | 临时行为事件 | 可丢弃，默认 7 天 |
 | `agreements`、`consumption_proofs`、`collector_index` | 消费约定与已发证明、收录索引 | 持久 |
-| `settings` | 用户设置（默认受众、不看与过滤规则、Topic、收录者、门户资料等） | 持久 |
+| `settings` | 用户设置（默认受众、不看与过滤规则、Topic、收录者、门户资料等）与各用户的同步游标 | 持久 |
+| `zone_feed`、`zone_changes` | Zone 汇总列表与变化序列（Zone 的行，无 `owner`） | 持久 |
 
 ## 7. 运行
 
 ### 7.1 服务模式
 
-- 构建与安装：`bucky_project.yaml` 模块 `homestation` → `bin/homestation/`；`rootfs/bin/homestation/kernel_pkg.toml`；scheduler `add_homestation()` 写入 `services/homestation/spec|settings`。
+- 构建与安装：`bucky_project.yaml` 模块 `homestation` → `bin/homestation/`；`rootfs/bin/homestation/kernel_pkg.toml`；scheduler `add_homestation()` 写入 `services/homestation/spec|settings`，spec 带 `rdb_instances.homestation-main`、`buckets`（`buckyos_api::homestation_bucket_decls()`）与 `storage_quota_mib`。
 - 网关：`boot_gateway.yaml` 把 `/home/*` 转发到 `homestation`，`/kapi/homestation` 走通用路由；鉴权都在服务内完成。scheduler 生成的 `node_gateway_info` 把 `homestation` 主机（`homestation.<zone>`）与 `_`、`www`、`sys` 一样交给 control-panel（Desktop），并列为应用不能占用的保留主机名。
 - 用户：system config `users/*`（`profile`、`settings`），缓存 60 秒；服务启动时打开全部用户的 Station，新用户在首次请求时打开。
 - RBAC：`g, system:homestation, frame`（含读取 `users/*`），另加 `p, system:homestation, obj://msg-center/owners/*,read,allow`，用于读取每个用户的 Message Center 联系人。
@@ -316,20 +327,23 @@ SQLite（WAL）。每个用户一个数据库 `<data dir>/users/<user>/homestati
 ```
 
 - `collector` 让 Zone owner 的 HomeStation 担任收录者；`default_feed` 为用户名或 `~zone`；`zone_feed_writers` 见 §5.7；`zone_name` 是汇总列表的显示名；未设置时取 Zone 展示设置（`system/zone_presentation` 的 `display_name`，其次 ZoneDocument 约定字段），再次为 Zone 主机名。服务每 60 秒重读 Zone 展示设置，`~zone` 资料的 `avatar` 即 Zone 图标。
-- 系统依赖：verify-hub 会话令牌、system-config（用户表、用户 DID、Zone 文档）、Message Center 联系人、NDM 命名对象存储、名字服务（跨 Zone 的 DID 与密钥）、AICC（仅模型评价）。
+- 系统依赖：verify-hub 会话令牌、system-config（用户表、用户 DID、Zone 文档、rdb 实例配置）、Message Center 联系人、Zone 命名对象存储与 nfs-server 的 `bucket.*`（kRPC `/kapi/nfs-server`，以服务会话调用）、名字服务（跨 Zone 的 DID 与密钥）、AICC（仅模型评价）。
 
 ### 7.2 单机模式与开发网络
 
 ```bash
 cd src
 cargo run -p homestation -- --keygen                # 生成密钥：private_key_pem / public_key_x / did_dev
-cargo run -p homestation -- --data-dir /tmp/hs-a --config hs-a.json
+cargo run -p homestation -- --bucket-specs > hs-buckets.json
+cargo run -p nfs_server -- --listen 127.0.0.1:3260 --data-dir /tmp/hs-a-nfs --export tmp=/tmp/hs-a-nfs-export \
+  --named-store /tmp/hs-a-nfs/store --bucket-specs hs-buckets.json    # 该 Zone 的 named store 与桶（无鉴权，仅本机）
+cargo run -p homestation -- --data-dir /tmp/hs-a --config hs-a.json   # hs-a.json 带 "nfs_server": "http://127.0.0.1:3260"
 cargo run -p homestation --example devnet -- --port 4131 --data-dir /tmp/hs-devnet --fresh
 ```
 
-单机配置字段：`owner`、`owner_name`、`user`（owner 的用户名，默认 `owner`）、`zone`、`zone_name`、`users[{user, did, name, contacts, settings, collector, zone_feed_writer}]`（同 Zone 的其他用户）、`default_feed`、`zone_feed_writers`、`private_key_pem` 或 `private_key_file`、`kid`、`listen`、`collector`、`spider`、`workers`、`disclose_admission`、`intervals_s{pull,delivery,select,comments}`、`reading_window`、`tokens{<token>: {principal, did, app_id}}`、`directory{identities{<did>: {zone, user, public_key_x, devices, owner}}, zones{<zone>: <origin>}}`、`contacts[{did, name, friend, blocked, tags, following, avatar}]`、`settings`（初始用户设置）。
+单机配置字段：`owner`、`owner_name`、`user`（owner 的用户名，默认 `owner`）、`zone`、`nfs_server`（该 Zone 的 nfs-server 地址，必填）、`zone_name`、`users[{user, did, name, contacts, settings, collector, zone_feed_writer}]`（同 Zone 的其他用户）、`default_feed`、`zone_feed_writers`、`private_key_pem` 或 `private_key_file`、`kid`、`listen`、`collector`、`spider`、`workers`、`disclose_admission`、`intervals_s{pull,delivery,select,comments}`、`reading_window`、`tokens{<token>: {principal, did, app_id}}`、`directory{identities{<did>: {zone, user, public_key_x, devices, owner}}, zones{<zone>: <origin>}}`、`contacts[{did, name, friend, blocked, tags, following, avatar}]`、`settings`（初始用户设置）。
 
-配置中的密钥是 Zone 的签名者，配置里的每个用户自动登记为由它签名；本 Zone 的源站默认指向 `listen`。`devnet` 在一个进程里启动 `me` 的 Zone（Desktop 的用户 `me`，令牌 `tok-me`；同 Zone 的第二个用户 `kai`，令牌 `tok-kai`；`me` 的 m1 与 kai 的 k1 列入汇总列表）、alice、bob、sarah 的 Zone、收录者 index 和一个 RSS 夹具站点，预置好友、关注、各类发表、评论、点赞、引用转发与订阅，节点之间只通过协议路径通信。Desktop 用 `HS_BACKEND=http://127.0.0.1:4131` 接入（见前端 README / UI_DATAMODEL）。
+配置中的密钥是 Zone 的签名者，配置里的每个用户自动登记为由它签名；本 Zone 的源站默认指向 `listen`。`devnet` 在一个进程里启动 `me` 的 Zone（Desktop 的用户 `me`，令牌 `tok-me`；同 Zone 的第二个用户 `kai`，令牌 `tok-kai`；`me` 的 m1 与 kai 的 k1 列入汇总列表）、alice、bob、sarah 的 Zone、收录者 index 和一个 RSS 夹具站点，预置好友、关注、各类发表、评论、点赞、引用转发与订阅，节点之间只通过协议路径通信；每个 Zone 在进程内带一个 nfs-server（named store 与桶，`tests/common/nfs.rs`）。Desktop 用 `HS_BACKEND=http://127.0.0.1:4131` 接入（见前端 README / UI_DATAMODEL）。
 
 ## 8. 验证
 
@@ -349,17 +363,18 @@ cd src/frame/desktop && BUCKYOS_UI_DV_BASE_URL=https://test.buckyos.io npx playw
 
 DV 部署：`uv run buckyos-build.py -s homestation`（以及改了 Zone 主机路由时的 `-s scheduler`、改了前端时的 `-s desktop`），把 `rootfs/bin/homestation/homestation`、`rootfs/bin/scheduler/scheduler`、`rootfs/bin/control-panel/web/` 复制到 `/opt/buckyos/bin/` 的对应位置（先备份），结束进程后由 node_daemon 拉起。
 
-Desktop 前端：`pnpm exec playwright test tests/e2e/pages/homestation.spec.ts`（Mock，16 例，含门户与汇总列表）；`HS_DEVNET_BIN=<cargo target>/debug/examples/devnet pnpm exec playwright test --config=playwright.homestation.config.ts`（真实后端 devnet，12 例：门户匿名与同 Zone 好友读取、条目链接、汇总列表与“同时发布到 Zone 主页”、`www.localhost` 模拟短域名）。
+Desktop 前端：`pnpm exec playwright test tests/e2e/pages/homestation.spec.ts`（Mock，18 例，含门户与汇总列表）；`HS_DEVNET_BIN=<cargo target>/debug/examples/devnet pnpm exec playwright test --config=playwright.homestation.config.ts`（真实后端 devnet，12 例：门户匿名与同 Zone 好友读取、条目链接、汇总列表与“同时发布到 Zone 主页”、`www.localhost` 模拟短域名；devnet 数据在系统临时目录 `homestation-devnet-e2e`，不放 `test-results/`，以免其他 Playwright 运行清目录）。
 
-多节点测试（`tests/`）在同一进程内启动多个真实 Zone 的 HomeStation 服务，各自有 Zone 密钥、用户数据库、chunk 目录与 HTTP 监听，只通过协议路径交互；一个 Zone 可以有多个用户（`Net::new_zones`）：
+多节点测试（`tests/`）在同一进程内启动多个真实 Zone 的 HomeStation 服务，各自有 Zone 密钥、数据库、nfs-server（named store 与桶，`tests/common/nfs.rs`）与 HTTP 监听，只通过协议路径交互；一个 Zone 可以有多个用户（`Net::new_zones`），共用该 Zone 的数据库与 nfs-server：
 
 | 文件 | 场景 |
 | --- | --- |
-| `network.rs` | 按读者身份的展示读取与读者证明（A66、A69、A32）；投递准入、披露、幂等、Push/Pull 合并（A01、A04、A05）；版本、撤回、旧 Head 重放、先 Head 后对象、同 seq 冲突（A17、A23、A24、A26、A30）；入口命名空间与内容规则（A46–A48）；他人门户的匿名预览、空闲时变化计数不动（A43） |
+| `network.rs` | 按读者身份的展示读取（A66、A69、A32）；投递准入、披露、幂等、Push/Pull 合并（A01、A04、A05）；版本、撤回、旧 Head 重放、先 Head 后对象、同 seq 冲突（A17、A23、A24、A26、A30）；入口命名空间与内容规则（A46–A48）；他人门户的匿名预览、空闲时变化计数不动（A43） |
 | `interactions.rs` | 评论与点赞到达作者与收录者、多视图合并与去重、作者移除可观测、取消点赞（A12–A16、A21–A23、A27）；受限内容的转发与评论（A70、A71）；私有 / 公开收藏、普通转发与引用转发（A11、A28、A40、A49、A74） |
 | `reading.rs` | 媒体按 ObjId 准备与校验、发布幂等、AI 标签过滤与修正、搜索、不看（A02、A06、A35、A41、A44、A51–A53、A56）；关注补看（A37–A39）；收录者冷启动（A18）；变化读取与压缩重同步（A67、A68） |
 | `services.rs` | 评价服务的身份 / 文件 / 路径 / InnerPath 目标、复用与刷新、异步任务、共享（A57–A62）；修正作用域（A64、A65）；消费证明（A19、A20）；权限边界（A25、A43） |
 | `sources.rs` | 离线接收方与重试（A13、A33）；Spider、私人抓取、快照与分享（A03、A45、A72）；好友派生关注（A34、A36）；没有 HomeStation 的好友不关注、不投递；自然语言意图（A42） |
+| `object_import.rs` | 上传在 `scratch` 的绑定即持有证明（缺失、绑的是别的对象都拒绝）；发表把版本绑进 `entries`、附件绑进 `published`，编辑后两个版本都在，撤回全部解绑；目录 / ChunkList / 空文件按受众可读；别人的动态预取进 `following-entries` / `following` 并带 `origin`，离开待读且取消稍后再看后解绑 |
 | `zone.rs` | 一个 Zone 的多个用户：Zone 索引与 DID 查询、同 Zone 互相关注与 Push / Pull、按读者的受众、状态隔离、其他 Zone 关注本 Zone 用户与 Zone 托管签名、伪造主页路径被拒（A75、A76）；汇总列表的写权限、公开限制、展示与变化读取、门户方法匿名可用、汇总列表媒体（A77、A78） |
 
 ## 9. 与架构的差异、已知限制与待定
@@ -367,7 +382,7 @@ Desktop 前端：`pnpm exec playwright test tests/e2e/pages/homestation.spec.ts`
 | 项 | 现状 |
 | --- | --- |
 | Head 字段 | 增加 `publisher`（§2.3） |
-| 读者身份 | 自签读者证明（§3.2），待对齐 CYFS 跨 Zone 身份机制 |
+| 读者身份 | 跨 Zone 登录换取的 External 会话（§3.2） |
 | 我关注的人 | `homestation.following` 是 `sources` 的投影，My Network 只读显示；别处对该 tag 的改动会在下次对账时按 `sources` 改回。HomeStation 自己写 tag 也会产生联系人变更事件，多触发一轮不写任何东西的好友同步与对账（已知） |
 | Zone 托管签名 | 服务模式用 OOD 设备密钥替 Zone 的所有用户签名；验证方接受发表者所在 Zone 的设备（已知风险：Zone 可以替其用户签名）。用户自己的密钥（`security/<user>/key`）未使用 |
 | Agent | 已支持为发表者（§1）；Agent 没有自己的 Message Center 联系人，`friends`/`group` 受众对它不可用，只发 `public`；跨 Zone 的 Agent 关注未验证 |
@@ -375,7 +390,7 @@ Desktop 前端：`pnpm exec playwright test tests/e2e/pages/homestation.spec.ts`
 | 设备签名的跨 Zone 验证 | 依赖对方解析发表者 / 设备 DID Document（`authentication` 或设备 `owner`）；未在真实多 Zone 环境验证。did:dev 设备 DID 无可解析的 owner 关系 |
 | 网关缓存 | 未配置 NamedInboxCacheServer，`cached` 只会来自对端网关 |
 | 大文件 | 只预取与校验单 chunk 文件；chunk list 内容记为 `reachable`，不预取、不校验 |
-| 媒体令牌 | 浏览器媒体元素用 `?access=<session token>` 取内容（已知风险） |
+| 媒体令牌 | 浏览器媒体元素用 `/home/<user>/objects/<ObjId>/content?access=<session token>` 取内容（已知风险：令牌在 URL 中）。2026-10-26 评估后保留、不改成 `/bucket/v1` + 单 key 只读令牌：读者授权是条目受众（好友 / 分组 / 指定 DID / 关注者）而不是桶权限，别人动态的内容在 ambient 桶里可能不在本地，要经 HomeStation 按需从持有者再取，`/bucket/v1` 的 v1 只回 404；单 key 令牌要每个媒体一次 RPC 签发且同样放在 URL 里。匿名公开读取 `/home/<user>/...` 是对外协议，不变。后续可让 `/home/` 路径接受同源 SSO cookie，去掉 `access=` |
 | 点踩 | 仅本地反馈，不发表、不计数（TODO §13 待确认） |
 | 默认受众 | 公开，可在偏好设置修改（TODO §13 待确认） |
 | 门户 | Desktop 路由 `/homestation/<user>`、`/homestation/<user>/<key>`、`/homestation/~zone`，短域名 `/` 为默认发表流（§5.7）；门户只读，登录访客可以关注；评论只显示作者视图 |
@@ -389,6 +404,6 @@ Desktop 前端：`pnpm exec playwright test tests/e2e/pages/homestation.spec.ts`
 
 ### 标准文件与目录导入
 
-浏览器使用 WebSDK `importFiles` / `ensureUploaded` 等待 `objectStatus=ready`，然后登记 ObjId。`object.register` 仅接受本用户的非 restricted session，并将该 session 原样转发到 NDM `get_object` 检查读取权（不借用 HomeStation 服务身份）；全依赖完整后登记对象树。图片、音视频保留专用类型，普通文件/目录用 `file` / `dir` 附件及 `content.type=files`。媒体展示元数据独立于 canonical 对象，发布时核对类型和非空；目录不自动转 ZIP 或图片集。
+浏览器先调 `object.upload_target {name}` 取得本人 `scratch` 桶里的一个新 key，再用 WebSDK `importFiles` / `ensureUploaded({ bind })` 上传，finalize 时 `auto_bind` 到该 key（7 天内有效，不再“只 put 不 pin”），然后 `object.register {objId, key}`：媒体附件的类型由对象自身的 `mime` 判定，`/content` 的 Content-Type 也读它。服务读这个绑定，确认它绑的正是该 ObjId（用户自己的上传就是持有证明），全依赖完整后登记对象树。不带 `key` 的登记（Agent 的产物）仍把调用者会话原样转发到 NDM `get_object` 检查读取权（不借用 HomeStation 服务身份）。`object.register` 只接受本用户的非 restricted session。图片、音视频保留专用类型，普通文件/目录用 `file` / `dir` 附件及 `content.type=files`。媒体展示元数据独立于 canonical 对象，发布时核对类型和非空；目录不自动转 ZIP 或图片集。
 
-FileObject 内容通过 NamedStore `open_reader` 支持 ChunkList，内容响应目前最多 64 MiB/文件；目录 JSON 可逐层读取，子对象与 chunks 继承同一条目的受众授权，撤回后停止访客访问。发布前按文件/目录根递归保留，失败或重试继续使用现有 publish key，NDM 临时 holding 不代替正式 retention。普通 Zone 的浏览器授权/断网恢复仍需在部署环境验收；独立服务测试通过预置对象验证业务读写和权限，不模拟成真实 NDM 登录上传。
+FileObject 内容通过 NamedStore `open_reader` 支持 ChunkList，内容响应目前最多 64 MiB/文件；目录 JSON 可逐层读取，子对象与 chunks 继承同一条目的受众授权，撤回后停止访客访问。发表时在写数据库之前把版本绑进 `entries`、把每个附件按 ObjId 绑进 `published`（`<namespace>/<entry key>/<version>/<n>`）；数据库写失败就解开刚绑的 key；撤回后解绑整个条目，再撤回一次会补做没解开的绑定。普通 Zone 的浏览器授权/断网恢复仍需在部署环境验收；独立服务测试用进程内 nfs-server 预置对象与 scratch 绑定验证业务读写和权限。

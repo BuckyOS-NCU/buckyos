@@ -1,7 +1,7 @@
-import { accessDenialOf, buckyos, type AccessDenial, type EntryDescriptor } from 'buckyos'
+import { accessDenialOf, buckyos, type AccessDenial, type EntryDescriptor, type DID, type NotifyCategory, type NotifyKind, type NotifyStatus, type ndn } from 'buckyos'
 import { fetchUserDetail } from '../../../api/user_mgr'
-import type { DID, MsgObject, NotifyCategory, NotifyKind, NotifyStatus } from '../protocol/msgobj'
 import type { NotifyView } from '../notify/model'
+import { groupErrorCode } from '../groupModel'
 
 /**
  * Thin client for the msg-center RPC surface used by MessageHub. Wire shapes
@@ -52,7 +52,7 @@ export interface IngressContext {
   contact_mgr_owner?: DID
 }
 
-/** A mailbox owner's reference to one immutable MsgObject. */
+/** A mailbox owner's reference to one immutable ndn.MsgObject. */
 export interface MailboxRecord {
   mailbox: string
   record_id: string
@@ -74,7 +74,7 @@ export interface MailboxRecord {
 
 export interface MailboxRecordWithObject {
   record: MailboxRecord
-  msg?: MsgObject | null
+  msg?: ndn.MsgObject | null
 }
 
 /** Owner-scoped session metadata (`msg.get_session_state`). */
@@ -124,7 +124,7 @@ export interface SessionMessageItem {
   to: DID
   recipient_state?: RecipientState
   delivery?: SessionDeliveryView
-  msg?: MsgObject | null
+  msg?: ndn.MsgObject | null
 }
 
 export interface SessionMessagePage {
@@ -305,13 +305,16 @@ export const listBoxByTime = (input: { mailbox: string; box_kind: MailboxKind; l
 
 /* ── Send ── */
 
-export async function postSendMessage(msg: MsgObject, idempotencyKey?: string): Promise<PostSendResult> {
+export async function postSendMessage(msg: ndn.MsgObject, idempotencyKey?: string): Promise<PostSendResult> {
   const request: Record<string, unknown> = { msg }
   if (idempotencyKey) request.idempotency_key = idempotencyKey
   const result = await call<PostSendResult | null>('msg.post_send', request)
   if (!result || typeof result.ok !== 'boolean') throw new MessageHubApiError('post_send returned no result', 'unknown')
   return result
 }
+
+/** `msg.collect_attachment`: the attachment's copy in the caller's `collected` bucket. */
+export const collectAttachment = (objId: string, contextPath: string) => call<{ bucket_id: string; key: string }>('msg.collect_attachment', { obj_id: objId, context_path: contextPath })
 
 /* ── UI session state (legacy session-only KV and owner-scoped KV) ── */
 
@@ -450,7 +453,7 @@ export interface PendingSessionInvitation {
   title?: string | null
   invited_by?: DID
 }
-export const listGroupsByMember = () => call<{ items?: GroupDocEnvelope[]; joined?: JoinedGroupSummary[]; session_invitations?: PendingSessionInvitation[] } | null>('group.list_by_member', {}).then(result => result ?? {})
+export const listGroupsByMember = () => call<{ items?: GroupDocEnvelope[]; joined?: JoinedGroupSummary[]; invitations?: Array<{ group_did?: DID; doc?: GroupDoc; member?: Partial<GroupMemberRecord> }>; session_invitations?: PendingSessionInvitation[] } | null>('group.list_by_member', {}).then(result => result ?? {})
 export const getGroupDoc = (groupDid: DID) => call<GroupDocEnvelope>('group.get_doc', { group_did: groupDid })
 export const getGroupConfig = (groupDid: DID) => call<GroupConfig>('group.get_config', { group_did: groupDid })
 /** Members of a hosted group plus the owner transfer still waiting for its target (members only; the public doc never carries it). */
@@ -474,6 +477,7 @@ export const createGroup = (input: { idempotency_key: string; profile: { name: s
 export const applyGroupConfig = (groupDid: DID, expectedRevision: string, patch: Record<string, unknown>, idempotencyKey: string) => call<{ revision: string }>('group.apply_config', { group_did: groupDid, expected_revision: expectedRevision, patch, ...key(idempotencyKey) })
 export const inviteGroupMember = (groupDid: DID, memberDid: DID, idempotencyKey: string) => call<{ invite_id: string; member_did: DID; expires_at_ms: number; state: 'invited' | 'active' | 'pending_admin_approval' }>('group.invite_member', { group_did: groupDid, member_did: memberDid, ...key(idempotencyKey) })
 export const removeGroupMember = (groupDid: DID, memberDid: DID, idempotencyKey: string) => call<unknown>('group.remove_member', { group_did: groupDid, member_did: memberDid, ...key(idempotencyKey) })
+export const revokeGroupInvite = (groupDid: DID, memberDid: DID, idempotencyKey: string) => call<{ state: 'revoked' }>('group.revoke_invite', { group_did: groupDid, member_did: memberDid, ...key(idempotencyKey) })
 export const approveGroupMember = (groupDid: DID, memberDid: DID, idempotencyKey: string) => call<GroupMemberRecord>('group.approve_member', { group_did: groupDid, member_did: memberDid, ...key(idempotencyKey) })
 export const rejectGroupMember = (groupDid: DID, memberDid: DID, idempotencyKey: string) => call<GroupMemberRecord>('group.reject_member', { group_did: groupDid, member_did: memberDid, ...key(idempotencyKey) })
 export const updateGroupMemberRole = (groupDid: DID, memberDid: DID, role: 'admin' | 'member', idempotencyKey: string) => call<{ role: string }>('group.update_member_role', { group_did: groupDid, member_did: memberDid, role, ...key(idempotencyKey) })
@@ -487,7 +491,7 @@ export const deleteGroup = (groupDid: DID, idempotencyKey: string) => call<{ lif
 export const createGroupInviteLink = (groupDid: DID, options: { expires_at_ms?: number; max_uses?: number; require_approval?: boolean }, idempotencyKey: string) => call<GroupInviteLink>('group.create_invite_link', { group_did: groupDid, ...options, ...key(idempotencyKey) })
 export const revokeGroupInviteLink = (groupDid: DID, token: string, idempotencyKey: string) => call<unknown>('group.revoke_invite_link', { group_did: groupDid, token, ...key(idempotencyKey) })
 /** Accepts a direct invitation; `memberDid` only when the viewer accepts on behalf of its agent. */
-export const acceptGroupInvitation = (groupDid: DID, invitationId: string, memberDid?: DID) => call<GroupMemberRecord>('group.accept_invitation', { group_did: groupDid, invitation_id: invitationId, ...(memberDid ? { member_did: memberDid } : {}) })
+export const acceptGroupInvitation = (groupDid: DID, invitationId: string, memberDid?: DID) => call<GroupMemberRecord & { sync_pending?: boolean }>('group.accept_invitation', { group_did: groupDid, invitation_id: invitationId, ...(memberDid ? { member_did: memberDid } : {}) })
 /** Asks to join (open / request_and_approve policy) or joins through an invite link token. */
 export const requestGroupJoin = (groupDid: DID, invite?: string) => call<GroupMemberRecord>('group.request_join', { group_did: groupDid, ...(invite ? { invite } : {}) })
 export const createGroupSession = (groupDid: DID, input: { title?: string; idempotency_key: string }) => call<{ group_did: DID; session_id: string; session: string; revision: string }>('group.create_session', { group_did: groupDid, ...input })
@@ -514,10 +518,9 @@ export const updateGroupMemberState = (groupDid: DID, sessionId: string | undefi
 
 /** The host's reason code (`capability-denied`, `invitation-mismatch`, …) carried in an RPC error. */
 export function groupErrorReason(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error)
-  // msg-center refuses to add an Agent whose `allow_group` is off (NoPermission … agent_group_disabled).
-  if (message.includes('agent_group_disabled')) return 'agent-group-disabled'
-  return message.match(/[a-z0-9]+(?:-[a-z0-9]+)+/)?.[0] ?? 'unknown'
+  const reason = groupErrorCode(error)
+  if (reason === 'unknown' && error instanceof MessageHubApiError && error.kind === 'unavailable') return 'unavailable'
+  return reason
 }
 
 /* ── System Notify (`msg_notify.rs`) ── */

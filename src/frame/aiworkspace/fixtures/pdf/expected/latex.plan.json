@@ -1,0 +1,1298 @@
+{
+ "plans": [
+  {
+   "id": "p1",
+   "name": "Page 1",
+   "background": "#ffffff",
+   "pageSize": {
+    "w": 1484,
+    "h": 1920
+   },
+   "items": [
+    {
+     "key": "p1",
+     "parent": null,
+     "type": "group",
+     "rect": {
+      "x": 0,
+      "y": 0,
+      "w": 1484,
+      "h": 1920
+     },
+     "rotation": 0,
+     "config": {}
+    },
+    {
+     "key": "p1~frame",
+     "parent": "p1",
+     "type": "frame",
+     "rect": {
+      "x": 0,
+      "y": 0,
+      "w": 1484,
+      "h": 1920
+     },
+     "rotation": 0,
+     "title": "Page 1",
+     "config": {
+      "color": "#9ca3af",
+      "fill": "#ffffff",
+      "stroke_width": 1,
+      "radius": 0,
+      "pdf_source": {
+       "page": 1,
+       "kind": "page"
+      }
+     },
+     "payload": {
+      "presentation": {
+       "background": "#ffffff"
+      }
+     }
+    },
+    {
+     "key": "p1~t0",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 444.91,
+      "y": 178.99,
+      "w": 499.74,
+      "h": 59.52
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "A Short Article on Import",
+      "font_size": 41.21,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "bold": true,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "A Short Article on Import",
+        "width": 499.74,
+        "height": 59.52,
+        "fontSize": 41.21,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": true,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "A Short Article on Import",
+          "x": 6,
+          "y": 44.04,
+          "width": 460.13,
+          "size": 41.21
+         }
+        ]
+       }
+      }
+     },
+     "title": "A Short Article on Import"
+    },
+    {
+     "key": "p1~t1",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 629.15,
+      "y": 248.95,
+      "w": 174.72,
+      "h": 44.36
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "A. N. Author",
+      "font_size": 29.09,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "A. N. Author",
+        "width": 174.72,
+        "height": 44.36,
+        "fontSize": 29.09,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "A. N. Author",
+          "x": 6,
+          "y": 32.26,
+          "width": 153.51,
+          "size": 29.09
+         }
+        ]
+       }
+      }
+     },
+     "title": "A. N. Author"
+    },
+    {
+     "key": "p1~t2",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 168.55,
+      "y": 336.22,
+      "w": 210.74,
+      "h": 44.36
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "1 Introduction",
+      "font_size": 29.09,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "bold": true,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "1 Introduction",
+        "width": 210.74,
+        "height": 44.36,
+        "fontSize": 29.09,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": true,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "1 Introduction",
+          "x": 6,
+          "y": 32.26,
+          "width": 187.49,
+          "size": 29.09
+         }
+        ]
+       }
+      }
+     },
+     "title": "1 Introduction"
+    },
+    {
+     "key": "p1~t3",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 168.55,
+      "y": 390.02,
+      "w": 874.36,
+      "h": 124.36
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "  This is the first paragraph of a short article, typeset the way LaTeX does it.\nEvery line is justified: the space between words varies from line to line, and kerning\nmoves single letters by a few thousandths of an em, as in Word and Type.\nThe last line of a paragraph is shorter.",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "line_height": 1.2,
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "  This is the first paragraph of a short article, typeset the way LaTeX does it.\nEvery line is justified: the space between words varies from line to line, and kerning\nmoves single letters by a few thousandths of an em, as in Word and Type.\nThe last line of a paragraph is shorter.",
+        "width": 874.36,
+        "height": 124.36,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": 1.2,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "This is the first paragraph of a short article, typeset the way LaTeX does it.",
+          "x": 42.36,
+          "y": 26.95,
+          "width": 727.13,
+          "size": 24.24
+         },
+         {
+          "text": "Every line is justified: the space between words varies from line to line, and kerning",
+          "x": 6,
+          "y": 56.04,
+          "width": 813.55,
+          "size": 24.24
+         },
+         {
+          "text": "moves single letters by a few thousandths of an em, as in Word and Type.",
+          "x": 6,
+          "y": 85.13,
+          "width": 716.78,
+          "size": 24.24
+         },
+         {
+          "text": "The last line of a paragraph is shorter.",
+          "x": 6,
+          "y": 114.22,
+          "width": 367.59,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "This is the first paragraph of a short article, typeset the way LaTeX does it."
+    },
+    {
+     "key": "p1~t4",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 168.55,
+      "y": 520.93,
+      "w": 896.13,
+      "h": 66.18
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "  A second paragraph starts with the same indent and runs over two lines so that the\nimporter has to keep it apart from the first one.",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "line_height": 1.2,
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "  A second paragraph starts with the same indent and runs over two lines so that the\nimporter has to keep it apart from the first one.",
+        "width": 896.13,
+        "height": 66.18,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": 1.2,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "A second paragraph starts with the same indent and runs over two lines so that the",
+          "x": 42.36,
+          "y": 26.95,
+          "width": 797.72,
+          "size": 24.24
+         },
+         {
+          "text": "importer has to keep it apart from the first one.",
+          "x": 6,
+          "y": 56.04,
+          "width": 453.79,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "A second paragraph starts with the same indent and runs over two lines so that the"
+    },
+    {
+     "key": "p1~t5",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 551.58,
+      "y": 607.6,
+      "w": 87.86,
+      "h": 38.3
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "E = mc",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "italic": true,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "E = mc",
+        "width": 87.86,
+        "height": 38.3,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": true,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "E = mc",
+          "x": 6,
+          "y": 27.55,
+          "width": 71.56,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "E = mc"
+    },
+    {
+     "key": "p1~t6",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 551.58,
+      "y": 604.97,
+      "w": 20.99,
+      "h": 29.21
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "2",
+      "font_size": 16.97,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "2",
+        "width": 20.99,
+        "height": 29.21,
+        "fontSize": 16.97,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "2",
+          "x": 6,
+          "y": 20.49,
+          "width": 8.48,
+          "size": 16.97
+         }
+        ]
+       }
+      }
+     },
+     "title": "2"
+    },
+    {
+     "key": "p1~s0",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 174.55,
+      "y": 678.29,
+      "w": 1134.55,
+      "h": 1
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "line",
+      "fill": "none",
+      "stroke": "#000000",
+      "stroke_width": 0.97,
+      "pdf_source": {
+       "page": 1,
+       "kind": "line"
+      }
+     }
+    },
+    {
+     "key": "p1~s1",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 363.64,
+      "y": 732.12,
+      "w": 727.27,
+      "h": 363.64
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "rect",
+      "fill": "#d9e6ff",
+      "stroke": "#334c99",
+      "stroke_width": 2.42,
+      "pdf_source": {
+       "page": 1,
+       "kind": "rect"
+      }
+     }
+    },
+    {
+     "key": "p1~s2",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 416.97,
+      "y": 816.97,
+      "w": 193.94,
+      "h": 193.94
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "ellipse",
+      "fill": "#ff9900",
+      "stroke": "none",
+      "stroke_width": 0,
+      "pdf_source": {
+       "page": 1,
+       "kind": "ellipse"
+      }
+     }
+    },
+    {
+     "key": "p1~s3",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 613.13,
+      "y": 911.51,
+      "w": 470.7,
+      "h": 4.85
+     },
+     "rotation": 145.49,
+     "config": {
+      "shape": "line",
+      "fill": "none",
+      "stroke": "#008000",
+      "stroke_width": 4.85,
+      "dash": "dashed",
+      "pdf_source": {
+       "page": 1,
+       "kind": "line"
+      }
+     }
+    },
+    {
+     "key": "p1~t7",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 269.63,
+      "y": 924.95,
+      "w": 124.4,
+      "h": 35.27
+     },
+     "rotation": 270,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "vertical axis",
+      "font_size": 21.82,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "vertical axis",
+        "width": 124.4,
+        "height": 35.27,
+        "fontSize": 21.82,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "vertical axis",
+          "x": 6,
+          "y": 25.2,
+          "width": 106.04,
+          "size": 21.82
+         }
+        ]
+       }
+      }
+     },
+     "title": "vertical axis"
+    },
+    {
+     "key": "p1~t8",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 539.45,
+      "y": 1116.69,
+      "w": 381.7,
+      "h": 38.3
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "Figure 1: A box, a circle and a line.",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "italic": true,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "Figure 1: A box, a circle and a line.",
+        "width": 381.7,
+        "height": 38.3,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": true,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "Figure 1: A box, a circle and a line.",
+          "x": 6,
+          "y": 27.55,
+          "width": 348.78,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "Figure 1: A box, a circle and a line."
+    },
+    {
+     "key": "p1~t9",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 168.55,
+      "y": 1678.98,
+      "w": 259.23,
+      "h": 32.24
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "1 A footnote in a smaller size.",
+      "font_size": 19.39,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "1 A footnote in a smaller size.",
+        "width": 259.23,
+        "height": 32.24,
+        "fontSize": 19.39,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "1 A footnote in a smaller size.",
+          "x": 6,
+          "y": 22.84,
+          "width": 233.23,
+          "size": 19.39
+         }
+        ]
+       }
+      }
+     },
+     "title": "1 A footnote in a smaller size."
+    },
+    {
+     "key": "p1~t10",
+     "parent": "p1",
+     "type": "shape",
+     "rect": {
+      "x": 728.55,
+      "y": 1771.24,
+      "w": 24.85,
+      "h": 38.3
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "1",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 1,
+       "kind": "text",
+       "text_layout": {
+        "text": "1",
+        "width": 24.85,
+        "height": 38.3,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "1",
+          "x": 6,
+          "y": 27.55,
+          "width": 12.12,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "1"
+    }
+   ],
+   "bounds": {
+    "x": 0,
+    "y": 0,
+    "w": 1484,
+    "h": 1920
+   },
+   "images": [],
+   "pageColor": "#ffffff",
+   "scale": 2.4242424242424243,
+   "counts": {
+    "text": 11,
+    "images": 0,
+    "shapes": 4,
+    "raster": false
+   }
+  },
+  {
+   "id": "p2",
+   "name": "Page 2",
+   "background": "#ffffff",
+   "pageSize": {
+    "w": 1484,
+    "h": 1920
+   },
+   "items": [
+    {
+     "key": "p2",
+     "parent": null,
+     "type": "group",
+     "rect": {
+      "x": 0,
+      "y": 0,
+      "w": 1484,
+      "h": 1920
+     },
+     "rotation": 0,
+     "config": {}
+    },
+    {
+     "key": "p2~frame",
+     "parent": "p2",
+     "type": "frame",
+     "rect": {
+      "x": 0,
+      "y": 0,
+      "w": 1484,
+      "h": 1920
+     },
+     "rotation": 0,
+     "title": "Page 2",
+     "config": {
+      "color": "#9ca3af",
+      "fill": "#ffffff",
+      "stroke_width": 1,
+      "radius": 0,
+      "pdf_source": {
+       "page": 2,
+       "kind": "page"
+      }
+     },
+     "payload": {
+      "presentation": {
+       "background": "#ffffff"
+      }
+     }
+    },
+    {
+     "key": "p2~t0",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 168.55,
+      "y": 190.77,
+      "w": 138.77,
+      "h": 44.36
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "2 Results",
+      "font_size": 29.09,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "bold": true,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 2,
+       "kind": "text",
+       "text_layout": {
+        "text": "2 Results",
+        "width": 138.77,
+        "height": 44.36,
+        "fontSize": 29.09,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": true,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "2 Results",
+          "x": 6,
+          "y": 32.26,
+          "width": 119.59,
+          "size": 29.09
+         }
+        ]
+       }
+      }
+     },
+     "title": "2 Results"
+    },
+    {
+     "key": "p2~t1",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 168.55,
+      "y": 244.57,
+      "w": 777.85,
+      "h": 66.18
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "  The second page has one more paragraph and a table drawn with rules.\nIts cells are separate lines of text.",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "line_height": 1.2,
+      "pdf_source": {
+       "page": 2,
+       "kind": "text",
+       "text_layout": {
+        "text": "  The second page has one more paragraph and a table drawn with rules.\nIts cells are separate lines of text.",
+        "width": 777.85,
+        "height": 66.18,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": 1.2,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "The second page has one more paragraph and a table drawn with rules.",
+          "x": 42.36,
+          "y": 26.95,
+          "width": 686.13,
+          "size": 24.24
+         },
+         {
+          "text": "Its cells are separate lines of text.",
+          "x": 6,
+          "y": 56.04,
+          "width": 322.47,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "The second page has one more paragraph and a table drawn with rules."
+    },
+    {
+     "key": "p2~s0",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 174.55,
+      "y": 367.76,
+      "w": 552.73,
+      "h": 1.45
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "line",
+      "fill": "none",
+      "stroke": "#000000",
+      "stroke_width": 1.45,
+      "pdf_source": {
+       "page": 2,
+       "kind": "line"
+      }
+     }
+    },
+    {
+     "key": "p2~s1",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 174.55,
+      "y": 464.73,
+      "w": 552.73,
+      "h": 1.45
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "line",
+      "fill": "none",
+      "stroke": "#000000",
+      "stroke_width": 1.45,
+      "pdf_source": {
+       "page": 2,
+       "kind": "line"
+      }
+     }
+    },
+    {
+     "key": "p2~s2",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 174.55,
+      "y": 416.24,
+      "w": 552.73,
+      "h": 1.45
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "line",
+      "fill": "none",
+      "stroke": "#000000",
+      "stroke_width": 1.45,
+      "pdf_source": {
+       "page": 2,
+       "kind": "line"
+      }
+     }
+    },
+    {
+     "key": "p2~t2",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 178.24,
+      "y": 374.87,
+      "w": 76.22,
+      "h": 38.3
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "Name",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "bold": true,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 2,
+       "kind": "text",
+       "text_layout": {
+        "text": "Name",
+        "width": 76.22,
+        "height": 38.3,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": true,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "Name",
+          "x": 6,
+          "y": 27.55,
+          "width": 60.58,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "Name"
+    },
+    {
+     "key": "p2~t3",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 469.15,
+      "y": 374.87,
+      "w": 76.24,
+      "h": 38.3
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "Value",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "bold": true,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 2,
+       "kind": "text",
+       "text_layout": {
+        "text": "Value",
+        "width": 76.24,
+        "height": 38.3,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": true,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "Value",
+          "x": 6,
+          "y": 27.55,
+          "width": 60.61,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "Value"
+    },
+    {
+     "key": "p2~t4",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 178.24,
+      "y": 423.36,
+      "w": 71.95,
+      "h": 38.3
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "Pages",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 2,
+       "kind": "text",
+       "text_layout": {
+        "text": "Pages",
+        "width": 71.95,
+        "height": 38.3,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "Pages",
+          "x": 6,
+          "y": 27.55,
+          "width": 56.56,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "Pages"
+    },
+    {
+     "key": "p2~t5",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 469.15,
+      "y": 423.36,
+      "w": 24.85,
+      "h": 38.3
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "2",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 2,
+       "kind": "text",
+       "text_layout": {
+        "text": "2",
+        "width": 24.85,
+        "height": 38.3,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "2",
+          "x": 6,
+          "y": 27.55,
+          "width": 12.12,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "2"
+    },
+    {
+     "key": "p2~t6",
+     "parent": "p2",
+     "type": "shape",
+     "rect": {
+      "x": 728.55,
+      "y": 1771.24,
+      "w": 24.85,
+      "h": 38.3
+     },
+     "rotation": 0,
+     "config": {
+      "shape": "text",
+      "fill": "none",
+      "stroke": "none",
+      "text": "2",
+      "font_size": 24.24,
+      "font_color": "#000000",
+      "align": "left",
+      "valign": "top",
+      "wrap": false,
+      "font_family": "serif",
+      "pdf_source": {
+       "page": 2,
+       "kind": "text",
+       "text_layout": {
+        "text": "2",
+        "width": 24.85,
+        "height": 38.3,
+        "fontSize": 24.24,
+        "align": "left",
+        "lineHeight": null,
+        "style": {
+         "color": "#000000",
+         "alpha": 1,
+         "bold": false,
+         "italic": false,
+         "family": "serif"
+        },
+        "spans": [
+         {
+          "text": "2",
+          "x": 6,
+          "y": 27.55,
+          "width": 12.12,
+          "size": 24.24
+         }
+        ]
+       }
+      }
+     },
+     "title": "2"
+    }
+   ],
+   "bounds": {
+    "x": 0,
+    "y": 0,
+    "w": 1484,
+    "h": 1920
+   },
+   "images": [],
+   "pageColor": "#ffffff",
+   "scale": 2.4242424242424243,
+   "counts": {
+    "text": 7,
+    "images": 0,
+    "shapes": 3,
+    "raster": false
+   }
+  }
+ ],
+ "report": {
+  "pages": 2,
+  "objects": 27,
+  "images": 0,
+  "notes": []
+ }
+}

@@ -39,6 +39,8 @@ pub struct HostDeps {
     /// Further commands of the host in each session's bin.
     pub session_helpers: Vec<crate::runtime::bin_overlay::SessionHelper>,
     pub app_tools: Vec<String>,
+    /// Where the window of a run's model is looked up.
+    pub context_windows: Option<Arc<dyn crate::runner::ContextWindowSource>>,
     pub options: RunnerOptions,
     /// Sub sessions driven at the same time.
     pub max_child_concurrency: usize,
@@ -58,6 +60,8 @@ pub struct HostDeps {
     /// Binding identity required of the sessions driven directly (not of
     /// their sub sessions).
     pub runtime_id: Option<String>,
+    /// Told of every reported state change of the sessions it drives (the host publishes their object events).
+    pub notifier: Option<Arc<dyn crate::channel::Notifier>>,
 }
 
 impl HostDeps {
@@ -86,11 +90,15 @@ impl HostDeps {
         deps.session_cli = self.session_cli.clone();
         deps.session_helpers = self.session_helpers.clone();
         deps.app_tools = self.app_tools.clone();
+        deps.context_windows = self.context_windows.clone();
         deps.outbound = self.outbound.clone();
         deps.objects = self.objects.clone();
         deps.turn_tasks = self.turn_tasks.clone();
         deps.notify = self.notify.clone();
         deps.share = self.share.clone();
+        if let Some(notifier) = &self.notifier {
+            deps.notifier = notifier.clone();
+        }
         deps.stop = stop;
         Ok(deps)
     }
@@ -109,8 +117,10 @@ struct Child {
 }
 
 /// Whether a session that is not finished is stopped from above: a sub
-/// session with its stopped parent; a Goal's Work with its Goal (archived),
-/// never with the epoch that created it (a restart keeps it running).
+/// session with its stopped parent, a reporting one with its finished
+/// parent (nobody hears it any more); a Goal's Work with its Goal
+/// (archived), never with the epoch that created it (a restart keeps it
+/// running).
 pub async fn stopped_from_above(
     agent: &dyn AgentStateClient,
     e: &RegistryEntry,
@@ -124,12 +134,16 @@ pub async fn stopped_from_above(
             None => true,
         });
     }
+    let reports = e
+        .origin
+        .as_ref()
+        .and_then(|o| o.report)
+        .is_some_and(|r| r != ReportMode::None);
     match e.origin.as_ref().and_then(|o| o.parent_session.clone()) {
-        Some(p) => Ok(agent
-            .sessions()
-            .lookup(&p)
-            .await?
-            .is_some_and(|p| p.status.outcome == Some(Outcome::Stopped))),
+        Some(p) => Ok(agent.sessions().lookup(&p).await?.is_some_and(|p| {
+            p.status.outcome == Some(Outcome::Stopped)
+                || (reports && p.status.run_state == RunState::Finished)
+        })),
         None => Ok(false),
     }
 }
@@ -190,6 +204,15 @@ impl ChildDriver {
         if parent_stopped {
             return true;
         }
+        // Backing off after retryable errors: driven again when its retry is
+        // due, not every tick (and it takes no slot meanwhile).
+        if e
+            .status
+            .retry_not_before_ms
+            .is_some_and(|t| crate::now_ms() < t)
+        {
+            return false;
+        }
         match self.results.lock().expect("results").get(&e.session_id) {
             // Blocked for a reason another drive cannot remove.
             Some(
@@ -204,7 +227,7 @@ impl ChildDriver {
             // looked at again every `recheck`.
             _ => {
                 if !(e.status.run_state == RunState::Waiting
-                    && e.status.waiting_for == Some(WaitingKind::Input)
+                    && e.status.needs_input
                     && e.input_queue.is_none())
                 {
                     return true;
@@ -495,10 +518,7 @@ fn has_pending_work(sd: &SessionDir) -> bool {
     !state.watched_tasks.is_empty()
         || crate::runner::has_pending_outbound(&state)
         || crate::runner::has_pending_turn_tasks(&state)
-        || state
-            .waiting_for
-            .as_ref()
-            .is_some_and(|w| matches!(w.kind, WaitingKind::Tool | WaitingKind::Children))
+        || state.follows_work()
         || cfg
             .subscriptions
             .iter()
@@ -571,13 +591,16 @@ async fn serve_one(
                 // applied by this drive.
                 break r;
             }
-            DriveResult::BindFailed { error } if error["recoverable"] == true => {
+            DriveResult::BindFailed { error } => {
+                log::warn!("session {}: binding failed: {error}", sd.sid());
+                if error["recoverable"] != true {
+                    break r;
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(60));
                 backoff
             }
             DriveResult::NotDriver { .. }
             | DriveResult::Unregistered
-            | DriveResult::BindFailed { .. }
             | DriveResult::RecoveryBlocked(_) => break r,
             DriveResult::Busy { .. } | DriveResult::RunBusy { .. } | DriveResult::LeaseLost => {
                 backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -764,11 +787,6 @@ impl Supervisor {
         self
     }
 
-    pub fn with_recheck(mut self: Arc<Self>, recheck: Duration) -> Arc<Self> {
-        Arc::get_mut(&mut self).expect("configured before use").recheck = recheck;
-        self
-    }
-
     pub fn host(&self) -> &HostDeps {
         &self.host
     }
@@ -914,7 +932,7 @@ impl Supervisor {
                     // deadline): looked at again every `recheck`.
                     Some(_)
                         if e.input_queue.is_none()
-                            && e.status.waiting_for != Some(WaitingKind::Input) =>
+                            && !e.status.needs_input =>
                     {
                         continue
                     }
@@ -969,14 +987,6 @@ impl Supervisor {
             .collect();
         out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         out
-    }
-
-    pub fn is_loaded(&self, sid: &str) -> bool {
-        self.slots
-            .lock()
-            .expect("slots")
-            .get(sid)
-            .is_some_and(Slot::running)
     }
 
     /// End hosting: no new loops, the running ones are cancelled and waited

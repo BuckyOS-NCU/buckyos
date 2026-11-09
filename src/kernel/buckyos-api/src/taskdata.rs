@@ -1,4 +1,4 @@
-use crate::{FunctionObject, ThunkExecutionResult, ThunkObject};
+use crate::{FunctionObject, FunctionRegistration, ThunkExecutionResult, ThunkObject};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -718,12 +718,19 @@ pub struct ThunkTaskRequest {
     pub runner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
+    /// `<run_id>/<node_id>/<attempt>`: the receipt correlation key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thunk_obj_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thunk: Option<ThunkObject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_object: Option<FunctionObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<FunctionRegistration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<ThunkDispatch>,
     #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
@@ -768,15 +775,11 @@ pub struct WorkflowRunTaskData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<WorkflowRunTaskResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub human_action: Option<TaskHumanAction>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<TaskDataErrorInfo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowRunTaskRequest {
-    #[serde(default)]
-    pub run_id: String,
     #[serde(default)]
     pub workflow_id: String,
     #[serde(default)]
@@ -796,17 +799,6 @@ pub struct WorkflowRunTaskResult {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct TaskHumanAction {
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub submitted_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskDataErrorInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -823,8 +815,6 @@ pub struct WorkflowStepTaskData {
     pub progress: Option<TaskDataProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub human_action: Option<TaskHumanAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<TaskDataErrorInfo>,
 }
@@ -1145,8 +1135,16 @@ pub struct AiccComputeTaskRequest {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_session_id: Option<String>,
+    /// The canonical request, stored verbatim only when it is small (AICC
+    /// `MAX_TASK_REQUEST_INLINE_BYTES`, 256 KiB); otherwise `request_summary`
+    /// is present instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<Value>,
+    /// Summary of a request too large to store: `{bytes, fingerprint,
+    /// messages: {count, by_role}, tools: [name], params, provider_state_bytes}`.
+    /// The full context lives in the caller's run, reachable via `trace_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_summary: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_input: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

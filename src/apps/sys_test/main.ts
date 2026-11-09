@@ -18,9 +18,10 @@
  * ../../../buckyos-websdk, which is the canonical reference for driving the
  * AppService runtime from a Deno process.
  */
-import { serveDir } from "jsr:@std/http/file-server";
+import { fromFileUrl, join, toFileUrl } from "jsr:@std/path@^1";
 import { runXllmIdentitySelftest } from "./xllm_selftest.ts";
 import { handleSupportRoute, type SupportContext } from "./support_group.ts";
+import { serveSystestStatic } from "./static_web.ts";
 
 type NodeSdkModule = typeof import("@sys-test/websdk-node-types");
 type AppInstanceIdentity = {
@@ -46,6 +47,7 @@ type GroupId =
   | "kevent"
   | "service_clients"
   | "sdk_utilities"
+  | "bucket"
   | "ndm_proxy";
 
 type BootstrapState =
@@ -53,7 +55,21 @@ type BootstrapState =
   | { kind: "missing-env"; reason: string }
   | { kind: "failed"; reason: string };
 
-const port = Number.parseInt(Deno.env.get("PORT") ?? "3000", 10);
+/**
+ * Where to listen: every interface, on the port node-daemon's app loader
+ * hands over in `BUCKYOS_SERVICE_PORT` (the AppDoc inner port in a
+ * container, the instance port when the node runs the app natively).
+ */
+function listenAddress(): { hostname: string; port: number } {
+  const raw = Deno.env.get("BUCKYOS_SERVICE_PORT") ?? Deno.env.get("PORT") ?? "3000";
+  const port = Number.parseInt(raw, 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error(`invalid service port ${raw}`);
+  }
+  return { hostname: "0.0.0.0", port };
+}
+
+const { hostname: listenHostname, port } = listenAddress();
 const sdkRoutePrefix = "/sdk/appservice";
 const bootstrapRetryDelaysMs = [250, 500, 1_000, 2_000, 5_000, 10_000, 30_000];
 
@@ -77,10 +93,10 @@ async function pathExists(path: string): Promise<boolean> {
 
 async function resolveStaticRoot(): Promise<string> {
   const candidates = [
-    new URL("./web/dist", import.meta.url).pathname,
-    new URL("./web", import.meta.url).pathname,
-    new URL("./dist/web", import.meta.url).pathname,
-    new URL("./dist", import.meta.url).pathname,
+    fromFileUrl(new URL("./web/dist", import.meta.url)),
+    fromFileUrl(new URL("./web", import.meta.url)),
+    fromFileUrl(new URL("./dist/web", import.meta.url)),
+    fromFileUrl(new URL("./dist", import.meta.url)),
   ];
 
   for (const candidate of candidates) {
@@ -126,8 +142,8 @@ async function resolveWebSdkRoot(): Promise<string> {
   const explicit = getEnv("BUCKYOS_WEBSDK_ROOT");
   const candidates = [
     explicit,
-    new URL("./node_modules/buckyos", import.meta.url).pathname,
-    new URL("./dist/node_modules/buckyos", import.meta.url).pathname,
+    fromFileUrl(new URL("./node_modules/buckyos", import.meta.url)),
+    fromFileUrl(new URL("./dist/node_modules/buckyos", import.meta.url)),
   ].filter((value): value is string =>
     typeof value === "string" && value.trim().length > 0
   );
@@ -144,7 +160,7 @@ async function resolveWebSdkRoot(): Promise<string> {
 
 async function loadSdkModule(): Promise<NodeSdkModule> {
   const sdkRoot = await resolveWebSdkRoot();
-  const moduleUrl = new URL(`file://${sdkRoot}/dist/node.mjs`);
+  const moduleUrl = toFileUrl(join(sdkRoot, "dist", "node.mjs"));
   return await import(moduleUrl.href) as NodeSdkModule;
 }
 
@@ -231,8 +247,9 @@ async function bootstrapSdk(): Promise<BootstrapState> {
 
 function isRetryableBootstrapFailure(state: BootstrapState): boolean {
   return state.kind === "failed" &&
-    (state.reason.includes("RPC call failed: fetch failed") ||
-      /RPC call error: 50[234]/.test(state.reason));
+    (/^RPC call failed: (?:fetch failed|error sending request for url)\b/.test(
+      state.reason,
+    ) || /^RPC call error: 50[234]\b/.test(state.reason));
 }
 
 function delay(durationMs: number): Promise<void> {
@@ -738,6 +755,40 @@ function buildGroupRunners(
     ];
   };
 
+  const bucketGroup = async (): Promise<SelftestCaseResult[]> => {
+    return [
+      await runSelftestCase(
+        "putBytes → fetchObject → bucket.delete in the app's smoke bucket",
+        async () => {
+          const client = sdk.buckyos.getBucketClient();
+          const bucketId = sdk.bucket.userBucketId(identity.appId, identity.ownerUserId, "smoke");
+          const key = `service/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`;
+          const body = `sys_test service putBytes ${key}`;
+          const put = await client.putBytes(bucketId, key, body, { contentType: "text/plain", if_none_match: "*" });
+          try {
+            const text = await (await client.fetchObject(bucketId, key)).text();
+            if (text !== body) {
+              throw new Error(`fetchObject returned ${JSON.stringify(text.slice(0, 80))}`);
+            }
+            const deleted = await client.delete(bucketId, key);
+            try {
+              await client.fetchObject(bucketId, key);
+            } catch (error) {
+              if (error instanceof sdk.bucket.BucketError && error.code === "no_such_key") {
+                return { bucketId, key, objId: put.obj_id, version: put.version, deleted: deleted.deleted };
+              }
+              throw error;
+            }
+            throw new Error(`${key} is still readable after bucket.delete`);
+          } catch (error) {
+            await client.delete(bucketId, key).catch(() => undefined);
+            throw error;
+          }
+        },
+      ),
+    ];
+  };
+
   const ndmProxyGroup = async (): Promise<SelftestCaseResult[]> => {
     return [
       await runSelftestCase(
@@ -822,6 +873,7 @@ function buildGroupRunners(
     kevent: keventGroup,
     service_clients: serviceClientsGroup,
     sdk_utilities: sdkUtilitiesGroup,
+    bucket: bucketGroup,
     ndm_proxy: ndmProxyGroup,
   };
 }
@@ -893,7 +945,7 @@ if (bootstrapState.kind === "ready") {
   void retryBootstrapUntilReady();
 }
 
-console.log(`[sys_test] serving ${staticRoot} on http://0.0.0.0:${port}`);
+console.log(`[sys_test] serving ${staticRoot} on http://${listenHostname}:${port}`);
 // Log static root contents for debugging
 try {
   const entries: string[] = [];
@@ -951,7 +1003,7 @@ let requestSeq = 0;
 
 Deno.serve({
   port,
-  hostname: "0.0.0.0",
+  hostname: listenHostname,
   onListen: ({ hostname, port }) => {
     console.log(`[sys_test] listening on http://${hostname}:${port}`);
     console.log(`[sys_test] mounted routes:`);
@@ -968,6 +1020,7 @@ Deno.serve({
     console.log(`  POST ${sdkRoutePrefix}/selftest/kevent`);
     console.log(`  POST ${sdkRoutePrefix}/selftest/service_clients`);
     console.log(`  POST ${sdkRoutePrefix}/selftest/sdk_utilities`);
+    console.log(`  POST ${sdkRoutePrefix}/selftest/bucket`);
     console.log(`  POST ${sdkRoutePrefix}/selftest/ndm_proxy`);
     console.log(`  GET  /support/panel                           (customer-service example panel)`);
     console.log(`  GET  ${sdkRoutePrefix}/support/summary`);
@@ -1152,27 +1205,7 @@ Deno.serve({
       );
     }
 
-    const staticResponse = await serveDir(req, {
-      fsRoot: staticRoot,
-      quiet: true,
-      showIndex: true,
-    });
-    // Fallback: if the static file is not found and the request is a
-    // navigation (not an asset), serve index.html so the SPA can handle
-    // client-side routing.
-    if (staticResponse.status === 404) {
-      const accept = req.headers.get("accept") ?? "";
-      if (accept.includes("text/html")) {
-        const fallback = await serveDir(
-          new Request(new URL("/index.html", req.url), req),
-          { fsRoot: staticRoot, quiet: true, showIndex: true },
-        );
-        if (fallback.status === 200) {
-          return tap("static[fallback]", fallback);
-        }
-      }
-    }
-    return tap("static", staticResponse);
+    return tap("static", await serveSystestStatic(req, staticRoot));
   } catch (error) {
     console.error(
       `[sys_test][req#${reqId}] !! handler threw: ${

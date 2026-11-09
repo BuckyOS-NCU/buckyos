@@ -151,9 +151,9 @@ LLM 消息使用 `AiMessage { role, content[] }` 的 content-block 模型，不�
 { "kind": "named_object", "obj_id": "<BuckyOS ObjId>" }
 ```
 
-输入 URL 会经过服务端策略、大小与 MIME 校验；Named Object 会做租户鉴权。较大输出应返回 `ResourceRef`/artifact，而不是把二进制放入诊断或错误字段。
+输入 URL 会经过服务端策略、大小与 MIME 校验；Named Object 会做租户鉴权。Provider 协议为 `BytesOnly` 时 URL 在首次调用前下载；`UrlOrBytes` 先直传并仅在明确的 URL 拒绝后转 bytes 重试；`UrlOnly` 先直传，仅在配置了公网 Named Object 下载入口时才可在明确拒绝后落入 NDN、换用公网 URL 重试，否则不重试。异步重提保持 BuckyOS task id，替换其远端 task id。较大输出应返回 `ResourceRef`/artifact，而不是把二进制放入诊断或错误字段。
 
-Provider 输出的 `ResourceRef::Url` 不保证可匿名下载。AICC 在返回结果时登记其来源，调用方通过 `open_artifact_url_reader(url, artifact_id?)` 按需读取；`artifact_id` 可省略，不使用 `task_id`。跨进程入口固定为 `POST /kapi/aicc/artifact/open`，成功响应是原始字节流。AICC 只打开已登记且属于当前 tenant 的 Provider URL；未登记普通 URL 不处理，跨 tenant 或 artifact id 不匹配必须拒绝。
+Provider 输出的 `ResourceRef::Url` 不保证可匿名下载。AICC 在返回结果时登记其来源，调用方通过 `open_artifact_url_reader(url, artifact_id?)` 按需读取；`artifact_id` 可省略，不使用 `task_id`。跨进程入口固定为 `POST /kapi/aicc/artifact/open`，成功响应是原始字节流。AICC 只打开已登记且属于当前 tenant/user 的 Provider URL；未登记普通 URL 不处理，跨 tenant、跨 user 或 artifact id 不匹配必须拒绝。
 
 ## 6. 响应与任务
 
@@ -183,7 +183,11 @@ typed response 共同字段为：`task_id`、`status`、业务结果、`usage?`�
 `ModelRequirement` 用于硬需求，例如 `tool_call`、`json_schema`、`web_search`、
 `vision`、`image_generation`、`min_context_tokens`、视频生成需求 `video` 和 canonical field 要求。`ModelDisable` 用于显式禁用能力。
 
-逻辑路由中只有以 `llm.chat`、`llm.plan`、`llm.vision` 为入口的 LLM 请求可以启用云端联网搜索；这三个入口不把联网搜索作为硬性选模条件。本次路由的模型、Adapter 和 Provider discovery 均支持 `web_search` 且未被目录或请求禁用时，AICC 默认向云端开放搜索，由模型决定是否调用。其他逻辑入口（含 `llm.code`、规格、家族和自定义路径）会强制禁用 `web_search`，并在 route trace 中记录；入口限制在 fallback / failover 后仍生效。OpenAI Responses（含 SN）追加 `web_search`，Gemini Interactions 追加 `google_search`，OpenRouter Responses 转换为 `openrouter:web_search`，Claude Messages 追加 `{ "type": "web_search_20250305", "name": "web_search" }`；这些服务端工具与调用方的函数工具共存。不支持搜索的模型仍可使用 Agent 提供的工具；`disable.web_search = true` 关闭云端搜索。仅使用 Responses 格式的其他 Adapter 不会因此继承搜索能力。
+逻辑路由中只有以 `llm.chat`、`llm.plan`、`llm.vision` 为入口的 LLM 请求可以启用云端联网搜索；这三个入口不把联网搜索作为硬性选模条件。本次路由的模型、Adapter 和 Provider discovery 均支持 `web_search` 且未被目录或请求禁用时，AICC 默认向云端开放搜索，由模型决定是否调用。其他逻辑入口（含 `llm.code`、规格、家族和自定义路径）会强制禁用 `web_search`，并在 route trace 中记录；入口限制在 fallback / failover 后仍生效。OpenAI Responses（含 SN）追加 `web_search`，Gemini Interactions 追加 `google_search`，OpenRouter Responses 转换为 `openrouter:web_search`，Claude Messages 追加 `{ "type": "web_search_20250305", "name": "web_search" }`；这些服务端工具与调用方的函数工具共存。不支持搜索的模型仍可使用 Agent 提供的工具；`disable.web_search = true` 关闭云端搜索。
+
+`response_format` 只有 `text` 和 `json_schema`，不提供 JSON mode（`json_object`）：它和 OpenAI Responses 的搜索互斥，Claude Messages 也不接受。`json_schema` 和搜索可以共存，OpenAI Responses 与 Gemini Interactions 已实测；Claude 未实测，它的搜索始终带 citations，而 citations 与 `output_config.format` 同用时返回 400。
+
+仅使用 Responses 格式的其他 Adapter 不会因此继承搜索能力。
 
 `chat.completions.create` 精确模型请求接受可选布尔字段 `web_search`，默认 `false`。显式设置 `true`（Playground 的“启用联网搜索”复选框）要求目标模型、Adapter 和 Provider 支持搜索，不支持时路由报错；启用只开放搜索能力，是否实际搜索由模型决定。该开关不改变上述逻辑入口限制。Claude 返回的 `server_tool_use` 和 `web_search_tool_result` 通过 `provider_state` 保存在响应及任务记录中，可用于核实是否实际发起搜索。MiniMax 等兼容 Messages 格式的 Adapter 不继承 Claude 搜索能力。
 

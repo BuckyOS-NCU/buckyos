@@ -2,7 +2,6 @@ export type SessionKind = 'ui' | 'work' | 'self_check' | 'goal'
 export type RunState = 'created' | 'ready' | 'running' | 'waiting' | 'finished'
 export type Outcome = 'succeeded' | 'failed' | 'stopped'
 export type Acceptance = 'n/a' | 'pending' | 'accepted' | 'discarded'
-export type WaitingKind = 'input' | 'tool' | 'event' | 'children'
 export type TurnStatus = 'completed' | 'failed' | 'budget_exhausted' | 'stopped'
 export type OutboxStatus = 'pending' | 'sent' | 'failed'
 export type Decision = 'accept' | 'discard'
@@ -28,8 +27,13 @@ export interface SessionStatus {
   one_line_status: string
   report_brief: string
   pending_decision?: unknown
-  waiting_for?: WaitingKind
+  /** Waiting, and only someone's input can move it. */
+  needs_input?: boolean
   turn_open?: boolean
+  /** Paused (`control(pause)`): it infers no more until resumed. */
+  paused?: boolean
+  /** Backing off after retryable errors: it infers again from then on (epoch ms). */
+  retry_not_before_ms?: number
   activity: Activity
   last_runner?: { runner_id: string; host?: string; pid: number; lock_epoch: number; at_ms: number }
   last_error?: unknown
@@ -64,12 +68,6 @@ export interface RegistryEntry {
   status: SessionStatus
   unreachable?: boolean
   location_rev: number
-}
-
-export interface WaitingFor {
-  kind: WaitingKind
-  refs?: string[]
-  deadline_ms?: number
 }
 
 export interface OpenTurn {
@@ -131,7 +129,8 @@ export interface SessionState {
   rev: number
   writer?: { runner_id: string; principal: string; host?: string; pid: number; lock_epoch: number }
   run_state: RunState
-  waiting_for?: WaitingFor
+  /** Sub sessions a waiting session must hear from. */
+  wait_children?: string[]
   outcome?: Outcome
   acceptance: Acceptance
   result?: unknown
@@ -176,7 +175,8 @@ export interface Binding {
   schema: string
   target: unknown
   runtime_id: string
-  kind: string
+  /** `native | node_executor`: how the working runtime is reached. */
+  connector: string
   workdir: string
   bound_at_ms: number
   bound_by: string
@@ -257,30 +257,103 @@ export interface WorkspaceBinding extends WorkspaceRef {
   location: WorkspaceLocation
 }
 
-/** A runtime the agent's sessions and workspaces may use (`state/runtimes/`). */
+/** A runtime the agent's sessions and workspaces may use (`state/runtimes/`, record version 4). */
 export type ComputerAccess = 'none' | 'observe' | 'control'
+export type InstallGrant = 'none' | 'agent_bin' | 'system'
+
+/** How a runtime is reached: the record's only type tag. */
+export type RuntimeConnector =
+  | { type: 'native'; aliases?: string[]; computer?: { endpoint: string; node_did: string; profile_id: string; access: ComputerAccess } }
+  | { type: 'node_executor'; node_did?: string | null; executor_id?: string | null; profile_id: string }
+  | { type: 'ssh'; host: string; user?: string | null; port?: number | null; identity_file?: string | null }
+
+/** Where a check found a command and who provides it; `version` comes from a full check only. */
+export interface ResolvedCommand {
+  path: string
+  version?: string | null
+  provided_by: 'buckyos_root' | 'exttools' | 'agent' | 'dev' | 'system'
+  stub?: boolean
+}
+
+/** A check of commands on the runtime (`check --commands`, skill installation). */
+export interface ToolsCheck {
+  checked_at_ms: number
+  present: string[]
+  missing: string[]
+  resolved?: Record<string, ResolvedCommand>
+  error?: string | null
+}
+
+/** The extended layer of a runtime, whatever it declares. */
+export interface ExtCheck {
+  status: 'ok' | 'partial' | 'none' | 'system'
+  missing: string[]
+  system: string[]
+}
+
+/** The last check of a runtime's tools against its declaration: a hint, never the declaration. */
+export interface BaselineCheck {
+  checked_at_ms: number
+  level?: RuntimeBaseline
+  missing: string[]
+  unmanaged?: string[]
+  resolved?: Record<string, ResolvedCommand>
+  ext?: ExtCheck | null
+  ok: boolean
+  error?: string | null
+}
+
+/** What the machine can do (learned when it is checked; `baseline` is declared). */
+export interface RuntimeCaps {
+  os: string
+  arch: string
+  shell: string
+  desktop: boolean
+  desktop_error?: string
+  identity_mode?: string | null
+  baseline: RuntimeBaseline
+  /** `$BUCKYOS_ROOT` of that machine as its executor reports it. */
+  buckyos_root?: string | null
+  baseline_check?: BaselineCheck | null
+  tools_check?: ToolsCheck | null
+}
+
+/** What this agent may do there: the node policy narrowed by the owner, with the daemon URL's term. */
+export interface RuntimeGrant {
+  ops: string[]
+  roots: string[]
+  computer: ComputerAccess
+  install: InstallGrant
+  workspace: boolean
+  expires_at_ms?: number | null
+}
+
+export interface RuntimeUsage {
+  sessions_total: number
+  last_used_at_ms?: number | null
+  last_session_id?: string | null
+  workspaces: number
+  skill_commands: string[]
+}
 
 export interface KnownRuntime {
   version: number
   runtime_id: string
-  kind: 'container' | 'host_native' | 'remote_node' | 'remote_ssh'
   name: string
-  description: string
+  desc: string
   runtime_host: string
-  exec: unknown
-  roots: string[]
-  capabilities: unknown
+  connector: RuntimeConnector
+  /** Switched on in the owner's settings. */
+  enabled: boolean
+  caps: RuntimeCaps
+  grant: RuntimeGrant
   availability: 'available' | 'runtime_unavailable' | 'permission_denied'
   builtin: boolean
-  /** The session-runtime new sessions take unless one is named or inherited. */
+  /** The owner's default runtime: the owner's machine; it may also be the private runtime. */
   default: boolean
-  computer: ComputerAccess
-  /** What its registrar declares it provides: decides the sessions' cmd_skills. */
-  baseline: RuntimeBaseline
-  /** Learned when it is checked (`os` linux | macos | windows). */
-  platform?: { os: string; arch: string; shell: string }
-  /** The last check of its standard tools: a hint, never the declaration. */
-  baseline_check?: { checked_at_ms: number; missing: string[]; ok: boolean; error?: string } | null
+  /** `retired`: withdrawn, expired or unregistered; kept for its history. */
+  lifecycle: 'active' | 'retired'
+  usage: RuntimeUsage
   revision: number
   registered_by: string
   registered_at_ms: number
@@ -326,11 +399,28 @@ export interface WorkspaceImportRequest {
   location: WorkspaceLocation
 }
 
+/** `runtimes.ext_tools`: what the node's reconciler installed under a runtime's `tools/`. An Agent only ever reads this. */
+export interface RuntimeExtTools {
+  runtime_id: string
+  tools_root: string
+  /** `node_volume`: a worker's view of its node's tools volume. */
+  managed_by: 'node' | 'node_volume'
+  packages: Record<string, { version: string; origin: 'seed' | 'desired'; commands: Record<string, string> }>
+}
+
 /** `AgentSettings.runtimes` as the owner chose them for this agent. */
 export type RuntimeBaseline = 'standard' | 'extended'
 
+/** The owner's grant beyond the node policy (`AgentRuntimeSettings.grant`). */
+export interface RuntimeGrantSetting {
+  install?: InstallGrant
+  workspace?: boolean | null
+  roots?: string[]
+  expires_at_ms?: number | null
+}
+
 export interface RuntimeSettings {
-  runtimes: Record<string, { enabled: boolean; computer: ComputerAccess; target: unknown; baseline?: RuntimeBaseline | null }>
+  runtimes: Record<string, { enabled: boolean; computer: ComputerAccess; target: unknown; baseline?: RuntimeBaseline | null; grant?: RuntimeGrantSetting | null }>
   default_runtime_id: string
 }
 
@@ -340,6 +430,7 @@ export interface RuntimeSettingPatch {
   computer?: ComputerAccess
   baseline?: RuntimeBaseline | null
   default?: boolean
+  grant?: RuntimeGrantSetting | null
 }
 
 export interface ArtifactHead {

@@ -46,6 +46,7 @@ fn host_deps(env: &Env, llm: Arc<ScriptedLlm>) -> HostDeps {
         session_cli: None,
         session_helpers: Vec::new(),
         app_tools: Vec::new(),
+        context_windows: None,
         options: deps.options.clone(),
         max_child_concurrency: 4,
         bridges: Vec::new(),
@@ -55,6 +56,7 @@ fn host_deps(env: &Env, llm: Arc<ScriptedLlm>) -> HostDeps {
         notify: None,
         share: None,
         runtime_id: None,
+        notifier: None,
     }
 }
 
@@ -163,9 +165,18 @@ fn report(n: usize, result: Value) -> buckyos_api::AiResponse {
 }
 
 /// Every tool result text of the request, oldest first.
+/// Tool results of the current Activation: the session history before its
+/// header carries the calls of the earlier ones.
 fn tool_results(req: &LlmInferenceRequest) -> Vec<String> {
+    let from = req
+        .messages
+        .iter()
+        .rposition(|m| {
+            m.role == buckyos_api::AiRole::User && m.text_content().starts_with("<goal_activation")
+        })
+        .unwrap_or(0);
     let mut out = Vec::new();
-    for m in &req.messages {
+    for m in &req.messages[from..] {
         for c in &m.content {
             if let buckyos_api::AiContent::ToolResult { content, .. } = c {
                 out.push(
@@ -261,9 +272,34 @@ fn silent_llm() -> Arc<ScriptedLlm> {
     ScriptedLlm::new(|req, _| panic!("no inference expected: {}", render(&req.messages)))
 }
 
-/// A finished Work session leaves run_digest / task_outcome material.
+/// A Work session that perceives something before it finishes leaves one
+/// observation as material. (The Runtime itself writes no perception: a
+/// finished Work without `ctl perceive` leaves nothing.)
 async fn leave_material(env: &Env, objective: &str) -> SessionDir {
     let sd = env.create_work(work_spec(objective)).await;
+    libopendan::post_input(
+        env.agent().as_ref(),
+        sd.sid(),
+        &PostedInput::control(
+            APP,
+            &format!("p-{objective}"),
+            ControlCommand::Perceive {
+                kind: "observation".into(),
+                summary: format!("objective {objective} finished in one run"),
+                tags: vec!["work".into()],
+                objects: vec![],
+                subjects: vec![],
+                cites: vec![],
+                source: None,
+                occurred_at: None,
+                suggested_kind: None,
+                memory_intent: None,
+                mentions: vec![],
+            },
+        ),
+    )
+    .await
+    .unwrap();
     assert!(drive(&sd, &env.deps(ScriptedLlm::new(|_, _| text("ok"))), StopWhen::Finished)
         .await
         .is_finished());

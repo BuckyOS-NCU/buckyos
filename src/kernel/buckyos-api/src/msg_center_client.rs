@@ -411,6 +411,51 @@ CREATE INDEX IF NOT EXISTS idx_friend_requests_expire
     ON friend_requests(state, expires_at_ms);
 "#;
 
+/// Zone bucket of the messages msg-center stores (`object`, key `<msg_id>`).
+pub const MSG_CENTER_MESSAGES_BUCKET: &str = "messages";
+/// Zone bucket of their attachments (`data`, key `<session>/<msg_id>/<n>`).
+pub const MSG_CENTER_ATTACHMENTS_BUCKET: &str = "attachments";
+/// Per-user bucket of the attachments a user collected (`msg.collect_attachment`).
+pub const MSG_CENTER_COLLECTED_BUCKET: &str = "collected";
+/// App pool of `messages` + `attachments`: every user's chat attachments.
+pub const MSG_CENTER_STORAGE_QUOTA_MIB: u64 = 100 * 1024;
+/// A chat zone outgrows the per-bucket default of one million keys.
+const MSG_CENTER_BUCKET_MAX_OBJECTS: u64 = 100_000_000;
+pub const METHOD_MSG_COLLECT_ATTACHMENT: &str = "msg.collect_attachment";
+/// Asked of the sender's Zone for a recipient: a short read token for one attachment key.
+pub const METHOD_MSG_ATTACHMENT_TICKET: &str = "msg.attachment_ticket";
+
+/// Buckets the scheduler declares in `services/msg-center/spec`
+/// (`doc/message_hub/Message Center Durable Data Schema.md`, Storage Strategy).
+pub fn msg_center_bucket_decls() -> HashMap<String, crate::bucket_client::BucketDecl> {
+    use crate::bucket_client::{BucketDecl, BucketKind, BucketScope, DataPolicy};
+    let decl = |kind, data_policy, scope, max_objects| BucketDecl {
+        kind,
+        data_policy,
+        scope,
+        versioning: None,
+        quota_mib: None,
+        max_objects,
+        default_ttl_days: None,
+        lifecycle: Vec::new(),
+    };
+    let zone_max = Some(MSG_CENTER_BUCKET_MAX_OBJECTS);
+    HashMap::from([
+        (
+            MSG_CENTER_MESSAGES_BUCKET.to_string(),
+            decl(BucketKind::Object, DataPolicy::AppData, BucketScope::Zone, zone_max),
+        ),
+        (
+            MSG_CENTER_ATTACHMENTS_BUCKET.to_string(),
+            decl(BucketKind::Data, DataPolicy::AppData, BucketScope::Zone, zone_max),
+        ),
+        (
+            MSG_CENTER_COLLECTED_BUCKET.to_string(),
+            decl(BucketKind::Data, DataPolicy::Collected, BucketScope::User, None),
+        ),
+    ])
+}
+
 /// Default rdb-instance config for the msg-center service. The scheduler drops
 /// this into `spec_config.rdb_instances` when bootstrapping the service.
 pub fn msg_center_default_rdb_instance_config() -> RdbInstanceConfig {
@@ -532,6 +577,18 @@ pub enum MailboxKind {
     RequestBox,
 }
 
+impl MailboxKind {
+    /// Object event name of this box (`/obj/msg-center/.../<box>`).
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            MailboxKind::Inbox => "inbox",
+            MailboxKind::Sent => "sent",
+            MailboxKind::GroupInbox => "group_inbox",
+            MailboxKind::RequestBox => "request_box",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct MailboxAddress {
@@ -604,6 +661,39 @@ impl MailboxAddress {
         format!("{}/contacts", self.owner_resource())
     }
 
+    /// Object events of a change in this mailbox's `box_kind` box (doc/key url.md §7): the session's
+    /// `/obj/msg-center/owners/<owner>/sessions/<session_id>/<box>` (when it fits a kevent id) and the
+    /// owner's session collection `/obj/msg-center/owners/<owner>/sessions/<box>` — both objects declare it.
+    pub fn box_event_ids(&self, box_kind: MailboxKind) -> Vec<String> {
+        let owner = self.owner.to_string();
+        let event = box_kind.event_name();
+        let mut ids = Vec::new();
+        if let Some(session) = self.session_id.as_deref() {
+            let key = crate::obj_event_key("msg-center", &["owners", &owner, "sessions", session], event);
+            if crate::validate_eventid(&key).is_ok() {
+                ids.push(key);
+            }
+        }
+        ids.push(crate::obj_event_key("msg-center", &["owners", owner.as_str(), "sessions"], event));
+        ids
+    }
+
+    /// Every mailbox and contact event of the owner.
+    pub fn owner_event_pattern(&self) -> String {
+        crate::obj_event_pattern("msg-center", &["owners", &self.owner.to_string()])
+    }
+
+    /// `obj://msg-center/owners/<owner_did>/sessions[/<session_id>]`: the object
+    /// URL and RBAC key of the owner's session collection or one session (D12).
+    pub fn sessions_resource(&self) -> String {
+        let mut resource = format!("{}/sessions", self.owner_resource());
+        if let Some(session) = self.session_id.as_deref() {
+            resource.push('/');
+            resource.push_str(&crate::encode_obj_segment(session));
+        }
+        resource
+    }
+
     fn encode_resource_address(value: &str) -> String {
         let mut result = String::new();
         for byte in value.as_bytes() {
@@ -613,6 +703,7 @@ impl MailboxAddress {
                 | b'0'..=b'9'
                 | b'-'
                 | b'_'
+                | b'.'
                 | b'~'
                 | b':'
                 | b'@'
@@ -4841,6 +4932,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_box_change_is_an_event_of_the_session_and_of_the_owners_sessions() {
+        let owner = DID::from_str("did:bns:alice").unwrap();
+        let session = MailboxAddress::new(owner.clone(), Some("s-1".into())).unwrap();
+        let hex = crate::kevent_segment("did:bns:alice");
+        assert_eq!(
+            session.box_event_ids(MailboxKind::Inbox),
+            vec![format!("/obj/msg-center/owners/{hex}/sessions/s-1/inbox"), format!("/obj/msg-center/owners/{hex}/sessions/inbox")]
+        );
+        let default = MailboxAddress::new(owner, None).unwrap();
+        assert_eq!(default.box_event_ids(MailboxKind::Inbox), vec![format!("/obj/msg-center/owners/{hex}/sessions/inbox")]);
+    }
+
+    #[test]
     fn mailbox_address_is_exact_and_requires_the_new_wire_field() {
         let owner = DID::new("bns", "alice");
         let default = MailboxAddress::new(owner.clone(), None).unwrap();
@@ -4915,6 +5019,17 @@ mod tests {
             build_msg_tunnel_ui_session_id(" tg ", "bot:one", " chat:1 "),
             "tg:bot_one:chat_1"
         );
+    }
+
+    #[test]
+    fn bucket_declarations_pass_the_install_checks() {
+        let decls = msg_center_bucket_decls();
+        assert_eq!(
+            crate::validate_app_buckets(&decls, Some(MSG_CENTER_STORAGE_QUOTA_MIB)),
+            Vec::<String>::new()
+        );
+        assert!(!crate::validate_app_buckets(&decls, None).is_empty());
+        assert!(decls.values().all(|d| d.lifecycle.is_empty()));
     }
 
     #[test]

@@ -1,12 +1,16 @@
 /**
  * Attachment access through the msg-center object route
- * (`GET /kapi/msg-center/objects/{obj_id}[/content][?context_path=…]`,
- * bearer session token). Results are cached per viewer (`identityKey`),
- * `context_path` and object id; a new viewer drops them and revokes the
- * Blob URLs (`resetObjectCaches`).
+ * (`GET /kapi/msg-center/objects/{obj_id}[/content]?context_path=…`,
+ * bearer session token; `context_path` names the message the object is read
+ * through). Results are cached per viewer (`identityKey`), `context_path`
+ * and object id; a new viewer drops them and revokes the Blob URLs
+ * (`resetObjectCaches`). Collecting copies the attachment into the viewer's
+ * `collected` bucket (`msg.collect_attachment`).
  */
-import { currentSessionToken, msgCenterServiceUrl } from '../datamodel/sessionApi'
-import { onObjectCachesReset, resetObjectCaches, type ObjectAccess, type ObjectInfo } from '../conversation/history/objectAccess'
+import { collectAttachment, currentSessionToken, msgCenterServiceUrl } from '../datamodel/sessionApi'
+import { ObjectRouteError, onObjectCachesReset, resetObjectCaches, retryingObjectRead, type ObjectAccess, type ObjectInfo } from '../conversation/history/objectAccess'
+
+export { ObjectRouteError }
 
 const infoCache = new Map<string, Promise<ObjectInfo>>()
 const contentCache = new Map<string, Promise<string>>()
@@ -25,7 +29,7 @@ export function setObjectViewer(identityKey: string) {
   viewer = identityKey
 }
 
-/** `context` is the `context_path` of an object shown in a hosted group session. */
+/** `context` is the `context_path` of the message that shows the object (`objectContextOf`). */
 export function objectUrl(objId: string, content = false, context?: string, innerPath?: string): string {
   const base = msgCenterServiceUrl().replace(/\/$/, '')
   const params = new URLSearchParams()
@@ -35,22 +39,13 @@ export function objectUrl(objId: string, content = false, context?: string, inne
   return `${base}/objects/${encodeURIComponent(objId)}${content ? '/content' : ''}${query}`
 }
 
-export class ObjectRouteError extends Error {
-  readonly status: number
-
-  constructor(status: number, text: string) {
-    super(`${status} ${text}`.trim())
-    this.name = 'ObjectRouteError'
-    this.status = status
-  }
-}
-
 export async function authorizedFetch(url: string): Promise<Response> {
   const token = await currentSessionToken()
   const response = await fetch(url, { headers: token ? { authorization: `Bearer ${token}` } : {}, credentials: 'omit' })
   if (!response.ok) {
     const text = await response.text().catch(() => '')
-    throw new ObjectRouteError(response.status, text || response.statusText)
+    const retryAfter = Number(response.headers.get('retry-after'))
+    throw new ObjectRouteError(response.status, text || response.statusText, retryAfter > 0 ? retryAfter : undefined)
   }
   return response
 }
@@ -62,7 +57,8 @@ export const apiObjectAccess: ObjectAccess = {
     const key = `${cacheKey(objId, context)}\n${innerPath ?? ''}`
     let pending = infoCache.get(key)
     if (!pending) {
-      pending = authorizedFetch(objectUrl(objId, false, context, innerPath)).then(async response => {
+      const reader = viewer
+      pending = retryingObjectRead(() => authorizedFetch(objectUrl(objId, false, context, innerPath)), () => viewer === reader).then(async response => {
         const json = await response.json() as Record<string, unknown>
         const isFile = typeof json.content === 'string'
         const isDirectory = typeof json.body === 'object' && json.body !== null
@@ -74,7 +70,8 @@ export const apiObjectAccess: ObjectAccess = {
           entries: isDirectory ? Object.keys(json.body as object).sort() : undefined,
           name: typeof meta.name === 'string' ? meta.name : undefined,
           size: typeof meta.size === 'number' ? meta.size : typeof meta.total_size === 'number' ? meta.total_size : undefined,
-          mimeType: typeof meta.mime_type === 'string' ? meta.mime_type : undefined,
+          mimeType: typeof meta.mime === 'string' ? meta.mime : undefined,
+          remote: response.headers.get('x-attachment-remote') === '1',
         } satisfies ObjectInfo
       })
       pending.catch(() => { if (infoCache.get(key) === pending) infoCache.delete(key) })
@@ -86,10 +83,20 @@ export const apiObjectAccess: ObjectAccess = {
     const key = `${cacheKey(objId, context)}\n${innerPath ?? ''}`
     let pending = contentCache.get(key)
     if (!pending) {
-      pending = authorizedFetch(objectUrl(objId, true, context, innerPath)).then(async response => URL.createObjectURL(await response.blob()))
+      const reader = viewer
+      pending = retryingObjectRead(() => authorizedFetch(objectUrl(objId, true, context, innerPath)), () => viewer === reader).then(async response => {
+        // Here now: the next description is local, and a thumbnail may read it.
+        infoCache.delete(key)
+        return URL.createObjectURL(await response.blob())
+      })
       pending.catch(() => { if (contentCache.get(key) === pending) contentCache.delete(key) })
       contentCache.set(key, pending)
     }
     return pending
+  },
+  async collect(objId, context) {
+    if (!context) throw new ObjectRouteError(404, 'not-found')
+    const { bucket_id: bucketId, key } = await collectAttachment(objId, context)
+    return { bucketId, key }
   },
 }

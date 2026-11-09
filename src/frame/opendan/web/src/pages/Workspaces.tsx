@@ -7,6 +7,8 @@ import {
   dataModel,
   type ArtifactHead,
   type ComputerAccess,
+  type ExtCheck,
+  type InstallGrant,
   type KnownRuntime,
   type KnownWorkspace,
   type RegistryEntry,
@@ -24,11 +26,16 @@ const availabilityLabel: Record<KnownWorkspace['availability'], TextKey> = {
   conflict: 'workspaceConflict',
 }
 
-const runtimeKindLabel: Record<KnownRuntime['kind'], TextKey> = {
-  container: 'runtimeKindContainer',
-  host_native: 'runtimeKindHost',
-  remote_node: 'runtimeKindNode',
-  remote_ssh: 'runtimeKindSsh',
+const connectorLabel: Record<KnownRuntime['connector']['type'], TextKey> = {
+  native: 'runtimeConnectorNative',
+  node_executor: 'runtimeConnectorNode',
+  ssh: 'runtimeConnectorSsh',
+}
+
+const installLabel: Record<InstallGrant, TextKey> = {
+  none: 'runtimeInstallNone',
+  agent_bin: 'runtimeInstallAgentBin',
+  system: 'runtimeInstallSystem',
 }
 
 const computerLabel: Record<ComputerAccess, TextKey> = {
@@ -44,7 +51,7 @@ function useAvailableRuntimes() {
   const runtimes = useQuery(['runtimes.list'], () => dataModel.runtimes())
   return {
     all: runtimes.data ?? [],
-    available: (runtimes.data ?? []).filter((runtime) => runtime.availability === 'available'),
+    available: (runtimes.data ?? []).filter((runtime) => runtime.availability === 'available' && runtime.lifecycle === 'active' && runtime.grant.workspace),
     refresh: () => runtimes.mutate(),
   }
 }
@@ -178,7 +185,7 @@ function WorkspaceForm({ mode, onClose, refresh }: {
       <label className="mb-3 block text-sm text-mute">
         {t('workspaceDirectory')}
         <input className={inputClass} value={directory} onChange={(event) => setDirectory(event.target.value)}
-          placeholder={available.find((r) => r.runtime_id === chosen)?.roots[0] ?? '/'} data-testid="workspace-directory" />
+          placeholder={available.find((r) => r.runtime_id === chosen)?.grant.roots[0] ?? '/'} data-testid="workspace-directory" />
       </label>
       <label className="mb-3 block text-sm text-mute">
         {t('workspaceName')}
@@ -355,6 +362,28 @@ const runtimeAvailability: Record<KnownRuntime['availability'], TextKey> = {
   permission_denied: 'runtimePermissionDenied',
 }
 
+function extToolsLine(ext: ExtCheck): string {
+  switch (ext.status) {
+    case 'ok': return t('runtimeExtOk')
+    case 'partial': return t('runtimeExtPartial', { tools: ext.missing.join(', ') })
+    case 'none': return t('runtimeExtNone')
+    case 'system': return t('runtimeExtSystem', { tools: ext.system.join(', ') })
+  }
+}
+
+/** What the node installed for this runtime. Read-only: packages are chosen for the whole Zone, not per Agent. */
+function RuntimeExtPackages({ runtimeId }: { runtimeId: string }) {
+  const report = useQuery(['runtimes.ext_tools', runtimeId], () => dataModel.runtimeExtTools(runtimeId))
+  const packages = Object.entries(report.data?.packages ?? {})
+  if (packages.length === 0) return null
+  const names = packages.map(([id, install]) => `${id} ${install.version}`).join(', ')
+  return (
+    <p className="mt-1 break-words text-xs text-mute" data-testid="runtime-ext-packages">
+      {t('runtimeExtPackages', { packages: names })} · {t('runtimeExtManagedByNode')}
+    </p>
+  )
+}
+
 function RuntimeCard({ runtime, chosen, refresh }: {
   runtime: KnownRuntime
   /** The owner's setting for this runtime on the agent, when there is one. */
@@ -376,55 +405,77 @@ function RuntimeCard({ runtime, chosen, refresh }: {
       setBusy(false)
     }
   }
-  const capabilities = (runtime.capabilities ?? {}) as { os?: string; identity_mode?: string; desktop?: { ui?: { ready?: boolean; state?: string } } }
-  const isContainer = runtime.kind === 'container'
+  const isPrivate = runtime.connector.type === 'native'
+  const retired = runtime.lifecycle === 'retired'
+  const { caps, grant, usage } = runtime
+  const check = caps.baseline_check
+  const devHelpers = Object.entries(check?.resolved ?? {}).filter(([, command]) => command.provided_by === 'dev').map(([name]) => name)
+  const extMissing = check?.ext?.missing ?? []
+  const standardMissing = check?.missing.filter((tool) => !extMissing.includes(tool)) ?? []
+  const toolProblem = check?.error
+    ? t('runtimeToolCheckFailed', { error: check.error })
+    : [
+        standardMissing.length > 0 && t('runtimeToolsMissing', { tools: standardMissing.join(', ') }),
+        check?.unmanaged?.length && t('runtimeToolsUnmanaged', { tools: check.unmanaged.join(', ') }),
+      ].filter(Boolean).join(' · ')
   return (
-    <li className="min-w-0 py-3 first:pt-1 last:pb-0" data-testid={`runtime-${runtime.runtime_id}`}>
+    <li className={clsx('min-w-0 py-3 first:pt-1 last:pb-0', retired && 'opacity-60')} data-testid={`runtime-${runtime.runtime_id}`}>
       <div className="flex items-start gap-2">
         <Server size={18} className="mt-0.5 shrink-0 text-accent" />
         <div className="min-w-0 flex-1">
           <h3 className="break-words text-sm font-semibold">{runtime.name}
             <span className="ml-1.5 font-mono text-xs font-normal text-mute">{runtime.runtime_id}</span>
           </h3>
-          {runtime.description && <p className="mt-1 break-words text-sm text-mute">{runtime.description}</p>}
+          {runtime.desc && <p className="mt-1 break-words text-sm text-mute">{runtime.desc}</p>}
         </div>
       </div>
       <div className="my-2 flex flex-wrap gap-x-3 gap-y-1 text-xs">
-        <span>{t(runtimeKindLabel[runtime.kind])}</span>
+        <span>{t(connectorLabel[runtime.connector.type])}</span>
+        {isPrivate && <span className="text-accent">{t('runtimePrivate')}</span>}
         <span className={clsx(runtime.availability === 'available' ? 'text-ok' : 'text-warn')}>
-          {t(runtimeAvailability[runtime.availability])}
+          {t(retired ? 'runtimeRetired' : runtimeAvailability[runtime.availability])}
         </span>
         {runtime.default && <span className="text-accent" data-testid="runtime-default">{t('runtimeDefault')}</span>}
         {runtime.builtin && <span>{t('runtimeBuiltin')}</span>}
-        {!isContainer && <span>{t('runtimeComputer')}: {t(computerLabel[runtime.computer ?? 'none'])}</span>}
-        <span data-testid="runtime-baseline">{t(runtime.baseline === 'extended' ? 'runtimeBaselineExtended' : 'runtimeBaselineStandard')}</span>
-        {runtime.platform?.os
-          ? <span className="font-mono">{runtime.platform.os}{runtime.platform.shell ? ` · ${runtime.platform.shell}` : ''}{capabilities.identity_mode ? ` · ${capabilities.identity_mode}` : ''}</span>
-          : capabilities.os && <span className="font-mono">{capabilities.os}{capabilities.identity_mode ? ` · ${capabilities.identity_mode}` : ''}</span>}
-        {capabilities.desktop?.ui && <span className={clsx(capabilities.desktop.ui.ready ? 'text-ok' : 'text-warn')}>
-          desktop: {capabilities.desktop.ui.state ?? (capabilities.desktop.ui.ready ? 'ready' : 'not ready')}
-        </span>}
+        {<span>{t('runtimeComputer')}: {t(computerLabel[grant.computer ?? 'none'])}</span>}
+        <span data-testid="runtime-baseline">{t(caps.baseline === 'extended' ? 'runtimeBaselineExtended' : 'runtimeBaselineStandard')}</span>
+        {caps.os && <span className="font-mono">{caps.os}{caps.shell ? ` · ${caps.shell}` : ''}{caps.identity_mode ? ` · ${caps.identity_mode}` : ''}</span>}
+        {caps.desktop && <span>{t('runtimeDesktop')}</span>}
+        <span>{t('runtimeInstall')}: {t(installLabel[grant.install ?? 'none'])}</span>
+        {!grant.workspace && <span>{t('runtimeNoWorkspaces')}</span>}
+        {grant.ops.length > 0 && !grant.ops.some((op) => ['exec', 'write', 'edit', 'mkdir', 'rename', 'remove'].includes(op)) && <span>{t('runtimeReadOnly')}</span>}
+        {grant.expires_at_ms != null && <span className="text-warn">{t('runtimeExpires', { time: new Date(grant.expires_at_ms).toLocaleString() })}</span>}
       </div>
-      {runtime.roots.length > 0 && <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+      {grant.roots.length > 0 && <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
         <dt className="text-mute">{t('runtimeRoots')}</dt>
-        <dd className="break-all font-mono">{runtime.roots.join(' · ')}</dd>
+        <dd className="break-all font-mono">{grant.roots.join(' · ')}</dd>
       </dl>}
+      {(usage.sessions_total > 0 || usage.workspaces > 0 || usage.skill_commands.length > 0) &&
+        <p className="mt-1 text-xs text-mute" data-testid="runtime-usage">
+          {t('runtimeUsage', { sessions: String(usage.sessions_total), workspaces: String(usage.workspaces) })}
+          {usage.last_session_id && <> · <a className="font-mono text-accent" href={sessionHref(usage.last_session_id)}>{usage.last_session_id}</a></>}
+          {usage.skill_commands.length > 0 && <> · {t('runtimeSkillCommands')}: {usage.skill_commands.join(', ')}</>}
+        </p>}
       {runtime.last_error && runtime.availability !== 'available' &&
         <p className="mt-2 break-words text-xs text-warn">{runtime.last_error}</p>}
-      {runtime.baseline_check && !runtime.baseline_check.ok &&
-        <p className="mt-2 break-words text-xs text-warn" data-testid="runtime-tool-check">
-          {runtime.baseline_check.error
-            ? t('runtimeToolCheckFailed', { error: runtime.baseline_check.error })
-            : t('runtimeToolsMissing', { tools: runtime.baseline_check.missing.join(', ') })}
-        </p>}
+      {caps.desktop_error && <p className="mt-2 break-words text-xs text-warn" data-testid="runtime-desktop-error">{caps.desktop_error}</p>}
+      {toolProblem &&
+        <p className="mt-2 break-words text-xs text-warn" data-testid="runtime-tool-check">{toolProblem}</p>}
+      {check?.ext &&
+        <p className={clsx('mt-1 break-words text-xs', check.missing.some((tool) => extMissing.includes(tool)) ? 'text-warn' : 'text-mute')} data-testid="runtime-ext">{extToolsLine(check.ext)}</p>}
+      {!retired && runtime.availability === 'available' && <RuntimeExtPackages runtimeId={runtime.runtime_id} />}
+      {devHelpers.length > 0 &&
+        <p className="mt-1 break-words text-xs text-mute" data-testid="runtime-dev-helpers">{t('runtimeDevHelpers', { tools: devHelpers.join(', ') })}</p>}
+      {caps.tools_check && caps.tools_check.present.length > 0 &&
+        <p className="mt-1 break-words text-xs text-mute">{t('runtimeCommandsVerified', { tools: caps.tools_check.present.join(', ') })}</p>}
       <ErrorBox error={error} />
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <button className="tap border border-line text-xs" disabled={busy} onClick={() => void run(() => dataModel.checkRuntime(runtime.runtime_id))}>{t('runtimeCheck')}</button>
-        {chosen && <button className="tap border border-line text-xs" disabled={busy} data-testid="runtime-toggle"
+        {chosen && !isPrivate && <button className="tap border border-line text-xs" disabled={busy} data-testid="runtime-toggle"
           onClick={() => void run(() => dataModel.setRuntimeSetting({ runtime_id: runtime.runtime_id, enabled: !chosen.enabled }))}>
           {t(chosen.enabled ? 'runtimeDisable' : 'runtimeEnable')}
         </button>}
-        {!runtime.default && (isContainer || chosen?.enabled) && <button className="tap border border-line text-xs" disabled={busy} data-testid="runtime-make-default"
+        {!runtime.default && !retired && (isPrivate || chosen?.enabled) && <button className="tap border border-line text-xs" disabled={busy} data-testid="runtime-make-default"
           onClick={() => void run(() => dataModel.setRuntimeSetting({ runtime_id: runtime.runtime_id, default: true }))}>
           {t('runtimeMakeDefault')}
         </button>}
@@ -459,10 +510,11 @@ export function RuntimeList() {
         {runtimes.data && <span className="ml-1.5 text-sm font-normal text-mute">{records.length}</span>}
       </h2>
       <p className="mb-3 text-xs text-mute">{t('runtimeManagedHint')}</p>
+      <p className="mb-3 text-xs text-mute">{t('runtimeModelHint')}</p>
       <ErrorBox error={runtimes.error ?? settings.error} />
       {records.length > 0 ? <ul className="divide-y divide-line">
         {records.map((runtime) => <RuntimeCard key={runtime.runtime_id} runtime={runtime}
-          chosen={settings.data?.runtimes[runtime.runtime_id] ?? null} refresh={refresh} />)}
+          chosen={settings.data?.runtimes[runtime.connector.type === 'native' ? (runtime.connector.aliases?.[0] ?? runtime.runtime_id) : runtime.runtime_id] ?? null} refresh={refresh} />)}
       </ul> : !runtimes.error && <p className="py-2 text-sm text-mute">{t(runtimes.isLoading ? 'loading' : 'noRuntimes')}</p>}
     </section>
   )

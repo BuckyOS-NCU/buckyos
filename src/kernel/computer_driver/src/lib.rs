@@ -12,11 +12,13 @@ pub mod windows;
 
 #[cfg(any(target_os = "macos", windows))]
 mod desktop;
+#[cfg(any(target_os = "macos", windows))]
+mod semantic;
 
 #[cfg(any(target_os = "macos", windows))]
 pub use desktop::{capabilities, driver};
 #[cfg(target_os = "macos")]
-pub use desktop::request_access;
+pub use desktop::{initialize_desktop, request_access};
 
 /// Whether this build carries a desktop Driver.
 pub const SUPPORTED: bool = cfg!(any(target_os = "macos", windows));

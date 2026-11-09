@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use llm_context::deps::{LLMContextDeps, LlmClient};
-use llm_context::state::LLMContextSnapshot;
-use llm_context::{LLMContext, LLMContextInterruptHandle, RunningTaskResolver};
+use agent_tool::task_model::RunningTaskResolver;
+use llm_context::{LLMContext, LLMContextInterruptHandle};
 
 use crate::channel::InputSource;
 use crate::error::Result;
@@ -46,6 +46,14 @@ pub struct Shared {
     pub turn_closed: Mutex<Option<ClosedTurn>>,
     /// Tool called last in this drive (the activity shown on the Turn's task).
     pub current_tool: Arc<Mutex<Option<String>>>,
+    /// The intent that call stated, if any (shown with it).
+    pub current_intent: Mutex<Option<String>>,
+    /// `one_line_status` changed after the last commit (the next boundary
+    /// commits it).
+    pub line_pending: std::sync::atomic::AtomicBool,
+    /// Result hints shown once per session and dedup keys of this drive
+    /// (the tool sets' `HintLedger`).
+    pub hints: Arc<super::hints::SessionHintLedger>,
     /// What the Turn's task was told last by this drive.
     pub task_status: Mutex<Option<(String, super::turn_task::TurnTaskStatus)>>,
     /// Serializes hand-overs of the outbox.
@@ -79,8 +87,8 @@ pub(super) struct LiveCtx {
     pub(super) behavior: bool,
     /// Resumed mid-run: may continue without new input.
     pub(super) ready: bool,
-    /// Suspended calls were just answered: the tool batch / step they
-    /// belong to continues first, no input batch can be placed before it.
+    /// Resumed with a tool batch / behavior step in progress: it continues
+    /// first, no input batch can be placed before it.
     pub(super) filled: bool,
     /// Deps of the context (rebuilding it for a normal behavior switch).
     pub(super) deps: LLMContextDeps,
@@ -90,68 +98,9 @@ pub(super) struct LiveCtx {
     pub(super) summary_llm: Arc<dyn LlmClient>,
     /// The run's view on running tasks (in-process + host task managers).
     pub(super) resolver: Arc<dyn RunningTaskResolver>,
-}
-
-/// A run suspended on tool calls whose tasks are still running
-/// (`PendingTool`): it has no live `LLMContext`; the driver waits for the
-/// tasks outside the context and resumes it with their results.
-pub(super) struct WaitingRun {
-    pub(super) run: RunHandle,
-    pub(super) snapshot: LLMContextSnapshot,
-    pub(super) behavior: bool,
-    pub(super) deps: LLMContextDeps,
-    pub(super) rounds: Arc<RoundCounter>,
-    pub(super) summary_llm: Arc<dyn LlmClient>,
-    pub(super) resolver: Arc<dyn RunningTaskResolver>,
-}
-
-impl WaitingRun {
-    pub(super) fn of(lc: LiveCtx) -> Self {
-        Self {
-            snapshot: lc.ctx.snapshot(),
-            run: lc.run,
-            behavior: lc.behavior,
-            deps: lc.deps,
-            rounds: lc.rounds,
-            summary_llm: lc.summary_llm,
-            resolver: lc.resolver,
-        }
-    }
-
-    /// Task ids the suspended calls wait for.
-    pub(super) fn task_ids(&self) -> Vec<String> {
-        self.snapshot
-            .state
-            .pending_calls()
-            .iter()
-            .map(|p| p.task_id.clone())
-            .collect()
-    }
-
-    /// Earliest `until_ms` of the suspended calls (a question asked through
-    /// a notification: its deadline).
-    pub(super) fn deadline_ms(&self) -> Option<u64> {
-        self.snapshot
-            .state
-            .pending_calls()
-            .iter()
-            .filter_map(|p| {
-                p.until_ms.or_else(|| {
-                    p.task_id
-                        .strip_prefix(USER_INPUT_TASK_PREFIX)
-                        .and_then(|c| self.run.ask_notify(c))
-                        .map(|a| a.deadline_ms)
-                })
-            })
-            .min()
-    }
-}
-
-/// What opening a run gave: a context to run, or a run still waiting for
-/// its tasks.
-pub(super) enum Opened {
-    Ctx(LiveCtx),
-    Waiting(WaitingRun),
+    /// Kept in memory while the drive waited for its next input: its next
+    /// segment is a new stretch of running (wallclock budget).
+    pub(super) waited: bool,
 }
 
 /// The run's client for the context: every inference is a counted Round
@@ -177,7 +126,7 @@ pub async fn report(sh: &Shared, status: SessionStatus) {
     super::turn_task::sync_turn_task(sh).await;
     let sid = sh.dir.sid().to_string();
     let rev = status.rev;
-    match sh.agent().sessions().report_state(&sh.lease, &sid, status).await {
+    match sh.agent().sessions().report_state(&sh.lease, &sid, status.clone()).await {
         Ok(_) => {
             let mut s = sh.session.lock().await;
             if s.state.reported_rev < rev {
@@ -187,18 +136,19 @@ pub async fn report(sh: &Shared, status: SessionStatus) {
         }
         Err(e) => log::warn!("report state of {sid}: {e}"),
     }
-    sh.deps.notifier.session_changed(&sid, rev).await;
+    sh.deps.notifier.session_changed(&sid, &status).await;
 }
 
 pub(super) async fn commit_and_report(sh: &Shared, s: &mut Session) -> Result<()> {
+    sh.hints.store(&mut s.state);
     s.commit_state(&sh.lease)?;
     let status = s.status(sh.lease.epoch());
     let rev = status.rev;
     let sid = sh.dir.sid().to_string();
-    match sh.agent().sessions().report_state(&sh.lease, &sid, status).await {
+    match sh.agent().sessions().report_state(&sh.lease, &sid, status.clone()).await {
         Ok(_) => s.state.reported_rev = s.state.reported_rev.max(rev),
         Err(e) => log::warn!("report state of {sid}: {e}"),
     }
-    sh.deps.notifier.session_changed(&sid, rev).await;
+    sh.deps.notifier.session_changed(&sid, &status).await;
     Ok(())
 }

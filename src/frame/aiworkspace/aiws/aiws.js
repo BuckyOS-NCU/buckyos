@@ -39,6 +39,13 @@ function fieldList(fields) {
   return Object.entries(fields).map(([name, t]) => (typeof t === 'string' ? { name, type: t } : { name, ...t }))
 }
 
+/** The message and the stack: a stack of SpiderMonkey or JavaScriptCore (the browser's executor) does not repeat the message. */
+function errorText(error) {
+  const text = String(error)
+  const stack = typeof error?.stack === 'string' ? error.stack : ''
+  return stack.includes(text) ? stack : [text, stack].filter(Boolean).join('\n')
+}
+
 function compareValues(a, b) {
   if (a === b) return 0
   if (a === null || a === undefined) return 1
@@ -55,7 +62,9 @@ class Input {
     this.name = name
     this.entity_id = info.entity_id
     this.type_id = info.type_id
-    this.kind = (info.type_id || '').replace('buckyos.', '').replace('table-source', 'table').replace('asset-ref', 'asset').replace('container', 'folder')
+    this.kind = info.control ? 'control' : (info.type_id || '').replace('buckyos.', '').replace('table-source', 'table').replace('asset-ref', 'asset').replace('container', 'folder')
+    /** A control input (a control, or one of its nodes): the control's kind. */
+    this.control = info.control ?? null
     this.title = info.label ?? info.title ?? name
     this.dir = join(host.root, info.dir ?? `context/entities/${info.entity_id}`)
     this.selector = info.selector ?? null
@@ -173,6 +182,12 @@ class Input {
     return dec.decode(this.bytes())
   }
 
+  /** A control as a Markdown outline (a node: its branch, the node as the one root item). */
+  outline() {
+    this.#expect('control')
+    return Deno.readTextFileSync(join(this.dir, 'outline.md'))
+  }
+
   /** Folder members as inputs (each with its own kind). */
   members() {
     this.#expect('folder')
@@ -286,6 +301,24 @@ export class ProgramHost {
         html(name, spec) {
           host.#push({ name, type: 'html', html: spec.html, css: spec.css ?? '', js: spec.js ?? '', bindings: spec.bindings ?? {}, title: spec.title })
         },
+        /**
+         * A Block-control (catalog/controls.json): `kind`, `children` a Markdown outline or `[{ text, children }]`,
+         * optional `config` and `title`; `under` (an input that is a control's node) puts the tree below that node.
+         * A composite control of the Workspace: `def` (`<author_did>#<name>`), `slots: { <slot>: ["result:<n>" |
+         * "input:<n>" | { view: 'richtext', markdown }] }`, optional `config`, `title`, `under: { input, slot }`.
+         */
+        control(name, spec = {}) {
+          if (typeof spec.def === 'string') {
+            if (!spec.slots || typeof spec.slots !== 'object') throw new Error(`result.control(${name}): slots is required with def`)
+            if (spec.under !== undefined && (typeof spec.under !== 'object' || input(spec.under.input).kind !== 'control')) throw new Error(`result.control(${name}): under must be { input, slot } of a composite input`)
+            host.#push({ name, type: 'control', def: spec.def, config: spec.config, slots: spec.slots, title: spec.title, under: spec.under })
+            return
+          }
+          if (typeof spec.kind !== 'string') throw new Error(`result.control(${name}): kind is required (see catalog/controls.json)`)
+          if (typeof spec.children !== 'string' && !Array.isArray(spec.children)) throw new Error(`result.control(${name}): children must be a Markdown outline or [{ text, children }]`)
+          if (spec.under !== undefined && input(spec.under).kind !== 'control') throw new Error(`result.control(${name}): under must name a control input`)
+          host.#push({ name, type: 'control', kind: spec.kind, config: spec.config, children: spec.children, title: spec.title, under: spec.under })
+        },
       },
       /** Numbers (and other values) the written text may cite. */
       facts(obj) {
@@ -339,7 +372,7 @@ export class ProgramHost {
       checks: this.checks,
       external: [...this.external],
       llm_map: this.llmStats,
-      error: error ? String(error?.stack ?? error) : null,
+      error: error ? errorText(error) : null,
     }
     Deno.writeTextFileSync(join(dir, 'results.json'), JSON.stringify(out))
     return out
@@ -354,6 +387,8 @@ export class ProgramHost {
         for (const row of r.rows.slice(0, 3)) lines.push('  ' + JSON.stringify(row))
       } else if (r.type === 'columns') lines.push(`columns ${r.name} on ${r.input}: ${Object.keys(r.values ?? {}).length} records`)
       else if (r.type === 'text') lines.push(`text ${r.name}: ${r.markdown.length} chars`)
+      else if (r.type === 'control' && r.def) lines.push(`control ${r.name}: ${r.def} (${Object.keys(r.slots || {}).join(', ')})`)
+      else if (r.type === 'control') lines.push(`control ${r.name}: ${r.kind}${r.under ? ` under ${r.under}` : ''}`)
       else lines.push(`${r.type} ${r.name}`)
     }
     if (Object.keys(this.factsObj).length) lines.push('facts ' + JSON.stringify(this.factsObj))

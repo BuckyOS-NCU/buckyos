@@ -1,6 +1,6 @@
 /* ── msg-center relationship surface: websdk MsgCenterClient for `contact.*`, kRPC for `group.*` / `msg.*` ── */
 
-import { buckyos } from 'buckyos'
+import { buckyos, objectUrl } from 'buckyos'
 import type { MsgCenterClient } from 'buckyos'
 import { fetchUserDetail } from '../../api/user_mgr'
 import { GROUP_INVITATION_INTENT } from './relation'
@@ -33,6 +33,7 @@ interface GroupMemberWire {
   role: GroupRole
   state: string
   entity_kind?: string
+  sync_pending?: boolean
 }
 
 interface MsgWire {
@@ -55,6 +56,8 @@ interface SessionItemWire {
 }
 
 interface ByMemberItem {
+  group_did?: string
+  hosted_here?: boolean
   doc?: unknown
   member?: { state?: string; role?: GroupRole | null; invitation_id?: string | null; invited_by?: string | null; expires_at_ms?: number | null } | null
 }
@@ -73,14 +76,6 @@ function rpc() {
 
 function call<T>(method: string, params: Record<string, unknown>): Promise<T> {
   return rpc().call<T, Record<string, unknown>>(method, params)
-}
-
-/** `did:<method>:<id>` → the raw host name msg-center uses in its kevent paths. */
-function ownerEventToken(did: string): string {
-  const parts = did.split(':')
-  const method = parts[1] ?? ''
-  const id = parts.slice(2).join(':').split(':')[0] ?? ''
-  return method === 'web' ? id : `${id}.${method}.did`
 }
 
 function docOf(value: unknown): GroupDocWire | null {
@@ -223,9 +218,9 @@ export function createRealNetworkBackend(): NetworkBackend {
         }
       }))
       const waiting = (result.invitations ?? []).flatMap((item): GroupRef[] => {
-        const doc = docOf(item.doc)
+        const doc = docOf(item.doc) ?? (item.group_did ? { id: item.group_did } : null)
         return doc && item.member?.state === 'pending_admin_approval'
-          ? [{ ...docInfo(doc), state: 'pending_admin_approval', hostedHere: true, canPost: false }]
+          ? [{ ...docInfo(doc), state: 'pending_admin_approval', hostedHere: item.hosted_here !== false, canPost: false }]
           : []
       })
       const remote = (result.joined ?? [])
@@ -276,6 +271,14 @@ export function createRealNetworkBackend(): NetworkBackend {
     acceptGroupInvitation: async (invitation) => {
       const record = await call<GroupMemberWire>('group.accept_invitation', { group_did: invitation.groupDid, invitation_id: invitation.inviteId })
       byMember = null
+      if (record.state !== 'active' && record.state !== 'pending_admin_approval') throw new Error('invitation-mismatch')
+      if (record.sync_pending && record.state === 'active') throw new Error('group-sync-pending')
+      try {
+        const result = await listByMember()
+        if (record.state === 'active' && !(result.items ?? []).some(item => docOf(item.doc)?.id === invitation.groupDid) && !(result.joined ?? []).some(item => item.group_did === invitation.groupDid)) throw new Error('group-refresh-pending')
+      } catch {
+        throw new Error('group-refresh-pending')
+      }
       return record.state === 'pending_admin_approval' ? 'pending_admin_approval' : 'active'
     },
     dismissGroupInvitation: async (invitation) => {
@@ -304,19 +307,22 @@ export function createRealNetworkBackend(): NetworkBackend {
       const online = () => { listener('contacts'); listener('requests'); listener('mailbox'); listener('groups') }
       window.addEventListener('online', online)
       void ownerDid().then((did) => {
-        const token = ownerEventToken(did)
-        const contacts = `/msg_center/${token}/CONTACTS/changed`
-        return buckyos.subscribeKEvent([contacts, `/msg_center/${token}/REQUEST_BOX/**`, `/msg_center/${token}/INBOX/**`], (event) => {
+        const contacts = objectUrl.objEventKey('msg-center', ['owners', did, 'contacts'], 'changed')
+        const sessions = objectUrl.objEventPattern('msg-center', ['owners', did, 'sessions'])
+        return buckyos.subscribeKEvent([contacts, sessions], (event) => {
           if (stopped) return
-          byMember = null
           const id = String(event.eventid ?? '')
-          if (id.startsWith(contacts)) {
+          const box = id.split('/').pop()
+          if (id === contacts) {
+            byMember = null
             listener('contacts')
             listener('requests')
             return
           }
+          if (box !== 'inbox' && box !== 'request_box') return
+          byMember = null
           listener('mailbox')
-          if (id.includes('/INBOX/')) listener('groups')
+          if (box === 'inbox') listener('groups')
         })
       }).then((subscription) => {
         if (stopped) void subscription.close()

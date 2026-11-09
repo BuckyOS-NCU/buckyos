@@ -1,14 +1,12 @@
 import { expect, editCell, grantPersistence, openCard, openDesktop, prepareOffline, saveSummary, serviceWorkerReady, test } from './offline-fixtures'
-import { closeWorkspace, openMock, openStatus, backToList } from './fixtures'
+import { closeWorkspace, openMock, openSide, openStatus, openWorkspacePage, backToList, workspacePage } from './fixtures'
 
 const ALICE = 'tok-alice'
 
 test('Block snapshots are cached and displayed after an offline cold start', async ({ page, context, api, net }) => {
   const ws = await api.sample(ALICE, `snapshot-offline ${Date.now()}`)
   const bytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" fill="red"/></svg>')
-  const begin = await api.rpc(ALICE, 'asset.begin_upload', { workspace_id: ws.workspace_id, size: bytes.length })
-  await fetch(`${api.base}/upload/${begin.upload_id}`, { method: 'PUT', headers: { authorization: `Bearer ${ALICE}` }, body: bytes })
-  const asset = await api.rpc(ALICE, 'asset.finish_upload', { workspace_id: ws.workspace_id, upload_id: begin.upload_id })
+  const asset = await api.uploadAsset(ALICE, ws.workspace_id, bytes)
   expect((await api.commit(ALICE, ws, [
     { op: 'entity.create', entity_id: 'snapshot-def', type_id: 'buckyos.block-def', parent_id: 'data', order_key: 'zz', payload: { def_id: 'test.snapshot', kind: 'html', allow_no_source: true, html: { html: '<div/>', js: 'aiws.ready()' } } },
     { op: 'entity.create', entity_id: 'snapshot-cell', type_id: 'buckyos.cell', parent_id: 'surface-main', order_key: 'zz', payload: { view: { type: 'html' }, def_ref: { entity_id: 'snapshot-def' }, config: { snapshot: { object_id: asset.object_id } } } },
@@ -34,13 +32,21 @@ test('Block snapshots are cached and displayed after an offline cold start', asy
 
 test('an offline cold start of a workspace address opens the prepared replica in a tab of its own', async ({ page, context, api, net }) => {
   const ws = await api.sample(ALICE, `tab-offline ${Date.now()}`)
-  await prepareOffline(page, net, ALICE, ws.workspace_id)
+  // the page lives on the workspace's own origin (T4-8): prepared there, it starts there without the network
+  const port = new URL(net.origin).port
+  await openWorkspacePage(page, ALICE, ws.workspace_id, null, port)
+  await grantPersistence(page.context(), page)
+  await expect(page.getByTestId('aiws-mode')).toHaveAttribute('data-mode', 'direct')
+  await expect(page.getByTestId('aiws-conn')).toHaveAttribute('data-status', 'live')
+  await openStatus(page)
+  await page.getByTestId('aiws-prepare-offline').click()
+  await expect(page.getByTestId('aiws-mode')).toHaveAttribute('data-mode', 'replica', { timeout: 60_000 })
   await serviceWorkerReady(page)
   await page.close()
   await net.down()
   await context.setOffline(true)
   const cold = await context.newPage()
-  await cold.goto(`${net.origin}/workspace/${ws.workspace_id}`)
+  await cold.goto(workspacePage(ws.workspace_id, null, port))
   expect(await cold.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true)
   await expect(cold.getByTestId('aiws-tab').getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', ws.workspace_id, { timeout: 30_000 })
   await expect(cold.getByTestId('aiws-mode')).toHaveAttribute('data-mode', 'replica')
@@ -268,4 +274,67 @@ test('offline: undo removes an unsent submission without the network; Mock run a
   await net.up()
   await expect.poll(async () => (await api.cell(ALICE, ws.workspace_id, 'tasks', 'task-40', 'owner')).value, { timeout: 40_000 }).toBe('将被撤销')
   expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head + 1)
+})
+
+test('脑图 offline: the replica checks a mind map edit like the service (a node under a node, "auto" placement) and it is accepted once back online', async ({ page, context, api, net }) => {
+  const { readFileSync } = await import('node:fs')
+  const { resolve } = await import('node:path')
+  const ws = await api.rpc(ALICE, 'ws.create', { title: `mindmap-offline ${Date.now()}` }) as { workspace_id: string; epoch: string }
+  const fixture = JSON.parse(readFileSync(resolve('../aiworkspace/fixtures/mindmap/commits.json'), 'utf8')) as { commits: { operations: Record<string, unknown>[] }[] }
+  for (const commit of fixture.commits.slice(0, 2)) expect((await api.commit(ALICE, ws, commit.operations) as { status: string }).status).toBe('accepted')
+  await api.rpc(ALICE, 'ws.set_user_state', { workspace_id: ws.workspace_id, entries: { 'surface:active': 's-mind', mode: 'canvas' } })
+  await prepareOffline(page, net, ALICE, ws.workspace_id)
+  await serviceWorkerReady(page)
+  const headBefore = await api.headSeq(ALICE, ws.workspace_id)
+  await net.down()
+  await context.setOffline(true)
+  await expect(page.getByTestId('aiws-conn')).toHaveAttribute('data-status', 'offline', { timeout: 40_000 })
+  if (await page.getByTestId('aiws-top-canvas').isVisible()) await page.getByTestId('aiws-top-canvas').click()
+  await page.keyboard.press('Escape')
+  await page.getByTestId('aiws-canvas-block-min-3').click()
+  await page.keyboard.press('Tab')
+  await expect(page.locator('[data-testid^="aiws-mindnode-edit-"]')).toBeVisible()
+  await page.keyboard.type('离线加的节点')
+  await page.keyboard.press('Enter')
+  await openStatus(page)
+  await expect.poll(async () => (await saveSummary(page)).pending).toBeGreaterThanOrEqual(2)
+  expect((await saveSummary(page)).attention).toBe(0)
+  expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(headBefore)
+  await context.setOffline(false)
+  await net.up()
+  await expect(page.getByTestId('aiws-conn')).toHaveAttribute('data-status', 'live', { timeout: 40_000 })
+  await expect.poll(async () => (await saveSummary(page)).pending, { timeout: 30_000 }).toBe(0)
+  const node = (await api.outline(ALICE, ws.workspace_id)).find((e: Record<string, unknown>) => e.title === '离线加的节点')
+  expect(node?.parent_id).toBe('min-3')
+  expect(node?.placement).toEqual({ x: 'auto', y: 'auto', w: 'auto', h: 'auto' })
+})
+
+test('扩展控件 Q29 offline: a property written offline while its control is rebuilt is refused on replay, with the notice', async ({ page, context, api, net }) => {
+  const ws = await api.freeCanvas(ALICE, `q29-offline ${Date.now()}`)
+  const component = (title: string) => ({ manifest_version: 3, ident: { author_did: 'did:bns:alice', name: 'q29-e2e' }, kind: 'declarative', title, allow_no_source: true, entry: 'declarative.json',
+    config_schema: { type: 'object', properties: { color: { type: 'string', default: '#000000' } } } })
+  const built = await api.build(ALICE, ws.workspace_id, { 'component.json': component('Q29'), 'declarative.json': { items: [{ kind: 'text', text: 'card' }] } })
+  expect((await api.commit(ALICE, ws, [{ op: 'entity.create', entity_id: 'card', type_id: 'buckyos.cell', parent_id: 'free', order_key: 'a', placement: { x: 40, y: 40, w: 240, h: 120 },
+    payload: { view: { type: 'declarative' }, def_ref: { entity_id: built.def_entity_id }, config: { color: '#000000' } } }])).status).toBe('accepted')
+  await api.rpc(ALICE, 'ws.set_user_state', { workspace_id: ws.workspace_id, entries: { 'surface:active': 'free', mode: 'canvas' } })
+  await prepareOffline(page, net, ALICE, ws.workspace_id)
+  await serviceWorkerReady(page)
+  await net.down()
+  await context.setOffline(true)
+  await expect(page.getByTestId('aiws-conn')).toHaveAttribute('data-status', 'offline', { timeout: 40_000 })
+  if (await page.getByTestId('aiws-top-canvas').isVisible()) await page.getByTestId('aiws-top-canvas').click()
+  await page.getByTestId('aiws-canvas-block-card').click()
+  await openSide(page, 'inspector')
+  await page.getByTestId('aiws-instance-config-color').fill('#ff0000')
+  await page.getByTestId('aiws-instance-config-color').press('Enter')
+  await openStatus(page)
+  await expect.poll(async () => (await saveSummary(page)).pending).toBe(1)
+  // meanwhile the control is rebuilt online: the form the write came from followed the old definition
+  await api.build(ALICE, ws.workspace_id, { 'component.json': component('Q29 v2'), 'declarative.json': { items: [{ kind: 'text', text: 'card v2' }] } }, { expect: { def_rev: built.def_rev, dir_rev: built.dir_rev } })
+  await context.setOffline(false)
+  await net.up()
+  await expect(page.getByTestId('aiws-conn')).toHaveAttribute('data-status', 'live', { timeout: 40_000 })
+  await expect(page.getByTestId('aiws-notice').filter({ hasText: '控件已更新' }).last()).toBeVisible({ timeout: 40_000 })
+  await expect.poll(async () => (await saveSummary(page)).attention, { timeout: 30_000 }).toBe(1)
+  expect((await api.read(ALICE, ws.workspace_id, 'card')).content.payload.config).toEqual({ color: '#000000' })
 })

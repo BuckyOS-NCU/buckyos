@@ -1,3 +1,5 @@
+// @ts-types="./node_modules/buckyos/dist/node.d.ts"
+import type { ndn } from "buckyos";
 import {
   ASSET_ENV,
   ASSET_FILE,
@@ -28,6 +30,7 @@ import {
 } from "../aicc_test/acceptance/usage_audit.ts";
 import {
   applyProviderTokens,
+  instanceDriver,
   configuredProviderTokens,
   providerTokenDrivers,
   selectProviderTokens,
@@ -62,29 +65,6 @@ type PasswordLoginResponse = {
   user_info?: { user_id?: unknown };
 };
 
-type RefItem = {
-  role: string;
-  target: { type: string; obj_id?: string };
-  label?: string;
-};
-
-type MsgObject = {
-  from: string;
-  source?: string;
-  to: string[];
-  kind: string;
-  /** MsgObject v2: named session under `to[0]`; omitted = default session. */
-  to_session?: string;
-  thread?: { topic?: string; reply_to?: string; correlation_id?: string };
-  created_at_ms: number;
-  content: {
-    format?: string;
-    content: string;
-    refs?: RefItem[];
-  };
-  [key: string]: unknown;
-};
-
 type SessionMessageItem = {
   record_id: string;
   msg_id: string;
@@ -92,7 +72,7 @@ type SessionMessageItem = {
   sort_key: number;
   from: string;
   to: string;
-  msg?: MsgObject | null;
+  msg?: ndn.MsgObject | null;
 };
 
 type SessionMessagePage = {
@@ -146,7 +126,7 @@ export type StepResult = {
   attachment?: AssetKey;
   attachments?: AssetKey[];
   reply_texts: string[];
-  reply_refs: RefItem[];
+  reply_refs: ndn.RefItem[];
   artifact_audits?: ArtifactAudit[];
   automatic_checks: string[];
   review: string[];
@@ -947,7 +927,7 @@ function deriveJarvisDid(zoneDid: string): string {
   return `did:${match[1]}:jarvis.${match[2]}`;
 }
 
-function assetRef(asset: AssetKey, objectId: string): RefItem {
+function assetRef(asset: AssetKey, objectId: string): ndn.RefItem {
   return {
     role: "input",
     target: { type: "data_obj", obj_id: objectId },
@@ -992,7 +972,7 @@ function makeMessage(input: {
   sourceDid?: string;
   replyTo?: string;
   attachments?: { asset: AssetKey; objectId: string }[];
-}): MsgObject {
+}): ndn.MsgObject {
   const refs = input.attachments?.length
     ? input.attachments.map((item) => assetRef(item.asset, item.objectId))
     : undefined;
@@ -1040,7 +1020,7 @@ function replyTexts(items: SessionMessageItem[], jarvisDid: string): string[] {
     .filter(Boolean);
 }
 
-function replyRefs(items: SessionMessageItem[], jarvisDid: string): RefItem[] {
+function replyRefs(items: SessionMessageItem[], jarvisDid: string): ndn.RefItem[] {
   return items
     .filter((item) => item.direction === "in" && item.from === jarvisDid)
     .flatMap((item) => item.msg?.content?.refs ?? []);
@@ -1085,7 +1065,7 @@ function artifactMatches(label: string | undefined, prefix: string): boolean {
 function evaluateAutomatic(
   step: ScenarioStep,
   texts: string[],
-  refs: RefItem[],
+  refs: ndn.RefItem[],
 ): { ready: boolean; failures: string[]; checks: string[] } {
   const combined = texts.join("\n");
   const failures: string[] = [];
@@ -1212,7 +1192,7 @@ function cleanSessionId(items: SessionMessageItem[], jarvisDid: string): string 
 
 async function postMessage(
   msgCenter: RpcClient,
-  msg: MsgObject,
+  msg: ndn.MsgObject,
   idempotencyKey: string,
 ): Promise<string | undefined> {
   const result = await msgCenter.call("msg.post_send", {
@@ -1306,7 +1286,7 @@ async function judgeStep(input: {
   traceId: string;
   step: ScenarioStep;
   texts: string[];
-  refs: RefItem[];
+  refs: ndn.RefItem[];
   resourceBlocks?: Array<Record<string, unknown>>;
 }): Promise<{ taskId: string; passed: boolean; score: number; reason: string }> {
   const rubric = input.step.review.join("\n- ");
@@ -1488,7 +1468,7 @@ async function auditRunFinance(options: CliOptions, report: RunReport): Promise<
           taskIds: report.judge.task_ids,
         })
         : Promise.resolve([]),
-      aicc.call("models.list", {}),
+      aicc.call("provider.list", {}),
     ]);
     const eventById = new Map([...workflowEvents, ...judgeEvents].map((event) => [event.event_id, event]));
     const events = [...eventById.values()];
@@ -1515,11 +1495,11 @@ async function auditRunFinance(options: CliOptions, report: RunReport): Promise<
     for (const provider of providers) {
       if (!provider || typeof provider !== "object") continue;
       const value = provider as Record<string, unknown>;
-      if (typeof value.provider_instance_name === "string" &&
-        typeof value.provider_driver === "string") {
+      const driver = instanceDriver(value);
+      if (typeof value.provider_instance_name === "string" && driver) {
         inventoryMappings.push({
           provider_instance_name: value.provider_instance_name,
-          provider_driver: value.provider_driver,
+          provider_driver: driver,
         });
       }
     }
@@ -1714,47 +1694,10 @@ async function runMsgCenter(
     }
   }
 
-  let sessionCreationTail = Promise.resolve();
-  const createScenarioSession = async (scenario: Scenario): Promise<string> => {
-    const previous = sessionCreationTail;
-    let release!: () => void;
-    sessionCreationTail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      const cleanTopic = `jarvis-dv:${report.run_id}:${scenario.id}:clean`;
-      const commandReplyTopic = `dm:${jarvisDid}`;
-      const cleanTrace = `${report.run_id}:msg-center:${scenario.id}:clean`;
-      const beforeClean = await listSession(msgCenter, userDid, commandReplyTopic);
-      await postMessage(
-        msgCenter,
-        makeMessage({ userDid, targetDid: jarvisDid, toSession: cleanTopic, prompt: "/clean", traceId: cleanTrace }),
-        cleanTrace,
-      );
-      const cleanReply = await waitForReply({
-        msgCenter,
-        userDid,
-        jarvisDid,
-        topic: commandReplyTopic,
-        afterSortKey: maxSortKey(beforeClean),
-        step: {
-          id: "clean",
-          prompt: "/clean",
-          expect: { textRequired: true },
-          maxWaitMs: 60_000,
-          review: [],
-        },
-        settleMs: 1_500,
-      });
-      const sessionId = cleanSessionId(cleanReply.items, jarvisDid);
-      createdSessionIds.add(cleanTopic);
-      createdSessionIds.add(commandReplyTopic);
-      createdSessionIds.add(sessionId);
-      return sessionId;
-    } finally {
-      release();
-    }
+  const createScenarioSession = (scenario: Scenario): string => {
+    const sessionId = `jarvis-dv:${report.run_id}:${scenario.id}`;
+    createdSessionIds.add(sessionId);
+    return sessionId;
   };
 
   const runScenario = async (scenario: Scenario): Promise<void> => {
@@ -2131,7 +2074,7 @@ function telegramTexts(messages: TelegramObservedMessage[]): string[] {
   return messages.map((message) => message.text.trim()).filter(Boolean);
 }
 
-function telegramRefs(messages: TelegramObservedMessage[]): RefItem[] {
+function telegramRefs(messages: TelegramObservedMessage[]): ndn.RefItem[] {
   return messages.flatMap((message) => message.media
     ? [{
       role: "output",

@@ -9,9 +9,10 @@ use crate::provider::{
     catalog_only_inventory, validate_discovery, CatalogOnlyDiscovery, CredentialDescriptor,
     DiscoveryMode, DynamicLoginCredentialResolver, FallbackDiscovery, ProviderAuthMode,
     ProviderConnectionContract, ProviderDiscovery, ProviderDiscoverySnapshot, ProviderError,
-    ProviderFieldMode, ProviderFieldSchema, ProviderInstanceConfig, ProviderProfile,
-    ProviderResult, RefreshPolicy,
+    ProviderFieldMode, ProviderFieldSchema, ProviderProfile, ProviderResult, RefreshPolicy,
 };
+#[cfg(test)]
+use crate::provider::ProviderInstanceConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -180,27 +181,9 @@ impl BuiltinProviderRegistry {
         self.codecs.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn custom_provider_adapter_ids(&self) -> &BTreeSet<String> {
         &self.custom_provider_adapter_ids
-    }
-
-    pub(crate) fn custom_provider_probe_candidates(
-        &self,
-        protocol_family_id: &str,
-    ) -> ProviderResult<Vec<String>> {
-        let candidates = self
-            .codecs
-            .probe_candidates(protocol_family_id)
-            .map_err(|error| ProviderError::InvalidConfiguration(error.to_string()))?
-            .into_iter()
-            .filter(|adapter_id| self.custom_provider_adapter_ids.contains(adapter_id))
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Err(ProviderError::InvalidConfiguration(format!(
-                "protocol family `{protocol_family_id}` is not enabled for custom providers"
-            )));
-        }
-        Ok(candidates)
     }
 
     pub(crate) fn dynamic_login_resolver(&self) -> Arc<dyn DynamicLoginCredentialResolver> {
@@ -286,6 +269,7 @@ impl BuiltinProviderRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_instance(
         &self,
         instance: &ProviderInstanceConfig,
@@ -1035,7 +1019,7 @@ mod tests {
     fn metadata_source_manager_supplies_all_builtin_catalogs_to_registry() {
         let registry = registry();
         let files = load_builtin_metadata().unwrap();
-        assert_eq!(files.len(), 40);
+        assert_eq!(files.len(), 42);
         assert_eq!(
             files
                 .iter()
@@ -1055,7 +1039,7 @@ mod tests {
                 .iter()
                 .filter(|file| file.kind == CatalogKind::ModelDriver)
                 .count(),
-            12
+            14
         );
 
         let snapshot = MetadataSources {
@@ -1187,16 +1171,21 @@ mod tests {
         // the payload must never be downloaded. The derived adapters
         // (`doubao-responses`, `glm-chat`, `kimi-chat`) must forward the base
         // declaration.
-        for (adapter, operation) in [
-            ("openai-responses", "responses.create"),
-            ("doubao-responses", "responses.create"),
-            ("claude-messages", "messages.create"),
-            ("glm-chat", "chat.completions.create"),
-            ("kimi-chat", "chat.completions.create"),
-            ("gemini-interactions", "interactions.create"),
+        for (adapter, operation, api_type) in [
+            ("openai-responses", "responses.create", ApiType::Llm),
+            ("doubao-responses", "responses.create", ApiType::Llm),
+            ("claude-messages", "messages.create", ApiType::Llm),
+            ("glm-chat", "chat.completions.create", ApiType::Llm),
+            ("kimi-chat", "chat.completions.create", ApiType::Llm),
+            ("gemini-interactions", "interactions.create", ApiType::Llm),
+            (
+                "qwen-media",
+                "dashscope.image_edit",
+                ApiType::ImageImageToImage,
+            ),
         ] {
             assert_eq!(
-                form(adapter, operation, ApiType::Llm),
+                form(adapter, operation, api_type),
                 crate::resource::ResourceInputForm::UrlOrBytes,
                 "{adapter} accepts a URL and an inlined payload"
             );

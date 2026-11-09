@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use crate::msg_center::MessageCenter;
 use crate::msg_tunnel::{
@@ -9,9 +8,7 @@ use async_trait::async_trait;
 use buckyos_api::{
     build_telegram_ui_session_id, get_buckyos_api_runtime, DeliveryRecord,
     DeliveryRecordWithObject, DeliveryReportResult, DeliveryState, IngressContext,
-    MSG_CENTER_SERVICE_NAME,
 };
-use buckyos_kit::get_buckyos_service_data_dir;
 use grammers_client::session::defs::{PeerAuth, PeerId, PeerRef};
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::updates::UpdatesLike;
@@ -42,14 +39,15 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 const TELEGRAM_PLATFORM: &str = "telegram";
-const TG_API_ID_ENV_KEY: &str = "BUCKYOS_TG_API_ID";
-const TG_API_HASH_ENV_KEY: &str = "BUCKYOS_TG_API_HASH";
-const TG_SESSION_DIR_ENV_KEY: &str = "BUCKYOS_TG_SESSION_DIR";
 const TG_BINDING_EXTRA_BOT_TOKEN: &str = "bot_token";
 const TG_BOT_API_ENDPOINT: &str = "https://api.telegram.org";
 const TG_TASK_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 const TG_BOT_API_OFFSET_CURSOR_KEY: &str = "bot_api_update_offset";
 const TG_EDIT_FALLBACK_KEY_PREFIX: &str = "edit_fallback:";
+/// A downloaded attachment is held until its message binds it in
+/// `attachments` (`buckets.rs`).
+const TG_INGRESS_HOLD_PREFIX: &str = "msg-center-ingress:";
+const TG_INGRESS_HOLD_SECS: u64 = 24 * 60 * 60;
 const TG_EDIT_ORIGINAL_PENDING_CODE: &str = "edit_original_pending";
 const TG_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("new", "Create a new session"),
@@ -111,7 +109,6 @@ pub struct TgTunnelConfig {
     /// Stable tunnel instance id (e.g. `tg-main-tunnel`) embedded in shadow
     /// endpoint DIDs. Defaults to the transport DID subject when not set.
     pub tunnel_instance_id: String,
-    pub name: String,
     pub supports_ingress: bool,
     pub supports_egress: bool,
 }
@@ -119,7 +116,6 @@ pub struct TgTunnelConfig {
 impl TgTunnelConfig {
     pub fn new(transport_did: DID) -> Self {
         Self {
-            name: format!("{}-tg-tunnel", transport_did.to_string()),
             tunnel_instance_id: transport_did.id.clone(),
             transport_did,
             supports_ingress: true,
@@ -681,6 +677,14 @@ impl TgMessageConverter {
             attachment.size,
             chunk_id.to_string(),
         );
+        file_obj.apply_media_meta(
+            &ndn_lib::probe_media_meta(
+                &ndn_lib::MemoryByteSource::new(&attachment.data),
+                &attachment.file_name,
+                attachment.mime_type.as_deref(),
+            )
+            .await,
+        );
         file_obj.meta.insert(
             "telegram_file_id".to_string(),
             json!(attachment.telegram_file_id),
@@ -689,11 +693,6 @@ impl TgMessageConverter {
             "telegram_media_kind".to_string(),
             json!(attachment.media_kind),
         );
-        if let Some(mime_type) = attachment.mime_type.as_ref() {
-            file_obj
-                .meta
-                .insert("mime_type".to_string(), json!(mime_type));
-        }
 
         let (file_obj_id, file_obj_json) = file_obj.gen_obj_id();
         named_store
@@ -702,6 +701,21 @@ impl TgMessageConverter {
             .map_err(|error| {
                 anyhow::anyhow!(
                     "store telegram attachment file object {} failed: {}",
+                    file_obj_id.to_string(),
+                    error
+                )
+            })?;
+        named_store
+            .pin(
+                &file_obj_id,
+                &format!("{TG_INGRESS_HOLD_PREFIX}{}", file_obj_id.to_string()),
+                named_store::PinScope::Recursive,
+                Some(Duration::from_secs(TG_INGRESS_HOLD_SECS)),
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "hold telegram attachment {} failed: {}",
                     file_obj_id.to_string(),
                     error
                 )
@@ -1011,40 +1025,6 @@ pub struct GrammersTgGatewayConfig {
     pub tunnel_instance_id: Option<String>,
 }
 
-impl GrammersTgGatewayConfig {
-    pub fn from_env() -> AnyResult<Self> {
-        let api_id = std::env::var(TG_API_ID_ENV_KEY)
-            .with_context(|| format!("{} is required", TG_API_ID_ENV_KEY))?
-            .trim()
-            .parse::<i32>()
-            .context("failed to parse BUCKYOS_TG_API_ID as i32")?;
-        if api_id <= 0 {
-            bail!("BUCKYOS_TG_API_ID must be > 0");
-        }
-
-        let api_hash = std::env::var(TG_API_HASH_ENV_KEY)
-            .with_context(|| format!("{} is required", TG_API_HASH_ENV_KEY))?;
-        if api_hash.trim().is_empty() {
-            bail!("BUCKYOS_TG_API_HASH cannot be empty");
-        }
-
-        let session_dir = std::env::var(TG_SESSION_DIR_ENV_KEY)
-            .unwrap_or_else(|_| default_tg_session_dir().to_string_lossy().to_string());
-
-        Ok(Self {
-            api_id,
-            api_hash,
-            session_dir: PathBuf::from(session_dir),
-            transport_did: None,
-            tunnel_instance_id: None,
-        })
-    }
-}
-
-fn default_tg_session_dir() -> PathBuf {
-    get_buckyos_service_data_dir(MSG_CENTER_SERVICE_NAME).join("tg_sessions")
-}
-
 fn resolve_binding_bot_token(binding: &TgBotBinding) -> AnyResult<String> {
     if let Some(token) = binding.extra.get(TG_BINDING_EXTRA_BOT_TOKEN) {
         if !token.trim().is_empty() {
@@ -1148,10 +1128,6 @@ impl GrammersTgGateway {
             dispatcher: Arc::new(Mutex::new(None)),
             ingress_tasks: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub fn from_env() -> AnyResult<Self> {
-        Ok(Self::new(GrammersTgGatewayConfig::from_env()?))
     }
 
     fn session_file_name(binding: &TgBotBinding) -> String {
@@ -3390,13 +3366,6 @@ impl TgTunnel {
         Self::with_gateway(cfg, Arc::new(GrammersTgGateway::new(grammers_cfg)))
     }
 
-    pub fn with_grammers_gateway_from_env(cfg: TgTunnelConfig) -> AnyResult<Self> {
-        Ok(Self::with_grammers_gateway(
-            cfg,
-            GrammersTgGatewayConfig::from_env()?,
-        ))
-    }
-
     pub fn with_bot_api_gateway(cfg: TgTunnelConfig) -> Self {
         let transport_did = Some(cfg.transport_did.clone());
         let tunnel_instance_id = Some(cfg.tunnel_instance_id.clone());
@@ -3425,15 +3394,6 @@ impl TgTunnel {
         Ok(())
     }
 
-    pub fn clear_msg_center_handler(&self) -> AnyResult<()> {
-        let mut guard = self
-            .dispatcher
-            .write()
-            .map_err(|_| anyhow::anyhow!("tg dispatcher lock poisoned"))?;
-        *guard = None;
-        Ok(())
-    }
-
     fn get_msg_center_handler(&self) -> AnyResult<Option<Arc<dyn TunnelIngressHandler>>> {
         let guard = self
             .dispatcher
@@ -3454,6 +3414,7 @@ impl TgTunnel {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn bind_bot_simple(
         &self,
         owner_did: DID,
@@ -3468,6 +3429,7 @@ impl TgTunnel {
         })
     }
 
+    #[cfg(test)]
     pub fn unbind_bot(&self, owner_did: &DID) -> AnyResult<Option<TgBotBinding>> {
         self.ensure_not_running("unbind_bot")?;
 
@@ -3742,14 +3704,6 @@ impl TgTunnel {
 impl DeliveryExecutor for TgTunnel {
     fn transport_did(&self) -> DID {
         self.cfg.transport_did.clone()
-    }
-
-    fn name(&self) -> &str {
-        &self.cfg.name
-    }
-
-    fn platform(&self) -> &str {
-        TELEGRAM_PLATFORM
     }
 
     fn supports_ingress(&self) -> bool {
@@ -4711,7 +4665,17 @@ mod tests {
             panic!("set TG_TEST_BOT_TOKEN constant before running this test");
         }
 
-        let cfg = GrammersTgGatewayConfig::from_env().unwrap();
+        let cfg = GrammersTgGatewayConfig {
+            api_id: std::env::var("BUCKYOS_TG_API_ID")
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+            api_hash: std::env::var("BUCKYOS_TG_API_HASH").unwrap(),
+            session_dir: std::env::temp_dir().join("buckyos-tg-live-test"),
+            transport_did: None,
+            tunnel_instance_id: None,
+        };
         let gateway = GrammersTgGateway::new(cfg);
 
         let mut extra = HashMap::new();

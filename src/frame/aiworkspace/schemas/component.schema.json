@@ -1,0 +1,355 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "buckyos.ai-workspace/component/3",
+ "title": "component.json of an AI Workspace control (扩展控件 P0–P3: manifest_version 3)",
+ "description": "The interface and file layout of one control's source directory. `ext.build` checks it with the Rust validator (store/src/ext.rs), clients pre-check it with buckyos-websdk src/aiws_ext.ts. Version 2 (P1) adds `kind: composite` (entry composition.json, see composition.schema.json) and non-empty `deps`; version 3 (P2) adds `events`, `host_api: 3` for HTML controls and the declarative `button` item. A file of an older version using a newer key fails the build with a hint to raise it. Newer manifest versions only add optional keys; older ones stay readable (Q19). A composite declares its events in composition.json.",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "manifest_version",
+  "ident",
+  "kind",
+  "title",
+  "entry"
+ ],
+ "properties": {
+  "manifest_version": {
+   "type": "integer",
+   "minimum": 1,
+   "maximum": 3
+  },
+  "ident": {
+   "$ref": "#/$defs/ident"
+  },
+  "kind": {
+   "enum": [
+    "declarative",
+    "html",
+    "composite"
+   ],
+   "description": "composite (manifest_version 2): a Block-control laying out the Blocks in its slots; no accepts / allow_no_source (it is a container, not a Cell)"
+  },
+  "title": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 256
+  },
+  "description": {
+   "type": "string",
+   "maxLength": 4000
+  },
+  "host_api": {
+   "type": "integer",
+   "minimum": 1,
+   "default": 1,
+   "description": "The host API the control was written for: html 2 or 3 (3 needs manifest_version 3: aiws.emit, createBlock parent / slot, context.interactive); the declarative interpreter is 1."
+  },
+  "accepts": {
+   "$ref": "#/$defs/data_types"
+  },
+  "allow_no_source": {
+   "type": "boolean"
+  },
+  "default_size": {
+   "$ref": "#/$defs/size"
+  },
+  "config_schema": {
+   "$ref": "#/$defs/config_schema"
+  },
+  "bindings": {
+   "$ref": "#/$defs/bindings"
+  },
+  "entry": {
+   "oneOf": [
+    {
+     "$ref": "#/$defs/file",
+     "description": "declarative: a JSON file that becomes the definition's `declarative`; composite: the composition file (composition.json) that becomes its `composition`"
+    },
+    {
+     "type": "object",
+     "additionalProperties": false,
+     "required": [
+      "html"
+     ],
+     "properties": {
+      "html": {
+       "$ref": "#/$defs/file"
+      },
+      "css": {
+       "$ref": "#/$defs/file"
+      },
+      "js": {
+       "$ref": "#/$defs/file"
+      }
+     },
+     "description": "html: the files inlined into html { html, css, js }"
+    }
+   ]
+  },
+  "assets": {
+   "type": "array",
+   "items": {
+    "$ref": "#/$defs/file"
+   },
+   "maxItems": 64,
+   "uniqueItems": true
+  },
+  "catalog": {
+   "$ref": "#/$defs/catalog"
+  },
+  "agent": {
+   "$ref": "#/$defs/file",
+   "description": "Markdown self-description for Agents (≤ 64 KiB)"
+  },
+  "deps": {
+   "type": "array",
+   "maxItems": 32,
+   "uniqueItems": true,
+   "items": {
+    "type": "string",
+    "maxLength": 128,
+    "pattern": "^did:[a-z0-9]+:[^/#\\s]+#[a-z0-9][a-z0-9._-]{0,63}$"
+   },
+   "description": "Identities `<author_did>#<name>` of the controls this one builds on (manifest_version 2; not itself). The build resolves each to a definition of the same Workspace folder (DEP_MISSING when absent) and writes a strong def_dep reference; exports carry them along."
+  },
+  "events": {
+   "type": "object",
+   "maxProperties": 16,
+   "propertyNames": {
+    "pattern": "^[a-z][a-z0-9_]{0,31}$"
+   },
+   "additionalProperties": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "title": {
+      "type": "string",
+      "maxLength": 256
+     },
+     "description": {
+      "type": "string",
+      "maxLength": 4000
+     },
+     "params": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": {
+       "pattern": "^[a-z][a-z0-9_]{0,31}$"
+      },
+      "additionalProperties": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "type"
+       ],
+       "properties": {
+        "type": {
+         "enum": [
+          "string",
+          "number",
+          "boolean",
+          "object",
+          "entity"
+         ]
+        },
+        "required": {
+         "type": "boolean"
+        },
+        "description": {
+         "type": "string",
+         "maxLength": 1000
+        }
+       }
+      }
+     }
+    }
+   },
+   "description": "Public events (manifest_version 3, Q26): an HTML control raises one with aiws.emit(name, params), a declarative one with a button item { kind: button, label, emit, params? }. An instance binds handlers in its `on`. ≤ 16 events, ≤ 16 params each."
+  }
+ },
+ "$defs": {
+  "name": {
+   "type": "string",
+   "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+   "description": "A renderer id; also the definition's def_id."
+  },
+  "file": {
+   "type": "string",
+   "pattern": "^(?!.*(^|/)\\.)(?!.*//)[^/\\u0000][^\\u0000]{0,254}(?<!/)$",
+   "description": "A file of the source directory: a relative path (P1, Q23) whose segments are non-empty and do not start with `.` (clients keep their own state in dot files)."
+  },
+  "data_types": {
+   "type": "array",
+   "items": {
+    "enum": [
+     "buckyos.table-source",
+     "buckyos.richtext",
+     "buckyos.record",
+     "buckyos.asset",
+     "buckyos.wish",
+     "buckyos.annotation",
+     "buckyos.block-def"
+    ]
+   },
+   "uniqueItems": true
+  },
+  "ident": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "author_did",
+    "name"
+   ],
+   "description": "Control identity (A3): written `<author_did>#<name>`, at most 128 bytes; the definition entity's name in the Workspace.",
+   "properties": {
+    "author_did": {
+     "type": "string",
+     "pattern": "^did:[a-z0-9]+:[^/#\\s]+$",
+     "maxLength": 120
+    },
+    "name": {
+     "$ref": "#/$defs/name"
+    }
+   }
+  },
+  "size": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "w",
+    "h"
+   ],
+   "properties": {
+    "w": {
+     "type": "number",
+     "exclusiveMinimum": 0
+    },
+    "h": {
+     "type": "number",
+     "exclusiveMinimum": 0
+    }
+   }
+  },
+  "config_schema": {
+   "description": "Instance properties: the JSON Schema subset of A7 (type, enum, default, required, title, description, minimum, maximum, minLength, maxLength; properties and items to nest). Other keywords fail the build. The Desktop validates values with it; the core never does (Q15).",
+   "type": "object",
+   "properties": {
+    "type": {
+     "oneOf": [
+      {
+       "enum": [
+        "object",
+        "array",
+        "string",
+        "number",
+        "integer",
+        "boolean",
+        "null"
+       ]
+      },
+      {
+       "type": "array",
+       "items": {
+        "enum": [
+         "object",
+         "array",
+         "string",
+         "number",
+         "integer",
+         "boolean",
+         "null"
+        ]
+       }
+      }
+     ]
+    },
+    "enum": {
+     "type": "array"
+    },
+    "default": {},
+    "required": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "title": {
+     "type": "string"
+    },
+    "description": {
+     "type": "string"
+    },
+    "minimum": {
+     "type": "number"
+    },
+    "maximum": {
+     "type": "number"
+    },
+    "minLength": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "maxLength": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "properties": {
+     "type": "object",
+     "additionalProperties": {
+      "$ref": "#/$defs/config_schema"
+     }
+    },
+    "items": {
+     "$ref": "#/$defs/config_schema"
+    }
+   },
+   "additionalProperties": false
+  },
+  "bindings": {
+   "type": "object",
+   "maxProperties": 32,
+   "propertyNames": {
+    "pattern": "^[a-z][a-z0-9_]{0,31}$"
+   },
+   "additionalProperties": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "accepts": {
+      "$ref": "#/$defs/data_types"
+     },
+     "required": {
+      "type": "boolean"
+     },
+     "title": {
+      "type": "string",
+      "maxLength": 256
+     },
+     "description": {
+      "type": "string",
+      "maxLength": 4000
+     }
+    }
+   },
+   "description": "Named data inputs; an instance binds them in its Cell `bindings` ({ <name>: { entity_id } })."
+  },
+  "catalog": {
+   "type": "object",
+   "additionalProperties": false,
+   "properties": {
+    "group": {
+     "type": "string",
+     "maxLength": 64
+    },
+    "icon": {
+     "type": "string",
+     "pattern": "^[a-z][a-z0-9-]{0,31}$"
+    },
+    "description": {
+     "type": "string",
+     "maxLength": 1000
+    }
+   }
+  }
+ }
+}

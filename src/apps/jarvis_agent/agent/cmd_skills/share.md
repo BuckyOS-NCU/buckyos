@@ -1,7 +1,7 @@
 ---
 name: share
 description: Give someone a file or folder from the Zone as a link — snapshot, optional password and expiry — then list your shares, see views and downloads, change or stop them.
-requires: the buckyos command (agent container: /usr/local/bin/buckyos; host: $BUCKYOS_ROOT/bin/buckyos); the file must be readable by your owner; creating or changing shares requires read_write Agent permission
+requires: the buckyos command (agent container: /opt/buckyos/bin/agent-tools/buckyos; host: $BUCKYOS_ROOT/bin/buckyos); the file must be readable by your owner; creating or changing shares requires read_write Agent permission
 baseline: standard
 ---
 #### When to use
@@ -22,8 +22,8 @@ buckyos share stats [--share-id <share_id>] [--days 30] [--granularity day|hour]
 
 #### Paths
 - `<path>` is a Zone path as Files shows it, `/home/<owner>/Documents/report.pdf`, or `cyfs:///home/<owner>/…`.
-- Docker AgentRoot is `/opt/buckyos/data/home/<owner>/.local/share/<app_id>/agents/<agent_id>/`; use the Zone path
-  `/home/<owner>/.local/share/<app_id>/agents/<agent_id>/` when sharing a file there. `/tmp` and runtime/cache paths
+- Docker AgentRoot is `/opt/buckyos/data/home/<owner>/agents/<agent_id>/`; use the Zone path
+  `/home/<owner>/agents/<agent_id>/` when sharing a file there. `/tmp` and runtime/cache paths
   are not in the Zone; write the file under your AgentRoot first.
 - The link carries a snapshot taken now. Later edits of the file are not in it; share again for a new version.
 - Folders leave out `.git/`, `node_modules/`, `.env*`, `*.key`, `*.pem`, `.DS_Store`, symlinks and what the owner cannot

@@ -194,8 +194,10 @@ pub struct PublishOutput {
     /// 最终 App Document body（canonical 前的 JSON 值，供工具链/测试消费）。
     pub app_doc_value: Value,
     pub pikg_digest: String,
+    /// Staging handle of the self-checked PIKG, owned by the caller (installable with `apps.submit`).
     pub pikg_handle: String,
-    pub staged_pikg_path: PathBuf,
+    /// The PIKG file in the Repo (`repo.resolve("<AppId>.pikg")`, bucket key `<AppId>.pikg/<version>`).
+    pub repo_content_id: ObjId,
     /// 发布状态：发布到 Repo/NamedStore 与发布 App DID 是两个动作；
     /// 这里只完成前者，App Document 仍是未经权威发布的 candidate。
     pub publish_status: &'static str,
@@ -384,6 +386,7 @@ impl AppInstaller {
         for expose in spec.spec_config.expose_config.values_mut() {
             expose.allow_guest = false;
         }
+        spec.spec_config.buckets.clear();
 
         let app_instance_id = spec.app_instance_id();
         let policy_key = app_availability_policy_key(app_instance_id);
@@ -909,6 +912,25 @@ impl AppInstaller {
 
         self.wait_for_instances_removed(&spec).await?;
 
+        task_mgr
+            .runner_progress(
+                &task_id,
+                Some(json!({"percent": 70.0})),
+                Some("Releasing app storage".to_string()),
+            )
+            .await?;
+        let owner = request.app_instance_id.owner_user_id();
+        let app_id = request.app_instance_id.app_id().as_str();
+        crate::buckets::PackageBuckets::zone()
+            .release(owner, app_id, None)
+            .await?;
+        crate::buckets::release_app_buckets(
+            owner,
+            app_id,
+            request.data_disposition == AppDataDisposition::Retain,
+        )
+        .await?;
+
         let deleted_paths = if request.data_disposition == AppDataDisposition::Delete {
             task_mgr
                 .runner_progress(
@@ -1275,11 +1297,6 @@ impl AppInstaller {
                         "Agent app template missing `pkg_list.agent`".to_string(),
                     )
                 })?;
-                if app_doc_template.pkg_list.agent_tools.is_some() {
-                    return Err(RPCErrors::ReasonError(
-                        "Agent publish does not support `pkg_list.agent_tools` yet".to_string(),
-                    ));
-                }
                 let sub_pkgs = match app_doc_template.pkg_list.agent_skills.clone() {
                     Some(skills_desc) => {
                         let skills_dir = local_dir.join(AGENT_SKILLS_PUBLISH_DIR);
@@ -1391,8 +1408,72 @@ impl AppInstaller {
                     sub_pkgs,
                 })
             }
+            // control packages are packed by the CLI (`pikg init --kind aiws-controls`) or exported from a Workspace
+            AppType::Aiws => Err(RPCErrors::ReasonError(
+                "AI Workspace control packages are built with `buckyos pikg` (kind aiws-controls) or exported from a Workspace, not published from a folder".to_string(),
+            )),
+            AppType::ExtTools => Self::scan_ext_tools_sources(local_dir, app_doc_template),
             AppType::Service => unreachable!(),
         }
+    }
+
+    /// An extension package's project: `ext-manifest.json` and `payload/<platform>/`, one sub package per platform.
+    /// Published like any App candidate; nothing installs it from here (doc/pikg/format.md §5).
+    fn scan_ext_tools_sources(local_dir: &Path, app_doc_template: &AppDoc) -> Result<PublishScanPlan, RPCErrors> {
+        let manifest_path = local_dir.join(buckyos_api::EXT_TOOLS_MANIFEST_FILE);
+        let raw = std::fs::read_to_string(&manifest_path).map_err(|error| {
+            RPCErrors::ReasonError(format!("Read `{}` failed: {error}", manifest_path.display()))
+        })?;
+        let manifest = buckyos_api::ExtToolsManifest::parse(&raw).map_err(RPCErrors::ReasonError)?;
+        let reserved = buckyos_api::ext_tools_reserved_provides(&manifest);
+        if !reserved.is_empty() {
+            return Err(RPCErrors::ReasonError(format!(
+                "{} provides standard commands: {}",
+                manifest.id,
+                reserved.join(", ")
+            )));
+        }
+        if manifest.id != app_doc_template._base.name || manifest.version != app_doc_template.version {
+            return Err(RPCErrors::ReasonError(format!(
+                "`{}` is {} {}, the AppDoc is {} {}",
+                manifest_path.display(),
+                manifest.id,
+                manifest.version,
+                app_doc_template._base.name,
+                app_doc_template.version
+            )));
+        }
+        let mut sub_pkgs = Vec::new();
+        let mut errors = Vec::new();
+        let mut platforms = Vec::new();
+        for (key, desc) in app_doc_template.pkg_list.iter() {
+            let Some(platform) = buckyos_api::ext_tools_platform_of_key(&key) else {
+                errors.push(format!("`{key}` is not an extension package's sub package"));
+                continue;
+            };
+            let dir = local_dir.join("payload").join(platform.name);
+            errors.extend(
+                buckyos_api::ext_tools_payload_errors(&manifest, platform, &dir)
+                    .into_iter()
+                    .map(|error| format!("{}: {error}", platform.name)),
+            );
+            platforms.push(platform.name.to_string());
+            sub_pkgs.push(ScannedSubPkg { key, desc: desc.clone(), source: PackageSource::Directory(dir) });
+        }
+        for listed in &manifest.platforms {
+            if !platforms.contains(listed) {
+                errors.push(format!("the manifest lists platform `{listed}` with no sub package"));
+            }
+        }
+        for platform in &platforms {
+            if !manifest.platforms.contains(platform) {
+                errors.push(format!("the manifest does not list platform `{platform}`"));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(RPCErrors::ReasonError(errors.join("; ")));
+        }
+        Ok(PublishScanPlan { app_bundle: None, sub_pkgs })
     }
 
     async fn package_publish_sources(
@@ -1458,7 +1539,9 @@ impl AppInstaller {
                     scanned.key
                 ))
             })?;
-            let meta = self.build_sub_pkg_meta(app_doc_template, &scanned.desc, file_object)?;
+            let mut meta = self.build_sub_pkg_meta(app_doc_template, &scanned.desc, file_object)?;
+            meta.content = crate::pikg::payload_chunk_id(&tarball_path, meta.size)
+                .map_err(|error| RPCErrors::ReasonError(format!("Hash payload `{}` failed: {error}", scanned.key)))?;
             prepared_sub_pkgs.push(PreparedSubPkg {
                 key: scanned.key,
                 desc: scanned.desc,
@@ -1483,11 +1566,6 @@ impl AppInstaller {
         let named_store = runtime.get_local_named_store().await.map_err(|error| {
             RPCErrors::ReasonError(format!("Open named store for publish failed: {error}"))
         })?;
-        info!(
-            "opening repo client for publish app `{}` version `{}`",
-            app_doc_template.show_name, app_doc_template.version
-        );
-        let repo = self.repo_client().await?;
         let mut resolved_sub_pkgs = Vec::new();
         let mut meta_values = Vec::new();
 
@@ -1502,12 +1580,6 @@ impl AppInstaller {
                         prepared_sub_pkg.key
                     ))
                 })?;
-            self.store_meta_object_via_repo(
-                &repo,
-                &meta_obj_id,
-                format!("subpkg-{}", prepared_sub_pkg.key).as_str(),
-            )
-            .await?;
 
             meta_values.push(
                 serde_json::to_value(&prepared_sub_pkg.meta).map_err(|error| {
@@ -1544,8 +1616,6 @@ impl AppInstaller {
                     "Write final AppDoc object into named store failed: {error}"
                 ))
             })?;
-        self.store_meta_object_via_repo(&repo, &final_obj_id, "appdoc")
-            .await?;
 
         Ok((final_obj_id, final_doc, meta_values))
     }
@@ -1555,6 +1625,9 @@ impl AppInstaller {
         app_type: AppType,
         local_dir: &Path,
         app_doc_template: &AppDoc,
+        staging: &crate::app_staging::PikgStagingStore,
+        owner_user_id: &str,
+        owner_app_id: &str,
     ) -> Result<PublishOutput, RPCErrors> {
         info!(
             "begin publish app `{}` type `{}` from `{}`",
@@ -1575,12 +1648,26 @@ impl AppInstaller {
             }
         };
 
-        // 生成本地 .pikg 并用同一个 PikgReader 自校验（packer/verifier 单实现）。
-        let pikg_result = self
-            .build_publish_pikg(&prepared, &final_doc, &meta_values)
-            .await;
+        // 生成 .pikg 后 staging：入 named store 并用同一个 PikgReader 自校验（packer/verifier 单实现），
+        // 通过后才进 Repo：Repo 只保存文件内容，PackageMeta 与 AppDoc 在 named store 和 PIKG 里。
+        let pikg_result = async {
+            let pikg = self
+                .build_publish_pikg(&prepared, &final_doc, &meta_values)
+                .await?;
+            let zone_did = get_buckyos_api_runtime()?.zone_id.clone();
+            let staged = staging
+                .stage_preinstall_file(&pikg, owner_user_id, owner_app_id, &zone_did)
+                .await
+                .map_err(|error| {
+                    RPCErrors::ReasonError(format!("published pikg failed self-check: {error}"))
+                })?;
+            let repo_content_id = self.store_pikg_in_repo(&pikg, &final_doc, &final_obj_id).await?;
+            Ok::<_, RPCErrors>((staged, repo_content_id))
+        }
+        .await;
         let _ = fs::remove_dir_all(&prepared.temp_root).await;
-        let (pikg_digest, staged_pikg_path) = pikg_result?;
+        let (staged, repo_content_id) = pikg_result?;
+        let pikg_digest = staged.pikg_digest.clone();
 
         info!(
             "publish completed for app `{}` version `{}` obj `{}` pikg sha256:{}",
@@ -1593,20 +1680,20 @@ impl AppInstaller {
             app_did: final_doc.app_did().clone(),
             app_doc_object_id: final_obj_id,
             app_doc_value,
-            pikg_handle: format!("{}{}", buckyos_api::PIKG_STAGING_HANDLE_PREFIX, pikg_digest),
+            pikg_handle: staged.handle.to_string(),
             pikg_digest,
-            staged_pikg_path,
+            repo_content_id,
             publish_status: "repo_stored_candidate",
         })
     }
 
-    /// 打包 pikg -> staging root -> 自校验（结构 + 全部内容 hash）。
+    /// 在发布临时目录打包 pikg。
     async fn build_publish_pikg(
         &self,
         prepared: &PreparedPublishPlan,
         final_doc: &AppDoc,
         meta_values: &[Value],
-    ) -> Result<(String, PathBuf), RPCErrors> {
+    ) -> Result<PathBuf, RPCErrors> {
         let mut builder = crate::pikg::PikgBuilder::new()
             .app_doc(final_doc)
             .map_err(|error| RPCErrors::ReasonError(format!("pikg builder: {error}")))?;
@@ -1629,25 +1716,7 @@ impl AppInstaller {
             .write_to(&tmp_pikg)
             .await
             .map_err(|error| RPCErrors::ReasonError(format!("write pikg failed: {error}")))?;
-
-        let staging_root = crate::app_install_driver::pikg_staging_root();
-        let (digest, staged_path) =
-            crate::pikg::PikgReader::stage_pikg_file(&tmp_pikg, &staging_root)
-                .await
-                .map_err(|error| {
-                    RPCErrors::ReasonError(format!("stage published pikg failed: {error}"))
-                })?;
-
-        // 自校验：packer 与 verifier 不允许两套规则漂移。
-        let reader = crate::pikg::PikgReader::open(&staged_path, Some(&digest))
-            .await
-            .map_err(|error| {
-                RPCErrors::ReasonError(format!("published pikg failed self-check: {error}"))
-            })?;
-        reader.verify_all_contents().await.map_err(|error| {
-            RPCErrors::ReasonError(format!("published pikg failed content self-check: {error}"))
-        })?;
-        Ok((digest, staged_path))
+        Ok(tmp_pikg)
     }
 
     fn canonical_packaged_name(key: &str, desc: &SubPkgDesc, app_id: &str) -> Option<String> {
@@ -1889,41 +1958,62 @@ impl AppInstaller {
         Ok(final_doc)
     }
 
-    async fn store_meta_object_via_repo(
+    /// What the Repo keeps of a published App: its PIKG as a file named after the App, with enough on it to find
+    /// it again by name and tell what it is without opening it.
+    fn published_pikg_template(final_doc: &AppDoc, app_doc_object_id: &ObjId) -> FileObject {
+        let mut template = FileObject::default();
+        Self::published_pikg_meta(&mut template, final_doc, app_doc_object_id);
+        template
+    }
+
+    pub(crate) fn published_pikg_meta(file: &mut FileObject, final_doc: &AppDoc, app_doc_object_id: &ObjId) {
+        file.content_obj.author = final_doc.author.to_string();
+        file.content_obj.owner = final_doc.owner.clone();
+        file.meta.insert("version".to_string(), json!(final_doc.version));
+        file.meta.insert("app_type".to_string(), json!(final_doc.get_app_type().to_string()));
+        file.meta.insert("app_doc_id".to_string(), json!(app_doc_object_id.to_string()));
+    }
+
+    async fn store_pikg_in_repo(
         &self,
-        repo: &RepoClient,
-        meta_obj_id: &ObjId,
-        label: &str,
-    ) -> Result<(), RPCErrors> {
-        info!(
-            "calling repo.store for publish object `{}` obj `{}`",
-            label, meta_obj_id
-        );
-        let stored_id = repo
-            .store(&meta_obj_id.to_string())
-            .await
-            .map_err(|error| {
-                warn!(
-                    "repo.store failed for publish object `{}` obj `{}`: {}",
-                    label, meta_obj_id, error
-                );
-                error
-            })?;
-        if stored_id != *meta_obj_id {
-            warn!(
-                "repo.store returned unexpected obj id for `{}`: expected {}, got {}",
-                label, meta_obj_id, stored_id
-            );
+        pikg: &Path,
+        final_doc: &AppDoc,
+        app_doc_object_id: &ObjId,
+    ) -> Result<ObjId, RPCErrors> {
+        let store = get_buckyos_api_runtime()?.get_local_named_store().await.map_err(|error| {
+            RPCErrors::ReasonError(format!("Open named store for publish failed: {error}"))
+        })?;
+        let mut template = Self::published_pikg_template(final_doc, app_doc_object_id);
+        if final_doc.get_app_type() == AppType::ExtTools {
+            let reader = crate::pikg::PikgReader::open(pikg, None)
+                .await
+                .map_err(|error| RPCErrors::ReasonError(format!("read published pikg failed: {error}")))?;
+            let manifest = crate::ext_tools_mgr::ext_manifest_of_pikg(&reader).await?;
+            crate::ext_tools_mgr::ext_tools_file_meta(&mut template, &manifest, reader.pikg_digest());
+        }
+        let (_, file_id, _) = cacl_file_object(
+            Some(&store),
+            pikg,
+            &template,
+            true,
+            &CheckMode::ByFullHash,
+            StoreMode::StoreInNamedMgr,
+            None,
+        )
+        .await
+        .map_err(|error| RPCErrors::ReasonError(format!("Import published pikg into named store failed: {error}")))?;
+        let repo = self.repo_client().await?;
+        let stored_id = repo.store(&file_id.to_string()).await.map_err(|error| {
+            warn!("repo.store failed for published pikg `{file_id}`: {error}");
+            error
+        })?;
+        if stored_id != file_id {
             return Err(RPCErrors::ReasonError(format!(
-                "repo.store returned unexpected obj id for `{}`: expected {}, got {}",
-                label, meta_obj_id, stored_id
+                "repo.store returned unexpected obj id: expected {file_id}, got {stored_id}"
             )));
         }
-        info!(
-            "repo.store succeeded for publish object `{}` obj `{}`",
-            label, meta_obj_id
-        );
-        Ok(())
+        info!("repo.store succeeded for published pikg `{file_id}` ({})", pikg.display());
+        Ok(file_id)
     }
 
     pub(crate) fn set_sub_pkg_desc(
@@ -1942,7 +2032,6 @@ impl AppInstaller {
             "web" => app_doc.pkg_list.web = Some(desc),
             "agent" => app_doc.pkg_list.agent = Some(desc),
             "agent_skills" => app_doc.pkg_list.agent_skills = Some(desc),
-            "agent_tools" => app_doc.pkg_list.agent_tools = Some(desc),
             other => {
                 app_doc.pkg_list.others.insert(other.to_string(), desc);
             }
@@ -2006,11 +2095,25 @@ pub(crate) enum AppSubmitOrigin {
     AgentRuntime,
 }
 
+impl AppSubmitOrigin {
+    fn admission(self) -> buckyos_api::AdmissionOrigin {
+        match self {
+            Self::Rpc => buckyos_api::AdmissionOrigin::User,
+            Self::Preinstall => buckyos_api::AdmissionOrigin::Preinstall,
+            Self::AgentRuntime => buckyos_api::AdmissionOrigin::AgentRuntime,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppSubmitRoute {
     Install,
     RegisterAgentTemplate,
+    /// An `aiws` package goes into the submitter's AI Workspace control library (`aiws_pkg.rs`).
+    RegisterAiwsPackage,
     Reject,
+    /// An `ext_tools` package is no App in any case: it reaches the Repo through `app.publish`.
+    RejectExtTools,
 }
 
 /// Agent PIKGs submitted by users register templates; only the internally
@@ -2020,6 +2123,9 @@ pub(crate) fn app_submit_route(app_type: AppType, origin: AppSubmitOrigin) -> Ap
         (AppType::Agent, AppSubmitOrigin::Rpc) => AppSubmitRoute::RegisterAgentTemplate,
         (AppType::Agent, AppSubmitOrigin::Preinstall) => AppSubmitRoute::Reject,
         (AppType::Agent, AppSubmitOrigin::AgentRuntime) => AppSubmitRoute::Install,
+        (AppType::Aiws, AppSubmitOrigin::Rpc) => AppSubmitRoute::RegisterAiwsPackage,
+        (AppType::Aiws, _) => AppSubmitRoute::Reject,
+        (AppType::ExtTools, _) => AppSubmitRoute::RejectExtTools,
         (_, AppSubmitOrigin::AgentRuntime) => AppSubmitRoute::Reject,
         _ => AppSubmitRoute::Install,
     }
@@ -2056,7 +2162,7 @@ impl ControlPanelServer {
         req: RPCRequest,
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
-        let _principal = Self::require_rpc_principal(principal)?;
+        let principal = Self::require_rpc_principal(principal)?;
         let local_dir = Self::require_param_str(&req, "local_dir")?;
         let app_doc_value = req
             .params
@@ -2077,7 +2183,14 @@ impl ControlPanelServer {
         );
         let output = self
             .app_installer
-            .publish_app_to_repo(app_type, std::path::Path::new(local_dir.as_str()), &app_doc)
+            .publish_app_to_repo(
+                app_type,
+                std::path::Path::new(local_dir.as_str()),
+                &app_doc,
+                &self.staging_store,
+                principal.username.as_str(),
+                principal.authenticated_app_id.as_str(),
+            )
             .await
             .map_err(|error| {
                 warn!(
@@ -2094,7 +2207,7 @@ impl ControlPanelServer {
                 "app_doc_id": output.app_doc_object_id.to_string(),
                 "pikg_handle": output.pikg_handle,
                 "pikg_digest": output.pikg_digest,
-                "pikg_path": output.staged_pikg_path.to_string_lossy(),
+                "repo_content_id": output.repo_content_id.to_string(),
                 "app_doc": output.app_doc_value,
                 // 发布到 Repo/NamedStore ≠ 发布 App DID：仍是未权威发布的 candidate。
                 "publish_status": output.publish_status,
@@ -2403,9 +2516,20 @@ impl ControlPanelServer {
         } else {
             buckyos_api::TASK_DATA_TYPE_APP_INSTALL
         };
-        let inspection = self
+        let mut inspection = self
             .inspect_from_rpc(&req, principal, task_type, None)
             .await?;
+        // What a user may add, before they submit (Agent PIKGs register
+        // templates, which the product does not restrict).
+        if inspection.plan.app_doc.get_app_type() != AppType::Agent {
+            let app_doc = inspection.plan.app_doc.clone();
+            crate::product::apply_admission(
+                &crate::product::current_product().await?,
+                &app_doc,
+                buckyos_api::AdmissionOrigin::User,
+                &mut inspection,
+            );
+        }
         Ok(RPCResponse::new(
             RPCResult::Success(serde_json::to_value(inspection).map_err(|error| {
                 RPCErrors::ReasonError(format!("serialize inspection failed: {error}"))
@@ -3868,14 +3992,41 @@ impl ControlPanelServer {
                     .await?;
                 return Ok(RPCResponse::new(RPCResult::Success(result), req.seq));
             }
+            AppSubmitRoute::RegisterAiwsPackage => {
+                let result = self.register_aiws_package(&req, principal, &inspection).await?;
+                return Ok(RPCResponse::new(RPCResult::Success(result), req.seq));
+            }
             AppSubmitRoute::Reject => {
                 return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
                     buckyos_api::InstallStage::Inspect,
                     buckyos_api::InstallErrorCode::ConfigBlocked,
                     false,
-                    "Agent templates cannot be pre-installed as Apps, and Agent runtime installs must be Agent Apps",
+                    "Agent templates and AI Workspace control packages are not pre-installed as Apps, and Agent runtime installs must be Agent Apps",
                 )));
             }
+            AppSubmitRoute::RejectExtTools => {
+                let denied = buckyos_api::AdmissionDenied::ExtToolsPackage;
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::UnsupportedTarget,
+                    false,
+                    format!("{denied} ({})", denied.code()),
+                )));
+            }
+        }
+        // The product edition decides what may be added, by who asks: users
+        // add static web apps to Lite, only the product its script apps and
+        // only Agent creation its Agent App.
+        if let Err(denied) = crate::product::current_product()
+            .await?
+            .admit_app(&inspection.plan.app_doc, origin.admission())
+        {
+            return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::UnsupportedTarget,
+                false,
+                format!("{denied} ({})", denied.code()),
+            )));
         }
         let installed = Self::find_spec_for_inspection(&inspection).await?;
         if submitted_plan.is_none() && installed.is_some() {
@@ -4680,9 +4831,24 @@ mod submit_action_tests {
             AppSubmitRoute::Install
         );
         assert_eq!(
+            app_submit_route(AppType::Aiws, AppSubmitOrigin::Rpc),
+            AppSubmitRoute::RegisterAiwsPackage
+        );
+        assert_eq!(
+            app_submit_route(AppType::Aiws, AppSubmitOrigin::Preinstall),
+            AppSubmitRoute::Reject
+        );
+        assert_eq!(
+            app_submit_route(AppType::Aiws, AppSubmitOrigin::AgentRuntime),
+            AppSubmitRoute::Reject
+        );
+        assert_eq!(
             app_submit_route(AppType::Web, AppSubmitOrigin::AgentRuntime),
             AppSubmitRoute::Reject
         );
+        for origin in [AppSubmitOrigin::Rpc, AppSubmitOrigin::Preinstall, AppSubmitOrigin::AgentRuntime] {
+            assert_eq!(app_submit_route(AppType::ExtTools, origin), AppSubmitRoute::RejectExtTools);
+        }
     }
 }
 
@@ -5134,21 +5300,91 @@ mod publish_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn publish_example_agent_tools_is_rejected() {
-        let installer = test_installer();
-        let mut template = build_agent_skills_template();
-        template.pkg_list.agent_tools = Some(pinned(
-            "all.agent_tools.demo-agent-skills.tester.bns.did#0.1.0",
-        ));
-        let dir = temp_test_dir("agent-tools-rejected");
-        std::fs::create_dir_all(dir.join(AGENT_SKILLS_PUBLISH_DIR)).expect("create skills dir");
+    fn ext_tools_template(platforms: &[&buckyos_api::ExtToolsPlatform]) -> AppDoc {
+        let owner = DID::from_str("did:bns:tester").expect("owner did");
+        let mut builder = AppDoc::builder(AppType::ExtTools, "ext-demo", "1.0.0", "tester", &owner);
+        for platform in platforms {
+            builder = builder.ext_tools_pkg(platform, pinned(&format!("{}.ext-demo.tester.bns.did#1.0.0", platform.key)));
+        }
+        builder.build().expect("extension package")
+    }
 
-        let error = match installer.scan_publish_sources(AppType::Agent, &dir, &template) {
-            Ok(_) => panic!("agent tools should be rejected"),
-            Err(error) => error,
+    fn ext_tools_project(name: &str, platforms: &[&str]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_test_dir(name);
+        let manifest = json!({
+            "schema": buckyos_api::EXT_TOOLS_MANIFEST_SCHEMA,
+            "id": "ext-demo",
+            "version": "1.0.0",
+            "provides": [{ "command": "demo", "version_probe": "demo --version" }],
+            "platforms": platforms,
+        })
+        .to_string();
+        std::fs::create_dir_all(&dir).expect("project dir");
+        std::fs::write(dir.join(buckyos_api::EXT_TOOLS_MANIFEST_FILE), &manifest).expect("manifest");
+        for platform in platforms {
+            let payload = dir.join("payload").join(platform);
+            std::fs::create_dir_all(payload.join("bin")).expect("payload dir");
+            std::fs::write(payload.join(buckyos_api::EXT_TOOLS_MANIFEST_FILE), &manifest).expect("payload manifest");
+            std::fs::write(payload.join("bin/demo"), "#!/bin/sh\n").expect("launcher");
+            std::fs::set_permissions(payload.join("bin/demo"), std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_published_pikg_says_what_it_is_in_the_repo() {
+        let linux = buckyos_api::ext_tools_platform("linux-x86_64").unwrap();
+        let doc = ext_tools_template(&[linux]);
+        let id = ObjId::new_by_raw("appdoc".to_string(), vec![7; 32]);
+        let template = AppInstaller::published_pikg_template(&doc, &id);
+        let value = serde_json::to_value(&template).unwrap();
+        // repo-service binds `<name>/<version>`; the name is the file's, set when the PIKG is imported
+        assert_eq!(value["version"], "1.0.0");
+        assert_eq!(value["app_type"], "ext_tools");
+        assert_eq!(value["app_doc_id"], id.to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_ext_tools_takes_one_payload_per_platform() {
+        let installer = test_installer();
+        let linux = buckyos_api::ext_tools_platform("linux-x86_64").unwrap();
+        let mac = buckyos_api::ext_tools_platform("darwin-arm64").unwrap();
+        let template = ext_tools_template(&[linux, mac]);
+        let dir = ext_tools_project("ext-tools-publish", &["linux-x86_64", "darwin-arm64"]);
+
+        let plan = match installer.scan_publish_sources(AppType::ExtTools, &dir, &template) {
+            Ok(plan) => plan,
+            Err(error) => panic!("{error}"),
         };
-        assert!(error.to_string().contains("agent_tools"));
+        let mut scanned: Vec<(String, PathBuf)> = plan
+            .sub_pkgs
+            .into_iter()
+            .map(|sub| match sub.source {
+                PackageSource::Directory(path) => (sub.key, path),
+                _ => panic!("a payload is a directory"),
+            })
+            .collect();
+        scanned.sort();
+        assert_eq!(
+            scanned,
+            vec![
+                ("ext_tools_darwin_arm64".to_string(), dir.join("payload/darwin-arm64")),
+                ("ext_tools_linux_x86_64".to_string(), dir.join("payload/linux-x86_64")),
+            ]
+        );
+
+        // what `pikg doctor` says of a project, the service says before publishing it
+        let refused = |template: &AppDoc| match installer.scan_publish_sources(AppType::ExtTools, &dir, template) {
+            Ok(_) => panic!("should be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(refused(&ext_tools_template(&[linux])).contains("darwin-arm64"), "a listed platform without a sub package");
+        std::fs::remove_file(dir.join("payload/linux-x86_64/bin/demo")).unwrap();
+        assert!(refused(&template).contains("bin/demo"), "a missing launcher");
+        std::fs::write(dir.join(buckyos_api::EXT_TOOLS_MANIFEST_FILE), "{}").unwrap();
+        assert!(refused(&template).contains("ext-manifest.json"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

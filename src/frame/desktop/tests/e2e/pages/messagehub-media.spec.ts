@@ -29,6 +29,8 @@ test('stream shows GIFs animated, videos as Preview thumbnails and files as card
   const gif = history.getByTestId('attachment-image').filter({ has: page.getByRole('img', { name: 'orbit-loader.gif' }) })
   await expect(gif).toHaveAttribute('data-gif', 'animated')
   await expect.poll(() => gif.locator('img').evaluate(img => (img as HTMLImageElement).naturalWidth)).toBe(160)
+  await expect.poll(() => gif.evaluate(element => Math.round(element.getBoundingClientRect().width))).toBe(160)
+  await expect(gif).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
   await expect(history.getByRole('img', { name: 'harbor-sunset.png', exact: true })).toBeVisible()
 
   // WebM: no Pipeline plan in the mock catalog → Runtime frame capture.
@@ -43,6 +45,86 @@ test('stream shows GIFs animated, videos as Preview thumbnails and files as card
   await expect(history.getByTestId('attachment-file')).toContainText('design-brief.pdf')
   await page.screenshot({ path: 'test-results/messagehub-media-stream.png' })
   expect(errors).toEqual([])
+})
+
+test('an attachment on its way from another Zone says so and arrives by itself', async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as never as { __mockObjectAnswers: unknown }).__mockObjectAnswers = {
+      'design-brief.pdf': { status: 503, reason: 'attachment-fetching', retryAfter: 1 },
+      'harbor-sunset.png': { status: 503, reason: 'attachment-fetching', retryAfter: 1 },
+    }
+  })
+  await page.goto(`/messagehub?entityId=${encodeURIComponent(ALICE)}`)
+  const history = page.getByTestId('conversation-history')
+  await expect(history.getByTestId('attachment-fetching').filter({ hasText: 'design-brief.pdf' })).toBeVisible({ timeout: 15_000 })
+  await expect(history.getByTestId('attachment-fetching').filter({ hasText: 'harbor-sunset.png' })).toBeVisible()
+  await expect(history.getByTestId('attachment-error')).toHaveCount(0)
+  await page.evaluate(() => { delete (window as never as { __mockObjectAnswers?: unknown }).__mockObjectAnswers })
+  await expect(history.getByTestId('attachment-file')).toContainText('design-brief.pdf', { timeout: 15_000 })
+  await expect(history.getByRole('img', { name: 'harbor-sunset.png', exact: true })).toBeVisible({ timeout: 15_000 })
+})
+
+test('reads give up on a Zone that does not answer, and offer a retry', async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as never as { __mockObjectAnswers: unknown }).__mockObjectAnswers = {
+      'design-brief.pdf': { status: 503, reason: 'attachment-source-unreachable', retryAfter: 1 },
+    }
+  })
+  await page.goto(`/messagehub?entityId=${encodeURIComponent(ALICE)}`)
+  const history = page.getByTestId('conversation-history')
+  const failed = history.getByTestId('attachment-error').filter({ hasText: 'design-brief.pdf' })
+  await expect(failed).toHaveAttribute('data-failure', 'unreachable', { timeout: 15_000 })
+  await page.evaluate(() => { delete (window as never as { __mockObjectAnswers?: unknown }).__mockObjectAnswers })
+  await failed.getByRole('button').click()
+  await expect(history.getByTestId('attachment-file')).toContainText('design-brief.pdf', { timeout: 15_000 })
+})
+
+test('a sender not accepted yet is no failure, and accepting brings the attachment', async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as never as { __mockObjectAnswers: unknown }).__mockObjectAnswers = {
+      'design-brief.pdf': { status: 403, reason: 'attachment-awaiting-acceptance' },
+    }
+  })
+  await page.goto(`/messagehub?entityId=${encodeURIComponent(ALICE)}`)
+  const history = page.getByTestId('conversation-history')
+  const waiting = history.getByTestId('attachment-awaiting').filter({ hasText: 'design-brief.pdf' })
+  await expect(waiting).toBeVisible({ timeout: 15_000 })
+  await expect(waiting.getByRole('button')).toHaveCount(0)
+  await page.evaluate(async () => {
+    delete (window as never as { __mockObjectAnswers?: unknown }).__mockObjectAnswers
+    const cache = '/src/components/network/cache.ts'
+    const { networkActions } = await import(/* @vite-ignore */ cache)
+    await networkActions.allowMessages('did:web:stranger.example')
+  })
+  await expect(history.getByTestId('attachment-file')).toContainText('design-brief.pdf', { timeout: 15_000 })
+})
+
+test('what a retry cannot change offers none; what it can, does', async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as never as { __mockObjectAnswers: unknown }).__mockObjectAnswers = {
+      'design-brief.pdf': { status: 415, reason: 'attachment-directory-unsupported' },
+      'harbor-sunset.png': { status: 404, reason: 'not-found' },
+    }
+  })
+  await page.goto(`/messagehub?entityId=${encodeURIComponent(ALICE)}`)
+  const history = page.getByTestId('conversation-history')
+  const directory = history.getByTestId('attachment-error').filter({ hasText: 'design-brief.pdf' })
+  await expect(directory).toHaveAttribute('data-failure', 'directory', { timeout: 15_000 })
+  await expect(directory.getByRole('button')).toHaveCount(0)
+  const missing = history.getByTestId('attachment-error').filter({ hasText: 'harbor-sunset.png' })
+  await expect(missing).toHaveAttribute('data-failure', 'not_found')
+  await expect(missing.getByRole('button')).toBeVisible()
+})
+
+test('a video still in another Zone is a tile until it is clicked', async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as never as { __mockRemoteObjects: string[] }).__mockRemoteObjects = ['screen-recording.webm']
+  })
+  const history = await openAlice(page)
+  const clip = history.getByTestId('attachment-video').filter({ has: page.getByRole('img', { name: 'screen-recording.webm' }) })
+  await expect(clip).toHaveAttribute('data-thumbnail', 'idle', { timeout: 15_000 })
+  await clip.click()
+  await expect(page.getByTestId('messagehub-media-preview')).toHaveAttribute('data-renderer', 'video', { timeout: 15_000 })
 })
 
 test('clicking media opens the in-window Preview with the conversation media as its session', async ({ page }) => {
@@ -94,7 +176,7 @@ test('media settings: GIF autoplay off shows the first frame; the window target 
   await page.getByRole('menuitem', { name: 'Media settings', exact: true }).click()
   const dialog = page.getByTestId('messagehub-media-settings')
   await expect(dialog.getByRole('radio', { name: 'Preview window' })).toBeDisabled()
-  await dialog.getByRole('switch', { name: 'Autoplay GIFs' }).click()
+  await dialog.getByRole('checkbox', { name: 'Autoplay GIFs' }).uncheck()
   await dialog.getByRole('button', { name: 'Close', exact: true }).last().click()
   await expect(dialog).toHaveCount(0)
   const gif = history.getByTestId('attachment-image').filter({ has: page.getByRole('img', { name: 'orbit-loader.gif' }) })

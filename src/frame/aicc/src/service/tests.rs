@@ -138,6 +138,10 @@ impl ServiceRuntime for FakeRuntime {
         Ok(self.snapshot.lock().await.clone())
     }
 
+    async fn preview_provider_rules(&self, _: ProviderRulesPreviewRequest) -> Result<ProviderRulesPreviewResponse, RPCErrors> {
+        Ok(ProviderRulesPreviewResponse::default())
+    }
+
     async fn prepare_settings(
         &self,
         settings: SettingsDocument,
@@ -176,6 +180,10 @@ struct SharedFakeRuntime(Arc<FakeRuntime>);
 impl ServiceRuntime for SharedFakeRuntime {
     async fn capture(&self) -> Result<RuntimeAdminSnapshot, RPCErrors> {
         self.0.capture().await
+    }
+
+    async fn preview_provider_rules(&self, _: ProviderRulesPreviewRequest) -> Result<ProviderRulesPreviewResponse, RPCErrors> {
+        Ok(ProviderRulesPreviewResponse::default())
     }
 
     async fn prepare_settings(
@@ -227,6 +235,7 @@ impl ProviderValidator for FakeValidator {
             resolved_protocol_adapter_id: request
                 .protocol_adapter_id
                 .or(Some("openai-responses".to_string())),
+            ..Default::default()
         })
     }
 }
@@ -459,6 +468,11 @@ fn sn_provider(name: &str, auth: Value) -> ProviderSettings {
 
 fn provider_public_view(provider: &ProviderSettings) -> ProviderInstanceView {
     ProviderInstanceView {
+        resolved_model_rules: BTreeMap::new(),
+        discovered_model_ids: Default::default(),
+        rules_catalog: None,
+        provider_rules_id: None,
+        instance_rules: None,
         provider_instance_name: provider.provider_instance_name.clone(),
         provider_type: provider.provider_type.clone(),
         provider_profile_id: provider.provider_profile_id.clone(),
@@ -472,6 +486,7 @@ fn provider_public_view(provider: &ProviderSettings) -> ProviderInstanceView {
             configured: true,
         },
         inventory: ProviderInstanceInventoryView {
+            filtered_capabilities: Vec::new(),
             unmatched_models: Vec::new(),
             unavailable_presets: Vec::new(),
             unpriced_models: Vec::new(),
@@ -496,7 +511,7 @@ fn provider_public_view(provider: &ProviderSettings) -> ProviderInstanceView {
 }
 
 #[tokio::test]
-async fn aicc_artifact_authorizer_is_tenant_scoped() {
+async fn aicc_artifact_authorizer_is_owner_scoped() {
     let storage = Arc::new(
         AiccStorage::open("sqlite::memory:", buckyos_api::RdbBackend::Sqlite)
             .await
@@ -522,6 +537,20 @@ async fn aicc_artifact_authorizer_is_tenant_scoped() {
         )
         .await
         .is_ok());
+    let same_tenant_other_user = AuthenticatedResourceAuthorizer {
+        tenant_id: "tenant-a".into(),
+        caller_id: "bob".into(),
+        storage: storage.clone(),
+        token: None,
+    };
+    assert!(same_tenant_other_user
+        .authorize(
+            &ResourceAccessContext::new("tenant-a", "bob", "request-b").unwrap(),
+            &target,
+            ResourceAccessOperation::ReadContent,
+        )
+        .await
+        .is_err());
     let foreign = AuthenticatedResourceAuthorizer {
         tenant_id: "tenant-b".into(),
         caller_id: "bob".into(),
@@ -1095,12 +1124,7 @@ fn model_catalog_preserves_known_models_and_specs_without_providers() {
         .find(|model| model["id"] == "qwen3.5-27b")
         .unwrap();
     assert_eq!(model["metadata"]["local_deployable"], true);
-    for model_id in [
-        "qwen3.8-max",
-        "qwen3.8-flash",
-        "qwen3.8-omni-flash",
-        "qwen3.7-plus",
-    ] {
+    for model_id in ["qwen3.8-flash", "qwen3.7-plus"] {
         let model = qwen["models"]
             .as_array()
             .unwrap()
@@ -1110,6 +1134,18 @@ fn model_catalog_preserves_known_models_and_specs_without_providers() {
         assert_eq!(
             model["metadata"]["api_types"],
             json!(["llm", "vision.caption", "vision.ocr"])
+        );
+    }
+    for model_id in ["qwen3.8-max", "qwen3.8-omni-flash"] {
+        let model = qwen["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == model_id)
+            .unwrap();
+        assert_eq!(
+            model["metadata"]["api_types"],
+            json!(["llm", "vision.caption"])
         );
     }
 }
@@ -1201,7 +1237,7 @@ fn builtin_logical_definitions_make_llm_chat_routable_without_routing_config() {
 #[test]
 fn builtin_logical_definitions_make_llm_chat_routable_with_glm_only() {
     let inventory =
-        crate::model::llm_tests::inventory("glm", "glm-5.3", "glm-channel", "glm-main", &["high"]);
+        crate::model::llm_tests::inventory("glm", "glm-5.3", "glm-channel", "glm-main", &["max"]);
     let registry = builtin_tree(&[inventory]);
     let candidates = registry
         .resolve_candidates("llm.chat", buckyos_api::ApiType::Llm)
@@ -1209,7 +1245,7 @@ fn builtin_logical_definitions_make_llm_chat_routable_with_glm_only() {
     assert_eq!(candidates.candidates.len(), 1);
     assert_eq!(
         candidates.candidates[0].model.exact_model.as_str(),
-        "glm-channel:reasoning-high@glm-main"
+        "glm-channel:reasoning-max@glm-main"
     );
     let directory = model_directory_json(&registry);
     assert_eq!(
@@ -1218,6 +1254,232 @@ fn builtin_logical_definitions_make_llm_chat_routable_with_glm_only() {
     );
     assert!(directory.get("llm.deepseek-flash").is_some());
     assert!(directory.get("llm.doubao-lite").is_some());
+}
+
+#[tokio::test]
+async fn sn_discovered_models_populate_catalog_and_builtin_llm_tasks() {
+    use crate::provider::{DiscoveredModel, InventoryBuilder, ModelAvailability};
+    use crate::runtime::ModelRegistryAssembler;
+
+    let catalog = crate::settings::MetadataSources {
+        builtin: crate::settings::load_builtin_metadata().unwrap(),
+        ..Default::default()
+    }
+    .build_snapshot(
+        crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+        &Default::default(),
+    )
+    .unwrap();
+    let providers = builtin_provider_registry(&catalog).unwrap();
+    let profile = providers
+        .profiles()
+        .find(|profile| profile.provider_profile_id == "sn")
+        .unwrap();
+    let config = ProviderInstanceConfig {
+        provider_instance_name: "sn-token".into(),
+        provider_profile_id: "sn".into(),
+        protocol_adapter_id: "sn-openai".into(),
+        base_url: "https://sn.example/api/v1/ai".into(),
+        operation_base_urls: BTreeMap::new(),
+        credential: CredentialReference {
+            reference: "secret://sn-token".into(),
+        },
+        credential_kind: Some(CredentialKind::Bearer),
+        provider_rules_id: Some("sn".into()),
+        region: None,
+        workspace: None,
+        account: None,
+        request_timeout: Duration::from_secs(30),
+        auto_sync_models: true,
+        instance_rules: None,
+    };
+    let ids = [
+        "glm-5",
+        "glm-5.3",
+        "kimi-k3",
+        "qwen3.6-plus",
+        "qwen3.7-plus",
+        "qwen3.8-max-0902",
+    ];
+    let inventory = InventoryBuilder::build(
+        profile,
+        &config,
+        ProviderDiscoverySnapshot {
+            revision: None,
+            discovered_at_ms: 1,
+            health: ProviderHealthState::Healthy,
+            models: ids
+                .into_iter()
+                .map(|id| DiscoveredModel {
+                    provider_model_id: id.into(),
+                    api_types: None,
+                    supported_features: None,
+                    unsupported_features: BTreeSet::new(),
+                    remote_methods: Some(BTreeSet::from(["responses.create".into()])),
+                    availability: ModelAvailability::Available,
+                    deprecated: false,
+                    pricing: None,
+                    video: None,
+                })
+                .collect(),
+        },
+        &catalog,
+        &providers.codecs(),
+    )
+    .unwrap();
+    assert_eq!(inventory.models.len(), ids.len());
+    assert!(inventory.unmatched_models.is_empty());
+    assert_eq!(inventory.unavailable_presets.len(), 1);
+    assert_eq!(
+        inventory.unavailable_presets[0].provider_model_id,
+        "qwen3.8-max-0902"
+    );
+    assert_eq!(inventory.unavailable_presets[0].effort, "none");
+    let registry = ServiceModelAssembler {
+        session: None,
+        events: None,
+    }
+    .build(catalog.clone(), vec![inventory.as_model_inventory()])
+    .await
+    .unwrap();
+    let directory = model_directory_json(&registry);
+    let provider = provider_public_view(&sn_provider(
+        "sn-token",
+        json!({"mode": "api_key", "credential_ref": "secret://sn-token", "credential_kind": "bearer"}),
+    ));
+    let view = model_catalog_json(&catalog, &registry, &[provider]);
+    for model in &inventory.models {
+        let llm = catalog
+            .llm_model(&model.model_driver_id, &model.origin_model_id)
+            .unwrap();
+        let exact = format!(
+            "{}:{}@sn-token",
+            model.provider_model_id,
+            llm.semantics.default_effort.variant().unwrap()
+        );
+        assert!(registry.exact_model(&exact).is_some(), "{exact}");
+        assert!(directory[&llm.family]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["target"] == exact));
+        for (spec, effort, _) in llm.semantics.spec_bindings() {
+            if !model
+                .variants
+                .iter()
+                .any(|variant| effort.variant().as_ref() == Some(&variant.name))
+            {
+                continue;
+            }
+            let target = format!("{}:{}", llm.family, effort.as_str());
+            assert!(directory[format!("llm.{spec}")]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["target"] == target));
+        }
+        let vendor = view["vendors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|vendor| vendor["id"] == model.model_driver_id)
+            .unwrap();
+        let entry = vendor["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == model.origin_model_id)
+            .unwrap();
+        assert_eq!(entry["providers"][0]["id"], "sn-token");
+        assert!(entry["providers"][0]["exact_models"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(exact)));
+    }
+    for (path, expected) in [
+        ("llm.chat", "qwen3.7-plus:reasoning-thinking@sn-token"),
+        ("llm.plan", "kimi-k3:reasoning-max@sn-token"),
+        ("llm.code", "kimi-k3:reasoning-max@sn-token"),
+    ] {
+        let candidates = registry
+            .resolve_candidates(path, buckyos_api::ApiType::Llm)
+            .unwrap();
+        assert_eq!(candidates.candidates.len(), 1, "{path}");
+        assert_eq!(
+            candidates.candidates[0].model.exact_model.as_str(),
+            expected,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn builtin_plan_and_code_prefer_openai_and_keep_other_vendors_available() {
+    let registry = builtin_tree(&[
+        crate::model::llm_tests::inventory("openai", "gpt-6-astra", "astra", "astra", &["high"]),
+        crate::model::llm_tests::inventory(
+            "openai",
+            "gpt-6.1-sol",
+            "sol",
+            "sol",
+            &["medium", "high", "xhigh"],
+        ),
+        crate::model::llm_tests::inventory(
+            "claude",
+            "claude-fable-5-1",
+            "fable",
+            "fable",
+            &["high"],
+        ),
+        crate::model::llm_tests::inventory("claude", "claude-opus-5-5", "opus", "opus", &["high"]),
+    ]);
+    for (path, expected) in [
+        (
+            "llm.plan",
+            &[
+                "astra:reasoning-high@astra",
+                "sol:reasoning-high@sol",
+                "sol:reasoning-medium@sol",
+                "fable:reasoning-high@fable",
+                "opus:reasoning-high@opus",
+            ][..],
+        ),
+        (
+            "llm.code",
+            &[
+                "sol:reasoning-xhigh@sol",
+                "sol:reasoning-medium@sol",
+                "opus:reasoning-high@opus",
+            ][..],
+        ),
+    ] {
+        let mut unavailable = Vec::new();
+        for next in expected {
+            let candidates = registry
+                .resolve_available_candidates(
+                    path,
+                    buckyos_api::ApiType::Llm,
+                    &mut |_, candidate| {
+                        !unavailable.contains(&candidate.model.exact_model.as_str())
+                    },
+                )
+                .unwrap();
+            assert_eq!(candidates.candidates.len(), 1, "{path}: {next}");
+            assert_eq!(
+                candidates.candidates[0].model.exact_model.as_str(),
+                *next,
+                "{path}"
+            );
+            unavailable.push(*next);
+        }
+        assert!(registry
+            .resolve_available_candidates(path, buckyos_api::ApiType::Llm, &mut |_, candidate| {
+                !unavailable.contains(&candidate.model.exact_model.as_str())
+            })
+            .unwrap()
+            .candidates
+            .is_empty());
+    }
 }
 
 #[test]
@@ -1296,7 +1558,7 @@ fn builtin_logical_tree_is_not_an_inventory_snapshot() {
         dir_item(&directory, "llm.chat", "qwen_plus")["target"],
         "llm.qwen-plus"
     );
-    assert_eq!(dir_item(&directory, "llm.plan", "gpt_pro")["weight"], 2.3);
+    assert_eq!(dir_item(&directory, "llm.plan", "gpt_pro")["weight"], 3.1);
     for path in ["llm", "llm.plan", "llm.gpt-standard"] {
         let set = registry
             .resolve_candidates(path, buckyos_api::ApiType::Llm)
@@ -1310,7 +1572,7 @@ fn builtin_logical_tree_is_not_an_inventory_snapshot() {
             .model_drivers()
             .map(|driver| driver.specs.len())
             .sum::<usize>(),
-        51
+        53
     );
     let mut task = None;
     let mut count = 0;
@@ -1418,6 +1680,35 @@ async fn service_assembler_builds_with_only_builtin_model_metadata() {
         model_directory_json(&registry),
         model_directory_json(&builtin_tree(&[]))
     );
+}
+
+#[test]
+fn provider_advanced_update_roundtrips_and_can_clear_channel_rules() {
+    let mut provider = sn_provider(
+        "primary",
+        json!({"mode":"api_key", "credential_ref":"test"}),
+    );
+    let mut request = ProviderUpdateRequest::new("primary", 5);
+    request.provider_rules_id = Some("sn".into());
+    let mut rules = buckyos_api::ProviderInstanceRules::default();
+    rules
+        .model_driver_overrides
+        .insert("alias".into(), "qwen/qwen3.7-plus".into());
+    rules.server_default_routes.insert(
+        "alias".into(),
+        std::collections::BTreeSet::from(["llm.chat".into()]),
+    );
+    request.instance_rules = Some(rules.clone());
+    let restored =
+        ProviderUpdateRequest::from_json(serde_json::to_value(request).unwrap()).unwrap();
+    apply_provider_update(&mut provider, restored);
+    assert_eq!(provider.provider_rules_id.as_deref(), Some("sn"));
+    assert_eq!(provider.instance_rules, Some(rules));
+    let mut clear = ProviderUpdateRequest::new("primary", 5);
+    clear.provider_rules_id = Some(String::new());
+    apply_provider_update(&mut provider, clear);
+    assert!(provider.provider_rules_id.is_none());
+    assert!(provider.instance_rules.is_some());
 }
 
 #[tokio::test]
@@ -1606,6 +1897,8 @@ async fn management_reads_and_krpc_dispatch_use_one_runtime_view() {
                 dynamic_login_behavior_id: None,
                 connection_behavior_id: None,
                 provider_rules_id: Some("openai".to_string()),
+                rules_catalog: None,
+                model_driver_overrides: BTreeMap::new(),
                 ui_hints: BTreeMap::new(),
             }],
         };
@@ -2081,10 +2374,12 @@ fn media_family_preferences_remain_static_and_cannot_be_bypassed_by_auto_mounts(
     for task in ["image.txt2img", "image.img2img", "video.generate"] {
         let entries = directory[task].as_array().unwrap();
         media_count += entries.len();
-        assert!(entries.iter().all(|item| item["target"]
-            .as_str()
-            .unwrap()
-            .starts_with(&format!("{task}."))));
+        assert!(entries.iter().all(|item| {
+            item["target"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{task}."))
+        }));
     }
     assert_eq!(media_count, 43);
     let mut contract_count = 0;
@@ -2180,4 +2475,152 @@ fn dir_item<'a>(directory: &'a Value, path: &str, name: &str) -> &'a Value {
         .as_array()
         .and_then(|items| items.iter().find(|item| item["name"] == name))
         .unwrap_or(&Value::Null)
+}
+
+#[tokio::test]
+async fn provider_list_hides_editable_rule_catalogs_from_non_managers() {
+    let fixture = fixture(false);
+    let settings = sn_provider("custom-private", json!({"mode":"api_key","credential_ref":"api_token"}));
+    let mut provider = provider_public_view(&settings);
+    provider.provider_profile_id = "custom".into();
+    provider.rules_catalog = Some(json!({"models":[{"id":"private-model"}]}));
+    provider.discovered_model_ids.insert("private-model".into());
+    provider.resolved_model_rules.insert("private-model".into(), json!({"operations":{"llm":"responses.create"}}));
+    provider.instance_rules = Some(buckyos_api::ProviderInstanceRules {
+        catalog: provider.rules_catalog.clone(),
+        ..Default::default()
+    });
+    fixture.runtime.snapshot.lock().await.providers = vec![provider];
+    let response = fixture.service.handle_list_providers(
+        ProviderListRequest::new(None), RPCContext::default()
+    ).await.unwrap();
+    let provider = &response.providers[0];
+    assert!(provider.rules_catalog.is_none());
+    assert!(provider.resolved_model_rules.is_empty());
+    assert!(provider.discovered_model_ids.is_empty());
+    assert!(provider.instance_rules.is_none());
+}
+
+#[test]
+fn protocol_adapter_views_export_the_runtime_default_operations() {
+    let catalog = crate::model::llm_tests::builtin_catalog();
+    let codecs = builtin_provider_registry(&catalog).unwrap().codecs();
+    let view = protocol_adapter_response(&codecs, &catalog.custom_provider_adapter_ids());
+    let openai = view.adapters.iter().find(|adapter| adapter.protocol_adapter_id == "openai-responses").unwrap();
+    assert_eq!(openai.default_operations["image.txt2img"], "images.generate");
+    assert_eq!(openai.default_operations["llm"], "responses.create");
+    for adapter in view.adapters {
+        for (api_type, operation) in adapter.default_operations {
+            assert!(adapter.operations.iter().any(|item| item.operation_id == operation
+                && item.api_types.iter().any(|kind| serde_json::to_value(kind).unwrap() == api_type)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn rule_preview_requires_settings_write_permission() {
+    for denied in [false, true] {
+        let fixture = fixture(denied);
+        let result = fixture.service.handle_preview_provider_rules(ProviderRulesPreviewRequest {
+            provider_instance_name: "custom-test".into(), rules_catalog: json!({}), model_ids: BTreeSet::new(),
+        }, RPCContext::default()).await;
+        assert_eq!(result.is_err(), denied);
+        assert_eq!(fixture.authorizer.calls.lock().await.as_slice(), &[("write", RESOURCE_SETTINGS)]);
+    }
+}
+
+mod body_limit {
+    use super::*;
+    use crate::execution::canonical_body_fingerprint;
+
+    fn body(bytes: impl Into<Bytes>) -> BoxBody<Bytes, ServerError> {
+        BoxBody::new(http_body_util::Full::new(bytes.into()).map_err(|never| match never {}))
+    }
+
+    fn rpc_body(padding: usize) -> Vec<u8> {
+        let mut request = RPCRequest::new(
+            buckyos_api::ai_methods::CHAT_COMPLETIONS_CREATE,
+            serde_json::json!({"exact_model": "model-a@primary", "pad": "p".repeat(padding)}),
+        );
+        request.token = Some("caller-token".to_string());
+        serde_json::to_vec(&request).unwrap()
+    }
+
+    async fn serve(server: &AiccHttpServer, request: http::Request<BoxBody<Bytes, ServerError>>) -> (StatusCode, Bytes) {
+        let response = server
+            .serve_request(request, StreamInfo::new("127.0.0.1:12345".to_string()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn serve_request_accepts_a_body_over_the_shared_default() {
+        let fixture = fixture(false);
+        let server = AiccHttpServer::new(fixture.service);
+        let body_bytes = rpc_body(2 * 1024 * 1024);
+        assert!(body_bytes.len() > buckyos_http_server::DEFAULT_MAX_RPC_BODY_SIZE);
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/kapi/aicc")
+            .header(http::header::CONTENT_LENGTH, body_bytes.len())
+            .body(body(body_bytes))
+            .unwrap();
+        let (status, bytes) = serve(&server, request).await;
+        assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        // The whole body was read and parsed: a JSON kRPC response (result
+        // or structured error) came back instead of a transport-level text.
+        let response: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| panic!("not a kRPC response: {:?}", String::from_utf8_lossy(&bytes)));
+        assert!(response.is_object(), "{response}");
+        assert_ne!(response["code"], "parse_request_error", "{response}");
+    }
+
+    #[tokio::test]
+    async fn serve_request_rejects_a_body_over_the_aicc_limit() {
+        let fixture = fixture(false);
+        let server = AiccHttpServer::new(fixture.service);
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/kapi/aicc")
+            .header(http::header::CONTENT_LENGTH, AICC_MAX_RPC_BODY_SIZE + 1)
+            .body(body(rpc_body(16)))
+            .unwrap();
+        let (status, bytes) = serve(&server, request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(bytes, Bytes::from("Payload Too Large"));
+        assert!(fixture.inference.calls.lock().await.is_empty());
+    }
+
+    #[test]
+    fn task_input_of_a_large_request_stays_under_task_mgr_limit() {
+        let mut messages = Vec::new();
+        for i in 0..40 {
+            messages.push(serde_json::json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": "t".repeat(32 * 1024)}));
+        }
+        let canonical = serde_json::json!({"exact_model": "model-a@primary", "messages": messages, "tools": [{"name": "read_file"}]});
+        assert!(serde_json::to_vec(&canonical).unwrap().len() > buckyos_http_server::DEFAULT_MAX_RPC_BODY_SIZE);
+        let fingerprint = canonical_body_fingerprint(&canonical).unwrap();
+        let input = ports::task_input_json("tenant-a", Some("trace-9"), task_request_view(canonical, &fingerprint));
+        let serialized = serde_json::to_vec(&input).unwrap();
+        assert!(serialized.len() < 4 * 1024, "task input is {} bytes", serialized.len());
+        assert_eq!(input["request"]["version"], 1);
+        assert_eq!(input["request"]["tenant_id"], "tenant-a");
+        assert_eq!(input["request"]["trace_id"], "trace-9");
+        assert!(input["request"].get("request").is_none());
+        assert_eq!(input["request"]["request_summary"]["fingerprint"], fingerprint);
+        assert_eq!(input["request"]["request_summary"]["messages"]["count"], 40);
+        assert_eq!(input["request"]["request_summary"]["tools"], serde_json::json!(["read_file"]));
+        let typed: buckyos_api::AiccComputeTaskData = serde_json::from_value(input["request"].clone()).map(|request| buckyos_api::AiccComputeTaskData { request, progress: None, result: None, error: None }).unwrap();
+        assert!(typed.request.request.is_none());
+        assert!(typed.request.request_summary.is_some());
+
+        let small = serde_json::json!({"exact_model": "model-a@primary", "messages": [{"role": "user", "content": "hi"}]});
+        let fingerprint = canonical_body_fingerprint(&small).unwrap();
+        let input = ports::task_input_json("tenant-a", None, task_request_view(small.clone(), &fingerprint));
+        assert_eq!(input["request"]["request"], small);
+        assert!(input["request"].get("request_summary").is_none());
+    }
 }

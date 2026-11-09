@@ -15,11 +15,12 @@
 | `tasks.rs` | TaskMgr 接入：`TurnTasks`（每个 Turn 一个 `opendan.agent_turn/v1` task，Agent 自建自跑，root task grant 给 owner）、`CancelBridge`（TaskMgr 的 cancel → Session `stop`） |
 | `service.rs` | Agent State kRPC 服务、Session 观测、三个操作、Loader 状态 |
 | `home.rs` | 首页用的数据：Agent 资料卡、按模型的 token 用量、UI Session 对应的会话、Agent State 登记的 Workspace 展示 |
+| `objects.rs` | 产物出站：报告与回复的文件存进 named store 并绑进本 Agent 的 `artifacts` 桶，`obj://bucket/...` 引用复制进该桶（见下文“产物”） |
 | `web/` | WebUI：首页（资料卡、工作概况、Session 列表，按手机屏幕设计）+ 观测页（Sessions / Agent State / Loader，`#/sessions` 起），数据全部来自 kRPC |
 
 ## Agent 与它的 Owner
 
-zone 内每个 Agent 是一个由模板构造的独立 App（AppId = AgentId，实例 `<agent_id>@<owner>`），由 control_panel 创建。Loader 启动后在 `users/<owner>/agents/*/spec` 里找绑定到本实例的 AgentSpec；还没有时一直等待（每 5 秒查一次，不退出），多于一个时报错退出。AgentRoot 在 `data/home/<owner>/.local/share/<agent_id>/agents/<agent_id>/`。
+zone 内每个 Agent 是一个由模板构造的独立 App（AppId = AgentId，实例 `<agent_id>@<owner>`），由 control_panel 创建。Loader 启动后在 `users/<owner>/agents/*/spec` 里找绑定到本实例的 AgentSpec；还没有时一直等待（每 5 秒查一次，不退出），多于一个时报错退出。AgentRoot 在 `data/home/<owner>/agents/<agent_id>/`。
 
 Add Agent 默认授予当前用户的读写权限，用户可选只读；对应 `agent.create.permission_mode` / `AgentSpec.permission_mode` 的 `read_write`（默认）与 `read_only`。Docker 内 Owner home 按该模式挂载，AgentRoot 在两种模式下始终读写。Session、记忆和技能写入 AgentRoot，不要求用户 home 可写。该授权由创建流程保存，模板更新沿用；不在 `agent.toml` 中设置。宿主调试进程遵循宿主文件权限，不具备 Docker 的只读挂载隔离。
 
@@ -42,11 +43,13 @@ Goals（`[loader.goals] enabled`，缺省开启，没有 Goal 时没有开销）
 
 托管循环在 `libopendan::host::Supervisor`：登记表里 `driver = 本进程身份` 且未结束（或有待处理 decide）的 Session 各有一个协程循环 `drive(Idle)`；启动后的第一次扫描就是恢复；空闲超过 `idle_unload_secs` 且没有待推进工作的 Session 被卸载，有新输入时再装载。
 
-Turn 与 task：zone 形态下每个 Turn 打开时在 TaskMgr 建 task（幂等键 `agent_turn:<sid>:<turn>`，input = `{agent_did, session_id, session_kind, turn, inputs}`），子 Session 的 Turn 挂在创建它的那个 Turn 的 task 下；Session 是 task 状态的唯一写入方（Running + message、Waiting(ChildTask / Dependency / External)、Succeeded `{summary}`、Failed、Stopped → Canceled）。`--dev` 没有 TaskMgr，不建 task。
+Turn 与 task：zone 形态下每个 Turn 打开时在 TaskMgr 建 task（幂等键 `agent_turn:<agent_did>:<sid>:<turn>`，input = `{agent_did, session_id, session_kind, turn, inputs}`），子 Session 的 Turn 挂在创建它的那个 Turn 的 task 下；Session 是 task 状态的唯一写入方（Running + message、Waiting(ChildTask / Dependency / External)、Succeeded `{summary}`、Failed、Stopped → Canceled）。`--dev` 没有 TaskMgr，不建 task。
 
 占位：Agent 包 `i18n/<语言>.toml` 的 `[outbound]` 有 `accepted` 文案、msg-center `msg.get_edit_capability` 回答可编辑、且 Turn 打开超过 `[loader] placeholder_delay_ms`（默认 3000）或已有首次工具调用时，先发占位（带 `agent_task`），Turn 结束时以一条 edit 替换；`stopped` / `finished` 是停止与无正文结束时收尾占位的文案。其余情况只发最终回复（同样带 `agent_task`）。
 
 提问：Session 里的 `agent-session ask-user` 让 Turn 等用户回答时，占位立即发出（不等 `placeholder_delay_ms`），问题以 `relates_to {thread → 占位}` + 顶层 `agent_ask {anchor, call_id, turn, input}` 出站；群聊里问题 `mentions` 主人（MessageHub 只对被提到的成员进入回答态）。用户的下一条消息就是答案（MessageHub 的回答带 `thread → 占位`，选项回答带 `machine {intent: "agent_ask.answer", data {call_id, option}}`）；Turn 结束时占位被 edit 成结果。TaskMgr 的 Turn task 在等待期间为 Waiting（reason `input`，“waiting for the user's answer”）。
+
+产物：报告的 `artifacts`、结构化回复的 `artifacts` 与回复正文的 `<attachment path=…>` 经 `objects.rs` 交出。工作目录里的文件以交付名存进 named store（`StoreInNamedMgr`，不链接本地文件），绑进模板声明的 `user/<agent_id>/<owner>/artifacts`（`data` / `documents`：归用户、卸载 Agent 不删、默认 versioning），key `<对象 id 前 16 位>/<名字>`，create-only（已存在且是同一对象即同一产物）；给出的是 `obj://bucket/...`（如 AICC 结果 `user/aicc/<owner>/outputs/...`）时 `bucket.copy` 进 `artifacts`，不再上传字节；`cyfile:` 等对象 id 原样转交。绑定成功才算交付：失败是 `report` 工具的错误（Agent 可改正重试）、结构化回复的 `artifacts not delivered`，或回复正文里该附件的拒绝说明。交付后 `ReportArtifact.url` 与回复 ref 的 `uri_hint` 都是这个 `obj://bucket/...`，`state/reports/<id>/` 里的稳定副本删除。中间文件用模板的 `scratch` 桶（`temp`，7 天，app 池 `storage_quota_mib` 只约束它）。入站附件保持 ObjId；AgentRoot、Session 工作目录、`runs/`、`usage.jsonl` 仍在文件系统（Agent 自己的电脑）。`--dev` 没有对象存储，产物只留稳定副本，在回复里按名字写出。
 
 Runtime：启动时在 Agent State 幂等补建内建 Runtime `container`（本进程所在环境，`roots` 为 AgentRoot 的 `workspaces/` 与 owner 的 home）与 `host`（宿主机，执行器落地前不可用），首页在 Workspace 旁列出。
 
@@ -122,6 +125,7 @@ WebUI 通过同源 `/api/opendan` 访问托管本页面的 Agent，由 zone 网�
 | method | params | result |
 |---|---|---|
 | `agent.info` | – | `{agent_did, agent_id}` |
+| `sessions.reserve_id` | `{kind, key, parent_dir?: string}` | 预留或复用短 Session ID（`<kind前缀>-YYYYMMDD-N`） |
 | `sessions.lookup` | `{sid}` | `RegistryEntry \| null` |
 | `sessions.query` | `{query?: RegistryQuery}` | `RegistryEntry[]` |
 | `sessions.children_of` | `{parents: string[]}` | `RegistryEntry[]` |
@@ -164,7 +168,7 @@ WebUI 通过同源 `/api/opendan` 访问托管本页面的 Agent，由 zone 网�
 
 没有任何对 Session 目录的写接口。
 
-`session.worklog {sid, turn, before?: number, after?: number, limit?: number = 50}` 按指定 turn 读取已提交的执行记录：
+`session.worklog {sid, turn?: number, before?: number, after?: number, limit?: number = 50}` 读取已提交的执行记录：给 `turn` 时只读这个 turn，不给时按提交顺序读整个 session（MessageHub 点 work session 卡看到的连续日志）：
 
 ```jsonc
 {
@@ -176,9 +180,37 @@ WebUI 通过同源 `/api/opendan` 访问托管本页面的 Agent，由 zone 网�
 }
 ```
 
-`entries` 按 seq 从旧到新排列，仅含这个 turn。首次读最近一页；`before` 反向翻页，`after` 从上一响应的 `next_after` 向前补读。游标是 worklog 的字节边界，不允许同时传入或越过 `state.worklog.committed_bytes`；`limit` 范围 1–200。单次最多检查 2000 条记录，因此空页仍可能有 `next_before`，实时补读的 `next_after` 也可能小于 `committed`，客户端需继续读取。`next_before = null` 表示该 turn 的更早记录已读尽。翻页期间日志继续追加不会改变既有游标。
+`entries` 按 seq 从旧到新排列：给了 `turn` 时仅含这个 turn；不给时含全部记录，没有 turn 的记录（`created`、控制、拒收等）也在内，`turn_started` / `turn_ended` 就是 Turn 之间的分隔，响应里 `turn`、`task_id` 为 null。首次读最近一页；`before` 反向翻页，`after` 从上一响应的 `next_after` 向前补读。游标是 worklog 的字节边界，不允许同时传入或越过 `state.worklog.committed_bytes`；`limit` 范围 1–200。单次最多检查 2000 条记录，因此空页仍可能有 `next_before`，实时补读的 `next_after` 也可能小于 `committed`，客户端需继续读取。`next_before = null` 表示该 turn（不给 turn 时为整个 session）的更早记录已读尽。翻页期间日志继续追加不会改变既有游标。
 
-`complete` 根据 `turn_seq / open_turn` 判断，包括失败、停止等终态；不使用只统计成功轮次的 `turns_completed`。`task_id` 来自仍保留的 `turn_tasks` 绑定，历史绑定被清理时可为 null，日志仍可读。`children` 来自 session 登记表的 `origin.created_by_call`，按 run/call 精确挂在创建调用上；子 session 的首个 turn 是其 work task 的入口。此接口沿用整个 OpenDAN 的 owner/root 读权限，单有 TaskMgr grant 不授予 worklog 权限。
+给了 `turn` 时 `complete` 根据 `turn_seq / open_turn` 判断，包括失败、停止等终态；不使用只统计成功轮次的 `turns_completed`。不给 `turn` 时 `complete` = session 已 Finished 且这一页读到了已提交的末尾（`next_after == committed`）。`task_id` 来自仍保留的 `turn_tasks` 绑定，历史绑定被清理时可为 null，日志仍可读。`children` 来自 session 登记表的 `origin.created_by_call`，按 run/call 精确挂在创建调用上；子 session 的首个 turn 是其 work task 的入口。此接口沿用整个 OpenDAN 的 owner/root 读权限，单有 TaskMgr grant 不授予 worklog 权限。
+
+`session.work_cards {sid, task_id}` 返回一个 UI Turn 建出的 work session 卡片（MessageHub 回复气泡下的附属 UI，`notepads/done/messagehub-worksession-ui-todo.md` §3）：
+
+```jsonc
+{
+  "agent_did": "…", "session_id": "<ui sid>", "task_id": "<ui turn task>",
+  "complete": false,              // Turn 已关闭，且每张卡（含 Todo 卡）都已终态
+  "sessions": [{
+    "session_id": "…", "shape": "simple | plan | explore",
+    "title": "…",                 // ≤60 chars：create-worksession --title；没有时取 objective 首个非空行
+    "created_at_ms": 0, "finished_at_ms": null,
+    "state": "queued | running | needs_input | paused | succeeded | failed | stopped",
+    "line": "…",                  // ≤160 chars，见下
+    "usage": { "input_tokens": 0, "output_tokens": 0, "rounds": 0,
+               "models": [{ "model": "gpt-6.1-sol@cliproxy", "input_tokens": 0, "output_tokens": 0 }] },
+    "model": "gpt-6.1-sol@cliproxy" | null,   // 最近一个成功 Round 的实际模型
+    "subtree_usage": null,        // plan：自身 + 全部子 session（Todo）的 usage 之和
+    "todos": null                 // plan：{rev, total（不含 cancelled）, done, items: [{todo_id, seq, title, status, mode,
+                                  //   attempt（最新一次，0 = 还没有）, blocked_by, block_reason, card: <该 attempt 的 work session 卡> | null}]}
+  }]
+}
+```
+
+- 筛选：`sessions.children_of([sid])` 中 `origin.parent_task == task_id` 的 session，按 `created_at_ms` 排序；plan 再读 `children_of([plan])` 与 `todos.json`，Todo 卡不再嵌 `todos`。
+- `state` 自上而下取第一条：Finished 按 outcome（无 outcome 视为 stopped）→ `paused` → 等输入（`needs_input`）→ 还没开过 Turn 的 Created / Ready（`queued`）→ 其余 `running`（包括在等自己的任务、子 session 或 timer）。
+- `line`：succeeded / stopped 取结局的首个非空行（`state.result.answer`，其次提交的 report，最后是 report.md 去掉 `# Report — …` 与 `- session:` 等头部之后的正文）；failed 取 `last_error.message`，没有再取结局；paused 取暂停原因；running 时 Turn 开着取 `one_line_status`（实时：调用带 `intent` 时就是 intent），Turn 之间取最后一个已关闭 Turn 绑定的 `summary`（该 Turn 的回复）。needs_input、queued 以及没有原因的 paused / stopped 为空串，由 UI 用本地化文案。
+- `usage` 每次调用全量读该 session 的 `usage.jsonl`，不读 `static.json`（多 Turn Work 运行中为 0）；xllm 接手的 run 的推理只记在 run.json，这部分不计入。
+- 鉴权同 `session.read`（只读白名单 `is_read`，owner/root 读权限）；被拒或 Agent 不认识这个方法时 Desktop 退回原来的任务区。
 
 ### 操作（都只是向 Session 的输入总线投一条记录）
 
@@ -274,6 +306,17 @@ Agent State 门面的 `skills.*`：Agent 的 cmd_skills（`cmd_skills/<name>.md`
 zone 内启动时，进程把 `AGENT_TOOL_HOST_ID` 设为 `<device did>/<app instance id>`（已设置则不动）：容器每次重建都会换 hostname，Session 的 runtime 绑定与 lease 用这个稳定身份。
 
 ## 测试
+
+容器附件真实链路回归（在 `src/` 下编译，再将测试二进制放入正在运行的 Agent 容器）：
+
+```bash
+cargo test -p opendan --test container_artifact_dv --no-run
+docker cp <上述命令输出的测试二进制> <agent-container>:/tmp/container_artifact_dv
+docker exec -e OPENDAN_DV_AGENT_ROOT=<容器内现有AgentRoot> -e OPENDAN_DV_SESSION_ID=<现有sid> \
+  <agent-container> /tmp/container_artifact_dv --ignored --nocapture --test-threads=1
+```
+
+测试经 SessionService 获取 Agent 当前 token，使用 Rust runtime 将临时文件存入 NamedStore、经 NodeGateway 绑定到 artifacts 桶，再核对绑定和读回内容，最后删除本次测试的绑定。不会调用 LLM 或推进现有 Session；token 不打印、不落盘。测试二进制须与容器架构及运行库匹配，也可编译为对应 musl target。已有授权 token 文件时，可用 `OPENDAN_DV_SESSION_TOKEN_FILE` 代替上述两个环境变量。
 
 提示词人工 review（在 `src/` 下运行）：
 

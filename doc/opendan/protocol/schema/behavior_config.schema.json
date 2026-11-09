@@ -44,6 +44,16 @@
             "integer",
             "null"
           ]
+        },
+        "wrap_up_tools": {
+          "description": "Functions still offered once `max_tool_iterations` is used up (`None`: `report` / `ask_user` of an explicit-report session; `[]`: none). Calling them costs no iteration, at most 2 batches.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -74,6 +84,17 @@
             "array",
             "null"
           ]
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/WorkspaceAccess"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The access a session entered with this behavior takes to its workspace (`None`: what its creator asked). A plan reads the workspace; the work sessions of its Todos write it."
         }
       },
       "type": "object"
@@ -101,10 +122,6 @@
               "type": "null"
             }
           ]
-        },
-        "todo": {
-          "description": "A hand-over to this behavior (`next_behavior`) executes the session's next serial Todo: the host admits it and hands its body over as the sub task (`create_sub_context` only).",
-          "type": "boolean"
         }
       },
       "type": "object"
@@ -201,12 +218,6 @@
             "null"
           ]
         },
-        "semi_subscription_snapshot": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "system": {
           "description": "System template of the behavior's context.",
           "type": [
@@ -222,7 +233,7 @@
       "description": "`[reply]`: the reply contract of a behavior's context. The final reply (an assistant text without tool calls) is one JSON value matching `schema`: the provider enforces it natively where it can, the host checks it and asks for one correction (`OutputSpec::Json { max_repairs: Some(1) }`). Function call loop only.",
       "properties": {
         "asks_field": {
-          "description": "An array field of the reply that must list every question the context asked the user (`agent-session ask-user`), one entry each.",
+          "description": "An array field of the reply that must list every question the context asked the user (`ask_user`), one entry each.",
           "type": [
             "string",
             "null"
@@ -317,25 +328,6 @@
         }
       ]
     },
-    "InputBackground": {
-      "description": "What the host shows a context besides its inputs.",
-      "oneOf": [
-        {
-          "description": "Only what an input batch carries (the chat format's background).",
-          "enum": [
-            "batch"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Also after every batch of tool results (behavior loop: every step with action results): the TodoList, sub session and runtime / workspace lines that changed since they were last shown, as a `<<background_context>>` message before the next inference.",
-          "enum": [
-            "after_tools"
-          ],
-          "type": "string"
-        }
-      ]
-    },
     "InputMedia": {
       "description": "Whether attachments also enter the context as image / document blocks.",
       "oneOf": [
@@ -378,14 +370,6 @@
       "additionalProperties": false,
       "description": "Input consumption policy of a context (separate from its templates).",
       "properties": {
-        "background": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/InputBackground"
-            }
-          ],
-          "default": "batch"
-        },
         "media": {
           "allOf": [
             {
@@ -404,6 +388,13 @@
         }
       },
       "type": "object"
+    },
+    "WorkspaceAccess": {
+      "enum": [
+        "read_only",
+        "read_write"
+      ],
+      "type": "string"
     }
   },
   "description": "One behavior of the agent, includes expanded.",

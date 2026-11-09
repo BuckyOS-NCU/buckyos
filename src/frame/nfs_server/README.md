@@ -19,8 +19,8 @@ KernelService 身份 login(含心跳),读取 `services/nfs-server/settings`
   成为一个 export root;`.` 开头目录不导出。导出列表为启动时快照。
 - filedb + 上传暂存放在 `$BUCKYOS_ROOT/data/.fsdb/`。
 - 监听 `127.0.0.1:4110`(`NFS_SERVER_SERVICE_PORT`)。NFSP 是跨 zone 通用协议,
-  网关把 zone 级根路径 `/nfs/v1/*` 原样转发到本服务(boot_gateway.yaml,
-  与 /ndn 同级),不使用 `/kapi/<service>` 形态。
+  网关把 zone 级根路径 `/nfs/v1/*`、`/ndn/*` 原样转发到本服务(boot_gateway.yaml),
+  不使用 `/kapi/<service>` 形态。
 - 每个请求验证调用者的 Verify Hub session token（Bearer 或 SSO cookie），再按路径 ACL 授权；
   Zone owner 全权限，用户管理自己的 `home/<user_id>`，其余靠 ACL 记录授予，匿名只到 `public`。
   详见下文“鉴权与权限”及产品文档 §11。
@@ -75,14 +75,14 @@ cargo test -p nfs_server        # 单元与集成测试，不需要外部服务
 | 搜索 | `search` | ✅ name mode;响应结构完整(`match_source`/`explain`/`sources[]`);先序遍历 + 路径游标 |
 | 权限 | `get_acl` / `set_acl` / `list_acls` | ✅ 路径 ACL(实现扩展);继承/关闭继承、内置 owner 规则、owner 可列出全部记录 |
 | 分享(活子树) | `grant` / `revoke` | ⚠️ 需 `manage`;签发/撤销/落库完整,**数据面不凭活子树 cap 放行** |
-| 分享(快照) | `share.*`(实现扩展) | ✅ 快照进 named store 并 pin;`/s/{token}` 访客页/下载/密码/到期;审计、访问统计、Public 投影、MessageHub/HomeStation 交接;详见产品文档 §12 |
-| 派生 | `repr` | ❌ 未实现、不广告(依赖缩略图管线 + NamedStore) |
+| 分享(快照) | `share.*`(实现扩展) | ✅ 快照进 named store,分享有效期间绑定在 zone 桶 `zone/nfs-server/_/shares`(key = share_id,停止/到期即解绑);`/s/{token}` 访客页/下载/密码/到期;审计、访问统计、Public 投影、MessageHub/HomeStation 交接;详见产品文档 §12 |
+| 派生 | `repr` / `get_repr`(实现扩展) | ✅ Preview Pipeline:ffmpeg/ffprobe(媒体)与 LibreOffice `soffice`(文档→PDF)各自有则用、没有就 `unsupported`;产物进 zone 桶 `zone/nfs-server/_/preview-cache`;见下文「预览管线」 |
 | 通知 | `watch`(SSE) | ✅ `container_changed`/`meta_changed`/`resync`;连接首事件恒为 `resync`(D11);watch_token 过滤 |
 | 数据面 | `GET /nfs/v1/read/{node_id}` | ✅ Range/ETag(弱)/If-None-Match/Content-Disposition;**不发 immutable**(link 语义,§4.2) |
 
 `hello` 广告的 features:`view` `collection` `reference-binding` `watch.sse` `search.name` `acl` `share`,
-并返回 `identity {user_id, role}`。
-不广告(未实现):`frozen-subtree` `search.semantic` `repr` `get_tree` `publish_dir`。
+找到任一转换器(ffmpeg+ffprobe 或 soffice)时再加 `repr`;并返回 `identity {user_id, role}` 与 `repr`(转换器能力,见「预览管线」)。
+不广告(未实现):`frozen-subtree` `search.semantic` `get_tree` `publish_dir`。
 
 ## filedb(§3.2 最小持久集)
 
@@ -139,7 +139,7 @@ v1 用**扫描循环 + 访问时校验**替代平台 watcher(inotify/USN/FSEvent
 
 1. 活子树 cap 校验(grant 数据面放行)与 App/Agent 主体的文件平面访问。按请求鉴权、路径 ACL 与快照分享已完成。
 2. NamedStore link 模式(`add_chunk_by_link_to_local_file` / qcid 阶梯)替换 `content_index`。
-3. `repr` 缩略图、`view_patch`、`get_tree`、`publish_dir`/Frozen、referral 设备视图。
+3. `view_patch`、`get_tree`、`publish_dir`/Frozen、referral 设备视图;`repr` 的 PDF/Office 等非音视频管线。
 4. NativeTree trait 冻结(M7):第二个实现(fs_meta)落地时从 `namespace.rs` 提取。
 
 ## 文件复制真实 E2E
@@ -190,11 +190,84 @@ loopback 监听且显式开启 `--debug-api`。测试仍执行 JWT 签名及标�
 `product/bucky_file/nfs_server.md` §13。回归：`cargo test -p nfs_server --test ndm`（真实 RBAC 模型 + 默认策略，
 覆盖归属、续传、终止、过期、登记校验、未授权读取与权限分离）。
 
+`bucket.grant_holdings { user_id, app_id, obj_ids }`（`obj://ndm/manage`）让某个用户经某个 App 能读这些对象，给生成对象的可信服务用：workflow 在 `get_run_output` 时把系统管线的产物交给已授权的请求者。只覆盖列出的对象本身，不含其下的 chunk，也不为这些对象加 lease，保留由登记方负责。
+
 浏览器使用 WebSDK `ndm.importFiles` / `ndm.importDirectory`，再等待 `ndm.ensureUploaded`；稳定 ObjId 与 `objectStatus: ready` 分开。`POST /ndm/v1/import/finalize` 接收 `{ objects: [{ obj_id, obj_data }], roots: [ObjId], qcid_links?: [{ qcid, content_id, size }] }`，在原上传用户和 canonical App/System target 下按依赖顺序登记 FileObject、ChunkList、DirObject，校验 ID、子对象读取权限及递归完整性。请求体上限 8 MiB、对象和根各最多 10000 个；根只能是 FileObject 或 DirObject。
 
 成功返回 `{ ready: true, roots: [{ obj_id, ready: true }], warnings: [] }`。缺失/无权访问依赖、登记或临时保留失败均不返回 ready，重试相同 manifest 不重复创建内容。QCID 是可选优化：服务端从已完成内容采样验证，失败只写 warnings；索引按上传主体隔离，并保存原 chunk/ChunkList 标识，避免复用改变 FileObject ID。lookup 的 `scope` 为 `app` 或 `global`；只有 `reusable: true` 才允许跳过上传，存在性查询本身不授予读取或登记权限。
 
 就绪根及依赖元数据使用 24 小时、递归展开的临时 pin，覆盖复用内容的强依赖；该保留不能替代消息、发布、异步请求等业务引用。零字节 TUS 在创建时直接完成真实空 chunk 写入，无需 PATCH。上传取消只清理所属 session 的 staging/pin，不删除共享对象。
+
+manifest 可带 `auto_bind: { bucket_id, key, content_type?, metadata?, tags?, expires_at?, origin?, if_none_match?, if_match? }`（只能有一个根）：登记完成后在同一请求里把根绑定进应用对象桶，响应多一个 `binding: { bucket_id, key, obj_id, version, etag, created }`；绑定失败按桶的错误码返回（如 412 `precondition_failed`、507 `quota_exceeded`），24 小时临时保留照旧。
+
+## 应用对象桶
+
+模型与规则在 cyfs-ndn `bucket_store`（设计：`doc/arch/应用对象桶 Bucket 设计.md`），本服务是它的宿主（`src/bucket/`）：
+
+- 索引：`bucket-index` RDB 实例（scheduler 在 `services/nfs-server/spec` 登记，sqlite，`$BUCKYOS_ROOT/data/nfs-server/bucket-index.db`）；独立模式在 `--data-dir/bucket-index.db`。
+- 桶只来自声明：`users/<user>/apps/<appid>/spec` 或 `services/<appid>/spec` 的 `spec_config.buckets` 与 `storage_quota_mib`，访问时懒建、每分钟同步声明值，不再声明的桶标记 `orphaned_at` 保留。独立模式用 `--bucket-specs <json>`（`{appid: {buckets, storage_quota_mib}}`）。
+- kRPC `bucket.*`：`POST /kapi/nfs-server`（方法表见设计 §12.1，另有 `bucket.set_versioning`）；`params.access_token` 可带 `bkt_` 能力令牌。
+- 数据面：`GET | HEAD | PUT | DELETE /bucket/v1/<scope>/<appid>/<owner>/<name>/<key>`（网关 `/bucket/*` 转发到本服务），会话来自 Bearer 或 SSO cookie，能力令牌来自 `?token=` 或 `Bearer bkt_…`；PUT 单请求上限 32 MiB。匿名且无令牌的请求不读配置也不建桶，直接拒绝；带令牌时会话校验失败按匿名继续。这个路由和 Desktop 同源，文件字节按 D24 处理：只有图片、音视频、PDF、纯文本内联，其余 `application/octet-stream` 加下载，都带 `nosniff`、CSP、`no-referrer`（`/nfs/v1/read` 同样）。
+- `/ndn/<obj_id>[/@/<inner>][?hint=<hint>]`（`src/ndn/`，设计 §4.6.5）：跨 Zone 按 ObjId 只读，标准 HTTP + Range。授权根在 `zone/nfs-server/_/public-objects` 或 `public-cache` 里就放行（`public, immutable`，受 `ndn_anonymous_bytes_per_sec` 限速），否则看 `hint.token`（只认单 key、只读、未绑定主体的 `bkt_`，当前绑定必须等于授权根，响应 `private`）；不读 cookie 和 Bearer，拒绝一律 404。写入进公开桶走 `bucket.provide_public` / `withdraw_public` / `list_public`（`obj://ndm/public`，`requested_by` 本人要持有整棵对象树）和 `bucket.cache_public`（`obj://ndm/public_cache`，真实匿名下载并校验后才绑定，单 App 上限 `public_cache_app_mib`）。`ambient` 绑定的内容不在本地时，读返回 `202 + Retry-After` 并按 `origin` 经 `/ndn/` 拉取，拉不到 `404 origin_unavailable`；`bucket.prefetch` 主动触发。
+- 授权：第一层 RBAC `obj://bucket/<bucket_id>/<key>`（默认策略在 `buckyos-api` `rbac_config.rs`）；Agent（DID 会话）只在 owner 的 user 桶上 list/read，读写模式再加 create/write；服务会话对自己 appid 的桶全权；之后由 lib 判 grant、令牌与档位规则。
+- 后台：本服务是 Zone named store 的 GC 宿主，每 30 秒投递级联边、刷 LRU、过期 pin；并驱逐无 pin、无入边的 class 0 对象和 24 小时未访问的无主 chunk（`services/nfs-server/settings.named_store_gc_evict`，默认开；每个写入方都把要留的内容绑进桶或持有 Lease，关掉只用于排查）。桶 reconcile 每 10 分钟（启动一次、每日深度对账与用量重算），生命周期每小时。对象事件发 kevent `/bucket/<bucket_id>`。
+
+- S3 兼容面：`/s3/*`（网关 `/s3/*` 转发）与 `s3.<zone>` 的所有路径（scheduler 的 APP_INFO `s3` 项），路径风格、region `us-east-1`；协议在 cyfs-ndn `s3_gateway`，本服务只回答密钥对应的 (user, app) 与它的 RBAC（`runtime.enforce_principal`，无会话 token）。密钥用 kRPC `bucket.create_s3_key {appid, scope?, expires_at?}` / `bucket.list_s3_keys` / `bucket.revoke_s3_key` 管理，只接受用户本人从系统 UI 来的会话；桶名是 `<appid>-<name>`。
+
+- Files 投影（设计 §4.5.4，`src/bucket/projection.rs`）：用户 `documents` 档的 `data` 桶只读投影到 `cyfs:///home/<user>/Apps/<App 显示名>/<桶名>/<key 按 / 展开>`，`collected` 档到 `Collected/`；本地真实目录同名时真实目录优先。App 显示名取 spec 的 `app_doc.show_name` / `service_doc.show_name`（独立模式取 `--bucket-specs` 的 `show_name`），重名追加 ` (<appid>)`，App 全部桶都是孤儿时目录名加 `（已卸载）`（部分桶孤儿时加在桶目录上）；key `a` 与前缀 `a/` 并存时文件显示为 `a~file`。节点 ref 为 `bk_<base64url(home 下路径)>`、条目 `binding: "projection"`、`flags: ["read_only"]`、没有 `copy_ref`；文件的 `access_urls.read` 是 `/bucket/v1/<bucket_id>/<key>`。可写操作只有 `delete`：删文件 = 解绑该 key，删前缀目录要 `recursive: true`（解绑其下所有 key），桶与 App 目录不能从 Files 删除；权限按 home 的 NFS ACL（本人 Manage）。不提供：投影内新建/写入/移动/复制（复制走 `read` URL 下载）、目录变化的 watch 推送（revision 随桶的 key 数与版本数变化）。
+
+回归：`cargo test -p nfs_server --test bucket --test projection`；lib 单测 `cargo test -p bucket_store -p s3_gateway`（cyfs-ndn）。
+
+## 预览管线(repr)
+
+`src/preview/`:Preview 组件不能直显的内容(Chromium 上的 HEIC/HEIF、HEVC,浏览器播放失败的 MOV 等;
+Office / ODF / RTF 文档)由 nfs_server 进程内 spawn ffmpeg/ffprobe 或 LibreOffice 转成兼容副本,原文件字节、
+ObjId、下载原文件不变(`notepads/preview-iphone-media-compatibility-todo.md` D1–D10、
+`notepads/done/aiworkspace-office-import-todo.md` §5.1、Preview PRD §23.6–23.7)。
+
+- **工具**(`tools.rs`):ffmpeg+ffprobe(两者都在才算)与 `soffice` 各自独立,依次查
+  `$BUCKYOS_ROOT/libexec/buckyos-tool/bin/` → `PATH` → 平台固定位置:macOS `/opt/homebrew/bin`、`/usr/local/bin`、
+  `/Applications/LibreOffice.app/Contents/MacOS`;Linux `/usr/bin`、`/usr/lib/libreoffice/program`、
+  `/opt/libreoffice*/program`;Windows `%ProgramFiles%\LibreOffice\program`、`%ProgramFiles(x86)%\LibreOffice\program`。
+  Windows 加 `.exe` 且子进程无控制台;**有则使用,没有就失败**,不下载不安装。启动时、每次 `hello` 与 `repr` 前按
+  (路径, 大小, mtime) 复核(只 stat,变了才重新跑 `-version` / `--version`)。`hello.repr`:`available`(任一转换器在)、
+  `profiles`(只列当前能产出的档位)、找到的 `ffmpeg`/`ffprobe`/`soffice` 各给 `{path, version}`、ffmpeg 在时另给
+  `tonemap`(zscale+tonemap)、`h264_encoder`(libx264)、`heif`(≥7.1 才有 tile grid),缺的工具进 `missing` 并给
+  `detail`。soffice 版本取 `soffice --version` 首行(`LibreOffice 25.2.3.2 …` → `25.2.3.2`;Windows 上 `soffice.exe`
+  不输出时改问同目录 `soffice.com`)。HEIC 需要 ffmpeg ≥ 7.1。
+- **协议**(`rpc.rs`,websdk `NfspClient.repr/getRepr` 同形):`repr` 的源是 `at`(NFSP 路径/ref,按路径 ACL
+  判 read)或 `args.source`(`{bucket:{bucket_id,key,version?,access_token?}}` 按桶权限,`{obj_id}` 按 NDM 读权);
+  `args.purpose` = `preview|thumbnail`,`args.runtime` 是能力提示(`video_codecs.hevc` 决定重封装还是转码),
+  `retry` + `expected_attempt_id` 是显式重试的 CAS;未知参数拒绝。规划结果 `state:"unsupported"`
+  (`reason` = `no-pipeline|no-renderer|not-content`,`detail` 说明);执行失败 `state:"failed"` + `error`。
+  `get_repr {work_key}` 只查询,要求本主体一小时内 ensure 过。
+- **记录**(filedb `preview_works`):`work_key = sha256(输入 ObjId, nfs.preview/<版本>@ffmpeg-<版本>|@soffice-<版本>, params)`;
+  本地文件的输入 ObjId 是 `sha256:<内容>`,按 (路径, 大小, mtime) 缓存在 `preview_inputs`;桶/对象源用内容
+  chunk/chunklist id。同一 work_key 合并等待,调用方离开不杀进程;失败负缓存 10 分钟,显式 Retry 立即新 attempt;
+  重启把 `processing` 记为可重试的 `INTERRUPTED`。
+- **档位**(`convert.rs`):`preview-image` JPEG 长边 ≤4096(HEIF tile grid 拼接、`irot`/`imir` 烘进像素、透明→白底);
+  `preview-video` H.264 High ≤1080p yuv420p + AAC 128k `+faststart`(H.264,或 Runtime 可播的 HEVC 只 `-c copy`
+  重封装;旋转由 autorotate 烘进像素);`preview-audio` AAC/MP4;`thumbnail` JPEG 长边 ≤640(视频取 min(1s,10%) 帧)。
+  PQ/HLG 一律 tonemap 到 SDR BT.709 并在 `fidelity` 注明。并发按 CPU 1–2,超时 max(60s, 时长×10)。
+- **文档**(`media.rs` `Kind::Document`、`convert.rs` `preview-document`):docx/pptx/xlsx 按 zip 条目名
+  (`word/document*.xml`、`ppt/presentation*.xml`、`xl/workbook*.xml`)认,ODF 按首条目 `mimetype`
+  (`application/vnd.oasis.opendocument.text|presentation|spreadsheet|graphics`),doc/ppt/xls 按 OLE2 目录里的流名
+  (`WordDocument`/`PowerPoint Document`/`Workbook`),RTF 按 `{\rtf`;只在头 1 MiB 不够判断时参考文件名。
+  `purpose:"preview"` 产出 PDF(`media_type: application/pdf`,`result_type: "document"`,`runtime.accept`
+  含 `pdf` 即可接受),`fidelity` 固定为「由 LibreOffice 转换，字体与版式可能与原件有差异」;文档缩略图暂无
+  (`no-renderer`)。命令:`soffice -env:UserInstallation=file:///<数据根>/preview-tmp/profile-<attempt_id>
+  --headless --norestore --nologo --nolockcheck --nodefault --convert-to pdf --outdir <attempt 目录>
+  <attempt 目录>/input.<真实扩展名>`——输入复制成带真实扩展名的文件(soffice 按扩展名选导入过滤器),每个
+  attempt 独立 profile(共用时第二个实例静默退出并留下锁),完成后删除;并发 1(与 ffmpeg 的槽分开),
+  超时 max(120s, 每 MiB 10s)。**保真度取决于节点字体,CJK 文档请安装 Noto CJK**(Debian:
+  `apt install libreoffice-nogui fonts-noto-cjk`);`hello` 不枚举字体。
+- **产物**:FileObject 绑定在 zone 桶 `zone/nfs-server/_/preview-cache`(`app_data`,key = work_key);结果的
+  `read_url` 是 `/bucket/v1/...?token=bkt_…`(只读、单 key、6 小时),每次 `repr` 先判源权限再签,命中缓存也一样。
+  30 天未被 `repr` 访问的结果过期,总量按 `services/nfs-server/settings.preview_cache_mib`(默认 20480)LRU 收缩;
+  绑定内容丢失时下一次 `repr` 重新转换。
+- **验证**:`cargo test -p nfs_server --test preview`(真实 HEIC/HEVC 样本在 `tests/fixtures/preview/`,由 libheif /
+  x265 编码;`office.*` 由 LibreOffice 保存;没装 ffmpeg / soffice 时对应转换用例跳过,文档嗅探、"缺失即
+  unsupported"、"缺 soffice 时 profiles 不含 `preview-document` 而 ffmpeg 档位照常"始终跑)。
 
 ## 编辑器取消写入
 

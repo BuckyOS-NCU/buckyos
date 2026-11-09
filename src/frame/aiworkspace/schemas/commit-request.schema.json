@@ -1,6 +1,6 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
- "$id": "buckyos.ai-workspace/commit-request/1.0",
+ "$id": "buckyos.ai-workspace/commit-request/1.1",
  "title": "Commit request (doc.commit / doc.prepare)",
  "type": "object",
  "additionalProperties": false,
@@ -13,11 +13,15 @@
  ],
  "properties": {
   "protocol_version": {
-   "const": "1.0"
+   "enum": [
+    "1.0",
+    "1.1"
+   ],
+   "description": "1.1 added Block-controls (\"auto\" placement, Cells holding Cells in a control, slot); 1.0 requests are still accepted"
   },
   "workspace_id": {
    "type": "string",
-   "pattern": "^ws_[a-z2-7]{26}$"
+   "pattern": "^ws_[0-9]{2}(0[1-9]|1[0-2])[0-9a-z]{4}$"
   },
   "epoch": {
    "type": "string",
@@ -42,7 +46,8 @@
     "import",
     "system"
    ],
-   "default": "human"
+   "default": "human",
+   "description": "Ignored: the service derives the origin (D08) — human, agent, program, import, system, source (a Source refresh) or build (ext.build / ext.import)."
   },
   "run_id": {
    "type": [
@@ -163,17 +168,24 @@
      "enum": [
       "entity",
       "doc_key",
+      "table_members",
       "table_field",
+      "table_field_type",
+      "table_field_values",
       "table_record",
       "table_cell",
+      "tree_children",
+      "tree_edge",
       "richtext_block",
-      "table_field_values",
-      "table_members",
-      "table_field_type"
+      "folder_member",
+      "entity_prop",
+      "table_view",
+      "table_query"
      ]
     },
     "key": {
-     "type": "string"
+     "type": "string",
+     "description": "doc_key: the payload key; entity_prop: the object key (config, bindings, on)"
     },
     "record_id": {
      "$ref": "#/$defs/id"
@@ -183,6 +195,26 @@
     },
     "block_id": {
      "$ref": "#/$defs/id"
+    },
+    "name": {
+     "type": "string",
+     "description": "folder_member: the member name; entity_prop: the property name"
+    },
+    "cell_id": {
+     "$ref": "#/$defs/id",
+     "description": "table_view: the table view Block"
+    },
+    "filter": {
+     "type": "object"
+    },
+    "sorts": {
+     "type": "array"
+    },
+    "fields": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
     }
    }
   },
@@ -286,7 +318,7 @@
    }
   },
   "placement": {
-   "description": "Free-layout placement of a Block or group (entity.create / tree.move / tree.place), relative to the parent; stacking order is order_key. A connector's placement is the bounding box of its two stored endpoint positions: w and h may be 0, rotation is not allowed, it is required (never null), and with two coordinate ends (start and end absent or null) it must not be a single point (w + h > 0; not re-judged for undo, which may restore a box written while the ends were bound).",
+   "description": "Free-layout placement of a Block or group (entity.create / tree.move / tree.place), relative to the parent; stacking order is order_key. A connector's placement is the bounding box of its two stored endpoint positions: w and h may be 0, rotation is not allowed, it is required (never null), and with two coordinate ends (start and end absent or null) it must not be a single point (w + h > 0; not re-judged for undo, which may restore a box written while the ends were bound). Each of x, y, w, h may instead be the string \"auto\" (Block-controls, 脑图方案 §5.1): the value is not stored but computed when shown by the control laying the Block out; writing a number pins that component, writing \"auto\" back resets it. x / y may be \"auto\" only on a Block or container laid out by a control (its nearest enclosing container, walking up through Blocks, is a control such as mindmap, or a composite whose definition does not use the fixed layout); w / h only on a control (its box wraps its children) or on a text view (mindnode, shape, richtext; controls/core.json) laid out by one. A connector never has \"auto\".",
    "type": "object",
    "additionalProperties": false,
    "required": [
@@ -297,20 +329,48 @@
    ],
    "properties": {
     "x": {
-     "type": "number"
+     "oneOf": [
+      {
+       "type": "number"
+      },
+      {
+       "const": "auto"
+      }
+     ]
     },
     "y": {
-     "type": "number"
+     "oneOf": [
+      {
+       "type": "number"
+      },
+      {
+       "const": "auto"
+      }
+     ]
     },
     "w": {
-     "type": "number",
-     "exclusiveMinimum": 0,
-     "description": "> 0; >= 0 for a connector"
+     "oneOf": [
+      {
+       "type": "number",
+       "exclusiveMinimum": 0
+      },
+      {
+       "const": "auto"
+      }
+     ],
+     "description": "> 0 (>= 0 for a connector), or \"auto\""
     },
     "h": {
-     "type": "number",
-     "exclusiveMinimum": 0,
-     "description": "> 0; >= 0 for a connector"
+     "oneOf": [
+      {
+       "type": "number",
+       "exclusiveMinimum": 0
+      },
+      {
+       "const": "auto"
+      }
+     ],
+     "description": "> 0 (>= 0 for a connector), or \"auto\""
     },
     "rotation": {
      "type": "number",
@@ -495,6 +555,52 @@
     }
    },
    "description": "A formula in place of a value of the field's type (内核架构改进 D18): saved as given, evaluated by readers (the Desktop) and never by the backend; results to be read by others are materialized by an ordinary Commit with a derived record. Sorting, filtering and `unique` treat it as empty."
+  },
+  "set_props": {
+   "description": "entity.set_props (扩展控件 P2, Q28): per-property writes of one object key. Each property is the version cell p:<key>.<name> (selector entity_prop); null removes it.",
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "op",
+    "entity_id",
+    "key",
+    "props"
+   ],
+   "properties": {
+    "op": {
+     "const": "entity.set_props"
+    },
+    "entity_id": {
+     "$ref": "#/$defs/id"
+    },
+    "key": {
+     "enum": [
+      "config",
+      "bindings",
+      "on"
+     ]
+    },
+    "props": {
+     "type": "object",
+     "minProperties": 1,
+     "maxProperties": 64,
+     "propertyNames": {
+      "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+     },
+     "description": "<name>: value (≤ 64 KiB canonical) | null"
+    },
+    "expect": {
+     "type": "object",
+     "propertyNames": {
+      "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,63}$"
+     },
+     "additionalProperties": {
+      "type": "integer",
+      "minimum": 0
+     },
+     "description": "<name>: the rev of p:<key>.<name> this write is based on (0 = never written); absent names merge"
+    }
+   }
   }
  }
 }

@@ -11,6 +11,7 @@ import { Alert, Button, CircularProgress, TextField } from '@mui/material'
 import { ArrowRight, Fingerprint, LogIn, UserPlus, UserRound } from 'lucide-react'
 import { accessDenialOf, buckyos, type AccessDenial, type CurrentIdentity, type EntryDescriptor, type EntryMethod, type EntryService } from 'buckyos'
 import { describeEntry, joinWorkspaceEntry, parseEntryService, registerAccount } from '../api/sso'
+import { openWorkspacePage } from '../app/aiworkspace/launch'
 import { AuthPageFrame } from '../auth/AuthPageFrame'
 import { loginWithPassword } from '../auth/passwordLogin'
 import { endSessionInPlace } from '../auth/signOut'
@@ -179,6 +180,7 @@ function RegisterForm({ service, entryId, onCancel }: { service: EntryService; e
         size="small"
         label={t('sso.register.userId', 'User name')}
         autoComplete="username"
+        slotProps={{ htmlInput: { autoCapitalize: 'none', autoCorrect: 'off', spellCheck: false } }}
         value={userId}
         disabled={busy}
         error={fieldError?.field === 'userId'}
@@ -272,6 +274,9 @@ export function EntryPage() {
         setBusy(false)
         return
       }
+      // the workspace's page is on its own origin (T4-8): arrive there signed in as this identity
+      await openWorkspacePage(resource.path)
+      return
     }
     window.location.assign(resource.path)
   }, [entryId, resource, service])

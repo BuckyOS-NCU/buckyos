@@ -19,7 +19,7 @@ use buckyos_api::{
     set_buckyos_api_runtime, user_app_spec_key, AgentId, AgentSpec, AppInstanceId,
     AppServiceInstanceConfig, AppServiceSpec, BuckyOSRuntimeType, OPENDAN_SERVICE_PORT,
 };
-use buckyos_kit::{get_buckyos_app_data_dir, init_logging};
+use buckyos_kit::{get_buckyos_root_dir, init_logging};
 use libopendan::channel::{KEventWaker, KmsgChannels, PollWaker};
 use libopendan::protocol::parse_did;
 use libopendan::runner::RunnerOptions;
@@ -270,7 +270,10 @@ async fn zone_env(args: &Args) -> Result<LoaderEnv> {
         ),
         Err(e) => log::warn!("opendan: profile of {} not readable: {e}", spec.agent_id),
     }
-    let agent_root = get_buckyos_app_data_dir(&runtime.get_app_id(), &owner)
+    let agent_root = get_buckyos_root_dir()
+        .join("data")
+        .join("home")
+        .join(&owner)
         .join("agents")
         .join(spec.agent_id.as_str());
     let package_root = args
@@ -296,9 +299,9 @@ async fn zone_env(args: &Args) -> Result<LoaderEnv> {
             None
         }
     };
-    // Long `shell` commands become tasks of the zone's TaskMgr (under the
-    // Turn they belong to), not of this process.
-    let xllm = opendan::tasks::zone_xllm_deps(&spec.agent_did.to_string(), Some(owner.clone()));
+    // Long `shell` commands stay tasks of this process; TaskMgr tasks of
+    // krpc tools (`ask_user`) are read from the zone.
+    let xllm = opendan::tasks::zone_xllm_deps();
     let share: Arc<dyn libopendan::share::ShareHost> = Arc::new(libopendan::share::ZoneShare {
         switch: Arc::new(records::RecordsShareSwitch(records.clone())),
     });
@@ -350,6 +353,9 @@ async fn zone_env(args: &Args) -> Result<LoaderEnv> {
         session_helpers: libopendan::runtime::bin_overlay::standard_helpers(
             std::env::current_exe().ok().as_deref().and_then(std::path::Path::parent),
         ),
+        context_windows: Some(Arc::new(libopendan::runner::CachedContextWindows::new(
+            Arc::new(libopendan::runner::AiccContextWindows),
+        ))),
         options: options_of(args),
     })
 }
@@ -418,6 +424,7 @@ async fn dev_env(args: &Args) -> Result<LoaderEnv> {
         session_helpers: libopendan::runtime::bin_overlay::standard_helpers(
             std::env::current_exe().ok().as_deref().and_then(std::path::Path::parent),
         ),
+        context_windows: None,
         options: options_of(args),
     })
 }
@@ -519,7 +526,9 @@ fn main() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     // On a node session-runtime the AICC clients get the agent's identity
     // from its session (the executor passes no BUCKYOS_* environment).
-    if let Some(name @ ("agent_tool" | "llm_understand_media")) = invoked_name().as_deref() {
+    if let Some(name) = invoked_name().as_deref().filter(|name| {
+        agent_tool_cli_dev::handles_invocation_name(name) || *name == "llm_understand_media"
+    }) {
         for (key, value) in libopendan::baseline::session_identity_env(name) {
             std::env::set_var(key, value);
         }
@@ -541,6 +550,10 @@ fn main() {
     }
     if args.first().and_then(|a| a.to_str()) == Some("install-agent-tools") {
         install_agent_tools(args.get(1).cloned());
+    }
+    if args.first().and_then(|a| a.to_str()) == Some("ext-tools") {
+        let rest: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().to_string()).collect();
+        std::process::exit(buckyos_api::ext_tools_install::ext_tools_cli_main(&rest));
     }
     init_logging("opendan", true);
     pin_host_identity();

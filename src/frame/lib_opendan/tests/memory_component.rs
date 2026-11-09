@@ -14,7 +14,7 @@ use agent_tool::agent_memory::{ObservationKind, ReinforceObjectWeightOp};
 use fs2::FileExt;
 use libopendan::lock::{Acquire, Lease};
 use libopendan::memory::*;
-use libopendan::protocol::HolderInfo;
+use libopendan::protocol::{HolderInfo, PerceptionRecord};
 use libopendan::state::perception::read_records;
 use libopendan::state::{AgentStateClient, FsAgentStateClient, RecallQuery as RunnerRecall};
 use memory_sim::*;
@@ -1284,32 +1284,53 @@ fn s44_observing_while_the_graph_writer_lock_is_held() {
     FileExt::unlock(&lock).unwrap();
 }
 
+/// S45 (2026-11-08): the Runtime kinds are refused at the write entry; a
+/// legacy run_digest line in an existing file is readable but is neither a
+/// change, nor material, nor a topic hit.
 #[test]
-fn s45_runtime_records_feed_consolidation_only() {
+fn s45_runtime_records_are_refused_and_legacy_ones_are_not_material() {
     let (_t, mut h) = host();
     let mut b = h.session("B", "ui-b", &[U1, A1], &[U1], &[ALPHA_GAME]);
     b.topic(&mut h, "调整游戏背景效果", &[]).unwrap();
     let w = h.session("W", "work-w", &[U1, A1], &[U1], &[ALPHA_GAME]);
-    let r = w
-        .record(
-            &mut h,
-            PerceptionInput {
-                kind: Some("run_digest".into()),
-                content: "run 3 ended: background effect adjusted".into(),
-                objects: vec![ALPHA_GAME.into()],
-                ..PerceptionInput::default()
-            },
-        )
+    let refused = w.record(
+        &mut h,
+        PerceptionInput {
+            kind: Some("run_digest".into()),
+            content: "run 3 ended: background effect adjusted".into(),
+            objects: vec![ALPHA_GAME.into()],
+            ..PerceptionInput::default()
+        },
+    );
+    assert!(
+        matches!(&refused, Err(e) if e.to_string().contains("no longer written")),
+        "{refused:?}"
+    );
+    // A legacy line, appended by the state client as a driver once did.
+    let client = FsAgentStateClient::open(&h.root, "did:bns:a1", None, None).unwrap();
+    let legacy = PerceptionRecord {
+        seq: 1,
+        at_ms: 1,
+        session_id: "work-w".into(),
+        kind: "run_digest".into(),
+        source: "session".into(),
+        objects: vec![ALPHA_GAME.into()],
+        summary: "finished: background effect adjusted".into(),
+        ..Default::default()
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(client.perception().append(&w.lease, "work-w", vec![legacy]))
         .unwrap();
     assert!(b.observe(&mut h).unwrap().changes.is_empty());
-    let view = h
-        .memory
-        .read_perception(&b.caller, r.reference.as_deref().unwrap())
-        .unwrap();
+    let view = h.memory.read_perception(&b.caller, "work-w:1").unwrap();
     assert_eq!(view.record.kind, "run_digest");
+    assert_eq!(h.memory.pending_work().unwrap().new, 0);
     let si = h.si("si");
     let batch = si.begin(&mut h, 10).unwrap();
-    assert_eq!(batch.materials.len(), 1);
+    assert!(batch.materials.is_empty(), "{:?}", batch.materials);
     assert!(b
         .topic(&mut h, "调整游戏背景效果", &["运行"])
         .unwrap()
@@ -1451,20 +1472,18 @@ async fn review_one_seq_allocator_per_file() {
     .unwrap();
     // A driver that allocates its own seqs would reuse seq 1: refused, not dropped.
     let client = FsAgentStateClient::open(&h.root, "did:bns:a1", None, None).unwrap();
-    let digest = libopendan::state::run_digest(
-        "ui-a",
-        1,
-        "run-1",
-        1,
-        None,
-        &Default::default(),
-        Vec::new(),
-        "run ended",
-        3,
-    );
+    let dup = PerceptionRecord {
+        seq: 1,
+        at_ms: 1,
+        session_id: "ui-a".into(),
+        kind: "observation".into(),
+        source: "session".into(),
+        summary: "another observation at seq 1".into(),
+        ..Default::default()
+    };
     assert!(client
         .perception()
-        .append(&a.lease, "ui-a", vec![digest])
+        .append(&a.lease, "ui-a", vec![dup])
         .await
         .is_err());
     // Explicit seqs: a caller that owns the allocator; identical retries are replays.
@@ -1675,4 +1694,23 @@ fn review_no_identifier_leaks() {
             .sources,
         vec!["A/secret".to_string()]
     );
+}
+
+/// A4 / A9: what an observation is about is kept as a reference another session can `read`: URLs in their
+/// canonical form, Zone data paths as `cyfs:///…`; its hint carries that URL.
+#[test]
+fn objects_are_kept_as_references_another_session_can_read() {
+    let (_t, mut h) = host();
+    let w = h.session("W", "ui-w", &[U1, A1], &[U1], &[ALPHA_GAME]);
+    let e = h.event("W/e1", "ui-w", ActorKind::User, "x");
+    let data = buckyos_kit::get_buckyos_root_dir().join("data/home/u1/notes/a.md");
+    let objects = ["OBJ://AIWorkspace/ws_1/entities/e_1", data.to_str().unwrap(), ALPHA_GAME];
+    w.record(&mut h, observation("看过这个实体", e, &objects, "W/e1/1")).unwrap();
+    let recs = read_records(&h.layout().perception_file("ui-w")).unwrap();
+    let rec = recs.last().unwrap();
+    assert!(rec.objects.contains(&"obj://aiworkspace/ws_1/entities/e_1".to_string()), "{:?}", rec.objects);
+    assert!(rec.objects.contains(&"cyfs:///home/u1/notes/a.md".to_string()), "{:?}", rec.objects);
+    assert!(rec.objects.contains(&ALPHA_GAME.to_string()), "{:?}", rec.objects);
+    let hint = Hint::from_perception(rec, None, Vec::new());
+    assert!(hint.object_url.as_deref().is_some_and(|u| u.starts_with("obj://") || u.starts_with("cyfs://")), "{hint:?}");
 }

@@ -2,25 +2,27 @@ import { useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { useI18n } from '../../i18n/provider'
 import { recordMeta } from './api/reader'
-import { MessageMarkdown } from './conversation/history/MessageMarkdown'
+import { LinkifiedText, MessageMarkdown } from './conversation/history/MessageMarkdown'
 import { findMessage } from './conversation/history/locate'
 import { messageObjId, messageRelations } from './conversation/history/relations'
 import type { ConversationMessageReader } from './conversation/history/types'
 import { CopyValue, TaskDetailsSection } from './conversation/tasks/MessageTask'
 import { AgentWorklog } from './conversation/worklog/AgentWorklog'
+import type { WorklogDestination } from './conversation/worklog/model'
 import { messageHubMessagePath } from './launch'
-import { getMessageDeliveryStatus, messageAgentTaskId, type DID, type MessageObject, type MsgContent } from './protocol/msgobj'
+import type { DID, ndn } from 'buckyos'
+import { getMessageDeliveryStatus, messageAgentTaskId, type MessageObject } from './protocol/msgobj'
 import { useMessageHubStore } from './store'
 import type { MessageHubContext } from './types'
 
 const sectionTitleClass = 'text-xs font-semibold uppercase tracking-wide text-[color:var(--cp-muted)]'
 
-function ContentView({ content, testId }: { content: MsgContent; testId: string }) {
+function ContentView({ content, testId }: { content: ndn.MsgContent; testId: string }) {
   const refs = content.refs ?? []
   const text = content.content ?? ''
   return (
     <div className="rounded-xl bg-[color:color-mix(in_srgb,var(--cp-text)_5%,transparent)] px-3 py-2 text-[13px]" data-testid={testId} data-format={content.format ?? 'text/plain'}>
-      {content.format === 'text/markdown' ? <MessageMarkdown text={text} /> : text ? <p className="whitespace-pre-wrap break-words">{text}</p> : null}
+      {content.format === 'text/markdown' ? <MessageMarkdown text={text} /> : text ? <p className="whitespace-pre-wrap break-words"><LinkifiedText text={text} /></p> : null}
       {refs.length > 0 ? <ul className="mt-1 space-y-0.5 text-xs text-[color:var(--cp-muted)]">{refs.map((ref, index) => <li key={index} className="break-all">{ref.label ?? (ref.target.type === 'data_obj' ? ref.target.uri_hint ?? ref.target.obj_id : ref.target.did)} · {ref.role}</li>)}</ul> : null}
       <p className="mt-1 text-[11px] text-[color:var(--cp-muted)]">{content.format ?? 'text/plain'}</p>
     </div>
@@ -29,15 +31,23 @@ function ContentView({ content, testId }: { content: MsgContent; testId: string 
 
 /**
  * Details of one message, addressed by its anchor ObjId. Agent replies open
- * the Turn worklog; the message tab keeps content, edits, delivery and task
- * metadata. Messages outside the loaded history are located in older pages.
+ * the Turn worklog (`initialWorklog`: a work session's whole log, opened from
+ * its card, with the Turn's log one step back); the message tab keeps
+ * content, edits, delivery and task metadata. Messages outside the loaded
+ * history are located in older pages.
  */
-export function MessageDetails({ context, entityId, sessionId, messageId, reader, displayName, onClose }: { context: MessageHubContext; entityId: string; sessionId: string; messageId: string; reader: ConversationMessageReader; displayName: (did: DID) => string; onClose: () => void }) {
+export function MessageDetails({ context, entityId, sessionId, messageId, initialWorklog, reader, displayName, onClose }: { context: MessageHubContext; entityId: string; sessionId: string; messageId: string; initialWorklog?: WorklogDestination & { request: number }; reader: ConversationMessageReader; displayName: (did: DID) => string; onClose: () => void }) {
   const { t } = useI18n()
   const store = useMessageHubStore()
   const [found, setFound] = useState<{ id: string; message: MessageObject | null } | null>(null)
   const located = useRef('')
   const [tab, setTab] = useState<'worklog' | 'message'>('worklog')
+  // A work session card opened again (or another card of this message): back to its work log.
+  const [worklogRequest, setWorklogRequest] = useState(initialWorklog?.request)
+  if (initialWorklog?.request !== worklogRequest) {
+    setWorklogRequest(initialWorklog?.request)
+    if (initialWorklog) setTab('worklog')
+  }
   useEffect(() => {
     let cancelled = false
     void findMessage(reader, messageId).then(async result => {
@@ -64,7 +74,7 @@ export function MessageDetails({ context, entityId, sessionId, messageId, reader
       {taskId ? <div className="flex shrink-0 gap-5 border-b border-[color:var(--cp-border)] px-4" role="tablist" aria-label={t('messagehub.messageDetails.title')}>
         {(['worklog', 'message'] as const).map(value => <button key={value} role="tab" aria-selected={tab === value} className={`border-b-2 py-3 text-xs font-medium ${tab === value ? 'border-[color:var(--cp-accent)] text-[color:var(--cp-accent)]' : 'border-transparent text-[color:var(--cp-muted)]'}`} onClick={() => setTab(value)} data-testid={`detail-tab-${value}`}>{t(`messagehub.worklog.tab.${value}`)}</button>)}
       </div> : null}
-      {taskId && tab === 'worklog' ? <AgentWorklog key={taskId} taskId={taskId} /> : <div className="shell-scrollbar min-h-0 flex-1 space-y-6 overflow-y-auto p-4 text-sm">
+      {taskId && tab === 'worklog' ? <AgentWorklog key={`${taskId}/${initialWorklog?.request ?? ''}`} taskId={taskId} initial={initialWorklog} /> : <div className="shell-scrollbar min-h-0 flex-1 space-y-6 overflow-y-auto p-4 text-sm">
         {!current ? <p role="status" className="text-[13px] text-[color:var(--cp-muted)]">{t('messagehub.messageDetails.locating')}</p> : null}
         {current && !message ? <p role="alert" className="text-[13px] text-[color:var(--cp-muted)]" data-testid="message-details-missing">{t('messagehub.messageDetails.notFound')}</p> : null}
         {message ? <>

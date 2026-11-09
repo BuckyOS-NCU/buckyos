@@ -6,26 +6,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buckyos_api::{
-    get_buckyos_api_runtime, init_buckyos_api_runtime, load_app_identity_from_env,
-    parse_typed_task_data, BuckyOSRuntimeType, CommitResultReq, FailTaskReq, RunnerWriteEnvelope,
+    get_buckyos_api_runtime, load_app_identity_from_env,
+    parse_typed_task_data, CommitResultReq, FailTaskReq, RunnerWriteEnvelope,
     Task, TaskDataType, TaskError, TaskManagerClient, TaskOutcome, TaskPhase, ToolShellTaskData,
     TypedTaskData,
 };
 use kRPC::kRPC;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value as Json};
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 
 use agent_did_object_lib::{
-    AgentDIDObjectRuntime, ObjectRouteConfig, ReadInput as ObjectReadInput, ReadLineRange,
-    XCallInput as ObjectXCallInput,
-};
-use agent_tool::agent_attention_signal::{
-    AttentionSignal, CreateExtractionWindowInput, DiscoverEventArgs,
-    DiscoverObjectObservationArgs, DiscoverRelationshipArgs, DiscoverSkillCoverageGapArgs,
-    ExtractionWindow, SignalLifecycleStatus,
+    AgentDIDObjectRuntime, ObjectRouteConfig, ObjectUrlReader, XCallInput as ObjectXCallInput,
 };
 use agent_tool::agent_memory::{
     AddObservationOp, AgentMemory, AgentMemoryConfig, AgentMemoryError, FlatSetOp, LoadOptions,
@@ -42,13 +35,10 @@ use agent_tool::agent_notebook::{
 use agent_tool::llm_tool_carft::{self, CommandNotFoundRequest};
 use agent_tool::{
     cli_error_result, cli_exit_code_for_error, cli_result_from_tool_result, cli_success_result,
-    normalize_abs_path, render_cli_output, session_record_path, AgentAttentionSignalStore,
-    AgentToolError, AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus,
-    AttentionSignalStoreConfig, AttentionSignalToolRuntime, CliRunOutput,
-    DcrontabTool, DiscoverEventTool, DiscoverObjectObservationTool,
-    DiscoverRelationshipTool, DiscoverSkillCoverageGapTool, EditFileTool, FileToolConfig,
-    GetSessionTool, GlobTool, GrepTool, NoopFileWriteAudit, ReadFileTool, RuntimeContext,
-    SessionRuntimeContext, SessionViewBackend, ToolCtx, TypedTool,
+    normalize_abs_path, render_cli_output, session_record_path, AgentToolError,
+    AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus, CliRunOutput,
+    DcrontabTool, EditFileTool, FileToolConfig, GetSessionTool, GlobTool, GrepTool,
+    NoopFileWriteAudit, ReadFileTool, RuntimeContext, SessionRuntimeContext, SessionViewBackend,
     WriteFileTool, DEFAULT_READ_TOKEN_LIMIT,
 };
 use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
@@ -57,18 +47,13 @@ const TOOL_CHECK_TASK: &str = "check_task";
 const TOOL_CANCEL_TASK: &str = "cancel_task";
 const TOOL_FINISH_TASK: &str = "finish_task";
 const TOOL_READ_OBJECT: &str = "read";
-const READ_OBJECT_USAGE: &str = "agent_tool read <object-or-path> [--content-only] [--offset <1-based-line>] [--limit <lines>] [--config <route.toml>]";
 const TOOL_XCALL: &str = "xcall";
 const XCALL_USAGE: &str = "xcall <object> <action> [--params <json>] [key=value ...] [--key=value ...] [--config <route.toml>]";
 const TOOL_AGENT_MEMORY: &str = "agent-memory";
 const TOOL_AGENT_MEMORY_SNAKE: &str = "agent_memory";
 const TOOL_AGENT_NOTEBOOK: &str = "agent-notebook";
 const TOOL_AGENT_NOTEBOOK_SNAKE: &str = "agent_notebook";
-const TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION: &str = "BeginAttentionSignalExtraction";
-const TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION: &str = "CompleteAttentionSignalExtraction";
-const TOOL_LIST_PENDING_ATTENTION_SIGNALS: &str = "ListPendingAttentionSignals";
-const TOOL_MARK_ATTENTION_SIGNAL_CONSUMED: &str = "MarkAttentionSignalConsumed";
-const TOOL_NAMES: [&str; 24] = [
+const TOOL_NAMES: [&str; 16] = [
     "Glob",
     "Grep",
     "dcrontab",
@@ -85,14 +70,6 @@ const TOOL_NAMES: [&str; 24] = [
     TOOL_CHECK_TASK,
     TOOL_CANCEL_TASK,
     TOOL_FINISH_TASK,
-    TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION,
-    TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION,
-    agent_tool::TOOL_DISCOVER_EVENT,
-    agent_tool::TOOL_DISCOVER_OBJECT_OBSERVATION,
-    agent_tool::TOOL_DISCOVER_RELATIONSHIP,
-    agent_tool::TOOL_DISCOVER_SKILL_COVERAGE_GAP,
-    TOOL_LIST_PENDING_ATTENTION_SIGNALS,
-    TOOL_MARK_ATTENTION_SIGNAL_CONSUMED,
 ];
 const AGENT_MEMORY_ROOT_ENV: &str = "AGENT_MEMORY_ROOT";
 const AGENT_MEMORY_DIR_NAME: &str = "memory";
@@ -105,68 +82,8 @@ const DEFAULT_AGENT_NAME: &str = "did:opendan:cli";
 const DEFAULT_WAKEUP_ID: &str = "cli-wakeup";
 const DEFAULT_BEHAVIOR: &str = "cli";
 const SESSION_RECORD_FILE: &str = "session.json";
-const ATTENTION_EXTRACTION_RUNTIME_REL_PATH: &str =
-    ".runtime/attention_signal_extraction/current.json";
 const OBJECT_ROUTE_CONFIG_ENV: &str = "AGENT_DID_OBJECT_ROUTE_CONFIG";
 const OPENDAN_OBJECT_ROUTE_CONFIG_ENV: &str = "OPENDAN_AGENT_OBJECT_ROUTE_CONFIG";
-const DEFAULT_OBJECT_ROUTE_CONFIG: &str = r#"
-version = 1
-
-[[adapters]]
-id = "filesystem"
-type = "filesystem"
-
-[[adapters]]
-id = "web"
-type = "web"
-
-[[adapters]]
-id = "agent-runtime"
-type = "agent_runtime"
-
-[[adapters]]
-id = "did-object"
-type = "did_object"
-
-[[routes]]
-id = "file-read"
-priority = 100
-match_type = "scheme"
-pattern = "file"
-adapter = "filesystem"
-methods = ["read"]
-
-[[routes]]
-id = "http-web-read"
-priority = 10
-match_type = "scheme"
-pattern = "http"
-adapter = "web"
-methods = ["read"]
-
-[[routes]]
-id = "https-web-read"
-priority = 10
-match_type = "scheme"
-pattern = "https"
-adapter = "web"
-methods = ["read"]
-
-[[routes]]
-id = "https-did-object-call"
-priority = 10
-match_type = "scheme"
-pattern = "https"
-adapter = "did-object"
-methods = ["x_call", "subscribe_event"]
-
-[[routes]]
-id = "agent-runtime"
-priority = 10
-match_type = "scheme"
-pattern = "agent"
-adapter = "agent-runtime"
-"#;
 
 #[derive(Clone, Debug)]
 struct CliRuntimeEnv {
@@ -254,10 +171,6 @@ enum ParsedCommand {
     Tool {
         tool_name: String,
         raw_tokens: Vec<String>,
-    },
-    ObjectRead {
-        route_config_path: Option<PathBuf>,
-        input: ObjectReadInput,
     },
     ObjectXCall {
         tool_name: String,
@@ -426,12 +339,7 @@ pub async fn run_process() -> CliRunOutput {
         };
     }
 
-    if args.get(1).and_then(|v| v.to_str()) == Some("llm_understand_media") {
-        let sub_args: Vec<String> = args
-            .iter()
-            .skip(2)
-            .map(|v| v.to_string_lossy().into_owned())
-            .collect();
+    if let Some(sub_args) = llm_understand_media_args(&args) {
         let exit_code = llm_understand_media::run_subcommand(sub_args).await;
         return CliRunOutput {
             exit_code,
@@ -495,6 +403,9 @@ async fn execute(
             tool_name,
             raw_tokens,
         } => {
+            if tool_name == TOOL_READ_OBJECT && raw_tokens.iter().any(|t| t.contains("://") && !t.contains("file://")) {
+                ensure_zone_runtime().await;
+            }
             let mgr = build_cli_tool_manager(&env).await?;
             let Some(tool) = mgr.get_any_tool(&tool_name) else {
                 return Err(AgentToolError::NotFound(tool_name));
@@ -517,10 +428,6 @@ async fn execute(
                 EXIT_SUCCESS,
             ))
         }
-        ParsedCommand::ObjectRead {
-            route_config_path,
-            input,
-        } => dispatch_object_read(&env, route_config_path, input).await,
         ParsedCommand::ObjectXCall {
             tool_name,
             route_config_path,
@@ -662,27 +569,6 @@ async fn dispatch_tool(
     }
 }
 
-async fn dispatch_object_read(
-    env: &CliRuntimeEnv,
-    route_config_path: Option<PathBuf>,
-    mut input: ObjectReadInput,
-) -> Result<CliRunOutput, AgentToolError> {
-    if input.session_id.is_none() {
-        input.session_id = Some(env.call_ctx.session_id.clone());
-    }
-    if input.max_tokens.is_none() {
-        input.max_tokens = Some(env.call_ctx.read_token_limit as usize);
-    }
-    let runtime = build_object_runtime(env, route_config_path).await?;
-    match runtime.read(input).await {
-        Ok(result) => Ok(render_cli_output(
-            &success_result(TOOL_READ_OBJECT, result),
-            EXIT_SUCCESS,
-        )),
-        Err(err) => Ok(render_object_error_output(Some(TOOL_READ_OBJECT), err)),
-    }
-}
-
 async fn dispatch_object_x_call(
     env: &CliRuntimeEnv,
     tool_name: &str,
@@ -695,6 +581,7 @@ async fn dispatch_object_x_call(
     if input.trace_id.is_none() {
         input.trace_id = Some(env.call_ctx.trace_id.clone());
     }
+    ensure_zone_runtime().await;
     let runtime = build_object_runtime(env, route_config_path).await?;
     match runtime.x_call(input).await {
         Ok(result) => {
@@ -712,6 +599,12 @@ async fn dispatch_object_x_call(
         }
         Err(err) => Ok(render_object_error_output(Some(tool_name), err)),
     }
+}
+
+/// Object URLs are read with this process's Zone identity (the session's token in an Agent's shell); without one
+/// the object library reports that there is no Zone here.
+async fn ensure_zone_runtime() {
+    let _ = agent_tool::xllm::ensure_buckyos_runtime().await;
 }
 
 async fn build_object_runtime(
@@ -736,8 +629,7 @@ async fn load_object_route_config(
             .await
             .map_err(object_error_to_agent_tool_error);
     }
-    ObjectRouteConfig::from_toml_str(DEFAULT_OBJECT_ROUTE_CONFIG)
-        .map_err(object_error_to_agent_tool_error)
+    Ok(ObjectRouteConfig::builtin())
 }
 
 fn render_object_error_output(
@@ -768,6 +660,21 @@ async fn resolve_content_input(
             Ok(buf)
         }
     }
+}
+
+/// The arguments of `llm_understand_media` when this process runs it:
+/// `agent_tool llm_understand_media …`, or this program named
+/// `llm_understand_media` (the Windows session helper).
+fn llm_understand_media_args(args: &[OsString]) -> Option<Vec<String>> {
+    let invoked = args.first().and_then(|a| Path::new(a).file_stem()).and_then(|s| s.to_str());
+    let skip = if invoked == Some("llm_understand_media") {
+        1
+    } else if args.get(1).and_then(|v| v.to_str()) == Some("llm_understand_media") {
+        2
+    } else {
+        return None;
+    };
+    Some(args.iter().skip(skip).map(|v| v.to_string_lossy().into_owned()).collect())
 }
 
 fn parse_command(args: &[OsString], current_dir: &Path) -> Result<ParsedCommand, AgentToolError> {
@@ -830,7 +737,6 @@ fn parse_tool_command(
     }
 
     match tool_name.as_str() {
-        TOOL_READ_OBJECT => parse_object_read_cli_command(tokens, current_dir),
         TOOL_XCALL => parse_object_x_call_cli_command(tool_name, tokens, current_dir),
         TOOL_CHECK_TASK => parse_check_task_cli_command(tool_name, tokens),
         TOOL_CANCEL_TASK => parse_cancel_task_cli_command(tool_name, tokens),
@@ -852,135 +758,6 @@ fn parse_tool_command(
             })
         }
     }
-}
-
-fn parse_object_read_cli_command(
-    tokens: &[String],
-    current_dir: &Path,
-) -> Result<ParsedCommand, AgentToolError> {
-    let mut route_config_path = None;
-    let mut object = None;
-    let mut purpose = None;
-    let mut session_id = None;
-    let mut content_only = false;
-    let mut offset = None;
-    let mut limit = None;
-    let mut options = json!({});
-    let mut idx = 0usize;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-        match token.as_str() {
-            "--config" | "--route-config" => {
-                idx += 1;
-                let Some(path) = tokens.get(idx) else {
-                    return Err(with_tool_usage(
-                        "missing route config path",
-                        TOOL_READ_OBJECT,
-                    ));
-                };
-                route_config_path = Some(resolve_cli_path(path, current_dir));
-            }
-            "--purpose" => {
-                idx += 1;
-                purpose = Some(required_token(tokens, idx, "--purpose", TOOL_READ_OBJECT)?);
-            }
-            "--session-id" => {
-                idx += 1;
-                session_id = Some(required_token(
-                    tokens,
-                    idx,
-                    "--session-id",
-                    TOOL_READ_OBJECT,
-                )?);
-            }
-            "--content-only" => content_only = true,
-            "--offset" => {
-                idx += 1;
-                offset = Some(parse_object_usize(
-                    &required_token(tokens, idx, "--offset", TOOL_READ_OBJECT)?,
-                    "offset",
-                    TOOL_READ_OBJECT,
-                )?);
-            }
-            "--limit" => {
-                idx += 1;
-                limit = Some(parse_object_usize(
-                    &required_token(tokens, idx, "--limit", TOOL_READ_OBJECT)?,
-                    "limit",
-                    TOOL_READ_OBJECT,
-                )?);
-            }
-            "--options" => {
-                idx += 1;
-                options = parse_json_arg(
-                    &required_token(tokens, idx, "--options", TOOL_READ_OBJECT)?,
-                    "--options",
-                    TOOL_READ_OBJECT,
-                )?;
-            }
-            _ if token.starts_with("--") => {
-                return Err(with_tool_usage(
-                    format!("unsupported flag `{token}`"),
-                    TOOL_READ_OBJECT,
-                ));
-            }
-            _ => {
-                if let Some((key, value)) = token.split_once('=') {
-                    match key {
-                        "object" | "uri" => object = Some(value.to_string()),
-                        "purpose" => purpose = Some(value.to_string()),
-                        "session_id" | "session-id" => session_id = Some(value.to_string()),
-                        "content_only" | "content-only" => {
-                            content_only = parse_object_bool(value, key, TOOL_READ_OBJECT)?
-                        }
-                        "offset" => {
-                            offset = Some(parse_object_usize(value, "offset", TOOL_READ_OBJECT)?)
-                        }
-                        "limit" => {
-                            limit = Some(parse_object_usize(value, "limit", TOOL_READ_OBJECT)?)
-                        }
-                        "options" => options = parse_json_arg(value, "options", TOOL_READ_OBJECT)?,
-                        _ => {
-                            return Err(with_tool_usage(
-                                format!("unsupported key `{key}`"),
-                                TOOL_READ_OBJECT,
-                            ));
-                        }
-                    }
-                } else if object.is_none() {
-                    object = Some(token.clone());
-                } else {
-                    return Err(with_tool_usage(
-                        format!("unexpected positional argument `{token}`"),
-                        TOOL_READ_OBJECT,
-                    ));
-                }
-            }
-        }
-        idx += 1;
-    }
-
-    let object = object
-        .map(|value| canonical_object_url_for_cli(&value, current_dir))
-        .transpose()?
-        .ok_or_else(|| with_tool_usage("missing object/uri", TOOL_READ_OBJECT))?;
-
-    Ok(ParsedCommand::ObjectRead {
-        route_config_path,
-        input: ObjectReadInput {
-            object,
-            purpose,
-            session_id,
-            content_only,
-            range: (offset.is_some() || limit.is_some()).then_some(ReadLineRange {
-                offset: offset.unwrap_or(1),
-                limit,
-            }),
-            max_tokens: None,
-            options,
-        },
-    })
 }
 
 fn parse_object_x_call_cli_command(
@@ -3956,498 +3733,6 @@ impl SessionViewBackend for CliSessionBackend {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct BeginAttentionSignalExtractionArgs {
-    session_id: String,
-    window_start: String,
-    window_end: String,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-struct BeginAttentionSignalExtractionOutput {
-    owner_id: String,
-    agent_id: String,
-    agent_scope_id: String,
-    user_id: String,
-    session_id: String,
-    window_start: String,
-    window_end: String,
-    extraction_window_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct CompleteAttentionSignalExtractionArgs {}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-struct CompleteAttentionSignalExtractionOutput {
-    extraction_window: ExtractionWindow,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct ListPendingAttentionSignalsArgs {
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-struct ListPendingAttentionSignalsOutput {
-    agent_scope_id: String,
-    returned: usize,
-    signals: Vec<AttentionSignal>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct MarkAttentionSignalConsumedArgs {
-    signal_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-struct MarkAttentionSignalConsumedOutput {
-    signal: AttentionSignal,
-}
-
-struct CliBeginAttentionSignalExtractionTool {
-    agent_root: PathBuf,
-    current_session_id: String,
-    agent_id: String,
-}
-
-struct CliCompleteAttentionSignalExtractionTool {
-    agent_root: PathBuf,
-    current_session_id: String,
-}
-
-struct CliListPendingAttentionSignalsTool {
-    store: Arc<AgentAttentionSignalStore>,
-    agent_scope_id: String,
-}
-
-struct CliMarkAttentionSignalConsumedTool {
-    store: Arc<AgentAttentionSignalStore>,
-}
-
-struct CliDiscoverEventTool {
-    store: Arc<AgentAttentionSignalStore>,
-    agent_root: PathBuf,
-    current_session_id: String,
-}
-
-struct CliDiscoverObjectObservationTool {
-    store: Arc<AgentAttentionSignalStore>,
-    agent_root: PathBuf,
-    current_session_id: String,
-}
-
-struct CliDiscoverRelationshipTool {
-    store: Arc<AgentAttentionSignalStore>,
-    agent_root: PathBuf,
-    current_session_id: String,
-}
-
-struct CliDiscoverSkillCoverageGapTool {
-    store: Arc<AgentAttentionSignalStore>,
-    agent_root: PathBuf,
-    current_session_id: String,
-}
-
-#[async_trait]
-impl TypedTool for CliBeginAttentionSignalExtractionTool {
-    type Args = BeginAttentionSignalExtractionArgs;
-    type Output = BeginAttentionSignalExtractionOutput;
-
-    fn name(&self) -> &str {
-        TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION
-    }
-
-    fn description(&self) -> &str {
-        "Open a persisted Stage1 extraction scope for subsequent Discover* CLI commands."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some(
-            "BeginAttentionSignalExtraction '{\"session_id\":\"...\",\"window_start\":\"...\",\"window_end\":\"...\"}'".to_string(),
-        )
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        format!(
-            "opened attention extraction window {} for session {}",
-            output.extraction_window_id, output.session_id
-        )
-    }
-
-    async fn execute(
-        &self,
-        _ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let session_id = args.session_id.trim();
-        validate_session_id_arg(session_id)?;
-        if session_id == self.current_session_id {
-            return Err(AgentToolError::InvalidArgs(
-                "current self-improve session history cannot be used as self-improve input"
-                    .to_string(),
-            ));
-        }
-        let window_start = args.window_start.trim();
-        let window_end = args.window_end.trim();
-        if window_start.is_empty() || window_end.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "`window_start` and `window_end` must not be empty".to_string(),
-            ));
-        }
-
-        let owner_id = "system".to_string();
-        let user_id = owner_id.clone();
-        let agent_scope_id = self.agent_id.clone();
-        let store = open_attention_store(&self.agent_root)?;
-        let extraction_window = store.create_extraction_window(CreateExtractionWindowInput {
-            owner_id: owner_id.clone(),
-            agent_id: self.agent_id.clone(),
-            agent_scope_id: agent_scope_id.clone(),
-            user_id: user_id.clone(),
-            window_start: window_start.to_string(),
-            window_end: window_end.to_string(),
-        })?;
-        let runtime = AttentionSignalToolRuntime {
-            owner_id: owner_id.clone(),
-            agent_id: self.agent_id.clone(),
-            agent_scope_id: agent_scope_id.clone(),
-            user_id: user_id.clone(),
-            session_id: session_id.to_string(),
-            window_start: window_start.to_string(),
-            window_end: window_end.to_string(),
-            extraction_window_id: extraction_window.id.clone(),
-            extractor_version: None,
-            prompt_version: None,
-            model_name: None,
-        };
-        save_attention_runtime(&self.agent_root, &self.current_session_id, &runtime).await?;
-        Ok(BeginAttentionSignalExtractionOutput {
-            owner_id,
-            agent_id: self.agent_id.clone(),
-            agent_scope_id,
-            user_id,
-            session_id: session_id.to_string(),
-            window_start: window_start.to_string(),
-            window_end: window_end.to_string(),
-            extraction_window_id: extraction_window.id,
-        })
-    }
-}
-
-#[async_trait]
-impl TypedTool for CliCompleteAttentionSignalExtractionTool {
-    type Args = CompleteAttentionSignalExtractionArgs;
-    type Output = CompleteAttentionSignalExtractionOutput;
-
-    fn name(&self) -> &str {
-        TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION
-    }
-
-    fn description(&self) -> &str {
-        "Complete the persisted Stage1 extraction scope for this session."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some("CompleteAttentionSignalExtraction".to_string())
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        format!(
-            "completed attention extraction window {}",
-            output.extraction_window.id
-        )
-    }
-
-    async fn execute(
-        &self,
-        _ctx: &ToolCtx<'_>,
-        _args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
-        let store = open_attention_store(&self.agent_root)?;
-        let extraction_window = store.complete_extraction_window(&runtime.extraction_window_id)?;
-        remove_attention_runtime(&self.agent_root, &self.current_session_id).await?;
-        Ok(CompleteAttentionSignalExtractionOutput { extraction_window })
-    }
-}
-
-#[async_trait]
-impl TypedTool for CliListPendingAttentionSignalsTool {
-    type Args = ListPendingAttentionSignalsArgs;
-    type Output = ListPendingAttentionSignalsOutput;
-
-    fn name(&self) -> &str {
-        TOOL_LIST_PENDING_ATTENTION_SIGNALS
-    }
-
-    fn description(&self) -> &str {
-        "List pending Stage2 attention signals from <agent_root>/attention_signals."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some("ListPendingAttentionSignals [limit=100]".to_string())
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        format!("listed {} pending attention signal(s)", output.returned)
-    }
-
-    async fn execute(
-        &self,
-        _ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let signals = self
-            .store
-            .list_pending_stage2(&self.agent_scope_id, args.limit)?;
-        Ok(ListPendingAttentionSignalsOutput {
-            agent_scope_id: self.agent_scope_id.clone(),
-            returned: signals.len(),
-            signals,
-        })
-    }
-}
-
-#[async_trait]
-impl TypedTool for CliMarkAttentionSignalConsumedTool {
-    type Args = MarkAttentionSignalConsumedArgs;
-    type Output = MarkAttentionSignalConsumedOutput;
-
-    fn name(&self) -> &str {
-        TOOL_MARK_ATTENTION_SIGNAL_CONSUMED
-    }
-
-    fn description(&self) -> &str {
-        "Mark one pending attention signal consumed in <agent_root>/attention_signals."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some(
-            "MarkAttentionSignalConsumed '{\"signal_id\":\"sig_...\"}' | MarkAttentionSignalConsumed signal_id=sig_...".to_string(),
-        )
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        format!("marked attention signal {} consumed", output.signal.id)
-    }
-
-    async fn execute(
-        &self,
-        _ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let signal = self
-            .store
-            .update_lifecycle_status(args.signal_id.trim(), SignalLifecycleStatus::Consumed)?;
-        Ok(MarkAttentionSignalConsumedOutput { signal })
-    }
-}
-
-#[async_trait]
-impl TypedTool for CliDiscoverEventTool {
-    type Args = DiscoverEventArgs;
-    type Output = agent_tool::AttentionSignalWriteResult;
-
-    fn name(&self) -> &str {
-        agent_tool::TOOL_DISCOVER_EVENT
-    }
-
-    fn description(&self) -> &str {
-        "Store a Stage1 event attention signal for the current extraction scope."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some("DiscoverEvent '{\"title\":\"...\",\"phase\":\"active\",\"evidence\":[...],\"confidence\":0.9}'".to_string())
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
-        DiscoverEventTool::new(self.store.clone(), runtime)
-            .execute(ctx, args)
-            .await
-    }
-}
-
-#[async_trait]
-impl TypedTool for CliDiscoverObjectObservationTool {
-    type Args = DiscoverObjectObservationArgs;
-    type Output = agent_tool::AttentionSignalWriteResult;
-
-    fn name(&self) -> &str {
-        agent_tool::TOOL_DISCOVER_OBJECT_OBSERVATION
-    }
-
-    fn description(&self) -> &str {
-        "Store a Stage1 object-observation attention signal for the current extraction scope."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some("DiscoverObjectObservation '{\"object\":{\"mention_text\":\"...\",\"entity_type\":\"project\"},\"observation\":\"...\",\"evidence\":[...],\"confidence\":0.9}'".to_string())
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
-        DiscoverObjectObservationTool::new(self.store.clone(), runtime)
-            .execute(ctx, args)
-            .await
-    }
-}
-
-#[async_trait]
-impl TypedTool for CliDiscoverRelationshipTool {
-    type Args = DiscoverRelationshipArgs;
-    type Output = agent_tool::AttentionSignalWriteResult;
-
-    fn name(&self) -> &str {
-        agent_tool::TOOL_DISCOVER_RELATIONSHIP
-    }
-
-    fn description(&self) -> &str {
-        "Store a Stage1 relationship attention signal for the current extraction scope."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some("DiscoverRelationship '{\"subject\":{\"name\":\"...\"},\"predicate\":\"uses\",\"object\":{\"name\":\"...\"},\"evidence\":[...],\"confidence\":0.9}'".to_string())
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
-        DiscoverRelationshipTool::new(self.store.clone(), runtime)
-            .execute(ctx, args)
-            .await
-    }
-}
-
-#[async_trait]
-impl TypedTool for CliDiscoverSkillCoverageGapTool {
-    type Args = DiscoverSkillCoverageGapArgs;
-    type Output = agent_tool::AttentionSignalWriteResult;
-
-    fn name(&self) -> &str {
-        agent_tool::TOOL_DISCOVER_SKILL_COVERAGE_GAP
-    }
-
-    fn description(&self) -> &str {
-        "Store a Stage1 skill coverage gap attention signal for the current extraction scope."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some("DiscoverSkillCoverageGap '{\"title\":\"...\",\"task_description\":\"...\",\"result_status\":\"success\",\"evidence\":[...],\"confidence\":0.8}'".to_string())
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let runtime = load_attention_runtime(&self.agent_root, &self.current_session_id).await?;
-        DiscoverSkillCoverageGapTool::new(self.store.clone(), runtime)
-            .execute(ctx, args)
-            .await
-    }
-}
-
-fn validate_session_id_arg(session_id: &str) -> Result<(), AgentToolError> {
-    if session_id.is_empty() {
-        return Err(AgentToolError::InvalidArgs(
-            "`session_id` must not be empty".to_string(),
-        ));
-    }
-    if session_id == "."
-        || session_id == ".."
-        || session_id.contains('/')
-        || session_id.contains('\\')
-    {
-        return Err(AgentToolError::InvalidArgs(
-            "`session_id` must be a plain session id, not a path".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn session_dir(agent_root: &Path, session_id: &str) -> PathBuf {
-    agent_root.join("sessions").join(session_id)
-}
-
-fn open_attention_store(agent_root: &Path) -> Result<AgentAttentionSignalStore, AgentToolError> {
-    AgentAttentionSignalStore::open(AttentionSignalStoreConfig::new(
-        agent_root.join("attention_signals"),
-    ))
-    .map_err(AgentToolError::from)
-}
-
-fn attention_runtime_path(agent_root: &Path, current_session_id: &str) -> PathBuf {
-    session_dir(agent_root, current_session_id).join(ATTENTION_EXTRACTION_RUNTIME_REL_PATH)
-}
-
-async fn save_attention_runtime(
-    agent_root: &Path,
-    current_session_id: &str,
-    runtime: &AttentionSignalToolRuntime,
-) -> Result<(), AgentToolError> {
-    let path = attention_runtime_path(agent_root, current_session_id);
-    let dir = path.parent().ok_or_else(|| {
-        AgentToolError::ExecFailed(format!("invalid runtime path {}", path.display()))
-    })?;
-    fs::create_dir_all(dir).await.map_err(|err| {
-        AgentToolError::ExecFailed(format!("mkdir {} failed: {err}", dir.display()))
-    })?;
-    let bytes = serde_json::to_vec_pretty(runtime).map_err(|err| {
-        AgentToolError::ExecFailed(format!("serialize extraction runtime failed: {err}"))
-    })?;
-    fs::write(&path, bytes).await.map_err(|err| {
-        AgentToolError::ExecFailed(format!("write {} failed: {err}", path.display()))
-    })
-}
-
-async fn load_attention_runtime(
-    agent_root: &Path,
-    current_session_id: &str,
-) -> Result<AttentionSignalToolRuntime, AgentToolError> {
-    let path = attention_runtime_path(agent_root, current_session_id);
-    let bytes = fs::read(&path).await.map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            AgentToolError::InvalidArgs(
-                "call BeginAttentionSignalExtraction before Discover* or CompleteAttentionSignalExtraction".to_string(),
-            )
-        } else {
-            AgentToolError::ExecFailed(format!("read {} failed: {err}", path.display()))
-        }
-    })?;
-    serde_json::from_slice(&bytes).map_err(|err| {
-        AgentToolError::ExecFailed(format!("parse {} failed: {err}", path.display()))
-    })
-}
-
-async fn remove_attention_runtime(
-    agent_root: &Path,
-    current_session_id: &str,
-) -> Result<(), AgentToolError> {
-    let path = attention_runtime_path(agent_root, current_session_id);
-    match fs::remove_file(&path).await {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(AgentToolError::ExecFailed(format!(
-            "remove {} failed: {err}",
-            path.display()
-        ))),
-    }
-}
-
 /// Single registry-of-tools used by the CLI dispatcher. Replaces the
 /// per-tool `build_xxx_tool` factories — adding a new tool here is a one
 /// line `register_typed_tool` call instead of a new branch in
@@ -4471,51 +3756,21 @@ async fn build_cli_tool_manager(env: &CliRuntimeEnv) -> Result<AgentToolManager,
     mgr.register_typed_tool(GrepTool::new(file_cfg.clone()))?;
     mgr.register_typed_tool(DcrontabTool::new())?;
     mgr.register_typed_tool(ReadFileTool::new(file_cfg.clone()))?;
+    // The Session's `read` (agent_tool ReadTool) with the same object reader OpenDAN gives it.
+    let routes = load_object_route_config(env, None).await?;
+    let objects = AgentDIDObjectRuntime::new(routes).map_err(object_error_to_agent_tool_error)?;
+    mgr.register_tool_arc(Arc::new(
+        agent_tool::read_tool::ReadTool::new(file_cfg.clone())
+            .with_urls(Some(Arc::new(ObjectUrlReader::new(objects)))),
+    ))?;
     mgr.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()))?;
     mgr.register_typed_tool(EditFileTool::new(file_cfg, audit))?;
-    mgr.register_typed_tool(CliBeginAttentionSignalExtractionTool {
-        agent_root: env.agent_env_root.clone(),
-        current_session_id: env.call_ctx.session_id.clone(),
-        agent_id: env.call_ctx.agent_name.clone(),
-    })?;
-    mgr.register_typed_tool(CliCompleteAttentionSignalExtractionTool {
-        agent_root: env.agent_env_root.clone(),
-        current_session_id: env.call_ctx.session_id.clone(),
-    })?;
-    let attention_store = Arc::new(open_attention_store(&env.agent_env_root)?);
-    mgr.register_typed_tool(CliDiscoverEventTool {
-        store: attention_store.clone(),
-        agent_root: env.agent_env_root.clone(),
-        current_session_id: env.call_ctx.session_id.clone(),
-    })?;
-    mgr.register_typed_tool(CliDiscoverObjectObservationTool {
-        store: attention_store.clone(),
-        agent_root: env.agent_env_root.clone(),
-        current_session_id: env.call_ctx.session_id.clone(),
-    })?;
-    mgr.register_typed_tool(CliDiscoverRelationshipTool {
-        store: attention_store.clone(),
-        agent_root: env.agent_env_root.clone(),
-        current_session_id: env.call_ctx.session_id.clone(),
-    })?;
-    mgr.register_typed_tool(CliDiscoverSkillCoverageGapTool {
-        store: attention_store.clone(),
-        agent_root: env.agent_env_root.clone(),
-        current_session_id: env.call_ctx.session_id.clone(),
-    })?;
-    mgr.register_typed_tool(CliListPendingAttentionSignalsTool {
-        store: attention_store.clone(),
-        agent_scope_id: env.call_ctx.agent_name.clone(),
-    })?;
-    mgr.register_typed_tool(CliMarkAttentionSignalConsumedTool {
-        store: attention_store,
-    })?;
-
     Ok(mgr)
 }
 
 fn build_cli_file_tool_config(env: &CliRuntimeEnv) -> FileToolConfig {
     let mut cfg = FileToolConfig::new(env.current_dir.clone());
+    cfg.dfs_root = Some(buckyos_kit::get_buckyos_root_dir().join("data"));
     cfg.allowed_read_roots.clear();
     if !env.has_agent_env {
         cfg.allowed_write_roots.clear();
@@ -4563,7 +3818,6 @@ async fn build_help_result(env: &CliRuntimeEnv, tool_name: Option<&str>) -> Agen
             }
         }
         match name {
-            TOOL_READ_OBJECT => READ_OBJECT_USAGE.to_string(),
             TOOL_XCALL => XCALL_USAGE.to_string(),
             TOOL_CHECK_TASK => "check_task <task_id>".to_string(),
             TOOL_CANCEL_TASK => "cancel_task <task_id> [--recursive]".to_string(),
@@ -4593,7 +3847,6 @@ async fn build_help_result(env: &CliRuntimeEnv, tool_name: Option<&str>) -> Agen
 
 fn with_tool_usage(message: impl Into<String>, tool_name: &str) -> AgentToolError {
     let usage = match tool_name {
-        TOOL_READ_OBJECT => READ_OBJECT_USAGE,
         TOOL_XCALL => XCALL_USAGE,
         TOOL_CHECK_TASK => "check_task <task_id>",
         TOOL_CANCEL_TASK => "cancel_task <task_id> [--recursive]",
@@ -4613,26 +3866,6 @@ fn required_token(
         .get(idx)
         .cloned()
         .ok_or_else(|| with_tool_usage(format!("missing value for `{flag}`"), tool_name))
-}
-
-fn parse_object_usize(raw: &str, name: &str, tool_name: &str) -> Result<usize, AgentToolError> {
-    raw.trim().parse::<usize>().map_err(|_| {
-        with_tool_usage(
-            format!("invalid `{name}` value `{raw}`, expected non-negative integer"),
-            tool_name,
-        )
-    })
-}
-
-fn parse_object_bool(raw: &str, name: &str, tool_name: &str) -> Result<bool, AgentToolError> {
-    match raw.trim() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        _ => Err(with_tool_usage(
-            format!("invalid `{name}` value `{raw}`, expected bool"),
-            tool_name,
-        )),
-    }
 }
 
 fn parse_json_arg(raw: &str, name: &str, tool_name: &str) -> Result<Json, AgentToolError> {
@@ -4815,20 +4048,23 @@ async fn build_task_manager_client(
         });
     }
 
-    if env.allow_dev_overrides() {
+    if env.allow_dev_overrides() && env.runtime_context.appclient_session_token.is_none() {
         if let Some(client) = resolve_dev_task_manager_client() {
             return Ok(client);
         }
     }
 
     require_runtime_token_for_rpc(env)?;
-    let runtime = init_buckyos_api_runtime("opendan", None, BuckyOSRuntimeType::FrameService)
+    agent_tool::xllm::ensure_buckyos_runtime()
         .await
         .map_err(|err| {
             AgentToolError::ExecFailed(format!(
                 "init runtime for task-manager access failed: {err}"
             ))
         })?;
+    let runtime = get_buckyos_api_runtime().map_err(|err| {
+        AgentToolError::ExecFailed(format!("get runtime for task-manager access failed: {err}"))
+    })?;
     runtime.get_task_mgr_client().await.map_err(|err| {
         AgentToolError::ExecFailed(format!("init task-manager client failed: {err}"))
     })
@@ -5238,7 +4474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_read_cli_uses_agent_did_runtime_for_bare_path() {
+    async fn read_cli_is_the_session_read() {
         let temp = tempdir().expect("create tempdir");
         let root = temp.path().join("agent");
         let cwd = root.join("workspace");
@@ -5249,107 +4485,32 @@ mod tests {
             .await
             .expect("write demo file");
 
-        let output = execute(
+        for args in [vec!["demo.txt", "range=2-2"], vec!["uri=demo.txt", "offset=1", "limit=1"]] {
+            let mut argv = vec![OsString::from("/tmp/agent_tool"), OsString::from("read")];
+            argv.extend(args.iter().map(OsString::from));
+            let output = execute(argv, test_env(root.clone(), cwd.clone()), None)
+                .await
+                .expect("run read");
+            assert_eq!(output.exit_code, EXIT_SUCCESS, "{}", output.stdout);
+            let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
+            assert_eq!(payload["status"], "success");
+            assert_eq!(payload["tool"], "read");
+            assert_eq!(payload["detail"]["content"], "line-2\n", "{args:?} {}", output.stdout);
+        }
+
+        // An object URL goes to the object library: refused without a Zone, not found in one.
+        let err = execute(
             vec![
                 OsString::from("/tmp/agent_tool"),
                 OsString::from("read"),
-                OsString::from("demo.txt"),
-                OsString::from("--content-only"),
-                OsString::from("--offset"),
-                OsString::from("2"),
-                OsString::from("--limit"),
-                OsString::from("1"),
+                OsString::from("obj://aiworkspace/ws_1"),
             ],
             test_env(root, cwd),
             None,
         )
         .await
-        .expect("run object read");
-
-        assert_eq!(output.exit_code, EXIT_SUCCESS);
-        let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
-        assert_eq!(payload["status"], "success");
-        assert_eq!(payload["tool"], "read");
-        assert_eq!(payload["cmd_name"], "read");
-        assert_eq!(payload["output"], "line-2");
-    }
-
-    #[tokio::test]
-    async fn object_read_cli_returns_unchanged_for_same_session_id_env() {
-        let _lock = nb_lock();
-        let temp = tempdir().expect("create tempdir");
-        let root = temp.path().join("agent");
-        let cwd = root.join("workspace");
-        fs::create_dir_all(&cwd)
-            .await
-            .expect("create workspace dir");
-        fs::write(cwd.join("demo.txt"), "line-1\nline-2\n")
-            .await
-            .expect("write demo file");
-        seed_agent_identity(&root, "alice", "did:example:agent");
-
-        struct EnvGuard {
-            key: &'static str,
-            previous: Option<std::ffi::OsString>,
-        }
-        impl EnvGuard {
-            fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-                let previous = std::env::var_os(key);
-                std::env::set_var(key, value);
-                Self { key, previous }
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                if let Some(previous) = self.previous.as_ref() {
-                    std::env::set_var(self.key, previous);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-
-        struct CwdGuard(std::path::PathBuf);
-        impl CwdGuard {
-            fn set(path: &Path) -> Self {
-                let previous = std::env::current_dir().expect("read current dir");
-                std::env::set_current_dir(path).expect("set current dir");
-                Self(previous)
-            }
-        }
-        impl Drop for CwdGuard {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.0);
-            }
-        }
-
-        let session_id = format!("unchanged-session-{}", agent_tool::now_ms());
-        let _g1 = EnvGuard::set(agent_tool::OPENDAN_AGENT_ROOT_ENV, &root);
-        let _g2 = EnvGuard::set(agent_tool::OPENDAN_SESSION_ID_ENV, &session_id);
-        let _g3 = EnvGuard::set(agent_tool::OPENDAN_TRACE_ID_ENV, "trace-unchanged");
-        let _cwd = CwdGuard::set(&cwd);
-
-        let args = vec![
-            OsString::from("/tmp/agent_tool"),
-            OsString::from("read"),
-            OsString::from("demo.txt"),
-            OsString::from("--content-only"),
-        ];
-        let first = execute(args.clone(), CliRuntimeEnv::from_process().unwrap(), None)
-            .await
-            .expect("first read");
-        assert_eq!(first.exit_code, EXIT_SUCCESS);
-        let first_payload: Json = serde_json::from_str(&first.stdout).expect("parse first json");
-        assert_eq!(first_payload["detail"]["unchanged"], false);
-        assert_eq!(first_payload["output"], "line-1\nline-2\n");
-
-        let second = execute(args, CliRuntimeEnv::from_process().unwrap(), None)
-            .await
-            .expect("second read");
-        assert_eq!(second.exit_code, EXIT_SUCCESS);
-        let second_payload: Json = serde_json::from_str(&second.stdout).expect("parse second json");
-        assert_eq!(second_payload["detail"]["unchanged"], true);
-        assert_eq!(second_payload["output"], "和上一次read相比没有变化");
+        .expect_err("no such workspace");
+        assert!(err.to_string().contains("obj://aiworkspace/ws_1"), "{err}");
     }
 
     #[tokio::test]
@@ -5481,196 +4642,6 @@ methods = ["x_call"]
             .await
             .expect("read updated file");
         assert_eq!(content, "hello buckyos\n");
-    }
-
-    #[tokio::test]
-    async fn attention_stage1_cli_flow_discovers_and_completes() {
-        let _guard = nb_lock();
-        let temp = tempdir().expect("create tempdir");
-        let root = temp.path().join("agent");
-        let cwd = root.join("workspace");
-        fs::create_dir_all(&cwd).await.expect("create cwd");
-        let target_session = "target-session";
-        let env = test_env(root.clone(), cwd.clone());
-        let message_ts = "2026-01-01T00:00:00Z";
-        let begin_args = json!({
-            "session_id": target_session,
-            "window_start": message_ts,
-            "window_end": message_ts,
-        });
-        let begin_output = execute(
-            vec![
-                OsString::from("/tmp/BeginAttentionSignalExtraction"),
-                OsString::from(begin_args.to_string()),
-            ],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("begin extraction");
-        assert_eq!(begin_output.exit_code, EXIT_SUCCESS);
-
-        let discover_args = json!({
-            "object": {
-                "mention_text": "Project Atlas",
-                "entity_type": "project",
-                "is_user_private_entity": true
-            },
-            "observation": "Project Atlas is blocked on DNS verification.",
-            "observation_type": "status",
-            "evidence": [{
-                "round_index": 1,
-                "entry_seq": 1,
-                "entry_kind": "message",
-                "role": "user",
-                "text_excerpt": "Project Atlas is blocked on DNS verification."
-            }],
-            "confidence": 0.92
-        });
-        let discover_output = execute(
-            vec![
-                OsString::from("/tmp/DiscoverObjectObservation"),
-                OsString::from(discover_args.to_string()),
-            ],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("discover object observation");
-        assert_eq!(discover_output.exit_code, EXIT_SUCCESS);
-        let discover_payload: Json =
-            serde_json::from_str(&discover_output.stdout).expect("discover json");
-        let signal_id = discover_payload["detail"]["signal"]["id"]
-            .as_str()
-            .expect("signal id")
-            .to_string();
-        assert_eq!(
-            discover_payload["detail"]["signal"]["source"]["session_id"],
-            target_session
-        );
-        assert_eq!(
-            discover_payload["detail"]["signal"]["extraction"]["extraction_window_id"],
-            begin_output_json(&begin_output)["detail"]["extraction_window_id"]
-        );
-
-        let complete_output = execute(
-            vec![OsString::from("/tmp/CompleteAttentionSignalExtraction")],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("complete extraction");
-        assert_eq!(complete_output.exit_code, EXIT_SUCCESS);
-
-        let list_output = execute(
-            vec![
-                OsString::from("/tmp/ListPendingAttentionSignals"),
-                OsString::from("limit=10"),
-            ],
-            env,
-            None,
-        )
-        .await
-        .expect("list pending signals");
-        assert_eq!(list_output.exit_code, EXIT_SUCCESS);
-        let list_payload: Json = serde_json::from_str(&list_output.stdout).expect("list json");
-        assert_eq!(list_payload["detail"]["returned"], 1);
-        assert_eq!(list_payload["detail"]["signals"][0]["id"], signal_id);
-    }
-
-    #[tokio::test]
-    async fn attention_stage2_cli_lists_and_marks_consumed() {
-        let _guard = nb_lock();
-        let temp = tempdir().expect("create tempdir");
-        let root = temp.path().join("agent");
-        let cwd = root.join("workspace");
-        fs::create_dir_all(&cwd).await.expect("create cwd");
-        let target_session = "target-session";
-        let env = test_env(root.clone(), cwd);
-
-        let begin_args = json!({
-            "session_id": target_session,
-            "window_start": "2026-01-01T00:00:00Z",
-            "window_end": "2026-01-01T00:01:00Z",
-        });
-        execute(
-            vec![
-                OsString::from("/tmp/BeginAttentionSignalExtraction"),
-                OsString::from(begin_args.to_string()),
-            ],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("begin extraction");
-        let discover_args = json!({
-            "title": "Project Atlas DNS verification blocked",
-            "phase": "blocked",
-            "evidence": [{
-                "round_index": 1,
-                "entry_seq": 1,
-                "entry_kind": "message",
-                "role": "user",
-                "text_excerpt": "Project Atlas is blocked on DNS verification."
-            }],
-            "confidence": 0.9
-        });
-        let discover_output = execute(
-            vec![
-                OsString::from("/tmp/DiscoverEvent"),
-                OsString::from(discover_args.to_string()),
-            ],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("discover event");
-        let signal_id = serde_json::from_str::<Json>(&discover_output.stdout)
-            .expect("discover json")["detail"]["signal"]["id"]
-            .as_str()
-            .expect("signal id")
-            .to_string();
-
-        let list_output = execute(
-            vec![OsString::from("/tmp/ListPendingAttentionSignals")],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("list pending");
-        let list_payload: Json = serde_json::from_str(&list_output.stdout).expect("list json");
-        assert_eq!(list_payload["detail"]["returned"], 1);
-
-        let mark_output = execute(
-            vec![
-                OsString::from("/tmp/MarkAttentionSignalConsumed"),
-                OsString::from(format!("signal_id={signal_id}")),
-            ],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("mark consumed");
-        assert_eq!(mark_output.exit_code, EXIT_SUCCESS);
-        let mark_payload: Json = serde_json::from_str(&mark_output.stdout).expect("mark json");
-        assert_eq!(
-            mark_payload["detail"]["signal"]["lifecycle_status"],
-            "consumed"
-        );
-
-        let after_output = execute(
-            vec![OsString::from("/tmp/ListPendingAttentionSignals")],
-            env,
-            None,
-        )
-        .await
-        .expect("list after consumed");
-        let after_payload: Json = serde_json::from_str(&after_output.stdout).expect("after json");
-        assert_eq!(after_payload["detail"]["returned"], 0);
-    }
-
-    fn begin_output_json(output: &CliRunOutput) -> Json {
-        serde_json::from_str(&output.stdout).expect("begin json")
     }
 
     #[tokio::test]
@@ -5957,6 +4928,20 @@ methods = ["x_call"]
         for name in ["opendan", "xagent", "llm_understand_media", ""] {
             assert!(!handles_invocation_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn llm_understand_media_runs_as_a_subcommand_or_under_its_own_name() {
+        let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        let want = Some(vec!["a.png".to_string(), "--ask".to_string()]);
+        assert_eq!(llm_understand_media_args(&os(&["agent_tool", "llm_understand_media", "a.png", "--ask"])), want);
+        #[cfg(windows)]
+        assert_eq!(
+            llm_understand_media_args(&os(&[r"C:\s\.runtime\bin\llm_understand_media.exe", "a.png", "--ask"])),
+            want
+        );
+        assert_eq!(llm_understand_media_args(&os(&["/s/.runtime/bin/llm_understand_media", "a.png", "--ask"])), want);
+        assert_eq!(llm_understand_media_args(&os(&["agent_tool", "read_file", "llm_understand_media"])), None);
     }
 
     #[test]

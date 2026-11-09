@@ -151,6 +151,10 @@ pub struct AgentEvent {
     /// The source's final event.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub terminal: bool,
+    /// A task's end: the tool call whose result handed the work over as
+    /// that task (the input is a task result of that call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 /// `type = "control"` payload: session control, executed by the runner.
@@ -167,6 +171,19 @@ pub enum ControlCommand {
         /// Goal).
         #[serde(default, skip_serializing_if = "StopScope::is_session")]
         scope: StopScope,
+    },
+    /// The session infers no more until `resume`: no Turn opens, a run in
+    /// progress stops at its next inference boundary; tasks it follows run
+    /// on. Its sub sessions are paused too.
+    Pause {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Undo `pause`: a run it stopped goes on from its checkpoint, inputs
+    /// that arrived meanwhile open the next Turn.
+    Resume {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// The only input a finished session still accepts.
     Decide {
@@ -257,6 +274,8 @@ fn default_perceive_kind() -> String {
 
 const CONTROL_COMMANDS: &[&str] = &[
     "stop",
+    "pause",
+    "resume",
     "decide",
     "subscribe",
     "unsubscribe",
@@ -269,6 +288,8 @@ impl ControlCommand {
     pub fn name(&self) -> &'static str {
         match self {
             ControlCommand::Stop { .. } => "stop",
+            ControlCommand::Pause { .. } => "pause",
+            ControlCommand::Resume { .. } => "resume",
             ControlCommand::Decide { .. } => "decide",
             ControlCommand::Subscribe { .. } => "subscribe",
             ControlCommand::Unsubscribe { .. } => "unsubscribe",
@@ -283,14 +304,6 @@ impl ControlCommand {
         ControlCommand::Stop {
             reason,
             scope: StopScope::Session,
-        }
-    }
-
-    /// `stop` of the open Turn only.
-    pub fn stop_turn(reason: Option<String>) -> Self {
-        ControlCommand::Stop {
-            reason,
-            scope: StopScope::Turn,
         }
     }
 }
@@ -823,7 +836,6 @@ pub enum MessagePos {
     Step { index: u64 },
 }
 
-pub const PART_SNAPSHOT: &str = "semi_subscription_snapshot";
 pub const PART_INPUT: &str = "input";
 
 pub const HOOK_ON_INIT: &str = "on_init";
@@ -833,7 +845,7 @@ pub const HOOK_ON_CONTEXT_SWITCH: &str = "on_context_switch";
 /// One message injected by a batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReceiptPart {
-    /// `goal_activation | semi_subscription_snapshot | input`.
+    /// `goal_activation | input`.
     pub part: String,
     pub pos: MessagePos,
     /// The message's text block (evidence, worklog `user_message`). Image /
@@ -946,8 +958,8 @@ pub struct InputReceipt {
     pub at_ms: u64,
 }
 
-/// `InputReceipt.extra` key: the `background_shown` map after a chat
-/// format batch (UI sessions), applied to the state with the receipt.
+/// `InputReceipt.extra` key: the `background_shown` map after a batch,
+/// applied to the state with the receipt.
 pub const RECEIPT_BACKGROUND: &str = "background";
 
 /// libopendan host metadata stored in `LLMContextState.host["libopendan"]`.
@@ -985,16 +997,14 @@ pub struct HostMeta {
     /// it is not tried again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub media_degraded: bool,
-    /// Background lines shown after tool results (`[input] background =
-    /// "after_tools"`): line key → digest of the text last shown. Committed
-    /// with the message that showed them, so a crash before that commit
-    /// shows them again and one after it never twice.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub observed: BTreeMap<String, String>,
-    /// The history epoch `observed` belongs to: after a rewrite the lines
-    /// are shown afresh.
+    /// The model was told that the tool budget is running out (`<<budget>>`
+    /// line); cleared when a Turn refills the budget.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub budget_warned: bool,
+    /// Turn in which the run, out of time / tokens, was given its wrap-up
+    /// (once per Turn).
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub observed_epoch: u64,
+    pub budget_wrap_up_turn: u64,
 }
 
 pub const HOST_META_KEY: &str = "libopendan";
@@ -1003,132 +1013,3 @@ fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 
-/// `meta` key of a question a session asks the user along its reply path
-/// (`agent-session ask-user`): `{anchor, call_id, turn, input}`.
-pub const AGENT_ASK_META: &str = "agent_ask";
-
-/// `content.machine.intent` of an answer picked from a question's options
-/// (`data: {call_id, option}`).
-pub const AGENT_ASK_ANSWER_INTENT: &str = "agent_ask.answer";
-
-/// Task id prefix of a call waiting for the user's answer
-/// (`userinput:<call_id>`): only the session resolves it, from its input
-/// queue.
-pub const USER_INPUT_TASK_PREFIX: &str = "userinput:";
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum UserInputKind {
-    #[default]
-    Text,
-    Choice,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct UserInputOption {
-    pub id: String,
-    pub label: String,
-}
-
-/// How the user answers a question.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct UserInputSpec {
-    #[serde(default)]
-    pub kind: UserInputKind,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub options: Vec<UserInputOption>,
-    /// A choice question also takes free text.
-    #[serde(default)]
-    pub allow_text: bool,
-}
-
-/// A question to the user (`details` of the `ask-user` pending result).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct UserInputRequest {
-    pub question: String,
-    #[serde(default)]
-    pub input: UserInputSpec,
-}
-
-impl UserInputRequest {
-    pub fn validate(&self) -> std::result::Result<(), String> {
-        if self.question.trim().is_empty() {
-            return Err("the question is empty".into());
-        }
-        let options = &self.input.options;
-        match self.input.kind {
-            UserInputKind::Text if !options.is_empty() || self.input.allow_text => {
-                Err("a text question has no options".into())
-            }
-            UserInputKind::Choice if options.len() < 2 => {
-                Err("a choice question needs at least two options".into())
-            }
-            UserInputKind::Choice => {
-                let mut ids = std::collections::BTreeSet::new();
-                for o in options {
-                    if o.id.trim().is_empty() || o.label.trim().is_empty() {
-                        return Err("every option needs an id and a label".into());
-                    }
-                    if !ids.insert(o.id.as_str()) {
-                        return Err(format!("option id `{}` is used twice", o.id));
-                    }
-                }
-                Ok(())
-            }
-            UserInputKind::Text => Ok(()),
-        }
-    }
-
-    /// The question as text for readers that do not know `agent_ask`.
-    pub fn text(&self) -> String {
-        let mut s = self.question.trim().to_string();
-        if self.input.kind == UserInputKind::Choice {
-            for (i, o) in self.input.options.iter().enumerate() {
-                s.push_str(&format!("\n{}. {}", i + 1, o.label.trim()));
-            }
-        }
-        s
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct UserInputAttachment {
-    pub obj_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-/// Result of an `ask-user` call: the next message the user sent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct UserInputAnswer {
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<UserInputAttachment>,
-    /// Option id picked (`agent_ask.answer` of this call).
-    pub option: Option<String>,
-    /// The message replies to the question (`thread` on its anchor).
-    pub in_reply_to_question: bool,
-    /// The message (empty when the answer came through a notification).
-    pub msg_id: String,
-    pub from: String,
-    pub at_ms: u64,
-    /// `notification`: answered on the notification card, not by a
-    /// message.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub via: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notify_id: Option<String>,
-}
-
-/// `run.json host.extra.asks[<call_id>].notify`: a question of a session
-/// nobody reads (a Work), asked through a notification. Recorded with the
-/// question (deadline), completed once the notification is sent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct AskNotify {
-    pub deadline_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notify_id: Option<String>,
-    /// The TaskMgr task the answer is committed to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-}

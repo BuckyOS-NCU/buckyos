@@ -6,10 +6,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use buckyos_api::*;
 use node_executor::*;
-use tokio::io::DuplexStream;
+use buckyos_api::node_executor_ipc::{ExecutorIo, LocalExecutorListener, connect_local_executor};
 
 const APP: &str = "computer.test.buckyos.io";
 const OWNER: &str = "owner";
+const LARGE_PNG_BYTES: usize = 3 * 1024 * 1024;
 
 struct Verifier;
 #[async_trait]
@@ -45,6 +46,9 @@ enum Behavior {
     Cancel,
     Unknown,
     Image,
+    LargeImage,
+    Semantic,
+    OversizedSemantic,
     PersistFailure,
     Timeout,
 }
@@ -119,34 +123,31 @@ impl ComputerDriver for FakeDriver {
                     message: "no dispatch confirmation".into(),
                 });
             }
-            Behavior::Image => {
+            Behavior::Image | Behavior::LargeImage => {
                 use base64::Engine;
-                png = Some(base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1sAAAAASUVORK5CYII=").unwrap());
+                let mut image = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1sAAAAASUVORK5CYII=").unwrap();
+                if matches!(self.behavior, Behavior::LargeImage) {
+                    image.resize(LARGE_PNG_BYTES, 0);
+                }
+                if image.len() > context.max_image_bytes {
+                    result.feedback.state = ComputerFeedbackState::Failed;
+                    result.error = Some(ComputerError {
+                        code: "capture_size_limit".into(),
+                        message: "screenshot exceeds the image budget".into(),
+                    });
+                } else {
+                    png = Some(image);
+                    result.feedback.state = ComputerFeedbackState::Included;
+                    result.observation = Some(observation(&request, true, None));
+                }
+            }
+            Behavior::Semantic | Behavior::OversizedSemantic => {
+                let text = match self.behavior {
+                    Behavior::Semantic => "[e1] window \"Notepad\" @0,0 800x600\n  [e2] button \"Save\" (invoke) @10,10 40x20\n".to_string(),
+                    _ => "x".repeat(COMPUTER_SEMANTIC_MAX_TEXT_BYTES + 1),
+                };
                 result.feedback.state = ComputerFeedbackState::Included;
-                result.observation = Some(ComputerObservation {
-                    observation_id: "observation".into(),
-                    binding_id: request.binding_id().into(),
-                    surface_id: "display:1".into(),
-                    surface_epoch: 1,
-                    interaction_revision: 1,
-                    requested_mode: ComputerObservationMode::Visual,
-                    effective_mode: ComputerObservationMode::Visual,
-                    selection_reason: "explicit".into(),
-                    capture_started_at_ms: now_ms(),
-                    capture_completed_at_ms: now_ms(),
-                    consistency: "best_effort".into(),
-                    screenshot: ComputerScreenshot {
-                        artifact_ref: String::new(),
-                        mime_type: "image/png".into(),
-                        width: 1,
-                        height: 1,
-                        space: ComputerCoordinateSpace::Screenshot,
-                        interactive: true,
-                    },
-                    focus_guard: "surface".into(),
-                    expires_at_ms: now_ms() + 30_000,
-                    warnings: vec![],
-                });
+                result.observation = Some(observation(&request, false, Some(text)));
             }
         }
         ComputerOutput { result, png }
@@ -156,15 +157,64 @@ impl ComputerDriver for FakeDriver {
     }
 }
 
+fn observation(request: &ComputerRequest, screenshot: bool, outline: Option<String>) -> ComputerObservation {
+    let mode = if outline.is_some() { ComputerObservationMode::Semantic } else { ComputerObservationMode::Visual };
+    ComputerObservation {
+        observation_id: "observation".into(),
+        binding_id: request.binding_id().into(),
+        surface_id: "display:1".into(),
+        surface_epoch: 1,
+        interaction_revision: 1,
+        requested_mode: mode,
+        effective_mode: mode,
+        selection_reason: "explicit".into(),
+        capture_started_at_ms: now_ms(),
+        capture_completed_at_ms: now_ms(),
+        consistency: "best_effort".into(),
+        screenshot: screenshot.then(|| ComputerScreenshot {
+            artifact_ref: String::new(),
+            mime_type: "image/png".into(),
+            width: 1,
+            height: 1,
+            space: ComputerCoordinateSpace::Screenshot,
+            interactive: true,
+            captured_at_ms: now_ms(),
+        }),
+        semantic: outline.map(|text| ComputerSemantic {
+            format: COMPUTER_SEMANTIC_FORMAT.into(),
+            text,
+            windows: vec![],
+            coverage: ComputerSemanticCoverage { visited: 2, returned: 2, truncated: false, reason: None },
+            captured_at_ms: now_ms(),
+        }),
+        focus_guard: "surface".into(),
+        expires_at_ms: now_ms() + 30_000,
+        warnings: vec![],
+    }
+}
+
 struct Fixture {
     executor: NodeExecutor,
-    client: DuplexStream,
+    client: Box<dyn ExecutorIo>,
     _dir: tempfile::TempDir,
     driver: Arc<FakeDriver>,
     store: String,
     config: ExecutorConfig,
 }
 impl Fixture {
+    async fn use_ipc(&mut self) {
+        let endpoint = if cfg!(windows) {
+            node_executor_ipc::local_executor_endpoint(self._dir.path())
+        } else {
+            self._dir.path().join("ipc.sock").display().to_string()
+        };
+        let mut listener = LocalExecutorListener::bind(&endpoint).await.unwrap();
+        let executor = self.executor.clone();
+        tokio::spawn(async move {
+            executor.serve(listener.accept().await.unwrap()).await;
+        });
+        self.client = login(connect_local_executor(&endpoint).await.unwrap(), "test").await;
+    }
     async fn new(behavior: Behavior, ops: Vec<ExecutorOp>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let driver = FakeDriver::new(behavior);
@@ -186,6 +236,7 @@ impl Fixture {
                 identity_mode: ExecutorIdentityMode::CurrentUser,
                 admission: ExecutorAdmission::Wss,
                 path_prefix: Vec::new(),
+                buckyos_root: None,
             },
             driver.clone(),
         )
@@ -280,10 +331,15 @@ impl Fixture {
         }
     }
 }
-async fn connect(executor: &NodeExecutor, token: &str) -> DuplexStream {
-    let (mut client, server) = tokio::io::duplex(64 * 1024);
+async fn connect(executor: &NodeExecutor, token: &str) -> Box<dyn ExecutorIo> {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let client: Box<dyn ExecutorIo> = Box::new(client);
     let executor = executor.clone();
     tokio::spawn(async move { executor.serve(server).await });
+    login(client, token).await
+}
+
+async fn login(mut client: Box<dyn ExecutorIo>, token: &str) -> Box<dyn ExecutorIo> {
     let reply = exchange(
         &mut client,
         ExecutorClientMessage::Login(ExecutorLogin {
@@ -305,7 +361,7 @@ async fn connect(executor: &NodeExecutor, token: &str) -> DuplexStream {
     client
 }
 async fn exchange(
-    client: &mut DuplexStream,
+    client: &mut Box<dyn ExecutorIo>,
     message: ExecutorClientMessage,
 ) -> ExecutorServerMessage {
     let id = message.request_id().map(str::to_owned);
@@ -456,12 +512,14 @@ async fn unknown_input_pauses_the_driver_and_is_never_replayed() {
 #[tokio::test]
 async fn screenshots_use_ledger_content_and_original_actor_acl() {
     let mut fixture = Fixture::new(Behavior::Image, ExecutorOp::ALL.to_vec()).await;
+    fixture.use_ipc().await;
     fixture
         .submit(
             "observe",
             ComputerRequest::Observe {
                 binding_id: "desktop:display:1".into(),
                 mode: ComputerObservationMode::Visual,
+                scope: None,
             },
         )
         .await;
@@ -473,6 +531,7 @@ async fn screenshots_use_ledger_content_and_original_actor_acl() {
         .observation
         .unwrap()
         .screenshot
+        .unwrap()
         .artifact_ref
         .starts_with("executor-content:"));
     let query = ExecutorClientMessage::Query(ExecutorQueryRequest {
@@ -494,6 +553,101 @@ async fn screenshots_use_ledger_content_and_original_actor_acl() {
         panic!()
     };
     assert_eq!(denied.error.code, ExecutorErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn screenshots_beyond_the_file_limit_fit_the_image_limit_and_still_reserve_store_space() {
+    let mut fixture = Fixture::new(Behavior::LargeImage, ExecutorOp::ALL.to_vec()).await;
+    let limits = fixture.config.limits.clone();
+    assert!(LARGE_PNG_BYTES as u64 > limits.max_file_bytes);
+    assert!(LARGE_PNG_BYTES as u64 <= limits.max_computer_image_bytes);
+    let observe = ComputerRequest::Observe {
+        binding_id: "desktop:display:1".into(),
+        mode: ComputerObservationMode::Visual,
+        scope: None,
+    };
+    fixture.submit("large", observe.clone()).await;
+    let result = fixture.result("large").await.result.unwrap();
+    assert_eq!(result.state, ExecutorOpState::Succeeded, "{:?}", result.computer);
+    assert_eq!(result.content.unwrap().retained_bytes, LARGE_PNG_BYTES as u64);
+    assert!(result.computer.unwrap().observation.unwrap().screenshot.unwrap()
+        .artifact_ref.starts_with("executor-content:"));
+
+    let mut config = fixture.config.clone();
+    config.generation += 1;
+    config.revision = "sha256:small-store".into();
+    config.limits.max_store_bytes = limits.max_computer_image_bytes;
+    assert_eq!(fixture.executor.apply_config(Some(config)).await, ApplyResult::Replaced);
+    fixture.client = connect(&fixture.executor, "test").await;
+    let ExecutorServerMessage::Error(full) = fixture.submit("no-room", observe).await else {
+        panic!("the image reservation must not fit the remaining store budget")
+    };
+    assert_eq!(full.error.code, ExecutorErrorCode::CapacityExceeded);
+    assert_eq!(fixture.driver.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn semantic_feedback_stays_in_the_control_frame_within_its_limit() {
+    for (behavior, op_id) in [(Behavior::Semantic, "semantic"), (Behavior::OversizedSemantic, "oversized")] {
+        let mut fixture = Fixture::new(behavior, ExecutorOp::ALL.to_vec()).await;
+        fixture
+            .submit(
+                op_id,
+                ComputerRequest::Observe {
+                    binding_id: "desktop:display:1".into(),
+                    mode: ComputerObservationMode::Semantic,
+                    scope: None,
+                },
+            )
+            .await;
+        let result = fixture.result(op_id).await.result.unwrap();
+        assert!(result.content.is_none(), "semantic observations never use the content channel");
+        let computer = result.computer.unwrap();
+        if matches!(behavior, Behavior::Semantic) {
+            assert_eq!(result.state, ExecutorOpState::Succeeded);
+            let observation = computer.observation.unwrap();
+            assert!(observation.screenshot.is_none());
+            assert!(observation.semantic.unwrap().text.contains("[e2] button \"Save\""));
+        } else {
+            assert_eq!(result.state, ExecutorOpState::Failed);
+            assert_eq!(computer.feedback.state, ComputerFeedbackState::Failed);
+            assert!(computer.observation.is_none());
+            assert_eq!(computer.error.unwrap().code, "feedback_failed");
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_ipc_preserves_computer_grants_and_duplicate_operation_identity() {
+    let mut fixture = Fixture::new(Behavior::Complete, vec![ExecutorOp::OpenStream, ExecutorOp::Describe,
+        ExecutorOp::ComputerInspect, ExecutorOp::ComputerObserve, ExecutorOp::Query]).await;
+    fixture.use_ipc().await;
+    assert!(matches!(fixture.submit("no-control", click(ComputerFeedback::None)).await, ExecutorServerMessage::Error(_)));
+    assert_eq!(fixture.driver.calls.load(Ordering::SeqCst), 0);
+    let inspect = ComputerRequest::Inspect { binding_id: "desktop:display:1".into() };
+    fixture.submit("inspect", inspect.clone()).await;
+    assert_eq!(fixture.result("inspect").await.state, ExecutorOpState::Succeeded);
+    let ExecutorServerMessage::Accepted(repeated) = fixture.submit("inspect", inspect).await else { panic!() };
+    assert!(repeated.duplicate);
+    assert_eq!(fixture.driver.calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_ipc_socket_is_private_and_only_reclaims_its_own_stale_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("computer.sock");
+    let endpoint = path.display().to_string();
+    std::fs::write(&path, "do not replace").unwrap();
+    assert!(LocalExecutorListener::bind(&endpoint).await.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "do not replace");
+    std::fs::remove_file(&path).unwrap();
+    let listener = LocalExecutorListener::bind(&endpoint).await.unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(LocalExecutorListener::bind(&endpoint).await.is_err());
+    drop(listener);
+    let _listener = LocalExecutorListener::bind(&endpoint).await.unwrap();
 }
 
 #[tokio::test]

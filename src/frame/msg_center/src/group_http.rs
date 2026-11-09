@@ -1,6 +1,6 @@
 use crate::group_types::*;
 use crate::msg_center::MessageCenter;
-use buckyos_api::{AccessDenial, MailboxAddress, SessionScope, ACCESS_DENIED_ERROR_CODE};
+use buckyos_api::{AccessDenial, AuthMethod, MailboxAddress, SessionScope, ACCESS_DENIED_ERROR_CODE};
 use buckyos_http_server::ServerError;
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
@@ -102,7 +102,8 @@ async fn body(req: &mut Request<Body>, max: usize) -> Result<Vec<u8>> {
 }
 async fn principal(
     center: &MessageCenter,
-    req: &Request<Body>,
+    req: &mut Request<Body>,
+    _group: &DID,
 ) -> Result<(GroupActor, RPCContext)> {
     let raw = req
         .headers()
@@ -115,29 +116,7 @@ async fn principal(
         from_ip: Some("127.0.0.1".parse().unwrap()),
         ..Default::default()
     };
-    let caller = center
-        .caller_identity(&ctx)
-        .await?
-        .ok_or_else(|| denied("unauthenticated"))?;
-    let mut actor = center.group_actor(&ctx).await?;
-    let original = req
-        .headers()
-        .get(CYFS_HEADER_ORIGINAL_USER)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| DID::from_str(s).ok())
-        .ok_or_else(|| denied("original-user-required"))?;
-    if actor.did != original {
-        return Err(denied("original-user-mismatch"));
-    }
-    if original.method == "msgtunnel" {
-        return Err(denied("shadow-endpoint-local-only"));
-    }
-    // An account of this Zone keeps its real client: a restricted session
-    // must not pass `allowed_clients` as an unverified remote.
-    if !(caller.restricted() && !caller.external) {
-        actor.remote = true;
-        actor.client = None;
-    }
+    let actor = center.federated_group_actor(&ctx).await?;
     Ok((actor, ctx))
 }
 /// Group HTTP routes; opened to restricted sessions, whom the group and
@@ -151,10 +130,16 @@ pub(crate) async fn serve(
 }
 async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<Response<Body>> {
     let path = req.uri().path().to_owned();
-    let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
+    let prefixed = path.strip_prefix("/kapi/msg-center/groups/");
+    let resource_path = prefixed.unwrap_or_else(|| path.trim_start_matches('/'));
+    let parts: Vec<_> = resource_path.split('/').collect();
     let group = DID::from_str(parts.first().copied().unwrap_or("")).ok()?;
     let state = match center.groups.load(&group).await {
         Ok(Some(g)) => g,
+        Ok(None) if prefixed.is_some() => return Some(reply(
+            StatusCode::NOT_FOUND,
+            json!({"error":"remote-group-not-found","retryable":false}),
+        )),
         Ok(None) => return None,
         Err(e) => return Some(error(e)),
     };
@@ -165,7 +150,12 @@ async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<
         .and_then(|h| h.to_str().ok())
         .or_else(|| req.uri().host())
         .unwrap_or("");
-    let expected = config.target_zone.as_deref().unwrap_or_else(|| "localhost");
+    // The Zone this msg-center serves, as the inbox path reads it: configured, else the runtime's.
+    let local_zone = config
+        .target_zone
+        .clone()
+        .or_else(crate::cyfs_dispatch::local_zone_host);
+    let expected = local_zone.as_deref().unwrap_or("localhost");
     let target = match group_target(host, &path) {
         Ok(target) => target,
         Err(e) => return Some(error(e)),
@@ -190,7 +180,7 @@ async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<
             }
         });
     }
-    let (actor, ctx) = match principal(center, req).await {
+    let (actor, ctx) = match principal(center, req, &group).await {
         Ok(a) => a,
         Err(e) => return Some(request_error(e, req, &target)),
     };
@@ -325,7 +315,7 @@ async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<
                     ),
                     CyfsNamedObjectEncoding::Jwt => {
                         let jwt = String::from_utf8(bytes).map_err(invalid)?;
-                        let signed = crate::cyfs_dispatch::verify_signed_message(&jwt)
+                        let signed = crate::cyfs_dispatch::verify_signed_message_with(&jwt, center)
                             .await
                             .map_err(|(_, r)| denied(r))?;
                         (signed.msg, Some(jwt))
@@ -334,10 +324,14 @@ async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<
                 if msg.to_session != sid || msg.to != [group.clone()] || msg.from != actor.did {
                     return Err(denied("sender-or-session-mismatch"));
                 }
-                MessageCenter::refuse_guest_attachments(
-                    center.caller_identity(&ctx).await?.as_ref(),
-                    &msg,
-                )?;
+                // Visitors post no media (SSO-12). A member's own Zone is no visitor: it signed in
+                // for the member and already checked what the member may send.
+                let caller = center.caller_identity(&ctx).await?;
+                let from_members_zone = state.role(&actor.did).is_some()
+                    && caller.as_ref().is_some_and(|caller| caller.auth_method == Some(AuthMethod::CrossZoneAssertion));
+                if !from_members_zone {
+                    MessageCenter::refuse_guest_attachments(caller.as_ref(), &msg)?;
+                }
                 let dispatch = center.accept_group_message(&actor, msg, jwt).await?;
                 let target = group_target(expected, &path)?;
                 let mut result = if dispatch.ok {
@@ -403,6 +397,11 @@ async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<
                     if !v.is_object() {
                         return Err(invalid("invalid-join-body"));
                     }
+                    for key in ["member_did", "idempotency_key"] {
+                        if let Some(value) = v.get(key) {
+                            p[key] = value.clone();
+                        }
+                    }
                     if let Some(invite) = params.get("invite") {
                         p["invite"] = json!(invite);
                     }
@@ -413,7 +412,15 @@ async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<
                         // bare join accepts the caller's pending invitation when
                         // one exists and no invite link was given, otherwise it
                         // is a join request.
-                        let explicit = v.get("invitation_id").and_then(Value::as_str);
+                        let explicit = v
+                            .get("invitation_id")
+                            .map(|value| {
+                                value
+                                    .as_str()
+                                    .filter(|id| !id.is_empty())
+                                    .ok_or_else(|| invalid("invalid-invitation-id"))
+                            })
+                            .transpose()?;
                         let pending = state
                             .members
                             .get(&actor.did.to_string())
@@ -435,12 +442,13 @@ async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<
                     _ if p.get("invitation_id").is_some() => "group.accept_invitation",
                     _ => "group.request_join",
                 };
-                Ok(reply(
-                    StatusCode::OK,
-                    center
-                        .group_rpc_authenticated(method, p, ctx, actor.clone())
-                        .await?,
-                ))
+                let mut result = center
+                    .group_rpc_authenticated(method, p, ctx, actor.clone())
+                    .await?;
+                if operation == "join" && sid.is_none() {
+                    result["group_did"] = json!(group);
+                }
+                Ok(reply(StatusCode::OK, result))
             }
             (&Method::GET, op) if op.starts_with("objects/") => {
                 let id = ObjId::new(op.trim_start_matches("objects/")).map_err(invalid)?;
@@ -454,7 +462,11 @@ async fn serve_group(center: &MessageCenter, req: &mut Request<Body>) -> Option<
                     center
                         .authorize_group_attachment(&actor, &id, context)
                         .await?;
-                    return Ok(crate::object_access::fetch_authorized_object(&id, false).await);
+                    let msg_id = crate::buckets::context_msg_id(context)?;
+                    return Ok(crate::object_access::bound_attachment_response(
+                        center, &ctx, &msg_id, &id, false, None,
+                    )
+                    .await);
                 }
                 center.authorize_group_message(&actor, &id).await?;
                 let (object_group, body, jwt) =

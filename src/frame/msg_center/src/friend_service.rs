@@ -375,7 +375,8 @@ impl MessageCenter {
         Box::pin(async move {
             let msg = Self::friend_message(owner, &outgoing)?;
             let (msg_id, msg_json) = msg.gen_obj_id();
-            Self::store_message(&msg_id, &msg_json).await?;
+            self.store_message(&msg_id, &msg_json, &msg, crate::buckets::Arrival::Local)
+                .await?;
             self.with_state_write(|state| {
                 Self::ensure_message(state, msg.clone());
                 Ok(())
@@ -450,7 +451,7 @@ impl MessageCenter {
                 }
             }
             let delivery = if local {
-                let target = format!("cyfs://local/{}/inbox", peer.to_string());
+                let target = format!("https://local/{}/inbox", peer.to_string());
                 match self.dispatch_to_receiver(msg, None, peer.clone(), target).await {
                     Ok(result) if result.delivered_recipients.contains(&peer) => FriendDelivery {
                         state: FriendDeliveryState::Delivered,

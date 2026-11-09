@@ -20,8 +20,6 @@ pub const SESSION_STATE_SCHEMA: &str = "opendan.session_state/6";
 
 /// Upper bound on `inputs.recent_keys` (bounded dedup cache).
 pub const RECENT_KEYS_LIMIT: usize = 256;
-/// Upper bound on `consumed_above` per source before we warn.
-pub const CONSUMED_ABOVE_WARN: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -76,29 +74,6 @@ pub struct WriterInfo {
     pub host: Option<String>,
     pub pid: u32,
     pub lock_epoch: u64,
-}
-
-/// What a waiting session waits for (`waiting_for.kind`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum WaitingKind {
-    Input,
-    Tool,
-    Event,
-    Children,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct WaitingFor {
-    pub kind: WaitingKind,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_ms: Option<u64>,
-    /// TaskMgr human tasks the wait depends on: questions asked through a
-    /// notification (`ask-user` of a Work).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub human_tasks: Vec<String>,
 }
 
 /// Inputs of one logical Turn that entered a run. The input batch that
@@ -183,8 +158,10 @@ pub enum CallTrigger {
     /// `next_behavior` of a complete Step: the result returns as
     /// `process_result` in the caller's hand-over batch.
     Behavior,
-    /// A tool call / behavior action: the caller is suspended on
-    /// `PendingTool`, the result is filled as the tool result of `call_id`.
+    /// A tool call / behavior action (`call_behavior` or a behavior's named
+    /// function): the call returned at once, the session handed over when
+    /// the caller's run segment ended; the result returns as
+    /// `process_result` (naming `call_id`) in the caller's hand-over batch.
     Tool { call_id: String, task_id: String },
 }
 
@@ -195,21 +172,9 @@ pub struct ChildCall {
     pub mode: ContextMode,
     pub behavior: String,
     pub trigger: CallTrigger,
-    /// Task given to the child (tool trigger: the call's `task` argument;
-    /// a Todo executor: the admitted Todo's body).
+    /// Task given to the child (tool trigger: the call's `task` argument).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
-    /// The serial Todo attempt this call executes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub todo: Option<TodoBinding>,
-}
-
-/// A sub context call bound to a serial Todo attempt (TodoList §2.1):
-/// its result is written back to that attempt when the call returns.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct TodoBinding {
-    pub todo_id: String,
-    pub attempt: u32,
 }
 
 /// Suspended behavior process (its run is kept, §4.4).
@@ -310,9 +275,6 @@ pub enum OutboxPurpose {
     Placeholder,
     /// The reply of a Turn as an edit of its placeholder.
     FinalEdit,
-    /// A question to the user while the Turn is open (`ask-user`): a
-    /// `thread` message on the placeholder, carrying `agent_ask`.
-    Question,
 }
 
 impl OutboxPurpose {
@@ -410,21 +372,6 @@ impl SourceProgress {
             return;
         }
         self.consumed_above.insert(index);
-        while self.consumed_above.remove(&(self.acked_index + 1)) {
-            self.acked_index += 1;
-        }
-    }
-
-    /// Mark every index `< first_available` consumed: the queue no longer
-    /// holds anything below it (deleted / retention), so the contiguous
-    /// prefix may advance past the hole.
-    pub fn skip_below(&mut self, first_available: u64) {
-        if first_available == 0 || first_available <= self.acked_index + 1 {
-            return;
-        }
-        self.acked_index = first_available - 1;
-        self.consumed_above.retain(|i| *i > first_available - 1);
-        self.accepted.retain(|i| *i > first_available - 1);
         while self.consumed_above.remove(&(self.acked_index + 1)) {
             self.acked_index += 1;
         }
@@ -659,8 +606,10 @@ pub struct SessionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer: Option<WriterInfo>,
     pub run_state: RunState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub waiting_for: Option<WaitingFor>,
+    /// Sub sessions a waiting session must hear from before it goes on (its
+    /// run kept for them, or its end held for them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wait_children: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
     #[serde(default)]
@@ -748,9 +697,8 @@ pub struct SessionState {
     pub internal_continuation: Option<String>,
     /// Result of a sub context, handed to its caller: `{behavior, result,
     /// status: ok | failed | needs_user_input, next_action_id,
-    /// next_step_index}`. Behavior trigger: rendered into the caller's
-    /// hand-over batch. Tool trigger: carries `call_id` and is filled as that
-    /// call's tool result when the caller's run is opened.
+    /// next_step_index}`, rendered into the caller's hand-over batch (a tool
+    /// trigger carries its `call_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_result: Option<Value>,
     /// Revision of the TodoList (`todos.json`) last shown to the session's
@@ -758,18 +706,124 @@ pub struct SessionState {
     /// again only when the list changed since (0: never shown).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub todo_view_rev: u64,
+    /// `control(pause)`: the session infers no more — no Turn opens, a run
+    /// in progress stops at its next inference boundary (its checkpoint)
+    /// — until `control(resume)`. Tasks it follows run on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<Paused>,
+    /// A run a pause stopped inside its Turn goes on from its checkpoint
+    /// (set by `resume`, cleared when it runs again).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume_run: bool,
     /// Goal Sessions: the Goal State it owns and the Activation in
     /// progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<super::goal::GoalSessionState>,
-    /// Chat input format (UI sessions): the background context lines last
-    /// shown, `key → digest` (`time` → the epoch ms it was shown at). A
-    /// line is shown again only when its digest changes; the time line at
-    /// most every [`BACKGROUND_TIME_STEP_MS`].
+    /// The background context lines last shown in an input, `key →
+    /// digest` (`time` → `<epoch ms>|<zone>`; `task:<id>` → how far its
+    /// output was shown, `<stdout bytes>,<stderr bytes>`). A line is shown
+    /// again only when its digest changes; the time line at most every
+    /// [`BACKGROUND_TIME_STEP_MS`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub background_shown: BTreeMap<String, String>,
+    /// Multi-Turn Work Sessions: the timer that opens a Turn while the
+    /// session waits for the work it started (`timer:` subscriptions).
+    #[serde(default, skip_serializing_if = "TaskWatch::is_empty")]
+    pub task_watch: TaskWatch,
+    /// Corrections the runner gave the open Turn (a reply that neither
+    /// ends the session nor waits for anything): at most one per Turn.
+    #[serde(default, skip_serializing_if = "Nudge::is_empty")]
+    pub nudge: Nudge,
+    /// The live run stopped on retryable errors in a row and infers again
+    /// once their backoff passed; any other outcome clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryState>,
+    /// Result hints shown once per session (`once` keys of the hint
+    /// ledger, see `agent_tool::hints`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub hints_once: BTreeSet<String>,
+    /// When the commit that finished the session was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
     #[serde(default)]
     pub updated_at_ms: u64,
+}
+
+/// [`SessionState::paused`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Paused {
+    pub at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Who asked (the poster of the control).
+    #[serde(default)]
+    pub by: String,
+    /// The pause stopped a run inside its open Turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_run: bool,
+}
+
+/// [`SessionState::task_watch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskWatch {
+    /// When the last tick was taken in, or the session began waiting for
+    /// its work (epoch ms): the next tick is `tick_secs` after it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_tick_ms: u64,
+}
+
+impl TaskWatch {
+    pub fn is_empty(&self) -> bool {
+        self == &TaskWatch::default()
+    }
+}
+
+/// [`SessionState::nudge`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Nudge {
+    /// Corrections given in the open Turn.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub count: u8,
+    /// A correction waits to be taken in (`system:runner`, `nudge`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+}
+
+impl Nudge {
+    pub fn is_empty(&self) -> bool {
+        self == &Nudge::default()
+    }
+}
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
+}
+
+/// [`SessionState::retry`]: the host's retries of a run that stopped on a
+/// retryable error (a provider that is unavailable for a while). Not the
+/// run's own error policy (llm_context `error_policy.max_consecutive_errors`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RetryState {
+    /// Retries scheduled in a row.
+    pub attempts: u32,
+    /// When the first of these errors happened (epoch ms; time the host was
+    /// down counts).
+    pub since_ms: u64,
+    /// The run infers again from then on (epoch ms); a user message in an
+    /// input batch retries earlier.
+    pub not_before_ms: u64,
+    /// `live_run.applied_input_seq` when the error happened: a batch the run
+    /// took in since (a user message's) is retried at once, also after a
+    /// crash before that inference.
+    #[serde(default)]
+    pub applied_input_seq: u64,
+}
+
+impl RetryState {
+    /// The live run waits for this retry at `now_ms`.
+    pub fn backing_off(&self, now_ms: u64, applied_input_seq: u64) -> bool {
+        now_ms < self.not_before_ms && applied_input_seq <= self.applied_input_seq
+    }
 }
 
 /// The time line of the background context changes at most this often
@@ -785,7 +839,7 @@ impl SessionState {
             rev: 1,
             writer: None,
             run_state: RunState::Created,
-            waiting_for: None,
+            wait_children: Vec::new(),
             outcome: None,
             acceptance: Acceptance::NotApplicable,
             result: None,
@@ -819,8 +873,15 @@ impl SessionState {
             internal_continuation: None,
             process_result: None,
             todo_view_rev: 0,
+            paused: None,
+            resume_run: false,
             goal: None,
             background_shown: BTreeMap::new(),
+            task_watch: TaskWatch::default(),
+            nudge: Nudge::default(),
+            retry: None,
+            hints_once: BTreeSet::new(),
+            finished_at_ms: None,
             updated_at_ms: now_ms,
         }
     }
@@ -852,6 +913,7 @@ impl SessionState {
                 summary: format!("The user's time zone is {tz}. Times in inputs are UTC."),
                 data_ref: None,
                 terminal: false,
+                call_id: None,
             };
             merge_pending_event(
                 &mut state.pending_events,
@@ -870,6 +932,21 @@ impl SessionState {
         let p = self.source(src);
         let above = p.consumed_above.iter().filter(|i| **i <= last_index).count() as u64;
         last_index.saturating_sub(p.acked_index).saturating_sub(above) as usize
+    }
+
+    /// Whether the session waits for work it started: tasks it follows,
+    /// sub sessions it must hear from, the runner's own correction.
+    pub fn follows_work(&self) -> bool {
+        !self.watched_tasks.is_empty() || !self.wait_children.is_empty() || self.nudge.pending
+    }
+
+    /// The session waits and only someone's input can move it (`goal`: a
+    /// Goal Session, which waits for its next run opportunity instead).
+    pub fn needs_input(&self, goal: bool) -> bool {
+        self.run_state == RunState::Waiting
+            && !goal
+            && !self.follows_work()
+            && self.paused.is_none()
     }
 
     pub fn source_mut(&mut self, id: &str) -> &mut SourceProgress {
@@ -906,16 +983,6 @@ impl SessionState {
             .last()
             .filter(|f| f.role == FrameRole::Caller)
             .and_then(|f| f.call.as_ref())
-    }
-
-    /// The live run is a caller whose tool-triggered sub context returned:
-    /// its result waits to be filled as the call's tool result.
-    pub fn tool_return_pending(&self) -> bool {
-        self.live_run.is_some()
-            && self
-                .process_result
-                .as_ref()
-                .is_some_and(|r| r.get("call_id").is_some())
     }
 
     /// Sub contexts in progress (nesting depth of the live run).
@@ -972,6 +1039,7 @@ mod tests {
             summary: summary.into(),
             data_ref: None,
             terminal,
+            call_id: None,
         }
     }
 

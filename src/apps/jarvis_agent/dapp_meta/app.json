@@ -25,6 +25,18 @@
           "allow_guest": false
         }
       }
-    }
+    },
+    "buckets": {
+      "artifacts": {
+        "kind": "data",
+        "data_policy": "documents"
+      },
+      "scratch": {
+        "kind": "data",
+        "data_policy": "temp",
+        "default_ttl_days": 7
+      }
+    },
+    "storage_quota_mib": 2048
   }
 }

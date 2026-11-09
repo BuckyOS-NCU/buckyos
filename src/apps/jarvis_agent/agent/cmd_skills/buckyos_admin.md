@@ -1,7 +1,7 @@
 ---
 name: buckyos_admin
 description: Inspect and manage a BuckyOS Zone — identify runtime, identity and versions, read or change settings and apps, check tasks, query logs and diagnostic bundles, and trace a fault into the source of the running version.
-requires: the buckyos command (agent container: /usr/local/bin/buckyos with the host Tool mounted at /opt/buckyos/libexec/buckyos-tool; host: $BUCKYOS_ROOT/bin/buckyos); writes depend on the agent's and its owner's RBAC
+requires: the buckyos command (agent container: /opt/buckyos/bin/agent-tools/buckyos with the host Tool mounted at /opt/buckyos/libexec/buckyos-tool; host: $BUCKYOS_ROOT/bin/buckyos); writes depend on the agent's and its owner's RBAC
 baseline: standard
 ---
 #### When to use
@@ -23,12 +23,17 @@ buckyos system info                                 # BuckyOS version, build_ver
   On a host, `buckyos` uses the device identity on `127.0.0.1:3180` and asks for `--yes`. In a session on a node
   runtime, `buckyos` is the node's `$BUCKYOS_ROOT/bin/agent-tools/buckyos` entry: it runs the host's launcher with
   your agent's identity (asked of your agent over the session token in `.opendan/`), so `whoami` shows your agent.
-- Runtimes of an Agent: `agent-session runtime list` shows each one's declared `baseline` (standard | extended),
-  `platform` and its last tool check (`baseline_check.missing`); `agent-session runtime baseline` lists the standard
-  commands and `xagent runtime baseline --check [--overlay]` checks this machine. A node's agent tool directory is
+- Runtimes of an Agent: `agent-session runtime list` prints a readable overview; `runtime list --json` or
+  `runtime get <id>` gives the complete record, including declared `baseline` (standard | extended), `platform`
+  and its last tool check (`baseline_check`: `missing`, `unmanaged`, where each command is in `resolved`, the extended
+  layer in `ext`). `agent-session runtime baseline [--level extended]` lists the commands and
+  `xagent runtime baseline --check [--level extended] [--overlay]` checks this machine; `xagent runtime check <id>
+  --commands a,b --full` also runs them, for versions and to catch stubs. A node's agent tool directory is
   `$BUCKYOS_ROOT/bin/agent-tools` (laid out by node-daemon with `opendan install-agent-tools`); missing entries mean
-  that node's install lacks OpenDAN. The owner declares a runtime extended in the Agent's runtime settings
-  (OpenDAN WebUI or control-panel `agent.update {runtimes: {"<id>": {"baseline": "extended"}}}`).
+  that node's install lacks OpenDAN, and a standard command found elsewhere (`provided_by: system`) is not the standard
+  one. `$BUCKYOS_ROOT/tools/bin` (extension tools) comes before it on PATH. The owner declares a runtime extended in the
+  Agent's runtime settings (OpenDAN WebUI or control-panel `agent.update {runtimes: {"<id>": {"baseline": "extended"}}}`);
+  a check never changes the declaration.
 - Container paths are not host paths. Your `/opt/buckyos/logs` is the host's `$BUCKYOS_ROOT/logs/apps/<instance-hash>/`;
   `/opt/buckyos/etc/` is the host's configuration directory mounted read-only. Host `security/`, `bin/`, other
   containers and processes are not visible to you. Startup credentials are in the host's `security/start_config.json`;
@@ -45,7 +50,14 @@ buckyos system info                                 # BuckyOS version, build_ver
 - `buckyos` missing or ".../buckyos-tool/... not found": the Tool mount is not deployed in this container. Say so and
   give the owner the exact host commands instead of guessing results.
 - Host-side `uv run src/check.py` (repo) checks processes and ports. "Activation Ready" means waiting for activation,
-  not running; "Running" with exit 0 can still come with an error-heavy log warning below it.
+  not running; "Running" with exit 0 can still come with an error-heavy log warning below it. The host root uses
+  `BUCKYOS_ROOT` when set, otherwise `C:\buckyos` on Windows and `/opt/buckyos` on macOS/Linux.
+- OOD startup waits for an authenticated local system-config RPC before registering its device. Readiness and
+  each registration write have a 60-second retry budget for transport failures; authentication and permission
+  errors fail immediately. A missing `boot/config` is valid during first activation. If startup times out, inspect
+  node-daemon and system-config logs and port 3200; do not clear identity or user data. A successful `start.py`
+  launch or `local system-config RPC ready` log does not prove scheduler and the remaining services are ready;
+  use the host check above to verify the complete startup.
 - macOS Desktop nodes run node_daemon as `$BUCKYOS_ROOT/bin/node-daemon/BuckyOS Runtime.app`, the LaunchAgent
   `com.buckyos.runtime` of the one OS user in `etc/desktop_runtime.json`. Host command for the owner:
   `"$BUCKYOS_ROOT/bin/node-daemon/BuckyOS Runtime.app/Contents/MacOS/node_daemon" service status` (bound user,
@@ -53,6 +65,11 @@ buckyos system info                                 # BuckyOS version, build_ver
   start|stop|restart|autostart on|off` controls it. Not running before the user logs in is expected; launchd output
   is in `logs/node_daemon/launchd.err.log`. Screen Recording and Accessibility are granted to "BuckyOS Runtime" (not
   the BuckyOS App or Terminal); Screen Recording applies after a Runtime restart.
+  Request them with `open -n "$BUCKYOS_ROOT/bin/node-daemon/BuckyOS Runtime.app" --args --request_permissions`.
+  A rebuilt ad-hoc signed development Runtime has a new code hash. If both switches are on but the Runtime
+  still reports permission required, check TCC logs for a code requirement mismatch; reset only its stale
+  grants (`tccutil reset ScreenCapture com.buckyos.runtime` and `tccutil reset Accessibility com.buckyos.runtime`),
+  request again, let the owner authorize the current build, then restart and verify the Runtime report.
 
 #### Find the real commands
 - Lightweight Linux/macOS/Windows executors: Settings → Cluster Manager → Nodes/Devices issues an access URL;
@@ -72,12 +89,18 @@ buckyos system info                                 # BuckyOS version, build_ver
   The standalone Windows package build links the MSVC CRT statically; ordinary Cargo development binaries
   require the matching VC++ v14 runtime. `--binary` packages are unverified: inspect their manifest and
   provide the prebuilt binary's runtime dependencies instead of assuming VC runtime DLLs ship with Windows.
-  Windows supports the primary display, visual/auto observations, click, Unicode type, keypress,
-  line scrolling and delay waits; semantic/hybrid, dragging and pixel scrolling are unsupported.
+  Windows supports the primary display, visual/semantic/hybrid/auto observations, click, Unicode type,
+  keypress, line scrolling, delay waits and, through UI Automation, element targets with invoke/set_value;
+  `inspect` reports `accessibility` readiness. Windows of a higher integrity level (Task Manager, an
+  elevated terminal) are listed `accessible:false` without a control tree. macOS offers the same observation
+  modes and element targets through Accessibility: semantic observation needs only the Accessibility grant
+  (the one input already needs), not Screen Recording; Chrome web links and buttons offer no `invoke`, so
+  click them as elements. Dragging is unsupported; pixel scrolling is unsupported on Windows.
   The owner can run `buckyos_agent_daemon pause|resume --executor <id>`; request acceptance is not
   cancellation confirmation. Inspect `instances[].capabilities` in local status, query the original operation,
   and take a new observation after resuming. Never replace the original store or replay uncertain input.
-  Windows automatically pauses on detected human input; the owner must resume locally and observe again.
+  Human keyboard or mouse use neither pauses the driver nor invalidates an observation: actions go on
+  and the person adapts; only an explicit pause, a focus or layout change, or an expired observation stops one.
   If a crash loses the pending Unicode release data, resume stays paused/dirty and requires owner handling;
   do not delete its coordination file to bypass that state.
   A Windows input monitor heartbeat gap disables desktop access until daemon restart, including gaps after
@@ -106,6 +129,15 @@ buckyos system info                                 # BuckyOS version, build_ver
   Desktop "Users and Agents". Don't write those keys with raw system-config: the RPCs also refresh RBAC and reload
   msg-center. A group carries no RBAC policy (`g, <u>, group:<id>` only): a Limited user in a group still has no
   mailbox, tasks or uploads; app access comes from `apps.availability` group rules (`group:<id>`).
+- User removal is soft deletion: Desktop Users and Agents calls `user.delete`, then reads back the list.
+  Admins can open Deleted users to restore the original account (`user.change_state`, `state: active`);
+  its DID, keys, password, roles, groups and data are retained. A same-name `user.create` returns `user_deleted`;
+  use the explicit restore flow, not an overwrite or raw key deletion. Root and the current account cannot be disabled.
+  For deletion or state changes, inspect `state`, `rbac_refreshed` and `warning`: a saved state with
+  `rbac_refreshed: false` needs permission refresh, and does not prove access has been revoked everywhere.
+  Read back with `user.list` (`include_deleted: true`) or `user.get`; retrying the same state retries the refresh.
+  A failed list read is not an empty list. Source and RPC contract: `src/frame/control_panel/src/user_mgr.rs`
+  and `doc/control_panel/Control_Panel_Service.md` §4.1; no dedicated user CLI verb.
 - External access (hybrid SSO, contract `doc/arch/verify-hub/混合SSO技术契约.md`): Zone switches `self_register_enabled` /
   `did_login_enabled` / `jump_base_url` in `system/sso/settings` via admin RPC `sso.settings.get|set` (Desktop Settings ›
   Sign-in & Sharing). Exclusive invites (a Limited account + password-free link, 48 h): admin RPCs
@@ -115,6 +147,9 @@ buckyos system info                                 # BuckyOS version, build_ver
   channel yourself (the system sends no email/SMS). Limited and External sessions are restricted: a service that has
   not opened a method answers kRPC `code: "access_denied"` with `data.reason` (`session_kind_not_allowed` = product
   boundary, not a setting); branch on `data.reason`, never on the error text.
+- Login requester display: public CP RPC `auth.describe_target {redirect_url}` resolves the gateway route
+  to a structured App/System target and display name. For custom-domain display issues, inspect this response
+  and `node_gateway_info.json`; the hostname prefix is neither a username nor an appid.
 - Apps: `buckyos app list|get|status|start|stop|restart|install|upgrade|uninstall|cancel`. Availability
   (`apps.availability.*`) has no CLI verb and needs a user's Control Panel login.
 - Devices, network, gateway, certificates: control-panel `zone.devices.list`, `network.overview`, `gateway.overview`,
@@ -124,7 +159,26 @@ buckyos system info                                 # BuckyOS version, build_ver
   the submitted OwnerDocument must match that DID and declare this Zone. These differ from exclusive invite links.
 - The local gateway's RTCP listener follows the device document's `rtcp_port` (default `2980`), rendered into
   `etc/node_gateway_params.json` at activation and startup. Inspect the document and listening socket together.
-- Storage: no settings API; `system status` warns on disk/memory/swap of the control-panel host.
+- Storage: `system status` warns on disk/memory/swap of the control-panel host. Application data lives in object buckets
+  hosted by nfs-server: `buckyos bucket ls [--appid <app_id>]` (on the host the device identity sees every bucket; an Agent sees its owner's), `bucket stat <bucket_id>` (key / version counts, bytes,
+  `orphaned_at` of an uninstalled App's bucket, reconcile `issues`), `bucket get obj://bucket/<bucket_id>/<key>`.
+  Named-store eviction (GC actually freeing bytes of unretained objects and chunks) is
+  `services/nfs-server/settings.named_store_gc_evict` (default `true`); unretained chunk bytes survive at least 24 h
+  after their last write or read. Pool and bucket quotas: kRPC `bucket.get_pool_quota|set_pool_quota|get_quota|set_quota`
+  (admin) and `bucket.usage_report`; no CLI verb, Desktop Settings › Storage lists per-App usage.
+  Preview conversion (HEIC/HEVC shown on browsers that cannot decode them; Office / ODF / RTF documents → PDF) runs
+  ffmpeg/ffprobe and LibreOffice `soffice`, each optional, found in `$BUCKYOS_ROOT/libexec/buckyos-tool/bin/`, `PATH`
+  or LibreOffice's install directory; nothing installs them, and document fidelity depends on the node's fonts (CJK
+  needs Noto CJK). NFSP `hello` (`POST /nfs/v1/hello`) reports the converters in `repr` (paths and versions, the
+  `profiles` it can produce — `preview-document` only with soffice — or what is missing); results live in bucket
+  `zone/nfs-server/_/preview-cache`, capped by `services/nfs-server/settings.preview_cache_mib` (default 20480).
+- System URLs (`obj://`, `cyfs://`, `file://<device_id>`, https; rules in `doc/key url.md`): `buckyos obj resolve <url>`
+  normalizes a reference (also `//config/...`, `/abs/path`) and prints its canonical form, RBAC key, kevent pattern and
+  Provider endpoint without checking access; `buckyos obj read <url> [--property a,b]` follows the DID Object Card
+  (`/kapi/<service>/obj/...`, `/kapi/<agent_id>/obj/...`, DFS at `/kapi/dfs/obj/...`) to its Profile and summary
+  properties with your session. Object events are kevents `/obj/<host>/<path>/<event>` (e.g. task changes
+  `/obj/taskmgr/<task_id>/changed`). A 403 / 404 is the object's own ACL, not a URL error. Inside an Agent session the
+  `read` tool (shell: `agent_tool read <url> [property=<name>]`) reads the same URLs as the Agent itself.
 - AI providers: `buckyos ai providers` (auth as configured/kind, health, models; never secrets), `ai routing`,
   `ai usage [--range last1d|last7d|last30d | --since <t>] [--group-by provider_instance_name,provider_model] [--bucket day]`
   (your own calls only; an admin's Desktop Usage page can show the whole Zone); per-model health and prices:
@@ -139,7 +193,8 @@ buckyos system info                                 # BuckyOS version, build_ver
   field of `nodes/<node>/settings` (`enabled`, `allowed_devices` = exact device DIDs from `devices/<id>/info`,
   `profiles.<id>` = `run_as{uid,gid}` (non-root; omitted for Windows nodes), `workdir_roots` (absolute node paths,
   e.g. `C:\Users\<u>\ws` on Windows), `env`, `principals` = exact Agent DIDs, `ops`, and
-  `limits`, and `owner_agents` = the node's policy for the zone owner's Agents: `enabled`, default `workdir_roots`,
+  `limits` (`max_computer_image_bytes` caps screenshots apart from `max_file_bytes`: default 8 MiB, at most 16 MiB;
+  raise it when visual observations fail with `capture_size_limit`), and `owner_agents` = the node's policy for the zone owner's Agents: `enabled`, default `workdir_roots`,
   `env`, `ops` (empty = all), `computer` max `none|observe|control`, optional `run_as`; a Desktop node seeds it open on
   first start, absent = never initialized, `enabled:false` = closed by the administrator); writing it needs an owner
   sudo token. Which Agent uses a node is the Agent's own setting: `agent.runtime_directory [agent_id]` lists the nodes
@@ -151,12 +206,30 @@ buckyos system info                                 # BuckyOS version, build_ver
   `agent.create` accepts these same runtime fields; for the container, use
   `runtimes: {"host": null}, default_runtime_id: "container"`. Create retries keep the saved choice.
 - A Zone owner's Agent whose default runtime is a node's `host` runs its Agent Service natively on that node: no
-  `buckyos-app-<agent>` container, no `container` runtime (`runtime_unavailable`), the node config shows
+  `buckyos-app-<agent>` container. When it runs as the owner's OS user on that node, `host` resolves to the same
+  `private` native runtime; local shell/files do not use the network. Computer use reuses node_daemon's driver over
+  a local Unix socket (Windows: named pipe), with the existing profile authorization and operation ledger. The node config shows
   `apps/<instance>/run_mode: "native"`, and `agent.runtime_directory <agent_id>` says `agent_service: {mode: "native",
   node_id}`. Changing the default between host and container restarts the Agent Service the other way; a default of
   `container` with no container node is refused (`container_unavailable`).
-  Linux `dev` / `devtest_ood1` config generation seeds a bounded host workspace at
-  `data/home/devtest/host-runtime`, with a non-root execution identity and no desktop control; explicit node settings
+- BuckyOS Desktop Lite (`system.product.get` → `edition: "lite"`; installed as `$BUCKYOS_ROOT/etc/product.json`,
+  which control-panel publishes as `system/product` on every start — never edit the key; a broken file stops
+  control-panel) has no container runtime: its node reports `support_container: false` and docker/wslc are never
+  probed or called, whatever is installed. It runs the system services, static web apps users add, the product's
+  preinstalled script apps (natively on the node's Deno: `run_mode: "native"`, record `local/app_native/<instance>.json`,
+  log `logs/apps/<instance>/native.log`) and one Agent. `system/agent_slot`
+  names the Agent holding the run slot; another `agent.create` fails with `agent_slot_occupied` until that Agent is
+  deleted (the slot frees once its runtime App is uninstalled). Installing a docker or script app is refused at
+  `apps.inspect` / submit and the install task stops at Inspect (`UnsupportedTarget`: `product_container_app`,
+  `product_service_app`, `product_mixed_packages`). The scheduler knows no edition: a script app needs no container
+  (`need_container: false`) and gets `run_mode: "container"` on a node with a container runtime, `"native"` on one
+  without, fixed once placed; node_daemon runs a script app natively only when the product lists it as preinstalled.
+  An Agent runs natively only on its owner's `host` default runtime: closing that node's `executor` or
+  `owner_agents` stops a Lite Agent (its instance turns to `container`, which the node refuses). A native app that
+  cannot run reports it in `services/<spec_id>/instances/<node>` `deployment_error`: `port_conflict` (app, service, port; free the port, it retries by itself),
+  `exited` (last log lines), `not_listening`, `interpreter_missing`; restarts back off 5 s … 5 min.
+  A Linux node offers no host unless the owner picked an OS account at activation (node-local `etc/host_account.json`): node_daemon then seeds `owner_agents` once, switching to a normal account in its home (no sudo or supplementary groups), or running as root with roots `/root` and `/`.
+  Linux `dev` / `devtest_ood1` config generation is that activation without a UI and picks the user running it (`start.py --all`); explicit node settings
   take precedence. The scheduler multiplies
   both into `nodes/<node>/config.executor` (never edit): a profile `agent-<12 hex>` per enabled Agent, check
   `generation` grew, the Agent is in `principal_bindings` with `enabled`/`app_installed` true (a runtime shared by two
@@ -169,7 +242,7 @@ buckyos system info                                 # BuckyOS version, build_ver
   there, and uid 65534 has no account). A desktop node_daemon (Windows desktop session, macOS `BuckyOS Runtime`
   LaunchAgent) cannot switch users: profiles omit `run_as`, operations run as the desktop user with all of that
   user's rights, the Windows shell is PowerShell, and only trusted Agents should get such a profile. A profile whose
-  `run_as` does not fit the node (missing on a root node, present on a desktop node) and a non-root Unix node_daemon
+  `run_as` does not fit the node (missing on a root node unless the owner chose root at activation, present on a desktop node or on that root-chosen node) and a non-root Unix node_daemon
   outside desktop mode expose only control capabilities (`open_stream`, `describe`, `query`, `cancel`); execution,
   file operations, and workdir resolution return `Capability`.
 - The rest goes through raw `system-config get|list|set|set-file|append`. Settings (user-adjustable, fine to edit):
@@ -179,7 +252,31 @@ buckyos system info                                 # BuckyOS version, build_ver
   `append` example), `system/app_registry`, `system/scheduler/*`, installed apps' `spec` (use `app` verbs).
   `*/instances/*` and `devices/*/info` are runtime reports; `*/doc` and `boot/config` are signed identity documents.
 
+#### Extension tool packages
+Local tools every Agent of the Zone shares (ffmpeg, pandoc, python3… live in `ext-core`) are chosen for the whole Zone by an administrator and installed by each node on its own; no Agent installs them.
+```bash
+buckyos ext-tools list                                 # what the Repo has, and the commands each package provides
+buckyos ext-tools status                               # package by node: what is asked for, stage, error
+buckyos ext-tools enable <id> [--version v] [--dry-run]    # brings what it requires; also how to upgrade or go back
+buckyos ext-tools disable <id>                         # refused while an enabled package requires it
+buckyos ext-tools import <file.pikg>                   # an official release's .pikg (on R2, `pikg.path` in its manifest.json), unchanged
+buckyos skill status --agent <agent_id> [--runtime id] # the commands each skill relies on there, and which package would bring what is missing
+```
+A node's reconciler retries a failed package with growing delays, and a failed upgrade leaves the old version running: read `error` under `nodes` in `ext-tools status`, then `log` for `node_daemon` (`ext_tools`). A package that came with the installer shows up with no `latest`: it needs `ext-tools import` before it can be upgraded.
+
 #### Change loop
+
+For AICC or `llm_understand_media` failures with `HTTP 504 Gateway Timeout` / `response head timeout`,
+correlate the gateway log with the AICC task/trace. The shipped `etc/boot_gateway.yaml` sets
+`servers.node_gateway.response_timeout: 900s`; this covers all upstream responses through that HTTP server.
+Inspect the effective gateway configuration for overrides, then reload and read it back after a configuration
+change. Provider and client timeouts remain independent. A timed-out caller does not prove the provider
+cancelled the original request; check its outcome before repeating it. Configuration source and lifecycle:
+`doc/arch/gateway/boot_gateway的配置生成.md`.
+If AICC reports a provider HTTP error containing `response head timeout`, inspect the provider's proxy too:
+the local gateway setting does not change a remote proxy's response budget. Older gateways may return this
+diagnostic with HTTP 500; use the upstream address and AICC task/trace to locate the failing hop.
+
 1. Read and keep the current state: `buckyos system-config get <key> > $OPENDAN_SESSION_DIR/before.json` (value and
    `version`), or `buckyos app status <app_instance_id>`.
 2. Smallest change: edit the one field and write the whole JSON with `buckyos system-config set-file <key> --file new.json`
@@ -211,15 +308,33 @@ Keep a timeline: symptom (user words, time) → evidence (command, `trace_id`, q
   not read, and `opendan` there is the host's. Your own runtime logs are files under `/opt/buckyos/logs/` in your container.
   A natively run Agent Service has no container: its log is the host's `$BUCKYOS_ROOT/logs/opendan/opendan.<pid>.log`
   (service `opendan`), its process record `$BUCKYOS_ROOT/local/app_native/<instance>.json` (pid, start time, port).
+- Windows background services and their tool processes should run without a console window, including
+  `opendan.exe install-agent-tools` during node startup. A flashing window warrants checking the launch site:
+  Rust callers reuse `src/kernel/buckyos-api/src/process_util.rs`; Python launchers use `CREATE_NO_WINDOW`
+  without `DETACHED_PROCESS` or `CREATE_NEW_CONSOLE`. Check logs to diagnose startup failures.
 - `buckyos diagnostic collect --services a,b --since <RFC3339>` (privileged; waits for the task; result has `bundle_id`,
   expiring in about an hour) → `buckyos diagnostic export <bundle_id> --path $OPENDAN_SESSION_DIR/diag.zip` (sha256
   checked). Scheduler logs run to tens of MB per hour; narrow the window.
 - Logs and bundles come redacted (`[REDACTED_TOKEN]`). Don't print tokens, `BUCKYOS_APPCLIENT_SESSION_TOKEN`, key
   files or `users/<u>/settings` (it holds a password hash); summarize the fields you need.
+- "My file / image / message attachment disappeared": find the binding first — `buckyos bucket stat <bucket_id>` and
+  `bucket get obj://bucket/<bucket_id>/<key>` (a delete marker or `no_such_key` = the App unbound it; an `evicted`
+  availability = content gone although bound, report it). nfs-server logs one `bucket bind|unbind <bucket_id> key=…
+  obj_id=… version=…` line per change: `buckyos log query --service nfs-server --keyword "<key>"`; the calling service
+  logs the same line on its side.
+- An attachment of a message from another Zone has no binding until its content is first read: `no_such_key` there means
+  not fetched yet, not removed. The read says why it is not here: 403 `attachment-awaiting-acceptance` (the sender has
+  not been accepted), 503 with `Retry-After` (being fetched, or the source is unreachable), 404 (the source refused or
+  has no such file), 413 (over 64 MiB), 415 (a directory), 502 (failed verification). msg-center logs the outcome:
+  `buckyos log query --service msg-center --keyword "<obj_id>"`.
 - Host-side evidence (processes, ports, docker, node_daemon, `etc/`, `security/`, other apps' container logs): name the
   host command for the owner, e.g. `uv run src/check.py`, `docker ps`, `ls $BUCKYOS_ROOT/logs/apps/`.
 
 #### When it fails
+- Agent report attachment errors (`last_error.kind = "artifact"`): inspect the NFS endpoint and gateway reachability.
+  Container NFS/bucket RPC uses `http://<host gateway>:<node gateway port>/kapi/nfs-server` (normally port 3180).
+  A request to the host bridge's port 4110 comes from an outdated runtime; NFS listens on the host loopback.
+  Rebuild/deploy the Agent runtime, then resume the saved session; see `opendan_agent_dev` for report recovery.
 - HTTP 503 `service_not_ready:<service>` from `/kapi/<service>` means the gateway has no registered route for that
   service. Verify the requested service name, `services/<service>/info`, the node's `gateway_info`, and service/scheduler
   logs. For an Agent, the gateway service name is its full AgentId: use `/kapi/<agent_id>`; its own WebUI uses
@@ -251,6 +366,7 @@ Keep a timeline: symptom (user words, time) → evidence (command, `trace_id`, q
   or denial; resolve authorization through the owner/admin first. `docker restart` keeps the expired startup assertion.
   Preserve AgentRootFS, message storage and Session ACK/outbox state. Check the original pending message is consumed
   and answered once, then observe subsequent renewal; a successful restart task alone is insufficient.
+  AgentRootFS is `$BUCKYOS_ROOT/data/home/<owner>/agents/<agent_id>/` (full AgentId, not a short name or `did:web:` string).
 - `SESSION_EXPIRED` in a long `tail`/`wait`: the injected token lasts minutes and is refreshed per shell call; rerun in
   a new call. `CONNECTION_REQUIRED`: no endpoint; add `--endpoint http://host.docker.internal:3180`.
 - Re-running writes: pass `--idempotency-key <k>` to app and diagnostic verbs; re-read before repeating a set.
@@ -281,3 +397,35 @@ and run it with `deno run --config /opt/buckyos/libexec/buckyos-tool/cli/deno.js
 using `BUCKYOS_TOOL_ENDPOINT` and the session token; this recipe is untested. Leave the mounted Tool files unchanged.
 
 Checked against: BuckyOS 0.7.0 (build261017.main.1b6e277fadd9.dirty), Tool/SDK 0.7.131 (`system info`, `log services`, `agent`, `ai` verbs from websdk source, run on the host as device and as devtest), test.buckyos.io; agent-identity results read from policy and code, not run in a container, 2026-10-17. User types, system user groups and projection RPCs: read from source and unit tests, not run on a Zone, 2026-10-21.
+
+Provider 接入诊断：在 AI Center 查看发现模型、身份匹配、不可用预设及聊天候选。自定义 Provider 的高级配置可设置渠道规则、模型身份别名和明确的服务端默认用途；协议兼容不会自动继承厂商预设。配置验证不发推理请求，不能代替真实对话验收。具体字段以当前 `src/kernel/buckyos-api/src/aicc_client.rs` 和 `doc/aicc/provider_server_defaults.md` 为准；不要用模型特定参数修改 Agent 的媒体调用方式。
+
+自定义 Provider 的协议探测不认证全部媒体能力。校验报 `Inventory` / `multiple default operations` 时，检查错误中的模型、适配器和渠道操作映射；不要直接归因为网络或 API Key。已有专用入口的渠道（如 OpenRouter）优先用内置 profile。默认操作选择与限制见 `doc/aicc/provider_ui_backend_mapping.md`。
+
+接入结果中的 `filtered_capabilities` 表示当前渠道不支持的模型能力项；缺失协议绑定时只移除对应能力，保留其他可用项。AI Center 的 Validation 和 Provider 模型清单页可展开查看模型、API 类型、适配器、操作及过滤原因；过滤明细不是认证或网络错误，完整字段以 `buckyos-api` 的 `FilteredProviderCapability` 为准。
+
+#### Custom AI provider rules
+- On PC: AI Center → Providers → custom provider → 模型规则 / Provider rules. Search and page through discovered
+  models, including disabled/unrecognized ones. Use the highlighted “Configure” action to open one model’s side
+  panel. Task lists are finite dropdown selections; API operations come from the current adapter, and unconfigured
+  mappings use its defaults. Configure provider_options for each supported_effort explicitly: unconfigured efforts
+  are unsupported, while an enabled empty object is a valid mapping. “Finish editing and apply” validates and reloads
+  the instance. A failed save retains the draft. The module is unavailable on mobile.
+- Switch “Model list / Full configuration JSON” at the top to inspect the existing *.provider.json catalog or draft, copy or
+  export it. The file uses buckyos.aicc.provider-rules-catalog, with no outer envelope; tasks use
+  server_default_routes and disabled models use models[].exclude. Import preserves instance connection/policy settings. Per-column JSON previews have been removed. The side panel preserves a draft without applying it.
+- Task admission here uses upstream default thinking parameters; it does not disable thinking. Operation names
+  must be supported by the selected adapter. Export full JSON before changing a working configuration; import
+  loads a draft and does not apply it until editing is finished. Import can also select built-in Channel preset rules
+  from the same list as the Add Provider wizard. Effort mappings use the existing variants array with
+  match.provider_model_id, including after per-model edits; exported files do not contain model_variants.
+  File headers, adapter declarations, match conditions and pricing units retain their original values; instance
+  connection settings remain separate. Empty task mappings are omitted unless explicitly present in the source. It replaces the draft, preserving connection settings and adapter.
+  The wizard advanced section only selects a channel preset; configure detailed rules in the Provider rules tab.
+  Imported drafts resolve inherited rules through provider.preview_rules without applying settings or calling upstream.
+  Blank task/price fields can be valid when absent from the preset; unresolved model identities need an explicit alias.
+- Source of the file contract and save/readback fields: doc/aicc/aicc-mgr.md (“Custom Provider 实例规则编辑”),
+  src/kernel/buckyos-api/src/aicc_client.rs and src/frame/aicc/src/catalog/schema.rs for the running version.
+  Rules exports omit credentials and use the instance configuration and actual inventory values. Missing prices
+  stay empty; choosing a protocol does not import a built-in price table. Instance catalogs are explicit snapshots; changing a shared preset later does
+  not overwrite an edited instance catalog. AIGC commands and task/artifact contracts remain unchanged.

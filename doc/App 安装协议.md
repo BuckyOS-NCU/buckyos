@@ -260,7 +260,7 @@ Serde/default 规则：
 - `req_capbilities/permissions` 缺省为空并省略。
 - `SubPkgDesc.required` 缺省解释为 `true`；PIKG 的 canonical 输出必须显式写出该布尔值。
 - selector 的 `os/arch/min_kernel_version` 均可省略；`amd64/x86_64/x64` 归一为 `x86_64`，`arm64/aarch64` 归一为 `aarch64`，`darwin/apple/osx` 归一为 `macos`。
-- 已知 package key 的 selector：各平台 key 派生相应 OS/arch；`web/agent/agent_skills/agent_tools/script` 匹配所有平台；未知 key 必须显式提供 selector 才参与自动选择。
+- 已知 package key 的 selector：各平台 key 派生相应 OS/arch；`web/agent/agent_skills/script` 匹配所有平台；未知 key 必须显式提供 selector 才参与自动选择。
 - 根对象不允许 schema 之外的扩展键；`service_config_tips` 的自定义键以及所有显式 BaseContentObject 元数据仍进入 AppDoc ObjectId。
 
 ### 2.2 App 类型约束
@@ -268,7 +268,8 @@ Serde/default 规则：
 - `service`：只表示 `SystemBuiltin` 的发布元数据，允许空 `pkg_list`，不得有 web、docker 或 Agent package；它不进入普通 App 安装、AppRegistry 或用户 AppSpec。
 - `dapp`：必须有 script 或 docker runtime，不得有 web/Agent package。
 - `web`：必须有 web package，不得有 runtime/Agent package，`selector_type` 固定 `static`。
-- `agent`：必须有 agent package，可含 agent_skills/agent_tools，不得有 web/native app。它仍是 runtime AppDoc，不是 AgentDocument。
+- `agent`：必须有 agent package，可含 agent_skills，不得有 web/native app。它仍是 runtime AppDoc，不是 AgentDocument。
+- `ext_tools`：只有 `ext_tools_<os>_<arch>` 子包（[PIKG 格式 §5.1](pikg/format.md)）。它不是 App：`apps.submit` 拒绝，不进入 AppRegistry。
 
 ### 2.3 权威、签名与 ObjectId
 
@@ -324,14 +325,19 @@ Golden fixture：
 
 `LocalPikg + LocalDeveloper` 是唯一公开的未发布例外。该组合显式选择受当前 Zone 安装权限和 staging lease 约束的 local developer authority，以 PIKG 内嵌 AppDoc 作为待安装 body，不要求 AppDoc 已签名或已发布到 BNS。它可在权威状态为 `Active/Missing/Expired/Unknown` 时进入 InstallPlan；`Migrated/Revoked/Tombstoned` 仍必须拒绝。解析快照必须保留 BNS 的原始 `document_status/app_doc_object_id`，并另行记录 `evidence=LocalDeveloperAuthority` 与 `local_authority_app_doc_object_id`；Scheduler 只在该 ObjectId 与 PIKG source identity 及计划 AppDoc 三者完全相等时接受。PIKG 结构、AppDID structural owner、canonical AppDoc ObjectId、PackageMeta、namespace、payload digest、目标、权限和路径安全校验不得省略。该例外不适用于 Catalog/Identifier 来源，也不会把 candidate 写入 BNS 或公开 resolver cache。
 
-PIKG 安装源在 Resolve 前必须成为 Installer staging 内完整、已校验的本地文件。系统版 Tool
+PIKG 安装源在 Resolve 前必须成为 Installer staging 里完整、已校验的命名对象：staging 是 named store 里的 PIKG FileObject
+绑定在 `zone/control-panel/_/pikg_staging`（`temp` 桶，key 为 staging handle，元数据随绑定保存、按 TTL 过期），安装各阶段经
+named store reader 直接读取，不再落成本地文件。系统版 Tool
 连接 OOD 本机回环地址时，可向 `cache/control_panel/pikg_staging/incoming` 写入私有文件，
 通过 `apps.staging.finalize(local_file_id, pikg_digest, size, purpose)` 纳入 staging；接口只解释
 32 位 hex 随机文件标识，不解释客户端路径。远端通过 FileObject 表示和传输 PIKG，内容可由
 多个不超过 32MiB 的 chunk 组成，以 `source_obj_id` 替代 `local_file_id` 调用 finalize。 浏览器通过 WebSDK `importFiles` / `ensureUploaded` 获得 ready FileObject；对象分支可以省略 `pikg_digest`，由服务端验证 canonical ID 并在本地提取中计算整包 digest。服务端使用原调用者 token 经 NDM 重新校验读取权限，提取期间以任务自有 Recursive pin + 24 小时 TTL 保留 FileObject 及依赖，完成或失败后释放此 pin。
 
 Desktop 本机选择目前已经接入真实 NDM → staging → `apps.inspect`，展示服务端校验结果；后续安装计划编辑、批准、提交仍未接入真实安装 UI，因此该入口阻止继续到 mock submit，不能把检查完成显示为安装完成。取消/切换来源/关闭页面会释放本次 staging handle，响应不确定时由 staging TTL 清理。
-服务端核对 FileObject/流的长度、整文件摘要、PIKG 结构与内容后才签发原有 staging handle。
+服务端核对 FileObject/流的长度、整文件摘要、PIKG 结构与内容后才签发原有 staging handle。安装完成后包正文、AppDoc 与
+PackageMeta 分别绑进 `zone/control-panel/_/packages` 与 `package_objects`（key `<owner>/<app_id>/<version>/...`），升级解绑旧版本、
+卸载解绑全部版本；卸载同时经 nfs-server `bucket.release_app` 按 data_policy 处置该实例声明的桶（`app_data`/`temp`/`cache`
+删除，`documents`/`collected` 转孤儿；`--data retain` 时 `app_data` 也转孤儿）。
 32MiB 不限制整包或子包；Prepare 导入大子包时使用文件导入接口分块保存，以 SameAs
 保留 PackageMeta 中已有的内容 ChunkId。staging 配额、principal/Zone/purpose 绑定和租约继续生效。
 
@@ -386,7 +392,7 @@ services/{app_instance_id}/instances/{node_id}
 
 `NodeConfig.apps` 的 key 是 AppInstanceId，不拼 NodeId。每个 value 携带一个完整 `NodeExecutionSpec v1`：AppInstanceId、AppDID、AppDoc ObjectId、spec generation、AppType、已选 exact package map、权限、ServiceSpecConfig 和 Registry 投影。它不嵌入完整 AppDoc/AppSpec。node-daemon 只读同一 NodeConfig revision 即可执行，禁止回读 AppSpec、AppDoc 或 Registry 来补字段。
 
-beta 2.2 bootstrap 先创建空 Registry，并把普通预装 App 仅保存为 `system/install_settings` 中的 `PreInstallPlanSeed`；builder 不读取 PIKG、不创建普通 App 的 Task、execution record、AppSpec 或 Registry allocation。Control Panel 登录且安装 runner 启动后，将 rootfs PIKG 复制到 immutable staging，以 `LocalPikg + SystemInternal + auto_confirm` 走标准 Installer。仅这个内部入口可把已经过结构、AppDID、structural owner 和 canonical AppDoc ObjectId 校验的 rootfs AppDoc 注册为进程内 `LocalAuthorityOverride`；该 override 不写普通 cache、不暴露给公共 RPC。运行时 Inspect 生成完整 immutable `InstallPlan` 后才提交 Scheduler。用户卸载后保留的 `Deleted` AppSpec 优先于预装种子：reconciler 记录 `action: user_removed`、清空错误并停止该种子的预装；种子升级或 PIKG 缺失也不重新安装。PIKG 缺失或损坏只形成 Control Panel 的后台预装错误，不阻断 kernel boot。Jarvis Agent 包作为 `system/install_settings.agent_templates` 中的内置模板，由 Control Panel Agent 管理读取和校验；不由旧 scheduler bootstrap helper 安装为运行实例，创建 Agent 时才构造独立 App。
+beta 2.2 bootstrap 先创建空 Registry，并把普通预装 App 仅保存为 `system/install_settings` 中的 `PreInstallPlanSeed`；builder 不读取 PIKG、不创建普通 App 的 Task、execution record、AppSpec 或 Registry allocation。Control Panel 登录且安装 runner 启动后，将 rootfs PIKG 导入 named store 并绑进 staging 桶，以 `LocalPikg + SystemInternal + auto_confirm` 走标准 Installer。仅这个内部入口可把已经过结构、AppDID、structural owner 和 canonical AppDoc ObjectId 校验的 rootfs AppDoc 注册为进程内 `LocalAuthorityOverride`；该 override 不写普通 cache、不暴露给公共 RPC。运行时 Inspect 生成完整 immutable `InstallPlan` 后才提交 Scheduler。用户卸载后保留的 `Deleted` AppSpec 优先于预装种子：reconciler 记录 `action: user_removed`、清空错误并停止该种子的预装；种子升级或 PIKG 缺失也不重新安装。PIKG 缺失或损坏只形成 Control Panel 的后台预装错误，不阻断 kernel boot。Jarvis Agent 包作为 `system/install_settings.agent_templates` 中的内置模板，由 Control Panel Agent 管理读取和校验；不由旧 scheduler bootstrap helper 安装为运行实例，创建 Agent 时才构造独立 App。
 
 ## 5. InstallPlan execution protocol
 

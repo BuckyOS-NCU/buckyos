@@ -136,9 +136,9 @@ Agent identity 与承载它的 runtime App 是两个独立对象：
 | `user.invite.create` | **Admin** | 生成邀请（可预建 Pending 用户或绑定已有 DID），返回 `invite_url`；`user_type` 为 `admin` / `user` / `limited`，`groups` 为已定义的系统用户组 id，接受邀请时写入账号 |
 | `user.invite.get` | **公开** | 凭 `invite_id` 读邀请详情（含过期、zone_did/host） |
 | `user.invite.accept` | **目标 DID 联合登录会话** | 先以 OwnerDocument 的 DID 联合登录本 Zone，再凭 `invite_id` + `owner_config` 接受邀请；会话须为 Control Panel 用户会话且 `auth_method=did_federation`，DID 须与文档及邀请的 `target_did`（若指定）一致。文档仍须声明绑定本 Zone |
-| `user.delete` | **Admin** | 软删除（置 Deleted），不可自删 |
+| `user.delete` | **Admin** | 软删除（置 Deleted），不可删除本人或 Root；保留身份、凭据和数据，名称仍被占用 |
 | `user.change_password` | 本人/Admin | 本人改密受 `allow_password_change` 限制 |
-| `user.change_state` | **Admin** | Active/Pending/Deleted 迁移 |
+| `user.change_state` | **Admin** | 账号状态迁移；Deleted → Active 恢复原账号，不能将本人或 Root 改为非 Active |
 | `user.change_type` | **Admin** | 只在 `admin` / `user` / `limited` 之间转换，不能改 Root；随后刷新 RBAC 并通知 msg-center（通讯录投影依赖类型），旧会话不自动获得新权限 |
 | `user.set_account_options` | **Admin** | `{ user_id, allow_password_change?, allow_contact_edit? }`，`null` 恢复类型默认；返回生效值 |
 | `user_group.list` | **Admin** | `{ groups: [UserGroup + members], projections: { rules, is_default, updated_by, updated_at } }` |
@@ -146,6 +146,10 @@ Agent identity 与承载它的 runtime App 是两个独立对象：
 | `user_group.delete` | **Admin** | 删除组定义，同时从成员的 `UserSettings.groups` 和投影规则中移除；刷新 RBAC 并通知 msg-center |
 | `user_group.set_members` | **Admin** | `{ group_id, add?, remove? }`；Root 不能加入；刷新 RBAC 并通知 msg-center |
 | `user_group.set_projections` / `user_group.reset_projections` | **Admin** | 保存单向“来源组 → 目标组”规则（`type:admin|user|limited` 或 `group:<id>`）到 `system/user_groups/_projections`；reset 删除该 key，恢复默认（Admin、User 互见） |
+
+删除与恢复：Desktop 的 Users & Agents 在删除 RPC 完成后重新读取列表；管理员可在“已删除用户”中恢复原账号。恢复保留原 DID、密钥、密码、角色、用户组和数据，不接受创建表单中的新密码或角色作为覆盖。`user.create` 遇到已删除的同名账号返回 `user_deleted` 并引导恢复；已删除账号的记录仍占用名称，不能只跳过名称索引检查。
+
+`user.delete` 与 `user.change_state` 返回 `{ ok: true, user_id, state, rbac_refreshed, warning? }`。`state` 表示已保存的状态；`rbac_refreshed: false` 表示状态已写入但权限刷新尚未确认完成，`warning` 给出原因，不能据此声称权限已全部撤销。客户端应显示警告并读回状态；再次提交相同目标状态可重试权限刷新。若写入或列表读取失败，显示实际错误，不能把请求失败当成空列表或删除完成。
 
 ### 4.2 设备管理 (Device)
 
@@ -161,13 +165,13 @@ Agent 按所选模式使用 Owner 的权限；只读模式限制用户数据写�
 
 权限页同时提供 Host runtime 开关。Zone Owner 在节点 `executor.enabled` 与 `owner_agents.enabled` 均开启时默认启用 `host`，可手动关闭。`agent.create` 的 `runtimes` / `default_runtime_id` 与 `agent.update` 使用相同格式：`runtimes: {"host": {"enabled": true, "computer": "none"}}, default_runtime_id: "host"` 表示启用；`runtimes: {"host": null}, default_runtime_id: "container"` 表示关闭。省略字段时按节点策略初始化，显式选择覆盖默认值，并参与幂等指纹；设置与创建预留记录原子保存，重试不重新开启。runtime 目标来自服务端目录，`computer` 不能超过节点授权，创建请求不修改节点策略。
 
-Control Panel 在校验 App session token 后读取绑定 Agent 的权限模式；只读 Agent 仅允许明确列出的读取 RPC，用户/Agent 配置、App 生命周期、容器操作等写请求返回 `NoPermission`。`/api/desktop` 的状态/会话写操作与壁纸上传使用同一限制。用户本人登录 Agent 页面取得的 User session token 继续按用户权限处理。
+Control Panel 在校验 App session token 后读取绑定 Agent 的权限模式；只读 Agent 仅允许明确列出的读取 RPC，用户/Agent 配置、App 生命周期、容器操作等写请求返回 `NoPermission`。`/api/desktop` 的状态/会话写操作使用同一限制；壁纸在用户自己的桶里，只读 Agent 由 nfs-server 的 Agent 策略拒绝写入。用户本人登录 Agent 页面取得的 User session token 继续按用户权限处理。
 
 | 方法 | 说明 |
 |---|---|
 | `agent.check_name` | 名称检查（与 `user.create` 共用）：DNS 标签、保留名、用户名、任何用户名下的 AgentId（含进行中）、已分配的 App/实例主机名；不可用时给出建议名 |
 | `agent.list_templates` | 系统内置模板（`system/install_settings.agent_templates`）与调用者用 CLI 安装的模板（`users/{owner}/agent_templates/*`）；`template_id` 为 `bundled:<app_id>` / `installed:<app_id>` |
-| `agent.create` | 以 `idempotency_key` 幂等；`permission_mode` 默认 `read_write`，可选 `read_only`；`runtimes` / `default_runtime_id` 保存用户的 runtime 选择；写入保留记录后立即返回状态，后台构造并安装 App、绑定 AgentSpec、校验并绑定 Telegram Bot（可选）、等待 OpenDAN 写入 `info` |
+| `agent.create` | 以 `idempotency_key` 幂等；`permission_mode` 默认 `read_write`，可选 `read_only`；`runtimes` / `default_runtime_id` 保存用户的 runtime 选择；写入保留记录后立即返回状态，后台构造并安装 App、绑定 AgentSpec、校验并绑定 Telegram Bot（可选）、等待 OpenDAN 写入 `info`，同步 msg-center 联系人后才进入 `ready` |
 | `agent.create.status` / `agent.create.retry` / `agent.create.cancel` | 查询创建状态；从失败步骤继续（`skip_tunnel` 放弃通道完成创建）；写入 spec 前取消 |
 | `agent.list` / `agent.get` | 本人名下（Admin 为全部）的 Agent，包括进行中与失败的创建；settings 中不含 Bot Token |
 | `agent.update` | 修改 `allow_group`、`homestation`、`auto_share_results`、`runtimes`、`default_runtime_id` |
@@ -175,6 +179,8 @@ Control Panel 在校验 App session token 后读取绑定 Agent 的权限模式�
 | `agent.profile.get` / `agent.profile.set` | `{display_name, avatar, bio}`，显示名称回退为 Agent 用户名 |
 | `agent.delete` | 先删身份记录，再刷新 RBAC、通知 msg-center、卸载构造 App，最后释放名字 |
 | `agent.set_msg_tunnel` / `agent.remove_msg_tunnel` | 读写 `settings.msg_tunnels`（本期最多一个 Telegram Bot） |
+
+无论是否配置 Telegram，进入 `ready` 前都完成 msg-center 的 Owner 与 Agent 联系人同步，确保创建完成后第一条消息能进入 Agent 的收件箱。已绑定 Telegram 时沿用 `tunnel` 步骤完成的同步，其余情况在 `start` 步骤同步；后者失败时创建状态为 `failed`，`last_error.code = msg_center_reload_failed` 且可重试。恢复服务后调用 `agent.create.retry` 从失败步骤继续，保留已安装实例与 Agent 身份。
 
 `apps.submit` 收到 Agent 类型的 PIKG 时不安装运行时实例，而是注册为调用者的 Agent 模板（返回 `template_registered` / `template_updated` / `satisfied`，`task_id` 为空）；模板更新会按各 Agent 的 `template_auto_update` 重建其构造 App。
 
@@ -222,8 +228,8 @@ Control Panel 在校验 App session token 后读取绑定 Agent 的权限模式�
 * 存储路径：`users/{user_id}/desktop/{session_id}/{state_key}`，会话元数据存 `.../_meta`。
 * HTTP 入口：`POST /api/desktop`，需 session token（401 if 失败），按 `action` 分发。
 * 方法：`session.list` / `session.create`（生成 UUID v4）/ `session.delete` / `session.rename`；`state.get` / `state.set` / `state.delete`，后三者支持 `json_path`（点分路径）做部分读写删。任何 state 写都会刷新会话 `updated_at`；写入一个还没有 `_meta` 的会话时补建 `_meta`（`name` = session_id）。`session_id`、`state_key` 只接受 `[A-Za-z0-9_-]{1,64}`，`state_key` 不能以 `_` 开头，否则 400。`state.get` 读从未写过的 state 返回 `{value: null, version: null, exists: false}`（不是错误），存在时 `exists: true`。
-* **账号级外观**：Desktop 所有设备共用约定的会话 `default`，外观设置存在 `state_key = appearance`，每项设置单独按 `json_path` 写，不同设备改不同设置不会互相覆盖：`{theme: "light"|"dark", locale, iconSize: "small"|"medium"|"large", window: {titleBarOpacity, backgroundOpacity}, wallpaper: {image: {asset, width, height, name} | null, fit: "fill"|"fit"|"stretch"|"tile"|"center"|"panorama", tileScale, focusX, focusY}}`。前端先用本机缓存立即绘制，启动和回到前台时读账号值（账号优先；本机改了但账号还没确认的设置以本机为准，跨刷新保留）；账号缺的设置用本机值补写，但不会把浏览器里另一个账号的壁纸带给新账号。状态栏消息预览、安全区、任务栏和图标位置仍是设备级设置（桌面上有哪些项目跟着账号走，见下方“桌面文件夹”）。
-* **壁纸图片**：图片字节不进 SystemConfig（单值上限），存在用户 home：`data/home/{user}/.local/share/control-panel/wallpapers/{sha256 前 32 位}.{jpg|png|gif|webp|avif}`。`POST /api/desktop/wallpaper`（body 为图片原始字节，≤16 MiB，按文件头识别类型，其它类型 415、超限 413）返回 `{ok, data: {asset, bytes}}`，同时只保留最新 3 张、删除更早的；`GET /api/desktop/wallpaper/{asset}` 返回图片，名字即内容哈希，响应 `Cache-Control: private, max-age=31536000, immutable`。两者都需登录。CSS/`<img>` 加载带不了请求头，所以读图（`GET`）在没有 `X-Auth`/`Authorization`/查询参数 token 时优先认 Gateway SSO 会话 cookie `buckyos_session_token`（根域 SSO 登录后由 `/sso_refresh` 持续续期），其次才是旧的 `control-panel_token` 等 cookie；Desktop 因此直接把这个 URL 用作 CSS 背景，加载失败时再用带 `X-Auth` 的 fetch 取回。上传（`POST`）不认 SSO cookie，必须带请求头：同站其它子域应用发出的请求也会捎带这个 cookie。
+* **账号级外观**：Desktop 所有设备共用约定的会话 `default`，外观设置存在 `state_key = appearance`，每项设置单独按 `json_path` 写，不同设备改不同设置不会互相覆盖：`{theme: "light"|"dark", locale, iconSize: "small"|"medium"|"large", window: {titleBarOpacity, backgroundOpacity}, wallpaper: {image: {ref, width, height, name} | null, fit: "fill"|"fit"|"stretch"|"tile"|"center"|"panorama", tileScale, focusX, focusY}}`。前端先用本机缓存立即绘制，启动和回到前台时读账号值（账号优先；本机改了但账号还没确认的设置以本机为准，跨刷新保留）；账号缺的设置用本机值补写，但不会把浏览器里另一个账号的壁纸带给新账号。状态栏消息预览、安全区、任务栏和图标位置仍是设备级设置（桌面上有哪些项目跟着账号走，见下方“桌面文件夹”）。
+* **壁纸图片**：图片字节不进 SystemConfig（单值上限），存在账号的桶 `user/control-panel/{user}/wallpapers`（`data` / `app_data`），key 为 `{sha256 前 32 位}.{jpg|png|gif|webp|avif}`，`appearance.wallpaper.image.ref` 存 `obj://bucket/user/control-panel/{user}/wallpapers/{key}`。Desktop 用 websdk `putBytes`（`PUT /bucket/v1/...`，≤32 MiB）上传，随后自己 `bucket.list_objects` + `bucket.delete` 只保留最新 3 张（含当前）；显示时用 `bucketObjectUrl(ref)` 直接作为 CSS 背景（同源带 SSO cookie），加载失败时再用带 token 的 `fetchObject` 取回。Control Panel 不再提供壁纸 HTTP 端点。持久格式见 [Control Panel Durable Data Schema](Control%20Panel%20Durable%20Data%20Schema.md)。
 * **桌面文件夹**（`desktop_folder.rs`）：像 Windows 一样，桌面显示的是用户 home 下的一个文件夹 `data/home/{user}/Desktop`（Files 里是 `/home/{user}/Desktop`），所以所有设备、所有会话看到的是同一批项目，会话（设备 × 形态）只保存项目的位置。以 `.` 开头的名字隐藏。两类小 JSON 文件是桌面对象：`*.lnk` 快捷方式 `{"app": "<内置 id | AppId | 实例 id>"}`，`*.widget` 小组件 `{"widget": "clock"}` / `{"widget": "notepad", "text": "..."}`；其它文件和文件夹按文档/文件夹显示（文档用内容处理器打开，文件夹在 Files 中打开）。动作：
   * `items.list {seed?: [{name, text}]}` → `{path, created, items: [{name, kind: "file"|"dir", size, mtime, text?}]}`。文件夹不存在时创建并写入 `seed`（`created: true`，seed 只接受 `.lnk`/`.widget`，每个 ≤64 KiB、最多 64 个）；用户自己清空的文件夹保持为空，删掉整个文件夹则下次按 seed 重建。`.lnk`/`.widget` 文件（≤64 KiB）随列表返回内容 `text`；符号链接不跟随、不读内容。
   * `items.write {name, text, create?}` 写一个 `.lnk`/`.widget` 文件（临时文件 + rename）；`create: true` 时已存在则 400 `exists: {name}`。
@@ -302,7 +308,7 @@ identifier / staging handle
 ### 5.3 升级 / 卸载
 
 * **升级**：同一 Stage 流水线；`AppUpdateTaskRequest` 冻结已批准的 `Upgrade` plan 与 fingerprint，并用 plan 的 canonical task ID 创建 TaskManager task。以权威 Resolve 的 App Document Object ID / `document_version` 判定新版本，继承当前组件、权限、mount/settings/env/resource pool、实例数和停止期望。当前切换策略是 in-place/recreate，写新 spec 后存在停机窗口，不宣称 blue-green/rolling。Activate 失败先恢复冻结 previous spec，再等待 previous `DeploymentIdentity` 重新满足 readiness；结果区分 target failed + previous restored、rollback failed 与 partial target。
-* **卸载/生命周期**：`app.start/v1` 与 `app.uninstall/v1` 都是 delegated durable task，共用启动扫描/sweep 与 mutation ownership。卸载先 stop 并等待 exact target evidence 消失，再删除 spec/record；`delete` 只删除 typed manifest 中的私有 data/cache，`retain` 不删除。进入 metadata deletion 边界后 cancel 被禁止。
+* **卸载/生命周期**：`app.start/v1` 与 `app.uninstall/v1` 都是 delegated durable task，共用启动扫描/sweep 与 mutation ownership。卸载先 stop 并等待 exact target evidence 消失，再删除 spec/record（`Deleted` spec 清空 `spec_config.buckets`）；随后解绑该实例在 `packages` / `package_objects` 桶里的包，并调 nfs-server `bucket.release_app`：`documents` / `collected` 转孤儿桶，`app_data` 在 `retain` 时转孤儿、`delete` 时删除，`temp` / `cache` / `ambient` 删除。`delete` 另外删除 typed manifest 中的私有 data/cache 目录，`retain` 不删除。进入 metadata deletion 边界后 cancel 被禁止。Agent 删除走同一任务（`retain`）。
 * **批量升级**：`apps.upgrade` 创建 `app.update_batch/v1` root；每个 `UpdateAvailable` item 同时冻结 Upgrade plan 与 fingerprint，child 使用该 plan 的 canonical task ID，并通过 parent/root 和稳定派生 idempotency key 关联。单项失败不影响其它 child，root 结果保存每项 terminal outcome，可在 Control Panel 重启后恢复。
 
 ### 5.4 记录与凭证
@@ -376,7 +382,10 @@ export const PUBLIC_ROUTE_PREFIXES = ['/login', '/userprofile'] as const
 | RBAC 策略 | `system/rbac/policy` | `append`（事务后追加，注意非原子） |
 | Zone 展示设置 | `system/zone_presentation` | 调用者 sudo token + revision CAS（不存在时 create） |
 | UI Session | `users/{uid}/desktop/{session_id}/{state_key}` · `.../_meta` | 单次 `set`，写后刷新（或补建）`_meta.updated_at` |
-| 桌面壁纸图片 | 文件 `data/home/{uid}/.local/share/control-panel/wallpapers/{hash}.{ext}` | 临时文件 + rename，保留最新 3 张 |
+| 桌面壁纸图片 | 桶 `user/control-panel/{uid}/wallpapers`，key `{hash}.{ext}` | 浏览器 `PUT /bucket/v1` 直传，前端保留最新 3 张 |
+| 已安装 App 的包 | 桶 `zone/control-panel/_/packages`、`package_objects`，key `{uid}/{app_id}/{version}/{id}` | Acquire / Prepare 绑定，升级后解绑旧版本，卸载解绑 |
+| Agent 模板 PIKG | 桶 `zone/control-panel/_/agent_templates`，key `{uid}/{app_id}/{digest}.pikg`；记录 `users/{uid}/agent_templates/{app_id}` 存 `(bucket_key, bucket_version)` | 从 staging 绑定 |
+| PIKG staging | 桶 `zone/control-panel/_/pikg_staging`（temp），key = staging handle，metadata 在绑定里 | finalize 绑定，释放 / 过期解绑；`cache/control_panel/pikg_staging/incoming/` 只收外部投放 |
 | 桌面文件夹 | 目录 `data/home/{uid}/Desktop`（`*.lnk` / `*.widget` 由本服务写） | 首次列出时建目录并写 seed；单文件临时文件 + rename |
 
 ---

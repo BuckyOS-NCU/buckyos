@@ -7,8 +7,8 @@ use common::*;
 use serde_json::{json, Value};
 
 async fn upload(net: &Net, name: &str, file: &str, mime: &str, data: Vec<u8>) -> Value {
-    let (id, object) = net.n(name).station.store_file(file, mime, data, json!({ "width": 4, "height": 3 })).await.unwrap();
-    json!({ "objId": id, "file": homestation::projection::file_view(&object), "object": object })
+    let (id, object) = net.n(name).station.store_file(&format!("uploads/{file}"), file, mime, data, json!({ "width": 4, "height": 3 })).await.unwrap();
+    json!({ "objId": id, "file": object.clone(), "object": object })
 }
 
 async fn reading(net: &Net, name: &str, query: Value) -> Value {
@@ -63,7 +63,7 @@ async fn pipeline_media_and_filters() {
     // The image arrived by ObjId and its chunk was checked into Bob's store.
     let card = page["cards"].as_array().unwrap().iter().find(|c| c["item"]["objId"] == first["objId"]).unwrap().clone();
     assert_eq!(card["resources"], "local", "{card}");
-    assert_eq!(card["item"]["media"][0]["file"]["meta"]["mime"], "image/png");
+    assert_eq!(card["item"]["media"][0]["file"]["mime"], "image/png");
     assert_eq!(card["reading"]["reason"]["code"], "friend");
     assert!(card["reading"]["topics"].as_array().unwrap().contains(&json!("topic-garden")), "{card}");
     let (status, body, _) = net.get(&format!("{}/objects/{photo_id}/content?access={}", bob.home, bob.token), None).await;
@@ -127,7 +127,7 @@ async fn followed_candidates_view() {
     let late = publish(&net, "alice", "late", json!({ "text": "late photo", "attachments": [{ "id": "a", "kind": "image", "name": "late.png", "status": "uploaded", "object": photo["objId"] }], "link": null, "audience": { "kind": "public" } })).await;
     net.rpc("bob", "admin.run", json!({ "task": "pull" })).await;
     let late_card = net.rpc("bob", "item.get", json!({ "objId": late["objId"] })).await;
-    assert_eq!(late_card["item"]["media"][0]["file"]["meta"]["mime"], "image/png");
+    assert_eq!(late_card["item"]["media"][0]["file"]["mime"], "image/png");
     let url = format!("{}/objects/{}/content?access={}", bob.home, photo["objId"].as_str().unwrap(), bob.token);
     let (status, body, _) = net.get(&url, None).await;
     assert_eq!((status, body.len()), (200, 2048));
@@ -140,7 +140,7 @@ async fn followed_candidates_view() {
     let with_read = net.rpc("bob", "candidates.list", json!({ "limit": 50, "includeRead": true })).await;
     assert_eq!(with_read["entries"].as_array().unwrap().len(), 5);
     // Admitted items never reappear as "never admitted", even after leaving the window (A39).
-    bob.station.db.call(|c| Ok(c.execute("DELETE FROM reading", [])?)).await.unwrap();
+    bob.station.db.call(|c| Ok(c.execute("DELETE FROM reading WHERE owner=?1", [c.owner])?)).await.unwrap();
     let followed = net.rpc("bob", "candidates.list", json!({ "limit": 50 })).await;
     assert_eq!(followed["entries"].as_array().unwrap().len(), 4);
 }

@@ -36,6 +36,12 @@ pub trait BehaviorCatalog: Send + Sync {
         let _ = kind;
         Ok(Vec::new())
     }
+    /// The commands each cmd_skill relies on, against `runtime_id` (`None`: the private runtime), and which extension
+    /// package would bring what is missing (`skills.status`).
+    async fn skills_status(&self, runtime_id: Option<&str>) -> Result<serde_json::Value> {
+        let _ = runtime_id;
+        Err(crate::error::OpenDanError::InvalidArgument("skills.status needs the Agent Service".to_string()))
+    }
     /// Install the skills of a skill package (`skills.install`).
     async fn install_skills(
         &self,
@@ -107,7 +113,6 @@ pub fn parse_behavior(name: &str, path: &Path) -> Result<BehaviorConfig> {
         &mut cfg.prompt.on_init,
         &mut cfg.prompt.on_input,
         &mut cfg.prompt.on_context_switch,
-        &mut cfg.prompt.semi_subscription_snapshot,
     ] {
         if let Some(text) = t {
             *text = expand_includes(text, base, 0)?;
@@ -316,14 +321,6 @@ impl MemBehaviorCatalog {
             .insert(name.to_string(), cfg);
         *self.rev.lock().expect("rev") += 1;
     }
-
-    pub fn put_cmd_skill(&self, name: &str, text: &str) {
-        self.cmd_skills
-            .lock()
-            .expect("cmd skills")
-            .insert(name.to_string(), text.to_string());
-        *self.rev.lock().expect("rev") += 1;
-    }
 }
 
 #[async_trait]
@@ -411,7 +408,7 @@ pub async fn freeze_config(
         .runtime
         .frozen
         .as_ref()
-        .map(|f| (f.baseline, f.platform.os.clone(), f.runtime_id.clone()));
+        .map(|f| (f.baseline(), f.caps.platform.os.clone(), f.runtime_id.clone()));
     for name in &cfg.prompt.cmd_skills {
         let Some(text) = catalog.cmd_skill(name).await? else {
             let known: Vec<String> = catalog
@@ -435,9 +432,16 @@ pub async fn freeze_config(
                 continue;
             }
         }
+        let missing_commands = cfg
+            .runtime
+            .frozen
+            .as_ref()
+            .map(|f| crate::skills::known_missing_commands(&skill_meta(SkillKind::Cmd, name, &text).commands, &f.caps))
+            .unwrap_or_default();
         frozen.cmd_skills.push(CmdSkill {
             name: name.clone(),
             text: split_front_matter(&text).1.to_string(),
+            missing_commands,
         });
     }
     let mut next = cfg.clone();

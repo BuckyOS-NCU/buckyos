@@ -21,9 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
-use buckyos_api::{LlmResponseFormat, TaskError};
-use serde_json::Value;
-
 use crate::xllm::{
     build_result_view, export_result, list_runs, load_run, ExtractedValue, LoopModel, ProviderKind,
     ResultFormat, ResumeLimits, ResumeStart, RunEvent, RunLogLevel, RunObserver, RunOutcome,
@@ -49,11 +46,12 @@ Usage:
   xllm --select <group> ["question"]      run a prompt group's default task
   xllm "task one" | xllm "task two"       chain: stdin becomes material / request
   xllm --image ./photo.png "what is it?"  images (repeatable), --file for text
-  xllm --tools "index the docs dir"       enable tools (read/write/edit/exec)
+  xllm --tools "index the docs dir"       enable tools (read/write/edit/shell)
   xllm list [--limit N]                   recent runs of the working directory
   xllm status [--run <id>]                run status, effective config, resumability
   xllm result [--run <id>]                re-export a saved result (no model call)
-  xllm --resume [--run <id>]              continue an interrupted / paused run
+  xllm --resume [--run <id>] [message]    continue an interrupted / paused run
+                                          (a message is given to it as new input)
 
 Input:
   "question" | --user <text>   task request (one of them, once)
@@ -438,15 +436,13 @@ impl CliOpts {
                 }
             }
             Command::Resume => {
-                if o.question.is_some()
-                    || o.user.is_some()
-                    || o.system.is_some()
+                if o.system.is_some()
                     || o.select.is_some()
                     || !o.attachments.is_empty()
                     || o.input_file.is_some()
                 {
                     return Err(ParseError::Bad(
-                        "--resume continues the original task; it does not accept a question, --user, --system, --select, --input-file or attachments".into(),
+                        "--resume continues the original task; a question or --user is given to it as a new message, --system, --select, --input-file and attachments are not accepted".into(),
                     ));
                 }
             }
@@ -507,8 +503,8 @@ impl CliOpts {
             runs_dir: self.runs_dir.clone(),
             json: self.json,
             json_schema: None,
-            // JSON mode excludes web search (OpenAI: "Web Search cannot be
-            // used with JSON mode"), which AICC turns on for llm.chat.
+            // A machine-read result has no use for the web search AICC turns
+            // on for llm.chat, which also costs thousands of input tokens.
             disable_capabilities: if self.json { vec!["web_search".to_string()] } else { Vec::new() },
         }
     }
@@ -803,9 +799,12 @@ async fn run_new(mut opts: CliOpts) -> i32 {
         && input.attachments.is_empty();
 
     let observer = Arc::new(StderrObserver::new(level));
-    let deps = XllmDeps::default()
-        .with_observer(observer.clone())
-        .with_node_executor(Arc::new(crate::runtime::node::BuckyosNodeConnector));
+    let deps = with_zone_tasks(
+        XllmDeps::default()
+            .with_observer(observer.clone())
+            .with_node_executor(Arc::new(crate::runtime::node::BuckyosNodeConnector)),
+    )
+    .await;
     let prepared = match XllmTask::prepare(&workdir, input, opts.overrides(), &deps).await {
         Ok(p) => p,
         Err(err) => {
@@ -1071,77 +1070,6 @@ fn deliver_completed(
     }
 }
 
-async fn load_task_error(
-    runtime: &buckyos_api::BuckyOSRuntime,
-    task_id: &str,
-) -> Option<TaskError> {
-    let client = match runtime.get_task_mgr_client().await {
-        Ok(client) => client,
-        Err(error) => {
-            log::warn!(
-                "aicc helper.llm_chat failed: load task error skipped; get task-manager client failed; task_id={task_id}; error={error}"
-            );
-            return None;
-        }
-    };
-
-    let task = match client.get_task(task_id).await {
-        Ok(task) => task,
-        Err(error) => {
-            log::warn!(
-                "aicc helper.llm_chat failed: get task failed; task_id={task_id}; error={error}"
-            );
-            return None;
-        }
-    };
-
-    if task.error.is_none() {
-        log::warn!(
-            "aicc helper.llm_chat failed: task has no error; task_id={task_id}; phase={:?}",
-            task.phase
-        );
-    }
-
-    task.error
-}
-
-fn format_aicc_failed_message(
-    task_id: &str,
-    event_ref: Option<&str>,
-    task_error: Option<&TaskError>,
-) -> String {
-    let mut message = format!(
-        "aicc helper.llm_chat failed: task_id={}, event_ref={}",
-        task_id,
-        event_ref.unwrap_or("")
-    );
-    if let Some(error) = task_error {
-        message.push_str(", error=");
-        message.push_str(&format_task_error(error));
-    }
-    message
-}
-
-fn format_task_error(error: &TaskError) -> String {
-    let mut message = format!("{}: {}", error.code, error.message);
-    if let Some(detail) = error.detail.as_ref() {
-        if let Ok(detail_json) = serde_json::to_string(detail) {
-            message.push_str(", detail=");
-            message.push_str(&detail_json);
-        }
-    }
-    message
-}
-
-fn aicc_response_format(force_json: bool, json_schema: Option<Value>) -> Option<LlmResponseFormat> {
-    force_json.then(|| match json_schema {
-        Some(schema) => {
-            LlmResponseFormat::json_schema(Some("llm_response".to_string()), schema, None)
-        }
-        None => LlmResponseFormat::json_object(),
-    })
-}
-
 // =========================================================================
 // resume / list / status / result
 // =========================================================================
@@ -1151,6 +1079,27 @@ fn fmt_time(ms: u64) -> String {
     chrono::DateTime::<chrono::Local>::from(t)
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
+}
+
+/// The zone's TaskMgr as this run's task backend when a BuckyOS session is
+/// given (`BUCKYOS_APPCLIENT_SESSION_TOKEN`, how OpenDAN hands tools a
+/// session): the run then follows TaskMgr tasks (`t-…`, e.g. an `ask_user`
+/// question) with the task tools. Without one, such tasks are unknown to
+/// the run; its own long commands stay tasks of this process either way.
+async fn with_zone_tasks(mut deps: XllmDeps) -> XllmDeps {
+    let has_session = std::env::var("BUCKYOS_APPCLIENT_SESSION_TOKEN")
+        .is_ok_and(|t| !t.trim().is_empty());
+    if !has_session {
+        return deps;
+    }
+    if let Err(e) = crate::xllm::ensure_buckyos_runtime().await {
+        log::warn!("xllm: zone tasks unavailable, BuckyOS runtime not ready: {e}");
+        return deps;
+    }
+    deps.buckyos_tasks = Some(crate::tasks_zone::ZoneTaskResolver::new(Arc::new(
+        crate::tasks_zone::ZoneTaskMgrBackend,
+    )));
+    deps
 }
 
 async fn run_resume(mut opts: CliOpts) -> i32 {
@@ -1164,9 +1113,12 @@ async fn run_resume(mut opts: CliOpts) -> i32 {
     };
     let store = store_for(&opts, &workdir);
     let observer = Arc::new(StderrObserver::new(level));
-    let deps = XllmDeps::default()
-        .with_observer(observer.clone())
-        .with_node_executor(Arc::new(crate::runtime::node::BuckyosNodeConnector));
+    let deps = with_zone_tasks(
+        XllmDeps::default()
+            .with_observer(observer.clone())
+            .with_node_executor(Arc::new(crate::runtime::node::BuckyosNodeConnector)),
+    )
+    .await;
     let start = XllmRun::resume(
         &store,
         opts.run.as_deref(),
@@ -1199,6 +1151,12 @@ async fn run_resume(mut opts: CliOpts) -> i32 {
             }
         }
         Ok(ResumeStart::Run(mut run)) => {
+            if let Some(message) = opts.question.clone().or_else(|| opts.user.clone()) {
+                if let Err(err) = run.inject_input(&message) {
+                    eprintln!("xllm: error: {err}");
+                    return EXIT_USAGE;
+                }
+            }
             let rec = run.record();
             let level = opts.run_logs.unwrap_or(rec.config.run_logs);
             opts.run_logs = Some(level);
@@ -1519,7 +1477,6 @@ async fn run_result(opts: &CliOpts) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn parse(args: &[&str]) -> Result<CliOpts, String> {
         CliOpts::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).map_err(|e| match e
@@ -1546,7 +1503,10 @@ mod tests {
             parse(&["status", "--run", "abc"]).unwrap().command,
             Command::Status
         );
-        assert!(parse(&["--resume", "question"]).is_err());
+        let resumed = parse(&["--resume", "go on"]).unwrap();
+        assert_eq!(resumed.command, Command::Resume);
+        assert_eq!(resumed.question.as_deref(), Some("go on"));
+        assert!(parse(&["--resume", "--select", "a"]).is_err());
         assert!(parse(&["--run", "abc", "question"]).is_err());
         assert!(parse(&["--tools", "--no-tools"]).is_err());
         assert!(parse(&["--select", "a", "--system", "b"]).is_err());
@@ -1617,25 +1577,5 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-    }
-
-    #[test]
-    fn aicc_failed_message_includes_task_error_detail() {
-        let error = TaskError {
-            code: "provider_error".to_string(),
-            message: "Gemini http_error: model unavailable".to_string(),
-            detail: Some(json!({
-                "provider_code": "404",
-                "message": "use models/gemini-3.1-pro-preview"
-            })),
-        };
-
-        let message = format_aicc_failed_message("t-1", Some("/task_mgr/t-1"), Some(&error));
-
-        assert!(message.contains("task_id=t-1"));
-        assert!(message.contains("provider_error"));
-        assert!(message.contains("Gemini http_error: model unavailable"));
-        assert!(message.contains("gemini-3.1-pro-preview"));
-        assert!(message.contains("\"provider_code\":\"404\""));
     }
 }

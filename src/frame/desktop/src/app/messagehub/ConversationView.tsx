@@ -2,6 +2,7 @@ import {
   ArrowLeft,
   FileUp,
   Lock,
+  Loader2,
   Menu,
   MoreVertical,
   Pin,
@@ -28,7 +29,9 @@ import { messageObjId, messageSummaryText, ownReactionId } from './conversation/
 import { SessionPanel } from './conversation/SessionPanel'
 import { isTransferWithFiles, type ComposerAttachmentInput } from './conversation/input/attachmentDraft'
 import { ConversationMediaScopeContext } from './conversation/media/context'
-import { notifySessionCategory, type DID, type MessageObject } from './protocol/msgobj'
+import { notifyCategoryFromSessionId, type DID } from 'buckyos'
+import type { MessageObject } from './protocol/msgobj'
+import type { WorklogDestination } from './conversation/worklog/model'
 import { useNotifyFilteredReader } from './notify'
 import { NOTIFY_FILTERS, type NotifyFilter } from './notify/model'
 import type { Entity, Session, SessionAccess, MessageHubContext } from './types'
@@ -76,8 +79,8 @@ interface ConversationViewProps {
   onForward?: (message: MessageObject) => void
   /** Extra content of the session panel, shown when it is expanded (host-defined). */
   sessionPanelDetails?: ReactNode
-  /** Opens the details of a message. */
-  onOpenMessage?: (message: MessageObject) => void
+  /** Opens the details of a message; `worklog`: on that session's work log (a work session card). */
+  onOpenMessage?: (message: MessageObject, worklog?: WorklogDestination) => void
   /** ObjId of a message to bring into view (a deep link, or the message whose details are open). */
   focusMessageId?: string | null
 }
@@ -113,11 +116,13 @@ export function ConversationView({
   const store = useMessageHubStore()
   useMessageHubRuntime()
   const context = contextProp ?? store.defaultContext()
+  const ownerStatus = store.ownerStatus(context)
+  const refreshing = ownerStatus.phase === 'ready' && ownerStatus.refreshing
   const runtime = session ? store.runtimeFor(context, session.id) : []
   const requestCount = session?.requestCount ?? 0
   const canSend = access === undefined || access?.mode === 'read_write'
   // A notification session (`sysnotify:*`) is not a conversation: its cards are filtered, never answered by typing.
-  const notifyCategory = session ? notifySessionCategory(session.id) : undefined
+  const notifyCategory = session ? notifyCategoryFromSessionId(session.id) : undefined
   const [notifyFilter, setNotifyFilter] = useState<NotifyFilter>('all')
   const historyReader = useNotifyFilteredReader(messageReader, notifyCategory ? notifyFilter : 'all')
   const isGroup = entity.type === 'group'
@@ -329,6 +334,7 @@ export function ConversationView({
           <button onClick={onOpenSessionDetails} disabled={!session} type="button" className="hidden max-w-full truncate text-xs text-[color:var(--cp-muted)] md:block" aria-label={t('messagehub.sessionDetails')} title={t('messagehub.sessionDetails')}>{subtitle}</button>
           <div role="status" data-testid="session-runtime" className="truncate text-xs text-[color:var(--cp-accent)]">{runtime.map(state => `${state.memberDid === context.ownerDid ? t('messagehub.you') : session?.members[state.memberDid]?.nickname || entity.name} · ${t(`messagehub.runtime.${state.status}`)}${state.statusLine ? ` · ${state.statusLine}` : ''}`).join(' · ')}</div>
         </div>
+        {refreshing ? <span role="status" className="flex min-w-0 max-w-28 items-center gap-1.5 text-xs text-[color:var(--cp-muted)]" data-testid="conversation-refresh-status"><Loader2 size={14} className="shrink-0 animate-spin" aria-hidden /><span className="truncate">{t('states.loading')}</span></span> : null}
         {onCreate && <button type="button" onClick={onCreate} disabled={!!creationReason} title={creationReason ? t(`messagehub.reason.${creationReason}`) : t('messagehub.newSession')} aria-label={t('messagehub.newSession')} className="flex min-h-11 min-w-11 items-center justify-center rounded-lg text-[color:var(--cp-muted)] disabled:opacity-40"><SquarePen size={18} /></button>}
         <button onClick={onOpenSessionDetails} disabled={!session} aria-label={t('messagehub.sessionDetails')} title={t('messagehub.sessionDetails')} className="flex min-h-11 min-w-11 items-center justify-center rounded-lg text-[color:var(--cp-muted)] disabled:opacity-40" type="button"><MoreVertical size={18} /></button>
       </div>

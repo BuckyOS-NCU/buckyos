@@ -59,6 +59,14 @@ Common options:
   --json                          (informational; AgentToolResult JSON is always emitted)
 `;
 
+// Media commands keep every result in this Agent's `artifacts` bucket.
+export const DELIVERY_HELP = `
+Result: kept in this Agent's artifacts bucket; detail.files[].url is its
+obj://bucket/... (list it as a report artifact). The output path is optional:
+give it only when a local tool needs the file (an extension is added from the
+result's type when it has none).
+`;
+
 export class ArgError extends Error {
   constructor(message: string) {
     super(message);
@@ -195,6 +203,30 @@ export function flagBool(
   name: string,
 ): boolean {
   return flags.get(name) === true;
+}
+
+// Removes every `--<name> <value>` of `names` from argv, keeping the order
+// the values were given in; the ordinary parser keeps only the last one.
+export function takeRepeatedFlags(
+  argv: string[],
+  names: readonly string[],
+): { rest: string[]; values: Map<string, string[]> } {
+  const values = new Map<string, string[]>(names.map((name) => [name, []]));
+  const rest: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const name = argv[index].startsWith("--") ? argv[index].slice(2) : "";
+    if (!values.has(name)) {
+      rest.push(argv[index]);
+      continue;
+    }
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new ArgError(`--${name} requires a value`);
+    }
+    values.get(name)!.push(value);
+    index += 1;
+  }
+  return { rest, values };
 }
 
 // Drop the known-common flags from the map so commands can detect leftovers.

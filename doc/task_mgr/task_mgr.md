@@ -282,7 +282,7 @@ TaskData schema 与 `task_type` 的绑定关系如下。一个任务的 `task_ty
 | --- | --- | --- | --- | --- |
 | `download` | `download` schema | TaskMgr `create_download_task` | TaskMgr download executor | Control Panel、Repo/File 相关下载调用方、TaskMgr UI |
 | `workflow/run` | `workflow.run` schema | Workflow `TaskManagerTaskTracker` | Workflow service | Workflow service、TaskMgr UI、Workflow WebUI deep link |
-| `workflow/step` | `workflow.step` schema | Workflow `TaskManagerTaskTracker` | Workflow service、用户经 TaskMgr UI 写 `human_action` | Workflow service、TaskMgr UI |
+| `workflow/step` | `workflow.step` schema | Workflow `TaskManagerTaskTracker` | Workflow service | Workflow service、TaskMgr UI |
 | `workflow/map_shard` | `workflow.map_shard` schema | Workflow `TaskManagerTaskTracker` | Workflow service | Workflow service、TaskMgr UI |
 | `workflow/thunk` | `workflow.thunk` schema | Workflow `TaskManagerTaskTracker` | Scheduler / node executor | Scheduler、node executor、Workflow service、TaskMgr UI |
 | `aicc.compute` | `aicc` schema | AICC | AICC provider task event sink | AICC、OpenDAN、TaskMgr UI |
@@ -401,8 +401,8 @@ workflow/thunk
 
 | task_type | data 主 namespace | 创建方 | 更新方 | 消费方 |
 | --- | --- | --- | --- | --- |
-| `workflow/run` | `workflow`，可选 `human_action` / `last_error` | Workflow tracker | Workflow service、用户动作入口 | Workflow service、TaskMgr UI |
-| `workflow/step` | `workflow`，可选 `output` / `human_action` / `last_error` | Workflow tracker | Workflow service、用户动作入口 | Workflow service、TaskMgr UI |
+| `workflow/run` | `workflow`，可选 `last_error` | Workflow tracker | Workflow service | Workflow service、TaskMgr UI |
+| `workflow/step` | `workflow`，可选 `output` / `last_error` | Workflow tracker | Workflow service | Workflow service、TaskMgr UI |
 | `workflow/map_shard` | `workflow`，可选 `output` / `last_error` | Workflow tracker | Workflow service | Workflow service、TaskMgr UI |
 | `workflow/thunk` | `workflow`，可选 `executor` / `executor_result` | Workflow tracker | Scheduler / node executor | Scheduler、node executor、Workflow service |
 
@@ -434,19 +434,11 @@ workflow/run
     },
     "updated_at": 1730000000
   },
-  "human_action": {
-    "kind": "rollback",
-    "payload": {
-      "target_node_id": "scan"
-    },
-    "actor": "user-A",
-    "submitted_at": 1730000000
-  },
   "last_error": null
 }
 ```
 
-`workflow/run` 是根任务，通常使用 `run_id` 作为 `Task.root_id`。`human_action` 只在用户对整个 Run 执行图级动作时出现。
+`workflow/run` 是根任务，通常使用 `run_id` 作为 `Task.root_id`。用户动作走 `workflow.submit_human_action`，不写任务数据。
 
 #### 5.3.2 `workflow/step`
 
@@ -467,12 +459,6 @@ workflow/run
     "waiting_human_since": 1730000000
   },
   "output": {},
-  "human_action": {
-    "kind": "approve",
-    "payload": {},
-    "actor": "user-A",
-    "submitted_at": 1730000000
-  },
   "last_error": {
     "message": "invalid action payload",
     "ts": 1730000001
@@ -494,21 +480,9 @@ workflow/run
 | `workflow.stakeholders` | 可处理该任务的用户或角色提示 |
 | `workflow.waiting_human_since` | 进入人工等待态的时间 |
 | `output` | step 成功输出 |
-| `human_action` | 用户经 TaskMgr UI 写入的动作 |
 | `last_error` | workflow 校验失败或执行失败时写回 |
 
-`human_action.kind` 当前约定值包括：
-
-```text
-approve
-modify
-reject
-retry
-skip
-abort
-rollback
-submit_output
-```
+用户动作（`approve`、`modify`、`reject`、`retry`、`skip`、`abort`、`rollback`）走 `workflow.submit_human_action`，见 [workflow service](../workflow/workflow%20service.md) §3.3。
 
 `modify`、`rollback`、`submit_output` 等动作通常需要 `payload`。非法动作由 workflow 写回 `last_error`，并让 task 保持 `WaitingForApproval`。
 
@@ -840,14 +814,14 @@ TaskMgr 在任务状态、错误、进度或数据变化后发布 kevent 事件�
 订阅路径：
 
 ```text
-/task_mgr/{task_id}
-/task_mgr/{root_id}
+/obj/taskmgr/{task_id}/changed
+/obj/taskmgr/{root_id}/tree
 ```
 
 语义：
 
-- `/task_mgr/{task_id}`：订阅单个任务变化。
-- `/task_mgr/{root_id}`：订阅整棵任务树变化；子孙任务变化会 fanout 到 root channel。
+- `/obj/taskmgr/{task_id}/changed`：订阅单个任务变化。
+- `/obj/taskmgr/{root_id}/tree`：订阅整棵任务树变化；子孙任务变化会 fanout 到 root channel。
 - 根任务的 `root_id == task_id` 时不会重复发布同一事件到两个相同 channel。
 - `root_id` 中不能包含 `/`，且必须能通过 kevent event id 校验，否则不会发布 root fanout。
 
@@ -855,7 +829,7 @@ beta2.2 删除了 `/task_mgr/runner/{runner}/task_ready` runner inbox 事件；k
 
 ### 8.1 任务变更事件
 
-任务变更事件发布到 `/task_mgr/{task_id}` 和 `/task_mgr/{root_id}`。
+任务变更事件发布到 `/obj/taskmgr/{task_id}/changed` 和 `/obj/taskmgr/{root_id}/tree`。
 
 事件 payload 当前包含：
 
