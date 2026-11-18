@@ -16,8 +16,6 @@ else
     cp /usr/local/share/buckyos/rootfs/etc/boot_gateway.yaml "$BUCKYOS_ROOT/etc/boot_gateway.yaml"
 fi
 
-python3 /usr/local/bin/configure-local-access.py
-
 mkdir -p "$BUCKYOS_ROOT/logs"
 dockerd --host=unix:///var/run/docker.sock >"$BUCKYOS_ROOT/logs/docker.log" 2>&1 &
 docker_pid=$!
