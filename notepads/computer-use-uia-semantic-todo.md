@@ -2,7 +2,7 @@
 
 日期：2026-11-08
 
-状态：设计已 Review（2026-11-08，结论见 §6）；第一阶段已实施（2026-11-08，记录见 §7），§4.6 的 Windows 实机场景验收尚未执行。macOS AX 后端已按同一协议实施并在本机 DV（2026-11-09，记录见 §8）。§2 是实施前的源码事实；旧文档里的规划不代表已有实现。
+状态：设计已 Review（2026-11-08，结论见 §6）；第一阶段已实施（2026-11-08，记录见 §7），§4.6 的 Windows 实机场景验收尚未执行。macOS AX 后端已按同一协议实施并在本机 DV（2026-11-09，记录见 §8），其后 Windows 回归通过（2026-11-11，见 §8.4）。D6 第二阶段的 `toggle`、`select`、`expand`、`collapse` 已在 Windows 实施并实机 DV（2026-11-11，见 §9），macOS 一侧随后实施并在本机 DV（2026-11-11，见 §9.6）。§2 是实施前的源码事实；旧文档里的规划不代表已有实现。
 
 来源与相关设计：
 
@@ -207,7 +207,7 @@ JSON 只保留 `format`（`outline-v1`）、`text`、`windows`、`coverage`，�
 
 ## 5. 后续
 
-- D6 第二阶段命令：`toggle`、`select`、`expand`、`collapse`、`scroll_into_view`。
+- D6 第二阶段命令：`toggle`、`select`、`expand`、`collapse` 见 §9；`scroll_into_view` 推迟，要先定 offscreen 节点的返回策略（§9.1）。
 - 浏览器语义后端：按 D13 实施，另列 TODO。
 - `wait_for` 的 `element_state` / `text` 条件：依赖 D4 的元素跟踪。
 - move / drag、多显示器、Linux AT-SPI、UIAccess。
@@ -321,7 +321,7 @@ DV 中发现并已修复：
 - **窗口列表**：`CGWindowListCopyWindowInfo` 取主屏上 on-screen、layer 0 的窗口，按前后次序，最多 32 个；标题优先用 `kCGWindowName`，拿不到（无屏幕录制权限）时用 AX 窗口标题，所以语义观察只需要辅助功能权限。`process` 为 owner 名，`accessible` 为窗口属主 uid 与当前用户相同，`foreground` 为 AX 焦点应用的焦点窗口。窗口身份是 CGWindowID，用 `_AXUIElementGetWindow` 对应到 AX 窗口，失败时按 pid 与窗口 frame 匹配。
 - **根**：scope 指定的窗口；默认取 AX 焦点应用的 `AXFocusedWindow`，依次退到 `AXMainWindow`、第一个窗口。对前台应用另加两类根：应用下打开的上下文菜单（`AXMenu`）和菜单栏（菜单栏是 macOS 的主要命令入口；未展开的子菜单没有几何，不展开）。遍历结束后，若应用的焦点元素不在树中（Finder 改名时的 field editor 直接挂在 `AXApplication` 下），把它作为一个额外的根。
 - **offscreen**：AX 没有 IsOffscreen。以主屏为初始可见区，经过 `AXScrollArea`、`AXWebArea` 时与其 frame 求交，进入 `AXMenu` 时重置为主屏（菜单是独立窗口）。可见部分为空且有几何的节点不返回也不展开；没有几何的节点视为逻辑容器，不返回但继续展开（`AXMenu` 与叶子角色除外）。`AXColumn` 不返回（其单元格已在行下）；同一元素按 `CFEqual` 只收一次。
-- **pattern / state 位**（与 UIA 同一布局）：
+- **pattern / state 位**（与 UIA 同一布局；2026-11-11 起 toggle / select / expand 的声明改为要求能执行，见 §9.6）：
   - `invoke`：动作列表含 `AXPress`；
   - `set_value`：文本类角色的 `AXValue` 可写，否则标 `readonly`；
   - `focus`：文本、列表、表格、大纲、网页区域和滑块上 `AXFocused` 可写；
@@ -372,10 +372,130 @@ DV 中发现并已修复：
 
 ### 8.4 未完成与风险
 
-- **Windows 未重新编译**：本次在 macOS 上实施，`native_windows.cpp` 的入口改名与 Rust 侧 `native_semantic` 的共用没有在 Windows 上编译。需要在 Windows 上跑 `cargo test -p computer_driver`、MSVC `/W4 /WX` 自测编译与 `--uia`。
+- **Windows 回归（2026-11-11 已执行，通过，未改代码）**：本次在 macOS 上实施，`native_windows.cpp` 的入口改名与 Rust 侧 `native_semantic` 的共用随后在 Windows 11（5120×1440 主屏）上重新编译和测试：
+  - `cargo test -p computer_driver`：27 通过，2 项 ignored，无警告。
+  - `--ignored` 的 `semantic_smoke`、`windows_desktop_capture_smoke` 通过。`semantic_smoke` 的前台为 VS Code（Electron），走了 Chromium 重采样：首次 6 节点（`tree_sparse`），重采样后 371 节点、`max_text_bytes` 截断，约 78 ms。
+  - MSVC `/W4 /WX /DBUCKY_DESKTOP_SELF_TEST` 自测编译通过。`--uia` 通过：快照 32 ms，三类控件均在树中，Invoke、SetValue 生效，控件销毁后 stale，挂起窗口 1000 ms 返回 `backend_timeout`。
+  - 自测中全屏 PNG 为 1,086,950 字节，超过 1 MiB，§7.5 的截图上限问题仍在。
 - **未执行的场景**：Retina 或缩放显示（本机为 1×，bounds 换算只有单元测试覆盖）、多显示器、锁屏、其他用户的窗口（`accessible:false`）、真实应用上 auto 回落 visual、Chromium 的重采样路径、真实应用中打开模态对话框的 invoke（只有自测覆盖）、Gmail 移到垃圾箱（涉及用户邮件，未执行）。
 - **私有 API**：`_AXUIElementGetWindow` 是私有但长期稳定的符号，SDK 中有导出；不可用时按 frame 匹配，同一应用两个 frame 完全相同的窗口可能对应错。
 - **Chromium 无障碍开销**：`AXManualAccessibility` 打开后，在该应用进程的生命周期内都保持开启，带来渲染进程的额外开销，与 Windows 上 UIA 客户端出现时的行为相同。
 - **Chrome 网页没有 invoke**：网页链接和按钮只能 `click(element)`，因此需要可见且未被遮挡。
 - **隐藏的备选菜单项**：AppKit 会暴露按住 Option 才显示的备选项（如 Close / Close All 位置相同），大纲中两者都会出现。
 - **pending 判断依赖应用的 AX 实现**：应用若在主线程以外处理 AX 请求，嵌套循环判断可能把尚未执行的按下当成已送达；本次测试的 AppKit、Chrome、Electron 都在主线程处理 AX 请求。
+
+## 9. D6 第二阶段命令（2026-11-11）
+
+### 9.1 范围与决定
+
+- **本期命令**：`toggle`、`select`、`expand`、`collapse`。
+  - 形态与 `invoke` 相同：只接受 element 目标，字段为 `binding_id`、`target`、`feedback`、`feedback_mode`、`execution_timeout_ms`，归入 `computer_act`。
+  - 命令名就是大纲里的动作名，只对观察中声明了该动作的元素开放。`expand` 只在元素折叠或部分展开时声明，`collapse` 只在展开或部分展开时声明。
+  - 执行前重新解析，要求元素未禁用、pattern 仍可用；与 `invoke` 一样不要求在可视区、不移动鼠标。
+- **`scroll_into_view` 推迟，D2 不变。**
+  - D2 不返回 offscreen 节点，滚出可视区的元素没有 ref，这个命令只能作用于已部分可见的元素，价值很小。
+  - 要让它有用，就要返回 offscreen 节点。这会让每次观察多花 token：Chromium 长页面上几乎每个元素都有 ScrollItem。需要先定上限再实测。
+  - 在此之前，滚动用 `scroll(element)` 加重新观察。D6 原文“`invoke` 可用于……不在可视区的元素”同样受 D2 限制，只对部分可见的元素成立。
+- **回读**：动作后轮询状态直到达到目标，最多 300 ms，且不超过元素超时的一半。
+  - 目标：`toggle` 是 checked / mixed 与动作前不同；`select` 是 `selected`；`expand` 是 `expanded`（含部分展开）；`collapse` 是 `collapsed`。
+  - 未达到目标返回 `state_mismatch`，执行状态 `completed`，与 `set_value` 的 `value_mismatch` 一致。元素在动作后消失则不判定。
+- **macOS AX 后补**：先在 Windows 上实施，AX 一侧同日在 Mac 上实施（§9.6）。AX 按 D13 映射：`toggle` 用 `AXPress`；`select` 对单选和标签页用 `AXPress`，对行设置 `AXSelected`；`expand` / `collapse` 设置 `AXExpanded`（没有该属性的大纲行设置 `AXDisclosing`），展开三角用 `AXPress`。
+
+### 9.2 TODO
+
+- [x] 协议（buckyos-api）：四个命令及其校验，单元测试。
+- [x] UIA（native_windows.cpp）：TogglePattern、SelectionItemPattern、ExpandCollapsePattern 的执行与回读；`--uia` 自测增加复选框 `toggle`、树节点 `select` 与 `expand` / `collapse`。
+- [x] Driver（desktop.rs）：element 目标与 pattern 校验、回读判定与 `state_mismatch`、capabilities 按平台列出命令，单元测试。
+- [x] agent_tool 工具说明；websdk 类型与测试。
+- [x] 文档与手册：草案 §7、[agent_daemon.md](../doc/arch/agent_daemon.md)、[node_exector.md](../doc/arch/node_exector.md)；手册 `xllm`、`buckyos_admin`、`opendan_agent_dev`。
+- [x] Windows 单元测试与原生自测（结果见 §9.3）。
+- [x] Windows 实机 DV：Notepad 设置页开关 `toggle`、资源管理器文件 `select` 与导航树 `expand` / `collapse`、Chrome 标签页 `select`（结果见 §9.4）。
+- [x] macOS AX 实施、`ax_macos.m` 自测与 DV（在 Mac 上，结果见 §9.6）。
+
+### 9.3 实施记录（2026-11-11）
+
+| 位置 | 内容 |
+| --- | --- |
+| [computer.rs](../src/kernel/buckyos-api/src/computer.rs) | `Toggle`、`Select`、`Expand`、`Collapse` 四个命令（字段同 `Invoke`，只接受 element 目标）；`element_action()` 给出命令对应的通用动作 |
+| [native_windows.cpp](../src/kernel/computer_driver/src/native_windows.cpp) | element 操作 4–7：调用对应 pattern 后轮询回读，回复 `before`、`st`（状态位）与 `gone`；`--uia` 自测增加树视图（comctl32，只在自测入口链接） |
+| [desktop.rs](../src/kernel/computer_driver/src/desktop.rs) | 声明动作与 pattern 校验；`state_mismatch` 判定；`STATE_COMMANDS`（只在 Windows 为真）控制 capabilities 与解析，macOS 返回 `command_unsupported` |
+| [agent_tool computer.rs](../src/frame/agent_tool/src/runtime/computer.rs) | 工具说明 |
+| [executor_client.ts](../../buckyos-websdk/src/executor_client.ts) | 四个命令的类型与测试 |
+| 文档与手册 | 草案 §7、agent_daemon.md、node_exector.md；`xllm`、`buckyos_admin`、`opendan_agent_dev` |
+
+验证（Windows 11，5120×1440 主屏）：
+
+- `cargo test -p buckyos-api --lib computer` 10 项、`cargo test -p computer_driver` 28 项（2 项 ignored）、`cargo test -p agent_tool --lib runtime::computer` 11 项、`cargo test -p node_executor --lib --test computer` 6 + 12 项，均通过；websdk `jest tests/executor_client.test.ts` 5 项通过，`tsc -p tsconfig.build.json` 通过（输出到临时目录，未改 `dist`）。
+- MSVC `/W4 /WX` 自测编译通过；`--uia` 通过：复选框 toggle 后为 checked，树节点 select 后为当前选中项，expand / collapse 后树视图的展开状态与回读一致，对没有 Toggle pattern 的输入框 toggle 返回失败（code 3，不是超时）。
+- `cargo check -p buckyos_agent_daemon -p node_daemon -p computer_driver --tests --examples` 通过。
+
+### 9.4 实机 DV（2026-11-11，Windows 11，5120×1440 主屏）
+
+方法同 §7.5：`computer_dv` harness，每步先观察、按大纲选 ref 再动作，动作反馈为默认 auto。开始前确认本机没有 node_daemon、opendan 或其他 Agent 进程。inspect 的 `commands` 列出四个新命令。全程没有截图，也没有出现 `state_mismatch`。
+
+| 场景 | 结果 |
+| --- | --- |
+| Notepad 菜单与设置页 | 通过。菜单栏 File `expand` 后为 `expanded`，反馈树出现 PopupHost 与菜单项；`collapse` 后弹出窗口消失。设置页 “Word wrap” 开关（`switch`）`toggle` 两次：checked → 未选中 → checked，设置已复原。“Opening files” combobox `expand` 列出两个可 `select` 的选项，未选择即 `collapse`；“App theme” 展开器 `expand` 后列出主题单选，`collapse` 复原 |
+| 资源管理器 | 通过。在临时目录中对 `beta.txt` `select`，反馈中为 `selected`。导航树 “DevDrive (D:)” `expand` 后为 `expanded`，`collapse` 后为 `collapsed`。注意：资源管理器在 `expand` 导航树节点时同时选中该节点，并把窗口导航到 D:，这是应用的行为 |
+| Chrome 标签页 | 通过。经 `scope` 观察后台 Chrome 窗口（261 节点），对另一标签页 `select`，反馈中该标签页为 `selected`；再 `select` 原标签页复原。注意：Chrome 在标签页被 `select` 时会把窗口带到前台 |
+| 未声明的动作 | 对标签页 `toggle` 返回 `element_action_unsupported` / `not_started` |
+
+DV 打开的 Notepad 与资源管理器窗口最后用 `invoke` 关闭按钮关掉。
+
+### 9.5 未完成与风险
+
+- `state_mismatch` 只有单元测试覆盖，DV 中没有出现过；Chromium 等异步 provider 在 300 ms 内仍未更新状态时会误报，需在实际使用中观察频率。
+- `select` / `expand` 可能带来应用自己的副作用（Chrome 激活窗口、资源管理器导航），Agent 需要看反馈观察，而不是假定只有状态改变。
+- `scroll_into_view` 仍推迟（§9.1）。
+
+### 9.6 macOS AX 实施记录（2026-11-11）
+
+| 位置 | 内容 |
+| --- | --- |
+| [native.m](../src/kernel/computer_driver/src/native.m) | element 操作 4–7：执行后轮询回读，回复 `before`、`st`、`gone`，与 Windows 同一格式；`ax_press` 推广为 `ax_deliver`（按下或设置属性，嵌套循环判断相同）；`ax_read` 改为只对能执行的元素声明 toggle / select / expand，读取 `AXDisclosing` |
+| [desktop.rs](../src/kernel/computer_driver/src/desktop.rs) | 去掉 `STATE_COMMANDS`，capabilities 与元素解析在两个平台相同 |
+| [ax_macos.m](../test/agent_daemon/ax_macos.m) | 测试窗口增加单选按钮、popup、combobox 和可展开、允许多选的大纲；新增 23 项检查 |
+| 文档与手册 | 草案 §7、[agent_daemon.md](../doc/arch/agent_daemon.md)、[node_exector.md](../doc/arch/node_exector.md)；手册 `xllm`、`buckyos_admin`、`opendan_agent_dev` 删除“macOS 未实施”。agent_tool 工具说明与 websdk 类型本就与平台无关，无需修改 |
+
+实施中定下的细节：
+
+- **执行**：
+  - `toggle`：复选框上的 `AXPress`。
+  - `select`：单选按钮与标签页上的 `AXPress`；行上设置 `AXSelected = true`。AppKit 大纲允许多选时，设置行的 `AXSelected` 会替换原有选择，与 UIA `Select` 一致（自测确认）。
+  - `expand` / `collapse`：设置 `AXExpanded`；没有该属性的大纲行设置 `AXDisclosing`。展开三角用 `AXPress`，因为按下是翻转，所以已处于目标状态时不按。
+  - 按下和设置属性都经 `ax_deliver` 在后台队列执行，0.5 s 未返回时用与 `invoke` 相同的判断返回 `pending`。combobox 的展开实测不阻塞。
+- **声明规则（取代 §8.2 的按角色声明）**：实测（自测窗口、Finder、System Settings、Chrome）发现：
+  - AppKit 大纲行没有 `AXExpanded`，只有 `AXDisclosing`：可展开的行可写，叶子行只读；Finder 列表视图的表头行与 System Settings（SwiftUI）侧栏行报只读的 `AXDisclosing = 1`。
+  - `NSPopUpButton` 没有 `AXExpanded`（打开它用 `invoke`），`NSComboBox` 的 `AXExpanded` 可写。
+  - Chromium 网页节点的 `AXSelected` / `AXExpanded` 只读（GitHub 文件表的行、带弹出菜单的网页按钮）；Chrome 自身的标签页声明 `AXPress`。
+
+  因此：`toggle`、单选与标签页的 `select`、展开三角的 `expand` / `collapse` 要求元素声明 `AXPress`；行的 `select` 要求 `AXSelected` 可写；其余 `expand` / `collapse` 要求 `AXExpanded` 或 `AXDisclosing` 可写，可写时才给出 expanded / collapsed 状态。不可写的 `AXExpanded` 为 true 时只显示 expanded；不可写的 `AXDisclosing` 不显示。可写性查询只对行、combobox、popup、菜单按钮各多一次 IPC。效果：Chrome 网页表格的行原先因只读属性显示 `collapsed (expand, select)`，现在只是 `row`。
+- **回读**：与 Windows 相同，动作后轮询直到达到目标，最多 300 ms 且不超过元素超时的一半；读取失败但元素未失效时不给 `st`，不判定 `state_mismatch`。
+- **不激活应用**：这些命令可直接作用于后台窗口，不把应用带到前台；Chrome 标签页 `select` 也不激活 Chrome（Windows 上会）。
+
+验证（macOS 15.8.1、Apple silicon、主屏 1620×1080）：
+
+- 原生自测 `ax_macos.m`（`-Wall -Werror`）40 项通过，其中新增 23 项：
+  - 声明：单选、两类大纲行、展开三角、combobox 的动作声明正确；只读 `AXDisclosing` 的叶子行和没有 `AXExpanded` 的 popup 不声明 expand。
+  - 执行与回读：复选框 toggle；单选与行 select（行 select 替换多选）；大纲行与展开三角 expand / collapse（已展开时再 expand 不翻转）；combobox expand / collapse。回读状态与之后的快照一致。
+  - 未声明的动作：对文本框 toggle、对 popup expand 直接失败（code 3）。
+- `cargo test -p computer_driver`：21 通过，1 项 ignored（`semantic_smoke`）。对自测窗口运行 `semantic_smoke`，大纲为 `treeitem collapsed (select, expand)`、`treeitem (select)`、`combobox "Color" collapsed (focus, set_value, expand)`、`checkbox "Remember" (invoke, toggle)`。
+- `cargo check -p node_daemon -p buckyos_agent_daemon -p computer_driver --tests --examples` 通过，只有一条与本改动无关的既有 dead code 警告（`node_daemon/src/paios_images.rs` 的 `short_id`）。
+- 实机 DV（`computer_dv` harness，方法同 §8.3，binding `desktop:display:3`）：开始前确认本机 Jarvis 自 11-08 起没有桌面操作。inspect 的 `commands` 列出四个命令。全程没有截图，没有出现 `state_mismatch`，前台始终是 Claude 桌面应用。单次动作的总耗时（含 60 ms 后的语义反馈）为 170–290 ms。
+
+| 场景 | 结果 |
+| --- | --- |
+| Finder 侧栏（后台窗口，经 `scope`） | 分区标题行 “Locations” 为 `expanded (select, collapse)`；`collapse` 后为 collapsed，Macintosh HD、liu-nas 从反馈树中消失；`expand` 复原。叶子行只有 `select` |
+| Finder 列表视图 | `select` 文件行 node_daemon，行与单元格为 selected。在 §8.3 的 DV 夹具目录中临时建了一个子文件夹：文件夹行为 `collapsed (select, expand)`，`expand` 后为 expanded，下一次观察出现子文件行；`collapse` 复原。临时文件夹已删除 |
+| Chrome 标签页（后台窗口） | 对“知乎”标签页 `select`，反馈中为 selected，Chrome 仍在后台；再 `select` 原标签页复原。GitHub 网页的 16 行不再带 expand / select |
+| 复选框 | Xcode 组件选择窗口的 “watchOS 26.2” `toggle` 两次：未选 → checked → 未选，已复原（未点 Download & Install）。对禁用的 “macOS 26.2” `toggle` 返回 `element_disabled` / `not_started` |
+| 未声明的动作 | 对 Finder 标签页 `toggle` 返回 `element_action_unsupported` / `not_started` |
+| System Settings（只读观察） | 侧栏行只有 `select`，不再因只读的 `AXDisclosing` 显示 expanded |
+
+未完成与风险：
+
+- **反馈时机**：Finder 展开文件夹后，60 ms 时的反馈中还没有子行（异步加载），要重新观察才能看到，与 §7.5 的问题相同。
+- **popup 没有 expand**：AppKit popup 用 `invoke` 打开菜单（菜单跟踪中返回 `pending`），再 `invoke` 菜单项。网页上的弹出按钮（`AXExpanded` 只读、不声明 `AXPress`）只能 `click(element)`。
+- **行没有名称**：AppKit 大纲行的名称在单元格上，大纲中 treeitem 本身无名，模型需要看子节点；Windows 的树节点有名称。展开三角与所在行重复声明 expand。
+- **未实测**：真实应用中的 NSComboBox 展开（只有自测覆盖）；SwiftUI 开关的 toggle（不改系统设置）；Chromium 网页复选框与单选（不声明 `AXPress` 时不会有 toggle / select）；`state_mismatch` 在实际使用中的频率。
+- **Windows**：本次只去掉了 Rust 侧在 Windows 上恒为真的 `STATE_COMMANDS` 条件，Windows 行为不变，未在 Windows 上重新编译和测试。

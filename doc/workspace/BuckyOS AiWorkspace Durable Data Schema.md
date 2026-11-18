@@ -39,11 +39,11 @@
 
 | 根 | 闭包 |
 | --- | --- |
-| 快照 `<ws>/snapshot/<snapshot_id>` | 快照根 `jobj`、内容根、`entities` 文件、每个实体内容对象及其 `records` / `doc` 文件、`cydir`（目录实体）、实体引用且在库的资产、谱系里的来源快照（`lineage.forked_from.snapshot`，在库时） |
+| 快照 `<ws>/snapshot/<snapshot_id>` | 快照根 `jobj`、内容根、`entities` 文件、每个实体内容对象及其 `records` / `doc` 文件、`cydir`（目录实体）、实体引用且在库的资产、谱系里的来源快照（`lineage.cloned_from.snapshot`，在库时） |
 | 生成版本 `<ws>/version/<epoch>/<seq>` | 该 Commit 中每个 `entity.set_derived` 实体的内容对象及其文件、`cydir`、资产 |
 | 固定版本 `<ws>/fixed/<content_root>` | 该实体内容对象及其文件（发布方被读固定版本时写入，7 天） |
 
-每次物化（checkpoint、export、fork 源、导入校验）都写一个快照行并绑定其保留集，与原先“每个快照都是保留根”一致。
+每次物化（checkpoint、export、Clone 源、导入校验）都写一个快照行并绑定其保留集，与原先“每个快照都是保留根”一致。
 
 ### 3.3 写入路径（谁 pin）
 
@@ -80,6 +80,7 @@ Table: assets（doc.sqlite，进入离线副本）
 | bucket_version | INTEGER | YES | 绑定版本；NULL = 已解绑（undo / 版本恢复答 RESOURCE_RECLAIMED） |
 
 Table: staged_assets（local.sqlite）：object_id、media_type、size、principal、expires_at、bucket_key、bucket_version（NOT NULL）。
+Table: staged_commits（local.sqlite，打开时 `CREATE TABLE IF NOT EXISTS`）：principal、idem_key、part、ops_json、bytes、digest、expires_at；主键 (principal, idem_key, part)。分块提交的暂存块（`doc.stage`），1 小时过期，`bytes` 计入 `usage.staged`；最终 `doc.commit` 求值后删除，`sweep` / `ws.clear_staged` 清理。
 Table: snapshots（doc.sqlite）：snapshot_id、content_root、seq、kind、created_at、created_by、bucket_key、bucket_version（NULL = 已释放，`{epoch, seq}` 引用答 VERSION_NOT_RETAINED）。
 Table: entity_versions（doc.sqlite）：… kind、created_at、bucket_key、bucket_version（`generated` 行指向其 Commit 的版本保留集；`checkpoint` 行经快照保留，为 NULL）。
 local_meta.show_clones：正在运行的演示克隆 id（JSON 数组，按文件夹是否存在计数，`MAX_CLONES`）。

@@ -18,20 +18,40 @@
 
 import ts from 'typescript'
 import * as blocks from '../../src/i18n/aiworkspace/blocks.ts'
+import * as blockui from '../../src/i18n/aiworkspace/blockui.ts'
+import * as blockprops from '../../src/i18n/aiworkspace/blockprops.ts'
 import * as canvas from '../../src/i18n/aiworkspace/canvas.ts'
 import * as common from '../../src/i18n/aiworkspace/common.ts'
 import * as core from '../../src/i18n/aiworkspace/core.ts'
 import * as data from '../../src/i18n/aiworkspace/data.ts'
 import * as demos from '../../src/i18n/aiworkspace/demos.ts'
+import * as directory from '../../src/i18n/aiworkspace/directory.ts'
 import * as ext from '../../src/i18n/aiworkspace/ext.ts'
 import * as imports from '../../src/i18n/aiworkspace/import.ts'
 import * as pdf from '../../src/i18n/aiworkspace/pdf.ts'
 import * as presentation from '../../src/i18n/aiworkspace/presentation.ts'
 import * as office from '../../src/i18n/aiworkspace/office.ts'
 import * as richtext from '../../src/i18n/aiworkspace/richtext.ts'
+import * as schedule from '../../src/i18n/aiworkspace/schedule.ts'
+import * as framework from '../../src/i18n/aiworkspace/framework.ts'
+import * as home from '../../src/i18n/aiworkspace/home.ts'
+import * as table from '../../src/i18n/aiworkspace/table.ts'
+import * as phone from '../../src/i18n/aiworkspace/phone.ts'
+import * as pathnode from '../../src/i18n/aiworkspace/pathnode.ts'
+import * as cover from '../../src/i18n/aiworkspace/cover.ts'
 import * as session from '../../src/i18n/aiworkspace/session.ts'
 import * as shell from '../../src/i18n/aiworkspace/shell.ts'
 import * as wish from '../../src/i18n/aiworkspace/wish.ts'
+import * as wishcard from '../../src/i18n/aiworkspace/wishcard.ts'
+import * as wishlinks from '../../src/i18n/aiworkspace/wishlinks.ts'
+import * as samplewish from '../../src/i18n/aiworkspace/samplewish.ts'
+import * as runlog from '../../src/i18n/aiworkspace/runlog.ts'
+import * as jarvis from '../../src/i18n/aiworkspace/jarvis.ts'
+import * as sourcereq from '../../src/i18n/aiworkspace/sourcereq.ts'
+import * as datasource from '../../src/i18n/aiworkspace/datasource.ts'
+import * as print from '../../src/i18n/aiworkspace/print.ts'
+import * as printrender from '../../src/i18n/aiworkspace/printrender.ts'
+import * as pdfframe from '../../src/i18n/aiworkspace/pdfframe.ts'
 
 type Table = Record<string, string>
 interface Part { name: string; prefixes: string[]; en: Table; zh: Table }
@@ -42,8 +62,11 @@ const PARTS: Part[] = [
   { name: 'shell', prefixes: ['shell'], ...shell },
   { name: 'canvas', prefixes: ['canvas', 'drawio'], ...canvas },
   { name: 'blocks', prefixes: ['blocks', 'connector'], ...blocks },
+  { name: 'blockui', prefixes: ['blockui'], ...blockui },
+  { name: 'blockprops', prefixes: ['blockprops'], ...blockprops },
   { name: 'wish', prefixes: ['wish', 'extension'], ...wish },
   { name: 'data', prefixes: ['data'], ...data },
+  { name: 'directory', prefixes: ['directory'], ...directory },
   { name: 'presentation', prefixes: ['presentation'], ...presentation },
   { name: 'richtext', prefixes: ['richtext'], ...richtext },
   { name: 'session', prefixes: ['session'], ...session },
@@ -53,6 +76,23 @@ const PARTS: Part[] = [
   { name: 'ext', prefixes: ['ext'], ...ext },
   { name: 'import', prefixes: ['import'], ...imports },
   { name: 'office', prefixes: ['office'], ...office },
+  { name: 'schedule', prefixes: ['label', 'datactl', 'todo', 'calendar', 'broadcast'], ...schedule },
+  { name: 'framework', prefixes: ['framework'], ...framework },
+  { name: 'home', prefixes: ['home'], ...home },
+  { name: 'table', prefixes: ['table'], ...table },
+  { name: 'phone', prefixes: ['phone'], ...phone },
+  { name: 'pathnode', prefixes: ['pathnode'], ...pathnode },
+  { name: 'cover', prefixes: ['cover'], ...cover },
+  { name: 'wishcard', prefixes: ['wishcard'], ...wishcard },
+  { name: 'wishlinks', prefixes: ['wishlinks'], ...wishlinks },
+  { name: 'samplewish', prefixes: ['samplewish'], ...samplewish },
+  { name: 'runlog', prefixes: ['runlog'], ...runlog },
+  { name: 'jarvis', prefixes: ['jarvis'], ...jarvis },
+  { name: 'sourcereq', prefixes: ['sourcereq'], ...sourcereq },
+  { name: 'datasource', prefixes: ['datasource'], ...datasource },
+  { name: 'print', prefixes: ['print'], ...print },
+  { name: 'printrender', prefixes: ['printrender'], ...printrender },
+  { name: 'pdfframe', prefixes: ['pdfframe'], ...pdfframe },
 ]
 
 const ROOT = new URL('../../', import.meta.url).pathname
@@ -237,7 +277,7 @@ Deno.test('aiworkspace i18n: the backend speaks English', () => {
     for (const l of rustLiterals(file)) if (!l.exempt && CJK.test(l.text)) problems.push(`${file}:${l.line}: ${l.text.trim().slice(0, 70)}`)
   }
   // the program host's assets the server compiles in: prompts and API text are read whole, scripts by literal
-  for (const file of ['aiws/prompts/analyze.md', 'aiws/prompts/execute.md', 'aiws/README.md', 'aiws/renderers.json']) {
+  for (const file of ['aiws/prompts/analyze.md', 'aiws/prompts/code.md', 'aiws/README.md', 'aiws/renderers.json']) {
     Deno.readTextFileSync(`${ROOT}${BACKEND}/${file}`).split('\n').forEach((line, i) => { if (CJK.test(line)) problems.push(`${BACKEND}/${file}:${i + 1}: ${line.trim().slice(0, 70)}`) })
   }
   for (const file of ['aiws/aiws.js', 'aiws/run.js']) {

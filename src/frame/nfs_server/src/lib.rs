@@ -12,6 +12,7 @@
 
 pub mod access;
 pub mod acl;
+pub mod archive;
 pub mod auth;
 pub mod bucket;
 pub mod config;
@@ -28,6 +29,7 @@ pub mod ndm;
 pub mod ndn;
 pub mod preview;
 pub mod reconciler;
+pub mod recent;
 pub mod search;
 pub mod server;
 pub mod session;

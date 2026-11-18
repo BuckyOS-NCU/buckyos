@@ -24,6 +24,7 @@ use libopendan::state::{
 use name_lib::DID;
 use ndn_lib::ObjId;
 
+use crate::browser::{BrowserDeps, BrowserModule};
 use crate::config::AgentConfig;
 use crate::home::Home;
 use crate::records::{self, AgentRecords};
@@ -100,6 +101,7 @@ pub struct Loader {
     pub supervisor: Arc<Supervisor>,
     pub info: Arc<LoaderInfo>,
     pub ui: Option<Arc<UiModule>>,
+    pub browser: Arc<BrowserModule>,
     pub config: AgentConfig,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// `shell` commands of the sessions that outlived their wait.
@@ -318,6 +320,17 @@ impl Loader {
             libopendan::todos::ENV_MAX_CHILDREN,
             max_child_concurrency.to_string(),
         );
+        // ... and where `agent-browser` reaches the agent's browser: this
+        // service, on the loopback interface. Sessions on other nodes do not
+        // inherit it and have no browser.
+        if config.loader.browser.enabled && config.loader.agent_state_service {
+            std::env::set_var(
+                crate::browser::ENV_BROWSER_RPC,
+                format!("http://127.0.0.1:{}/kapi/{}", env.port, agent.agent_id()),
+            );
+        } else {
+            std::env::remove_var(crate::browser::ENV_BROWSER_RPC);
+        }
         let host = HostDeps {
             who: env.who.clone(),
             agent: agent.clone(),
@@ -381,6 +394,16 @@ impl Loader {
         }
 
         let mut tasks = Vec::new();
+        // The agent's browser: started when someone needs it.
+        let browser = BrowserModule::new(
+            config.loader.browser.clone(),
+            BrowserDeps {
+                agent: agent.clone(),
+                supervisor: Some(supervisor.clone()),
+                owner_did: env.owner_did.as_ref().map(|d| d.to_string()),
+                agent_root: env.agent_root.clone(),
+            },
+        );
         let ui = match (&env.mail, config.loader.ui.is_empty()) {
             (_, true) => {
                 module("ui", false, false, Some("no [[loader.ui]] rule"));
@@ -407,6 +430,7 @@ impl Loader {
                     env.channels.clone(),
                     supervisor.clone(),
                     env.agent_root.join("sessions"),
+                    browser.clone(),
                 ))
             }
         };
@@ -416,23 +440,33 @@ impl Loader {
             config.loader.goals.enabled,
             config.loader.goals.enabled.then_some("schedule backend: local"),
         );
-        module(
-            "self_check",
-            config.loader.self_check.enabled,
-            false,
-            config.loader.self_check.enabled.then_some("not available in this version"),
-        );
+        let (enabled, usable, note) = browser.module_status();
+        module("browser", enabled, usable, note.as_deref());
+        if enabled {
+            tasks.push(tokio::spawn(browser.clone().run()));
+        }
         let maintenance = libopendan::goal::defaults(Some(&env.agent_root), libopendan::goal::GOAL_CLASS).maintenance;
         module(
             "memory_maintenance",
             maintenance.enabled,
             maintenance.enabled && config.loader.goals.enabled,
             Some(if maintenance.enabled {
-                "built-in goal seeded by the goals module; decision pre-check off"
+                "built-in goal seeded by the goals module; its check script decides when it infers"
             } else {
                 "[session.goal.maintenance] enabled = false"
             }),
         );
+
+        // Sync tasks: the programs behind AI Workspace data sources, on
+        // their own timetables.
+        let sync = libopendan::sync::SyncHost::new(libopendan::sync::SyncHostOptions::new(
+            env.agent_root.clone(),
+            Arc::new(records::RecordsSecrets(env.records.clone())),
+            env.notify.clone(),
+        ));
+        let deno = libopendan::sync::DenoSyncRunner::discover().is_some();
+        module("sync", true, deno, (!deno).then_some("no Deno on this host: sync programs cannot run"));
+        tasks.push(tokio::spawn(sync.clone().serve()));
 
         if config.loader.agent_state_service || config.loader.webui {
             let runner = Runner::new(env.port);
@@ -442,6 +476,8 @@ impl Loader {
                     supervisor: supervisor.clone(),
                     info: info.clone(),
                     ui: ui.clone(),
+                    browser: browser.clone(),
+                    sync: Some(sync.clone()),
                     access: env.access.clone(),
                     sessions: match libopendan::session_context::SessionService::new(
                         &env.agent_root,
@@ -454,6 +490,12 @@ impl Loader {
                         }
                     },
                     objects: std::sync::OnceLock::new(),
+                    work: Some(crate::service::WorkStarter {
+                        sessions_dir: env.agent_root.join("sessions"),
+                        channels: env.channels.clone(),
+                        llm_context: config.llm_context.clone(),
+                        driver: env.who.clone(),
+                    }),
                     home: Home::new(
                         env.records.clone(),
                         env.owner_did.as_ref().map(|d| d.to_string()),
@@ -517,8 +559,16 @@ impl Loader {
         }
 
         // Recovery does not wait for something to touch a session: the
-        // first registry scan hosts everything left unfinished.
+        // first registry scan hosts everything left unfinished. What was
+        // working when the host stopped is not advanced: it is marked
+        // interrupted and waits for the owner's resume.
         tasks.push(tokio::spawn(supervisor.clone().run()));
+        tasks.push(tokio::spawn(tell_interrupted(
+            agent.clone(),
+            supervisor.clone(),
+            env.who.clone(),
+            env.notify.clone(),
+        )));
         match &env.notify {
             Some(notify) => {
                 module("notify", true, true, None);
@@ -547,6 +597,7 @@ impl Loader {
             env.settings.clone(),
             env.who.clone(),
             env.options.poll_interval.saturating_mul(6).max(Duration::from_secs(15)),
+            env.notify.clone(),
         )));
         match &env.tasks {
             Some(service) => {
@@ -597,6 +648,7 @@ impl Loader {
             supervisor,
             info,
             ui,
+            browser,
             config,
             tasks,
             local_tasks: env.xllm.local_tasks.clone(),
@@ -613,6 +665,7 @@ impl Loader {
         for t in self.tasks {
             let _ = t.await;
         }
+        self.browser.shutdown().await;
         self.supervisor.shutdown().await;
         // Commands still running continue without this process: their
         // execution directories record their ends, which the next start
@@ -677,9 +730,123 @@ pub async fn check_runtimes(agent: Arc<dyn AgentStateClient>) {
     }
 }
 
-/// The owner changes an agent's runtimes (enable the host, pick a default,
-/// adjust ComputerUse) while the agent runs: the projection follows the
-/// settings. Existing sessions keep what they froze.
+/// Why a runtime cannot be used now (`None`: it can).
+fn runtime_unusable(r: &libopendan::protocol::RuntimeRecord, now_ms: u64) -> Option<String> {
+    use libopendan::protocol::RuntimeLifecycle;
+    if r.lifecycle == RuntimeLifecycle::Retired {
+        Some(format!("runtime `{}` was removed from this agent", r.runtime_id))
+    } else if r.is_private() {
+        None
+    } else if !r.enabled {
+        Some(format!("runtime `{}` was switched off for this agent", r.runtime_id))
+    } else if r.grant.expired_at(now_ms) {
+        Some(format!("access to runtime `{}` expired; it works again once its daemon URL is renewed", r.runtime_id))
+    } else if !r.usable() {
+        Some(format!("runtime `{}` is not available: {}", r.runtime_id, r.last_error.clone().unwrap_or_else(|| "it does not answer".into())))
+    } else {
+        None
+    }
+}
+
+/// Sessions that are not finished keep the runtime they froze: when it is
+/// switched off, removed, expired or stops answering they are marked
+/// (`runtime_unavailable` of their registry entry) and the owner is told
+/// once. Nothing is moved to another runtime; the marks go when the runtime
+/// is usable again.
+pub async fn mark_runtime_sessions(agent: &dyn AgentStateClient, notify: Option<&dyn libopendan::notify::NotifyHost>) {
+    let runtimes = match agent.runtimes().list().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("loader: runtimes not listed ({e}); session marks stay");
+            return;
+        }
+    };
+    let now = libopendan::now_ms();
+    for mut r in runtimes {
+        if let Ok(Some(checked)) = libopendan::runtime::lookup_rechecked(agent, &r.runtime_id).await {
+            r = checked;
+        }
+        let reason = runtime_unusable(&r, now);
+        let marked = match agent.sessions().mark_runtime(&r.runtime_id, reason.as_deref()).await {
+            Ok(marked) => marked,
+            Err(e) => {
+                log::warn!("loader: sessions on runtime {} not marked: {e}", r.runtime_id);
+                continue;
+            }
+        };
+        let (Some(reason), false) = (reason, marked.is_empty()) else { continue };
+        let names = marked.iter().map(|e| format!("{} ({})", e.title.clone().unwrap_or_else(|| e.objective.clone()), e.session_id)).collect::<Vec<_>>();
+        log::warn!("loader: {reason}; {} session(s) in progress on it: {}", marked.len(), names.join(", "));
+        let Some(notify) = notify else { continue };
+        let request = libopendan::notify::NotifySendReq::notice(
+            "",
+            format!("Runtime `{}` is not usable", r.name),
+            format!(
+                "{reason}. {} session(s) were in progress on it and are not moved to another runtime: {}. Make the runtime usable again, or stop them.",
+                marked.len(),
+                names.join("; ")
+            ),
+            format!("runtime-unusable:{}:{}", r.runtime_id, marked.iter().map(|e| e.session_id.as_str()).collect::<Vec<_>>().join(",")),
+        );
+        if let Err(e) = notify.send(request).await {
+            log::warn!("loader: owner not told that {reason}: {e}");
+        }
+    }
+}
+
+/// Once the first look at the registry is over: the owner is told, once,
+/// which sessions the restart interrupted and where they are resumed.
+async fn tell_interrupted(
+    agent: Arc<dyn AgentStateClient>,
+    supervisor: Arc<Supervisor>,
+    who: String,
+    notify: Option<Arc<dyn libopendan::notify::NotifyHost>>,
+) {
+    while !supervisor.recovered() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Each session is marked by its own drive, under its own lease.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let query = libopendan::protocol::RegistryQuery { driver: Some(who), not_finished_or_pending: Some(true), ..Default::default() };
+    let interrupted: Vec<libopendan::protocol::RegistryEntry> = match agent.sessions().query(&query).await {
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|e| e.status.paused == Some(libopendan::protocol::PauseSource::Interrupted))
+            .collect(),
+        Err(e) => {
+            log::warn!("loader: interrupted sessions not listed: {e}");
+            return;
+        }
+    };
+    if interrupted.is_empty() {
+        return;
+    }
+    let names = interrupted
+        .iter()
+        .take(8)
+        .map(|e| format!("{} ({})", e.title.clone().unwrap_or_else(|| e.objective.chars().take(60).collect()), e.session_id))
+        .collect::<Vec<_>>();
+    log::warn!("loader: {} session(s) were working when the host stopped; interrupted until resumed: {}", interrupted.len(), names.join(", "));
+    let Some(notify) = notify else { return };
+    let request = libopendan::notify::NotifySendReq::notice(
+        "",
+        "Work was interrupted by a restart".to_string(),
+        format!(
+            "{} session(s) were working when I restarted and are on hold until you resume them: {}. Resume them on my home page (\"Resume all\"), in the conversation that started them, or with /resume; or stop them.",
+            interrupted.len(),
+            names.join("; ")
+        ),
+        format!("interrupted:{}", interrupted.iter().map(|e| e.session_id.as_str()).collect::<Vec<_>>().join(",")),
+    );
+    if let Err(e) = notify.send(request).await {
+        log::warn!("loader: owner not told about the interrupted sessions: {e}");
+    }
+}
+
+/// The owner changes an agent's runtimes (assign one, switch one on or off,
+/// pick a default) while the agent runs: the projection follows the
+/// settings. Existing sessions keep what they froze; the ones whose runtime
+/// went away are marked.
 async fn watch_runtime_settings(
     records: Arc<dyn AgentRecords>,
     agent: Arc<dyn AgentStateClient>,
@@ -687,9 +854,11 @@ async fn watch_runtime_settings(
     mut last: AgentSettings,
     who: String,
     every: Duration,
+    notify: Option<Arc<dyn libopendan::notify::NotifyHost>>,
 ) {
     loop {
         tokio::time::sleep(every).await;
+        mark_runtime_sessions(agent.as_ref(), notify.as_deref()).await;
         let current = match records::settings(records.as_ref()).await {
             Ok(s) => s,
             Err(e) => {

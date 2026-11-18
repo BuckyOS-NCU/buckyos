@@ -1,4 +1,7 @@
 import type { GroupDisplayInfo, GroupHookInfo, GroupPanelRef } from './extensions/model'
+import type { GroupInvitation, GroupInvitationView, GroupRole, PinnedMessage, ReadReceipt, RuntimeState, SessionAccess, SessionPanelInfo } from '../../components/conversation/model/types'
+
+export type { GroupInvitation, GroupInvitationView, GroupRole, PinnedMessage, ReadReceipt, RuntimeState, SessionAccess, SessionPanelInfo }
 
 /* ── Entity ── */
 
@@ -93,23 +96,6 @@ export interface Session {
   panel?: SessionPanelInfo
 }
 
-/** Host-defined content of the floating session panel, e.g. the state of a ticket. */
-export interface SessionPanelInfo {
-  title: string
-  /** Free text, shown in at most three lines until expanded. */
-  text?: string
-  fields?: Array<{ label: string; value: string; tone?: 'success' | 'warning' | 'danger' }>
-}
-
-/** Snapshot of the message a viewer pinned to the top of a session. */
-export interface PinnedMessage {
-  /** `messageObjId` of the pinned message. */
-  id: string
-  text: string
-  senderDid: string
-  createdAt: number
-}
-
 /* ── Entity Details ── */
 
 export interface EntityDetail extends Entity {
@@ -157,18 +143,10 @@ export type SessionBinding =
   | { kind: 'tunnel'; tunnelInstanceId: string; endpointDid: string; connectionName: string; remoteContextId?: string; supportsMultipleSessions: boolean; canCreateRemoteSession: boolean; canSend: boolean; connected: boolean; revision?: number }
   | { kind: 'unknown' }
 
-export interface SessionAccess {
-  mode: 'read_only' | 'read_write'
-  canManage: boolean
-  canEnableWrite: boolean
-  canEditPresentation: boolean
-  canEditSharedState: boolean
-  canEditOwnMemberState: boolean
-  readOnlyReason?: string
-}
-
 export interface SessionPreferences {
   title: string
+  /** The owner's own description of the session (`ui.description`). */
+  description: string
   pinned: boolean
   muted: boolean
   showActions: boolean
@@ -182,16 +160,8 @@ export interface MessageHubContext {
   mode: 'self' | 'observe'
 }
 
-export interface RuntimeState {
-  memberDid: string
-  status: 'typing' | 'processing' | 'active'
-  statusLine?: string
-  expiresAt: number
-}
-
 /* ── Self-host Group v2 ── */
 
-export type GroupRole = 'owner' | 'admin' | 'member'
 export type GroupMemberState = 'invited' | 'pending_admin_approval' | 'active' | 'left' | 'removed' | 'rejected' | 'expired' | 'revoked'
 
 export interface GroupMember {
@@ -289,28 +259,4 @@ export interface GroupInfo {
   messageRules: { editWindowMs?: number; recallWindowMs?: number }
   /** An owner transfer the owner started and the target has not accepted yet. */
   pendingTransfer?: { memberDid: string; transferId: string; expiresAt: number }
-}
-
-/** `buckyos.group_invitation` notification sent to an invited DID. */
-export interface GroupInvitation {
-  groupDid: string
-  inviteId: string
-  role: GroupRole
-  expiresAt?: number
-  inviterDid: string
-  /** `active`: accepted automatically; `pending_admin_approval`: accepted, waiting for approval; `invited`: waiting for the member. */
-  state?: 'invited' | 'active' | 'pending_admin_approval'
-  /** Set when the invitation is for the viewer's agent and the viewer accepts on its behalf. */
-  memberDid?: string
-}
-
-export interface GroupInvitationView {
-  groupName: string
-  state: 'pending' | 'joined' | 'approval' | 'expired' | 'syncing'
-}
-
-/** Read receipt of one own group message (`group.get_read_markers`). */
-export interface ReadReceipt {
-  count: number
-  readers?: string[]
 }

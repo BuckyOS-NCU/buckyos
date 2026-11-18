@@ -1,5 +1,5 @@
 import { expect, editCell, grantPersistence, openCard, openDesktop, prepareOffline, saveSummary, serviceWorkerReady, test } from './offline-fixtures'
-import { closeWorkspace, openMock, openSide, openStatus, openWorkspacePage, backToList, workspacePage } from './fixtures'
+import { chooseFromZone, closeWorkspace, mainMenu, openSide, openStatus, openWorkspacePage, backToList, workspacePage } from './fixtures'
 
 const ALICE = 'tok-alice'
 
@@ -11,7 +11,8 @@ test('Block snapshots are cached and displayed after an offline cold start', asy
     { op: 'entity.create', entity_id: 'snapshot-def', type_id: 'buckyos.block-def', parent_id: 'data', order_key: 'zz', payload: { def_id: 'test.snapshot', kind: 'html', allow_no_source: true, html: { html: '<div/>', js: 'aiws.ready()' } } },
     { op: 'entity.create', entity_id: 'snapshot-cell', type_id: 'buckyos.cell', parent_id: 'surface-main', order_key: 'zz', payload: { view: { type: 'html' }, def_ref: { entity_id: 'snapshot-def' }, config: { snapshot: { object_id: asset.object_id } } } },
   ])).status).toBe('accepted')
-  await api.rpc(ALICE, 'ws.set_user_state', { workspace_id: ws.workspace_id, entries: { 'canvas:mode': 'view' } })
+  // design mode shows the snapshot (view mode would run the control)
+  await api.rpc(ALICE, 'ws.set_user_state', { workspace_id: ws.workspace_id, entries: { 'canvas:mode': 'edit' } })
   await prepareOffline(page, net, ALICE, ws.workspace_id)
   await serviceWorkerReady(page)
   await expect(page.getByTestId('aiws-prepare-report')).toContainText('资产已缓存 2 个')
@@ -203,7 +204,7 @@ test('persistent storage refused by the browser: offline is unavailable with the
 
 test('a reader without workspace-level read cannot prepare: the backend\'s refusal is shown', async ({ page, api, net }) => {
   const ws = await api.sample(ALICE, `scoped ${Date.now()}`)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', scope_entity_id: 'surface-main', capabilities: ['read'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', resource: 'surface-main', allow: ['read'] }] })
   await openDesktop(page, net, 'tok-bob')
   await grantPersistence(page.context(), page)
   await openCard(page, ws.workspace_id)
@@ -214,7 +215,7 @@ test('a reader without workspace-level read cannot prepare: the backend\'s refus
   await expect(page.getByTestId('aiws-mode')).toHaveAttribute('data-mode', 'direct')
 })
 
-test('offline: undo removes an unsent submission without the network; Mock run and write locks say they need the backend', async ({ page, api, net }) => {
+test('offline: undo removes an unsent submission without the network; write locks say they need the backend', async ({ page, api, net }) => {
   const ws = await api.sample(ALICE, `offline-misc ${Date.now()}`)
   const meta = (await api.rpc(ALICE, 'doc.read', { workspace_id: ws.workspace_id, entity_id: 'project-info' })).meta_rev
   expect((await api.commit(ALICE, ws, [{ op: 'entity.set_write_policy', entity_id: 'project-info', policy: 'lock_required', expect: { rev: meta } }])).status).toBe('accepted')
@@ -253,14 +254,8 @@ test('offline: undo removes an unsent submission without the network; Mock run a
   await lock.getByTestId('aiws-lock-acquire').click()
   await expect(page.getByTestId('aiws-notice').filter({ hasText: '需要写锁的对象在后台不可达时只读' })).toBeVisible()
   await expect(lock).toHaveAttribute('data-held', 'false')
-  await expect(page.getByTestId('aiws-record-project-info').getByRole('button').first()).toBeDisabled()
-
-  // the Mock run happens on the backend: offline it says so and produces nothing
-  await openMock(page)
-  await page.getByTestId('aiws-mock-start').click()
-  await expect(page.getByTestId('aiws-mock-message')).toContainText('没有运行')
-  await expect(page.getByTestId('aiws-mock-run')).toHaveCount(0)
-  expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head)
+  // the record form (UI 框架 PRD §7.3) offers no enabled input while it is read-only
+  await expect(page.getByTestId('aiws-record-project-info').locator('input:not([disabled]), textarea:not([disabled]), select:not([disabled])')).toHaveCount(0)
 
   // a URL query table opened offline: no rows are invented, the view says its data needs the backend
   await closeWorkspace(page)
@@ -337,4 +332,42 @@ test('扩展控件 Q29 offline: a property written offline while its control is 
   await expect(page.getByTestId('aiws-notice').filter({ hasText: '控件已更新' }).last()).toBeVisible({ timeout: 40_000 })
   await expect.poll(async () => (await saveSummary(page)).attention, { timeout: 30_000 }).toBe(1)
   expect((await api.read(ALICE, ws.workspace_id, 'card')).content.payload.config).toEqual({ color: '#000000' })
+})
+
+test('导入原子化 replica: an import saved locally is sent as one Commit in parts; one undo takes it back', async ({ page, api, net }) => {
+  test.setTimeout(180_000)
+  const ws = await api.sample(ALICE, `offline-import ${Date.now()}`)
+  await prepareOffline(page, net, ALICE, ws.workspace_id)
+  await page.evaluate(() => {
+    const w = window as unknown as { __aiwsTestHooks?: Record<string, unknown> }
+    w.__aiwsTestHooks ??= { editors: {} }
+    w.__aiwsTestHooks.commitPartBytes = 4096
+  })
+  const sent: string[] = []
+  page.on('request', (request) => {
+    if (request.method() !== 'POST' || !request.url().includes('/kapi/aiworkspace')) return
+    try { const m = request.postDataJSON()?.method; if (m === 'doc.stage' || m === 'doc.commit') sent.push(m) } catch { /* not JSON */ }
+  })
+  const tables = async () => (await api.outline(ALICE, ws.workspace_id)).filter((e: { type_id?: string; name?: string; deleted?: boolean }) => e.type_id === 'buckyos.table-source' && e.name === 'big' && !e.deleted)
+  const head = await api.headSeq(ALICE, ws.workspace_id)
+  // (a table: an import with pictures needs the backend's asset store, which the replica does not plan against)
+  await chooseFromZone(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-file', 'aiws-menu-import-table'), { name: 'big.csv', mimeType: 'text/csv', buffer: Buffer.from(['n,label', ...Array.from({ length: 3000 }, (_, i) => `${i},row ${i}`)].join('\n')) })
+  const dialog = page.getByTestId('aiws-table-dialog')
+  await dialog.getByTestId('aiws-table-start').click()
+  await expect(dialog).toHaveCount(0, { timeout: 60_000 })
+  // the replica saved one submission; the send loop delivers it through doc.stage + one doc.commit
+  await expect.poll(async () => (await tables()).length, { timeout: 60_000 }).toBe(1)
+  const [source] = await tables()
+  expect((await api.table(ALICE, ws.workspace_id, { source_id: source.entity_id, limit: 1 })).total).toBe(3000)
+  expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head + 1)
+  expect(sent.filter((m) => m === 'doc.stage').length).toBeGreaterThan(1)
+  expect(sent.filter((m) => m === 'doc.commit')).toHaveLength(1)
+  const report = page.getByTestId('aiws-import-report')
+  if (await report.isVisible()) await report.getByTestId('aiws-import-report-close').click()
+  // the change stream settles the submission in the replica; from then on its undo is the backend's
+  await expect.poll(async () => (await saveSummary(page)).pending, { timeout: 60_000 }).toBe(0)
+  await expect(page.getByTestId('aiws-undo')).toHaveText(/撤销 1/)
+  await page.getByTestId('aiws-undo').click()
+  await expect.poll(async () => (await tables()).length, { timeout: 60_000 }).toBe(0)
+  expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head + 2)
 })

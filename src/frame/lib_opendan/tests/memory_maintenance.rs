@@ -1,7 +1,8 @@
 //! The agent's default Memory maintenance Goal (Jarvis default Goal TODO
-//! §9 V01, V04, V07, V08, V09, V17): seeding, the deterministic gate, the
-//! consolidation host tools, the lease, anti echo, the report check and
-//! crash recovery of a receipt.
+//! §9 V01, V04, V07, V08, V09, V17): seeding, its check script (the package's
+//! `goal_checks/memory_maintenance.ts` on Deno), the consolidation host
+//! tools, the lease, anti echo, the report check and crash recovery of a
+//! receipt.
 
 mod common;
 
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use libopendan::host::goals::{GoalHost, GoalHostOptions, ManualClock};
+use libopendan::host::goals::{GoalClock, GoalHost, GoalHostOptions, ManualClock};
 use libopendan::host::{HostDeps, Supervisor};
 use libopendan::lock::Acquire;
 use libopendan::memory::{Memory, MemoryConfig, CONSOLIDATION_LEASE};
@@ -60,14 +61,21 @@ fn host_deps(env: &Env, llm: Arc<ScriptedLlm>) -> HostDeps {
     }
 }
 
+/// The package's check script of the built-in Goal.
+const PACKAGE_CHECK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/jarvis_agent/agent/goal_checks/memory_maintenance.ts");
+
 /// `agent.toml` that switches the built-in Goal on (no behavior: the plain
-/// function-call prompt with the host tools).
+/// function-call prompt with the host tools), and the package's check script
+/// on the AgentRoot.
 fn enable_maintenance(env: &Env) {
     std::fs::write(
         env.agent_root.join("agent.toml"),
         "[session.goal.maintenance]\nenabled = true\nbehavior = \"\"\n",
     )
     .unwrap();
+    let dir = env.agent_root.join("goal_checks");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(PACKAGE_CHECK, dir.join("memory_maintenance.ts")).unwrap();
 }
 
 fn hosted(env: &Env, llm: Arc<ScriptedLlm>) -> Hosted {
@@ -77,7 +85,9 @@ fn hosted(env: &Env, llm: Arc<ScriptedLlm>) -> Hosted {
         json!({ "tools": { "enabled": true } }),
     );
     opts.clock = clock.clone();
-    let sup = Supervisor::new(host_deps(env, llm), None).with_goals(GoalHost::new(opts));
+    let mut deps = host_deps(env, llm);
+    deps.options.goal_clock = GoalClock(clock.clone());
+    let sup = Supervisor::new(deps, None).with_goals(GoalHost::new(opts));
     Hosted {
         sup,
         clock,
@@ -91,8 +101,9 @@ impl Hosted {
         self.sup.tick_goals().await.unwrap();
     }
 
+    /// Tick until `f` holds (~20s: each check starts a Deno).
     async fn until(&self, what: &str, f: impl Fn(&Hosted) -> bool) {
-        for _ in 0..400 {
+        for _ in 0..800 {
             self.tick().await;
             if f(self) {
                 return;
@@ -124,11 +135,13 @@ impl Hosted {
         block(self.agent.goals().state(id)).unwrap()
     }
 
-    fn gate(&self, id: &str) -> MaintenanceGate {
-        block(self.agent.goals().schedule(id))
-            .unwrap()
-            .and_then(|s| s.gate)
-            .expect("the built-in goal has a gate")
+    fn schedule(&self, id: &str) -> GoalSchedule {
+        block(self.agent.goals().schedule(id)).unwrap().expect("the built-in goal has a schedule")
+    }
+
+    /// What the last check of the built-in Goal said.
+    fn last_check(&self, id: &str) -> CheckRecord {
+        self.schedule(id).last_check.expect("a check ran")
     }
 
     fn session(&self, id: &str) -> SessionDir {
@@ -334,11 +347,16 @@ async fn the_builtin_goal_is_seeded_once_and_costs_no_model_without_material() {
     let ext = g.opendan().unwrap();
     assert!(ext.has_capability(CAP_MEMORY_CONSOLIDATION) && !ext.records_perception);
     assert_eq!(ext.policy_version, MEMORY_MAINTENANCE_POLICY_VERSION);
-    // Its session exists; the created event went through the gate: no work.
+    // It runs the package's check script; its session exists; the start
+    // was a check: nothing to consolidate, no model.
+    let check = g.schedule.check.clone().expect("the package check script");
+    assert_eq!(check.source, "package:goal_checks/memory_maintenance.ts");
+    assert_eq!(check.package.as_deref(), Some("goal_checks/memory_maintenance.ts"));
     assert!(h.agent.sessions().lookup(&g.session.sid).await.unwrap().is_some());
-    let gate = h.gate(&g.goal_id);
-    assert_eq!(gate.status, "no_work", "{gate:?}");
-    assert!(gate.last_full_check_at_ms > 0 && gate.last_inputs_digest.is_some());
+    let last = h.last_check(&g.goal_id);
+    assert_eq!(last.outcome, CheckOutcome::False, "{last:?} {:?}", h.schedule(&g.goal_id));
+    let st = h.schedule(&g.goal_id).check_state.expect("the script keeps its state");
+    assert!(st["digest"].is_string() && st["full_check_at"].is_number(), "{st}");
     assert!(h.activations(&g.goal_id).is_empty());
     h.shutdown().await;
     // Two more hosts (restarts): the same Goal, one `created` change.
@@ -356,13 +374,62 @@ async fn the_builtin_goal_is_seeded_once_and_costs_no_model_without_material() {
     // Two slots without any change: cheap checks only.
     let h = hosted(&env, silent_llm());
     h.tick().await;
-    for _ in 0..2 {
+    for n in 1..=2 {
         h.clock.advance(SLOT_MS);
         h.tick().await;
-        let gate = h.gate(&g.goal_id);
-        assert!(matches!(gate.status.as_str(), "no_change" | "no_work"), "{gate:?}");
+        let s = h.schedule(&g.goal_id);
+        assert_eq!(s.last_check.as_ref().unwrap().outcome, CheckOutcome::False, "{s:?}");
+        assert!(s.skipped.iter().filter(|k| k.reason == "check_false").count() >= n, "{s:?}");
     }
     assert!(h.activations(&g.goal_id).is_empty());
+    // A package upgrade replaces a script the Goal never changed …
+    std::fs::write(env.agent_root.join("goal_checks/memory_maintenance.ts"), format!("{}\n// upgraded\n", std::fs::read_to_string(PACKAGE_CHECK).unwrap())).unwrap();
+    h.shutdown().await;
+    let h = hosted(&env, silent_llm());
+    h.tick().await;
+    let v2 = h.builtin().schedule.check.unwrap();
+    assert_eq!(v2.version, check.version + 1, "{v2:?}");
+    // … and keeps one the Goal wrote itself.
+    let own = h
+        .agent
+        .goals()
+        .set_check(
+            &g.goal_id,
+            &libopendan::state::GoalCheckChange {
+                script: Some("export default () => ({ run: false });\n".into()),
+                reason: Some("tuned".into()),
+                ..Default::default()
+            },
+            &GoalCaller::owner("someone"),
+        )
+        .await
+        .unwrap()
+        .schedule
+        .check
+        .unwrap();
+    assert_eq!(own.source, "owner");
+    assert_eq!(own.package.as_deref(), Some("goal_checks/memory_maintenance.ts"), "it still knows where it came from");
+    std::fs::write(env.agent_root.join("goal_checks/memory_maintenance.ts"), "// newer package\nexport default () => true;\n").unwrap();
+    h.shutdown().await;
+    let h = hosted(&env, silent_llm());
+    h.tick().await;
+    assert_eq!(h.builtin().schedule.check.unwrap().version, own.version, "an upgrade keeps what the goal changed");
+    // Restoring the package's script is the owner's choice.
+    let restored = h
+        .agent
+        .goals()
+        .set_check(
+            &g.goal_id,
+            &libopendan::state::GoalCheckChange { restore_package: true, ..Default::default() },
+            &GoalCaller::owner(AGENT),
+        )
+        .await
+        .unwrap()
+        .schedule
+        .check
+        .unwrap();
+    assert_eq!(restored.source, "package:goal_checks/memory_maintenance.ts");
+    assert!(h.agent.goals().check_script(&g.goal_id, None).await.unwrap().unwrap().contains("newer package"));
     // Another agent's root gets its own Goal (isolation by directory).
     let env2 = Env::new();
     enable_maintenance(&env2);
@@ -377,7 +444,7 @@ async fn the_builtin_goal_is_seeded_once_and_costs_no_model_without_material() {
     h.shutdown().await;
 }
 
-/// V04 / the main flow: material makes the gate active, the Activation reads
+/// V04 / the main flow: material makes the check pass, the Activation reads
 /// a batch and commits it through the host tools; the cognition exists, the
 /// material is cleared, the receipt is complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -417,14 +484,16 @@ async fn material_is_consolidated_through_the_host_tools() {
     // The Goal Session itself left no material: nothing to do at the next slot.
     h.clock.advance(SLOT_MS);
     h.tick().await;
-    let gate = h.gate(&g.goal_id);
-    assert!(matches!(gate.status.as_str(), "no_work" | "no_change"), "{gate:?}");
+    assert_eq!(h.last_check(&g.goal_id).outcome, CheckOutcome::False);
     assert_eq!(h.activations(&g.goal_id).len(), 1);
-    // A second piece of material: the next slot is active and consolidates it.
+    // A second piece of material: the next slot's check passes and the
+    // Activation consolidates it.
     leave_material(&env, "B").await;
     h.clock.advance(SLOT_MS);
     h.until("second activation", |h| h.activations(&g.goal_id).len() == 2).await;
-    assert_eq!(h.gate(&g.goal_id).status, "active");
+    let last = h.last_check(&g.goal_id);
+    assert_eq!(last.outcome, CheckOutcome::True);
+    assert!(last.reason.as_deref().unwrap_or_default().contains("1 new"), "{last:?}");
     assert_eq!(h.activations(&g.goal_id)[1].reasons[0].kind, ActivationReasonKind::Scheduled);
     let m = h.state(&g.goal_id).unwrap().maintenance.unwrap();
     assert_eq!(m.consolidations, 2);
@@ -549,10 +618,129 @@ async fn an_acted_report_with_an_open_batch_is_refused() {
     h.shutdown().await;
 }
 
-/// V02 / V06: a paused Goal shows `paused` in its gate and runs nothing; a
-/// resumed one checks again at the next slot.
+/// A plan that writes one cognition `item` with `statement` for `refs`.
+fn statement_plan(op: &str, refs: &[String], item: &str, statement: &str, extra: Value) -> Value {
+    let obs = extra["obs"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("obs_{}", item.trim_start_matches("item_")));
+    let mut put = json!({"op": "put_item", "item_id": item, "kind": "observation_inference",
+        "claim": {"type": "observation_inference", "statement": statement},
+        "weight": 0.6, "confidence": 0.7, "evidence": [obs], "write_reason": "test",
+        "scope": {"subjects": [AGENT]}, "basis": "tool_observation",
+        "last_evidence_at": "2026-10-23T00:00:00Z", "stability": "contextual"});
+    let mut plan = json!({
+        "operation_id": op,
+        "summary": "one cognition from the work's observation",
+        "dispositions": refs.iter().map(|r| json!({"perception_ref": r, "outcome": "absorbed", "cognition_refs": [item]})).collect::<Vec<_>>(),
+    });
+    for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+        if k == "reviewed" {
+            plan[k] = v;
+        } else if k != "obs" {
+            put[k] = v;
+        }
+    }
+    plan["operations"] = json!([
+        {"op": "add_observation", "observation_id": obs, "kind": "tool_evidence",
+         "content": "as observed", "source_ref": {"type": "session_event", "event_ref": refs[0]}, "confidence": 0.8},
+        put
+    ]);
+    plan
+}
+
+/// The commits of one activation, tried in order: the next one is sent
+/// after each refusal, the report after the first accepted one.
+fn committing_llm(attempts: Vec<(&'static str, &'static str, Value)>) -> Arc<ScriptedLlm> {
+    ScriptedLlm::new(move |req, n| {
+        let results = tool_results(req);
+        if results.iter().any(|t| t.contains("\"status\":\"committed\"")) {
+            return report(n, json!({ "decision": "acted", "distance": "batch committed" }));
+        }
+        let Some(begin) = results.iter().find(|t| t.contains("\"operation_id\":\"mc-")) else {
+            return tool_call(&format!("b{n}"), TOOL_MEMORY_CONSOLIDATION_BEGIN, json!({}));
+        };
+        let tried = results.len() - 1;
+        let (item, statement, extra) = attempts.get(tried).unwrap_or_else(|| panic!("no attempt {tried}: {results:?}"));
+        tool_call(
+            &format!("c{n}"),
+            TOOL_MEMORY_CONSOLIDATION_COMMIT,
+            statement_plan(&field(begin, "operation_id").unwrap(), &refs_of(begin), item, statement, extra.clone()),
+        )
+    })
+}
+
+/// T3 / Q9: `explicit` is the user's statement, never an inference; a
+/// statement that reads like a log is named once (advice) and accepted as
+/// it is with `reviewed: true`; the batch shows the rules and the sources
+/// of what is known.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pause_shows_in_the_gate_and_resume_checks_again() {
+async fn expression_review_is_advice_and_explicit_is_never_an_inference() {
+    const LOG: &str = "2026-10-27T23:00:15Z work-20261027-3 reported done; 2026-10-28T01:10:00Z the UI relayed it";
+    let env = Env::new();
+    enable_maintenance(&env);
+    leave_material(&env, "A").await;
+    let llm = committing_llm(vec![
+        ("item_log", LOG, json!({ "explicit": true, "basis": "inference" })),
+        ("item_log", LOG, json!({})),
+        ("item_log", LOG, json!({ "reviewed": true })),
+    ]);
+    let h = hosted(&env, llm.clone());
+    h.tick().await;
+    let g = h.builtin();
+    h.until("activation", |h| h.activations(&g.goal_id).len() == 1).await;
+    assert_eq!(h.activations(&g.goal_id)[0].decision, ActivationDecision::Acted);
+    let last = llm.requests.lock().unwrap().last().cloned().unwrap();
+    let results = tool_results(&last);
+    assert!(results[0].contains("\"admission\"") && results[0].contains("\"weight\"") && results[0].contains("\"explicit\""), "{}", results[0]);
+    assert!(results[1].contains("an inference is not explicit"), "{}", results[1]);
+    assert!(results[2].contains("expression review") && results[2].contains("reads like a log") && results[2].contains("reviewed: true"), "{}", results[2]);
+    assert!(results[3].contains("\"status\":\"committed\""), "{}", results[3]);
+    let view = memory(&env).graph_view().unwrap();
+    assert_eq!(view.item("item_log").expect("kept on purpose").statement(), LOG);
+    h.shutdown().await;
+}
+
+/// T3: a date, a version and a period that change the meaning are not a
+/// log; a new item that repeats a known one in the same range is named,
+/// with the known item's sources shown in the batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dated_versioned_statement_passes_and_a_twin_is_named() {
+    const STATEMENT: &str = "tool-x v1.2 on Linux needs an explicit output directory (seen 2026-11-01; v2 succeeded without one)";
+    let env = Env::new();
+    enable_maintenance(&env);
+    let first = leave_material(&env, "A").await;
+    let llm = committing_llm(vec![("item_toolx", STATEMENT, json!({}))]);
+    let h = hosted(&env, llm.clone());
+    h.tick().await;
+    let g = h.builtin();
+    h.until("first activation", |h| h.activations(&g.goal_id).len() == 1).await;
+    assert_eq!(llm.count(), 3, "begin, one accepted commit, report");
+    h.shutdown().await;
+
+    leave_material(&env, "B").await;
+    let llm = committing_llm(vec![
+        ("item_toolx_again", "tool-x v1.2 on Linux needs an explicit output directory (seen 2026-11-01)", json!({})),
+        ("item_toolx", STATEMENT, json!({ "expected_revision": 1, "obs": "obs_toolx_b" })),
+    ]);
+    let h = hosted(&env, llm.clone());
+    h.clock.advance(SLOT_MS);
+    h.until("second activation", |h| h.activations(&g.goal_id).len() == 2).await;
+    let last = llm.requests.lock().unwrap().last().cloned().unwrap();
+    let results = tool_results(&last);
+    assert!(results[0].contains(&format!("\"sources\":[\"{}:1\"]", first.sid())), "{}", results[0]);
+    assert!(results[1].contains("expression review") && results[1].contains("close to the known item_toolx@1"), "{}", results[1]);
+    assert!(results[2].contains("\"status\":\"committed\""), "{}", results[2]);
+    let view = memory(&env).graph_view().unwrap();
+    assert!(view.item("item_toolx_again").is_none());
+    assert_eq!(view.item("item_toolx").unwrap().revision, 2);
+    h.shutdown().await;
+}
+
+/// V02 / V06: a paused Goal runs nothing, not even its check; a resumed one
+/// checks again at the next slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_goal_checks_nothing_and_resume_checks_again() {
     let env = Env::new();
     enable_maintenance(&env);
     let h = hosted(&env, silent_llm());
@@ -572,11 +760,14 @@ async fn pause_shows_in_the_gate_and_resume_checks_again() {
         .await
         .unwrap();
     leave_material(&env, "A").await;
+    let checks = h.schedule(&g.goal_id).stats.checks_false + h.schedule(&g.goal_id).stats.checks_true;
     h.clock.advance(SLOT_MS);
     h.tick().await;
-    // The admission chain skips a paused goal before the gate; the gate's
-    // own view is updated by the restart below.
+    // The gate skips a paused goal before its check.
     assert!(h.activations(&g.goal_id).is_empty());
+    let s = h.schedule(&g.goal_id);
+    assert!(s.skipped.iter().any(|k| k.reason == "paused"), "{s:?}");
+    assert_eq!(s.stats.checks_false + s.stats.checks_true, checks, "no check ran");
     h.shutdown().await;
     // Restarting the host does not revive a paused goal.
     let h = hosted(&env, silent_llm());
@@ -603,7 +794,36 @@ async fn pause_shows_in_the_gate_and_resume_checks_again() {
     // of the wall clock (a clock set back replays no slot).
     h.clock.advance(2 * SLOT_MS);
     h.until("activation after resume", |h| h.activations(&g.goal_id).len() == 1).await;
-    assert_eq!(h.gate(&g.goal_id).status, "active");
+    assert_eq!(h.last_check(&g.goal_id).outcome, CheckOutcome::True);
+    h.shutdown().await;
+}
+
+/// H6: without material the built-in Goal infers only when its hard
+/// guarantee comes (72 hours by default), once per quiet stretch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_material_only_the_hard_guarantee_infers() {
+    let env = Env::new();
+    enable_maintenance(&env);
+    let llm = consolidating_llm();
+    let h = hosted(&env, llm.clone());
+    h.tick().await;
+    let g = h.builtin();
+    for _ in 0..3 {
+        h.clock.advance(SLOT_MS);
+        h.tick().await;
+    }
+    assert!(h.activations(&g.goal_id).is_empty());
+    assert_eq!(llm.count(), 0);
+    h.clock.advance(72 * 3600 * 1000);
+    h.until("the hard guarantee", |h| h.activations(&g.goal_id).len() == 1).await;
+    let a = &h.activations(&g.goal_id)[0];
+    assert_eq!(a.reasons[0].kind, ActivationReasonKind::Guarantee, "{a:?}");
+    assert!(a.reasons[0].note.as_deref().unwrap().contains("last check false"), "{a:?}");
+    for _ in 0..3 {
+        h.clock.advance(SLOT_MS);
+        h.tick().await;
+    }
+    assert_eq!(h.activations(&g.goal_id).len(), 1);
     h.shutdown().await;
 }
 
@@ -656,6 +876,14 @@ async fn crash_then_recover(fault: &str) {
     assert!(!wait_exit(&mut child).success(), "the child aborts at {fault}");
     let h = hosted(&env, consolidating_llm());
     let g = h.builtin();
+    // The Activation the crash interrupted goes on once its owner resumes it.
+    h.until("interrupted", |h| {
+        block(h.agent.sessions().lookup(&g.session.sid))
+            .unwrap()
+            .is_some_and(|e| e.status.paused == Some(PauseSource::Interrupted))
+    })
+    .await;
+    assert_eq!(resume_interrupted(h.agent.as_ref()).await, 1);
     h.until("activation after the crash", |h| h.activations(&g.goal_id).len() == 1).await;
     let a = &h.activations(&g.goal_id)[0];
     assert_eq!(a.decision, ActivationDecision::Acted, "{a:?}");

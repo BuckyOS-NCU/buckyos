@@ -85,14 +85,18 @@ async fn a_guest_token_reaches_public_grants_only() {
     assert_eq!(code(&r), "NOT_FOUND", "{r}");
     assert_eq!(srv.rpc(GUEST, "ws.list", json!({})).await["workspaces"], json!([]));
     assert_eq!(code(&srv.rpc(GUEST, "ws.create", json!({ "title": "x" })).await), "PERMISSION_DENIED");
+    assert_eq!(code(&srv.rpc(GUEST, "ws.ensure", json!({ "name": "x" })).await), "PERMISSION_DENIED");
+    // the service clock is anyone's (控件机制 TODO G16)
+    assert!(srv.rpc(GUEST, "ws.time", json!({})).await["server_ms"].as_i64().is_some_and(|t| t > 1_700_000_000_000));
     assert_eq!(code(&srv.rpc(GUEST, "ws.list_subjects", json!({})).await), "PERMISSION_DENIED");
     assert_eq!(code(&srv.rpc(GUEST, "ws.import", json!({ "bucket_id": bound["bucket_id"], "key": bound["key"], "semantics": "new" })).await), "PERMISSION_DENIED");
     assert!(srv.raw("gt_tooshort", "ws.get_info", json!({ "workspace_id": id })).await.is_err(), "a malformed guest token is no session");
     let asset = srv.http.get(format!("{}/asset/{}/{}", srv.base, id, object_id)).bearer_auth(GUEST).send().await.unwrap();
     assert_eq!(asset.status(), 404);
 
-    // alice publishes the link
-    srv.rpc("tok-alice", "ws.grant", json!({ "workspace_id": id, "subject": "public", "capabilities": ["read", "comment"] })).await;
+    // alice opens the Workspace to anonymous visitors (权限需求 §4.2: the switch, and `@guest`'s entry)
+    srv.rpc("tok-alice", "acl.set_anonymous", json!({ "workspace_id": id, "enabled": true })).await;
+    srv.rpc("tok-alice", "acl.set", json!({ "workspace_id": id, "changes": [{ "subject": "@guest", "allow": ["read", "comment"] }] })).await;
     let info = srv.rpc(GUEST, "ws.get_info", json!({ "workspace_id": id })).await;
     assert_eq!(info["capabilities"], json!(["read", "comment"]), "{info}");
     assert!(info["principal"].as_str().unwrap().starts_with("guest:"));
@@ -106,7 +110,7 @@ async fn a_guest_token_reaches_public_grants_only() {
     let note = srv.rpc(GUEST, "doc.read", json!({ "workspace_id": id, "entity_id": "note" })).await;
     assert_eq!(note["content"]["payload"]["author"], info["principal"]);
     // guests cannot change who may come in
-    assert_eq!(code(&srv.rpc(GUEST, "ws.revoke", json!({ "workspace_id": id, "subject": "public" })).await), "PERMISSION_DENIED");
-    srv.rpc("tok-alice", "ws.revoke", json!({ "workspace_id": id, "subject": "public" })).await;
+    assert_eq!(code(&srv.rpc(GUEST, "acl.set_anonymous", json!({ "workspace_id": id, "enabled": false })).await), "PERMISSION_DENIED");
+    srv.rpc("tok-alice", "acl.set_anonymous", json!({ "workspace_id": id, "enabled": false })).await;
     assert_eq!(code(&srv.rpc(GUEST, "ws.get_info", json!({ "workspace_id": id })).await), "NOT_FOUND");
 }

@@ -634,6 +634,9 @@ async fn own_run_context(
     }
     llm_ctx["runtime"] = serde_json::to_value(sh.deps.runtime.config()).unwrap();
     resolve_context_window(sh, &mut llm_ctx).await;
+    // The assembled system is final text (the session's own templates are
+    // already rendered): never an xllm template, so a literal `{{` from a
+    // skill, the objective or the identity stays as written.
     let hosted = XllmTask::prepare_hosted(
         sh.dir.path(),
         &llm_ctx,
@@ -642,7 +645,7 @@ async fn own_run_context(
             .join("session_config.json")
             .display()
             .to_string(),
-        &system,
+        &system.replace("{{", "\\{{"),
         &xdeps,
     )
     .await?;
@@ -1497,11 +1500,13 @@ pub(super) struct InputBatch<'a> {
     /// `background_shown` after this batch and the semi-subscription
     /// versions its input message shows (as background lines).
     pub background: Option<(std::collections::BTreeMap<String, String>, Vec<EventReceipt>)>,
+    /// The session's Memory observation after this batch.
+    pub memory: Option<super::memory_batch::MemoryReceipt>,
     /// The controlled input message: template output and media blocks.
     pub text: String,
     pub media: Vec<AiContent>,
     /// Goal Sessions: the Activation this batch opens and its header
-    /// (placed first; the receipt carries the Activation).
+    /// (leading the input message; the receipt carries the Activation).
     pub goal: Option<super::goal::Opening>,
     /// Revision of the TodoList whose view the input message shows.
     pub todo_rev: Option<u64>,
@@ -1587,6 +1592,21 @@ pub(super) async fn commit_input_batch(
         );
         events = shown;
     }
+    if let Some(m) = batch.memory {
+        extra.insert(
+            RECEIPT_MEMORY.to_string(),
+            serde_json::to_value(&m.state).unwrap_or(Value::Null),
+        );
+        if let Some(t) = m.topic {
+            extra.insert(
+                RECEIPT_TOPIC.to_string(),
+                serde_json::to_value(t).unwrap_or(Value::Null),
+            );
+        }
+        if let Some(e) = m.error {
+            extra.insert(RECEIPT_MEMORY_ERROR.to_string(), Value::String(e));
+        }
+    }
     if let Some(g) = &goal {
         extra.insert(
             RECEIPT_GOAL_ACTIVATION.to_string(),
@@ -1616,15 +1636,19 @@ pub(super) async fn commit_input_batch(
     let after_step = lc.ctx.snapshot().state.next_step_index;
     let mut messages = Vec::new();
     let mut part_texts: Vec<(&str, String)> = Vec::new();
-    let goal_brief = goal.as_ref().map(|g| g.brief.clone());
-    if let Some(g) = &goal {
-        messages.push(AiMessage::text(AiRole::User, g.text.clone()));
-        part_texts.push((PART_GOAL, g.text.clone()));
-    }
-    let mut input_msg = AiMessage::text(AiRole::User, batch.text.clone());
+    // A Goal Activation's header leads its input message (one User message,
+    // TODO B5); history keeps one line of it.
+    let (text, goal_brief) = match &goal {
+        Some(g) => (
+            format!("{}\n{}", g.text, batch.text),
+            Some(format!("{}\n{}", g.brief, batch.text)),
+        ),
+        None => (batch.text, None),
+    };
+    let mut input_msg = AiMessage::text(AiRole::User, text.clone());
     input_msg.content.extend(batch.media);
     messages.push(input_msg);
-    part_texts.push((PART_INPUT, batch.text));
+    part_texts.push((PART_INPUT, text));
     let count = messages.len();
     let pos = lc.ctx.inject(Injection {
         messages,
@@ -1649,11 +1673,7 @@ pub(super) async fn commit_input_batch(
             .into_iter()
             .zip(positions)
             .map(|((part, text), pos)| ReceiptPart {
-                brief: if part == PART_GOAL {
-                    goal_brief.clone()
-                } else {
-                    None
-                },
+                brief: if part == PART_INPUT { goal_brief.clone() } else { None },
                 part: part.to_string(),
                 pos,
                 text,

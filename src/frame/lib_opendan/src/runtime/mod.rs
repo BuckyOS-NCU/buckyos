@@ -206,35 +206,28 @@ pub async fn open_node_target_of(runtime_id: &str, config: &RuntimeConfig, ops_d
 const NODE_SESSIONS_DIR: &str = "sessions";
 
 /// The directory of this agent on a node: `<account home>/.opendan/<agent_id>`
-/// (directory convention). The executor's account home must lie inside
-/// the granted roots.
+/// (directory convention), or `<first granted root>/.opendan/<agent_id>`
+/// when the account home lies outside the granted roots (a device issued
+/// for one work directory).
 pub fn node_agent_dir(target: &RemoteNodeTarget, runtime_id: &str, agent_id: &str) -> Result<String> {
-    let home = target
-        .described()
-        .info
-        .home
-        .clone()
-        .filter(|h| !h.trim().is_empty())
-        .ok_or_else(|| {
-            OpenDanError::Bind(format!(
-                "runtime `{runtime_id}`: its executor reports no account home, so the agent's directory there (<home>/.opendan/{agent_id}) cannot be placed"
-            ))
-        })?;
+    let home = target.described().info.home.clone().filter(|h| !h.trim().is_empty());
     let roots = target.workdir_roots();
     let grant = RuntimeGrant { roots: roots.iter().map(PathBuf::from).collect(), ..Default::default() };
-    if !grant.within_roots(&home) {
-        return Err(OpenDanError::Bind(format!(
-            "runtime `{runtime_id}`: the account home {home} is outside the granted roots ({}); ask the administrator to include it",
-            roots.join(", ")
-        )));
-    }
-    Ok(target_join(&home, &[".opendan", agent_id]))
+    let base = match home {
+        Some(home) if grant.within_roots(&home) => home,
+        _ => roots.first().cloned().ok_or_else(|| {
+            OpenDanError::Bind(format!(
+                "runtime `{runtime_id}`: its executor reports no account home and grants no directory, so the agent's directory there cannot be placed"
+            ))
+        })?,
+    };
+    Ok(target_join(&base, &[".opendan", agent_id]))
 }
 
 /// Join path parts below `base` with the separator of the target OS (a
 /// drive path is a Windows path whatever this side runs on).
 pub fn target_join(base: &str, parts: &[&str]) -> String {
-    let windows = buckyos_api::is_absolute_node_path(base) && !base.starts_with('/');
+    let windows = (buckyos_api::is_absolute_node_path(base) && !base.starts_with('/')) || base.starts_with(r"\\");
     let sep = if windows { '\\' } else { '/' };
     let mut out = base.trim_end_matches(['/', '\\']).to_string();
     for part in parts {
@@ -253,30 +246,10 @@ pub struct SessionEnvCtx {
     pub input_queue: Option<String>,
     pub trace_id: String,
     pub extra_env: Vec<(String, String)>,
-    /// The session's frozen cmd_skills: their commands
-    /// (`<agent_root>/tools/<name>/bin`) come first on PATH.
-    pub cmd_skills: Vec<String>,
     /// The session's workspace: where it is, beside the working directory.
     pub workspace: Option<WorkspaceBinding>,
 }
 
-/// `<agent_root>/tools/<name>/bin` of each cmd_skill that brings commands.
-pub fn skill_tool_dirs(agent_root: &Path, cmd_skills: &[String]) -> Vec<PathBuf> {
-    cmd_skills
-        .iter()
-        .map(|n| agent_root.join(crate::skills::TOOLS_DIR).join(n).join("bin"))
-        .filter(|d| d.is_dir())
-        .collect()
-}
-
-/// The names of the session's frozen cmd_skills.
-pub fn frozen_cmd_skills(cfg: &SessionConfig) -> Vec<String> {
-    cfg.prompt
-        .frozen
-        .as_ref()
-        .map(|f| f.cmd_skills.iter().map(|c| c.name.clone()).collect())
-        .unwrap_or_default()
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEnv {
     pub runtime_id: String,
@@ -560,7 +533,8 @@ pub async fn runtime_for_session(
         config.baseline = Some(frozen.baseline());
         config.workdir = Some(node_workdir(sd, agent, &frozen.runtime_id, &config).await?);
         let mut deps = deps.clone();
-        if deps.node_executor.is_none() {
+        let device = config.remote_node.as_ref().and_then(|n| n.executor_id.as_deref()).is_some_and(|e| !e.is_empty());
+        if deps.node_executor.is_none() || device {
             let (connector, resolved, _) = connector_for(&frozen.runtime_id, &config).await?;
             deps.node_executor = Some(connector);
             config = resolved;
@@ -685,13 +659,11 @@ pub fn runtime_entry(r: &RuntimeRecord) -> serde_json::Value {
         "default": r.default,
         "private": r.is_private(),
         "computer": r.grant.computer.as_str(),
-        "install": r.grant.install,
         "read_only": r.grant.read_only(),
-        "workspace": r.grant.workspace,
+        "workspace": r.grant.no_workspace().is_none(),
         "roots": r.grant.roots,
         "desktop": r.caps.desktop,
         "desktop_error": r.caps.desktop_error,
-        "skill_commands": r.usage.skill_commands,
         "desc": r.desc,
     });
     if let Some(t) = &r.caps.tools_check {
@@ -733,7 +705,7 @@ pub fn runtime_line(r: &RuntimeRecord) -> String {
     if r.grant.read_only() {
         flags.push("read-only".to_string());
     }
-    if !r.grant.workspace {
+    if r.grant.no_workspace().is_some() {
         flags.push("no workspaces".to_string());
     }
     if r.caps.desktop {
@@ -749,12 +721,8 @@ pub fn runtime_line(r: &RuntimeRecord) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default();
-    let install = serde_json::to_value(r.grant.install)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default();
     let mut line = format!(
-        "- {}: {} — {}; {}; {}; {}; computer: {}; install: {}{}",
+        "- {}: {} — {}; {}; {}; {}; computer: {}{}",
         r.runtime_id,
         one_line(&r.name),
         r.connector.as_str(),
@@ -762,7 +730,6 @@ pub fn runtime_line(r: &RuntimeRecord) -> String {
         r.caps.baseline.as_str(),
         availability,
         r.grant.computer.as_str(),
-        install,
         if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) },
     );
     if !r.grant.roots.is_empty() {
@@ -773,9 +740,6 @@ pub fn runtime_line(r: &RuntimeRecord) -> String {
     }
     if let Some(t) = r.caps.tools_check.as_ref().filter(|t| !t.present.is_empty()) {
         line.push_str(&format!("; commands: {}", t.present.join(", ")));
-    }
-    if !r.usage.skill_commands.is_empty() {
-        line.push_str(&format!("; skill commands: {}", r.usage.skill_commands.join(", ")));
     }
     if !r.desc.is_empty() {
         line.push_str(&format!(" — {}", one_line(&r.desc)));
@@ -929,7 +893,7 @@ pub async fn bind_or_verify(
     }
     bin_overlay::prepare(&sd.runtime_bin_dir(), plan)?;
     bin_overlay::verify(&sd.runtime_bin_dir(), plan)?;
-    let layers = if node { Vec::new() } else { session_layers(sd, cfg, agent_root) };
+    let layers = if node { Vec::new() } else { session_layers(sd, agent_root) };
     let windows_target = node && desc.capabilities.os == "windows";
     let tools: Vec<&str> = cfg.runtime.requirement.tools.iter().map(String::as_str).collect();
     if !tools.is_empty() {
@@ -1225,6 +1189,25 @@ pub async fn check_commands(record: &RuntimeRecord, ops_dir: &Path, commands: &[
     }
 }
 
+pub async fn check_node_placement(agent: &dyn crate::state::AgentStateClient, record: &RuntimeRecord) -> Result<()> {
+    let Ok(ops_dir) = runtime_ops_dir(agent) else {
+        return Ok(());
+    };
+    let exec = record
+        .exec()
+        .ok_or_else(|| OpenDanError::Bind(format!("runtime `{}` is not enabled", record.runtime_id)))?;
+    let config = node_config_of(&record.runtime_id, &exec)?;
+    let target = open_node_target_of(&record.runtime_id, &config, &ops_dir).await?;
+    node_agent_dir(&target, &record.runtime_id, agent.agent_id())?;
+    if !target.caps().contains(&buckyos_api::ExecutorOp::Mkdir) {
+        return Err(OpenDanError::Bind(format!(
+            "runtime `{}` does not allow creating directories, so a session's directory cannot be made there; use it from a private session (`agent-session run` / `copy`)",
+            record.runtime_id
+        )));
+    }
+    Ok(())
+}
+
 /// `<account home>/.opendan/<agent>` on the node of `record`.
 async fn node_agent_dir_of(record: &RuntimeRecord, agent_id: &str, ops_dir: &Path) -> Option<String> {
     let config = node_config_of(&record.runtime_id, &record.exec()?).ok()?;
@@ -1443,14 +1426,7 @@ pub async fn runtime_exec(
         if !dir.is_absolute() || !dir.is_dir() {
             return Err(OpenDanError::InvalidArgument(format!("--cwd {} is not an existing absolute directory on the private runtime", dir.display())));
         }
-        let mut layers = Vec::new();
-        if let Some(root) = agent.agent_root() {
-            if root.join("tools").is_dir() {
-                layers.push(root.join("tools"));
-            }
-        }
-        layers.extend(crate::baseline::managed_tool_dirs());
-        (private_runtime_of(&dir)?, dir.display().to_string(), layers)
+        (private_runtime_of(&dir)?, dir.display().to_string(), crate::baseline::managed_tool_dirs())
     } else {
         let dir = cwd
             .filter(|c| !c.trim().is_empty())
@@ -1600,7 +1576,6 @@ pub async fn open_session_env(binding: &Binding, ctx: &SessionEnvCtx) -> Result<
     if binding.connector != "node_executor" {
         layers.push(ctx.session_dir.join(RUNTIME_DIR).join("bin"));
         if let Some(root) = &ctx.agent_root {
-            layers.extend(skill_tool_dirs(root, &ctx.cmd_skills));
             if root.join("tools").is_dir() {
                 layers.push(root.join("tools"));
             }
@@ -1618,12 +1593,10 @@ pub async fn open_session_env(binding: &Binding, ctx: &SessionEnvCtx) -> Result<
     })
 }
 
-/// PATH layers of a local session: the session bin, the frozen cmd_skills'
-/// commands, the agent's tools.
-fn session_layers(sd: &SessionDir, cfg: &SessionConfig, agent_root: Option<&Path>) -> Vec<PathBuf> {
+/// PATH layers of a local session: the session bin, the agent's tools.
+fn session_layers(sd: &SessionDir, agent_root: Option<&Path>) -> Vec<PathBuf> {
     let mut layers = vec![sd.runtime_bin_dir()];
     if let Some(root) = agent_root {
-        layers.extend(skill_tool_dirs(root, &frozen_cmd_skills(cfg)));
         if root.join("tools").is_dir() {
             layers.push(root.join("tools"));
         }
@@ -1664,8 +1637,22 @@ pub fn bin_plan_with(
             plan.tool_plan = Some(tp);
         }
     }
+    if cfg.session.kind == SessionKind::Goal {
+        // A Goal never waits for a person inside an Activation (TODO B2).
+        plan.scripts.insert(
+            bin_overlay::tombstone_name(GOAL_NO_ASK),
+            bin_overlay::tombstone_script(
+                GOAL_NO_ASK,
+                "a goal does not ask inside an activation: put the question in the `questions` of the activation's result (it reaches the user as a notification; the answer opens a later activation)",
+                "goal_session",
+            ),
+        );
+    }
     Ok(plan)
 }
+
+/// The command a Goal Session does not get.
+const GOAL_NO_ASK: &str = "ask_user";
 
 /// The §7.3 environment contract.
 pub async fn session_env_vars(ctx: &SessionEnvCtx, runtime_id: &str) -> Result<Vec<(String, String)>> {
@@ -1699,6 +1686,7 @@ pub async fn session_env_vars(ctx: &SessionEnvCtx, runtime_id: &str) -> Result<V
     if let Ok(tok) = std::env::var("BUCKYOS_APPCLIENT_SESSION_TOKEN") {
         v.push(("BUCKYOS_APPCLIENT_SESSION_TOKEN".to_string(), tok));
     }
+    v.extend(crate::baseline::playwright_env());
     v.extend(ctx.extra_env.iter().cloned());
     agent_tool::runtime_context::refresh_appclient_session_env(&mut v)
         .await

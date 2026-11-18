@@ -163,6 +163,8 @@ impl RpcAuthPrincipal {
                     | "agent.get"
                     | "agent.profile.get"
                     | "agent.runtime_directory"
+                    | "agent.runtime_catalog"
+                    | "agent.runtime_enable"
                     | "system.overview"
                     | "system.buckyos_info.get"
                     | "system.product.get"
@@ -1340,6 +1342,9 @@ impl ControlPanelServer {
             "agent.delete" => Box::pin(self.handle_agent_delete(req, principal)),
             "agent.profile.get" => Box::pin(self.handle_agent_profile_get(req, principal)),
             "agent.runtime_directory" => Box::pin(self.handle_agent_runtime_directory(req, principal)),
+            "agent.runtime_catalog" => Box::pin(self.handle_agent_runtime_catalog(req, principal)),
+            "agent.runtime_enable" => Box::pin(self.handle_agent_runtime_enable(req, principal)),
+            "node.owner_agents_set" => Box::pin(self.handle_node_owner_agents_set(req, principal)),
             "agent.profile.set" => Box::pin(self.handle_agent_profile_set(req, principal)),
             "agent.set_msg_tunnel" => Box::pin(self.handle_agent_set_msg_tunnel(req, principal)),
             "agent.remove_msg_tunnel" => {
@@ -1385,6 +1390,7 @@ impl ControlPanelServer {
             "ext_tools.status" => Box::pin(self.handle_ext_tools_status(req)),
             "ext_tools.plan" => Box::pin(self.handle_ext_tools_plan(req)),
             "ext_tools.set_desired" => Box::pin(self.handle_ext_tools_set_desired(req, principal)),
+            "ext_tools.download" => Box::pin(self.handle_ext_tools_download(req, principal)),
             "ext_tools.import" => Box::pin(self.handle_ext_tools_import(req, principal)),
             "apps.list" => Box::pin(self.handle_apps_list(req, principal)),
             "apps.details" => Box::pin(self.handle_app_detials(req, principal)),

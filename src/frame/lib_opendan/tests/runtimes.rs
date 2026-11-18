@@ -18,7 +18,15 @@ fn state(path: &Path) -> FsAgentStateClient {
 }
 
 fn builtin(_path: &Path) -> Vec<RuntimeRegister> {
-    builtin_runtimes(&Default::default(), "did:test:agent", &PrivateRuntimeInfo::default())
+    let mut settings = buckyos_api::AgentSettings::default();
+    settings.runtimes.insert(
+        "host".into(),
+        buckyos_api::AgentRuntimeSettings {
+            enabled: false,
+            target: buckyos_api::AgentRuntimeTarget::Node { node_id: "ood1".into(), node_did: "did:web:ood1.test.buckyos.io".into() },
+        },
+    );
+    builtin_runtimes(&settings, "did:test:agent", &PrivateRuntimeInfo::default())
 }
 
 /// V01 / V02: the host creates the built-in runtimes once; what the owner
@@ -33,7 +41,7 @@ async fn builtin_runtimes_are_created_once_and_kept() {
     let container = &r[0];
     assert_eq!((container.availability, container.builtin), (RuntimeAvailability::Available, true));
     assert_eq!(container.exec(), Some(json!({ "kind": "native" })));
-    assert!(container.connector.is_native() && container.grant.workspace && !container.grant.read_only());
+    assert!(container.connector.is_native() && container.grant.no_workspace().is_none() && !container.grant.read_only());
     assert_eq!(container.registered_by, "host");
     let host = &r[1];
     assert_eq!(host.availability, RuntimeAvailability::RuntimeUnavailable);
@@ -117,7 +125,7 @@ async fn the_private_runtime_says_who_provides_a_command() {
     let temp = tempfile::tempdir().unwrap();
     let state = state(temp.path());
     state.runtimes().ensure_builtin(&builtin(temp.path()), "host").await.unwrap();
-    let skill_bin = temp.path().join("agent/tools/lint/bin");
+    let skill_bin = temp.path().join("agent/tools");
     std::fs::create_dir_all(&skill_bin).unwrap();
     for (name, body) in [("real-tool", "echo 'real-tool 9.9'"), ("stub-tool", "echo 'not bundled' >&2; exit 127")] {
         let path = skill_bin.join(name);
@@ -310,7 +318,7 @@ impl agent_tool::runtime::node::NodeExecutorConnector for LateNode {
                     "login" => {
                         profile = request["profile"].clone();
                         json!({"type":"login_ok", "request_id":id, "posture":"normal",
-                        "principal":"did:test:agent", "app_instance_id":"app2@alice", "caps":["read","stat","exec"],
+                        "principal":"did:test:agent", "app_instance_id":"app2@alice", "caps":["read","stat","exec","mkdir"],
                         "limits":buckyos_api::ExecutorLimits::default(), "revision":"one", "generation":1,
                         "auth_valid_until_ms":u64::MAX, "token_expires_at_ms":u64::MAX,
                         "store_id":"late-ledger", "server_epoch":"one"})
@@ -318,7 +326,8 @@ impl agent_tool::runtime::node::NodeExecutorConnector for LateNode {
                     "describe" => json!({"type":"describe_ok", "request_id":id,
                         "target":{"node_did":"did:web:ood1.test.buckyos.io", "profile_id":profile, "uid":65534, "gid":65534,
                             "workdir":request["workdir"], "workdir_roots":["/srv/host-runtime"], "store_id":"late-ledger", "protocol_version":1},
-                        "info":{"os":"linux", "arch":"x86_64", "hostname":"ood1", "shell":"bash", "time_ms":1, "identity_mode":"switch_user"}}),
+                        "info":{"os":"linux", "arch":"x86_64", "hostname":"ood1", "shell":"bash", "time_ms":1, "identity_mode":"switch_user",
+                            "baseline":"extended", "computer":"observe"}}),
                     other => panic!("unexpected executor operation: {other}"),
                 };
                 server.write_all(&buckyos_api::encode_executor_control(&response).unwrap()).await.unwrap();
@@ -349,13 +358,10 @@ async fn a_node_runtime_refused_at_start_is_used_once_its_executor_answers() {
         "host".into(),
         buckyos_api::AgentRuntimeSettings {
             enabled: true,
-            computer: Default::default(),
             target: buckyos_api::AgentRuntimeTarget::Node {
                 node_id: "ood1".into(),
                 node_did: "did:web:ood1.test.buckyos.io".into(),
             },
-            baseline: None,
-            grant: None,
         },
     );
     settings.default_runtime_id = Some("host".into());
@@ -388,6 +394,14 @@ async fn a_node_runtime_refused_at_start_is_used_once_its_executor_answers() {
     let record = agent.runtimes().lookup("host").await.unwrap().unwrap();
     assert_eq!(record.availability, RuntimeAvailability::Available);
     assert!(connects.load(Ordering::SeqCst) > tries);
+    // What the runtime allows is what it says of itself, and a new
+    // projection of the same settings keeps it.
+    assert_eq!((record.caps.baseline, record.grant.computer), (buckyos_api::RuntimeBaseline::Extended, buckyos_api::ComputerAccess::Observe));
+    assert_eq!(record.grant.roots, vec![std::path::PathBuf::from("/srv/host-runtime")]);
+    assert_eq!((frozen.caps.baseline, frozen.grant.computer), (record.caps.baseline, record.grant.computer));
+    agent.runtimes().ensure_builtin(&registers, APP).await.unwrap();
+    let kept = agent.runtimes().lookup("host").await.unwrap().unwrap();
+    assert_eq!((kept.caps.baseline, kept.grant.computer, kept.grant.ops.len()), (buckyos_api::RuntimeBaseline::Extended, buckyos_api::ComputerAccess::Observe, 4));
 
     // `agent-session run` and `copy` get the same second chance.
     up.store(false, Ordering::SeqCst);
@@ -422,10 +436,7 @@ async fn a_natively_run_agent_service_keeps_its_private_runtime() {
         "host".into(),
         buckyos_api::AgentRuntimeSettings {
             enabled: true,
-            computer: Default::default(),
             target: buckyos_api::AgentRuntimeTarget::Node { node_id: "ood1".into(), node_did: "did:web:ood1.test.buckyos.io".into() },
-            baseline: Some(buckyos_api::RuntimeBaseline::Extended),
-            grant: None,
         },
     );
     settings.default_runtime_id = Some("host".into());
@@ -450,9 +461,9 @@ async fn a_natively_run_agent_service_keeps_its_private_runtime() {
     assert_eq!(private.exec(), Some(json!({ "kind": "native" })));
     assert!(private.default && private.desc.contains("natively"));
     assert_eq!(state.runtimes().list().await.unwrap().len(), 1);
-    assert_eq!(private.caps.baseline, buckyos_api::RuntimeBaseline::Extended, "the host's declaration");
+    assert_eq!(private.caps.baseline, buckyos_api::RuntimeBaseline::Standard, "the node's declaration is learned from its executor");
     let host = state.runtimes().lookup("host").await.unwrap().unwrap();
-    assert!(host.default && host.grant.workspace);
+    assert!(host.default && host.grant.no_workspace().is_none());
     assert_eq!(host.runtime_id, "private");
     assert_eq!(host, private);
     state.runtimes().ensure_builtin(&project(false), "host").await.unwrap();
@@ -532,4 +543,82 @@ async fn a_desktop_found_unavailable_is_probed_again() {
     let again = libopendan::runtime::lookup_rechecked(&state, "private").await.unwrap().unwrap();
     assert_eq!(again.caps.desktop_error, Some(live));
     assert!(again.checked_at_ms.unwrap() > 1);
+}
+
+/// A runtime the owner took away from the agent keeps its record as history
+/// and comes back when it is assigned again; a default that is switched off
+/// keeps its place.
+#[tokio::test]
+async fn a_runtime_taken_from_the_agent_is_retired_and_comes_back_when_assigned_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = state(temp.path());
+    let lab = |enabled: bool| buckyos_api::AgentRuntimeSettings {
+        enabled,
+        target: buckyos_api::AgentRuntimeTarget::Executor { executor_id: "5f0c2b9e-7a1d-4c53-9d0e-0b6a3c1f2e44".into(), profile_id: None },
+    };
+    let mut settings = buckyos_api::AgentSettings::default();
+    settings.runtimes.insert("exec-lab".into(), lab(true));
+    settings.default_runtime_id = Some("exec-lab".into());
+    let project = |settings: &buckyos_api::AgentSettings| builtin_runtimes(settings, "did:test:agent", &PrivateRuntimeInfo::default());
+    state.runtimes().ensure_builtin(&project(&settings), "host").await.unwrap();
+    state.runtimes().note_usage("exec-lab", &RuntimeUsageEvent::Session { session_id: "work-1".into() }).await.unwrap();
+    state.runtimes().note_usage("exec-lab", &RuntimeUsageEvent::Workspace).await.unwrap();
+    let on = state.runtimes().lookup("exec-lab").await.unwrap().unwrap();
+    assert!(on.default && on.enabled && on.lifecycle == RuntimeLifecycle::Active);
+    assert_eq!(on.connector.executor_id(), Some("5f0c2b9e-7a1d-4c53-9d0e-0b6a3c1f2e44"));
+    assert_eq!((on.usage.sessions_total, on.usage.workspaces), (1, 1));
+
+    // Switched off: still the configured default, which counts again once it is on.
+    settings.runtimes.insert("exec-lab".into(), lab(false));
+    assert!(settings.validate_runtimes().is_ok());
+    state.runtimes().ensure_builtin(&project(&settings), "host").await.unwrap();
+    let off = state.runtimes().lookup("exec-lab").await.unwrap().unwrap();
+    assert!(!off.default && !off.usable() && off.lifecycle == RuntimeLifecycle::Active);
+    assert!(state.runtimes().lookup("private").await.unwrap().unwrap().default);
+
+    // Taken away: retired, with its history.
+    settings.runtimes.remove("exec-lab");
+    settings.default_runtime_id = None;
+    let projected = state.runtimes().ensure_builtin(&project(&settings), "host").await.unwrap();
+    let retired = projected.iter().find(|r| r.runtime_id == "exec-lab").unwrap();
+    assert!(retired.lifecycle == RuntimeLifecycle::Retired && !retired.usable() && !retired.enabled);
+    assert_eq!(retired.usage.last_session_id.as_deref(), Some("work-1"));
+    assert!(state.runtimes().lookup("host").await.unwrap().is_none(), "nothing is projected for a runtime never assigned");
+    let revision = retired.revision;
+    state.runtimes().ensure_builtin(&project(&settings), "host").await.unwrap();
+    assert_eq!(state.runtimes().lookup("exec-lab").await.unwrap().unwrap().revision, revision, "retired once");
+
+    // Assigned again: the same record, active.
+    settings.runtimes.insert("exec-lab".into(), lab(true));
+    state.runtimes().ensure_builtin(&project(&settings), "host").await.unwrap();
+    let back = state.runtimes().lookup("exec-lab").await.unwrap().unwrap();
+    assert!(back.lifecycle == RuntimeLifecycle::Active && back.enabled);
+    assert_eq!(back.usage.sessions_total, 1);
+}
+
+/// Sessions that are not finished are marked when their runtime cannot be
+/// used, once; the mark goes when it can again. The sessions list says which
+/// runtime a session is on and filters by it.
+#[tokio::test]
+async fn unfinished_sessions_are_marked_when_their_runtime_goes_away() {
+    let env = Env::new();
+    let agent = env.agent();
+    agent.runtimes().ensure_builtin(&builtin(&env.root), APP).await.unwrap();
+    let sd = env.create_work(work_spec("stays where it was frozen")).await;
+    let entry = agent.sessions().lookup(sd.sid()).await.unwrap().unwrap();
+    assert_eq!(entry.runtime_id.as_deref(), Some("private"));
+    assert!(entry.runtime_unavailable.is_none());
+    let on = |runtime: &str| RegistryQuery { runtime_id: Some(runtime.into()), ..Default::default() };
+    assert_eq!(agent.sessions().query(&on("container")).await.unwrap().len(), 1, "an alias names the same runtime");
+    assert!(agent.sessions().query(&on("host")).await.unwrap().is_empty());
+
+    let marked = agent.sessions().mark_runtime("private", Some("switched off")).await.unwrap();
+    assert_eq!(marked.iter().map(|e| e.session_id.as_str()).collect::<Vec<_>>(), [sd.sid()]);
+    assert_eq!(agent.sessions().lookup(sd.sid()).await.unwrap().unwrap().runtime_unavailable.as_deref(), Some("switched off"));
+    assert!(agent.sessions().mark_runtime("private", Some("switched off")).await.unwrap().is_empty(), "told once");
+    assert!(agent.sessions().mark_runtime("private", Some("expired")).await.unwrap().is_empty(), "a new reason is no new mark");
+    assert_eq!(agent.sessions().lookup(sd.sid()).await.unwrap().unwrap().runtime_unavailable.as_deref(), Some("expired"));
+    assert!(agent.sessions().mark_runtime("host", Some("off")).await.unwrap().is_empty());
+    agent.sessions().mark_runtime("private", None).await.unwrap();
+    assert!(agent.sessions().lookup(sd.sid()).await.unwrap().unwrap().runtime_unavailable.is_none());
 }

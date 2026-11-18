@@ -41,7 +41,7 @@ async function openFixture(page: Page, source: string) {
   await routeAppHost(page, /http:\/\/(notes|reader)-fixture\.localhost:4173\//, fixture(source))
   await page.goto('/?scenario=normal&contentApps=1')
   await page.getByTestId('desktop-app-files').click()
-  await page.locator('aside').getByRole('button', { name: /Documents/ }).first().click()
+  await page.getByTestId('window-files').getByRole('cell', { name: 'Documents', exact: true }).dblclick()
   await page.getByRole('cell', { name: /^Kyoto Trip Plan\.md/ }).first().dblclick()
   await expect(page.getByTestId('window-notes-fixture')).toBeVisible()
   const app = page.frameLocator('[data-testid="web-app-frame"]')
@@ -78,6 +78,38 @@ test('an App shows the system Preview inline and its Open with goes to the shell
   await expect(page.getByTestId('window-reader-fixture')).toBeVisible()
 })
 
+test('the embedded Preview names the file in its own compact bar, can let it hide, and shares the file there with links only', async ({ page }) => {
+  const { app, embed } = await openFixture(page, 'cyfs:///samples/release-notes.md')
+  const preview = embed.getByTestId('content-preview')
+  await expect(preview).toHaveAttribute('data-status', 'ready', { timeout: 15_000 })
+  const toolbar = embed.getByTestId('content-preview-toolbar')
+  // No title bar of its own here: the bar names the file and closes the preview (not the App), and starts shown.
+  await expect(toolbar.getByTestId('content-preview-title')).toHaveText('release-notes.md')
+  await expect(toolbar.getByTestId('content-preview-exit')).toBeVisible()
+  await expect(toolbar).toHaveAttribute('data-pinned', 'true')
+  expect(await toolbar.evaluate((el) => getComputedStyle(el).backgroundImage)).toBe('none')
+  await toolbar.getByTestId('content-preview-pin-toolbar').click()
+  await expect(toolbar).toHaveAttribute('data-pinned', 'false')
+  const box = (await preview.boundingBox())!
+  await page.mouse.move(box.x + 40, box.y + box.height - 40)
+  await expect(preview).toHaveAttribute('data-ui-visible', 'false', { timeout: 8_000 })
+  await preview.hover()
+  await expect(preview).toHaveAttribute('data-ui-visible', 'true')
+
+  await toolbar.getByTestId('content-preview-share').click()
+  const share = embed.getByTestId('preview-embed-share')
+  await expect(share.getByTestId('share-dialog-name')).toHaveText('release-notes.md')
+  // Hand-offs to other apps and My Content need the Desktop shell: only links here.
+  await expect(share.getByTestId('share-dialog-messagehub')).toHaveCount(0)
+  await share.getByTestId('share-dialog-create').click()
+  await expect(share.getByTestId('share-dialog-created')).toBeVisible({ timeout: 10_000 })
+  await expect(share.getByTestId('share-dialog-manage')).toHaveCount(0)
+  await share.getByTestId('share-dialog-done').click()
+  await expect(share).toHaveCount(0)
+  await expect(app.locator('#state')).toHaveText('ready')
+  await expect(page.getByTestId('window-preview')).toHaveCount(0)
+})
+
 test('Preview shows its own unsupported state inline and the window does not ping-pong focus and title', async ({ page }) => {
   const { app, embed } = await openFixture(page, 'cyfs:///samples/keynote.pptx')
   await expect(app.locator('#state')).toHaveText('error:unsupported', { timeout: 15_000 })
@@ -90,6 +122,15 @@ test('Preview shows its own unsupported state inline and the window does not pin
   expect(Number(await app.locator('#focus').textContent())).toBe(focus)
   await page.getByTestId('window-files').click({ position: { x: 10, y: 10 } })
   await expect.poll(async () => Number(await app.locator('#focus').textContent())).toBe(focus + 1)
+})
+
+test('a PDF inside an embedding App is drawn by pdf.js with the data files of the Zone root', async ({ page }) => {
+  // Headless Chromium has no built-in PDF viewer, like Android Chrome: the embed page loads pdf.js and its worker.
+  const { app, embed } = await openFixture(page, 'cyfs:///samples/annual-report.pdf')
+  await expect(app.locator('#state')).toHaveText('ready', { timeout: 20_000 })
+  const viewer = embed.getByTestId('content-preview-pdfjs')
+  await expect(viewer).toHaveAttribute('data-page-count', '12')
+  await expect(viewer.getByTestId('content-preview-pdf-canvas').first()).toHaveAttribute('data-rendered', 'true')
 })
 
 test('the system entry opens the chooser from a link and leaves out the requesting App', async ({ page }) => {

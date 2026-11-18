@@ -2,7 +2,7 @@
 
 版本 3（`opendan.session_input/3`）· 2026-10-03 · 由 `libopendan` 反写（`src/protocol/input.rs`、`src/channel/{mod,kmsg}.rs`、`src/runner/{inputs,input_view,assembler,receipts,live,drive,children}.rs`、`src/bridge/`）。§10（Sub Session）与内部输入源 `_bootstrap` / `_child` 随 session_config/5 加入。
 
-总线上的记录有三种：`msg`、`event`（Agent 的输入）和 `control`（Session 控制，见 [Session Control Protocol](<Session Control Protocol.md>)）。本文说明记录的线格式、接收方如何处理、输入如何成为上下文里的 user 消息，以及崩溃后如何恢复。输入批次与逻辑 Turn 的关系见 [Session Directory Protocol](<Session Directory Protocol.md>) §4。机器可读样例与逐字节渲染结果在 `fixtures/14_input_bus/`。
+总线上的记录有三种：`msg`、`event`（Agent 的输入）和 `control`（Session 控制）。本文说明记录的线格式、接收方如何处理、输入如何成为上下文里的 user 消息，以及崩溃后如何恢复。控制命令的作用域、生效边界、终态与级联规则统一由 [Session Control Protocol](<Session Control Protocol.md>) 定义；本文只保留控制对输入路由与等待的影响。输入批次与逻辑 Turn 的关系见 [Session Directory Protocol](<Session Directory Protocol.md>) §4。机器可读样例与逐字节渲染结果在 `fixtures/14_input_bus/`。
 
 ## 1. 通道
 
@@ -15,6 +15,8 @@
 Session 不直接读 msg-center：msg bridge 消费 inbox 后投递到总线（§7）。`agent_id` 默认取 agent DID 最后一段并把字母、数字、`_ - .` 之外的字符替换为 `_`。
 
 **kmsg 使用规则**：`create_queue` / `subscribe` 返回“already exists”视为成功（并用 `get_queue_stats` 确认队列）；读取用 `read_message(queue, acked_index + 1, n)`，不依赖服务端游标；`commit_ack` 只提交 state.json 已提交的**连续**消费位置（累积确认）；遇到 “Subscription not found” 以 `At(acked_index + 1)` 重新订阅。队列是生产者-消费者语义：确认过的记录由 kmsg 删除（不声明 `keep_acked`），消费正常时队列基本为空；Session 自己不调用 `delete_message_before`，也不设 `retention_seconds` / `max_messages`（它们不看消费进度）。
+
+**队列与收不收消息**：宿主有队列客户端时，每个 Session 都有输入队列，控制命令一律走它（Session Control Protocol §8）。队列收不收 msg / Input event 由 `session.input_policy` 决定：`any`（缺省）收；`none` 只收控制命令——内置 `work` 类和模板里 `input = "none"` 的类是这种，它的首批材料来自 `prompt.initial_inputs`（只读源 `_bootstrap`，不受这条限制）。向 `input_policy = none` 的 Session 投 msg，登记表在投递时就拒绝并说明原因（`invalid_argument`：takes no messages）；绕过登记表直接入队的 msg / Active 的 Input event 在消费时记 `input_rejected{reason: input_policy}`。后台 Work 里收消息的只有 plan（模板 `input = "queue"`）、Todo 派发的 Work 和 `--interactive` 的 Work。没有队列客户端的宿主建出的 Session 没有队列。
 
 **队列释放**：Session 不再接收输入时（finished，且 acceptance 不是 `pending` / `accepted`、也没有排队的 `decide`；`accepted` 仍可被 `discard`），驱动者在结束它的那次推进末尾删除队列；之后的推进不再打开输入源。向这样的 Session 投递任何记录都在登记表入口返回 `session_finished`。
 
@@ -103,6 +105,7 @@ CLI：`post <sid> --json <file | ->` 接受逻辑记录（`schema`、`from`、`a
 | `unknown_command` | control 的 `command` 未知 |
 | `session_finished` | finished 之后收到 `decide` 以外的输入 |
 | `input_policy` | Session 的 `input_policy = none` 而收到 msg / Input event |
+| `retracted` | 用户在这条 msg 被消费之前撤回了它（`control(retract)`，Session Control Protocol §4.1）；它不进任何 Turn |
 
 payload 中的未知字段忽略（producer 可以比 consumer 新）；未知 control `command` 拒绝。
 
@@ -121,7 +124,7 @@ payload 中的未知字段忽略（producer 可以比 consumer 新）；未知 c
 | `event`，`source = task:<id>` 且该 task 在 `state.watched_tasks` 中 | 消费，`event_dropped{reason: watched_task}` | 只提前触发一次查询；task 的结束按 §9 作为 task 结果输入交回 |
 | `event`，没有匹配的有效订阅 | 消费，`event_dropped{reason: unsubscribed}` | 无；timer、系统事件没有兜底例外 |
 
-- 订阅匹配：给出 `subscription_id` 时必须存在且来源相符；未给出时取第一个来源相符的显式或隐式订阅。每个 Session 都有一个隐式 semi 订阅：用户时区（`_user_timezone`，`source = system:user_timezone`）。Goal Session（模板 `goal`）另有隐式 active 订阅 `_goal_activation`（`source = system:goal`）。UI Session（模板 `ui`，`group` 经 `base` 继承）另有隐式 semi 订阅 `_notify`（`source = system:notify`）。`system:<id>` 的订阅也匹配子 id `system:<id>:<sub>`。
+- 订阅匹配：给出 `subscription_id` 时必须存在且来源相符；未给出时取第一个来源相符的显式或隐式订阅。每个 Session 都有两个隐式 semi 订阅：用户时区（`_user_timezone`，`source = system:user_timezone`），以及用户在它的会话里对 Agent 浏览器的交接（`_browser`，`source = system:browser:<group_id>`：接手、交还、交给 Agent，见 [Agent Browser Protocol](Agent%20Browser%20Protocol.md) §2.4）。Goal Session（模板 `goal`）另有隐式 active 订阅 `_goal_activation`（`source = system:goal`）。UI Session（模板 `ui`，`group` 经 `base` 继承）另有隐式 semi 订阅 `_notify`（`source = system:notify`）。`system:<id>` 的订阅也匹配子 id `system:<id>:<sub>`。
 - **通知的观察（`_notify`）**：Agent 的系统通知另投进它与用户的某个会话后，msg-center 在 Agent 自己的 INBOX 该会话写一条 `buckyos.notify.delivered` 记录；宿主（OpenDAN Loader 的 msg bridge）把它转成该会话 UI Session 的 `AgentEvent{subscription_id: "_notify", source: system:notify:<notify_id>, event: "delivered", summary}`（key `notify:<notify_id>:<会话>`）。每条通知是独立的半订阅状态（来源带通知 id），不唤醒 Session、不开 Turn，随下一批受控输入出现在快照中；`summary` 是一行 `[notify <id>] <kind>/<level> from <goal …|session …> at <UTC>: <title> — <message 摘要> (options: id=label, …) — check the current state with `agent-session notify show <id>``。会话还没有 UI Session 时宿主照常新建一代，回复坐标取自记录的 `reply_route`；UI Session 只在有受控输入时 bootstrap，单有观察不会开口。第一段只有“已投递”事件，状态由 Agent 按需查询。
 - **Goal 问题的回答**：Goal 的 `questions` 由驱动者在 Activation 关闭前发成 `input` 通知（幂等键 `goal:<goal_id>:q:<sha256(text) 前 16 位>`）；通知结束后宿主投递 `AgentEvent{subscription_id: "_goal_activation", source: system:goal, event: "answer", summary}`（key `goal:<goal_id>:answer:<notify_id>`），成为 Activation 原因 `answer`（`ref` = notify_id）；该 Activation 关闭时问题记下 `status` 与 `answer`，Goal 头的 `<open_questions>` 带上它们。
 - **Goal 的运行机会**：运行时（宿主或 CLI）向 Goal 当前 epoch 的 Goal Session 投递 `AgentEvent{subscription_id: "_goal_activation", source: system:goal, event, summary}`：`event = created | reopened | restarted`（epoch 开始，key `goal:<goal_id>:start:<epoch>`，每个 epoch 只投一次）、`scheduled`（定时，key `goal:<goal_id>:scheduled:<slot>:<missed>`，`missed` = 自上次以来经过的槽数，>1 表示停机期间错过的槽已合并为这一次）、`activate`（手动，key `goal:<goal_id>:activate:<request_id>`）。UI 转交的反馈是 Agent 自己发给自己的 `msg`（`delivery.from_name = "feedback from <来源>"`、`conversation_name = "goal <goal_id>"`）。积压的多个运行机会、Work 的结束（`_child`，Goal Session 按 `goal_id` 收取，跨 epoch 只收一次）与反馈合成一个 Activation 的输入批次，各自成为该 Activation 的 `reasons[]`。Goal 暂停时这些输入留在队列。
@@ -221,7 +224,7 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 
 属性值转义 `& < > "`。只有一条纯文本消息时也使用 `<msg>`。`machine` 与 `ServiceDid` 引用不在内建渲染中出现。
 
-内建模板（UI Session 除外，见 §6.5）：`<session_input hook="…" time="<批次时间>">` 元素，依次包含交接状态（`<context_switch to>`、`<process_result>`、`<sub_task>`）、bootstrap 的 `<task>` / `<scope>`、`input.text`、`<perceptions>`、`<hints>`、活动 session 列表、`<runtime>`；有变化的背景行时，`<<background_context>>` 块放在 `<session_input>` 之前（§6.6）。
+内建模板（UI Session 除外，见 §6.5）：`<session_input hook="…" time="<批次时间>">` 元素，依次包含交接状态（`<context_switch to>`、`<process_result>`、`<sub_task>`）、bootstrap 的 `<task>` / `<scope>`、`input.text`、`<perceptions>`、活动 session 列表、`<runtime>`；有变化的背景行时，`<<background_context>>` 块放在 `<session_input>` 之前（§6.6）。Memory 线索（§6.5 的 `memory:` 行）只在背景里，内建模板不再另放 `<hints>`；自定义模板可用变量 `hints`（同样的行，字符串数组）或 `hints_text`（`<hints>` 包着的 `- <行>` 列表），线索只有在输入里出现其行文本才算显示。
 
 协议时间与内建渲染一律 UTC。用户时区与 Session 绑定（`session.timezone`，IANA 名），其初始值与后续变化经隐式 semi 订阅进入半订阅状态，不取 Runner 所在机器的时区，变化本身不唤醒推理。
 
@@ -258,7 +261,8 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 - runtime native on lzc-pve, cwd …/sessions/<sid>
 - work work-12481d…: running — reviewing PR #667 diff
 - [notify n_01] input/timely from session work-… : Which branch? … — check the current state with `agent-session notify show n_01`
-- hint: owner prefers replies in Chinese (noticed 2026-10-02)
+- hint: owner prefers replies in Chinese (the agent's inference, not confirmed; applies to workspace:proj-a; noticed 2026-10-02T08:00:00Z; ref item_reply_language@1)
+- noted, not yet consolidated: the owner said project A's weekly report goes out before Friday noon (from session ui-20261109-1; noticed 2026-11-09T20:05:19Z; ref ui-20261109-1:4)
 <</background_context>>
 你好 Jarvis
 ```
@@ -282,10 +286,12 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 | `ui:<sid>` | 其它 UI Session 的 topic 标题 | 活动视图（登记表 `status.topic`） |
 | `session:<sid>` | 与本 Session 目标相同或范围重叠的其它活动 Session（避让规则） | 活动视图 |
 | `event:<key>` | 半订阅状态版本：`_notify` 的通知行原样（`[notify <id>] …`）；其它为 `<source> <event>: <summary>`。用户时区事件不单列（由 `time` 行承载） | `pending_events`（同 §5 的选择与预算） |
-| `hint:<id>` | `hint: <sentence> (noticed <time>)` | 按 `state.topic.tags` 召回的 hints |
+| `memory:<ref>\|<state>` | 本批的 Memory 线索，一条一行（UI 与 Work Session 都有，见下），按身份区分：认知 `hint: <陈述> (<note>)`；读过的认知被修订 `hint revised (you saw @<n>): …`；被替代 / 删除 / 过时 `hint withdrawn (<superseded by …\|deleted\|no longer current>), do not rely on it: …`；`hint disputed: …`；有未整理的纠正叠加 `hint: … (<note>) — may have been corrected: "<纠正原话>"; clarify before relying on it`；未整理感知 `noted, not yet consolidated: <摘要> (from session <sid>; noticed <时间>; ref <sid>:<seq>)`（纠正为 `correction noted`，要求记住的为 `asked to remember`，暂缓的为 `consolidation deferred`）；已显示感知的处置 `note <sid>:<seq> was consolidated into <认知引用> (the same material, not new evidence)`（或 `was a duplicate of …` / `was discarded by consolidation`）；澄清问题 `memory question pending: <问题> (about note <ref>)`。`<note>` 依次是 `qualifier`（证据性质：`the user's explicit statement` / `stated by the user` / `observed` / `a third party's claim, not verified` / `the agent's inference, not confirmed`，confidence 低于 0.5 另加 `weak evidence`；范围：`applies to <workspace 主体与 scope 对象，至多 3 个>`、`not to <例外>`；有效期：`holds until <valid_until>`，没有期限的 volatile 为 `short-lived`）、`noticed <时间>`、`about <对象 URL>`、`ref <引用>`，缺哪项省哪项 | `runner/memory_batch.rs`：Memory 门面 `observe_batch` 的结果（`Hint::note()`） |
+| `memory:unavailable` | `memory unavailable: <原因>`：本批读不到 Memory（不是“没有相关记忆”） | 同上；worklog 的批次标记记 `memory_error` |
 
 - **只显示变化的行**：`state.background_shown` 记录每个 key 上次显示时的内容摘要；摘要变了才显示。`time` 行另按 5 秒粒度：距上次显示不足 `BACKGROUND_TIME_STEP_MS = 5000` 且时区未变时不显示。本批候选里没有的 key 从记录中删除（再出现时重新显示）。所有行都没有变化时整个 `<<background_context>>` 块省略。
 - 新记录随批次 receipt 提交（`extra.background`，见 §7），恢复时与 receipt 一起应用；显示了哪些半订阅版本仍记在 receipt 的 `events` 里。只有输入消息里实际出现的行才记为已显示（§6.6）。
+- **Memory 线索**不走 `background_shown`（`memory:unavailable` 除外）：每个有新输入的批次（UI 与 Work，首批包括在内）先让 topic 的 tag 按时间衰减，再经 Memory 门面召回与观察——UI 以标题、本批消息正文与有效 tag 召回，Work 只在首批以标题和目标召回，此后只观察快照之后的变化（含已读认知的修订）；两路候选合并去重后按同批预算分配（UI 8 条、Work 4 条，有效性变化优先）。去重与“已显示”记在 Session 的观察状态里（`state.memory`），随 receipt 的 `extra.memory` 提交；只有出现在输入里的线索记为已显示，其余留待下一批。召回失败只出 `memory:unavailable` 一行，不推进观察进度。
 - **消息**：一对一时只写原文，不写 key / from / time；附件每个一行 `[attachment <media> "<name>" -> <path 或 ObjId>]`；回复 / 编辑等关系有才写一行（`(replying to <ObjId>)`）。一个批次有多条消息时每条前加一行 `[<发言人> <本地时间 HH:MM:SS>]`。**群聊**保留 §6.2 的 `<msg>` 元素（发言人与 `context="true"` 是群聊语义的根本），与事件一起放在 `<<inputs>>` 里。
 - **事件**：保留 `<event>` 元素（属性是用 CLI 回查的依据），放在 `<<inputs>> … <</inputs>>` 中、消息原文之前；子 Session 事件的摘要对 UI 父 Session 只有一行，不附 `report:`，结束时末尾附 `— read: agent-session read-session <sid> --report`。
 - 交接块（`<context_switch>` 等）与 TodoList 视图有时照旧放在最前。自定义模板可用 `background`（行数组）与 `background_context`（整块文本）。
@@ -294,7 +300,7 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 
 半订阅永远不是一条独立的输入，只能在输入里被使用：每个受控输入批次算出自上次显示以来变化的背景行，作为模板变量 `background`（行数组，`{key, text}`）与 `background_context`（整块 `<<background_context>>` 文本，无变化时为空串）交给该批次的模板。模板不引用它，半订阅对这个 Session 就不可见。没有单独的快照消息，工具结果之后也不注入背景。
 
-- 候选行：UI Session 为 §6.5 的各行；其它 Session 为半订阅状态版本（`event:<key>`，格式同 §6.5，用户时区事件也成行）；所有 Session 另有在跟的运行中 task 的新输出（`task:<id>`：`task <id> · <命令摘要> · running <时长> · new output:` 加自上次显示以来的新输出，最多 2 KB，超出只留末尾）。
+- 候选行：UI Session 为 §6.5 的各行；其它 Session 为半订阅状态版本（`event:<key>`，格式同 §6.5，用户时区事件也成行），Work Session 另有本批的 Memory 线索（`memory:` 行，§6.5）；所有 Session 另有在跟的运行中 task 的新输出（`task:<id>`：`task <id> · <命令摘要> · running <时长> · new output:` 加自上次显示以来的新输出，最多 2 KB，超出只留末尾）。
 - 子 Session 的结束、等输入、等决定，task 的结束，Todo 的状态都不成行：它们是事件（或调用结果、命令输出）。
 - 已显示的判定：渲染后的输入文本包含该行文本才算显示。未出现的行保持原记录（下次放置它的输入照样显示），未出现的状态版本不进 receipt 的 `events`，留在 `pending_events`。
 - `task:<id>` 的记录值是已显示到的输出位置 `<stdout 字节>,<stderr 字节>`；调用转为 task 后的第一个推理边界记下当时位置（调用结果已显示到这里），不产生消息。
@@ -315,6 +321,7 @@ AiMessage{role: user}              恢复、接手、压缩都从快照与 workl
 ```
 
 - `extra.background`：本批之后的 `state.background_shown`，应用 receipt 时整体替换。
+- `extra.memory`：本批之后的 Session Memory 观察状态（`state.memory`：topic 的标题、每个 tag 的分数与最近提及时间、基础范围、快照、`pending`、`read_set`、`shown` 等），应用时整体替换；`extra.topic`：UI Session 由它派生、给其它 Session 看的 `state.topic`；`extra.memory_error`：本批读不到 Memory 的原因（worklog 批次标记的 `memory_error`）。
 - 批次 ID = `(run_id, input_seq)`，每个 run 从 1 开始连续。`opens_turn` 只看提交时有没有打开的 Turn。
 - `inputs`：本批消费的 msg 与 Input event。Runner 自己合成的输入（Session 在跟的 task 结束，§9）用 `src = "_task"`、`key = task:<task_id>:terminal`，没有消费位置。
 - `events`：输入消息里实际出现（作为背景行）的状态版本；应用时按 `(subscription_id, source, key)`（有 `seq` 时一并核对）从 `pending_events` 精确清除。处理 v7 期间收到 v8，提交 v7 不删除 v8。
@@ -354,8 +361,8 @@ loop 里不等待，任何等待都是 task。
   正文最多 16 KB（16×1024 字符），更长的截断并注明用 task id 读全文。它不伪装成工具结果：调用当初已经有了“仍在运行”的结果，模型凭 `call_id` 与 task id 把两者对上。
 - 查不到的 task（进程内 task 换了进程、没有 task 管理器认识它）按 `unknown` 交回，由 LLM 判断，不重建、不重放任务。
 - **run 结束后的 task**：run 结束而 Session 未 finished 时，仍在运行的 task（`host.extra.tasks` 与 resolver 报告的）记入 `state.watched_tasks`，之后同样以 task 结果输入交回，可能开启新 Turn。finished 的 Session 清空 `watched_tasks`，不因 task 完成而重开。
-- stop：本 Turn 可取消的 task（resolver 报告在运行的，以及 run 记录的）被取消，run 以 Stopped 结束。工具执行期间由监视任务查看队列中的 stop 并打断运行（只查看，不消费、不写 state）。
-- pause / resume（`control(pause | resume, reason?)`）：pause 记入 `state.paused = {at_ms, reason, by, in_run}`，Session 不再推理：不打开新 Turn（到达的 msg / event 留在队列，task 的结束留在 `watched_tasks`，不产生 tick），运行中的 run 在下一个推理边界（在飞行的调用返回、检查点写入之后）以中断原因 `session paused` 停下，run 保留在检查点、Turn 保持打开（worklog `outcome.kind = paused`，`in_run = true`）。在跟的 task 按 OS 进程语义继续。resume 清除 `paused`；被暂停在 Turn 内的 run 置 `state.resume_run`，下一次推进从检查点接着推理（与崩溃恢复同一路径），Turn 之间暂停的则由积压的输入打开下一个 Turn。登记表 `status.paused`；暂停中的 Session 不报 `needs_input`。对已结束的 Session 是空操作（`applied: false`）。
+- **stop 与 task**：监视任务只查看队列中的 stop，消费与提交仍由驱动者完成。停止 Turn 不证明其外部 task 已取消；Turn / Session 的停止范围、取消覆盖与结果、未知副作用的处理见 [Session Control Protocol](<Session Control Protocol.md>)。
+- **pause / resume 与输入**：Session 暂停时不推理、不打开新 Turn、不产生 tick；msg / event 留在队列，task 结果留待 `watched_tasks` 后续查询，控制命令仍由 Runner 处理。在跟的 task 继续执行。resume 后按检查点继续原 Turn，或由积压输入打开下一 Turn；控制语义见 [Session Control Protocol](<Session Control Protocol.md>)，`paused` / `resume_run` 的持久字段见 [Session Directory Protocol](<Session Directory Protocol.md>) §4。
 - 经外部服务创建任务的工具以 run 与 call 的稳定身份导出幂等键（如 shell 交给 Zone TaskMgr 的 `shell:<run_id>:<call_id>`）；shell 命令的环境里有 `XLLM_RUN_ID` / `XLLM_CALL_ID`。
 - 崩溃恢复：调用中途崩溃时，恢复从派发前的检查点再派发它，由 runtime 的工具管理器按 `call_id` 找回（Session Directory Protocol §10）；run 的终态已落盘而 state 尚未提交时，重做的结束从 run.json 的 `host.extra.tasks` 取回仍需跟踪的 task；保活决定（`host.extra.kept`）同样按记录重做。task 结果只交付一次。
 - **向用户提问**：提问是一个普通的 task。websdk 命令 `ask_user <question> [--option <id>=<label>]... [--allow-text] [--expires <secs>]`（`src/tools/buckyos-agent`）发出一条 `input` 系统通知，即 Zone TaskMgr 上的 `human.input/v1` 任务（幂等键 `ask:<run_id>:<call_id>`，取自 `XLLM_RUN_ID` / `XLLM_CALL_ID`，所以它必须是一条独立的 shell 命令），返回该 task 的 pending 结果（`pending_reason = user_input`）；回答是 task 的结果，按上面的规则以 `<<task_result>>` 交回，过期 / 撤销也是它的终态。Session 不解析问题，也不把下一条消息当作答案：提问期间用户发来的消息照常是新输入。Goal 不用它提问，问题写进 Goal 结果的 `questions`（§3）。
@@ -365,12 +372,12 @@ loop 里不等待，任何等待都是 task。
 Sub Session 是 `origin.parent_session` 指向父的普通 Session：自己的目录、state、worklog、Turn 与 lease，驱动者默认是父的驱动者。父子都只写自己的 state.json，彼此只经登记表、输入通道与控制协议沟通；登记表里的状态是真相，下面的事件只是加速。
 
 - **创建**（参考实现 `api::create_sub_session`，CLI `agent-session create-worksession`）：`origin = {parent_session, report, created_by_call}`。幂等键由 `(父 session_id, run_id, call_id)` 导出：同一次调用重放得到同一个 Session。超过父的 `policy.max_sub_sessions`（同时未结束）或 `max_session_depth` 时拒绝。继承父的 `prompt.llm_context`（含 runtime 配置；绑定身份是子自己的）、默认共用父的工作目录。首批输入是所属 Agent 自己发出的 MsgObject：子没有队列时进 `prompt.initial_inputs`，有队列（interactive）时投递到队列。创建不推进子 Session。
-- **隐式关注**：父的 Runner 按 `origin.parent_session = 自己` 查登记表（每次选批之前、以及等待期间的每次轮询），不需要订阅，父也不需要输入队列。`origin.report` 为 `none` 或缺省的子不产生任何事件。
+- **隐式关注**：父的 Runner 按 `origin.parent_session = 自己` 查登记表（每次选批之前、以及等待期间的每次轮询），不需要订阅，也不占用父的输入队列。`origin.report` 为 `none` 或缺省的子不产生任何事件。
   - 进度（仅 `report = progress`，子未结束）：`status.rev` 前进且 `{run_state, one_line_status, activity.summary}` 变化时，合成 `AgentEvent{subscription_id: "_child:<sid>", source: session:<sid>, event: "progress", seq: rev}` 并入 `pending_events`（Observe），游标存 `state.subscription_cursors["_child:<sid>"] = {rev, view}`。
   - 需要关注与结束：子 `finished` → `event = finished`（`terminal = true`，summary 含 `report_brief`）；有 `pending_decision` → `needs_decision`；登记表 `status.needs_input`（等待且没有在跟的工作）→ `needs_input`。它们是 **Input**：作为内部输入源 `_child` 的候选（`key = child:<sid>:<event>@<rev>`，index 0）进入受控输入批次，可开启或并入 Turn。候选在每次选批时重新合成，直到消费它的批次的 receipt 提交：应用 receipt 时把 `subscription_cursors["_child:<sid>"].attention` 置为该事件名，同一状态不再交付；子离开该状态后清空，下次进入是新的事件。`_child` 与 `_task` 一样没有总线消费位置。
 - **没有“等一个子 Session”**：`agent-session wait` 与 `create-worksession --wait` 已删除（调用时返回说明）。Session 在 loop 之外跟进它的子 Session：模型结束回复即可，多 Turn Work 的 run 为需要汇报的子保活（`wait_children`），子的结束以 `_child` 的 `finished` 事件作为下一条输入。宿主的 resolver 仍能回答 `session:<sid>` 形式的 task（只读登记表，立即回答），但没有命令再产生它。
-- **plan 发给 Todo 的 work session 的事件**：plan session 的 Todo 由宿主派出的 work session 带输入队列（`SubSessionSpec.queued`；不是 inbox，等待策略仍是 `finish_failed`）。plan 的 `todo update` 向运行中的 attempt 投一条 `event`：`source = todo:<todo_id>`、`event = updated`、`seq = Todo 的 rev`、`summary = "Todo Tx was updated (<字段>): <原因>"`（≤ 1 KiB）、`data_ref = <plan sid>#<todo_id>@<attempt>`、key `<plan sid>:<todo_id>:<attempt>#updated@<rev>`。有 `origin.parent_session` 的 Session 把 `source.kind = todo` 的事件当作 Active 输入接收（不需要订阅）；取入批次时宿主按 `data_ref` 读 plan 的列表，把 Todo 当前的完整任务接在 summary 后。模板变量 `is_todo_update`、`todo_id`。work session 在这类事件取入之前提交的 `report(is_end=true)` 被拒绝（可修正）。
+- **plan 发给 Todo 的 work session 的事件**：plan session 的 Todo 由宿主派出的 work session 的队列收 msg / event（`SubSessionSpec.queued`，`input_policy = any`；不是 inbox，等待策略仍是 `finish_failed`）。plan 的 `todo update` 向运行中的 attempt 投一条 `event`：`source = todo:<todo_id>`、`event = updated`、`seq = Todo 的 rev`、`summary = "Todo Tx was updated (<字段>): <原因>"`（≤ 1 KiB）、`data_ref = <plan sid>#<todo_id>@<attempt>`、key `<plan sid>:<todo_id>:<attempt>#updated@<rev>`。有 `origin.parent_session` 的 Session 把 `source.kind = todo` 的事件当作 Active 输入接收（不需要订阅）；取入批次时宿主按 `data_ref` 读 plan 的列表，把 Todo 当前的完整任务接在 summary 后。模板变量 `is_todo_update`、`todo_id`。work session 在这类事件取入之前提交的 `report(is_end=true)` 被拒绝（可修正）。
 - **父结束规则**：见 [Session Directory Protocol](<Session Directory Protocol.md>) §4 的 `wait_children` 与保活。`run`、`serve` 与等待循环在 `wait_children` 或 `watched_tasks` 非空（或 runner 的纠正待取）时轮询登记表 / resolver，不以“没有输入队列”为返回依据。
-- **stop 级联**：父被 stop 或结束（结束时只针对需要汇报的子）时，对未结束且有输入队列的子投递 `stop`；没有队列的子由驱动它的宿主以驱动者自己的停止请求结束（`host::stopped_from_above`；见 [Session Control Protocol](<Session Control Protocol.md>)）。子被 stop 只在父那里表现为一次 `finished`（outcome stopped）。
-- **pause 级联**：父被 `pause` 时，对未结束且有输入队列的子投递 `pause`（reason `parent session <sid> was paused`）；父 `resume` 时只对因这次级联而暂停的子投递 `resume`。
+- **停止与级联**：`stop(scope=turn)` 不停止子 Session；父 Session 终止时按 [Session Control Protocol](<Session Control Protocol.md>) 的归属与级联规则处理，子 Session 通过 control 停止（每个 Session 都有控制队列；没有队列客户端的宿主建出的无队列子 Session 由驱动它的进程自己停）。子被 stop 在父处表现为一次 `finished`（outcome stopped）。
+- **暂停与级联**：有队列的子可接收级联 pause；父 resume 只恢复因该父暂停的子，具体资格与来源判定见 [Session Control Protocol](<Session Control Protocol.md>)。子暂停不等于 `finished`，不合成结束输入。
 - **推进**：子由其驱动者身份的托管进程推进（参考实现 `host::ChildDriver`：轮询登记表，为每个未结束、未被驱动的子按其自己的配置装配 runtime 后 `drive(Idle)`，各持自己的 lease）。宿主进程退出只停止这些任务，不改变已提交状态；重启后从登记表重新接管。

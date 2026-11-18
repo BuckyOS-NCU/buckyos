@@ -7,6 +7,7 @@
 
 pub mod http;
 pub mod projection;
+pub mod reflow;
 pub mod rpc;
 pub mod s3;
 pub mod spec;
@@ -32,11 +33,13 @@ pub struct BucketHost {
     groups: Mutex<HashMap<String, (Instant, Vec<String>, bool)>>,
     /// Display names of apps owning buckets (Files projection folders), from their specs.
     pub(crate) names: Mutex<HashMap<String, String>>,
+    /// What the named-store GC did lately (`bucket.gc_status`); in memory only.
+    pub(crate) gc_log: Mutex<tasks::GcLog>,
 }
 
 impl Default for BucketHost {
     fn default() -> Self {
-        BucketHost { store: tokio::sync::OnceCell::new(), synced: Default::default(), groups: Default::default(), names: Default::default() }
+        BucketHost { store: tokio::sync::OnceCell::new(), synced: Default::default(), groups: Default::default(), names: Default::default(), gc_log: Default::default() }
     }
 }
 
@@ -196,6 +199,9 @@ pub async fn session_of(state: &AppState, token: Option<&str>) -> BucketResult<S
     let claims = buckyos_api::verify_nfs_session_token(token, test_key.as_deref())
         .await
         .map_err(|e| BucketError::PermissionDenied(format!("invalid session token: {e}")))?;
+    if crate::auth::is_page_session(&claims) {
+        return Err(BucketError::PermissionDenied("this session only opens reflow pages".into()));
+    }
     Ok(match claims.principal_kind {
         TokenPrincipalKind::User | TokenPrincipalKind::App => Session::User {
             user: claims.subject,

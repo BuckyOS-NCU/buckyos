@@ -23,6 +23,8 @@ export interface CyfsPathRef {
 export interface ObjectIdRef {
   kind: 'object-id'
   objectId: string
+  /** A member of an archive object: `/archive` (its root) or `/archive/<member path>` — as fixed as the object. */
+  innerPath?: string
   version?: string
 }
 
@@ -53,7 +55,7 @@ export interface ExtensionRef {
   value?: unknown
 }
 
-export function extensionRefField(ref: ContentRef, field: 'name' | 'reference'): string | undefined {
+export function extensionRefField(ref: ContentRef, field: 'name' | 'reference' | 'url'): string | undefined {
   const value = (ref as ExtensionRef).value
   if (!value || typeof value !== 'object') return undefined
   const found = (value as Record<string, unknown>)[field]
@@ -165,6 +167,8 @@ export interface ResolvedPreviewSource {
   containerRef?: ContentRef
   /** Provider-specific opaque handle (e.g. NFSP ref) for later calls. */
   providerHandle?: unknown
+  /** A host-resolved source: the object id the viewer's own session can read, for Pipeline work. */
+  pipelineObjectId?: () => Promise<string>
 }
 
 // ─── Standard result types (§9.2) ───
@@ -177,6 +181,8 @@ export type PreviewRendererType =
   | 'audio'
   | 'video'
   | 'pdf'
+  | 'sheet'
+  | 'diagram'
 
 /** §9.4 success payload of a Pipeline (or the Direct path's synthesized one). */
 export interface PreviewResult {
@@ -352,6 +358,7 @@ export interface PreviewCapabilities {
   next: boolean
   export: boolean
   openWith: boolean
+  share: boolean
   fullscreen: boolean
 }
 
@@ -414,9 +421,12 @@ export interface PreviewHostAction {
   onInvoke: (context: { item: PreviewItemInfo; resolved?: ResolvedPreviewSource }) => void
 }
 
+/** An action on the original of the current item (Open with…, Share): never on a Pipeline result. */
 export interface PreviewOpenWithRequest {
   item: PreviewItemInfo
   resolved?: ResolvedPreviewSource
-  /** Best-known media type at the time of the request. */
+  /** The original's media type as classified (a converted Office document keeps its own type, not the PDF's). */
   mediaType?: string
 }
+
+export type PreviewShareRequest = PreviewOpenWithRequest

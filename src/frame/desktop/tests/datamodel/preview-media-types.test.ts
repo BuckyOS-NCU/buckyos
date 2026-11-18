@@ -1,6 +1,6 @@
 // Real HEIC / HEVC samples (libheif / x265) and Office documents shared with nfs_server's Pipeline tests.
 import { readFileSync } from 'node:fs'
-import { classifyMedia, decideDirect, heifImageSize, isPipelineDocument, rendererForMediaType, sniffMagic } from '../../src/components/preview/mediaTypes.ts'
+import { classifyMedia, decideDirect, heifImageSize, isPipelineDocument, pipelineDocumentProfile, rendererForMediaType, sniffMagic } from '../../src/components/preview/mediaTypes.ts'
 import type { PreviewRuntimeProfile } from '../../src/components/preview/types.ts'
 
 const FIXTURES = new URL('../../../nfs_server/tests/fixtures/preview/', import.meta.url)
@@ -48,7 +48,7 @@ equal(decideDirect(mov, 32970, chromium), { ok: true }, 'MOV is tried directly')
 const avi = classifyMedia({ name: 'clip.avi', contentType: 'video/x-msvideo' })
 equal(decideDirect(avi, 1, chromium), { ok: false, reason: 'runtime-unsupported' }, 'AVI is not a Direct container')
 
-// Office / ODF / RTF: the pdf renderer, but only for the Pipeline's PDF (nfs_server `preview-document`).
+// Office / ODF / RTF documents: the pdf renderer, but only for the Pipeline's PDF (nfs_server `preview-document`).
 const docx = classifyMedia({ name: 'Q3 Report.DOCX', hints: ['application/octet-stream'], magic: bytes('office.docx') })
 equal([docx.mediaType, docx.rendererType, docx.direct], ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'pdf', false], 'DOCX classification')
 equal(decideDirect(docx, 5656, chromium), { ok: false, reason: 'no-renderer' }, 'a DOCX never goes to the PDF viewer as is')
@@ -56,23 +56,93 @@ const pptx = classifyMedia({ name: 'deck.pptx', magic: bytes('office.pptx') })
 equal([pptx.rendererType, pptx.direct, decideDirect(pptx, 10321, chromium).ok], ['pdf', false, false], 'PPTX goes to the Pipeline')
 const odt = classifyMedia({ name: 'notes.odt', magic: bytes('office.odt') })
 equal([odt.mediaType, odt.rendererType, odt.direct], ['application/vnd.oasis.opendocument.text', 'pdf', false], 'ODT classification')
-for (const [name, type] of [
-  ['old.doc', 'application/msword'],
-  ['old.ppt', 'application/vnd.ms-powerpoint'],
-  ['old.xls', 'application/vnd.ms-excel'],
-  ['book.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
-  ['slides.odp', 'application/vnd.oasis.opendocument.presentation'],
-  ['sheet.ods', 'application/vnd.oasis.opendocument.spreadsheet'],
-  ['letter.rtf', 'application/rtf'],
-]) {
+for (const [name, type, renderer] of [
+  ['old.doc', 'application/msword', 'pdf'],
+  ['old.ppt', 'application/vnd.ms-powerpoint', 'pdf'],
+  ['slides.odp', 'application/vnd.oasis.opendocument.presentation', 'pdf'],
+  ['letter.rtf', 'application/rtf', 'pdf'],
+  ['macro.docm', 'application/vnd.ms-word.document.macroenabled.12', 'pdf'],
+  ['kingsoft.wps', 'application/kswps', 'pdf'],
+  ['show.ppsx', 'application/vnd.openxmlformats-officedocument.presentationml.slideshow', 'pdf'],
+  ['deck.key', 'application/vnd.apple.keynote', 'pdf'],
+  ['plan.vsdx', 'application/vnd.ms-visio.drawing', 'pdf'],
+  ['FLOW.VSD', 'application/vnd.visio', 'pdf'],
+  // Spreadsheets a Pipeline converts to xlsx (nfs_server `preview-sheet`).
+  ['old.xls', 'application/vnd.ms-excel', 'sheet'],
+  ['kingsoft.et', 'application/kset', 'sheet'],
+  ['sheet.ods', 'application/vnd.oasis.opendocument.spreadsheet', 'sheet'],
+  ['table.numbers', 'application/vnd.apple.numbers', 'sheet'],
+  // Markup a Pipeline converts to a page (nfs_server `preview-html`).
+  ['novel.epub', 'application/epub+zip', 'html'],
+  ['analysis.ipynb', 'application/x-ipynb+json', 'html'],
+  ['README.md', 'text/markdown', 'html'],
+] as const) {
   const doc = classifyMedia({ name })
-  equal([doc.mediaType, doc.rendererType, doc.direct], [type, 'pdf', false], `${name} by extension`)
+  equal([doc.mediaType, doc.rendererType, doc.direct], [type, renderer, false], `${name} by extension`)
 }
+// Visio drawings: converted to a PDF whatever the server calls them; a generic or text header loses to the name.
+const ole2 = new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, ...new Array(504).fill(0)])
+const vsdx = classifyMedia({ name: 'drawing.vsdx', hints: ['application/octet-stream'], contentType: 'application/octet-stream', magic: bytes('drawing.vsdx') })
+equal([vsdx.mediaType, vsdx.rendererType, vsdx.direct], ['application/vnd.ms-visio.drawing', 'pdf', false], 'VSDX bytes with its name')
+equal(decideDirect(vsdx, 5337, chromium), { ok: false, reason: 'no-renderer' }, 'a VSDX goes to the Pipeline, never to the PDF viewer as is')
+for (const [what, input] of [
+  ['OLE2 bytes named .vsd', { name: 'Network Diagram.vsd', contentType: 'application/octet-stream', magic: ole2 }],
+  ['an empty File.type', { name: 'flow.VSD', hints: [''], contentType: '' }],
+  ['a text header', { name: 'flow.vsd', contentType: 'text/plain' }],
+  ['the IANA type alone', { name: 'download', contentType: 'application/vnd.visio' }],
+  ['an x- alias', { name: 'download', contentType: 'application/x-visio' }],
+  ['the viewer type Windows registers', { name: 'download', contentType: 'application/vnd.ms-visio.viewer' }],
+  ['a VSDX part type', { name: 'download', contentType: 'application/vnd.ms-visio.drawing.main+xml; charset=binary' }],
+  ['a text header on VSDX', { name: 'plan.vsdx', contentType: 'text/plain' }],
+] as const) {
+  const drawing = classifyMedia(input)
+  equal([drawing.rendererType, drawing.direct, pipelineDocumentProfile(drawing.mediaType)], ['pdf', false, 'preview-document'], `Visio: ${what}`)
+}
+const vsd = classifyMedia({ name: 'drawing.vsd', hints: ['application/octet-stream'], contentType: 'application/octet-stream', magic: bytes('drawing.vsd').subarray(0, 512) })
+equal([vsd.mediaType, vsd.rendererType, vsd.direct, decideDirect(vsd, 11264, chromium).ok], ['application/vnd.visio', 'pdf', false, false], 'a real VSD with its name goes to the Pipeline')
+equal(classifyMedia({ name: 'macro.vsdm' }).rendererType, null, 'vsdm is not taken')
+equal(
+  ['old.doc', 'old.xls', 'novel.epub', 'book.xlsx', 'paper.pdf'].map((name) => pipelineDocumentProfile(classifyMedia({ name }).mediaType)),
+  ['preview-document', 'preview-sheet', 'preview-html', null, null],
+  'the nfs_server profile of each document family',
+)
+
+// xlsx / xlsm / csv / tsv: the sheet renderer reads the original bytes.
+for (const name of ['book.xlsx', 'macro.xlsm', 'list.csv', 'list.tsv']) {
+  const sheet = classifyMedia({ name, contentType: name.endsWith('sv') ? 'text/plain' : 'application/octet-stream' })
+  equal([sheet.rendererType, sheet.direct, decideDirect(sheet, 1024, chromium).ok], ['sheet', true, true], `${name} is shown directly`)
+}
+equal(decideDirect(classifyMedia({ name: 'huge.xlsx' }), 31 * 1024 * 1024, chromium), { ok: false, reason: 'too-large' }, 'a sheet over 30 MiB is not read')
+// Text markup falls back to the text renderer where no Pipeline converts it; a binary one does not.
+const md = classifyMedia({ name: 'README.md', contentType: 'text/plain', magic: new TextEncoder().encode('# Title\n\ntext\n') })
+equal([md.mediaType, md.direct, md.textFallback], ['text/markdown', false, true], 'Markdown is a Pipeline document with a text fallback')
+const rst = classifyMedia({ name: 'guide.rst', contentType: 'text/plain', magic: new TextEncoder().encode('Title\n=====\n') })
+equal([rst.rendererType, rst.direct], ['text', true], 'markup pandoc is not sure to render whole stays text')
+equal(classifyMedia({ name: 'server.key', magic: new TextEncoder().encode('-----BEGIN PRIVATE KEY-----\n') }).rendererType, 'text', 'a PEM .key is text, not a Keynote deck')
+equal(classifyMedia({ name: 'novel.epub', magic: bytes('office.docx') }).textFallback, false, 'an epub has no text fallback')
 equal(rendererForMediaType('text/rtf'), 'pdf', 'text/rtf is a document, not text')
 equal(classifyMedia({ name: 'memo', contentType: 'application/msword' }).rendererType, 'pdf', 'MIME type alone')
 equal([isPipelineDocument('application/pdf'), isPipelineDocument('application/zip')], [false, false], 'PDF and ZIP are not converted documents')
 const pdf = classifyMedia({ name: 'paper.pdf', magic: new TextEncoder().encode('%PDF-1.7\n') })
 equal([pdf.rendererType, pdf.direct, decideDirect(pdf, 9, chromium).ok], ['pdf', true, true], 'a PDF stays Direct')
+equal(decideDirect(pdf, 9, { ...chromium, pdfInline: false }), { ok: true }, 'a PDF is Direct without a built-in viewer too: pdf.js draws it')
 equal(classifyMedia({ name: 'bundle.zip', magic: bytes('office.docx') }).direct, false, 'a ZIP has no renderer')
+
+const mxfile = new TextEncoder().encode('<mxfile host="app.diagrams.net"><diagram id="a" name="Page-1">')
+const declared = new TextEncoder().encode('<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="Electron">')
+const model = new TextEncoder().encode('<mxGraphModel dx="800"><root>')
+for (const [input, what] of [
+  [{ name: 'flow.drawio', contentType: 'application/octet-stream', magic: mxfile }, 'a .drawio file'],
+  [{ name: 'flow.drawio', contentType: 'application/xml', magic: declared }, 'a .drawio file with an XML declaration served as XML'],
+  [{ name: 'flow.dio', hints: ['application/xml'] }, 'a .dio file by name'],
+  [{ name: 'export.xml', contentType: 'text/xml', magic: declared }, 'an XML file that is a draw.io file'],
+  [{ name: 'clip.txt', contentType: 'text/plain', magic: model }, 'a bare model'],
+] as const) {
+  const c = classifyMedia(input)
+  equal([c.mediaType, c.rendererType, c.direct, decideDirect(c, 1024, chromium).ok], ['application/vnd.jgraph.mxfile', 'diagram', true, true], what)
+}
+equal(classifyMedia({ name: 'data.xml', contentType: 'application/xml', magic: new TextEncoder().encode('<?xml version="1.0"?><root/>') }).rendererType, 'text', 'other XML stays text')
+equal(classifyMedia({ name: 'flow.drawio.svg', magic: new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile">') }).rendererType, 'svg', 'a .drawio.svg is an SVG')
+equal(decideDirect(classifyMedia({ name: 'huge.drawio' }), 33 * 1024 * 1024, chromium), { ok: false, reason: 'too-large' }, 'a diagram over 32 MiB is not read')
 
 console.log('preview media types: ok')

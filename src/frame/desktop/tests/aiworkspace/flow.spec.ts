@@ -16,7 +16,7 @@ const notes = (page: Page) => page.getByTestId('aiws-richtext-notes')
 const frame = (page: Page, cellId: string) => page.getByTestId(`aiws-cell-frame-${cellId}`)
 
 async function order(api: Api, workspaceId: string, parent = 'surface-main'): Promise<string[]> {
-  const children = (await api.rpc(ALICE, 'doc.list_children', { workspace_id: workspaceId, entity_id: parent })).children as { entity_id: string; type_id: string; view_type?: string; kind?: string }[]
+  const children = (await api.children(ALICE, workspaceId, parent)) as { entity_id: string; type_id: string; view_type?: string; kind?: string }[]
   return children.filter((child) => child.type_id === 'buckyos.cell' || child.kind === 'group').map((child) => child.entity_id)
 }
 
@@ -153,7 +153,8 @@ test('FP03 the / menu: filters, turns the line into a heading, inserts a table r
   expect(now[0]).toBe('cell-notes')
   expect(now.slice(2)).toEqual(['cell-all-tasks', 'cell-open-tasks', 'cell-info', 'cell-diagram'])
   await expect(frame(page, now[1])).toBeVisible()
-  await expect(page.getByTestId(`aiws-cell-title-${now[1]}`)).toHaveText('无标题')
+  // a new table has a name (a counter, 核心 API 调整 R19): the heading shows it until the Block gets a title
+  await expect(page.getByTestId(`aiws-cell-title-${now[1]}`)).toHaveText(/^table-\d+$/)
   await expectAllCommitted(page)
 })
 
@@ -202,7 +203,7 @@ test('FP04 Markdown source ("notepad") mode: typed text reaches the rich text bl
 
 test('FP05 source mode and a colleague: changes from elsewhere come in, my typing is kept', async ({ browser, api }) => {
   const ws = await api.sample(ALICE, `fp05 ${Date.now()}`)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', capabilities: ['read', 'update', 'append', 'comment'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', allow: ['read', 'update', 'append', 'comment'] }] })
   const aliceContext = await browser.newContext({ viewport: { width: 1600, height: 1000 } })
   const bobContext = await browser.newContext({ viewport: { width: 1600, height: 1000 } })
   const alice = await aliceContext.newPage()
@@ -261,24 +262,33 @@ test('FP06 keyboard and handles: Esc selects the Block, arrows walk, Ctrl+Shift+
   await expectAllCommitted(page)
 })
 
-test('FP07 insertion where the user is: ＋ after a Block, and a click below the page continues writing', async ({ page, api }) => {
+test('FP07 insertion where the user is: ＋ before a Block, and a click below the page continues writing', async ({ page, api }) => {
   const ws = await api.sample(ALICE, `fp07 ${Date.now()}`)
   await openWorkspace(page, ALICE, ws.workspace_id)
   await frame(page, 'cell-notes').hover()
   await page.getByTestId('aiws-flow-plus-cell-notes').click()
   await page.getByTestId('aiws-flow-add-richtext').click()
-  // a new text right after the notes, with the caret in it
+  // a new text right before the notes (the first Block), with the caret in it
   await expect.poll(async () => (await order(api, ws.workspace_id)).length).toBe(6)
-  const textCell = (await order(api, ws.workspace_id))[1]
+  const textCell = (await order(api, ws.workspace_id))[0]
+  expect((await order(api, ws.workspace_id))[1]).toBe('cell-notes')
   await expect(frame(page, textCell).locator('.ProseMirror')).toBeFocused()
-  await page.keyboard.type('插在说明后面')
+  await page.keyboard.type('插在说明前面')
   await expectAllCommitted(page)
   const textSource = (await api.read(ALICE, ws.workspace_id, textCell)).content.payload.source_ref.entity_id
-  expect(text(await api.ast(ALICE, ws.workspace_id, textSource))).toContain('插在说明后面')
+  expect(text(await api.ast(ALICE, ws.workspace_id, textSource))).toContain('插在说明前面')
+  // ＋ of a later Block inserts between it and the one above
+  await frame(page, 'cell-open-tasks').hover()
+  await page.getByTestId('aiws-flow-plus-cell-open-tasks').click()
+  await page.getByTestId('aiws-flow-add-group').click()
+  await expect.poll(async () => (await order(api, ws.workspace_id)).length).toBe(7)
+  const placed = await order(api, ws.workspace_id)
+  expect(placed).toEqual([textCell, 'cell-notes', 'cell-all-tasks', placed[3], 'cell-open-tasks', 'cell-info', 'cell-diagram'])
+  expect(placed[3]).not.toBe(textCell)
   // below the last Block (a picture): a click starts a new text there
   await page.getByTestId('aiws-flow-continue').click()
-  await expect.poll(async () => (await order(api, ws.workspace_id)).length).toBe(7)
-  const lastCell = (await order(api, ws.workspace_id))[6]
+  await expect.poll(async () => (await order(api, ws.workspace_id)).length).toBe(8)
+  const lastCell = (await order(api, ws.workspace_id))[7]
   await expect(frame(page, lastCell).locator('.ProseMirror')).toBeFocused()
   await page.keyboard.type('页尾第一段')
   await expectAllCommitted(page)
@@ -288,7 +298,7 @@ test('FP07 insertion where the user is: ＋ after a Block, and a click below the
   await expect(frame(page, lastCell).locator('.ProseMirror')).toBeFocused()
   await page.keyboard.type('页尾第二段')
   await expectAllCommitted(page)
-  expect((await order(api, ws.workspace_id)).length).toBe(7)
+  expect((await order(api, ws.workspace_id)).length).toBe(8)
   const ast = await api.ast(ALICE, ws.workspace_id, lastSource)
   expect((ast.content as Json[]).map(text)).toEqual(['页尾第一段', '页尾第二段'])
 })
@@ -297,7 +307,7 @@ test('FP08 the table as a database grid: new rows by typing, a field from the he
   const ws = await api.sample(ALICE, `fp08 ${Date.now()}`)
   await openWorkspace(page, ALICE, ws.workspace_id)
   const all = frame(page, 'cell-all-tasks')
-  const rows = async () => (await api.rpc(ALICE, 'doc.query', { workspace_id: ws.workspace_id, source_id: 'tasks' })).rows as { record_id: string; values: Record<string, unknown> }[]
+  const rows = async () => (await api.table(ALICE, ws.workspace_id, { source_id: 'tasks' })).rows as { record_id: string; values: Record<string, unknown> }[]
   // field types show as icons in the header; options as pills
   await expect(all.locator('.aiws-th').first().locator('svg')).toBeVisible()
   await expect(all.getByTestId('aiws-cell-task-40-status').locator('.aiws-pill')).toHaveText('完成')
@@ -333,10 +343,11 @@ test('FP08 the table as a database grid: new rows by typing, a field from the he
   await expect(page.getByLabel('负责人 task-41', { exact: true })).toHaveValue('Z')
   await page.keyboard.press('Tab')
   await expect.poll(async () => (await rows()).find((row) => row.record_id === 'task-41')?.values.owner).toBe('Z')
-  // a row is deleted from its hover button
-  await all.getByTestId('aiws-row').filter({ hasText: '第一条新任务' }).hover()
+  // a row is deleted by ticking its head and deleting from the selection bar, asked first (UI 框架 PRD §7.3)
   const added = (await rows()).find((row) => row.values.title === '第一条新任务')?.record_id as string
-  await page.getByTestId(`aiws-delete-record-${added}`).click()
+  await all.getByTestId(`aiws-row-check-${added}`).check()
+  await all.getByTestId('aiws-table-selection-delete').click()
+  await page.getByTestId('aiws-table-confirm-ok').click()
   await expect.poll(async () => (await rows()).length).toBe(6)
   await expectAllCommitted(page)
 })

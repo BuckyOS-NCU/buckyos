@@ -28,6 +28,10 @@ pub enum ErrorCode {
     NotEmpty,
     Unsupported,
     Internal,
+    SudoRequired,
+    PasswordRequired,
+    PasswordInvalid,
+    ArchiveCorrupt,
 }
 
 impl ErrorCode {
@@ -52,6 +56,10 @@ impl ErrorCode {
             ErrorCode::NotEmpty => "NOT_EMPTY",
             ErrorCode::Unsupported => "UNSUPPORTED",
             ErrorCode::Internal => "INTERNAL",
+            ErrorCode::SudoRequired => "SUDO_REQUIRED",
+            ErrorCode::PasswordRequired => "PASSWORD_REQUIRED",
+            ErrorCode::PasswordInvalid => "PASSWORD_INVALID",
+            ErrorCode::ArchiveCorrupt => "ARCHIVE_CORRUPT",
         }
     }
 
@@ -76,6 +84,10 @@ impl ErrorCode {
             ErrorCode::NotEmpty => 409,
             ErrorCode::Unsupported => 400,
             ErrorCode::Internal => 500,
+            ErrorCode::SudoRequired => 403,
+            ErrorCode::PasswordRequired => 403,
+            ErrorCode::PasswordInvalid => 403,
+            ErrorCode::ArchiveCorrupt => 422,
         }
     }
 }
@@ -130,6 +142,9 @@ pub fn invalid(msg: impl Into<String>) -> NfsError {
 }
 pub fn internal(msg: impl Into<String>) -> NfsError {
     NfsError::new(ErrorCode::Internal, msg)
+}
+pub fn sudo_required(msg: impl Into<String>) -> NfsError {
+    NfsError::new(ErrorCode::SudoRequired, msg)
 }
 pub fn rev_mismatch(expected: &str, actual: &str) -> NfsError {
     NfsError::new(ErrorCode::RevMismatch, "container revision mismatch")

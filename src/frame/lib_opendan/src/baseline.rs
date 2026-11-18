@@ -84,6 +84,7 @@ pub const STANDARD_TOOLS: &[BaselineTool] = &[
     tool("import_office", ToolCategory::BuckyosService, AGENT_TOOLS_SOURCE),
     tool("import_table", ToolCategory::BuckyosService, AGENT_TOOLS_SOURCE),
     tool("materialize_resource", ToolCategory::BuckyosService, AGENT_TOOLS_SOURCE),
+    tool("reflow", ToolCategory::BuckyosService, AGENT_TOOLS_SOURCE),
     tool("resume_aicc_task", ToolCategory::BuckyosService, AGENT_TOOLS_SOURCE),
     helper("llm_understand_media", ToolCategory::Media, AGENT_TOOL_SOURCE, "agent_tool"),
     tool("caption_image", ToolCategory::Media, AGENT_TOOLS_SOURCE),
@@ -116,6 +117,7 @@ pub enum ExtToolCategory {
     Document,
     Python,
     JavaScript,
+    Browser,
     Utility,
 }
 
@@ -135,6 +137,11 @@ pub struct ExtCommand {
     /// A no-network check, relative to the root of the package's payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smoke: Option<&'static str>,
+    /// The online item of the package it runs (`needs` in the package's
+    /// manifest): until the node has downloaded it, the launcher answers as a
+    /// stub and the command is waiting, not missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub online: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -146,7 +153,11 @@ pub struct ExtendedTool {
 }
 
 const fn ext_cmd(name: &'static str, version_probe: &'static str, smoke: Option<&'static str>) -> ExtCommand {
-    ExtCommand { name, version_probe, smoke }
+    ExtCommand { name, version_probe, smoke, online: None }
+}
+
+const fn ext_online_cmd(name: &'static str, version_probe: &'static str, smoke: Option<&'static str>, online: &'static str) -> ExtCommand {
+    ExtCommand { name, version_probe, smoke, online: Some(online) }
 }
 
 const fn core_tool(id: &'static str, category: ExtToolCategory, commands: &'static [ExtCommand]) -> ExtendedTool {
@@ -172,6 +183,7 @@ pub const EXTENDED_TOOLS: &[ExtendedTool] = &[
     ]),
     core_tool("tesseract", ExtToolCategory::Ocr, &[ext_cmd("tesseract", "tesseract --version", Some("smoke/tesseract.sh"))]),
     core_tool("pandoc", ExtToolCategory::Document, &[ext_cmd("pandoc", "pandoc --version", Some("smoke/pandoc.sh"))]),
+    core_tool("libreoffice", ExtToolCategory::Document, &[ext_cmd("soffice", "soffice --version", Some("smoke/soffice.sh"))]),
     core_tool("python", ExtToolCategory::Python, &[
         ext_cmd("python3", "python3 --version", Some("smoke/python3.sh")),
         ext_cmd("uv", "uv --version", None),
@@ -182,6 +194,11 @@ pub const EXTENDED_TOOLS: &[ExtendedTool] = &[
         ext_cmd("npx", "npx --version", None),
     ]),
     core_tool("deno", ExtToolCategory::JavaScript, &[ext_cmd("deno", "deno --version", Some("smoke/deno.sh"))]),
+    core_tool("chromium", ExtToolCategory::Browser, &[
+        ext_online_cmd("chromium", "chromium --version", Some("smoke/chromium.sh"), "chromium"),
+        ext_cmd("agent-browser", "agent-browser version", Some("smoke/agent-browser.sh")),
+        ext_cmd("page-render", "page-render --version", Some("smoke/page-render.sh")),
+    ]),
     core_tool("helpers", ExtToolCategory::Utility, &[
         ext_cmd("git", "git --version", Some("smoke/helpers.sh")),
         ext_cmd("curl", "curl --version", None),
@@ -280,9 +297,15 @@ pub fn evaluate(level: RuntimeBaseline, overlay: bool, resolved: &BTreeMap<Strin
     }
     let mut ext_missing = Vec::new();
     let mut system = Vec::new();
+    let mut waiting = Vec::new();
     let mut found = 0usize;
     for tool in EXTENDED_TOOLS {
-        for name in tool.commands.iter().map(|c| c.name) {
+        for command in tool.commands {
+            let name = command.name;
+            if command.online.is_some() && resolved.get(name).is_some_and(|c| c.stub) {
+                waiting.push(name.to_string());
+                continue;
+            }
             match present(name) {
                 Some(c) => {
                     found += 1;
@@ -311,7 +334,7 @@ pub fn evaluate(level: RuntimeBaseline, overlay: bool, resolved: &BTreeMap<Strin
     BaselineFindings {
         missing,
         unmanaged,
-        ext: ExtCheck { status, missing: ext_missing, system },
+        ext: ExtCheck { status, missing: ext_missing, system, waiting },
     }
 }
 
@@ -341,7 +364,7 @@ impl CommandOrigin {
     }
 
     pub fn of(&self, path: &str) -> ProvidedBy {
-        let agent_tools = self.agent_root.as_ref().map(|r| format!("{}/{}", r.trim_end_matches(['/', '\\']), crate::skills::TOOLS_DIR));
+        let agent_tools = self.agent_root.as_ref().map(|r| format!("{}/tools", r.trim_end_matches(['/', '\\'])));
         if agent_tools.as_deref().is_some_and(|d| self.under(path, d)) || path.replace('\\', "/").contains("/.opendan/") {
             return ProvidedBy::Agent;
         }
@@ -413,7 +436,15 @@ pub fn version_probe_of(name: &str) -> String {
 /// those of `versions` also the probe's exit code and first output line.
 /// Exits 0: POSIX `sh`, or PowerShell when `windows`.
 pub fn resolve_probe(names: &[&str], versions: &[&str], windows: bool) -> String {
-    let probe = |n: &&str| if versions.contains(n) { version_probe_of(n) } else { String::new() };
+    let probe = |n: &&str| {
+        if !versions.contains(n) {
+            String::new()
+        } else if windows && *n == "unzip" {
+            "unzip --help".to_string()
+        } else {
+            version_probe_of(n)
+        }
+    };
     if windows {
         let calls = names
             .iter()
@@ -421,7 +452,7 @@ pub fn resolve_probe(names: &[&str], versions: &[&str], windows: bool) -> String
             .collect::<Vec<_>>()
             .join("; ");
         format!(
-            "function p($c,$f) {{ $g = Get-Command $c -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $g) {{ return }}; if ($f) {{ $global:LASTEXITCODE = 0; $o = try {{ Invoke-Expression \"$f 2>&1\" }} catch {{ $global:LASTEXITCODE = 127; $_ }}; $v = ($o | Select-Object -First 1); Write-Output (\"{{0}}`t{{1}}`t{{2}}`t{{3}}\" -f $c,$g.Source,$LASTEXITCODE,$v) }} else {{ Write-Output (\"{{0}}`t{{1}}\" -f $c,$g.Source) }} }}; {calls}"
+            "function p($c,$f) {{ $g = Get-Command $c -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $g) {{ return }}; if ($f) {{ $ErrorActionPreference = 'Continue'; $PSNativeCommandUseErrorActionPreference = $false; $global:LASTEXITCODE = 0; $o = @(try {{ Invoke-Expression \"$f 2>&1\" }} catch {{ $global:LASTEXITCODE = 127; $_ }}); $r = $LASTEXITCODE; $v = ($o | Where-Object {{ $_ -isnot [System.Management.Automation.ErrorRecord] }} | Select-Object -First 1); if ($null -eq $v) {{ $v = ($o | Select-Object -First 1) }}; Write-Output (\"{{0}}`t{{1}}`t{{2}}`t{{3}}\" -f $c,$g.Source,$r,$v) }} else {{ Write-Output (\"{{0}}`t{{1}}\" -f $c,$g.Source) }} }}; {calls}; $global:LASTEXITCODE = 0"
         )
     } else {
         let calls = names
@@ -467,7 +498,9 @@ pub fn parse_resolved(stdout: &str, asked: &[&str]) -> BTreeMap<String, ProbedCo
 }
 
 /// A command `exit_code` says does not run: not found or not executable by
-/// the shell (a stub explaining how to get the real tool exits 127).
+/// the shell (a stub explaining how to get the real tool exits 127, and so
+/// does a launcher whose online item the node has not downloaded yet:
+/// `chromium` of `ext-core`).
 pub fn is_stub_exit(exit_code: Option<i32>) -> bool {
     matches!(exit_code, Some(126 | 127))
 }
@@ -524,18 +557,10 @@ pub fn resolve_locally(names: &[&str], before: &[PathBuf], path: Option<&std::ff
         .collect()
 }
 
-/// The directories of this machine where an Agent's own commands are, in PATH
-/// order: `tools/<skill>/bin` of every installed skill, then `tools`.
+/// The directory of this machine where an Agent's own commands are (`<agent_root>/tools`).
 pub fn agent_tool_dirs(agent_root: &Path) -> Vec<PathBuf> {
-    let tools = agent_root.join(crate::skills::TOOLS_DIR);
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&tools)
-        .map(|entries| entries.flatten().map(|e| e.path().join("bin")).filter(|d| d.is_dir()).collect())
-        .unwrap_or_default();
-    dirs.sort();
-    if tools.is_dir() {
-        dirs.push(tools);
-    }
-    dirs
+    let tools = agent_root.join("tools");
+    if tools.is_dir() { vec![tools] } else { Vec::new() }
 }
 
 /// The directory of this program: where a development build's helpers are.
@@ -572,19 +597,37 @@ pub fn is_deno_command(name: &str) -> bool {
             .any(|t| t.name == name && t.source == AGENT_TOOLS_SOURCE)
 }
 
-/// `$BUCKYOS_ROOT` as this program sees it: the environment, else two
-/// levels above the program (`bin/<dir>/<program>`).
+/// `$BUCKYOS_ROOT` as this program sees it: the environment (read on every
+/// call), else [`buckyos_kit::get_buckyos_root_dir`] (the install holding
+/// the program, else the OS default).
 pub fn buckyos_root() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("BUCKYOS_ROOT").filter(|r| !r.is_empty()) {
         return Some(PathBuf::from(root));
     }
-    let exe = std::env::args_os().next().map(PathBuf::from)?;
-    let exe = if exe.is_absolute() { exe } else { std::env::current_exe().ok()? };
-    exe.parent()?.parent()?.parent().map(Path::to_path_buf)
+    Some(buckyos_kit::get_buckyos_root_dir())
 }
 
 pub fn managed_tool_dirs() -> Vec<PathBuf> {
     buckyos_root().map(|root| vec![root.join("tools/bin"), root.join("bin/agent-tools")]).unwrap_or_default()
+}
+
+/// Points Playwright at the browser of `ext-core` under `root`, so that a project on the same Playwright version
+/// downloads none. The browser is an online item of the package: the node downloads it into `tools/online/chromium`,
+/// and it takes its libraries from the package, so the host has nothing for Playwright to validate. Empty until the
+/// node has downloaded it.
+pub fn playwright_env_in(root: &Path) -> Vec<(String, String)> {
+    let browsers = root.join("tools/online/chromium");
+    if !browsers.is_dir() {
+        return Vec::new();
+    }
+    vec![
+        ("PLAYWRIGHT_BROWSERS_PATH".to_string(), browsers.display().to_string()),
+        ("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS".to_string(), "1".to_string()),
+    ]
+}
+
+pub fn playwright_env() -> Vec<(String, String)> {
+    buckyos_root().map(|root| playwright_env_in(&root)).unwrap_or_default()
 }
 
 /// The agent's BuckyOS identity for a service tool run by a Session
@@ -732,6 +775,23 @@ mod tests {
     }
 
     #[test]
+    fn playwright_is_pointed_at_the_installed_browser_only() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(playwright_env_in(root.path()).is_empty(), "no ext-core browser, no opinion");
+        std::fs::create_dir_all(root.path().join("tools/store/ext-core/browser")).unwrap();
+        assert!(playwright_env_in(root.path()).is_empty(), "the package is there, its browser is not downloaded yet");
+        let browsers = root.path().join("tools/online/chromium");
+        std::fs::create_dir_all(&browsers).unwrap();
+        assert_eq!(
+            playwright_env_in(root.path()),
+            vec![
+                ("PLAYWRIGHT_BROWSERS_PATH".to_string(), browsers.display().to_string()),
+                ("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn no_package_can_provide_a_standard_command() {
         let mut standard: Vec<&str> = STANDARD_TOOLS.iter().map(|t| t.name).collect();
         standard.sort();
@@ -855,6 +915,22 @@ mod tests {
         assert_eq!(stub.missing, vec!["ffmpeg".to_string()]);
         assert!(stub.ext.summary().contains("missing ffmpeg"));
 
+        // the browser's launcher is there before the node has downloaded the browser: waiting, not missing
+        let mut waiting = all_standard();
+        waiting.extend(all_extended(ProvidedBy::Exttools));
+        let mut waiting = found(&waiting);
+        waiting.get_mut("chromium").unwrap().stub = true;
+        let not_yet = evaluate(RuntimeBaseline::Extended, false, &waiting);
+        assert!(not_yet.ok(), "{not_yet:?}");
+        assert_eq!(not_yet.ext.status, ExtStatus::Ok);
+        assert_eq!(not_yet.ext.waiting, vec!["chromium".to_string()]);
+        assert_eq!(not_yet.ext.summary(), "ok; not downloaded yet: chromium");
+        // without its launcher it is missing like any other
+        waiting.remove("chromium");
+        let gone = evaluate(RuntimeBaseline::Extended, false, &waiting);
+        assert_eq!(gone.missing, vec!["chromium".to_string()]);
+        assert!(gone.ext.waiting.is_empty());
+
     }
 
     #[test]
@@ -932,11 +1008,46 @@ mod tests {
 
     #[test]
     fn a_windows_resolve_probe_is_one_powershell_line() {
-        let ps = resolve_probe(&["it's", "ffmpeg"], &["ffmpeg"], true);
+        let ps = resolve_probe(&["it's", "ffmpeg", "unzip"], &["ffmpeg", "unzip"], true);
         assert!(ps.contains("Get-Command") && ps.contains("$g.Source"));
         assert!(ps.contains("p 'it''s' ''") && ps.contains("p 'ffmpeg' 'ffmpeg -version'"), "{ps}");
+        assert!(ps.contains("p 'unzip' 'unzip --help'"), "{ps}");
+        assert!(!ps.contains('\n'), "{ps}");
         assert_eq!(version_probe_of("custom-tool"), "custom-tool --version");
         assert_eq!(version_probe_of("pdftotext"), "pdftotext -v");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_resolve_probe_keeps_native_stderr_and_exit_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            std::fs::write(dir.path().join(format!("{name}.cmd")), format!("@echo off\r\n{body}\r\n")).unwrap();
+        };
+        script("probe-real", "echo deprecated >&2\r\necho real 1.2.3\r\nexit /b 0");
+        script("probe-stderr", "echo stderr 1.2.3 >&2\r\nexit /b 0");
+        script("probe-stub", "echo not bundled >&2\r\nexit /b 127");
+        script("probe-denied", "echo not executable >&2\r\nexit /b 126");
+        script("probe-failed", "echo unsupported argument >&2\r\nexit /b 1");
+        script("unzip", "if not \"%1\"==\"--help\" exit /b 1\r\necho BusyBox unzip\r\nexit /b 0");
+        let asked = ["probe-real", "probe-stderr", "probe-stub", "probe-denied", "probe-absent", "unzip", "probe-failed"];
+        let path = std::env::join_paths(std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))).unwrap();
+        let probe = resolve_probe(&asked, &asked, true);
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
+            .arg(format!("$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; & {{ {probe} }}; if ($ErrorActionPreference -ne 'Stop' -or -not $PSNativeCommandUseErrorActionPreference) {{ throw 'probe changed caller preferences' }}; exit $LASTEXITCODE"))
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let found = parse_resolved(&String::from_utf8_lossy(&output.stdout), &asked);
+        assert_eq!((found["probe-real"].exit_code, found["probe-real"].version.as_deref()), (Some(0), Some("real 1.2.3")));
+        assert_eq!((found["probe-stderr"].exit_code, found["probe-stderr"].version.as_deref()), (Some(0), Some("stderr 1.2.3")));
+        assert_eq!((found["probe-failed"].exit_code, found["probe-failed"].version.as_deref()), (Some(1), Some("unsupported argument")));
+        assert!(is_stub_exit(found["probe-stub"].exit_code));
+        assert!(is_stub_exit(found["probe-denied"].exit_code));
+        assert!(!found.contains_key("probe-absent"));
+        assert_eq!((found["unzip"].exit_code, found["unzip"].version.as_deref()), (Some(0), Some("BusyBox unzip")));
     }
 
     #[test]

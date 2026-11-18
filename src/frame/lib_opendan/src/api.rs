@@ -68,8 +68,9 @@ pub struct SessionSpec {
     /// Session template policy (`session.policy`).
     #[serde(default)]
     pub policy: SessionPolicy,
-    /// Whether the session gets an input queue. `None`: one is created
-    /// when the host has a queue client.
+    /// What the session's input queue takes. Every session gets a queue when
+    /// the host has a queue client (controls always go through it); `None`
+    /// here: the template did not say, msg / event inputs are taken.
     #[serde(default)]
     pub input_channel: Option<InputChannel>,
     /// Reply coordinates of a session bound to one conversation.
@@ -97,9 +98,12 @@ pub struct SessionSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputChannel {
-    /// No queue: bootstrap material comes from `prompt.initial_inputs`,
-    /// nothing can be posted later.
+    /// The queue only takes controls (`session.input_policy = none`):
+    /// bootstrap material comes from `prompt.initial_inputs`, no msg can be
+    /// posted later.
     None,
+    /// The queue takes msg / event inputs too; the host must have a queue
+    /// client.
     Queue,
 }
 
@@ -213,6 +217,9 @@ pub async fn freeze_runtime(agent: &dyn AgentStateClient, spec: &mut SessionSpec
                     record.grant.ops
                 )));
             }
+            if record.connector.is_node() {
+                crate::runtime::check_node_placement(agent, &record).await?;
+            }
             FrozenRuntime {
                 runtime_id: record.runtime_id.clone(),
                 connector: record.connector.clone(),
@@ -313,6 +320,9 @@ pub async fn create_session(
         });
     }
     let agent_did = agent.agent_did().to_string();
+    if spec.require_cmd_skills {
+        crate::state::check_named_skills(agent.behaviors(), &spec.prompt.cmd_skills).await?;
+    }
     freeze_runtime(agent, &mut spec).await?;
     // The entry behavior may only read the workspace (a plan): its binding
     // is narrowed, the grant it hands on to its sub sessions is not.
@@ -366,16 +376,19 @@ pub async fn create_session(
             ));
         }
     }
+    let controls_only = spec.input_channel == Some(InputChannel::None);
+    if controls_only {
+        spec.input_policy = InputPolicy::None;
+    }
     let queue_client = match spec.input_channel {
-        Some(InputChannel::None) => None,
         Some(InputChannel::Queue) => Some(channels.queue_client().ok_or_else(|| {
-            OpenDanError::Channel("the session needs an input queue but the host has no queue client".into())
+            OpenDanError::Channel("the session takes input but the host has no queue client".into())
         })?),
-        None => channels.queue_client(),
+        _ => channels.queue_client(),
     };
-    if queue_client.is_some() && !spec.prompt.initial_inputs.is_empty() {
+    if queue_client.is_some() && !controls_only && !spec.prompt.initial_inputs.is_empty() {
         return Err(OpenDanError::InvalidArgument(
-            "prompt.initial_inputs is the bootstrap material of a session without an input queue; post to the queue instead".into(),
+            "prompt.initial_inputs is the bootstrap material of a session whose queue takes no msg; post to the queue instead".into(),
         ));
     }
 
@@ -494,6 +507,16 @@ pub async fn create_session(
     let readme = render_readme(&config);
     // ACL: no file-level ACL exists yet (§1.5); `acl` is recorded only.
     let (sd, publish) = SessionDir::publish_new(parent_dir, &config, created, &readme)?;
+    // The host counts what work was created with (`skills_state.json` `usage`): the manuals it froze, or none. A plan
+    // only chooses for its Todos and is not counted.
+    if publish != Publish::AlreadyExists && spec.kind == SessionKind::Work {
+        if let Some(frozen) = config.prompt.frozen.as_ref().filter(|_| !config.prompt.entry_takes_candidates()) {
+            let names: Vec<String> = frozen.cmd_skills.iter().map(|c| c.name.clone()).collect();
+            if let Err(e) = agent.behaviors().note_skills_frozen(&names, &sid).await {
+                log::warn!("session {sid}: skill usage not counted: {e}");
+            }
+        }
+    }
     let existing = sd.config()?;
     if publish == Publish::AlreadyExists
         && !((spec.idempotency_key.is_some() || spec.kind == SessionKind::Ui)
@@ -501,10 +524,7 @@ pub async fn create_session(
     {
         return Err(OpenDanError::SessionIdConflict(sid));
     }
-    let canonical = sd
-        .path()
-        .canonicalize()
-        .unwrap_or_else(|_| sd.path().to_path_buf());
+    let canonical = crate::canonical_path(sd.path()).unwrap_or_else(|_| sd.path().to_path_buf());
     let entry = RegistryEntry {
         session_id: sid.clone(),
         kind: existing.session.kind,
@@ -544,6 +564,8 @@ pub async fn create_session(
                     .and_then(|o| o.goal.as_ref())
                     .map(|g| g.goal_id.clone())
             }),
+        runtime_id: existing.runtime.frozen.as_ref().map(|f| f.runtime_id.clone()),
+        runtime_unavailable: None,
         status: SessionStatus::created(crate::now_ms()),
         unreachable: false,
         location_rev: 0,
@@ -659,7 +681,8 @@ pub struct SubSessionSpec {
     pub behavior: Option<String>,
     /// The sub session's cmd_skills, chosen now (at most
     /// [`MAX_CMD_SKILLS`]). `None`: a Work parent's frozen choice (the
-    /// manuals still installed), else the template's default.
+    /// manuals still installed and on; a plan freezes none, so its Todos
+    /// take only what it names), else the template's default.
     #[serde(default)]
     pub cmd_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -670,11 +693,11 @@ pub struct SubSessionSpec {
     pub runtime_id: Option<String>,
     #[serde(default)]
     pub report: ReportMode,
-    /// The sub session gets an input queue and may wait for input.
+    /// The sub session takes msg input and may wait for it.
     #[serde(default)]
     pub interactive: bool,
-    /// The sub session gets an input queue for its parent's events (a
-    /// Todo's updates and controls); it still never waits for input.
+    /// The sub session takes its parent's msg / event inputs (a Todo's
+    /// updates); it still never waits for input.
     #[serde(default)]
     pub queued: bool,
     /// `(run_id, call_id)` of the creating tool call: the idempotency key.
@@ -893,11 +916,49 @@ async fn decide_locked(
     Ok(target)
 }
 
+fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Is a Work ready to be created (architecture §3.1, §14.5; TODO G1)? One
+/// mechanical check for every entry: a task to do; and for a Goal's Work
+/// (N4), no second unfinished Work of the Goal with the same task, and a
+/// piece of the Goal, never the Goal itself.
+async fn check_ready(
+    agent: &dyn AgentStateClient,
+    pcfg: &SessionConfig,
+    objective: &str,
+    unfinished: &[RegistryEntry],
+) -> Result<()> {
+    let want = normalized(objective);
+    if want.is_empty() {
+        return Err(OpenDanError::InvalidArgument("a work session needs an objective".into()));
+    }
+    if let Some(b) = &pcfg.session.goal {
+        if let Some(same) = unfinished.iter().find(|e| normalized(&e.objective) == want) {
+            return Err(OpenDanError::InvalidArgument(format!(
+                "work session {} of this goal with the same objective is still running: follow it (or stop it) instead of starting it again",
+                same.session_id
+            )));
+        }
+        if let Some(goal) = agent.goals().get(&b.goal_id).await? {
+            if normalized(&goal.objective) == want {
+                return Err(OpenDanError::InvalidArgument(
+                    "a work session takes one bounded piece of the goal, not the goal's whole objective: give it a task it can finish and check".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+
 /// Create a sub session of `parent_sid`: registered with
 /// `origin = {parent_session, report, created_by_call}`, driven by the
 /// parent's driver, not advanced here. Idempotent for the same creating
 /// call. Refused beyond the parent's `max_sub_sessions` (not finished at the
-/// same time) and `max_session_depth`.
+/// same time) and `max_session_depth`, and when it is not ready
+/// ([`check_ready`]).
 pub async fn create_sub_session(
     agent: &dyn AgentStateClient,
     who: &str,
@@ -933,7 +994,7 @@ pub async fn create_sub_session(
         Some(binding) => Some(crate::goal::work_admission(agent, &pcfg, &parent_dir, binding).await?),
         None => None,
     };
-    let siblings = match &goal_origin {
+    let unfinished: Vec<RegistryEntry> = match &goal_origin {
         Some(g) => agent
             .sessions()
             .query(&RegistryQuery {
@@ -943,15 +1004,17 @@ pub async fn create_sub_session(
             .await?
             .into_iter()
             .filter(|e| e.kind != SessionKind::Goal && e.status.run_state != RunState::Finished)
-            .count(),
+            .collect(),
         None => agent
             .sessions()
             .children_of(&[parent_sid.to_string()])
             .await?
             .into_iter()
             .filter(|e| e.status.run_state != RunState::Finished)
-            .count(),
+            .collect(),
     };
+    check_ready(agent, &pcfg, &sub.objective, &unfinished).await?;
+    let siblings = unfinished.len();
     if siblings >= policy.max_sub_sessions as usize {
         return Err(OpenDanError::InvalidArgument(format!(
             "session {parent_sid} already has {siblings} unfinished sub sessions (max_sub_sessions = {}); wait for one or stop it",
@@ -1010,6 +1073,10 @@ pub async fn create_sub_session(
     spec.policy.max_session_depth = policy.max_session_depth;
     if let Some(b) = sub.behavior.clone() {
         spec.prompt.behavior = Some(b);
+    } else if pcfg.session.kind == SessionKind::Goal && spec.prompt.behavior.is_some() {
+        // A Goal plans across its Activations: its Work is one bounded task
+        // (TODO B4), not the class default (a plan with Todos).
+        spec.prompt.behavior = Some(crate::todos::WORK_BEHAVIOR.to_string());
     }
     spec.require_cmd_skills = sub.cmd_skills.is_some();
     spec.prompt.cmd_skills = match &sub.cmd_skills {
@@ -1026,9 +1093,10 @@ pub async fn create_sub_session(
             };
             let installed: Vec<String> = agent
                 .behaviors()
-                .skills(Some(SkillKind::Cmd))
+                .skills(Some(SkillKind::Work))
                 .await?
                 .into_iter()
+                .filter(|m| m.enabled && m.scope.work())
                 .map(|m| m.name)
                 .collect();
             chosen.into_iter().filter(|n| installed.contains(n)).collect()

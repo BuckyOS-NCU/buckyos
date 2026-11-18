@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { createNamedSession } from '../fixtures/messagehub'
 import { MOCK_VOICE_NOTE } from '../../../src/app/messagehub/mock/objects'
 
 declare global {
@@ -24,12 +25,7 @@ test.use({
 async function openSession(page: Page, title: string) {
   await page.goto(`/messagehub?entityId=${encodeURIComponent(CODER)}`)
   await expect(page.getByRole('button', { name: 'Sessions', exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'New Session', exact: true }).last().click()
-  const dialog = page.getByRole('dialog')
-  await dialog.getByLabel('Title (optional)', { exact: true }).fill(title)
-  await dialog.getByRole('combobox', { name: 'Connection', exact: true }).selectOption('native')
-  await dialog.getByRole('button', { name: 'Create', exact: true }).click()
-  await expect(dialog).toHaveCount(0)
+  await createNamedSession(page, title)
   await expect(page.getByTestId('conversation-history')).toHaveAttribute('data-raw-count', '0')
   return page.evaluate(({ context, entity }) => window.__messageHubMock.sessions(context, entity)[0].id, { context: OWN, entity: CODER })
 }
@@ -86,11 +82,19 @@ test('emoji panel inserts at the caret, searches, remembers, and emoji-only mess
   await expect(history.getByTestId('message-bubble').filter({ hasText: 'Hi 👍 there' })).toBeVisible()
 
   await page.getByTestId('emoji-button').click()
-  await panel.getByRole('group', { name: 'Smileys & people' }).getByRole('button', { name: 'face with tears of joy', exact: true }).click()
-  await panel.getByRole('group', { name: 'Smileys & people' }).getByRole('button', { name: 'red heart', exact: true }).click()
-  await expect(textarea).toHaveValue('😂❤️')
-  // The picks lead the recent list next time.
   const recent = panel.getByRole('group', { name: 'Recently used' }).getByRole('button')
+  const recentBefore = await recent.allTextContents()
+  await expect(recent.nth(2)).toHaveAccessibleName('face with tears of joy')
+  await recent.nth(2).click()
+  await expect(recent).toHaveText(recentBefore)
+  await recent.nth(2).click()
+  await panel.getByRole('group', { name: 'Smileys & people' }).getByRole('button', { name: 'red heart', exact: true }).click()
+  await expect(textarea).toHaveValue('😂😂❤️')
+  await expect(recent).toHaveText(recentBefore)
+  await page.getByTestId('emoji-button').click()
+  await expect(panel).toHaveCount(0)
+  await page.getByTestId('emoji-button').click()
+  // The picks lead the recent list next time.
   await expect(recent.first()).toHaveAccessibleName('red heart')
   await expect(recent.nth(1)).toHaveAccessibleName('face with tears of joy')
   await page.mouse.click(5, 5)
@@ -98,8 +102,8 @@ test('emoji panel inserts at the caret, searches, remembers, and emoji-only mess
   await textarea.press('Enter')
   const big = history.getByTestId('message-emoji')
   await expect(big).toHaveCount(1)
-  await expect(big.locator('.mh-big-emoji')).toHaveAttribute('data-count', '2')
-  await expect(big.locator('.mh-big-emoji')).toHaveText('😂❤️')
+  await expect(big.locator('.mh-big-emoji')).toHaveAttribute('data-count', '3')
+  await expect(big.locator('.mh-big-emoji')).toHaveText('😂😂❤️')
   await page.screenshot({ path: 'test-results/messagehub-emoji-big.png' })
   expect(errors).toEqual([])
 })

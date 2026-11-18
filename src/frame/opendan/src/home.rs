@@ -193,8 +193,10 @@ impl Home {
         Ok(json!(out))
     }
 
-    /// The owner's runtime choice for this agent (`AgentSettings.runtimes`,
-    /// `default_runtime_id`), as the WebUI edits it.
+    /// The runtimes assigned to this agent (`AgentSettings.runtimes`) and the
+    /// owner's default: the one in effect (`default_runtime_id`, the private
+    /// runtime while the configured one is switched off) and the one the
+    /// owner configured.
     pub async fn runtime_settings(&self, agent: &dyn AgentStateClient) -> Result<Value, OpenDanError> {
         let settings = records::settings(self.records.as_ref()).await.map_err(store_err)?;
         let default = agent.runtimes().lookup(settings.effective_default_runtime()).await?
@@ -202,66 +204,145 @@ impl Home {
         Ok(json!({
             "runtimes": settings.runtimes,
             "default_runtime_id": default,
+            "configured_default_runtime_id": settings.default_runtime_id,
         }))
     }
 
-    /// Change one runtime the owner already has on this agent (enable /
-    /// disable, ComputerUse, declared baseline, default). Adding a runtime target is the
-    /// control panel's (`agent.update` / `agent.runtime_directory`): this
-    /// side never invents a target. Returns the new settings.
+    /// The settings key a runtime id names (`None`: the private runtime,
+    /// which has no entry) and whether it is the private runtime under one
+    /// of its names (the owner's machine, when the service runs natively).
+    async fn settings_key(agent: &dyn AgentStateClient, runtime_id: &str) -> Result<(Option<String>, bool), OpenDanError> {
+        if is_private_runtime(runtime_id) {
+            return Ok((None, true));
+        }
+        Ok(match agent.runtimes().lookup(runtime_id).await?.map(|r| r.connector) {
+            Some(RuntimeConnector::Native { aliases, .. }) => (aliases.first().cloned(), true),
+            _ => (Some(runtime_id.to_string()), false),
+        })
+    }
+
+    /// `runtimes.impact {runtime_id}`: what switching a runtime off or
+    /// removing it touches. `blocking`: sessions that started run on it and
+    /// it is usable, so switching it off would cut them off: it cannot be
+    /// switched off or removed now.
+    pub async fn runtime_impact(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<Value, OpenDanError> {
+        let asked = required(params, "runtime_id")?;
+        let record = agent.runtimes().lookup(&asked).await?.ok_or_else(|| OpenDanError::NotFound(format!("runtime {asked}")))?;
+        let id = record.runtime_id.clone();
+        let open: Vec<RegistryEntry> = agent
+            .sessions()
+            .query(&RegistryQuery::default())
+            .await?
+            .into_iter()
+            .filter(|e| e.status.run_state != RunState::Finished)
+            .collect();
+        let on_it: Vec<&RegistryEntry> = open
+            .iter()
+            .filter(|e| e.runtime_id.as_deref().is_some_and(|r| record.names(r)))
+            .collect();
+        let running: Vec<&str> = on_it
+            .iter()
+            .filter(|e| record.usable() && e.status.run_state != RunState::Created)
+            .map(|e| e.session_id.as_str())
+            .collect();
+        let sessions: Vec<Value> = on_it
+            .iter()
+            .map(|e| json!({
+                "session_id": e.session_id,
+                "kind": e.kind,
+                "class": e.class,
+                "title": e.title.clone().unwrap_or_else(|| e.objective.clone()),
+                "run_state": e.status.run_state,
+            }))
+            .collect();
+        let mut todos = Vec::new();
+        for e in &open {
+            let Ok(sd) = SessionDir::open(&e.location) else { continue };
+            let Ok(list) = libopendan::todos::store_of(&sd).load() else { continue };
+            for t in list.todos.iter().filter(|t| {
+                !t.status.is_terminal() && t.running().is_none() && t.runtime_id.as_deref().is_some_and(|r| record.names(r))
+            }) {
+                todos.push(json!({ "session_id": e.session_id, "todo_id": t.todo_id, "title": t.title, "status": t.status }));
+            }
+        }
+        let workspaces: Vec<Value> = agent
+            .workspaces()
+            .query(&WorkspaceQuery::default())
+            .await?
+            .into_iter()
+            .filter(|w| record.names(&w.location.runtime_id))
+            .map(|w| json!({ "workspace_id": w.workspace_id, "name": w.name, "directory": w.location.directory, "lifecycle": w.lifecycle }))
+            .collect();
+        Ok(json!({
+            "runtime_id": id,
+            "owner_default": record.default,
+            "blocking": !running.is_empty(),
+            "running_sessions": running,
+            "active_sessions": sessions,
+            "pending_todos": todos,
+            "workspaces": workspaces,
+            "usage": record.usage,
+        }))
+    }
+
+    /// A runtime is not taken away from sessions in progress on it.
+    async fn not_in_use(&self, agent: &dyn AgentStateClient, runtime_id: &str, verb: &str) -> Result<(), OpenDanError> {
+        let impact = self.runtime_impact(agent, &json!({ "runtime_id": runtime_id })).await?;
+        let sessions: Vec<&str> = impact["running_sessions"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        Err(OpenDanError::InvalidArgument(format!(
+            "sessions_in_progress: runtime `{runtime_id}` has {} session(s) in progress ({}); stop them or let them finish, then {verb}",
+            sessions.len(),
+            sessions.join(", ")
+        )))
+    }
+
+    /// `runtimes.settings_set {runtime_id, enabled?, default?}`:
+    /// whether this agent uses a runtime it was assigned, and the owner's
+    /// default. What a runtime allows is its own configuration and is not
+    /// changed here; assigning a runtime is the control panel's
+    /// (`agent.update`). A default that is switched off keeps its place.
+    /// Returns the new settings.
     pub async fn set_runtime_settings(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<buckyos_api::AgentSettings, OpenDanError> {
         let invalid = |m: String| OpenDanError::InvalidArgument(m);
         let mut settings = records::settings(self.records.as_ref()).await.map_err(store_err)?;
-        let runtime_id = text_param(params, "runtime_id")?
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| invalid("param `runtime_id` is required".into()))?;
-        let runtime_id = match agent.runtimes().lookup(&runtime_id).await?.map(|r| r.connector) {
-            Some(RuntimeConnector::Native { aliases, .. }) if !aliases.is_empty() => aliases[0].clone(),
-            _ => runtime_id,
-        };
-        let private = libopendan::protocol::is_private_runtime(&runtime_id);
-        let runtime_id = if private { buckyos_api::CONTAINER_RUNTIME_ID.to_string() } else { runtime_id };
-        if !private {
-            let entry = settings.runtimes.get_mut(&runtime_id).ok_or_else(|| {
-                invalid(format!(
-                    "runtime `{runtime_id}` is not one of this agent's runtimes; the control panel adds runtimes (agent.update)"
-                ))
-            })?;
-            if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
-                entry.enabled = enabled;
-            }
-            if let Some(computer) = params.get("computer").filter(|v| !v.is_null()) {
-                entry.computer = serde_json::from_value(computer.clone())
-                    .map_err(|_| invalid("param `computer` takes none | observe | control".into()))?;
-            }
-            // What the owner declares the machine to provide (Q5): decides
-            // the cmd_skills of sessions created on it from now on.
-            if let Some(baseline) = params.get("baseline") {
-                entry.baseline = serde_json::from_value(baseline.clone())
-                    .map_err(|_| invalid("param `baseline` takes standard | extended | null".into()))?;
-            }
-            // The owner's grant beyond the node policy (install, workspaces,
-            // narrowed roots, term): the Agent State projects it as is.
-            if let Some(grant) = params.get("grant") {
-                entry.grant = if grant.is_null() {
-                    None
-                } else {
-                    Some(serde_json::from_value(grant.clone()).map_err(|e| invalid(format!("param `grant`: {e}")))?)
-                };
+        let asked = required(params, "runtime_id")?;
+        let (key, private) = Self::settings_key(agent, &asked).await?;
+        if let Some(enabled) = params.get("enabled").and_then(Value::as_bool) {
+            if private {
+                if !enabled {
+                    return Err(invalid(format!("`{asked}` is the agent's private runtime: it is always on")));
+                }
+            } else {
+                let key = key.clone().unwrap_or_default();
+                let entry = settings.runtimes.get(&key).cloned().ok_or_else(|| {
+                    invalid(format!("runtime `{key}` is not assigned to this agent; the owner assigns runtimes in the runtime directory (control panel `agent.update`)"))
+                })?;
+                if entry.enabled && !enabled {
+                    self.not_in_use(agent, &key, "switch it off").await?;
+                }
+                if !entry.enabled && enabled && matches!(entry.target, buckyos_api::AgentRuntimeTarget::Executor { .. }) {
+                    // A device is used by one agent at a time: only the
+                    // control panel sees the owner's other agents.
+                    enable_through_control_panel(&key).await?;
+                    settings = records::settings(self.records.as_ref()).await.map_err(store_err)?;
+                } else if let Some(entry) = settings.runtimes.get_mut(&key) {
+                    entry.enabled = enabled;
+                }
             }
         }
         if let Some(default) = params.get("default").and_then(Value::as_bool) {
+            let key = key.clone().unwrap_or_else(|| buckyos_api::CONTAINER_RUNTIME_ID.to_string());
             if default {
-                settings.default_runtime_id = Some(runtime_id.clone());
-            } else if settings.default_runtime_id.as_deref() == Some(&runtime_id) {
+                settings.default_runtime_id = Some(key).filter(|k| k != buckyos_api::CONTAINER_RUNTIME_ID);
+            } else if settings.default_runtime_id.as_deref() == Some(&key) {
                 settings.default_runtime_id = None;
             }
-        }
-        if settings.default_runtime_id.as_deref().is_some_and(|d| !settings.runtime_enabled(d)) {
-            settings.default_runtime_id = None;
-        }
-        if settings.default_runtime_id.as_deref() == Some(buckyos_api::CONTAINER_RUNTIME_ID) {
-            settings.default_runtime_id = None;
         }
         settings.validate_runtimes().map_err(invalid)?;
         records::set_settings(self.records.as_ref(), &settings)
@@ -270,55 +351,229 @@ impl Home {
         Ok(settings)
     }
 
-    /// `skills.status`: each cmd_skill's commands on a runtime, and which extension package would bring what is missing.
-    /// The check runs now, so a package that just went active or away shows at once. The package catalog is the Zone's: an
-    /// Agent that cannot reach it still knows what is missing, only not what would bring it.
+    /// `runtimes.remove {runtime_id}`: take an assigned runtime
+    /// away from this agent. Its record is kept as `retired` for its
+    /// history; the runtime itself stays in the owner's directory and can
+    /// be assigned again. Returns the new settings.
+    pub async fn remove_runtime(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<buckyos_api::AgentSettings, OpenDanError> {
+        let asked = required(params, "runtime_id")?;
+        let (key, private) = Self::settings_key(agent, &asked).await?;
+        if private {
+            return Err(OpenDanError::InvalidArgument(format!("`{asked}` is the agent's private runtime: it cannot be removed")));
+        }
+        let key = key.unwrap_or_default();
+        let mut settings = records::settings(self.records.as_ref()).await.map_err(store_err)?;
+        if !settings.runtimes.contains_key(&key) {
+            return Err(OpenDanError::InvalidArgument(format!("runtime `{key}` is not assigned to this agent")));
+        }
+        self.not_in_use(agent, &key, "remove it").await?;
+        settings.runtimes.remove(&key);
+        if settings.default_runtime_id.as_deref() == Some(&key) {
+            settings.default_runtime_id = None;
+        }
+        settings.validate_runtimes().map_err(OpenDanError::InvalidArgument)?;
+        records::set_settings(self.records.as_ref(), &settings)
+            .await
+            .map_err(store_err)?;
+        Ok(settings)
+    }
+
+    /// `skills.status`: every work skill against one runtime — whether a session there would take it (`unmet`: its
+    /// baseline or platform), the commands its manual relies on and which extension package would bring what is missing.
+    /// The check runs now, so a package that just went active or away
+    /// shows at once. The package catalog is the Zone's: an Agent that cannot reach it still knows what is missing, only
+    /// not what would bring it.
     pub async fn skills_status(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<Value, OpenDanError> {
         let runtime_id = text_param(params, "runtime_id")?.filter(|id| !id.is_empty()).unwrap_or_else(|| "private".to_string());
-        let skills = agent.behaviors().skills(Some(SkillKind::Cmd)).await?;
+        let skills = agent.behaviors().skills(Some(SkillKind::Work)).await?;
         let mut wanted: Vec<String> = skills.iter().flat_map(|s| s.commands.iter().cloned()).collect();
         wanted.sort();
         wanted.dedup();
         let record = agent.runtimes().check(&runtime_id, &wanted, false).await?;
-        let mut resolved = record.caps.baseline_check.as_ref().map(|b| b.resolved.clone()).unwrap_or_default();
-        if let Some(tools) = record.caps.tools_check.as_ref() {
-            resolved.extend(tools.resolved.clone());
-        }
+        let resolved = resolved_of(&record);
         let (catalog, desired) = zone_ext_tools().await;
         let reports: Vec<Value> = skills
             .iter()
-            .filter(|s| !s.commands.is_empty())
-            .map(|s| json!({"name": s.name, "status": libopendan::skills::commands_status(&s.commands, &resolved, &catalog, &desired)}))
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "scope": s.scope,
+                    "enabled": s.enabled,
+                    "off": s.why_off(),
+                    "requires": s.requires,
+                    "unmet": s.unmet_on(record.caps.baseline, &record.caps.platform.os),
+                    "commands": libopendan::skills::commands_status(&s.commands, &resolved, &catalog, &desired),
+                })
+            })
             .collect();
-        Ok(json!({"runtime_id": record.runtime_id, "skills": reports}))
+        Ok(json!({"runtime_id": record.runtime_id, "baseline": record.caps.baseline, "platform": record.caps.platform.os, "skills": reports}))
     }
 
-    /// `skills.install_plan`: before a skill package goes in, what its manuals rely on against a runtime. Advice only: an
-    /// install never fails for a missing command.
-    pub async fn skills_install_plan(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<Value, OpenDanError> {
-        let package: libopendan::skills::SkillPackage = serde_json::from_value(params.get("package").cloned().unwrap_or(Value::Null))
+    /// The package of a call: sent whole (`package`), or a draft on the AgentRoot (`draft`).
+    fn skill_package(agent: &dyn AgentStateClient, params: &Value) -> Result<(libopendan::skills::SkillPackage, Option<String>), OpenDanError> {
+        if let Some(slug) = text_param(params, "draft")?.filter(|s| !s.is_empty()) {
+            return Ok((libopendan::skills::read_draft(&skills_root(agent)?, &slug)?, Some(slug)));
+        }
+        let package = serde_json::from_value(params.get("package").cloned().unwrap_or(Value::Null))
             .map_err(|e| OpenDanError::InvalidArgument(format!("param `package`: {e}")))?;
-        let runtime_id = text_param(params, "runtime_id")?.filter(|id| !id.is_empty()).unwrap_or_else(|| "private".to_string());
-        let mut skills = Vec::new();
-        for (path, file) in &package.files {
-            let Some(name) = path.strip_prefix("cmd_skills/").and_then(|p| p.strip_suffix(".md")) else { continue };
-            let text = String::from_utf8(file.bytes()?).map_err(|_| OpenDanError::InvalidArgument(format!("{path} is not UTF-8 text")))?;
-            skills.push(libopendan::protocol::skill_meta(SkillKind::Cmd, name, &text));
+        Ok((package, None))
+    }
+
+    async fn plan_of(
+        agent: &dyn AgentStateClient,
+        package: &libopendan::skills::SkillPackage,
+        draft: Option<&str>,
+    ) -> Result<libopendan::skills::InstallPlan, OpenDanError> {
+        let root = skills_root(agent)?;
+        let mut plan = libopendan::skills::plan(&root, package)?;
+        // What the agent wrote about its own draft is part of what the owner reads before saying yes.
+        if let Some(slug) = draft {
+            let meta: Value = fsutil::read_json_opt(&root.join(libopendan::skills::DRAFTS_DIR).join(slug).join(libopendan::skills::DRAFT_META))?.unwrap_or(Value::Null);
+            if let Some(risk) = meta.get("risk").and_then(Value::as_str).filter(|r| !r.trim().is_empty()) {
+                plan.risk.findings.push(libopendan::skills::SkillFinding {
+                    code: "author_note".into(),
+                    level: "low".into(),
+                    place: slug.to_string(),
+                    note: risk.trim().to_string(),
+                });
+            }
         }
-        let mut wanted: Vec<String> = skills.iter().flat_map(|s| s.commands.iter().cloned()).collect();
-        wanted.sort();
-        wanted.dedup();
-        let record = agent.runtimes().lookup(&runtime_id).await?.ok_or_else(|| OpenDanError::InvalidArgument(format!("no runtime `{runtime_id}`")))?;
-        let mut resolved = record.caps.baseline_check.as_ref().map(|b| b.resolved.clone()).unwrap_or_default();
-        if let Some(tools) = record.caps.tools_check.as_ref() {
-            resolved.extend(tools.resolved.clone());
-        }
+        Ok(plan)
+    }
+
+    /// `skills.install_plan`: what installing a package (or a draft) would do, what a reader should know before saying
+    /// yes, and what its manuals rely on against a runtime (`runtime_id`, else the private one). Nothing is written.
+    pub async fn skills_install_plan(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<Value, OpenDanError> {
+        let (package, draft) = Self::skill_package(agent, params)?;
+        let runtime_id = text_param(params, "runtime_id")?.filter(|id| !id.is_empty());
+        let plan = Self::plan_of(agent, &package, draft.as_deref()).await?;
+        let against = runtime_id.unwrap_or_else(|| "private".to_string());
+        let record = agent.runtimes().lookup(&against).await?;
+        let resolved = record.as_ref().map(resolved_of).unwrap_or_default();
         let (catalog, desired) = zone_ext_tools().await;
-        let reports: Vec<Value> = skills
+        let command_status: Vec<Value> = plan
+            .skills
             .iter()
-            .map(|s| json!({"name": s.name, "commands": s.commands, "status": libopendan::skills::commands_status(&s.commands, &resolved, &catalog, &desired)}))
+            .filter(|s| s.meta.kind == SkillKind::Work)
+            .map(|s| json!({"name": s.meta.name, "commands": s.meta.commands, "status": libopendan::skills::commands_status(&s.meta.commands, &resolved, &catalog, &desired)}))
             .collect();
-        Ok(json!({"runtime_id": record.runtime_id, "skills": reports}))
+        let mut out = serde_json::to_value(&plan).map_err(|e| OpenDanError::Other(e.to_string()))?;
+        out["command_status"] = json!(command_status);
+        out["checked_runtime_id"] = json!(record.map(|r| r.runtime_id));
+        Ok(out)
+    }
+
+    /// `skills.install` (owner): install what the owner saw the plan of. Installing is copying the package's text
+    /// files onto the AgentRoot; new sessions take the skills from then on. A draft is gone once it is installed.
+    pub async fn skills_install(&self, agent: &dyn AgentStateClient, params: &Value, who: &str) -> Result<Value, OpenDanError> {
+        let (package, draft) = Self::skill_package(agent, params)?;
+        let root = skills_root(agent)?;
+        let plan = Self::plan_of(agent, &package, draft.as_deref()).await?;
+        let given = text_param(params, "plan_digest")?.unwrap_or_default();
+        if given != plan.plan_digest {
+            return Err(OpenDanError::InvalidArgument(format!(
+                "plan_digest `{given}` is not the plan of this package ({}): ask for the plan again (`skills.install_plan`) and confirm what it says",
+                plan.plan_digest
+            )));
+        }
+        let replace = params.get("replace").and_then(Value::as_bool).unwrap_or(false);
+        let accepted = libopendan::skills::Accepted { level: plan.risk.level.clone(), plan_digest: plan.plan_digest.clone() };
+        let report = libopendan::skills::install(&root, &package, replace, who, Some(&accepted))?;
+        log::info!(
+            "skills: {} {} ({}) installed by {who}, risk {}: {}",
+            report.package,
+            report.version,
+            report.digest,
+            plan.risk.level,
+            report.skills.iter().map(|s| format!("{}:{}", s.kind.as_str(), s.name)).collect::<Vec<_>>().join(", ")
+        );
+        if let Some(slug) = &draft {
+            libopendan::skills::discard_draft(&root, slug, who, true)?;
+        }
+        let mut out = serde_json::to_value(&report).map_err(|e| OpenDanError::Other(e.to_string()))?;
+        out["plan"] = json!(plan);
+        Ok(out)
+    }
+
+    /// `skills.remove` (owner).
+    pub async fn skills_remove(&self, agent: &dyn AgentStateClient, params: &Value, who: &str) -> Result<Value, OpenDanError> {
+        let (kind, name) = skill_ref(params)?;
+        let removed = libopendan::skills::remove(&skills_root(agent)?, kind, &name, who)?;
+        log::info!("skills: {}:{name} removed by {who}", kind.as_str());
+        Ok(json!(removed))
+    }
+
+    /// The owner's other skill methods, all on the AgentRoot files.
+    pub async fn skills_call(&self, agent: &dyn AgentStateClient, method: &str, params: &Value, who: &str) -> Result<Value, OpenDanError> {
+        use libopendan::skills;
+        let root = skills_root(agent)?;
+        let out = |v: Value| Ok(v);
+        match method {
+            "skills.state" => out(json!(skills::load_state(&root)?)),
+            "skills.ui_get" => out(json!(skills::ui_skills(&root)?)),
+            "skills.ui_set" => {
+                let names: Option<Vec<String>> = serde_json::from_value(params.get("names").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| OpenDanError::InvalidArgument(format!("param `names`: {e}")))?;
+                out(json!(skills::set_ui_skills(&root, names, who)?))
+            }
+            "skills.set_enabled" => {
+                let (kind, name) = skill_ref(params)?;
+                let enabled = params.get("enabled").and_then(Value::as_bool).ok_or_else(|| OpenDanError::InvalidArgument("param `enabled` is true | false".into()))?;
+                let reason = text_param(params, "reason")?;
+                out(json!(skills::set_enabled(&root, kind, &name, enabled, reason.as_deref(), who)?))
+            }
+            "skills.crystallize_set" => {
+                let enabled = params.get("enabled").and_then(Value::as_bool).ok_or_else(|| OpenDanError::InvalidArgument("param `enabled` is true | false".into()))?;
+                let state = skills::set_crystallize(&root, enabled, who)?;
+                log::info!("skills: crystallization goal switched {} by {who}", if enabled { "on" } else { "off" });
+                out(json!({ "crystallize": state.crystallize }))
+            }
+            "skills.drafts" => out(json!(skills::list_drafts(&root)?)),
+            "skills.draft_file" => {
+                let slug = required(params, "slug")?;
+                let file = required(params, "file")?;
+                out(json!({ "text": skills::read_draft_file(&root, &slug, &file)? }))
+            }
+            "skills.draft_discard" => {
+                let slug = required(params, "slug")?;
+                skills::discard_draft(&root, &slug, who, false)?;
+                out(json!({ "discarded": slug }))
+            }
+            other => Err(OpenDanError::InvalidArgument(format!("unknown method `{other}`"))),
+        }
+    }
+
+    /// `skills.import` (owner): keep the text where a work session can read it. The session that turns it into a draft
+    /// is the caller's to start.
+    pub fn skills_import_inbox(&self, agent: &dyn AgentStateClient, params: &Value) -> Result<SkillImport, OpenDanError> {
+        const MAX_SOURCE_BYTES: usize = 512 * 1024;
+        let text = params.get("text").and_then(Value::as_str).unwrap_or_default();
+        if text.trim().is_empty() {
+            return Err(OpenDanError::InvalidArgument("param `text` is the text to turn into skills".into()));
+        }
+        if text.len() > MAX_SOURCE_BYTES {
+            return Err(OpenDanError::InvalidArgument(format!("the text is larger than {} KiB: split it", MAX_SOURCE_BYTES / 1024)));
+        }
+        let name = text_param(params, "name")?.filter(|n| !n.is_empty());
+        if let Some(name) = &name {
+            libopendan::ids::validate_session_id(name).map_err(|_| OpenDanError::InvalidArgument(format!("bad skill name `{name}`")))?;
+        }
+        let scope = text_param(params, "scope")?.filter(|s| !s.is_empty());
+        if let Some(scope) = &scope {
+            if !["work", "ui", "plan"].contains(&scope.as_str()) {
+                return Err(OpenDanError::InvalidArgument(format!("scope `{scope}` is not work | ui | plan")));
+            }
+        }
+        let id = libopendan::ids::new_runner_id();
+        let inbox = format!("{}/.inbox/{id}/source.md", libopendan::skills::DRAFTS_DIR);
+        fsutil::atomic_replace(&skills_root(agent)?.join(&inbox), text.as_bytes())?;
+        Ok(SkillImport {
+            inbox,
+            name,
+            scope,
+            source: text_param(params, "source")?.filter(|s| !s.is_empty()),
+            runtime_id: text_param(params, "runtime_id")?.filter(|s| !s.is_empty()),
+        })
     }
 
     pub async fn workspaces(&self, agent: &dyn AgentStateClient) -> Result<Value, OpenDanError> {
@@ -343,6 +598,63 @@ impl Home {
             "last_error": record.last_error,
         })).collect::<Vec<_>>()))
     }
+}
+
+/// A text the owner handed in to be made into skills.
+pub struct SkillImport {
+    /// AgentRoot-relative path of the text.
+    pub inbox: String,
+    pub name: Option<String>,
+    pub scope: Option<String>,
+    pub source: Option<String>,
+    pub runtime_id: Option<String>,
+}
+
+impl SkillImport {
+    /// The first message of the work that writes the draft.
+    pub fn message(&self) -> String {
+        let mut text = format!("Turn the text at $OPENDAN_AGENT_ROOT/{} into skill drafts for the owner to install.", self.inbox);
+        if let Some(source) = &self.source {
+            text.push_str(&format!("\nIt came from: {source}."));
+        }
+        if let Some(name) = &self.name {
+            text.push_str(&format!("\nThe owner asks for the name `{name}` (the draft slug, and the skill's name when it becomes one skill)."));
+        }
+        if let Some(scope) = &self.scope {
+            text.push_str(&format!("\nThe owner asks for a {scope} skill; say so in draft.json if the text does not fit that."));
+        }
+        if let Some(runtime_id) = &self.runtime_id {
+            text.push_str(&format!("\nVerify its commands on runtime `{runtime_id}` (`agent-session run --runtime {runtime_id} -- command -v <cmd>`): the skill is for that machine."));
+        }
+        text
+    }
+}
+
+fn skills_root(agent: &dyn AgentStateClient) -> Result<std::path::PathBuf, OpenDanError> {
+    agent
+        .agent_root()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| OpenDanError::InvalidArgument("skills are managed where the AgentRoot is".into()))
+}
+
+fn required(params: &Value, name: &str) -> Result<String, OpenDanError> {
+    text_param(params, name)?.filter(|v| !v.is_empty()).ok_or_else(|| OpenDanError::InvalidArgument(format!("param `{name}` is required")))
+}
+
+fn skill_ref(params: &Value) -> Result<(SkillKind, String), OpenDanError> {
+    let kind = match params.get("kind") {
+        None | Some(Value::Null) => SkillKind::Work,
+        Some(v) => serde_json::from_value(v.clone()).map_err(|_| OpenDanError::InvalidArgument("param `kind` is work | plan | goal".into()))?,
+    };
+    Ok((kind, required(params, "name")?))
+}
+
+fn resolved_of(record: &RuntimeRecord) -> BTreeMap<String, ResolvedCommand> {
+    let mut resolved = record.caps.baseline_check.as_ref().map(|b| b.resolved.clone()).unwrap_or_default();
+    if let Some(tools) = record.caps.tools_check.as_ref() {
+        resolved.extend(tools.resolved.clone());
+    }
+    resolved
 }
 
 /// The Zone's extension package catalog and desired state, from control-panel. Empty outside a Zone or when it does not
@@ -372,6 +684,19 @@ async fn zone_ext_tools() -> (Vec<buckyos_api::ExtToolsCatalogEntry>, std::colle
         }
     }
     (catalog, desired)
+}
+
+/// Switch a device runtime on for this agent through the control panel,
+/// which refuses while another agent of the owner has it on.
+async fn enable_through_control_panel(runtime_id: &str) -> Result<(), OpenDanError> {
+    let failed = |e: String| OpenDanError::Bind(format!("runtime `{runtime_id}` was not switched on: {e}"));
+    let runtime = buckyos_api::get_buckyos_api_runtime().map_err(|e| failed(e.to_string()))?;
+    let client = runtime.get_zone_service_krpc_client("control-panel").await.map_err(|e| failed(e.to_string()))?;
+    client
+        .call("agent.runtime_enable", json!({ "runtime_id": runtime_id }))
+        .await
+        .map(|_| ())
+        .map_err(|e| failed(e.to_string()))
 }
 
 /// Where the home page reads its agent root from (for re-projection).

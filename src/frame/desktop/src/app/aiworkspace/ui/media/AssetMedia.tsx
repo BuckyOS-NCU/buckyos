@@ -9,7 +9,7 @@ import { ContentPreview } from '../../../../components/ContentPreview'
 import type { ContentRef } from '../../../../components/preview/types'
 import { describeError, type ReadOk } from '../../api/session'
 import type { AssetContent } from '../../api/types'
-import { useStore } from '../../state/hooks'
+import { useOutlineVersion, useStore } from '../../state/hooks'
 import type { WorkspaceStore } from '../../state/store'
 import { useAiwsText } from '../../useAiwsText'
 import { consumeIntent, useIntent } from '../blocks/editorToolbar'
@@ -17,12 +17,16 @@ import { assetMediaType, fileBadge, formatDuration, mediaKindOf, playsInPlace, t
 import { assetSource, surfaceMediaSession } from './source'
 import { useSession } from '../../session/context'
 import { SessionMediaPlayer } from '../../session/media'
+import { BroadcastMedia, broadcastOf } from './BroadcastMedia'
+import { printAssetUrl } from '../../print/renderer/assets'
 
 /** A stored picture (the asset itself or its poster) as a blob URL: the asset route needs the session token. */
 function usePictureUrl(store: WorkspaceStore, objectId: string | undefined, mediaType: string) {
   const [picture, setPicture] = useState<{ objectId: string; url: string | null; error: string | null } | null>(null)
+  // a print package has the file next to the page (打印 TODO T7)
+  const packaged = printAssetUrl(objectId)
   useEffect(() => {
-    if (!objectId) return
+    if (!objectId || packaged) return
     let live = true
     let url: string | null = null
     store.session.fetchAsset(objectId).then(
@@ -35,7 +39,8 @@ function usePictureUrl(store: WorkspaceStore, objectId: string | undefined, medi
       (error: unknown) => { if (live) setPicture({ objectId, url: null, error: describeError(error) }) },
     )
     return () => { live = false; if (url) URL.revokeObjectURL(url) }
-  }, [store, objectId, mediaType])
+  }, [store, objectId, mediaType, packaged])
+  if (objectId && packaged) return { objectId, url: packaged, error: null }
   return picture && picture.objectId === objectId ? picture : null
 }
 
@@ -52,33 +57,49 @@ export interface AssetMediaProps {
   onActivate?: () => void
   /** Playback stopped or the preview closed. */
   onDone?: () => void
+  /** On a printed page (打印 TODO §3.2): a picture, a video's poster or the file's card; nothing plays or opens. */
+  print?: boolean
 }
 
 export function AssetMedia(props: AssetMediaProps) {
   const session = useSession()
   const payload = props.asset.content.payload
   const kind = mediaKindOf(assetMediaType(payload.media_type, payload.file_name))
+  if (props.print) return <PlainAssetMedia {...props} />
   // on a session's stage a video or sound plays from the run Workspace, kept to the presenter's playback (第四期规划 §7.3.2)
   if (session && (kind === 'video' || kind === 'audio')) {
     return <SessionMediaPlayer entityId={props.asset.entity_id} objectId={payload.object_id} kind={kind} name={payload.file_name ?? props.asset.name ?? props.asset.entity_id} />
   }
+  return <MediaOrBroadcast {...props} kind={kind} />
+}
+
+/** In a composite's media slot a video or sound is a broadcast (G17): it plays where the composite's anchor says. */
+function MediaOrBroadcast(props: AssetMediaProps & { kind: MediaKind }) {
+  const store = useStore()
+  useOutlineVersion()
+  const payload = props.asset.content.payload
+  const broadcast = props.kind === 'video' || props.kind === 'audio' ? broadcastOf(store, props.cellId) : null
+  if (broadcast) {
+    return <BroadcastMedia assetId={props.asset.entity_id} objectId={payload.object_id} kind={props.kind as 'video' | 'audio'} name={payload.file_name ?? props.asset.name ?? props.asset.entity_id}
+      compositeId={broadcast.compositeId} media={broadcast.media} config={broadcast.config} />
+  }
   return <PlainAssetMedia {...props} />
 }
 
-function PlainAssetMedia({ asset, cellId, fit, activated = false, onActivate, onDone }: AssetMediaProps) {
+function PlainAssetMedia({ asset, cellId, fit, activated = false, onActivate, onDone, print = false }: AssetMediaProps) {
   const { t } = useAiwsText()
   const store = useStore()
   const payload = asset.content.payload
   const mediaType = assetMediaType(payload.media_type, payload.file_name)
   const kind = mediaKindOf(mediaType)
-  const playable = playsInPlace(kind, mediaType)
+  const playable = !print && playsInPlace(kind, mediaType)
   const name = payload.file_name ?? asset.name ?? asset.entity_id
   const [playing, setPlaying] = useState(activated && playable)
   const [previewing, setPreviewing] = useState(activated && !playable)
   // "preview" (the toolbar) and "open" (a double-click while reading: play in place, or preview)
   const intent = useIntent(cellId ?? '')
   const [seen, setSeen] = useState(0)
-  const wanted = intent && (intent.value === 'preview' || intent.value === 'open') ? intent : undefined
+  const wanted = !print && intent && (intent.value === 'preview' || intent.value === 'open') ? intent : undefined
   if (wanted && wanted.seq !== seen) {
     setSeen(wanted.seq)
     if (wanted.value === 'open' && playable) setPlaying(true)

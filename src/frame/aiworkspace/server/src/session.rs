@@ -148,6 +148,13 @@ async fn pump(state: &Arc<AppState>, room: &Arc<Room>) {
     }
 }
 
+/// Broadcast what the timeline gained outside a call (the voice service's events).
+pub async fn nudge(state: &Arc<AppState>, session_id: &str) {
+    if let Some(room) = state.rooms.get(session_id) {
+        pump(state, &room).await;
+    }
+}
+
 /// Who learns of a Commit: everyone when it touched shared content, else the participants whose own data it touched.
 fn commit_vis(ws: &aiworkspace_store::Workspace, ev: &Value, _now: &str) -> WsResult<Vis> {
     let mut participants = BTreeSet::new();
@@ -194,7 +201,7 @@ fn deliver(actor: &Actor, out: &Outgoing) -> Option<Value> {
 /// The link a request carries (`params.link`), if it names a live one.
 pub fn link_of(state: &AppState, p: &Value) -> Option<InviteRow> {
     let t = p.get("link").and_then(Value::as_str).filter(|t| aiworkspace_store::session::is_link_token(t))?;
-    state.svc.sessions.invite_by_token(t).ok().flatten()
+    state.svc.sessions.invite_by_token(t).ok().flatten().filter(|i| i.usable((state.svc.clock)()))
 }
 
 /// A display or prompter link used as the session token (`sys[1]`): its own subject reads the run Workspace.
@@ -202,7 +209,7 @@ pub fn link_caller(state: &AppState, token: &str) -> Option<(Caller, InviteRow)>
     if !aiworkspace_store::session::is_link_token(token) || token.starts_with("at_") {
         return None;
     }
-    let invite = state.svc.sessions.invite_by_token(token).ok().flatten()?;
+    let invite = state.svc.sessions.invite_by_token(token).ok().flatten().filter(|i| i.usable((state.svc.clock)()))?;
     Some((Caller::link(&invite.invite_id), invite))
 }
 
@@ -210,6 +217,13 @@ pub fn link_caller(state: &AppState, token: &str) -> Option<(Caller, InviteRow)>
 pub async fn handle(state: &Arc<AppState>, method: &str, p: &Value, caller: Caller, link: Option<InviteRow>) -> WsResult<Value> {
     match method {
         "session.create" => {
+            // a presenter other than the caller must be an account of this Zone (权限需求 R27)
+            if let Some(other) = p.get("presenter").and_then(Value::as_str).filter(|x| !x.is_empty() && *x != caller.principal) {
+                let known = state.auth.subjects().await.iter().any(|v| v["subject"].as_str() == Some(other) && v["kind"] == json!("user"));
+                if !known {
+                    return Err(WsError::invalid_op("presenter must be an account of this Zone"));
+                }
+            }
             let (st, c, p) = (state.clone(), caller.clone(), p.clone());
             return blocking(move || st.svc.session_create(&c, &p)).await;
         }
@@ -228,6 +242,25 @@ pub async fn handle(state: &Arc<AppState>, method: &str, p: &Value, caller: Call
                 if let Some(page) = crate::pages::page_url(state, ws, if slug.is_empty() { "session" } else { &slug }, None) {
                     item["url"] = json!(format!("{page}?session={}", url::form_urlencoded::byte_serialize(sid.as_bytes()).collect::<String>()));
                 }
+            }
+            return Ok(v);
+        }
+        "session.list_open" => {
+            let (st, c) = (state.clone(), caller.clone());
+            let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(100).clamp(1, 500) as usize;
+            let mut v = blocking(move || st.svc.session_list_open(&c, limit)).await?;
+            for item in v["sessions"].as_array_mut().into_iter().flatten() {
+                let str_of = |k: &str| item[k].as_str().unwrap_or("").to_string();
+                let (ws, sid, title) = (str_of("source_workspace_id"), str_of("session_id"), str_of("title"));
+                let slug = aiworkspace_store::source::pub_name(&title);
+                if let Some(page) = crate::pages::page_url(state, &ws, if slug.is_empty() { "session" } else { &slug }, None) {
+                    item["url"] = json!(format!("{page}?session={}", url::form_urlencoded::byte_serialize(sid.as_bytes()).collect::<String>()));
+                }
+                // who is in the room now, while it has one (a room exists from the first connection)
+                item["online"] = match state.rooms.get(&sid) {
+                    Some(room) => json!(room.conns.lock().unwrap().values().filter(|n| **n > 0).count()),
+                    None => Value::Null,
+                };
             }
             return Ok(v);
         }
@@ -258,7 +291,7 @@ pub async fn handle(state: &Arc<AppState>, method: &str, p: &Value, caller: Call
         let (st, c, row, inv) = (state.clone(), caller.clone(), s.clone(), link.clone());
         blocking(move || st.svc.require_actor(&row, &c, inv.as_ref())).await?
     };
-    call(state, s, &actor, method, p, None).await
+    call(state, s, &actor, &caller, method, p, None).await
 }
 
 /// `session.get` with the media state of the room.
@@ -273,17 +306,28 @@ async fn get(state: &Arc<AppState>, s: &SessionRow, actor: &Actor) -> WsResult<V
 }
 
 /// The methods of a known actor — over kRPC and over the channel (`terminal`: the connection's own control terminal).
-async fn call(state: &Arc<AppState>, s: SessionRow, actor: &Actor, method: &str, p: &Value, terminal: Option<&str>) -> WsResult<Value> {
+async fn call(state: &Arc<AppState>, s: SessionRow, actor: &Actor, caller: &Caller, method: &str, p: &Value, terminal: Option<&str>) -> WsResult<Value> {
     let st = state.clone();
     let a = actor.clone();
+    let c = caller.clone();
     let p2 = p.clone();
     let mut row = s.clone();
     let result = match method {
         "session.get" => return get(state, &s, actor).await,
-        "session.start" => blocking(move || st.svc.session_start(&mut row, &a)).await?,
+        "session.start" => {
+            let v = blocking(move || st.svc.session_start(&mut row, &a)).await?;
+            if let Ok(fresh) = state.svc.sessions.require(&s.session_id) {
+                if let Some(t0) = fresh.started_ms {
+                    state.media.started(&s.session_id, t0);
+                }
+            }
+            v
+        }
         "session.end" => {
             let retention = state.svc.session_retention_ms;
-            blocking(move || st.svc.session_end(&mut row, &a, retention)).await?
+            let v = blocking(move || st.svc.session_end(&mut row, &a, retention)).await?;
+            state.media.ended(&s.session_id);
+            v
         }
         "session.save" => blocking(move || st.svc.session_save(&mut row, &a)).await?,
         "session.delete" => {
@@ -291,12 +335,39 @@ async fn call(state: &Arc<AppState>, s: SessionRow, actor: &Actor, method: &str,
             state.rooms.map.lock().unwrap().remove(&s.session_id);
             return Ok(v);
         }
-        "session.set_access" => blocking(move || st.svc.session_set_access(&mut row, &a, &p2)).await?,
+        "session.set_access" => {
+            let v = blocking(move || st.svc.session_set_access(&mut row, &a, &c, &p2)).await?;
+            if let Ok(fresh) = state.svc.sessions.require(&s.session_id) {
+                state.media.recheck(state, &fresh);
+            }
+            if let Some(room) = state.rooms.get(&s.session_id) {
+                mark(&room, "participants");
+            }
+            v
+        }
+        "session.voice" => {
+            let op = p.get("op").and_then(Value::as_str).unwrap_or("").to_string();
+            let v = blocking(move || st.svc.session_voice(&row, &a, &p2)).await?;
+            match op.as_str() {
+                "allow" => {
+                    state.media.recheck(state, &s);
+                    if let Some(room) = state.rooms.get(&s.session_id) {
+                        mark(&room, "participants");
+                    }
+                }
+                "mute_all" => state.media.mute_all(&s.session_id),
+                "mode" => state.media.mode(&s.session_id, &actor.principal, v["mode"].as_str().unwrap_or("")),
+                _ => {}
+            }
+            v
+        }
         "session.invite" => blocking(move || st.svc.session_invite(&row, &a, &p2)).await?,
         "session.list_invites" => blocking(move || st.svc.session_invites(&row, &a)).await?,
         "session.revoke_invite" => {
             let id = s_owned(p, "invite_id")?;
-            blocking(move || st.svc.session_revoke_invite(&row, &a, &id)).await?
+            let v = blocking(move || st.svc.session_revoke_invite(&row, &a, &id)).await?;
+            state.media.recheck(state, &s);
+            v
         }
         "session.command" => {
             let cmd = p.get("command").cloned().ok_or_else(|| WsError::invalid_op("command required"))?;
@@ -371,8 +442,7 @@ async fn call(state: &Arc<AppState>, s: SessionRow, actor: &Actor, method: &str,
             blocking(move || st.svc.with_run(&row, |ws| {
                 let mut notes = serde_json::Map::new();
                 if let Some(id) = row.baseline["notes_entity_id"].as_str() {
-                    let q = ws.query(&Caller::user(&row.owner), &json!({ "source_id": id, "limit": 1000 }), &st.svc.sources)?;
-                    for r in q["rows"].as_array().into_iter().flatten() {
+                    for r in &ws.table_rows(&Caller::internal(&row.owner), id, 1000)? {
                         notes.insert(r["values"]["target_id"].as_str().unwrap_or("").to_string(), r["values"]["notes"].clone());
                     }
                 }
@@ -642,8 +712,8 @@ async fn connection(state: Arc<AppState>, socket: WebSocket) -> Result<(), Strin
                         params["session_id"] = json!(sid);
                         params["_conn"] = json!(conn_id);
                         let row = match state.svc.sessions.require(&sid) { Ok(r) => r, Err(e) => break Err(e.to_string()) };
-                        let out = if method.starts_with("session.") && !matches!(method.as_str(), "session.create" | "session.list" | "session.list_mine" | "session.join" | "session.feed_sample") {
-                            call(&state, row, &actor, &method, &params, Some(terminal.as_str()).filter(|t| !t.is_empty())).await
+                        let out = if method.starts_with("session.") && !matches!(method.as_str(), "session.create" | "session.list" | "session.list_mine" | "session.list_open" | "session.join" | "session.feed_sample") {
+                            call(&state, row, &actor, &caller, &method, &params, Some(terminal.as_str()).filter(|t| !t.is_empty())).await
                         } else {
                             Err(WsError::invalid_op(format!("{method} is not a session call")))
                         };
@@ -752,7 +822,7 @@ pub fn spawn_timers(state: Arc<AppState>) {
                     st.svc.with_run(&s, |ws| {
                         let mut stage = ws.stage();
                         if !feeds.is_empty() {
-                            ws.refresh_feeds(&Caller::user(&s.owner), &s.presenter, &format!("tick/{}", s.session_id), &FeedSel::of(&feeds), &participants)?;
+                            ws.refresh_feeds(&Caller::internal(&s.owner), &s.presenter, &format!("tick/{}", s.session_id), &FeedSel::of(&feeds), &participants)?;
                         }
                         if stage.get("step_id").is_some() && stage["followers"].as_u64() != Some(followers as u64) {
                             stage["followers"] = json!(followers);

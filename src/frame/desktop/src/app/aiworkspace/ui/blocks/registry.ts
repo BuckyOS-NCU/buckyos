@@ -19,11 +19,13 @@ import type { AnchorDef, Shape } from '../canvas/connectors/anchors'
 import { aiwsT, aiwsText, localizedLabels } from '../../i18n'
 import { htmlApiOf } from '../extensions/htmlRuntime'
 
-/** `show` is not a sub-mode the user picks: it is the stage of a show (第三期规划 §10.1). */
-export type CanvasMode = 'edit' | 'view' | 'presentation_edit' | 'show'
+/** `show` is not a sub-mode the user picks: it is the stage of a show (第三期规划 §10.1); nor is `print`, the pages of a
+ * printed PDF (打印 TODO §3.2), rendered in the print package. */
+export type CanvasMode = 'edit' | 'view' | 'presentation_edit' | 'show' | 'print'
 export const CANVAS_MODES: CanvasMode[] = ['edit', 'view', 'presentation_edit']
 export const CANVAS_MODE_LABEL = localizedLabels<CanvasMode>({
   edit: 'aiworkspace.blocks.mode.edit', view: 'aiworkspace.blocks.mode.view', presentation_edit: 'aiworkspace.blocks.mode.presentationEdit', show: 'aiworkspace.blocks.mode.show',
+  print: 'aiworkspace.printrender.mode',
 })
 
 export type DataState = 'ready' | 'missing' | 'unreadable' | 'degraded' | 'none'
@@ -51,8 +53,8 @@ export interface RenderContext {
   dataState: DataState
   size: { w: number; h: number }
   zoom: number
-  /** The canvas runs this Block (扩展控件 P2, Q27): a declarative `button` is enabled, a click on an HTML Block mounts it,
-   * events run their handlers. False in design mode, on replays, for guests and on phones. */
+  /** The canvas runs this Block (扩展控件 P2, Q27): a declarative `button` is enabled, an HTML Block runs (in view mode
+   * by itself, else on a click), events run their handlers. False in design mode and on stages that do not run. */
   interactive: boolean
   /** Explicit activation ("edit content" / double-click in edit mode); the host mounts the Editor. */
   activateEditor: () => void
@@ -66,6 +68,8 @@ export interface RenderContext {
   /** Start an annotation (null without the `comment` capability); show the annotations targeting an entity. */
   annotate: ((anchor: CapturedAnchor) => void) | null
   showAnnotations: (targetId: string) => void
+  /** One file from the system file picker (the Zone, or this device), as for `<input accept>`; null when cancelled. */
+  pickFile: (accept?: string) => Promise<File | null>
 }
 
 /** One control of the near toolbar (标准对象的交互改进 §5.4). `disabled` is the reason, shown as the tooltip.
@@ -95,9 +99,21 @@ export interface HoverAffordance {
   modes?: CanvasMode[]
 }
 
+/** One thing a Block type can do (UI 框架 PRD §10.1). Where it shows is decided by `primary` alone: a primary action is an
+ * icon button of the Block toolbar (the flow title row, the phone's context window); every action is in the Block's
+ * menu (the context menu and the toolbar's "more"), primary ones first. The stable id is `block.<type>.<id>`
+ * (`actionStableId`); `id` stays the test id (`aiws-near-<id>`, `aiws-menu-<id>`). The action bound to Enter is the
+ * type's "edit content" (the menu's "open" group). */
 export interface BlockAction {
   id: string
   label: string
+  /** The label as the Block is now ("run" / "run again"), where it differs from `label`. */
+  labelFor?: (context: RenderContext, store: WorkspaceStore) => string
+  /** The toolbar button's icon (without one the label is shown). */
+  icon?: LucideIcon
+  primary?: boolean
+  /** Marked as an AI action (the toolbar draws it as such). */
+  ai?: boolean
   /** Sub-modes where the action is offered; the policy of the mode still applies (§10.2). */
   modes: CanvasMode[]
   /** Both canvas and source views unless narrowed. */
@@ -105,10 +121,32 @@ export interface BlockAction {
   /** Available with these capabilities on the Block (and its source when `onSource`). */
   needs?: Capability[]
   onSource?: boolean
-  when?: (context: RenderContext) => boolean
+  when?: (context: RenderContext, store: WorkspaceStore) => boolean
+  /** Why it cannot run right now (offered disabled, with the reason), or false. */
+  disabled?: (context: RenderContext, store: WorkspaceStore) => string | false
+  /** Shown pressed (a panel it opens is open, a node is folded). */
+  active?: (context: RenderContext, store: WorkspaceStore) => boolean
   run: (context: RenderContext, store: WorkspaceStore) => void | Promise<void>
   /** Shown as a keyboard hint; the host binds it while the Block is selected. */
   key?: string
+  /** The menu group: `open` for the type's "edit content" (by default the action bound to Enter), else the type's own. */
+  group?: 'type' | 'open'
+}
+
+/** The stable action id (PRD §3.3): `block.<type>.<name>`; an id that already names its namespace is kept. */
+export function actionStableId(type: string, id: string): string {
+  if (id.includes('.')) return id
+  return `block.${type}.${id.startsWith(`${type}-`) ? id.slice(type.length + 1) : id}`
+}
+
+/** What a flow page and the canvas host ask of a type (PRD §10.1: declared by the type, not listed by name in the host). */
+export interface BlockTraits {
+  /** A selected Block of this type starts its editor when a letter is typed (§4.4). */
+  typeToEdit?: boolean
+  /** A flow page shows no heading line for it (the content carries its own: text, pictures, notes, shapes, frames). */
+  flowUntitled?: boolean
+  /** It is not offered by a flow page's ＋ (canvas-only objects). */
+  flowInsertable?: false
 }
 
 /** Insert catalog groups (UI improvement §6.3): standard objects, samples kept apart, workspace extensions. */
@@ -126,10 +164,14 @@ export interface CatalogInfo {
   needs: 'none' | 'data' | 'file' | 'definition'
   /** Inserted without a title prompt, then the editor opens at once (text, notes, wishes). */
   editAfterInsert?: boolean
-  /** Offered directly on the object toolbar. */
+  /** Offered in the quick insert lists (context menu, flow page insert, slash menu). The object toolbar has its own
+   * fixed layout (`ObjectToolbar.tsx` `OBJECTS`). */
   standard?: boolean
   /** Further entries of the same definition with preset configuration (a shape's "text"). */
   variants?: CatalogVariant[]
+  /** Its place in the tool picker of the left tool area (§4.3): entries with it form the default list, in this order
+   * (ObjectToolbar reads it; none: reached through "insert…" only). */
+  toolPicker?: number
 }
 
 /** A catalog entry of a definition with a preset `config` (and its own size, group, text). */
@@ -144,6 +186,8 @@ export interface CatalogVariant {
   standard?: boolean
   /** Choices the insert catalog offers before inserting (merged into `config`). */
   options?: { key: string; label: string; choices: { value: string; label: string }[] }[]
+  /** Its place in the tool picker (see `CatalogInfo.toolPicker`). */
+  toolPicker?: number
 }
 
 export interface BlockDefinition {
@@ -165,14 +209,22 @@ export interface BlockDefinition {
   View?: ComponentType<RenderContext>
   /** Mounted only after explicit activation in edit mode, or directly in the data-source view. */
   Editor?: ComponentType<RenderContext>
-  /** Property editing for the side panel; the host places it. */
+  /** A section of the properties panel the type draws itself (§10.2); the host places it among the type's sections. */
   Inspector?: ComponentType<RenderContext>
+  /** The title of that drawn section (default: the type's title). */
+  inspectorTitle?: string
+  /** The type's icon (flow title row, the properties panel's heading). */
+  icon?: LucideIcon
+  /** The sections of the type's own properties, in order (`ConfigField.section` names one; default one section). */
+  sections?: { id: string; label: string }[]
+  traits?: BlockTraits
   actions?: BlockAction[]
   /** Pure UI Blocks live in the BlockTree only (frame, shape); content Blocks pair with a data entity (§4.2). */
   pureUi?: boolean
   /** How "insert" creates this Block (data entity + Cell in one commit, or the Cell alone). */
   create?: (args: CreateArgs) => Operation[]
-  /** Config schema for the generic inspector (simple key → control). */
+  /** The type's properties (§10.1): the properties panel shows all of them, the Block toolbar the ones marked `quick`.
+   * One declaration serves both: the same value, the same write. */
   configFields?: ConfigField[]
   configSchema?: Json
   definitionKind?: BlockDefPayload['kind']
@@ -189,13 +241,52 @@ export interface BlockDefinition {
   anchors?: readonly AnchorDef[] | ((payload: CellPayload) => readonly AnchorDef[])
   /** `locked`: corner handles keep the proportions (Shift frees them); `free`: Shift keeps them. */
   resize?: { aspect?: 'free' | 'locked' }
-  /** Hover affordances (§4.2); without it a Block with data shows the data's name. */
+  /** Hover affordances (§4.2); without it a Block with data shows the data's name. Each button names one of the type's
+   * actions (`action`), so a touch reaches it from the toolbar, the menu and the phone's context window (PRD §10.1). */
   hover?: (context: RenderContext, store: WorkspaceStore) => HoverAffordance[]
-  /** The type section of the near toolbar for the current state (§5.2). */
-  toolbar?: (context: RenderContext, store: WorkspaceStore) => ToolbarItem[]
 }
 
-export interface ConfigField { key: string; label: string; kind: 'text' | 'number' | 'select' | 'boolean' | 'color'; options?: { value: string; label: string }[] }
+/** One property of a type (§10.1, §10.2): its control, default, where it shows. Without `get` it reads `config.<key>` of
+ * the Cell; it writes `config.<key>` (the default value stored as absent), or the config `patch` it gives, or the
+ * operations of `ops` — each one undoable commit, and with several Blocks selected one commit for all of them (§10.2).
+ * `set` is for a writer that cannot be one of those (it is then not offered for several Blocks at once). */
+export interface ConfigField {
+  key: string
+  label: string
+  kind: 'text' | 'textarea' | 'number' | 'select' | 'boolean' | 'color'
+  options?: { value: string; label: string; icon?: LucideIcon }[]
+  /** The tool id (`aiws-near-<id>`); default `<type>-<key>` with `_` as `-`. */
+  id?: string
+  /** The section of the properties panel: `common` (the first one), or one of the type's `sections` (default: the first). */
+  section?: string
+  /** Also on the Block toolbar (a colour, a menu, a toggle, a size). */
+  quick?: boolean
+  /** Quick properties shown together behind one toolbar button (the shape's line tools). */
+  quickGroup?: { id: string; label: string; icon: LucideIcon }
+  icon?: LucideIcon
+  palette?: 'fill' | 'ink'
+  /** Special colour values before the palette (`none`, `auto`). */
+  extras?: { value: string; label: string }[]
+  default?: Json
+  min?: number
+  max?: number
+  /** A number's toolbar choices (font sizes); the panel keeps the number field. */
+  presets?: number[]
+  /** Shown only for some states (a line has no fill). */
+  when?: (context: RenderContext, store: WorkspaceStore) => boolean
+  get?: (context: RenderContext, store: WorkspaceStore) => Json | undefined
+  /** The Cell's `config` keys to write for `value` (null removes one). */
+  patch?: (context: RenderContext, value: Json | null) => Record<string, Json | null>
+  /** The operations that write `value` (other keys, the data, another entity); none: nothing to change. */
+  ops?: (context: RenderContext, store: WorkspaceStore, value: Json | null) => Promise<Operation[]>
+  /** The edit history's label of a change (default "<label> → <value>"). */
+  editLabel?: (value: Json | null) => string
+  set?: (context: RenderContext, store: WorkspaceStore, value: Json | null) => void
+  /** Why it cannot be changed now (default: the Block's read-only reason, and `update` in edit mode). */
+  readOnly?: (context: RenderContext) => string | false
+  /** Drawn by the toolbar as a panel with this picker instead of a menu (the shape kinds). */
+  picker?: (props: { value: string; pick: (value: string) => void }) => ReactNode
+}
 
 export interface CreateArgs {
   store: WorkspaceStore
@@ -352,5 +443,8 @@ export function modePolicy(mode: CanvasMode): ModePolicy {
     // only Blocks marked "operable on stage" take input (the host checks `presentation.live`, §10.2)
     case 'show':
       return { select: false, layout: false, editContent: true, insert: false, annotate: false, readingInteraction: true, writes: true, events: 'live' }
+    // a page of a printed PDF: nothing is selected, edited, written, played or run (打印 TODO §3.2)
+    case 'print':
+      return { select: false, layout: false, editContent: false, insert: false, annotate: false, readingInteraction: false, writes: false, events: 'off' }
   }
 }

@@ -531,56 +531,16 @@ pub enum AgentRuntimeTarget {
     },
 }
 
-/// What an Agent may install on a runtime.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum InstallGrant {
-    #[default]
-    None,
-    /// Commands a skill brings, into the Agent's own bin.
-    AgentBin,
-    /// A skill's `install.toml` may also write outside the Agent's own directory.
-    /// Never `$BUCKYOS_ROOT/tools`: extension packages are installed by node_daemon.
-    System,
-}
-
-/// The owner's grant to an Agent on one runtime, beyond the node policy
-/// (the control panel writes the intersection; the Agent State reads it).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRuntimeGrant {
-    #[serde(default)]
-    pub install: InstallGrant,
-    /// Whether long-lived workspaces may be created there (`None`: the
-    /// runtime's preset decides).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<bool>,
-    /// Directories the owner narrows the executor's roots to (empty: the
-    /// executor's own).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub roots: Vec<String>,
-    /// When the grant ends; `None`: open-ended.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at_ms: Option<u64>,
-}
-
-/// The owner's choice for one execution runtime of an Agent. The node's
-/// policy (`ExecutorSettings.owner_agents`) says what the node allows; the
-/// scheduler multiplies both into the Agent's profile on that node.
+/// One execution runtime assigned to an Agent: which runtime (`target`) and
+/// whether the Agent uses it now. What the runtime allows (operations,
+/// directories, ComputerUse, declared baseline, term) is the runtime's own
+/// configuration (a node's `owner_agents` policy, a device's issued
+/// profile), never set per Agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRuntimeSettings {
     pub enabled: bool,
-    #[serde(default)]
-    pub computer: crate::ComputerAccess,
     pub target: AgentRuntimeTarget,
-    /// The environment the owner declares this runtime to provide (`None`:
-    /// standard). Decides which cmd_skills a session on it gets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline: Option<RuntimeBaseline>,
-    /// What the owner grants the Agent there beyond the node's policy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant: Option<AgentRuntimeGrant>,
 }
 
 /// Declared environment baseline of an execution runtime: `standard` has
@@ -645,6 +605,11 @@ pub struct AgentSettings {
     /// to its HomeStation so other Agents can learn from it.
     #[serde(default = "default_true")]
     pub auto_share_results: bool,
+    /// Credentials of the Agent's sync tasks (task id → name → value), set
+    /// only by the owner (`sync.set_secret`) and handed to the task's
+    /// program; the Agent can read them too (a known risk).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sync_secrets: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for AgentSettings {
@@ -662,6 +627,7 @@ impl Default for AgentSettings {
             default_runtime_id: None,
             homestation: true,
             auto_share_results: true,
+            sync_secrets: BTreeMap::new(),
         }
     }
 }
@@ -699,8 +665,9 @@ impl AgentSettings {
             || self.runtimes.get(runtime_id).is_some_and(|r| r.enabled)
     }
 
-    /// The default runtime for new sessions: the configured one when it is
-    /// enabled, else the container.
+    /// The owner's default runtime: the configured one while it is enabled,
+    /// else the container. A disabled default keeps its place in
+    /// `default_runtime_id` and counts again once it is enabled.
     pub fn effective_default_runtime(&self) -> &str {
         match self.default_runtime_id.as_deref() {
             Some(id) if self.runtime_enabled(id) => id,
@@ -745,9 +712,9 @@ impl AgentSettings {
             }
         }
         if let Some(default) = &self.default_runtime_id {
-            if !self.runtime_enabled(default) {
+            if default != CONTAINER_RUNTIME_ID && !self.runtimes.contains_key(default) {
                 return Err(format!(
-                    "default runtime `{default}` is not an enabled runtime"
+                    "default runtime `{default}` is not one of the Agent's runtimes"
                 ));
             }
         }
@@ -759,13 +726,17 @@ impl AgentSettings {
 /// (AppId == AgentId) chose as its default: its Agent Service runs natively
 /// there instead of in a paios container (native-agent-service TODO §2).
 /// `input` is the system-config view the scheduler works on. `None`: the
-/// Agent belongs to another user, its default runtime is not a node runtime,
-/// or that node is not open to the owner's Agents.
+/// product has containers (an Agent's private runtime is then always its
+/// container), the Agent belongs to another user, its default runtime is
+/// not a node runtime, or that node is not open to the owner's Agents.
 pub fn native_agent_node(
     input: &std::collections::HashMap<String, String>,
     owner_user_id: &str,
     app_id: &AppId,
 ) -> Option<String> {
+    if crate::ProductProfile::from_system_config(input).map_or(true, |p| p.container_enabled()) {
+        return None;
+    }
     let zone_owner = input.get(ZONE_OWNER_USER_ID_KEY).map(|raw| {
         serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.trim().trim_matches('"').to_string())
     })?;
@@ -910,10 +881,7 @@ mod tests {
         let agent = AgentId::parse("jarvis.test.buckyos.io").unwrap();
         let host = |enabled: bool| AgentRuntimeSettings {
             enabled,
-            computer: crate::ComputerAccess::None,
             target: AgentRuntimeTarget::Node { node_id: "ood1".into(), node_did: "did:web:ood1.test.buckyos.io".into() },
-            baseline: None,
-            grant: None,
         };
         let node = |open: bool| {
             serde_json::json!({"executor": {"enabled": true, "owner_agents": {"enabled": open, "workdir_roots": ["/home/u"]}}}).to_string()
@@ -923,12 +891,16 @@ mod tests {
                 (ZONE_OWNER_USER_ID_KEY.to_string(), "\"devtest\"".to_string()),
                 (agent_settings_key("devtest", &agent), serde_json::to_string(&settings).unwrap()),
                 (crate::node_settings_key("ood1"), node(open)),
+                (crate::PRODUCT_PROFILE_KEY.to_string(), include_str!("../../../product/lite.json").to_string()),
             ])
         };
         let mut on_host = AgentSettings::default();
         on_host.runtimes.insert(HOST_RUNTIME_ID.into(), host(true));
         on_host.default_runtime_id = Some(HOST_RUNTIME_ID.into());
         assert_eq!(native_agent_node(&input(on_host.clone(), true), "devtest", &app).as_deref(), Some("ood1"));
+        let mut full = input(on_host.clone(), true);
+        full.remove(crate::PRODUCT_PROFILE_KEY);
+        assert_eq!(native_agent_node(&full, "devtest", &app), None, "a product with containers keeps the Agent in its container");
         assert_eq!(native_agent_node(&input(on_host.clone(), false), "devtest", &app), None, "node closed");
         assert_eq!(native_agent_node(&input(on_host.clone(), true), "alice", &app), None, "not the zone owner");
         let mut enabled_only = on_host.clone();
@@ -936,7 +908,11 @@ mod tests {
         assert_eq!(native_agent_node(&input(enabled_only, true), "devtest", &app), None, "container is the default");
         let mut disabled = on_host;
         disabled.runtimes.insert(HOST_RUNTIME_ID.into(), host(false));
-        assert_eq!(native_agent_node(&input(disabled, true), "devtest", &app), None, "host switched off");
+        assert!(disabled.validate_runtimes().is_ok(), "a disabled default keeps its place");
+        assert_eq!(disabled.effective_default_runtime(), CONTAINER_RUNTIME_ID);
+        assert_eq!(native_agent_node(&input(disabled.clone(), true), "devtest", &app), None, "host switched off");
+        disabled.runtimes.remove(HOST_RUNTIME_ID);
+        assert!(disabled.validate_runtimes().is_err(), "the default names a runtime the Agent has");
     }
 
     fn reserved() -> BTreeSet<String> {

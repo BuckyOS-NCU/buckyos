@@ -2,7 +2,7 @@
  * Blocks sharing data, gestures as single commits, layout concurrency, mode dispatch and fallbacks.
  * Persistence is asserted through kRPC, not only through the DOM. */
 
-import { blockCenter, expect, hooks, openCanvas, openWorkspace, test, fitAll, setCanvasMode, zoomIn } from './fixtures'
+import { blockCenter, expect, fitAll, hooks, openCanvas, openWorkspace, setCanvasMode, test, treeMenu, zoomIn } from './fixtures'
 
 const ALICE = 'tok-alice'
 const BOB = 'tok-bob'
@@ -98,6 +98,8 @@ test('UI04 Surfaces: create, move a Block across, delete with pre-check; referen
   await page.getByTestId('aiws-surface-item-sf-analysis').getByRole('menuitem').click()
   await page.getByTestId('aiws-canvas-block-blk-kpi').click()
   await page.getByTestId('aiws-near-more').click()
+  // more than twelve items: "arrange" is a submenu (UI 框架 PRD §10.3)
+  await page.getByTestId('aiws-near-group-arrange').click()
   await page.getByTestId('aiws-near-move-surface').click()
   await page.getByTestId('aiws-picker-surface').selectOption(third.entity_id)
   await page.getByTestId('aiws-picker-confirm').click()
@@ -106,12 +108,13 @@ test('UI04 Surfaces: create, move a Block across, delete with pre-check; referen
   expect((await api.outline(ALICE, ws.workspace_id)).find((e: { entity_id: string }) => e.entity_id === 'blk-kpi')?.source_id).toBe('sales')
   // deleting the table is refused: the pre-check names the Blocks (all readable here) and nothing else
   await page.getByTestId('aiws-top-sources').click()
-  await page.getByTestId('aiws-tree-sales').click()
-  await page.getByTestId('aiws-delete-entity').click()
+  await treeMenu(page, 'sales', 'aiws-delete-entity')
   await expect(page.getByTestId('aiws-delete-blocked')).toContainText('仍被引用')
   await expect(page.getByTestId('aiws-delete-confirm')).toHaveCount(0)
+  await page.keyboard.press('Escape')
+  await expect(page.getByTestId('aiws-delete-dialog')).toHaveCount(0)
   // bob reads only the data tree: the same pre-check tells him nothing about the Blocks
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', scope_entity_id: 'data', capabilities: ['read', 'delete'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', resource: 'data', allow: ['read', 'delete'] }] })
   const prepared = await api.rpc(BOB, 'doc.prepare', { protocol_version: '1.0', workspace_id: ws.workspace_id, epoch: ws.epoch, idempotency_key: 'bob-pre', session_id: 'bob', operations: [{ op: 'entity.delete', entity_id: 'intro', expect: { rev: (await api.read(BOB, ws.workspace_id, 'intro')).life_rev } }] })
   expect(prepared.status).toBe('rejected')
   expect(prepared.errors[0].data.referrers).toEqual([])
@@ -147,7 +150,8 @@ test('UI05 a drag is one commit and one undo step; Esc cancels with zero commits
   expect((await hooks(page)).commits).toBe(0)
   // a completed drag of two selected Blocks: exactly one commit, both placements persisted
   await page.getByTestId('aiws-canvas-block-blk-kpi').click()
-  await page.getByTestId('aiws-canvas-block-blk-wish').click({ modifiers: ['Shift'] })
+  // (the wish by its title: its request field takes a click itself)
+  await page.getByTestId('aiws-wish-card-wish-analysis').getByTestId('aiws-wish-title').click({ modifiers: ['Shift'] })
   await expect(page.locator('[data-testid^="aiws-selection-"]')).toHaveCount(2)
   const from = await blockCenter(page, 'blk-kpi')
   await page.mouse.move(from.x, from.y)
@@ -161,7 +165,7 @@ test('UI05 a drag is one commit and one undo step; Esc cancels with zero commits
   const kpi = after.find((e: { entity_id: string }) => e.entity_id === 'blk-kpi').placement
   const wish = after.find((e: { entity_id: string }) => e.entity_id === 'blk-wish').placement
   expect(kpi.x).toBe(980 + 100)
-  expect(wish.y).toBe(190 + 60)
+  expect(wish.y).toBe(300 + 60)
   // undo restores both in one step
   await page.getByTestId('aiws-undo').click()
   await expect.poll(async () => (await api.outline(ALICE, ws.workspace_id)).find((e: { entity_id: string }) => e.entity_id === 'blk-kpi').placement.x).toBe(980)
@@ -288,7 +292,7 @@ test('trackpad wheel preserves horizontal and vertical table scrolling with over
 test('UI06 two clients move the same Block: the later arrival wins, the other is told and can re-apply', async ({ page, api, browser }) => {
   const ws = await api.demo(ALICE, 'quarterly', `ui06 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', capabilities: ['read', 'update', 'structure', 'append', 'delete', 'comment'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', allow: ['read', 'update', 'structure', 'append', 'delete', 'comment'] }] })
   const other = await browser.newContext({ viewport: { width: 1600, height: 1000 } })
   const page2 = await other.newPage()
   await openCanvas(page2, BOB, ws.workspace_id)
@@ -375,8 +379,8 @@ test('UI08/UI09 edit and view sub-modes dispatch rendering, tools and writes; un
   await page.keyboard.press('Delete')
   await page.waitForTimeout(400)
   expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head)
-  // the chart's view variant: values on hover (the right panel stays open across Surfaces: close it to give the canvas its width)
-  await page.getByTestId('aiws-side-close').click()
+  // the chart's view variant: values on hover (the properties panel is closed to give the canvas its room)
+  await page.getByTestId('aiws-props-close').click()
   await page.getByTestId('aiws-surface-switch').click()
   await page.getByTestId('aiws-surface-item-sf-detail').getByRole('menuitem').click()
   await expect(page.getByTestId('aiws-chart-blk-chart-2')).toHaveAttribute('data-interactive', 'true')
@@ -386,7 +390,7 @@ test('UI08/UI09 edit and view sub-modes dispatch rendering, tools and writes; un
   // annotation in view mode is the one allowed write
   await page.getByTestId('aiws-canvas-block-blk-sales-2').click()
   await page.getByTestId('aiws-near-annotate').click()
-  await page.getByLabel('批注内容').fill('查看模式下的批注')
+  await page.getByLabel('评论内容').fill('查看模式下的批注')
   await page.getByTestId('aiws-annotation-save').click()
   await expect.poll(async () => api.headSeq(ALICE, ws.workspace_id)).toBe(head + 1)
   const outline = await api.outline(ALICE, ws.workspace_id)
@@ -449,5 +453,7 @@ test('UI17 both demos open through the normal UI with every Block rendered by th
     await expect(page.getByTestId(`aiws-canvas-block-${id}`)).toBeVisible()
   }
   await expect(page.locator('[data-testid^="aiws-block-fallback-"]')).toHaveCount(0)
-  await expect(page.getByTestId('aiws-wish-card-wish-characters')).toContainText('模拟')
+  // the wishes are cards on the real executor (许愿格交互升级 §3.10 D): their title, the analysis to do first
+  await expect(page.getByTestId('aiws-wish-card-wish-characters').getByTestId('aiws-wish-title')).toHaveText('许愿格 ①：生成角色设定图')
+  for (const id of ['wish-characters', 'wish-storyboard', 'wish-video']) await expect(page.getByTestId(`aiws-wish-card-${id}`)).toHaveAttribute('data-next', 'analyze')
 })

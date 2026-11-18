@@ -7,15 +7,26 @@
 //! - `session.read {sid, report?, worklog?}`: registry entry, state, worklog
 //!   tail, report, configuration summary, runs, hosting state. Read-only;
 //!   there is no write interface to a session directory.
-//! - `session.stop {sid, reason?}`, `session.decide {sid, decision, note?}`,
-//!   `session.post {sid, text}`: the three operations of the WebUI; each is
-//!   a record posted to the session's input bus, nothing else.
+//! - `session.stop {sid, reason?, scope?}`, `session.pause` / `session.resume
+//!   {sid, reason?}`, `session.decide {sid, decision, note?}`, `session.post
+//!   {sid, text}`: the operations of the WebUI; each is a record posted to
+//!   the session's input bus, nothing else. What a stop of the session means
+//!   follows its kind: a Work ends, a Goal Session's Goal goes dormant, a
+//!   conversation refuses (it is archived with `ui.rotate {sid}`).
+//! - `session.work_tree {sid, unfinished_only?}`, `ui.conversation {peer_did,
+//!   session_id?}`: what a conversation's side panel shows.
 //! - `loader.status`: hosting state, modules, recent errors.
 //! - `agent.profile`, `agent.profile_set`, `usage.models`, `ui.bindings`:
 //!   the home page ([`crate::home`]).
 //! - `goals.*` of the facade, plus `goals.activate` / `goals.post` (a run
 //!   opportunity / a message for a Goal); a Goal changed here is reconciled
 //!   by the host right away.
+//! - `browser.*`, the screen and the upload entry of the agent's browser
+//!   ([`crate::browser`]).
+//! - `sync.*`, the agent's sync tasks ([`libopendan::sync`]): the owner and
+//!   the owner's Agent; the AI Workspace service runs and reads them
+//!   (`sync.run`, `sync.get`); only the owner, signed in as themselves,
+//!   enters a credential (`sync.set_secret`).
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -23,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use buckyos_api::{
     load_agent_permission_mode, validate_verify_hub_token_claims, AgentPermissionMode,
-    AppInstanceId, AuthTarget, TokenPrincipalKind, TokenUse,
+    AppInstanceId, AuthTarget, TokenPrincipalKind, TokenUse, AIWORKSPACE_SERVICE_NAME,
 };
 use buckyos_http_server::{serve_http_by_rpc_handler, HttpServer, ServerError, ServerResult, StreamInfo};
 use bytes::Bytes;
@@ -39,10 +50,13 @@ use libopendan::{OpenDanError, SessionDir};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::browser::BrowserModule;
 use crate::home::Home;
 use crate::ui::UiModule;
 
 pub const SERVICE_PATH: &str = "/kapi/opendan";
+/// `who` of the AI Workspace service's own session.
+pub const AIWORKSPACE_CALLER: &str = "service:aiworkspace";
 pub const WEB_API_PATH: &str = "/api/opendan";
 
 /// Who may call the service.
@@ -109,6 +123,10 @@ pub struct StateService {
     pub supervisor: Arc<Supervisor>,
     pub info: Arc<LoaderInfo>,
     pub ui: Option<Arc<UiModule>>,
+    /// The agent's browser (`browser.*`, the screen, uploads).
+    pub browser: Arc<BrowserModule>,
+    /// The agent's sync tasks (`sync.*`). `None`: this host runs none.
+    pub sync: Option<Arc<libopendan::sync::SyncHost>>,
     pub access: Access,
     pub home: Home,
     /// Session processes on other runtimes: their session tokens and
@@ -116,6 +134,18 @@ pub struct StateService {
     pub sessions: Option<Arc<SessionService>>,
     /// The Agent's DID Object Provider (`/kapi/<agent_id>/obj`).
     pub objects: std::sync::OnceLock<buckyos_http_server::DIDObjectHttpServer<buckyos_api::KrpcObjectProvider>>,
+    /// What the service needs to start a work of its own (`skills.import`). `None`: this host starts none.
+    pub work: Option<WorkStarter>,
+}
+
+/// Where and as whom the service creates a work session.
+pub struct WorkStarter {
+    pub sessions_dir: std::path::PathBuf,
+    pub channels: Arc<dyn libopendan::channel::InputChannelFactory>,
+    /// Base `.llm_context` of the sessions the Loader creates.
+    pub llm_context: Value,
+    /// The Loader's own principal: the driver of the sessions it creates.
+    pub driver: String,
 }
 
 fn param<T: serde::de::DeserializeOwned>(params: &Value, name: &str) -> Result<T, OpenDanError> {
@@ -123,9 +153,15 @@ fn param<T: serde::de::DeserializeOwned>(params: &Value, name: &str) -> Result<T
         .map_err(|e| OpenDanError::InvalidArgument(format!("param `{name}`: {e}")))
 }
 
-impl StateService {
-    async fn caller(&self, req: &RPCRequest, ip_from: IpAddr) -> Result<String, RPCErrors> {
-        match &self.access {
+impl Access {
+    /// Who calls `method` with `token` from `ip_from`, if they may: the
+    /// agent's owner (through any app) or the zone's root; an Agent's App
+    /// identity only what [`authorize_agent_method`] lets it; the AI
+    /// Workspace service only [`zone_service`]'s methods. kRPC calls, the
+    /// screen's handshake and uploads all pass here (the latter two as the
+    /// owner-only methods `browser.screen` / `browser.upload`).
+    pub(crate) async fn caller(&self, token: Option<&str>, method: &str, ip_from: IpAddr) -> Result<String, RPCErrors> {
+        match self {
             Access::Open { who } => Ok(who.clone()),
             Access::Zone {
                 owner,
@@ -133,15 +169,18 @@ impl StateService {
                 trust_loopback,
                 ..
             } => {
-                if *trust_loopback && req.token.is_none() && ip_from.is_loopback() {
+                if *trust_loopback && token.is_none() && ip_from.is_loopback() {
                     return Ok(format!("did:bns:{owner}"));
                 }
-                let token = req.token.as_deref().ok_or_else(|| {
+                let token = token.ok_or_else(|| {
                     RPCErrors::NoPermission("a session token is required".to_string())
                 })?;
                 let runtime = buckyos_api::get_buckyos_api_runtime()?;
                 let token = runtime.verify_trusted_session_token(token).await?;
                 let claims = validate_verify_hub_token_claims(&token, TokenUse::Session)?;
+                if let Some(admitted) = zone_service(claims.principal_kind, &claims.target, method) {
+                    return admitted;
+                }
                 let user = token
                     .sub
                     .clone()
@@ -151,6 +190,7 @@ impl StateService {
                         "{user} is not the owner of this agent"
                     )));
                 }
+                person_only(claims.principal_kind, &user, owner, method)?;
                 if claims.principal_kind == TokenPrincipalKind::App {
                     let AuthTarget::App { app_instance_id } = &claims.target else {
                         return Err(RPCErrors::InvalidToken(
@@ -159,7 +199,7 @@ impl StateService {
                     };
                     let client = runtime.get_system_config_client().await?;
                     let mode = load_agent_permission_mode(client.as_ref(), app_instance_id).await?;
-                    authorize_agent_method(mode, app_instance_id, app_id, owner, &req.method)?;
+                    authorize_agent_method(mode, app_instance_id, app_id, owner, method)?;
                 }
                 Ok(match token.appid.as_deref().filter(|a| !a.is_empty()) {
                     Some(app) => format!("app:{app}@{user}"),
@@ -167,6 +207,12 @@ impl StateService {
                 })
             }
         }
+    }
+}
+
+impl StateService {
+    pub(crate) async fn caller(&self, token: Option<&str>, method: &str, ip_from: IpAddr) -> Result<String, RPCErrors> {
+        self.access.caller(token, method, ip_from).await
     }
 
     async fn read_session(&self, params: &Value) -> Result<Value, OpenDanError> {
@@ -283,6 +329,37 @@ impl StateService {
         Ok(json!({ "index": index }))
     }
 
+    /// `skills.import`: start the work that turns the owner's text into a draft. It installs nothing; the draft waits
+    /// on the Skills page.
+    async fn import_skills(&self, who: &str, params: &Value) -> Result<Value, OpenDanError> {
+        let starter = self
+            .work
+            .as_ref()
+            .ok_or_else(|| OpenDanError::InvalidArgument("this host starts no work sessions: skills.import needs the Agent Loader".into()))?;
+        let import = self.home.skills_import_inbox(self.agent.as_ref(), params)?;
+        let template = libopendan::SessionTemplate::load("work", self.agent.agent_root())?;
+        let mut spec = template.spec("Turn a text the owner handed in into skill drafts: one draft directory under skills_drafts/ with a draft.json, verified against the runtime it is for. Nothing is installed; the owner installs the draft.");
+        spec.title = Some(match &import.name {
+            Some(name) => format!("Import skill {name}"),
+            None => "Import skill".to_string(),
+        });
+        spec.prompt.behavior = Some("skill_import".to_string());
+        spec.prompt.cmd_skills = vec!["skill_authoring".to_string()];
+        spec.require_cmd_skills = true;
+        spec.prompt.llm_context = starter.llm_context.clone();
+        spec.driver = Some(starter.driver.clone());
+        spec.via = "opendan".to_string();
+        spec.owner = Some(who.to_string());
+        spec.workspace = None;
+        spec.freeze = true;
+        spec.prompt.initial_inputs = vec![PostedInput::text(who, self.agent.agent_did(), import.message())?];
+        let sd = libopendan::create_session(&starter.sessions_dir, spec, self.agent.as_ref(), &starter.driver, starter.channels.as_ref()).await?;
+        let sid = sd.sid().to_string();
+        self.host(&sid, "skills.import").await;
+        log::info!("skills: import {} started by {who} as session {sid}", import.inbox);
+        Ok(json!({ "session_id": sid, "inbox": import.inbox }))
+    }
+
     /// New input reached a session of this agent: make sure it is advanced
     /// (a session someone else drives is theirs to advance).
     async fn host(&self, sid: &str, reason: &str) {
@@ -316,13 +393,53 @@ impl StateService {
             "session.read" => self.read_session(params).await,
             "session.worklog" => self.read_worklog(params).await,
             "session.work_cards" => self.work_cards(params).await,
+            "session.work_tree" => {
+                let sid: String = param(params, "sid")?;
+                let unfinished_only = param::<Option<bool>>(params, "unfinished_only")?.unwrap_or(false);
+                let tree = libopendan::work_card::work_tree(self.agent.as_ref(), &sid, unfinished_only).await?;
+                serde_json::to_value(&tree).map_err(|e| OpenDanError::Other(format!("encode work tree: {e}")))
+            }
             "session.stop" => {
                 let sid: String = param(params, "sid")?;
                 let reason = param::<Option<String>>(params, "reason")?;
-                // A Goal Session only stops its open Activation; the session
-                // itself ends with its Goal.
                 let scope = param::<Option<StopScope>>(params, "scope")?.unwrap_or_default();
+                let entry = self.agent.sessions().lookup(&sid).await?
+                    .ok_or_else(|| OpenDanError::NotFound(format!("session {sid}")))?;
+                match (scope, entry.kind) {
+                    (StopScope::Session, SessionKind::Ui) => return Err(OpenDanError::InvalidArgument(format!(
+                        "session {sid} is a conversation: it is not stopped. Stop the message in progress (scope: turn), or start a new conversation (ui.rotate) to drop its context"
+                    ))),
+                    (StopScope::Archive, _) => return Err(OpenDanError::InvalidArgument(
+                        "a conversation is archived with ui.rotate".to_string(),
+                    )),
+                    (StopScope::Turn, _) if !entry.status.turn_open => return Err(OpenDanError::InvalidArgument(format!(
+                        "session {sid} has no Turn in progress"
+                    ))),
+                    _ => {}
+                }
                 self.post_control(who, &sid, ControlCommand::Stop { reason, scope }).await
+            }
+            "session.pause" | "session.resume" => {
+                let sid: String = param(params, "sid")?;
+                let reason = param::<Option<String>>(params, "reason")?;
+                let command = if method == "session.pause" {
+                    ControlCommand::Pause { reason }
+                } else {
+                    ControlCommand::Resume { reason }
+                };
+                self.post_control(who, &sid, command).await
+            }
+            "ui.conversation" => {
+                let peer: String = param(params, "peer_did")?;
+                let session = param::<Option<String>>(params, "session_id")?;
+                crate::ui::conversation(self.agent.as_ref(), &peer, session.as_deref()).await
+            }
+            "ui.rotate" => {
+                let sid: String = param(params, "sid")?;
+                let ui = self.ui.as_ref().ok_or_else(|| {
+                    OpenDanError::InvalidArgument("this host has no message tunnel: there is no conversation to rotate".into())
+                })?;
+                ui.rotate(&sid, who).await
             }
             "session.decide" => {
                 let sid: String = param(params, "sid")?;
@@ -360,11 +477,29 @@ impl StateService {
             "usage.models" => self.home.usage_models(self.agent.as_ref()).await,
             "ui.bindings" => self.home.ui_bindings(self.agent.as_ref()).await,
             "home.workspaces" => self.home.workspaces(self.agent.as_ref()).await,
+            "home.summary" => self.home.summary(self.agent.as_ref()).await,
+            "memory.overview" => self.home.memory_overview(self.agent.as_ref()).await,
+            "memory.list" => self.home.memory_list(self.agent.as_ref(), params).await,
+            "memory.read" => self.home.memory_read(self.agent.as_ref(), params).await,
+            "memory.forget" => self.home.memory_forget(self.agent.as_ref(), params, who).await,
+            "deliveries.recent" => self.home.deliveries_recent(self.agent.as_ref(), params).await,
             "skills.status" => self.home.skills_status(self.agent.as_ref(), params).await,
             "skills.install_plan" => self.home.skills_install_plan(self.agent.as_ref(), params).await,
+            "skills.install" => self.home.skills_install(self.agent.as_ref(), params, who).await,
+            "skills.remove" => self.home.skills_remove(self.agent.as_ref(), params, who).await,
+            "skills.import" => self.import_skills(who, params).await,
+            "skills.state" | "skills.ui_get" | "skills.ui_set" | "skills.set_enabled" | "skills.drafts" | "skills.draft_file"
+            | "skills.draft_discard" | "skills.crystallize_set" => {
+                self.home.skills_call(self.agent.as_ref(), method, params, who).await
+            }
             "runtimes.settings" => self.home.runtime_settings(self.agent.as_ref()).await,
-            "runtimes.settings_set" => {
-                let settings = self.home.set_runtime_settings(self.agent.as_ref(), params).await?;
+            "runtimes.impact" => self.home.runtime_impact(self.agent.as_ref(), params).await,
+            "runtimes.settings_set" | "runtimes.remove" => {
+                let settings = if method == "runtimes.remove" {
+                    self.home.remove_runtime(self.agent.as_ref(), params).await?
+                } else {
+                    self.home.set_runtime_settings(self.agent.as_ref(), params).await?
+                };
                 // The projection follows the settings at once (the watcher
                 // would catch up later).
                 if let Some(root) = crate::home::agent_root_of(self.agent.as_ref()) {
@@ -372,6 +507,13 @@ impl StateService {
                     tokio::spawn(crate::loader::check_runtimes(self.agent.clone()));
                 }
                 self.home.runtime_settings(self.agent.as_ref()).await
+            }
+            m if m.starts_with("sync.") => {
+                let sync = self.sync.as_ref().ok_or_else(|| {
+                    OpenDanError::InvalidArgument("this host runs no sync tasks".into())
+                })?;
+                let trigger = if who == AIWORKSPACE_CALLER { "aiworkspace" } else { "manual" };
+                libopendan::sync::call(sync, m, params, trigger).await
             }
             "goals.activate" => {
                 let id: String = param(params, "goal_id")?;
@@ -417,6 +559,37 @@ impl StateService {
     }
 }
 
+/// A Zone service's own session (a System or Device principal for a system
+/// service): the AI Workspace service runs and reads the sync tasks behind
+/// its data sources (`sync.run`, `sync.get`); nothing else here is open to
+/// a Zone service. `None`: not the AI Workspace service.
+fn zone_service(kind: TokenPrincipalKind, target: &AuthTarget, method: &str) -> Option<Result<String, RPCErrors>> {
+    let AuthTarget::System { service_id } = target else {
+        return None;
+    };
+    if !matches!(kind, TokenPrincipalKind::System | TokenPrincipalKind::Device) || service_id.as_str() != AIWORKSPACE_SERVICE_NAME {
+        return None;
+    }
+    Some(if matches!(method, "sync.run" | "sync.get") {
+        Ok(AIWORKSPACE_CALLER.to_string())
+    } else {
+        Err(RPCErrors::NoPermission(format!(
+            "the AI Workspace service calls sync.run and sync.get of an Agent, not {method}"
+        )))
+    })
+}
+
+/// Methods only the owner calls signed in as themselves (no App, no Agent,
+/// not root): entering a sync task's credentials.
+fn person_only(kind: TokenPrincipalKind, user: &str, owner: &str, method: &str) -> Result<(), RPCErrors> {
+    if method == "sync.set_secret" && (kind != TokenPrincipalKind::User || user != owner) {
+        return Err(RPCErrors::NoPermission(
+            "sync.set_secret is the owner's own: only the owner, signed in as themselves, enters a credential (the data source's properties in the AI Workspace)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn authorize_agent_method(
     mode: Option<AgentPermissionMode>,
     caller: &AppInstanceId,
@@ -424,6 +597,19 @@ fn authorize_agent_method(
     target_owner: &str,
     method: &str,
 ) -> Result<(), RPCErrors> {
+    // What an Agent may do is the owner's to widen: no Agent — this one included, whatever its permission mode —
+    // installs, removes or switches skills.
+    if is_owner_only(method) && (mode.is_some() || caller.app_id().as_str() == target_app_id) {
+        return Err(RPCErrors::NoPermission(if method.starts_with("memory.") {
+            format!("{method} is the owner's: an Agent does not delete what an Agent remembers (the Memory page, as the owner)")
+        } else if method.starts_with("browser.") {
+            format!("{method} is the owner's: watching an Agent's browser, taking it over and handing it back is what its user does (the Agent Browser app)")
+        } else if method.starts_with("sync.") {
+            format!("{method} is the owner's: an Agent never handles the credentials of a sync task (the owner enters them in the data source's properties)")
+        } else {
+            format!("{method} is the owner's: an Agent does not change which skills an Agent has (the Skills page, or `buckyos skill` as the owner)")
+        }));
+    }
     if mode != Some(AgentPermissionMode::ReadOnly) || is_read(method) {
         return Ok(());
     }
@@ -439,6 +625,33 @@ fn authorize_agent_method(
     )))
 }
 
+/// Methods only the owner calls (never an Agent's own App identity): which skills the Agent has, deleting what the
+/// Agent remembers (cognitions change only through consolidation; an Agent does not delete them on the owner's behalf),
+/// and the user's side of the Agent's browser (`browser.screen` is the screen's handshake, not a kRPC method).
+fn is_owner_only(method: &str) -> bool {
+    matches!(
+        method,
+        "skills.install"
+            | "skills.remove"
+            | "skills.set_enabled"
+            | "skills.ui_set"
+            | "skills.import"
+            | "skills.draft_discard"
+            | "skills.crystallize_set"
+            | "memory.forget"
+            | "browser.take_over"
+            | "browser.hand_back"
+            | "browser.hand_to_agent"
+            | "browser.bind_default"
+            | "browser.upload"
+            | "browser.download_export"
+            | "browser.clear_profile"
+            | "browser.reflow_action"
+            | "browser.screen"
+            | "sync.set_secret"
+    )
+}
+
 fn is_read(method: &str) -> bool {
     matches!(
         method,
@@ -451,7 +664,8 @@ fn is_read(method: &str) -> bool {
             | "perception.cursor"
             | "perception.backlog"
             | "perception.read"
-            | "cognition.recall_hints"
+            | "cognition.query"
+            | "cognition.read"
             | "artifacts.head"
             | "artifacts.version"
             | "artifacts.versions"
@@ -469,6 +683,10 @@ fn is_read(method: &str) -> bool {
             | "behaviors.cmd_skill"
             | "skills.list"
             | "skills.install_plan"
+            | "skills.state"
+            | "skills.ui_get"
+            | "skills.drafts"
+            | "skills.draft_file"
             | "runtimes.ext_tools"
             | "goals.list"
             | "goals.get"
@@ -478,17 +696,32 @@ fn is_read(method: &str) -> bool {
             | "goals.epoch_state"
             | "goals.activations"
             | "goals.schedule"
+            | "goals.check_script"
+            | "memory.status"
             | "notify.state"
             | "notify.list"
             | "session.read"
             | "session.worklog"
             | "session.work_cards"
+            | "session.work_tree"
+            | "ui.conversation"
             | "agent.profile"
             | "usage.models"
             | "ui.bindings"
             | "home.workspaces"
+            | "home.summary"
+            | "memory.overview"
+            | "memory.list"
+            | "memory.read"
+            | "deliveries.recent"
             | "runtimes.settings"
+            | "runtimes.impact"
             | "loader.status"
+            | "browser.status"
+            | "browser.reflow_state"
+            | "sync.list"
+            | "sync.get"
+            | "sync.runs"
     )
 }
 
@@ -497,13 +730,46 @@ fn is_operation(method: &str) -> bool {
     matches!(
         method,
         "session.stop"
+            | "session.pause"
+            | "session.resume"
+            | "ui.rotate"
             | "session.decide"
             | "session.post"
             | "agent.profile_set"
             | "runtimes.settings_set"
+            | "runtimes.remove"
             | "skills.status"
+            | "skills.install"
+            | "skills.remove"
+            | "skills.set_enabled"
+            | "skills.ui_set"
+            | "skills.import"
+            | "skills.draft_discard"
+            | "skills.crystallize_set"
             | "goals.activate"
             | "goals.post"
+            | "memory.forget"
+            | "browser.ensure"
+            | "browser.acquire"
+            | "browser.renew"
+            | "browser.release"
+            | "browser.request_handover"
+            | "browser.take_over"
+            | "browser.hand_back"
+            | "browser.hand_to_agent"
+            | "browser.bind_default"
+            | "browser.upload"
+            | "browser.download_export"
+            | "browser.clear_profile"
+            | "browser.reflow_refresh"
+            | "browser.reflow_action"
+            | "browser.screen"
+            | "sync.put"
+            | "sync.set_enabled"
+            | "sync.delete"
+            | "sync.set_secret"
+            | "sync.try"
+            | "sync.run"
     )
 }
 
@@ -537,9 +803,24 @@ impl RPCHandler for StateService {
         if let Some(token) = req.token.as_deref().filter(|t| is_session_token(t)) {
             return self.session_call(&req, token).await;
         }
-        let who = self.caller(&req, ip_from).await?;
-        if is_write(&req.method) || is_operation(&req.method) {
+        let who = self.caller(req.token.as_deref(), &req.method, ip_from).await?;
+        if (is_write(&req.method) || is_operation(&req.method)) && req.method != "browser.renew" {
             log::info!("service: {} by {who}", req.method);
+        }
+        if req.method.starts_with("browser.") {
+            let bound = self.browser.default_session();
+            // The browser's errors carry a `code` beside the facade's `kind`.
+            return match crate::browser::rpc::call(&self.browser, &who, req.token.as_deref(), &req.method, &req.params).await {
+                Ok(v) => {
+                    // A conversation that became the browser conversation takes the browser's manual.
+                    let now = self.browser.default_session().filter(|now| req.method == "browser.bind_default" && Some(now) != bound.as_ref());
+                    if let (Some(ui), Some(now)) = (&self.ui, now) {
+                        ui.browser_bound(&now).await;
+                    }
+                    Ok(RPCResponse::new(RPCResult::Success(v), req.seq))
+                }
+                Err(e) => Err(RPCErrors::ReasonError(e.to_wire())),
+            };
         }
         match self.call(&who, &req.method, &req.params).await {
             Ok(v) => Ok(RPCResponse::new(RPCResult::Success(v), req.seq)),
@@ -576,6 +857,12 @@ impl HttpServer for StateService {
                 }
                 return objects.serve_request(req, info).await;
             }
+        }
+        // The browser's screen (a WebSocket upgrade) and uploads.
+        let agent_path = format!("/kapi/{}", self.agent.agent_id());
+        let mounts = [SERVICE_PATH, WEB_API_PATH, agent_path.as_str()];
+        if let Some(route) = crate::browser::http::route(req.method(), req.uri().path(), &mounts) {
+            return crate::browser::http::serve(self, route, req, info).await;
         }
         if *req.method() == http::Method::POST {
             return serve_http_by_rpc_handler(req, info, self).await;
@@ -635,14 +922,17 @@ mod permission_tests {
         for method in [
             "agent.info", "sessions.lookup", "sessions.query", "sessions.children_of",
             "activity.active", "perception.last_seq", "perception.cursor", "perception.backlog",
-            "perception.read", "cognition.recall_hints", "artifacts.head", "artifacts.version",
+            "perception.read", "cognition.query", "cognition.read", "artifacts.head", "artifacts.version",
             "artifacts.versions", "artifacts.list", "workspaces.lookup", "workspaces.query",
             "workspaces.list", "workspaces.runtime_impact", "runtimes.list", "runtimes.lookup",
             "behaviors.identity", "behaviors.get", "behaviors.list", "behaviors.revision",
-            "behaviors.cmd_skill", "skills.list", "skills.install_plan", "runtimes.ext_tools", "goals.list", "goals.get", "goals.revision",
+            "behaviors.cmd_skill", "skills.list", "skills.install_plan", "skills.state", "skills.ui_get", "skills.drafts", "skills.draft_file", "runtimes.ext_tools", "goals.list", "goals.get", "goals.revision",
             "goals.changes", "goals.state", "goals.epoch_state", "goals.activations",
-            "goals.schedule", "notify.state", "notify.list", "session.read", "session.worklog", "session.work_cards",
-            "agent.profile", "usage.models", "ui.bindings", "home.workspaces", "loader.status",
+            "goals.schedule", "goals.check_script", "memory.status", "notify.state", "notify.list", "session.read", "session.worklog", "session.work_cards",
+            "session.work_tree", "ui.conversation",
+            "home.summary", "memory.overview", "memory.list", "memory.read", "deliveries.recent",
+            "agent.profile", "usage.models", "ui.bindings", "home.workspaces", "loader.status", "runtimes.settings", "runtimes.impact",
+            "browser.status", "browser.reflow_state", "sync.list", "sync.get", "sync.runs",
         ] {
             for target in [OWN_APP, OTHER_APP] {
                 assert!(authorize(Some(AgentPermissionMode::ReadOnly), method, target), "{method}");
@@ -654,13 +944,19 @@ mod permission_tests {
     fn read_only_agent_writes_only_its_own_state() {
         for method in [
             "sessions.reserve_id", "sessions.register", "sessions.post_input", "sessions.verify",
-            "cognition.notebook_append", "artifacts.decide", "workspaces.create",
+            "artifacts.decide", "workspaces.create",
             "workspaces.import", "workspaces.discover", "workspaces.check", "workspaces.update",
             "workspaces.archive", "workspaces.unregister", "workspaces.set_runtime_available",
             "runtimes.register", "runtimes.update", "runtimes.check", "runtimes.unregister", "runtimes.note_usage",
-            "goals.create", "goals.revise", "goals.set_status", "goals.reopen", "goals.restart",
-            "notify.send", "notify.cancel", "notify.answer", "skills.install", "skills.remove", "skills.status", "runtimes.ext_tools_check",
-            "session.stop", "session.decide", "session.post", "goals.activate", "goals.post",
+            "goals.create", "goals.revise", "goals.set_status", "goals.reopen", "goals.restart", "goals.set_check",
+            "notify.send", "notify.cancel", "notify.answer", "skills.note_frozen", "skills.revise", "skills.status", "runtimes.ext_tools_check",
+            "session.stop", "session.pause", "session.resume", "ui.rotate", "sessions.delete",
+            "session.decide", "session.post", "goals.activate", "goals.post",
+            // Using its own browser is the Agent's own ability, whatever it may do to the owner's files.
+            "browser.ensure", "browser.acquire", "browser.renew", "browser.release", "browser.request_handover",
+            "browser.reflow_refresh",
+            // Its sync tasks are the Agent's own work: it writes, tries and runs them.
+            "sync.put", "sync.set_enabled", "sync.delete", "sync.try", "sync.run",
         ] {
             assert!(authorize(Some(AgentPermissionMode::ReadOnly), method, OWN_APP), "{method}");
             assert!(!authorize(Some(AgentPermissionMode::ReadOnly), method, OTHER_APP), "{method}");
@@ -672,11 +968,34 @@ mod permission_tests {
     }
 
     #[test]
+    fn no_agent_changes_which_skills_an_agent_has() {
+        for method in [
+            "skills.install", "skills.remove", "skills.set_enabled", "skills.ui_set", "skills.import",
+            "skills.draft_discard", "skills.crystallize_set", "memory.forget",
+            // The user's side of the browser: an Agent neither takes its browser over nor hands it to itself.
+            "browser.take_over", "browser.hand_back", "browser.hand_to_agent", "browser.bind_default", "browser.upload",
+            "browser.download_export", "browser.clear_profile", "browser.reflow_action", "browser.screen",
+            // The credentials of a sync task are entered by the owner only.
+            "sync.set_secret",
+        ] {
+            for mode in [Some(AgentPermissionMode::ReadOnly), Some(AgentPermissionMode::ReadWrite)] {
+                for target in [OWN_APP, OTHER_APP] {
+                    assert!(!authorize(mode, method, target), "{method} by an Agent ({mode:?}) on {target}");
+                }
+            }
+            // The Agent's own App identity is an Agent even when its permission record cannot be found.
+            assert!(!authorize(None, method, OWN_APP), "{method} by the Agent's own App");
+            // An App of the owner that is no Agent (the desktop, the CLI's App) acts for the owner.
+            assert!(authorize(None, method, OTHER_APP), "{method} by an owner App");
+        }
+    }
+
+    #[test]
     fn read_only_agent_cannot_edit_profiles_or_call_unclassified_methods() {
         for method in [
             "agent.profile_set", "goals.write_state", "goals.append_activations",
             "goals.prepare_epoch", "goals.end_epoch", "goals.write_schedule",
-            "agent.future_get", "sessions.delete", "unknown",
+            "agent.future_get", "unknown",
         ] {
             for target in [OWN_APP, OTHER_APP] {
                 assert!(!authorize(Some(AgentPermissionMode::ReadOnly), method, target), "{method}");
@@ -691,6 +1010,66 @@ mod permission_tests {
                 assert!(authorize(mode, "agent.profile_set", target));
                 assert!(authorize(mode, "session.post", target));
             }
+        }
+    }
+
+    const SYNC_METHODS: [&str; 9] = [
+        "sync.list", "sync.get", "sync.put", "sync.set_enabled", "sync.delete", "sync.set_secret", "sync.try", "sync.run",
+        "sync.runs",
+    ];
+
+    fn service(name: &str) -> AuthTarget {
+        AuthTarget::system(buckyos_api::SystemServiceId::parse(name).unwrap())
+    }
+
+    /// `sync.*` by caller kind: the owner calls all of them; the owner's Agent all but `sync.set_secret` (and so does
+    /// root); the AI Workspace service's own session only `sync.run` and `sync.get`; no other Zone service any.
+    #[test]
+    fn sync_tasks_by_caller_kind() {
+        use TokenPrincipalKind::*;
+        for method in SYNC_METHODS {
+            assert!(is_read(method) != is_operation(method), "{method} is read or an operation");
+            // The owner, signed in as themselves (the Desktop, or an AI Workspace page's delegated session).
+            for target in [service("control-panel"), service("aiworkspace")] {
+                assert!(zone_service(User, &target, method).is_none(), "{method}: a person is no service");
+                assert!(person_only(User, "alice", "alice", method).is_ok(), "{method} by the owner");
+            }
+            // Root and an App of the owner (an Agent included) reach everything but the credentials.
+            assert_eq!(person_only(User, "root", "alice", method).is_ok(), method != "sync.set_secret", "{method} by root");
+            assert_eq!(person_only(App, "alice", "alice", method).is_ok(), method != "sync.set_secret", "{method} by an App");
+            for mode in [None, Some(AgentPermissionMode::ReadOnly), Some(AgentPermissionMode::ReadWrite)] {
+                assert_eq!(authorize(mode, method, OWN_APP), method != "sync.set_secret", "{method} by the Agent ({mode:?})");
+            }
+            // The AI Workspace service's own session (a System principal; a device key's login is a Device one).
+            for kind in [System, Device] {
+                let admitted = zone_service(kind, &service("aiworkspace"), method).expect("the AI Workspace service");
+                match method {
+                    "sync.run" | "sync.get" => assert_eq!(admitted.unwrap(), AIWORKSPACE_CALLER),
+                    _ => assert!(admitted.is_err(), "{method} by the AI Workspace service"),
+                }
+                // Any other Zone service is judged as its subject (a device: refused as no owner).
+                assert!(zone_service(kind, &service("control-panel"), method).is_none(), "{method}");
+            }
+        }
+    }
+
+    /// Every `browser.*` method of the protocol is classified: none falls through as "unclassified".
+    #[test]
+    fn every_browser_method_is_classified() {
+        for method in [
+            "browser.status", "browser.ensure", "browser.acquire", "browser.renew", "browser.release",
+            "browser.request_handover", "browser.take_over", "browser.hand_back", "browser.hand_to_agent",
+            "browser.bind_default", "browser.upload", "browser.download_export", "browser.clear_profile", "browser.reflow_state",
+            "browser.reflow_refresh", "browser.reflow_action",
+        ] {
+            assert!(is_read(method) != is_operation(method), "{method} is read or an operation");
+            assert!(!is_read(method) || !is_owner_only(method), "{method}");
+            // The Agent's own App identity, whatever its permission mode, calls exactly what is not the owner's.
+            for mode in [None, Some(AgentPermissionMode::ReadOnly), Some(AgentPermissionMode::ReadWrite)] {
+                assert_eq!(authorize(mode, method, OWN_APP), !is_owner_only(method), "{method} by the Agent ({mode:?})");
+            }
+            // An App of the owner that is no Agent calls all of them.
+            assert!(authorize(None, method, OTHER_APP), "{method} by an owner App");
         }
     }
 }

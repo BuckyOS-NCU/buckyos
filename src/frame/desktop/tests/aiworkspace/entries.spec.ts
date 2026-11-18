@@ -3,14 +3,14 @@
  * Panel of the Desktop shell here), guests let in while the entry is open — and what a restricted session (a
  * Limited account) sees: no workspace creation, and the category of a refusal instead of a sign-in prompt. */
 
-import { expect, openCanvas, openWorkspacePage, test, workspaceOrigin } from './fixtures'
+import { asUser, expect, openCanvas, test, workspaceOrigin, workspacePage } from './fixtures'
 
 const ALICE = 'tok-alice'
 const LIMITED = 'tok-lim'
 /** The mock Control Panel keeps its state here (src/api/control_panel_mock.ts) and re-reads it on every call. */
 const MOCK_CP_KEY = 'buckyos.mock.control-panel.v1'
 
-test('UI-SSO1 entry links: create with chosen ways in, Zone-closed ways marked, anyone in while open, closed again', async ({ page, api, browser }) => {
+test('UI-SSO1 entry links: create with chosen ways in, Zone-closed ways marked, whoever comes through it gets in, closed again', async ({ page, api, browser }) => {
   const ws = await api.demo(ALICE, 'quarterly', `sso1 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
   await page.getByTestId('aiws-share').click()
@@ -30,7 +30,11 @@ test('UI-SSO1 entry links: create with chosen ways in, Zone-closed ways marked, 
   expect(listed.entries).toHaveLength(1)
   const entry = listed.entries[0]
   expect(entry.methods).toEqual({ guest: true, password: true, self_register: false, did_login: true })
-  expect(entry.capabilities).toEqual(['read', 'comment'])
+  // an entry leads into a group (权限需求 R8): the preset's capabilities are that group's entry on the workspace
+  expect(entry.group_id).toMatch(/^share-/)
+  const all = await api.rpc(ALICE, 'acl.query', { workspace_id: ws.workspace_id, by: 'all' })
+  const grouped = all.entries.filter((e: { subject: string }) => e.subject === `@${entry.group_id}`)
+  expect(grouped.map((e: { resource: { entity_id: string | null }; allow: string[] }) => [e.resource.entity_id, e.allow])).toEqual([[null, ['read', 'comment']]])
   expect(entry.entry_id).toMatch(new RegExp(`^${ws.workspace_id}~se_[a-z2-7]{26}$`))
   const link = new URL(await entries.getByTestId('aiws-share-entry-link').inputValue())
   expect(link.pathname).toBe('/sso/entry')
@@ -56,13 +60,18 @@ test('UI-SSO1 entry links: create with chosen ways in, Zone-closed ways marked, 
   await expect(row.getByTestId('aiws-share-entry-method-did_login')).toContainText('已被 Zone 设置关闭')
   await expect(row.getByTestId('aiws-share-entry-method-guest')).not.toHaveAttribute('data-zone-disabled', 'true')
 
-  // an entry open to guests lets anyone in, a Limited account included (there is no public grant)
+  // the workspace id alone gives nothing; whoever comes through the entry joins its group — a Limited account included
+  expect((await api.rpc(LIMITED, 'ws.get_info', { workspace_id: ws.workspace_id })).error.code).toBe('NOT_FOUND')
+  expect((await api.rpc(LIMITED, 'ws.join_entry', { entry_id: entry.entry_id })).group_id).toBe(entry.group_id)
   expect((await api.rpc(LIMITED, 'ws.get_info', { workspace_id: ws.workspace_id })).capabilities).toEqual(['read', 'comment'])
-  // a guest with the link gets the entry's access
+  // a guest arriving with the entry (the entry page's "continue as a guest") joins on the workspace's own page
   const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } })
   const guest = await context.newPage()
-  await openWorkspacePage(guest, { guest: true }, ws.workspace_id)
+  await asUser(guest, { guest: true })
+  await guest.goto(`${workspacePage(ws.workspace_id)}?entry=${encodeURIComponent(entry.entry_id)}`)
+  await expect(guest.getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', ws.workspace_id, { timeout: 30_000 })
   await expect(guest.getByTestId('aiws-principal')).toHaveAttribute('data-guest', 'true')
+  expect(new URL(guest.url()).searchParams.get('entry')).toBeNull()
   await context.close()
 
   // closing it in the panel: guests are out at their next request
@@ -77,9 +86,12 @@ test('UI-SSO1 entry links: create with chosen ways in, Zone-closed ways marked, 
 test('UI-SSO2 a restricted session owns nothing and is told the category of a refusal', async ({ page, api }) => {
   const shared = await api.demo(ALICE, 'quarterly', `sso2 shared ${Date.now()}`)
   const hidden = await api.demo(ALICE, 'quarterly', `sso2 hidden ${Date.now()}`)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: shared.workspace_id, subject: '*', capabilities: ['read'] })
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: shared.workspace_id, subject: 'acme-c1', capabilities: ['read', 'comment'] })
-  // the service refuses creation with its reason; `*` does not reach the Limited account
+  // a group of every ordinary account (`*`) does not reach the Limited account (权限需求 §4.2)
+  await api.rpc(ALICE, 'acl.set_group', { workspace_id: shared.workspace_id, group_id: 'zone' })
+  await api.rpc(ALICE, 'acl.members', { workspace_id: shared.workspace_id, group_id: 'zone', add: ['*'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: shared.workspace_id, changes: [{ subject: '@zone', allow: ['read'] }] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: shared.workspace_id, changes: [{ subject: 'acme-c1', allow: ['read', 'comment'] }] })
+  // the service refuses creation with its reason
   const created = await api.rpc(LIMITED, 'ws.create', { title: 'x' })
   expect([created.error.code, created.error.denial.reason]).toEqual(['PERMISSION_DENIED', 'session_kind_not_allowed'])
   expect((await api.rpc(LIMITED, 'ws.get_info', { workspace_id: shared.workspace_id })).capabilities).toEqual(['read', 'comment'])

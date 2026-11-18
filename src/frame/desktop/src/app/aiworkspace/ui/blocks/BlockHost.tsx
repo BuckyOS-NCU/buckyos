@@ -4,7 +4,7 @@
  * expensive implementations, and localises every failure: a missing renderer, unreadable data or a
  * throwing component becomes a fallback inside this Block, never a broken workspace. */
 
-import { Component, type ErrorInfo, type ReactNode, memo, useContext, useEffect, useState } from 'react'
+import { Component, type ErrorInfo, type ReactNode, memo, useContext, useEffect } from 'react'
 import { TriangleAlert } from 'lucide-react'
 import { describeError } from '../../api/session'
 import type { CellPayload, EntityEnvelope } from '../../api/types'
@@ -13,7 +13,7 @@ import { useStore } from '../../state/hooks'
 import { useAiwsText } from '../../useAiwsText'
 import { AssetBlobImage } from '../extensions/AssetBlobImage'
 import { linkAffordance, shapeOf, sourceLabel } from './affordances'
-import { BudgetContext, type MountBudget } from './budget'
+import { useBudgetSlot, type MountBudget } from './budget'
 import { BlockMetaContext } from './editorToolbar'
 import type { CanvasMode, RenderContext } from './registry'
 import { useBlockContext } from './useBlockContext'
@@ -35,21 +35,6 @@ export interface BlockHostProps {
   lod?: Lod
   /** Embedded inside rich text: always static, never an editor. */
   depth?: number
-}
-
-/** Reserve one slot of the budget while mounted; `false` when the limit is reached. */
-function useBudgetSlot(kind: keyof MountBudget | null): boolean {
-  const budget = useContext(BudgetContext)
-  const [granted, setGranted] = useState<boolean>(false)
-  useEffect(() => {
-    if (!kind) return
-    let held = false
-    const attempt = () => { if (!held && budget.take(kind)) { held = true; setGranted(true) } }
-    attempt()
-    const off = budget.subscribe(attempt)
-    return () => { off(); if (held) budget.give(kind); setGranted(false) }
-  }, [budget, kind])
-  return kind ? granted : true
 }
 
 interface BoundaryProps { children: ReactNode; fallback: (error: Error, reset: () => void) => ReactNode; resetKey: string }
@@ -87,10 +72,25 @@ export function GenericFallback({ cell, payload, reason, detail, source }: { cel
   )
 }
 
+/** What a printed page shows of a Block it cannot render: nothing for content it may not read, the snapshot of an HTML
+ * Block this host is too old for, else a neutral placeholder. */
+function PrintBlank({ cellId, reason, payload }: { cellId: string; reason: string; payload: CellPayload | null }) {
+  const { t } = useAiwsText()
+  const unreadable = reason === 'data_unavailable' || reason === 'read_failed'
+  const snapshot = reason === 'unsupported_api' ? payload?.config?.snapshot : undefined
+  return (
+    <div className="aiws-print-blank" data-testid={`aiws-block-fallback-${cellId}`} data-reason={reason}>
+      {snapshot?.object_id ? <AssetBlobImage objectId={snapshot.object_id} mediaType={snapshot.media_type} alt="" /> : unreadable ? null : t('aiworkspace.printrender.unprintable')}
+    </div>
+  )
+}
+
 /** Memoised: pans and overlay updates re-render the frame list only; a Block re-renders when its own props change. */
 export const BlockHost = memo(function BlockHost(props: BlockHostProps) {
   const { t } = useAiwsText()
   const { cell, context, resolution, error, registryVersion } = useBlockContext(props)
+  // a printed page names nothing it cannot show (打印 TODO §3.4): what cannot be read stays empty
+  if (props.mode === 'print' && ((!context && error) || resolution?.ok === false)) return <PrintBlank cellId={props.cellId} reason={resolution?.ok === false ? resolution.reason : 'read_failed'} payload={context?.payload ?? null} />
   if (!context && error) return <div className="aiws-block-fallback" data-testid={`aiws-block-fallback-${props.cellId}`} data-reason="read_failed"><div className="aiws-error" role="alert">{t('aiworkspace.blocks.readFailed', { error })}</div></div>
   if (!context && cell?.view_type === INK_VIEW) return null
   if (!context) return <div className="aiws-block-loading" data-testid={`aiws-block-loading-${props.cellId}`}>{t('aiworkspace.blocks.loading')}</div>

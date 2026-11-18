@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { Page } from '@playwright/test'
 import type { EntityEnvelope, Operation, WorkspaceSummary } from '../../src/app/aiworkspace/api/types'
-import { expect, openWorkspace, screenshot, test, type Actor } from './aiworkspace.fixtures'
+import { chooseFromDevice, expect, openWorkspace, screenshot, test, type Actor } from './aiworkspace.fixtures'
 
 type Workspace = Pick<WorkspaceSummary, 'workspace_id' | 'epoch'>
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -34,7 +34,7 @@ async function canvasWorkspace(actor: Actor): Promise<Workspace> {
 const outline = async (actor: Actor, ws: Workspace) => (await actor.client.ok<{ entities: EntityEnvelope[] }>('doc.outline', { workspace_id: ws.workspace_id })).entities
 const children = (all: EntityEnvelope[], parent: string) => all.filter((e) => e.parent_id === parent && !e.deleted).sort((a, b) => ((a.order_key ?? '') < (b.order_key ?? '') ? -1 : 1))
 const tables = async (actor: Actor, ws: Workspace) => children(await outline(actor, ws), 'sf-t-content').filter((e) => e.type_id === 'buckyos.table-source')
-const query = (actor: Actor, ws: Workspace, sourceId: string, extra: Json = {}) => actor.client.ok<{ rows: { values: Json }[]; total: number }>('doc.query', { workspace_id: ws.workspace_id, source_id: sourceId, limit: 1000, ...extra })
+const query = (actor: Actor, ws: Workspace, sourceId: string, extra: Json = {}) => actor.client.table({ workspace_id: ws.workspace_id, epoch: '' }, { source_id: sourceId, limit: 1000, ...extra })
 const fields = async (actor: Actor, ws: Workspace, sourceId: string) => (await actor.client.ok<{ content: { fields: Json[] } }>('doc.read', { workspace_id: ws.workspace_id, entity_id: sourceId })).content.fields
 
 async function openCanvas(actor: Actor, ws: Workspace) {
@@ -67,12 +67,13 @@ async function drop(page: Page, name: string, bytes: Buffer, at: { x: number; y:
   await target.dispatchEvent('drop', { dataTransfer: dt, clientX: at.x, clientY: at.y })
 }
 
+/** The table import from the insert menu, the file chosen from this device in the system file picker. */
 async function importFromMenu(page: Page, name: string, buffer: Buffer, mimeType: string) {
-  const chooser = page.waitForEvent('filechooser')
-  await page.getByTestId('aiws-main-menu').click()
-  await page.getByTestId('aiws-menu-insert').click()
-  await page.getByTestId('aiws-menu-import-table').click()
-  await (await chooser).setFiles({ name, mimeType, buffer })
+  await chooseFromDevice(page, async () => {
+    await page.getByTestId('aiws-main-menu').click()
+    await page.getByTestId('aiws-menu-insert').click()
+    await page.getByTestId('aiws-menu-import-table').click()
+  }, { name, mimeType, buffer })
 }
 
 async function closeReport(page: Page) {

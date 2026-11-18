@@ -315,6 +315,27 @@ export class Replica {
         }
     }
     /**
+     * An asset the service staged after the replica was made (an upload from this window): local plans know it.
+     * @param {string} object_id
+     * @param {string} media_type
+     * @param {number} size
+     */
+    note_asset(object_id, media_type, size) {
+        const val3 = +size;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passStringToWasm0(object_id, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(media_type, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_export5(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_export5(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        wasm.replica_note_asset(this.__wbg_ptr, ptr0, len0, ptr1, len1, val3);
+    }
+    /**
      * @returns {string}
      */
     outline() {
@@ -1140,6 +1161,60 @@ export function verify_object(id, canonical_text) {
 }
 
 /**
+ * A table view compiled to SQL over the logical table named `table` (a path or an alias, quoted here) — core
+ * `sqlview::compile_view`, the one compiler the service uses too (核心 API 调整 §3.5). For sessions without a replica,
+ * which read a view with `doc.query { sql }`. `fields_json`: the table's live fields as `doc.read` gives them;
+ * `view_json`: `{ filter?, sorts?, fields?, group?, manual_order? }`; `projection`: `records` (`_record`, the native
+ * rows) or `display` (`_id` and the display columns). → `{ sql, count_sql, group_sql?, diagnostics }`.
+ * @param {string} table
+ * @param {string} fields_json
+ * @param {string} view_json
+ * @param {string} projection
+ * @returns {string}
+ */
+export function view_sql(table, fields_json, view_json, projection) {
+    let deferred6_0;
+    let deferred6_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16) >>> 0;
+        let ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3;
+        try {
+            ptr0 = passStringToWasm0(table, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(fields_json, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            len1 = WASM_VECTOR_LEN;
+            ptr2 = passStringToWasm0(view_json, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            len2 = WASM_VECTOR_LEN;
+            ptr3 = passStringToWasm0(projection, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            len3 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr3) { wasm.__wbindgen_export5(ptr3, len3 * 1, 1); }
+            if (ptr2) { wasm.__wbindgen_export5(ptr2, len2 * 1, 1); }
+            if (ptr1) { wasm.__wbindgen_export5(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_export5(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        wasm.view_sql(retptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr5 = r0;
+        var len5 = r1;
+        if (r3) {
+            ptr5 = 0; len5 = 0;
+            throw takeFromExternrefTable0(r2);
+        }
+        deferred6_0 = ptr5;
+        deferred6_1 = len5;
+        return getStringFromWasm0(ptr5, len5);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export5(deferred6_0, deferred6_1, 1);
+    }
+}
+
+/**
  * Configuration digest of a wish payload (results record it; §4.3).
  * @param {string} payload_json
  * @returns {string}
@@ -1173,6 +1248,49 @@ export function wish_config_digest(payload_json) {
 
 /**
  * Whether a wish payload must be analysed before it can execute (§4.1).
+ * The main state and next action of a wish (PRD §5.8, 许愿格交互升级 §2.6): `freshness_json` is its freshness, `runs_json`
+ * what the page knows of its runs (`{ active?: { stage, state }, last_failed?: { stage, error } }`).
+ * @param {string} freshness_json
+ * @param {string} runs_json
+ * @returns {string}
+ */
+export function wish_main_status(freshness_json, runs_json) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16) >>> 0;
+        let ptr0, len0, ptr1, len1;
+        try {
+            ptr0 = passStringToWasm0(freshness_json, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            len0 = WASM_VECTOR_LEN;
+            ptr1 = passStringToWasm0(runs_json, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            len1 = WASM_VECTOR_LEN;
+        } catch (e) {
+            if (ptr1) { wasm.__wbindgen_export5(ptr1, len1 * 1, 1); }
+            if (ptr0) { wasm.__wbindgen_export5(ptr0, len0 * 1, 1); }
+            throw e;
+        }
+        wasm.wish_main_status(retptr, ptr0, len0, ptr1, len1);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr3 = r0;
+        var len3 = r1;
+        if (r3) {
+            ptr3 = 0; len3 = 0;
+            throw takeFromExternrefTable0(r2);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export5(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
  * @param {string} payload_json
  * @returns {boolean}
  */

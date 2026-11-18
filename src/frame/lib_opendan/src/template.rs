@@ -48,7 +48,7 @@ pub struct SessionTemplate {
     pub objective: Option<String>,
     /// `agent.toml [session.<class>] default_cmd_skills`: the command
     /// manuals a session of this class takes when its creator chooses none
-    /// (`cmd_skills/<name>.md`).
+    /// (`cmd_skills/<name>/SKILL.md`).
     pub default_cmd_skills: Vec<String>,
     /// `agent.toml [session.<class>] tick_secs`: how often the session's
     /// `timer:` subscriptions tick while it waits for its work (0: never).
@@ -67,14 +67,12 @@ pub const UI_OBJECTIVE: &str = "The long-lived conversation of this agent with o
 pub const GROUP_OBJECTIVE: &str = "The long-lived presence of this agent in one group, serving its owner only. Answer what a conversation can answer; hand work that must happen outside the conversation to intent analysis and relay what it created; when a work session or goal reports back, relay the result. The conversation never ends by itself.";
 
 /// `agent.toml [session.goal.maintenance]`: the agent's default Memory
-/// consolidation Goal (Jarvis default Goal TODO §2, §6, §7).
+/// consolidation Goal (Jarvis default Goal TODO §2, §6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceDefaults {
     /// Seed and run the built-in `memory_maintenance` Goal (off: no seeding,
-    /// no background check; an existing Goal keeps its state).
+    /// no checks; an existing Goal keeps its state).
     pub enabled: bool,
-    /// `off | auto`: the optional decision pre-check (§7; `auto` is T06).
-    pub decision: String,
     /// Behavior of its Goal Session (`None`: the class default).
     pub behavior: Option<String>,
 }
@@ -83,19 +81,60 @@ impl Default for MaintenanceDefaults {
     fn default() -> Self {
         Self {
             enabled: false,
-            decision: "off".to_string(),
             behavior: Some("memory_maintenance".to_string()),
         }
     }
 }
 
-/// `agent.toml [session.goal]` defaults of every Goal (`budget`,
-/// `min_interval_secs`, `maintenance`), over the built-in ones.
+/// `agent.toml [session.goal.crystallize]`: the agent's skill crystallization Goal — it reads the work sessions the
+/// usage record points at, revises the manuals that are the agent's own, and leaves drafts for the owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrystallizeDefaults {
+    /// Seed and run the built-in `skill_crystallize` Goal (off: no seeding; an existing Goal gets no session).
+    pub enabled: bool,
+    /// Behavior of its Goal Session (`None`: the class default).
+    pub behavior: Option<String>,
+}
+
+impl Default for CrystallizeDefaults {
+    fn default() -> Self {
+        Self { enabled: false, behavior: Some("skill_crystallize".to_string()) }
+    }
+}
+
+/// `agent.toml [session.goal.agent_budget]`: the agent's background total,
+/// shared by every Goal's inferences and the Work they create (not the
+/// conversations, not the Work a user starts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBudget {
+    pub window_secs: u64,
+    /// `None`: no total.
+    pub max_total_tokens: Option<u64>,
+}
+
+impl Default for AgentBudget {
+    fn default() -> Self {
+        Self {
+            window_secs: 86_400,
+            max_total_tokens: Some(5_000_000),
+        }
+    }
+}
+
+/// `agent.toml [session.goal]` defaults of every Goal (`budget`, the gates
+/// of architecture §12.1.1, the built-in Goals), over the built-in ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalDefaults {
     pub budget: GoalBudget,
+    /// Hard interval between two inferences of a Goal.
     pub min_interval_secs: u64,
+    /// Hard guarantee (`0`: off).
+    pub guarantee_secs: u64,
+    /// Check timetable of a Goal with a check script and no timetable.
+    pub check_every_secs: u64,
+    pub agent_budget: AgentBudget,
     pub maintenance: MaintenanceDefaults,
+    pub crystallize: CrystallizeDefaults,
 }
 
 impl Default for GoalDefaults {
@@ -105,22 +144,56 @@ impl Default for GoalDefaults {
                 activation: ActivationBudget {
                     max_total_tokens: Some(400_000),
                     max_runs: Some(8),
+                    max_wall_secs: Some(1_800),
                 },
                 period: PeriodBudget {
                     window_secs: Some(86_400),
-                    max_total_tokens: None,
+                    max_total_tokens: Some(2_000_000),
                     max_activations: None,
                     max_works: Some(24),
                 },
             },
-            min_interval_secs: 60,
+            min_interval_secs: 900,
+            guarantee_secs: 259_200,
+            check_every_secs: 300,
+            agent_budget: AgentBudget::default(),
             maintenance: MaintenanceDefaults::default(),
+            crystallize: CrystallizeDefaults::default(),
         }
     }
 }
 
+/// A conversation's own manuals (`extensions.opendan.cmd_skills`): it takes
+/// them besides those of its class (as far as [`MAX_CMD_SKILLS`] allows),
+/// when it is created and whenever its prompt is frozen again.
+pub fn own_cmd_skills(extensions: &std::collections::BTreeMap<String, serde_json::Value>) -> Vec<String> {
+    extensions
+        .get(OPENDAN_EXTENSION)
+        .and_then(|o| o.get("cmd_skills"))
+        .and_then(|v| v.as_array())
+        .map(|names| names.iter().filter_map(|n| n.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// Give the session of `spec` manuals of its own ([`own_cmd_skills`]).
+pub fn add_own_cmd_skills(spec: &mut SessionSpec, names: &[&str]) {
+    let mut own = own_cmd_skills(&spec.extensions);
+    for name in names {
+        if !own.iter().any(|n| n == name) {
+            own.push(name.to_string());
+        }
+        if spec.prompt.cmd_skills.len() < MAX_CMD_SKILLS && !spec.prompt.cmd_skills.iter().any(|n| n == name) {
+            spec.prompt.cmd_skills.push(name.to_string());
+        }
+    }
+    let opendan = spec.extensions.entry(OPENDAN_EXTENSION.to_string()).or_insert_with(|| json!({}));
+    if let Some(o) = opendan.as_object_mut() {
+        o.insert("cmd_skills".to_string(), json!(own));
+    }
+}
+
 impl SessionTemplate {
-    /// The built-in templates: `work`, `ui`, `self_check`, `goal`.
+    /// The built-in templates: `work`, `ui`, `goal`.
     pub fn builtin(class: &str) -> Option<Self> {
         let policy = SessionPolicy::default();
         let base = |kind, turns, wait, input, observe, hints| SessionTemplate {
@@ -148,6 +221,8 @@ impl SessionTemplate {
             // progress the caller sees), the end of a task it started or a
             // timer tick while it waits opens the next; only an explicit
             // final report ends it. Nobody answers it and it has no queue.
+            // Its first batch recalls Memory by its title and objective, the
+            // later ones observe what changed (recall wiring TODO R2).
             "work" => {
                 let mut t = base(
                     SessionKind::Work,
@@ -155,7 +230,7 @@ impl SessionTemplate {
                     WaitPolicy::FinishFailed,
                     InputChannel::None,
                     ObserveScope::Events,
-                    false,
+                    true,
                 );
                 t.completion = CompletionPolicy::ExplicitReport;
                 t.implicit_subscriptions.push(Subscription {
@@ -185,25 +260,6 @@ impl SessionTemplate {
                     mode: SubscriptionMode::Semi,
                     source: SubscriptionSource::System {
                         id: NOTIFY_SOURCE_ID.into(),
-                    },
-                    watch: Vec::new(),
-                });
-                t
-            }
-            "self_check" => {
-                let mut t = base(
-                    SessionKind::SelfCheck,
-                    Turns::Unbounded,
-                    WaitPolicy::FinishFailed,
-                    InputChannel::Queue,
-                    ObserveScope::Off,
-                    true,
-                );
-                t.implicit_subscriptions.push(Subscription {
-                    id: "_self_check_timer".into(),
-                    mode: SubscriptionMode::Active,
-                    source: SubscriptionSource::Timer {
-                        name: "self_check".into(),
                     },
                     watch: Vec::new(),
                 });
@@ -241,6 +297,17 @@ impl SessionTemplate {
     /// The template of `class`: the built-in one (`work` for an unknown
     /// class) with the overrides of `agent.toml [session.<class>]`.
     pub fn load(class: &str, agent_root: Option<&Path>) -> Result<Self> {
+        let mut t = Self::load_package(class, agent_root)?;
+        // The owner's UI set (`skills.ui_set`) takes the place of the package's for new conversations.
+        if t.kind == SessionKind::Ui {
+            if let Some(names) = agent_root.and_then(crate::skills::ui_override) {
+                t.default_cmd_skills = names;
+            }
+        }
+        Ok(t)
+    }
+
+    fn load_package(class: &str, agent_root: Option<&Path>) -> Result<Self> {
         let over = agent_root
             .map(|r| r.join("agent.toml"))
             .filter(|p| p.is_file())
@@ -273,7 +340,7 @@ impl SessionTemplate {
             }
             (None, None) => {
                 return Err(OpenDanError::InvalidArgument(format!(
-                    "unknown session class `{class}` (built-in: work, ui, self_check, goal; others need agent.toml [session.{class}])"
+                    "unknown session class `{class}` (built-in: work, ui, goal; others need agent.toml [session.{class}])"
                 )))
             }
         };
@@ -360,16 +427,47 @@ impl SessionTemplate {
                     .map_err(|e| OpenDanError::InvalidArgument(format!("agent.toml [session.{class}] budget: {e}")))?;
                 g.budget = budget.over(&g.budget);
             }
-            if let Some(v) = over.get("min_interval_secs") {
-                g.min_interval_secs = v
-                    .as_integer()
-                    .and_then(|n| u64::try_from(n).ok())
-                    .ok_or_else(|| bad("min_interval_secs"))?;
+            for (key, slot) in [
+                ("min_interval_secs", &mut g.min_interval_secs),
+                ("guarantee_secs", &mut g.guarantee_secs),
+                ("check_every_secs", &mut g.check_every_secs),
+            ] {
+                if let Some(v) = over.get(key) {
+                    *slot = v.as_integer().and_then(|n| u64::try_from(n).ok()).ok_or_else(|| bad(key))?;
+                }
+            }
+            if g.check_every_secs < CHECK_MIN_EVERY_SECS {
+                return Err(bad("check_every_secs (at least 60)"));
+            }
+            if g.guarantee_secs > 0 && g.guarantee_secs < GUARANTEE_MIN_SECS {
+                return Err(bad("guarantee_secs (0: off, otherwise at least 3600)"));
+            }
+            if let Some(a) = over.get("agent_budget") {
+                let a = a.as_table().ok_or_else(|| bad("agent_budget"))?;
+                for key in a.keys() {
+                    if !matches!(key.as_str(), "window_secs" | "max_total_tokens") {
+                        return Err(OpenDanError::InvalidArgument(format!(
+                            "agent.toml [session.{class}.agent_budget]: unknown key `{key}`"
+                        )));
+                    }
+                }
+                if let Some(v) = a.get("window_secs") {
+                    g.agent_budget.window_secs = v
+                        .as_integer()
+                        .and_then(|n| u64::try_from(n).ok())
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| bad("agent_budget.window_secs"))?;
+                }
+                if let Some(v) = a.get("max_total_tokens") {
+                    // 0: no total.
+                    let n = v.as_integer().and_then(|n| u64::try_from(n).ok()).ok_or_else(|| bad("agent_budget.max_total_tokens"))?;
+                    g.agent_budget.max_total_tokens = (n > 0).then_some(n);
+                }
             }
             if let Some(m) = over.get("maintenance") {
                 let m = m.as_table().ok_or_else(|| bad("maintenance"))?;
                 for key in m.keys() {
-                    if !matches!(key.as_str(), "enabled" | "decision" | "behavior") {
+                    if !matches!(key.as_str(), "enabled" | "behavior") {
                         return Err(OpenDanError::InvalidArgument(format!(
                             "agent.toml [session.{class}.maintenance]: unknown key `{key}`"
                         )));
@@ -378,17 +476,27 @@ impl SessionTemplate {
                 if let Some(v) = m.get("enabled") {
                     g.maintenance.enabled = v.as_bool().ok_or_else(|| bad("maintenance.enabled"))?;
                 }
-                if let Some(v) = m.get("decision") {
-                    let d = v.as_str().ok_or_else(|| bad("maintenance.decision"))?;
-                    if !matches!(d, "off" | "auto") {
-                        return Err(bad("maintenance.decision (off | auto)"));
-                    }
-                    g.maintenance.decision = d.to_string();
-                }
                 if let Some(v) = m.get("behavior") {
                     g.maintenance.behavior =
                         Some(v.as_str().ok_or_else(|| bad("maintenance.behavior"))?.to_string())
                             .filter(|b| !b.trim().is_empty());
+                }
+            }
+            if let Some(c) = over.get("crystallize") {
+                let c = c.as_table().ok_or_else(|| bad("crystallize"))?;
+                for key in c.keys() {
+                    if !matches!(key.as_str(), "enabled" | "behavior") {
+                        return Err(OpenDanError::InvalidArgument(format!(
+                            "agent.toml [session.{class}.crystallize]: unknown key `{key}`"
+                        )));
+                    }
+                }
+                if let Some(v) = c.get("enabled") {
+                    g.crystallize.enabled = v.as_bool().ok_or_else(|| bad("crystallize.enabled"))?;
+                }
+                if let Some(v) = c.get("behavior") {
+                    g.crystallize.behavior =
+                        Some(v.as_str().ok_or_else(|| bad("crystallize.behavior"))?.to_string()).filter(|b| !b.trim().is_empty());
                 }
             }
         }

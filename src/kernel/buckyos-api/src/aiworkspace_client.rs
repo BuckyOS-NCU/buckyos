@@ -120,6 +120,8 @@ pub struct AiWorkspaceSettings {
     pub max_wait_ms: u64,
     /// Upper bound of one uploaded asset, in bytes (single chunk in this phase).
     pub max_asset_bytes: u64,
+    /// Upper bound of one uploaded audio or video asset (played by Range from `asset.stream_url`), in bytes.
+    pub max_media_bytes: u64,
     /// Wish runs (xllm executor, program runner).
     pub wish: AiWorkspaceWishSettings,
     /// Logical bytes one Workspace may occupy (内核架构改进 D19); `None` = no quota.
@@ -131,31 +133,46 @@ pub struct AiWorkspaceSettings {
 }
 
 /// Wish execution settings (doc/workspace 许愿格详细设计 §13.3). Models are AICC selectors (logical
-/// names such as `llm.code`, or exact `model@provider`).
+/// names such as `llm.code`, or exact `model@provider`). The service runs no model and no program: every
+/// stage executes on an executor (the browser, or an Agent), which gets these as the stage's budget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiWorkspaceWishSettings {
     pub analyze_model: String,
+    /// Model of the coding stage (writing and test-running the macro).
     pub execute_model: String,
-    /// Model of `aiws.llm.map` (per-item judgements inside programs).
+    /// Model of `aiws.llm.map` (per-item judgements inside macros).
     pub map_model: String,
-    /// Deno used to run wish programs; empty = `$BUCKYOS_ROOT/libexec/buckyos-tool/runtime/deno`, then `PATH`.
-    pub deno: String,
+    /// Default model of `aiws.ai.complete` (a macro's single inference).
+    pub complete_model: String,
+    /// Default model of `aiws.ai.image` (a macro's generated picture; with reference pictures its `image.img2img` twin).
+    pub image_model: String,
+    /// Default model of `aiws.ai.video` (a macro's generated clip).
+    pub video_model: String,
     pub analyze_tool_iterations: u32,
     pub execute_tool_iterations: u32,
     /// Output limit of one model turn (thinking included). Some providers (Claude) require one; AICC
     /// routes only to models whose output limit reaches it.
     pub max_output_tokens: u32,
-    /// Wall clock of one stage, seconds.
-    pub stage_timeout_secs: u64,
     pub program_timeout_secs: u64,
-    pub program_memory_mb: u32,
     pub llm_map_max_items: u32,
-    /// Where a wish runs when the request names no mode (内核架构改进 D14): `service` (the transitional
-    /// in-service executor, until T3-9), `local` (the browser) or `hosted` (an Agent Work Session).
+    /// Model calls of `aiws.ai.complete` one run may make (a macro declares less).
+    pub ai_max_calls: u32,
+    /// Output tokens the `aiws.ai.complete` calls of one run may spend.
+    pub ai_max_tokens: u32,
+    /// `aiws.sql` calls one run may make.
+    pub sql_max_calls: u32,
+    /// Pictures the `aiws.ai.image` calls of one run may generate (cached answers are free).
+    pub image_max_calls: u32,
+    /// Clips the `aiws.ai.video` calls of one run may generate.
+    pub video_max_calls: u32,
+    /// How long one generated picture or clip may take; the macro's own time limit does not count this wait.
+    pub media_timeout_secs: u64,
+    /// Bytes `proc.files` hands one executor (the stage snapshot); more is `SNAPSHOT_TOO_LARGE`.
+    pub snapshot_download_max_bytes: u64,
+    /// Where a wish runs when the request names no mode (内核架构改进 D14): `local` (the browser) or
+    /// `hosted` (an Agent Work Session).
     pub default_execution: String,
-    /// The transitional in-service executor may still be chosen (`false` once hosted execution passed DV, T3-9).
-    pub allow_service_execution: bool,
 }
 
 impl Default for AiWorkspaceWishSettings {
@@ -164,16 +181,22 @@ impl Default for AiWorkspaceWishSettings {
             analyze_model: "llm.plan".into(),
             execute_model: "llm.code".into(),
             map_model: "llm.chat".into(),
-            deno: String::new(),
+            complete_model: "llm.chat".into(),
+            image_model: "image.txt2img".into(),
+            video_model: "video.generate".into(),
             analyze_tool_iterations: 30,
             execute_tool_iterations: 60,
             max_output_tokens: 32_000,
-            stage_timeout_secs: 1800,
             program_timeout_secs: 120,
-            program_memory_mb: 1024,
             llm_map_max_items: 2000,
-            default_execution: "service".into(),
-            allow_service_execution: true,
+            ai_max_calls: 50,
+            ai_max_tokens: 100_000,
+            sql_max_calls: 200,
+            image_max_calls: 20,
+            video_max_calls: 2,
+            media_timeout_secs: 900,
+            snapshot_download_max_bytes: 64 * 1024 * 1024,
+            default_execution: "local".into(),
         }
     }
 }
@@ -185,6 +208,7 @@ impl Default for AiWorkspaceSettings {
             max_ops: 10_000,
             max_wait_ms: 30_000,
             max_asset_bytes: 32 * 1024 * 1024,
+            max_media_bytes: 2 << 30,
             wish: AiWorkspaceWishSettings::default(),
             quota_bytes: None,
             history_retention_days: 30,

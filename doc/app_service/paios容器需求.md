@@ -219,7 +219,8 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
 
 ```text
 [Base Image]
-    └─ ca-certs / locale / 字体 / Deno / uv / 最小系统库
+    └─ ca-certs / Deno / uv / 最小系统库（locale 用 glibc 自带的 C.UTF-8；
+       字体随 ext-core 的 LibreOffice，不装进镜像）
             │
             ▼
 [Worker Image]（默认运行镜像，paios/aios）
@@ -253,7 +254,7 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
 3. 工匠镜像的产物是独立的工具包，不是“工匠镜像本身替代工作镜像”。工具包加载回工作镜像后，工作层 Agent 才能使用新能力。
 4. 工匠镜像必须具备“模拟工作镜像环境”的能力，以便在交付前验证产物能在干净的工作镜像里运行，避免构建环境与运行环境之间的隐式依赖泄漏。
 5. 体积大、但只有部分任务用到的 CLI（目前是 pandoc）以自包含工具包的形式随 External Tool Volume 发布（`/opt/buckyos/tools/bin/` 在 PATH 上），不进工作镜像。External Tool Volume 不可用时 Worker 照常启动，只是缺这些工具（node_daemon 记 error 日志）。ExtTools TODO T2 之后整组 `ext-core` 命令都这样交付：容器节点的 `buckyos-tools` 卷与原生的 `$BUCKYOS_ROOT/tools/` 用同一份 payload 字节（§6.4 表 B）。
-6. Agent 看到的工具分三层（owner 2026-11-05 定）：**核心**（Agent 标准命令及其运行依赖，随系统升级、不能独立升级）、**扩展**（zone-owner 装的扩展包，可独立升级，装在哪台机器上对该机器所有 Agent 生效）、**Agent 自装**（在自己的实例卷里，删掉不伤核心）。工作镜像预置的 CLI 工具集在扩展包体系落地后就是 `ext-core` 的内容；T2 之后工作镜像不再 apt 装这组命令，容器也从 `ext-core` payload 取（§6.4 表 B）。
+6. Agent 看到的工具分三层（owner 2026-11-05 定）：**核心**（Agent 标准命令及其运行依赖，随系统升级、不能独立升级）、**扩展**（zone-owner 装的扩展包，可独立升级，装在哪台机器上对该机器所有 Agent 生效）、**Agent 自装**（在自己的实例卷里，删掉不伤核心）。工作镜像预置的 CLI 工具集在扩展包体系落地后就是 `ext-core` 的内容；T2 之后工作镜像不再 apt 装这组命令，容器也从 `ext-core` payload 取（§6.4 表 B）。`ext-core` 1.2.0 起 LibreOffice headless 与字体也在其中：`build_aios` 的 `RUNTIME_PACKAGES` 只剩 `bash`、`ca-certificates`、`rsync`，不装 `locales`（`LANG=C.UTF-8`）。另外装 TigerVNC 的 `Xvnc`（`tigervnc-standalone-server`，2026-11-16 owner 确认）：Agent 浏览器有窗口地跑在它上面（[Agent Browser Protocol](<../opendan/protocol/Agent Browser Protocol.md>) §1、§6）。它的包经 `libGL` 拉进 Mesa 和 LLVM、为 `vncserver` 包装脚本拉进 Perl，`Xvnc` 本身都不用：`build_aios` 先用 `dpkg-deb` 造一个占位包 `buckyos-xvnc-shim`（`Provides: libglx-mesa0, libfile-readbackwards-perl, perl`），和它一起装，镜像只多约 17 MB（不用占位包约 290 MB），`apt-get check` 保持一致。Ubuntu 24.04 的版本是 1.13.1。它不是扩展工具：显示器是浏览器运行环境的一部分，跟着工作镜像走。
 
 ### 6.4 官方发布的基线与扩展工具清单（运维事实来源）
 
@@ -266,7 +267,7 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
 - 版本锁在各自构建脚本顶部：`build_aios` 的 `NODE_VERSION`、`DENO_VERSION`（核心层自己钉死的 Deno）；`publish/exttool/ext-core/build.sh` 顶部的官方归档版本，SHA256 在同目录 `sources.sha256`；conda-forge 那组由同目录 `conda-env.yml` 声明、`conda-lock.yml` 锁定。
 - 非官方来源（Agent 自装、用户在 host 上自备、第三方扩展包）不在本表；它们由 runtime 的 `tools_check` 按实际探测记录（`provided_by: agent | system`）。
 
-**表 A：核心层（standard，`baseline::STANDARD_TOOLS`，31 条）** 随系统发布，三种形态（容器、Desktop Lite、node-daemon host）都必须有；依赖的 Deno、TS 源码与 SDK 由 launcher 钉在 `$BUCKYOS_ROOT` 下的绝对路径，不走 PATH。
+**表 A：核心层（standard，`baseline::STANDARD_TOOLS`，32 条）** 随系统发布，三种形态（容器、Desktop Lite、node-daemon host）都必须有；依赖的 Deno、TS 源码与 SDK 由 launcher 钉在 `$BUCKYOS_ROOT` 下的绝对路径，不走 PATH。
 
 | 命令 | 是什么 | 支持的场景（为什么要装） |
 | --- | --- | --- |
@@ -278,6 +279,7 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
 | `ask_user` | 经 notify 向用户提问 | work / goal 需要人答时 |
 | `import_office`、`import_table` | 把 Office 文档 / 表格导入为对象 | 文档与数据导入、知识整理 |
 | `materialize_resource` | 把对象 / URL 物化成本地文件 | 任何要把 `obj://`、附件落成文件再加工的步骤 |
+| `reflow` | 用户的重排库（桶 `user/control-panel/<user>/reflow`）：按网址查匹配的包、列出、取回、校验并放入包、删除、存结果或兜底页、请常驻浏览器刷新 | Agent 浏览器的重排：`browser` 手册里写包、做兜底重排、提前刷新（[Agent Browser Protocol](../opendan/protocol/Agent%20Browser%20Protocol.md) §5）。只依赖 SDK，不依赖表 B 的浏览器；`reflow refresh` 要常驻浏览器可用 |
 | `resume_aicc_task` | 续接异步 AICC 任务 | `aigc_*` 的长任务跟进 |
 | `llm_understand_media` | 看图、读文档（PDF…）、听音视频，结果是文本 | `ui_core` 的媒体理解；`aigc_image` 的结果检查 |
 | `caption_image`、`detect_image`、`segment_image`、`ocr_image` | 图像理解：描述、检测、分割、OCR（走 Zone 模型） | 图像类任务的理解步骤；`ocr_image` 是 OCR 的主路径 |
@@ -285,23 +287,27 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
 | `gen_video`、`edit_video`、`extend_video`、`upscale_video` | 视频生成与编辑（走 Zone 模型） | `aigc_video`；本地剪辑 / 合成另需表 B 的 ffmpeg |
 | `gen_music`、`text_to_speech`、`speech_to_text`、`enhance_audio` | 音频生成、TTS、ASR、增强（走 Zone 模型） | `aigc_audio`；本地转码 / 拼接另需表 B 的 ffmpeg |
 
-**表 B：`ext-core` 扩展包（`extended` 基线，`baseline::EXTENDED_TOOLS` ↔ `publish/exttool/ext-core/ext-manifest.json`，23 条命令）**
+**表 B：`ext-core` 扩展包（`extended` 基线，`baseline::EXTENDED_TOOLS` ↔ `publish/exttool/ext-core/ext-manifest.json`，27 条命令）**
 
 `ext-core` 是扩展包目录里的第一个包，五个平台（`linux-x86_64`、`linux-aarch64`、`darwin-arm64`、`darwin-x86_64`、`windows-x86_64`）各一个自包含 payload；装到 `$BUCKYOS_ROOT/tools/`，三种形态一套（容器节点是 `buckyos-tools` 卷）。发行、钉版与种子见 ExtTools TODO §3.10。工作镜像不再 apt 装这组命令，容器与原生一样从 `ext-core` payload 得到它们。
 
-来源列的含义（owner 2026-11-06 裁决）：**官方** = 上游官方发布的归档，`build.sh` 逐工具下载并固定版本与 SHA256，落 `store/ext-core/<tool>/`；**conda-forge** = 没有官方二进制（或某个平台没有）的工具，统一装进一个 conda-forge 前缀 `store/ext-core/conda/`，由 `conda-lock.yml` 锁版本与来源；ELF / Mach-O 的 rpath 本来就相对于自身，数据目录由 launcher 用环境变量指过去（T0 实测，不需要 conda-pack 的安装后重写，见 ExtTools TODO §4.2）。`bin/` 里的 launcher 只指向 `store/` 内的文件，**不回退到 PATH**（缺就退 127），这样 `extended` 的检查结果不受机器环境影响。
+来源列的含义（owner 2026-11-06 裁决）：**官方** = 上游官方发布的归档，`build.sh` 逐工具下载并固定版本与 SHA256，落 `store/ext-core/<tool>/`；**conda-forge** = 没有官方二进制（或某个平台没有）的工具，统一装进一个 conda-forge 前缀 `store/ext-core/conda/`，由 `conda-lock.yml` 锁版本与来源；ELF / Mach-O 的 rpath 本来就相对于自身，数据目录由 launcher 用环境变量指过去（T0 实测，不需要 conda-pack 的安装后重写，见 ExtTools TODO §4.2）。`bin/` 里的 launcher 只指向 `store/` 内的文件和包的在线项（`tools/online/<id>/`，见下文“在线项”），**不回退到 PATH**（缺就退 127），这样 `extended` 的检查结果不受机器环境影响。
 
 | 命令 | 工具 / 版本锁 | linux x86_64 / aarch64 | macOS arm64 / x86_64 | windows x86_64 | 支持的场景（为什么要装） |
 | --- | --- | --- | --- | --- | --- |
-| `ffmpeg`、`ffprobe` | ffmpeg，`conda-lock.yml`（conda-forge 的构建没有 libzimg，没有 `zscale` 滤镜） | conda-forge | conda-forge | conda-forge | `aigc_audio` / `aigc_video` 的转码、剪辑、拼接、抽帧、媒体信息检查；workflow 媒体工具基线 |
-| `magick`、`convert`、`identify`、`compare` | ImageMagick 7，`conda-lock.yml`。`convert / identify / compare` 是兼容入口：IM7 自带旧名时直接用，否则 launcher 映射到 `magick <子命令>` | conda-forge | conda-forge | conda-forge | `aigc_image` / `aigc_video` 的本地图像检查与加工。随本表统一到 IM7（原 ExtTools TODO T0 的 IM6 / IM7 待决项按此关闭） |
+| `ffmpeg`、`ffprobe` | ffmpeg，`conda-lock.yml`（conda-forge 的构建没有 libzimg，没有 `zscale` 滤镜）。字体经 fontconfig（见 `soffice` 一行）：`subtitles`（libass）缺字时按字回退，中文落到 Noto Sans CJK SC；`drawtext` 不回退，画中文要写 `font=Noto Sans CJK SC` 或 `fontfile=` | conda-forge | conda-forge | conda-forge | `aigc_audio` / `aigc_video` 的转码、剪辑、拼接、抽帧、媒体信息检查；workflow 媒体工具基线 |
+| `magick`、`convert`、`identify`、`compare` | ImageMagick 7，`conda-lock.yml`。`convert / identify / compare` 是兼容入口：IM7 自带旧名时直接用，否则 launcher 映射到 `magick <子命令>`。不写 `-font` 时用它自己字体表里的默认字体，不经 fontconfig 回退：`label:` / `caption:` 画中文要写 `-font Noto-Sans-CJK-SC`（`magick -list font` 列出可用的名字），`pango:` 经 fontconfig 回退，不用写 | conda-forge | conda-forge | conda-forge | `aigc_image` / `aigc_video` 的本地图像检查与加工。随本表统一到 IM7（原 ExtTools TODO T0 的 IM6 / IM7 待决项按此关闭） |
 | `pdftotext`、`pdftoppm`、`pdfinfo` | poppler ≥ 22.0，`conda-lock.yml` | conda-forge | conda-forge | conda-forge | 媒体工具基线（[doc/workflow/media tool baseline.md](../workflow/media%20tool%20baseline.md)）：workflow `media.pdf` / `media.document` 的 PDF 文本 / 页图提取；`import_office` 后加工 |
 | `tesseract`（含常用语言数据） | tesseract，`conda-lock.yml`（conda-forge 带全部 126 种语言，tessdata_fast；构建时保留 28 种加 `osd`：系统界面语言 `chi_sim`、`chi_tra`、`eng`、`spa`、`fra`、`deu`、`kor`、`jpn`、`rus`，竖排 `chi_sim_vert`、`chi_tra_vert`、`jpn_vert`、`kor_vert`，其他常用 `por`、`ita`、`nld`、`pol`、`tur`、`ukr`、`ara`、`fas`、`heb`、`hin`、`ben`、`tha`、`vie`、`ind`、`msa`；保留清单在 `build.sh`，`smoke/tesseract.*` 逐个检查） | conda-forge | conda-forge | conda-forge | workflow 媒体基线：`media.ocr_pages` 为文字层缺失或乱码的 PDF 页重新识别（[media tool baseline.md](../workflow/media%20tool%20baseline.md)）；Agent 本地 OCR |
 | `pandoc` | 3.12.1，`build.sh` | 官方 | 官方 | 官方 | 文档格式转换（docx / md / html / pdf 互转）：`import_office` 的后加工、文档类产出 |
+| `soffice` | LibreOffice 官方发布版 26.8.2，`build.sh`。只取无界面转换要用的子集：core、ure、writer、calc、impress、draw、math、graphicfilter、xsltfilter 和它自带的字体；pyuno、内置 Python、Java 类、帮助、图库、图标主题、扩展、词典、数据库驱动、GUI 媒体后端都不要。另带 Noto Sans / Serif CJK 的常规体和粗体（OTC，`Sans2.004` / `Serif2.003`），五个平台同一套，放在 LibreOffice 自己的字体目录。版本在 `build.sh` 顶部，SHA256 在 `sources.sha256` | 官方 deb 包解包（`build.sh` 自己读 `ar`，不需要 dpkg）。官方构建从系统取的库（cairo、cups、dbus、fontconfig、freetype、glib、NSS / NSPR、X11 一族、Kerberos、avahi、libstdc++）全部来自同一个 conda-forge 前缀，其中只有 `avahi` 是为它新加的（`conda-env.yml`）；launcher 把 `LD_LIBRARY_PATH` 设成 LibreOffice 自己的 `program/` 加前缀的 `lib/`，`FONTCONFIG_FILE`、`FONTCONFIG_PATH` 指向前缀的配置（后者让 `fonts.conf` 找得到它的 `conf.d`；`ext-core` 里用 fontconfig 的命令都这样设，1.3.1 起）。前缀配置看得见的字体是包里的（前缀的 `fonts/`，加上 `conf.d` 加进来的 LibreOffice 字体目录，含 Noto CJK；1.3.3 起还有字体包 `ext-fonts` 已经下载的字体，见下文“字体包”）和机器上用户、系统的字体目录（XDG 的 `~/.local/share/fonts`、`/usr/local/share/fonts`、`/usr/share/fonts`，以及 `~/.fonts`）：机器上装了文档点名的字体就用它，没写字体或点名的字体机器上没有时，中日韩文字回退到简体字形（Noto Sans / Serif CJK SC）。环境里没有 UTF-8 locale 时 launcher 设 `LC_ALL=C.UTF-8`。**要求 glibc ≥ 2.34**（`ext-core` 其余命令是 2.28）：Debian 11、RHEL 8 这一代上 `smoke/soffice.sh` 不过，整个包装不上 | 官方 dmg 里的 LibreOffice.app（`hdiutil`，只能在 Mac 上构建），arm64 和 x86_64 分开；launcher 指向 `Contents/MacOS/soffice` | 官方 msi 解包：在 Windows 上用 `msiexec /a` 做管理安装，在其它系统上用 `msiextract`（msitools）；msi 里装进系统字体目录的字体改放到 `share\fonts\truetype`；launcher 指向 `program\soffice.com` | Preview 管线：把 Office / ODF / WPS 文档转成 PDF，把 xls / ods 等旧表格转成 xlsx。workflow 媒体基线 `media.to_pdf`。`import_office` 的原样模式和不可解析对象的栅格化。字体集算在转换指纹里（`env/fonts`），所以各平台带同一套 |
 | `python3` | python-build-standalone `install_only` 3.12.x，`build.sh` | 官方（astral） | 官方（astral） | 官方（astral） | ScriptHost Python App 的依赖安装；Agent 临时脚本。项目解释器由 uv 管，这份只是保证 `python3` 存在 |
 | `uv` | `build.sh` | 官方 | 官方 | 官方 | Python 项目与解释器管理；`UV_CACHE_DIR` 等指到 Agent 缓存（ExtTools TODO §3.6） |
 | `node`、`npm`、`npx` | Node LTS，`build.sh`（与 `build_aios` 的 `NODE_VERSION` 同一个数） | 官方 | 官方 | 官方 | ScriptHost / aiws 项目构建；`buckyos_app_dev` 的 web 包 |
 | `deno` | `build.sh`（与 `build_aios` 的 `DENO_VERSION` 同一个数） | 官方 | 官方 | 官方 | ScriptHost TS、aiworkspace 程序宿主、`aiworkspace_run` 的 JSON 处理。核心命令用的是自己钉死的那份 Deno，不是它 |
+| `chromium` | Chrome for Testing 159.0.8154.6：`playwright-core` 1.65.1 配的那一版（Playwright 的 revision 1255）。**在线项**（清单的 `online`），不在 payload 里：包装好以后节点联网从 Google 的官方地址下载一次（zip 约 200 MiB），按 Playwright 的浏览器目录布局放在 `$BUCKYOS_ROOT/tools/online/chromium/chromium-1255/`，会话环境里 `PLAYWRIGHT_BROWSERS_PATH` 指到 `tools/online/chromium`。下载好之前 `chromium` 退 127 并说明还没下载；下载失败后在“设置 > 扩展工具”或用 `buckyos ext-tools download ext-core chromium` 再触发。只有完整构建，没有 headless shell，所以 Playwright 测试要写 `channel: 'chromium'`。五个平台都无头运行。版本在 `build.sh` 顶部，各平台的地址、SHA256、大小在清单里；`sources.sha256` 钉的是同一批归档，构建时下来对着包里的库检查一遍，不进包 | 官方 zip，节点下载。官方构建从系统取的库（X11 一族、NSS / NSPR、glib、cairo、pango、cups、dbus、alsa、atk、at-spi、gbm）全部来自包里的 conda-forge 前缀，其中只有 `libgbm` 是为它新加的（`conda-env.yml`）。Playwright 直接执行 `chrome-linux64/chrome`（aarch64 是 `chrome-linux-arm64/chrome`），不经过 `bin/`，所以下载后这个名字换成 payload 的 `online/chromium/` 里带的 sh 脚本，归档里的真二进制改名 `chrome-bin`：脚本按自己的位置找到 `tools/store/ext-core/conda`，把 `LD_LIBRARY_PATH` 设成前缀的 `lib/`，`FONTCONFIG_FILE`、`FONTCONFIG_PATH` 都没设时指向前缀的配置，再执行旁边的 `chrome-bin`。字体是前缀配置看得见的那些（见 `soffice` 一行），包括 LibreOffice 的字体目录（含 Noto CJK）。以 root 运行或在容器里要带 `--no-sandbox` | 官方 zip 里的 `Google Chrome for Testing.app`，节点下载，解包时保留归档里的符号链接和权限位；arm64 和 x86_64 分开；launcher 指向 `Contents/MacOS/Google Chrome for Testing` | 官方 zip，节点下载；launcher 指向 `chrome-win64\chrome.exe`。`chrome.exe` 是 GUI 程序，`--version` 由 launcher 自己回答 | Agent Service 的常驻浏览器（「Agent 浏览器」）；Agent 在私有 runtime 里跑 Playwright 测试，不用自己装浏览器和系统库；系统渲染 |
+| `agent-browser` | 随包脚本 `browser/agent-browser.mjs`（源码在 `publish/exttool/ext-core/browser/`），跑在 ext-core 的 node 上，用随包的 `playwright-core` 1.65.1（npm 发布包，`build.sh`，放在 `store/ext-core/playwright/node_modules/`）。它连的是 Agent Service 的常驻浏览器：浏览器（在线项 `chromium`）还没下载时由服务报不可用（退出码 3），`version`、`env` 不受影响 | 随包脚本 | 随包脚本 | 随包脚本 | Agent 操作自己的常驻浏览器：跑 Playwright 脚本、读页面、截图、请用户接手。`agent-browser env` 给用别的 Playwright 版本的项目打印要设的环境变量 |
+| `page-render` | 随包脚本 `browser/page-render.mjs`，同上。自己起一个浏览器，所以要在线项 `chromium`：还没下载时退出码 6，`--version` 不受影响 | 随包脚本 | 随包脚本 | 随包脚本 | 系统渲染：把一个页面输出成 PDF 或 PNG（workflow 的 `media.page_to_pdf`、`media.page_snapshot`） |
 | `git` | `conda-lock.yml`；Windows 用 MinGit | conda-forge | conda-forge（**不回退** `/usr/bin/git`：它是 Xcode CLT 垫片，会弹安装对话框） | 官方 MinGit | `buckyos_app_dev`、`opendan_agent_dev`、`buckyos_dev_release` 的源码操作 |
 | `curl` | `conda-lock.yml` | conda-forge | conda-forge | conda-forge | 下载；Agent 脚本的 HTTP 调用 |
 | `jq` | `build.sh` | 官方 | 官方 | 官方 | JSON 提取（`aiworkspace_run` 示例、skill 脚本） |
@@ -311,7 +317,35 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
 
 `git`、`curl`、`tree`、`unzip`、`xz` 这组辅助命令在五个平台都随 `ext-core` 带，launcher 不依赖系统同名命令（owner 2026-11-06 确认；macOS 的系统 `git` 是 Xcode CLT 垫片，会弹安装对话框）。锁定清单与构建脚本都在 `publish/exttool/ext-core/`：`build.sh` 管官方归档，`conda-lock.yml` 管 conda-forge 那组。
 
-`bash`、`rsync` 是 Linux 特有，仍由 `build_aios` 的 `RUNTIME_PACKAGES` 进工作镜像，不在 `ext-core`，也不要求 macOS / Windows 提供。
+`bash`、`rsync` 是 Linux 特有，仍由 `build_aios` 的 `RUNTIME_PACKAGES` 进工作镜像，不在 `ext-core`，也不要求 macOS / Windows 提供。`Xvnc` 同样只在 Linux 的工作镜像里（§6.3）。
+
+**owner 2026-11-10 定：工作镜像里的工具都来自 `ext-core`。** LibreOffice 进了工作镜像，就属于核心扩展工具：`soffice` 命令一定可用，各环境的区别只是调用方式不同（容器从工具卷取，宿主从 `$BUCKYOS_ROOT/tools` 取）。所以原来规划的 `ext-office` 并入 `ext-core`，也就是上表的 `soffice`（`ext-core` 1.2.0）。`build_aios` 里原来那组 apt 包（`libreoffice-{core,writer,impress,calc}-nogui`、四个字体包、`locales`）已删除。
+
+**owner 2026-11-14 定：浏览器也进 `ext-core`**（1.3.0），不另立扩展包。一份 Chromium（Chrome for Testing）加配套的 `playwright-core`，装好后是两个用途：Playwright 测试环境和 Agent 的常驻浏览器。2026-11-15 改为：Chromium 是 `ext-core` 的在线项，不在包里，节点装好包以后从 Google 的官方地址下载；`playwright-core`、启动器和脚本仍随包。
+
+**在线项（owner 2026-11-15 定）**
+
+扩展包的清单可以声明“在线项”（`ext-manifest.json` 的 `online`）：包里只写它是什么、从哪里下，节点在包装好以后自己从上游下载。它不进 payload、不进种子、不进离线包、不经过 Repo，我们不分发它。现在的在线项是 `ext-core` 的 `chromium`（Chrome for Testing）和字体包 `ext-fonts` 的各个字体（下文“字体包”）；还有哪些东西可以在线化另行讨论。
+
+- **清单字段**：`online[]` 的每一项有 `id`、`version`、`desc`、`license`、`auto` 和按平台的 `platforms`（`url`、`sha256`、`size_bytes`、`format`、`into`、`rename`、`overlay`）；`provides` 的命令用 `needs` 列出它离不开的在线项。下载地址只写上游的官方 https 地址，不配镜像，也没有可以覆盖的下载源。没有某个平台的条目，就是这个平台上没有它，`needs` 它的命令在这个平台上不可用。字段规则和例子见 [PIKG 格式 §5.1](../pikg/format.md)。
+- **节点上的布局**：`$BUCKYOS_ROOT/tools/online/<id>/` 是解出来的内容，`tools/online/<id>.json` 是记录，都在包的版本目录之外；容器里是 `/opt/buckyos/tools/online/<id>/`。包升级时在线项的版本和归档没变就不重新下载。目录对所有账号可进入，文件对所有账号可读，原来可执行的对所有账号可执行，不随节点进程的 umask 变：容器里的 Agent 和降权的系统渲染是别的账号。
+- **记录** `tools/online/<id>.json`（schema `buckyos.ext_tools.online/1`）：`id`、`version`、`package`、`platform`、`sha256`、`state`（`downloading | ready | failed`）、`size_bytes`、`downloaded_bytes`、`error`（失败时的一句原因）、`updated_at_ms`、`request_ms`（这次下载回应的手工请求，0 是没有人要求的自动那次）。没有记录就是从来没有下载过（`missing`）。记录每次都是写临时文件再改名，读的一方读不到半截。用的一方这样判断可用：`state` 是 `ready` 并且目录在。
+- **overlay 跟着包走**：包每次激活（新装、升级、回退、修复）时，在线项已经在、版本和归档都没变的，把这个包的 overlay 重新盖一遍，不重新下载归档；overlay 里的文件逐个换名替换，不在 overlay 里的文件不动。这样 overlay 里的脚本改了，随包升级就到节点。所以同一个 `version` 下 `into`、`rename` 不能改：归档怎么放变了，就要换 `version`。overlay 里只能有普通文件和目录。
+- **包怎么找在线项**：launcher 装好以后在 `tools/bin/`，在线项在它上一层的 `online/<id>/`。payload 在安装检查时位于 `tools/staging/<名字>/`（launcher 在 `tools/staging/<名字>/bin/`），激活以后的版本目录是 `tools/versions/<包>/<目录>/`，`tools/store/<包>` 是指向 `tools/versions/<包>/<目录>/store/<包>` 的链接。这些目录名和层数是引擎给包的约定（`ext-core` 的 launcher 和 `browser/runtime.mjs` 按它从 staging 和版本目录里找到 `tools/online/chromium`），改它们要连同各个包一起改。
+- **已经有一份在用时**（包升级后在线项换了版本，或者手工要求重新下载）：新的先完整下到 `tools/staging/`，校验、解包、改名、盖上 overlay 都做完，才和在用的目录换名，旧目录随后删掉。这期间记录一直是 `ready`，正在进行的那次下载记在记录的 `next` 里（`version`、`sha256`、`state`、`size_bytes`、`downloaded_bytes`、`error`、`updated_at_ms`），所以不可用的时间只有换名那一下。下载没成功：在用的就是包要的版本时它继续 `ready`，原因留在 `next.error`；在用的是旧版本时记录变成 `failed`（包要的版本不在这台机器上），旧目录留在原地，等下一次成功的下载换掉。
+- **下载**：HTTPS GET，流式写盘，边下边算 SHA256。连接 30 秒、连续 60 秒收不到数据、总共 2 小时算超时；重定向只跟 https；收到的比清单写的大就中断。SHA256 不对、解包失败、任何一步出错，都不留半截目录，也不留下载的归档。进度每秒写进记录一次，报给 Zone 是每 1% 一次。
+- **触发**：自动只有一次。包在、在线项 `auto`、这个版本从来没有试过（没有记录，或者记录是别的版本）时下载。失败就停在 `failed`，不再自动重试，节点重启也不重试；节点在下载中途停了，重启后记成失败（`the node stopped during the download`）。手工：管理员在 Desktop “设置 > 扩展工具”里点下载 / 重试，或者用 `buckyos ext-tools download <包> <在线项> [--node <节点>]`（control-panel 的 `ext_tools.download {id, item, node?}`，管理员）。它给每个有这个在线项的节点写一条 `nodes/<node>/ext_tools_online/<item>`（`{package, request_ms, by}`）；节点的 reconciler 看到 `request_ms` 比记录里回应过的新，就再下载一次，不管上一次是什么结果，已经 `ready` 的也重新下载并整体换掉。下载在 reconciler 之外进行，不挡包的安装，也不挡节点启动。
+- **包和命令的状态**：在线项没到 `ready` 不算包损坏，不触发修复。`needs` 它的命令记在 `tools/installs/<包>.json` 的 `waiting` 里（命令 → 还缺的在线项），`commands` 里它的版本是空串；在线项 `ready` 以后补探测、补记版本。这些命令的 smoke 在还等着的时候不跑；在线项已经在（比如包升级而在线项版本没变）时，安装检查照常跑它，`ext-tools check --full` 也跑（跑的是 `tools/bin` 里的 launcher）。节点上报的 `nodes/<node>/ext_tools/<包>` 里，每个工具根（`targets.native`、`targets.container`）带 `online`（在线项 → `state`、`version`、`size_bytes`、`downloaded_bytes`、`error`、`updated_at_ms`，`state` 多一个 `missing`）和 `waiting`，整个节点另有一份 `online`（各工具根里离 `ready` 最远的那个）；control-panel 的 `ext_tools.status` 在 `packages[].nodes.<node>` 下原样带出。
+- **移除**：包被移除，或者升级以后不再声明某个在线项，并且没有别的包声明它时，目录和记录一起清掉。
+- **“Docker 在 VM 里”的节点**：容器用的工具卷有自己的一份在线项（Linux 平台的那份）。归档由 node_daemon 在宿主上下载，工作镜像里的引擎只做校验和解包（`opendan ext-tools online-begin | online-apply | online-fail`），那个容器仍然没有网络。`opendan ext-tools online-download --root <工具根> --item <在线项>` 是在一个工具根上手工完成整次下载的入口。
+- **和离线包的关系**：离线包、安装器带的种子只有 payload。在线项要等节点能上网才有；没有网络的环境里 `needs` 它的命令一直是“等在线项”，包的其它命令不受影响。
+
+**字体包 `ext-fonts`（owner 2026-11-16 定，[打印 TODO](../../notepads/aiws-print-pdf-export-todo.md) Q16、Q21、Q22、T11、T12）**
+
+- **是什么。** 打印（导出可打印 PDF）用的、`ext-core` 默认字体以外的字体。包没有命令（`provides` 为空：清单校验允许只声明在线项的包，Rust 的 `ExtToolsManifest::validate` 和 websdk 的 `extToolsManifestErrors` 一致；没有 `bin/` 的包照常安装、移除）。每个字体族一个在线项（上游按字体族各自发布一个归档，一个在线项只有一个归档），`auto: false`，五个平台指向同一份归档。下载地址只用上游在 GitHub 上的官方发布；只收许可证允许嵌入 PDF 的字体（现在都是 SIL OFL 1.1，字体文件的 `fsType` 都是 0）；我们不分发。首批 8 个：Noto Sans / Serif Thai、Noto Sans / Serif Devanagari、Inter、Source Sans 3、Source Serif 4、JetBrains Mono。阿拉伯文、希伯来文不在包里：`ext-core` 的 LibreOffice 字体目录已经有 Noto Sans Arabic、Noto Naskh Arabic、Noto Sans Hebrew、Noto Serif Hebrew（常规体、粗体），它们是默认字体。清单、包里的文件和加字体的步骤见 `publish/exttool/ext-fonts/README.md`；打印用的字体目录是 `src/frame/aiworkspace/print/fonts.ts`（`DEFAULT_FONTS`、`PACK_FONTS`），由字体包的测试对着清单检查。
+- **fontconfig 怎么看到。** 包里带 `store/ext-fonts/fonts.conf`，按在线项列出各自静态 TrueType 字体的目录（`../../../../../online/<在线项>/<目录>`）。`ext-core` 1.3.3 起在前缀配置的 `conf.d/64-ext-fonts.conf` 里用 `<include ignore_missing="yes">` 引入它，用 fontconfig 的命令（`soffice`、`page-render` 和 Agent 浏览器的 Chromium、ffmpeg 的字幕、ImageMagick 的 `pango:`）因此都看得到已经下载的字体；没下载的项目录不存在，没装字体包时什么都不发生。相对路径的解析实测过（`ext-core` 前缀里的 fontconfig 2.18.3）：`<dir prefix="relative">` 从所在文件的真实路径（`realpath`）算起；`<include>` 的相对名拼在 `FONTCONFIG_PATH` 后面交给内核，`..` 按目录的真实位置走。两种都不受中间 `store/<包>` 符号链接的影响，层数只取决于文件实际在哪。所以 `fonts.conf` 只写版本目录里的层数（`tools/versions/ext-fonts/<目录>/store/ext-fonts` 上五层）；`ext-core` 的引入写三个候选，对应它自己在版本目录（上八层）、`staging/`（上七层）和 payload 直接解成工具目录（CI 冒烟，上五层），只有一个存在。只在 Linux 上有效：macOS、Windows 上的 Chromium 用 CoreText / DirectWrite，不读 fontconfig，`ext-core` 的字体和字体包都看不到。
+- **缓存。** Workflow 的 `media.page_to_pdf`、`media.page_snapshot`、`media.to_pdf` 的指纹在每次取的时候现读工具根，不等探测周期：`current.json` 里 `ext-core` 的版本和摘要（`env/ext-core`），`online/*.json` 里 `package` 是 `ext-fonts`、`state` 是 `ready` 且目录在的项（`env/ext-fonts`，`<在线项>@<版本>` 排序后用逗号连接）。宿主 `fc-list` 的摘要（`env/fonts`）照旧。下载一个字体以后不用重启 Workflow，同一份打印包再打印也不会命中之前用替代字体出的结果（[media tool baseline](../workflow/media%20tool%20baseline.md) §2）。
+- **种子与发布。** 开发环境里 `src/tools/prepare_ext_tools.py` 每次都从 `publish/exttool/ext-fonts` 构建它，和 `ext-core` 写进同一个钉版清单（`ext-core` 这次没拿到也照写），node_daemon 和 `ext-core` 一起播种；exttool 种子镜像（`build_exttool`）也一样。发布走 `.github/workflows/ext-fonts.yml`（tag `ext-fonts-v<版本>`，R2 上是 `ext-tools/ext-fonts/<版本>/`），它的 PIKG 要用支持只有在线项的包的 websdk CLI 构建。正式安装器的钉版清单（`.github/scripts/ext_tools.py resolve`）还只有 `ext-core`。
 
 **表 C：其它官方扩展包与非包内容**
 
@@ -319,7 +353,7 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
 
 | 包 / 内容 | 命令 | 状态 | 来源 / 版本 | 支持的场景（为什么要装） |
 | --- | --- | --- | --- | --- |
-| `ext-office`（规划） | `soffice`（LibreOffice headless）+ 字体（`fonts-dejavu-core`、`fonts-liberation`、`fonts-noto-core`、`fonts-noto-cjk`）+ locale（`en_US.UTF-8`，`LANG=C.UTF-8`） | 规划中。今天只在 Linux 容器：`build_aios` 的 apt 包 `libreoffice-*-nogui` + 字体 + `locales`；原生包要 T0 另核（LibreOffice 三平台有官方安装包但不是 portable，体积约数百 MB） | apt ≥ 7.0；原生待定 | 媒体工具基线：workflow `media.document` 的 DOCX / PPTX / ODT → PDF；`import_office` 的版式转换。字体影响页图内容，属于执行环境指纹 |
+| `ext-fonts` | 无，只有在线项（每个字体族一个） | 1.0.0。开发环境和 exttool 种子镜像随 `ext-core` 播种；字体都不自动下载，管理员按需下载 | 包里只有清单、`store/ext-fonts/fonts.conf` 和说明；字体来自上游在 GitHub 上的发布（见上文“字体包”） | 打印：工作区把 `sans`、`serif`、`mono` 对应到字体包里的字体，打印对话框缺字体时引导去下载；`soffice` 的文档转换同样用得上 |
 | `ext-cad`（规划） | `freecadcmd` | 规划中，默认不装。今天是 exttool 镜像的可选项：`FREECAD_APPIMAGE_URL_*` 为空时没有这个命令 | FreeCAD 官方 AppImage（Linux x86_64；aarch64 核）、dmg、7z | CAD 脚本化 |
 | 工具卷的 `uv-cache`、`deno-cache` | 不是命令 | 随 `publish/exttool` seed 镜像预热，卷新建时复制一次；格式不允许包携带缓存（X3 定：留在 seed 镜像） | 随镜像 | ScriptHost 首启离线装依赖 |
 

@@ -1,7 +1,7 @@
 import { accessDenialOf, buckyos, type AccessDenial, type EntryDescriptor, type DID, type NotifyCategory, type NotifyKind, type NotifyStatus, type ndn } from 'buckyos'
 import { fetchUserDetail } from '../../../api/user_mgr'
 import type { NotifyView } from '../notify/model'
-import { groupErrorCode } from '../groupModel'
+import { groupErrorCode } from '../../../components/conversation/model/groupNotice'
 
 /**
  * Thin client for the msg-center RPC surface used by MessageHub. Wire shapes
@@ -296,6 +296,8 @@ export const createSession = (input: { owner: DID; peer_did: DID; title?: string
 export const archiveSession = (owner: DID, sessionId: string) => call<OwnerSessionState>('msg.archive_session', { owner, session_id: sessionId })
 export const restoreSession = (owner: DID, sessionId: string) => call<OwnerSessionState>('msg.restore_session', { owner, session_id: sessionId })
 export const deleteSession = (owner: DID, sessionId: string) => call<OwnerSessionState>('msg.delete_session', { owner, session_id: sessionId })
+/** Hides the records the session holds now from the owner; the session itself, its title and UI state stay. */
+export const clearSession = (owner: DID, sessionId: string) => call<OwnerSessionState>('msg.clear_session', { owner, session_id: sessionId })
 
 /* ── Records ── */
 
@@ -315,6 +317,9 @@ export async function postSendMessage(msg: ndn.MsgObject, idempotencyKey?: strin
 
 /** `msg.collect_attachment`: the attachment's copy in the caller's `collected` bucket. */
 export const collectAttachment = (objId: string, contextPath: string) => call<{ bucket_id: string; key: string }>('msg.collect_attachment', { obj_id: objId, context_path: contextPath })
+/** `msg.prepare_save_attachment`: hands the attachment (or what `innerPath` names inside a folder attachment) to the caller's own session, to commit into their files. */
+export const prepareSaveAttachment = (objId: string, contextPath: string, innerPath?: string) =>
+  call<{ obj_id: string; kind: 'file' | 'dir' }>('msg.prepare_save_attachment', { obj_id: objId, context_path: contextPath, ...(innerPath ? { inner_path: innerPath } : {}) })
 
 /* ── UI session state (legacy session-only KV and owner-scoped KV) ── */
 
@@ -494,7 +499,7 @@ export const revokeGroupInviteLink = (groupDid: DID, token: string, idempotencyK
 export const acceptGroupInvitation = (groupDid: DID, invitationId: string, memberDid?: DID) => call<GroupMemberRecord & { sync_pending?: boolean }>('group.accept_invitation', { group_did: groupDid, invitation_id: invitationId, ...(memberDid ? { member_did: memberDid } : {}) })
 /** Asks to join (open / request_and_approve policy) or joins through an invite link token. */
 export const requestGroupJoin = (groupDid: DID, invite?: string) => call<GroupMemberRecord>('group.request_join', { group_did: groupDid, ...(invite ? { invite } : {}) })
-export const createGroupSession = (groupDid: DID, input: { title?: string; idempotency_key: string }) => call<{ group_did: DID; session_id: string; session: string; revision: string }>('group.create_session', { group_did: groupDid, ...input })
+export const createGroupSession = (groupDid: DID, input: { title?: string; description?: string; idempotency_key: string }) => call<{ group_did: DID; session_id: string; session: string; revision: string }>('group.create_session', { group_did: groupDid, ...input })
 export const updateGroupSession = (groupDid: DID, sessionId: string, expectedRevision: string, input: { add_members?: DID[]; membership?: unknown }, idempotencyKey: string) => call<{ revision: string }>('group.update_session', { group_did: groupDid, session_id: sessionId, expected_revision: expectedRevision, ...input, ...key(idempotencyKey) })
 export const archiveGroupSession = (groupDid: DID, sessionId: string, expectedRevision: string, idempotencyKey: string) => call<{ revision: string; lifecycle: string }>('group.archive_session', { group_did: groupDid, session_id: sessionId, expected_revision: expectedRevision, ...key(idempotencyKey) })
 export const deleteGroupSession = (groupDid: DID, sessionId: string, expectedRevision: string, idempotencyKey: string) => call<{ revision: string; lifecycle: string }>('group.delete_session', { group_did: groupDid, session_id: sessionId, expected_revision: expectedRevision, ...key(idempotencyKey) })

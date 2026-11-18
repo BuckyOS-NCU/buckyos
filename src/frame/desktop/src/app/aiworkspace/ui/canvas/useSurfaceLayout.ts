@@ -10,6 +10,7 @@ import { useOutlineVersion, useStore } from '../../state/hooks'
 import { distanceTo } from './connectors/geometry'
 import { ShapeBook } from './connectors/layout'
 import { foldBook } from '../controls/folds'
+import { projectionCounts } from '../controls/composite/counts'
 import { layoutSurface } from './layout'
 import { SpatialIndex } from './render/spatialIndex'
 
@@ -21,9 +22,12 @@ export function useSurfaceLayout(surfaceId: string) {
   // the nodes this reader folded in a control (user state, 脑图方案 R8) are part of the layout
   const folds = foldBook(store)
   const foldsVersion = useSyncExternalStore(folds.subscribe, folds.snapshot)
-  const laid = useMemo(() => layoutSurface(store.outline, surfaceId, (id) => shapeBook.get(store.outline.get(id)), (id) => folds.folded(id)),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- outlineVersion / shapesVersion / foldsVersion are the invalidation signals
-    [store, surfaceId, outlineVersion, shapesVersion, shapeBook, folds, foldsVersion])
+  // how many items the composites' projections have (their data is read after the outline, G13)
+  const counts = projectionCounts(store)
+  const countsVersion = useSyncExternalStore(counts.subscribe, counts.snapshot)
+  const laid = useMemo(() => layoutSurface(store.outline, surfaceId, (id) => shapeBook.get(store.outline.get(id)), (id) => folds.folded(id), (id, name) => counts.get(id, name)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- outlineVersion / shapesVersion / foldsVersion / countsVersion are the invalidation signals
+    [store, surfaceId, outlineVersion, shapesVersion, shapeBook, folds, foldsVersion, counts, countsVersion])
   useEffect(() => {
     const targets = []
     for (const l of laid.values()) for (const end of [l.connector?.data.start, l.connector?.data.end]) { const target = end ? laid.get(end.entity_id)?.entity : undefined; if (target) targets.push(target) }
@@ -35,6 +39,8 @@ export function useSurfaceLayout(surfaceId: string) {
   const index = useMemo(() => {
     const idx = new SpatialIndex()
     for (const [id, l] of laid) {
+      // a PDF Frame's band is pressed and picked as its frame (Blocks still drop into it, layout.ts groupAt)
+      if (l.band) continue
       const line = l.connector
       const ink = l.entity.view_type === INK_VIEW ? book.world(id, l.rect, l.rotation) : null
       idx.insert({ id, rect: l.bounds, paint: l.paint, ...(l.rotation ? { turned: { rect: l.rect, rotation: l.rotation } } : {}),

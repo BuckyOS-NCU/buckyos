@@ -183,11 +183,11 @@ impl Perception for ForwardingStateClient {
 
 #[async_trait]
 impl Cognition for ForwardingStateClient {
-    async fn recall_hints(&self, q: &RecallQuery) -> Result<Vec<Hint>> {
-        self.inner.cognition().recall_hints(q).await
+    async fn query(&self, sid: &str, q: &crate::memory::MemoryQuery) -> Result<crate::memory::QueryResult> {
+        self.inner.cognition().query(sid, q).await
     }
-    async fn notebook_append(&self, note: &NotebookNote, who: &str) -> Result<()> {
-        self.inner.cognition().notebook_append(note, who).await
+    async fn read(&self, sid: &str, reference: &str) -> Result<crate::memory::MemoryRead> {
+        self.inner.cognition().read(sid, reference).await
     }
 }
 
@@ -260,16 +260,14 @@ impl BehaviorCatalog for ForwardingStateClient {
     async fn skills(&self, kind: Option<SkillKind>) -> Result<Vec<SkillMeta>> {
         self.inner.behaviors().skills(kind).await
     }
-    async fn install_skills(
-        &self,
-        pkg: &crate::skills::SkillPackage,
-        replace: bool,
-        who: &str,
-    ) -> Result<crate::skills::InstallReport> {
-        self.inner.behaviors().install_skills(pkg, replace, who).await
+    async fn note_skills_frozen(&self, names: &[String], session_id: &str) -> Result<()> {
+        self.inner.behaviors().note_skills_frozen(names, session_id).await
     }
-    async fn remove_skill(&self, kind: SkillKind, name: &str, who: &str) -> Result<SkillMeta> {
-        self.inner.behaviors().remove_skill(kind, name, who).await
+    async fn revise_skill(&self, kind: SkillKind, name: &str, text: &str, reason: &str, who: &str) -> Result<SkillMeta> {
+        self.inner.behaviors().revise_skill(kind, name, text, reason, who).await
+    }
+    async fn skills_status(&self, runtime_id: Option<&str>) -> Result<serde_json::Value> {
+        self.inner.behaviors().skills_status(runtime_id).await
     }
 }
 

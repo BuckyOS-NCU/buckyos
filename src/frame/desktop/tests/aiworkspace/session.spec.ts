@@ -154,6 +154,8 @@ test('S-01 a public session: presenter, audience, guest and display in one room;
   await desk.addInitScript((token) => window.localStorage.setItem('aiworkspace.dev', JSON.stringify({ token })), BOB)
   const home = await desk.newPage()
   await openApp(home, BOB)
+  // the home's "All public classes" (UI framework PRD §9.1): a card, opened by a click on it
+  await home.getByTestId('aiws-home-tab-sessions').click()
   const mine = home.getByTestId(`aiws-my-session-${sid}`)
   await expect(mine).toHaveAttribute('data-role', 'audience', { timeout: 15_000 })
   await expect(mine).toHaveAttribute('data-state', 'archived')
@@ -233,7 +235,7 @@ test('S-02 attendance against a roster and a random pick that never repeats (P4-
   const events = await api.rpc(ALICE, 'session.events', { session_id: sid, after: 0, limit: 2000 })
   expect(events.ok).toBe(true)
   const run = created.session.workspace_id as string
-  const tasks = (await api.rpc(ALICE, 'doc.query', { workspace_id: run, source_id: choice.content.payload.bindings.tasks.entity_id, limit: 100 })).rows as Json[]
+  const tasks = (await api.table(ALICE, run, { source_id: choice.content.payload.bindings.tasks.entity_id, limit: 100 })).rows as Json[]
   expect(tasks.filter((r) => r.values.mode === 'assigned')).toHaveLength(2)
   for (const p of [presenter, pages['tok-ext'], pages['tok-bob'], pages['tok-lim']]) await p.context().close().catch(() => undefined)
 })

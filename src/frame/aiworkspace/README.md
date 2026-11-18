@@ -12,8 +12,8 @@ core/      aiworkspace-core   pure logic, builds for wasm32-unknown-unknown (no 
                               anchor.rs: annotation anchors (target / range / quote) and per-type anchor adapters;
                               freshness.rs: dependency-based freshness and relation queries (shared with the replica);
                               wish.rs: wish v2 contracts and digests; markdown.rs: Markdown ⇄ rich text
-store/     aiworkspace-store  SQLite storage, objects in the named store retained by bucket bindings, packages, Mock runs, URL sources;
-                              wish/: snapshot, context map, read tools, result collector, planner, run records
+store/     aiworkspace-store  SQLite storage, objects in the named store retained by bucket bindings, packages, URL sources;
+                              wish/: snapshot, context map, read tools, result collector, planner, runs, run records (history)
 server/    aiworkspace        process entry, kRPC dispatch, upload/download routes, auth;
                               wish/: run orchestration, xllm adapter and host tools, Deno program runner, llm.map
 aiws/      aiws v2 package    program host (aiws.js, run.js), API doc for the model, prompts, renderer catalog (deno test)
@@ -57,11 +57,11 @@ everything but NDM uploads and bucket downloads works (the Rust tests). The Desk
 
 ## File and folder imports
 
-Nothing is copied: the FileObject the browser uploaded is the asset (`object_id` is its id). A single file is uploaded through WebSDK NDM with `bind` into the caller's own `user/aiworkspace/<user>/assets` (key `<workspace_id>/<object_id>`), then `asset.import_object { workspace_id, bucket_id, key }` registers it: the service reads the binding (`bucket.get`), checks workspace update/structure access, binds the object under `<workspace_id>/<object_id>` in the Workspace owner's `assets` bucket (a collaborator's upload moves there and its own key goes) and lists it as staged. A folder or several files are uploaded without `bind` (NDM's 24 h hold covers them) and each FileObject is registered with `asset.import_object { workspace_id, obj_id }`: the service authorizes the object at the trusted NDM gateway with the caller's own token, then binds it. The per-asset limit remains 32 MiB, including each leaf of a directory.
+Nothing is copied: the FileObject the browser uploaded is the asset (`object_id` is its id). A single file is uploaded through WebSDK NDM with `bind` into the caller's own `user/aiworkspace/<user>/assets` (key `<workspace_id>/<object_id>`), then `asset.import_object { workspace_id, bucket_id, key }` registers it: the service reads the binding (`bucket.get`), checks workspace update/structure access, binds the object under `<workspace_id>/<object_id>` in the Workspace owner's `assets` bucket (a collaborator's upload moves there and its own key goes) and lists it as staged. A folder or several files are uploaded without `bind` (NDM's 24 h hold covers them) and each FileObject is registered with `asset.import_object { workspace_id, obj_id }`: the service authorizes the object at the trusted NDM gateway with the caller's own token, then binds it. The per-asset limit is `max_asset_bytes` (32 MiB), including each leaf of a directory; an audio or video asset (by the sniffed media type) may be up to `max_media_bytes` (2 GiB, 控件机制 TODO Q16) and is played by Range from `asset.stream_url` (`services/aiworkspace/settings` holds both). Such an upload is the browser's multi-chunk FileObject: a self-contained `doc.export` lists it as missing (packages carry single chunks only).
 
 Directory roots and descendants become `buckyos.container` folders, and files become AssetRefs in one normal business commit. A canvas import also creates corresponding groups and asset cells. Online imports may be cancelled; after failure or refresh, reselecting the source uses NDM deduplication. There is no offline upload queue or automatic recovery of browser File handles. FileList-based folder pickers cannot enumerate empty folders; callers with an explicit directory tree can preserve them through the SDK. draw.io and workspace ZIP retain their format validation, while image replacement and generated snapshots use the same asset stage/commit semantics.
 
-Table data (表格数据导入, `notepads/done/aiworkspace-table-import-todo.md`) is imported on the client: [import-table/](import-table/README.md) turns pasted HTML / TSV, CSV, xlsx and SQLite into a TableSource (header, field names, inferred types including `currency`, values in their stored form) and commits `entity.create` + `table.insert_records` (≤ 500 records each) in commits of at most 20 000 rows and 6 MiB — the service takes at most `Limits.max_commit_bytes` (8 MiB) per request. The service adds nothing for it: every value is checked by the usual write rules. The Desktop's wizard and the Agent command `import_table` (src/tools/buckyos-agent) run the same module.
+Table data (表格数据导入, `notepads/done/aiworkspace-table-import-todo.md`) is imported on the client: [import-table/](import-table/README.md) turns pasted HTML / TSV, CSV, xlsx and SQLite into a TableSource (header, field names, inferred types including `currency`, values in their stored form) and commits `entity.create` + `table.insert_records` (≤ 500 records / 1 MiB each) as **one Commit per import**, whatever its size: the client sends a Commit larger than one request in parts (`doc.stage`, see “Commit size” below). The service adds nothing for it: every value is checked by the usual write rules. The Desktop's wizard and the Agent command `import_table` (src/tools/buckyos-agent) run the same module.
 
 Bytes the service produces itself (Source fetches, wish results and program sources, the assets a package brings, test fixtures) are staged by `Workspace::stage_asset`: stored as the single-chunk FileObject of `canonical::file_object` and bound the same way. A workspace package is uploaded with `bind` into the importer's own `exports` bucket and imported with `ws.import { bucket_id, key, semantics, replace? }`; a successful import consumes the package (its binding goes), so the same upload cannot be replayed onto newer work. A restore journal recovers interruption between backing up the old directory and promoting the new one. Restore holds the workspace writer lock while rechecking permission, copying ACLs and replacing its state; queued writers observe the new epoch; the restored Workspace keeps its owner (whose buckets hold its objects). Final asset submission rechecks current workspace permission.
 
@@ -70,7 +70,7 @@ Bytes the service produces itself (Source fetches, wish results and program sour
 ```bash
 cargo test -p aiworkspace-core      # values, canonical ids, filters, rich text codec, planner, annotation anchors, phase2 (two trees, wishes, freshness),
                                     # tests/ink.rs: pen strokes (fixtures/ink) committed and read back, malformed ink refused
-cargo test -p aiworkspace-store     # V01–V22, V24, write locks, Mock — against real SQLite files; tests/sso.rs: caller classes,
+cargo test -p aiworkspace-store     # V01–V22, V24, write locks, a run's Commit — against real SQLite files; tests/sso.rs: caller classes,
                                     # group / contact subjects, share entries;
                                     # tests/replica.rs: the offline engine incl. the incremental rows a replica persists
 cargo test -p aiworkspace           # V23 + crash recovery — against the real process over HTTP; tests/sso.rs: the same
@@ -82,6 +82,8 @@ cargo test -p aiworkspace           # V23 + crash recovery — against the real 
 # REFERENCE_CYCLE, replay without the business schema), tests/clone.rs (tree.clone), tests/apply_log.rs;
 # store `cargo test -p aiworkspace-store --lib pack` (the ext.pack archive); server tests/ext.rs
 # (build, library, .pikg install, composite_controls_with_dependencies incl. ext.pack → ext.install)
+# standard tables and Workspace names: core tests/standard.rs (record rules on final values, undo, replay without them),
+# `--lib standard` (the RRULE subset); store tests/names.rs (ws.ensure under concurrency, conflicts, delete, packages)
 ```
 
 ## The two trees (phase two §4)
@@ -91,12 +93,18 @@ collection); `canvas-content` is a system folder under `data` holding one folder
 holding the presentation paths and Viewports (below). They exist from
 `seq` 0 and cannot be created, deleted, moved or renamed by operations. Structure rules (`core/src/plan.rs`
 `child_allowed`): `data` / `folder` take folders and data entities (TableSource, RichText, Record, AssetRef,
-Annotation, `buckyos.wish`, `buckyos.block-def`); `surfaces` takes `surface` containers; `surface` / `group`
-take Cells, groups and controls only (a control's Cells may hold Cells, see “Block-controls”). A Surface names its content folder (`content_folder_id`); the folder may point back
+Annotation, `buckyos.wish`, `buckyos.block-def`); `surfaces` takes `surface` containers and canvas folders; `surface` / `group`
+take Cells, groups and controls only (a control's Cells may hold Cells, see “Block-controls”). A **canvas folder** (UI 框架 PRD
+§4.1.1, Q5) is a `folder` under `surfaces`, at any depth: it holds Surfaces and canvas folders only, never carries `system`,
+cannot move into the data tree (nor a data folder into `surfaces`) and is deleted only when empty (`FOLDER_NOT_EMPTY`).
+A Surface's path runs through its folders (`/surfaces/日记/2026-11/11-13`); grants on a folder cover the Surfaces in it
+(structural inheritance); links name the Surface by id, so moving it keeps them working. Its content folder stays flat
+under `canvas-content`. A Surface names its content folder (`content_folder_id`); the folder may point back
 (`surface_id`). A Surface may carry `icon`: the id of a client-side preset icon (`[a-z][a-z0-9-]{0,31}`, Surfaces
 only; the client owns the preset list), a shared, undoable key projected into the outline like `title`. A Surface may also
-carry `config`, its page settings (`background`, `page_size`; an object of at most 64 KiB the client checks, read with
-`doc.read`, not projected; draw.io 导入 TODO §2.5). `placement` is `{ x, y, w, h, rotation? }` relative to the parent (`rotation`: degrees clockwise about the centre,
+carry `config`, its page settings (`background`, `page_size`, `toolbar`; an object of at most 64 KiB the client checks, read with
+`doc.read`, not projected; draw.io 导入 TODO §2.5; changing `config.toolbar` needs `structure` on the Surface, see
+“Workspace settings”). `placement` is `{ x, y, w, h, rotation? }` relative to the parent (`rotation`: degrees clockwise about the centre,
 `[0, 360)`, absent = 0); stacking order is `order_key`. A Cell or a group may carry `locked: true`: a shared flag
 the client honours (no moves, resizing or deletion from the canvas) and the core only checks for being boolean.
 (These two keys raised the format to 0.3 at the time; named connector anchors raised the protocol to 0.4; both are
@@ -120,10 +128,20 @@ and gets an addressable version in `entity_versions` at every application. Fresh
 A result the user keeps against a later run ("保留人工修改") is re-recorded with that run's read set and `kept_manual: true`, so the wish is current again without regenerating it.
 those versions with the cells now: `current | stale | upstream_stale | unavailable | unknown`.
 
-Format version is `1.0` (内核架构改进 FORMAT 1.0: `schema_id`, the resource directory, the reference catalogue with `mode` / `integrity` and `owns`, the pure-application log, `$formula`, the `run` capability, delegation fields, the usage ledger, `user_state.revision`, `base_seq`; protocol `1.0`). Stores and packages of an older format are refused with `UNSUPPORTED_VERSION` (no migration). From 1.0 on, an incompatible change of the format needs an explicit conversion (D07); within 1.0 only additions an older implementation can ignore are allowed. Protocol 1.1 added Block-controls (container kind `mindmap`, `"auto"` placement components, Cells holding Cells inside a control, `slot`; see “Block-controls”); requests speaking 1.0 are still accepted. Extension controls P1 added, within the same versions, the container kind
+Format version is `1.0` (内核架构改进 FORMAT 1.0: `schema_id`, the resource directory, the reference catalogue with `mode` / `integrity` and `owns`, the pure-application log, `$formula`, the `run` capability, delegation fields, the usage ledger, `user_state.revision`, `base_seq`; protocol `1.0`). Stores and packages of an older format are refused with `UNSUPPORTED_VERSION` (no migration). From 1.0 on, an incompatible change of the format needs an explicit conversion (D07); within 1.0 only additions an older implementation can ignore are allowed. Protocol 1.1 added Block-controls (container kind `mindmap`, `"auto"` placement components, Cells holding Cells inside a control, `slot`; see “Block-controls”); requests speaking 1.0 are still accepted. Protocol 1.2 (storage schema 6) is “Finding, reading and querying”: `doc.list`, `doc.find`, `doc.read { as, path }`, `doc.query` with `text` or `sql` only, `doc.source_query`, every entity named; Commit requests of 1.0 / 1.1 are still accepted. Extension controls P1 added, within the same versions, the container kind
 `composite` (`def_ref`, `bindings`, `slot` on Block containers), the block-def keys `deps` / `composition`, the reference
 kind `def_dep` (live, strong), the error code `REFERENCE_CYCLE`, the operation `tree.clone`, `tree.move { slot }` and
 directory member names holding `/` (see “Extension controls”). 1.1 also added the value type `currency` (表格数据导入 TODO §6, Q2: format and protocol versions unchanged): a field `{ type: "currency", currency: "<ISO 4217>", scale?: 0–18 (default 2) }` stores `{ "amount": "<decimal of that scale>", "currency": "<code>" }` — the code always written out (a bare amount or number takes the field's default; changing the default, `table.update_field { changes: { currency } }`, never changes stored values); symbols and names (`$12`, `USD 12`) are refused. Values order by (code, amount); `lt / lte / gt / gte` only meet amounts of the operand's currency; `eq` / `ne` / `in` need the same code; no `unique`, no grouping. Migrations: `number | decimal → currency` (the target's default), `currency → decimal` (drops the code), `currency → text` (`"USD 12.00"`), `currency → currency` (another scale).
+
+The value type `json` (控件机制 TODO G8, versions unchanged): a field `{ type: "json" }` holds a JSON **object**, replaced whole (no path edits; concurrent writes of one cell conflict on its version) — at most 16 KiB canonical (`LIMIT_EXCEEDED`), nesting at most 8 levels (the object is one), every string within the text limit; `null` only on a nullable field; a `{ "$formula" }` object is refused (`INVALID_SCHEMA`), formulas compute no extension fields. Not sortable or groupable, no `unique`, `scale`, `options`, `currency` or `target_types`; filters only `is_empty` / `is_not_empty`; no migration to or from it.
+
+**Records owned by their submitter** (控件机制 TODO G20, Q14; versions unchanged). A `text` field may be declared `submitter: true` (at most one per table, never on a record property). The service fills it with the inserting principal on `table.insert_records`; a client value for it — on insert, `table.set_values` or `table.unset_values` — is `INVALID_OPERATION` (“the submitter is filled by the service”), whoever writes: undo, import and replay keep the recorded value. It is unique: a principal's second insert is `INVALID_OPERATION` / `SUBMITTER_EXISTS` with `data.record_id` of the record it already has. A caller holding `append` but not `update` on the table may `set_values` / `unset_values` only records whose submitter is itself, and one holding `append` but not `delete` may `delete_records` only those (others `PERMISSION_DENIED`); with `update`, any record's other fields. `submitter` is set or cleared (`table.add_field`, `table.update_field { changes: { submitter } }`) only while the table has no live records (`SCHEMA_CONFLICT`). Reading is unchanged: no record-level read grant exists, so an `append`-only caller without `read` sees the record it inserted in the Commit answer (`touched`) only, never through `doc.query` / `doc.read` (a vote readable by everyone who can read the canvas, Q13, needs `read` anyway).
+
+A `multi_select` field may declare `max_items` (1–1000): a value with more distinct options is `INVALID_SCHEMA` (“at most N options”). Setting or lowering it with `table.update_field { changes: { max_items } }` (`null` removes it) re-scans the live records like `required`.
+
+**Field defaults** (UI 框架 PRD §7.3; versions unchanged). A field may declare `default`: a value of its type, stored in canonical form (`"9.5"` of a scale-2 decimal is `"9.50"`, a currency amount gets the field's currency) — never `null`, never a `{ "$formula" }`, never on a `submitter`, `unique` or `object_ref` field, nor on a record property (`INVALID_SCHEMA`, the detail says why). `table.insert_records` gives every record the defaults of the fields it does not name, for every writer (the Desktop, an Agent, `buckyos aiws`, an importer, a control's handler); a field it names keeps what it gives — `null` too, where the field is nullable — and internal writes (undo, package import, replay) keep what was recorded. The filled values are in the normalized operation, so the Commit's log and the replicas see them. A required field with a default may be left out. Set or change it with `table.add_field { field: { …, default } }` or `table.update_field { changes: { default } }` (`null` removes it; judged under the definition as changed, so turning `unique` on, or lowering `max_items` below the default, is refused); stored values never change — existing records get a new field's value only from `backfill`. `table.migrate_field` converts the default as it converts a value and reports it (`report.default { value, converted, convertible }`): one that does not convert fails the migration, or is removed with `on_failure: unset`. `table.delete_option` counts the default as a use — `reject_if_used` refuses (“option … is the field's default”, `data { used_by, default: true }`), `unset` removes the option from it (an emptied list is no default), `replace_with` puts the replacement there; undo puts it back.
+
+**Standard business tables** (控件机制 TODO G8–G10, [schemas/standard-tables.md](schemas/standard-tables.md)): a table whose `schema_id` is `buckyos.todo@1` or `buckyos.calendar@1` has standard fields with fixed ids and types and the business rules of that document, checked at admission only ([core/src/standard.rs](core/src/standard.rs), schema class, see “Validator classes”). The record rules judge every record a Commit inserted, changed or restored once, on its **final** values after the whole Commit (moving `start` and `end` together, or turning a timed event into an all-day one over a `table.set_values` and a `table.unset_values`, is one change; its undo replays the inverse operations in another order); a failure is `INVALID_SCHEMA` naming the record and field (`data: { entity_id, record_id, field_id }`) and the last operation that touched the record (`op_index`). `null` counts as absent. Of `ext`, only the keys the document gives a meaning are checked (an RRULE outside the subset is refused with a message naming the part); other keys pass.
 
 ## Presentation (第三期规划 §4–§6, §8, §11)
 
@@ -134,7 +152,7 @@ paths and Viewports and nothing else; neither type is allowed anywhere else (`pl
 | --- | --- |
 | `buckyos.viewport` | `title?`, `surface_ref: { entity_id }` (a free-layout Surface, judged when written), `center: { x, y }`, `zoom` in [0.05, 4], `notes?` (≤ 16 KiB), `caption?` (≤ 2000 chars). The visible area is `stage / zoom` around `center`, `stage` being the size of the path that shows it. |
 | `buckyos.show-path` | `title?`, `purpose: presentation \| guide`, `stage: { w, h }` (16–16384), `background?` (`#rgb`/`#rrggbb`/`#rrggbbaa`), `steps: [{ id, target: { kind: frame \| viewport, entity_id }, title?, enabled?, transition?: auto \| fly \| fade \| cut, hide?: [cell ids] }]` (≤ 500, ids unique). |
-| `buckyos.dir` | A **resource directory** (内核架构改进 D01, D25; not the data tree's `container(kind=folder)`): `members: { <name>: { kind: file, object_id, media_type, size } \| { kind: dir, entity_id } }` (≤ 10 000 names; a name is a version cell `m:<name>`, so renaming is remove + add), `meta?` (≤ 64 KiB). File members name uploaded objects (media type and size come from the content); child directories must be alive and must not contain this one (`member` references keep them alive). Members change only through `dir.set_member` / `dir.remove_member` / `dir.replace`. It materializes to the cyfs-ndn DirObject (`cydir`) with its time fields fixed to 0, so equal members give the same id (`content.dir_object`), and a DirObject imports as a directory (`types::dir_payload_from_dir_object`). v1 takes no external URL members. |
+| `buckyos.dir` | A **resource directory** (内核架构改进 D01, D25; not the data tree's `container(kind=folder)`): `members: { <name>: { kind: file, object_id, media_type, size } \| { kind: folder } \| { kind: dir, entity_id } }` (≤ 10 000 names; a name is a version cell `m:<name>`, so renaming is remove + add), `meta?` (≤ 64 KiB). A name may be a relative path (`docs/2026/a.txt`): the directory's own sub-folders are the prefixes of its names, and a `folder` member names one that may be empty — a sub-folder is part of this directory, not another entity (UI 框架 PRD Q25: creating, renaming, moving or removing one changes only this directory's members; removing it removes it and every name under it). A name is a file, a folder or a child directory, never also a folder of other names (`a` and `a/b` need `a` to be a `folder`). File members name uploaded objects (media type and size come from the content); a `dir` member links another directory entity, which must be alive and must not contain this one (`member` references keep it alive). Members change only through `dir.set_member` / `dir.remove_member` / `dir.replace`. It materializes to the cyfs-ndn DirObject (`cydir`) with its time fields fixed to 0, so equal members give the same id (`content.dir_object`): names stay flat paths, an empty `folder` is the empty DirObject (a folder holding names is said by them); a DirObject imports as a directory (`types::dir_payload_from_dir_object`; an empty child DirObject that is not an imported child entity is a `folder`). v1 takes no external URL members. |
 | Cell `presentation` | `{ live? }` on any Block but a line (operable on stage, §10.2); `{ background?, notes?, caption? }` on a Frame only. `null` removes it. |
 
 - Step targets are judged when a step is added or retargeted (alive, readable, a Frame Cell on a free Surface or a
@@ -179,7 +197,7 @@ paths and Viewports and nothing else; neither type is allowed anywhere else (`pl
 A **session** is a public presentation room of one Workspace's presentation path: a row of the service's registry
 (`sessions.sqlite`: state, owner, presenter, policy, baseline, archive, links, participants, posts) and a **run
 Workspace** (`purpose = session`) the service keeps for it. `session.create { workspace_id, path_id, title?, presenter?,
-policy? }` (workspace-level `read` + `update` on the source; the caller becomes the owner) clones the source whole
+policy?, readers_of? }` (workspace-level `read` + `update` on the source; the caller becomes the owner) clones the source whole
 (`VACUUM INTO` in its writer) and, before anyone opens the clone: gives it a new epoch, cuts its history to the clone
 point (`base_seq`; earlier commits, versions and snapshots go; rich texts become shallow snapshots), resets its grants to
 the owner (all) and the presenter (all but `manage`), drops entries, publications, runs, locks, user state and uploads,
@@ -189,9 +207,13 @@ binds every live asset under the run Workspace's own key in the owner's `assets`
 Workspaces are not listed, not swept as show clones and not counted among them.
 
 `policy`: `guest_interact` (false: guests watch only), `voice` (true), `show_names` (true), `expected_audience` (50),
-`media_limit_mib` (2048). States: `prepared → live → ended → archived`, or `expired` (an ended, unsaved session past
-`session_retention_days`, 7 by default: the run Workspace goes, the row stays); `access` (`open | closed`: new audience)
-and `posts` (`open | closed`) are switches of their own, `session.delete` a third.
+`media_limit_mib` (2048), `speak` (`granted | all`, `granted`) and `speak_mode` (`auto | manual`, `manual`) — see “Voice” below —, and `readers_of` — set by the service, never in the `policy` parameter: the session's
+permission object (see “Readers of the permission object”). States: `prepared → live → ended → archived`, or `expired`
+(an ended, unsaved session past `session_retention_days`, 7 by default: the run Workspace goes, the row stays); `access`
+(`open | closed`: new audience) and `posts` (`open | closed`) are switches of their own, `session.delete` a third.
+`session.set_access { access?, posts?, guest_interact?, readers_of?, speak?, speak_mode? }` (owner, presenter or prompter;
+`guest_interact` the owner only; `readers_of` the owner or the presenter in person, not a prompter link) answers `{ access,
+posts, policy, readers_of }`.
 
 **Roles and links (Q14).** The presenter controls the stage and runs tasks; the owner (when not the presenter) manages,
 saves, deletes and reads everything; participants joined through a link. `session.invite { kind, label?, config? }`
@@ -247,6 +269,33 @@ their own; a Commit's details only to reviewers). The client sends `ping { c }` 
 result | error }`). Presence (`presence.join` / `presence.leave`, presenter track) follows the first and last connection
 while the session runs; after `session.end` people watching the replay are not recorded.
 
+**Voice (第四期规划 §7.3; 多人发言, `notepads/aiws-session-multi-speaker-todo.md`).** One WebRTC connection per terminal to
+the host's media port (`AIWS_MEDIA_PORT`, default 4122, `off`; `AIWS_MEDIA_HOSTS`; ICE-lite, UDP only, no TURN): everyone
+receives one Opus track, the host's mix; whoever may speak also sends on the same connection. `session.rtc { op: offer,
+sdp, send? }` → `{ sdp, send }` (`send` is a wish, the answer says whether this connection sends into the mix; an offer
+with the connection's ICE ufrag and DTLS fingerprint renegotiates it — a right that comes or goes changes its direction
+in place), `{ op: close }`. Opus is answered with `usedtx=1`. The host (`server/src/mixer.rs`, libopus through the `opus`
+crate; one thread per session, 20 ms ticks) keeps a jitter buffer per sender (60 ms to start, 40–120 ms), mixes at most
+`AIWS_VOICE_MAX_SPEAKERS` (4) voices chosen by the browsers' `ssrc-audio-level` (the presenter always while they speak,
+then the loudest, with hysteresis; packets of the others are dropped undecoded), encodes the total mix once for every
+connection and, for each voice in it, the mix without itself; nobody speaking, nothing is sent. Who may speak (§4.2): the
+presenter and the prompter always, a display never, anyone else by the participant row's `speak` (NULL: the room's
+`policy.speak` — `all` covers guests only with `guest_interact`; 1 / 0: a manager's own setting, kept across reconnects
+and restarts, dropped with the row when its link is revoked); an `at_` link with `config.speak: true` sets it to 1 for who
+joins through it, unless set already. One sending connection per person: a newer one takes over. `session.voice { op }`:
+`allow { principal, allow }` and `mute_all {}` (owner, presenter, prompter), `mode { mode: auto | manual | mute }` and
+`request { on? }` (one's own; `VOICE_NOT_ALLOWED` for a speaking mode without the right). A withdrawn right and "mute all"
+take effect in the host at once (mute all holds everyone but the presenter until they pick a speaking mode again).
+`session.get` adds `my_speak`, `speak`, `speak_mode`, `voice_service.mixing.max_speakers` and, for reviewers,
+`participants[].speak | speak_set | request`; the `participants` feed has `speak`. Voice track events: `voice.allow
+{ principal, name, allow, by, via: manager | room | link, speak_mode }` (`participant:<p>`), `voice.request { principal,
+name, on }` (`participant:<p>`), `voice.mode { principal, mode }` (presenter), `voice.speaking { principal, on, name? }`
+(public; in the mix and audible for 300 ms, off after 1 s), `voice.mute_all { by }` (public), `voice.start` / `voice.stop`
+(the first sending connection up in a started session, the last gone), `voice.segment` (the recording: the total mix,
+10 s segments, silence frames for ticks nobody spoke in; `lost_ms` is 0), diag `voice.uplink { principal, conn, bytes,
+packets, active_ms, longest_ms }` (every minute while a connection sends, and when it ends) and `voice.mix { principal,
+decoded, skipped, late, concealed, with_level }` (when a sender leaves the mix).
+
 **After the class (§8).** `session.save` (owner, after `session.end`) writes the archive manifest
 (`buckyos.ai-workspace/session-archive/1`: baseline, final snapshot, event range, voice segments, gaps, missing objects,
 `complete`) and binds a `session` retention set (baseline, final content and every asset) under
@@ -260,7 +309,111 @@ presenter and their author), `session.delete_post`.
 (all of them for its managers). `session.list_mine { limit? }` (我的公开课, 100 by default, at most 500): the sessions the
 caller owns, presents or joined across Workspaces, newest first, each with `my_role` (`presenter`, else `owner`, else
 `audience`) and, when the deployment knows its public base, `url` — the room on its courseware's origin
-(`<public_base>/<slug>?session=<id>`). Neither is a channel call.
+(`<public_base>/<slug>?session=<id>`). `session.list_open { limit? }` (所有公开课, UI 框架 PRD §9.1, K7; same limits): every
+session the caller may open without a link, across Workspaces — those it owns, presents or joined (expired ones too) and,
+while their room is open (`access: open`) and not expired, those whose permission object it reads — live ones first, the rest by
+start (else creation) time, newest first. Each carries `my_role` (`presenter`, `owner`, `audience`: joined before,
+`member`: a reader of its permission object who has not), `presenting` (the caller presents it), `opened_at` (the caller's last time in
+it, or null), `online` (connections now, while it has a room in memory; else null), `cover` (see “Covers” below) and
+`url`. None of the three is a channel call.
+
+**Covers (UI 框架 PRD §9.2, Q37).** A Workspace's cover is the picture its managers chose: `cover` in its settings
+(the root's `config`, see “Workspace settings”) — nothing is taken from the canvases. A `ws.list` item's `cover` is
+`{ workspace_id, object_id, media_type }` when one is set and its bytes are stored here, else null: the card draws its
+placeholder. A session's `cover` (`session.list_open`) is its courseware's, for a caller who may enter the courseware
+(who reads its settings, as `ws.get_info` asks); null otherwise. The bytes are `GET …/asset/<workspace_id>/<object_id>`
+like every asset's: the root references the cover, and the asset route admits that reference to whoever may enter the
+Workspace — the readers of the settings, a reader of one canvas included.
+
+**Readers of the permission object (K7, UI 框架 PRD Q19).** Each session has a permission object: an entity of the
+source Workspace — a Surface, a folder, a Block, or the Workspace itself (`root`) — kept by id in `policy.readers_of`, so
+renaming or moving it changes nothing. `session.create`'s `readers_of` names it as a path or an entity id the caller may
+read there (resolved like an entry's resource); by default it is the Surface of the path's first playable step (the
+Workspace when no step is on a Surface). `session.set_access { readers_of }` chooses another, resolved the same way for
+the caller. A person (not a guest, a link or a run) whom the source Workspace names in its own right — what `ws.list`
+lists — holding `read` on the object (path inheritance, deny first, as every read) may open the session without a link
+while the room is `open` and not expired: `session.get` answers them as `audience`, `session.join` makes them
+participants and puts them in the run Workspace's `source-readers` group (`read` on the whole run Workspace, like a
+link's group). An object that is deleted or gone admits nobody this way until another is chosen; those who joined stay.
+Their memberships (`group:` / `contact:`) are settled against the courseware's entries. The presenter and the owner see
+the object in `session.create`, `session.get` and `session.set_access` as `readers_of { entity_id, path, title, type_id,
+kind, alive }`; nobody else is told.
+
+## Printing (导出可打印 PDF, `notepads/aiws-print-pdf-export-todo.md` T5, T7)
+
+`print.package` builds the **print package** of one canvas (`store/src/print.rs`; the contract is
+[print/package.ts](print/package.ts)), which the caller's own Workflow run `media.page` turns into a PDF. In one go under the
+Workspace's writer (one head; nothing is written to the document):
+
+- **What prints.** A flow canvas: itself (`path_id` is refused). A free canvas: the steps of a presentation path
+  (`purpose: presentation`; a guide is `PRINT_PATH_UNUSABLE` `reason: guide`) on every canvas the path visits; it needs a
+  step printed on this canvas (`reason: not_on_surface`), and no path is `PRINT_PATH_REQUIRED`. Steps are resolved as a show
+  does: a disabled one, a missing target, a Frame not placed on a free canvas (`surface`) or on a flow canvas (`flow`) is
+  `step_skipped` with that `detail`.
+- **Permissions.** `export` on the canvas (else `PERMISSION_DENIED`); a step on a canvas the caller may not read is
+  `surface_unreadable` (the canvas unnamed), on one it may not export `surface_not_exportable` (`surface_id`); either way
+  nothing of that canvas travels. A PDF Frame (`frame_id`) is decoration: it needs to be readable
+  (else `NOT_FOUND`) and a `buckyos.container` of kind `pdf-frame` (else `PRINT_FRAME_UNUSABLE`), no `export`.
+- **The rows** (`rows`: the WASM `Replica`'s `tables_json`, the shape of a session's `baseline.json`): the printed canvases'
+  subtrees, the path and the Viewports of its printed steps, the PDF Frame's subtree, and what those show through `bind`,
+  `owns`, `embed`, `value`, `body`, `def`, `def_dep` and `member` references (tables with their live fields and records,
+  rich texts with pending updates folded in, records' bodies, Block definitions); then every ancestor, whole when readable,
+  else only its id and kind (as the outline's path nodes). Only `shared` scope; speaker notes (`without_notes`) are left
+  out, captions stay; comments — an annotation with a `target` and a Block showing one — are left out (Q7), a sticky note
+  (an annotation without one) is content. What the caller may not read is left out and counted per canvas
+  (`content_unreadable`, `detail` = the count).
+- **Assets** (`assets/<obj_id_to_filename>.<ext>`, the extension by media type — svg, png, jpg, gif, webp, avif, bmp, pdf,
+  none otherwise — since Chromium types `file://` by it; listed in `assets`): the AssetRefs' files and posters and the Blocks'
+  `config.snapshot`; audio and video travel as their poster only (`asset_omitted`, `detail` = the media type), bytes not in
+  the store are `asset_missing`; past 384 MiB or 5000 files `asset_omitted` `detail: package_limit`.
+- **The zip**: every file of the Desktop build's `aiws-print/` (the service's `web_dir`, `--web` standalone; without it
+  `DEPENDENCY_UNAVAILABLE` / `PRINT_RENDERER_MISSING`), `data.js` (`window.__AIWS_PRINT__ = <package>;`) and the assets. It is
+  bound under `<workspace_id>/print/<id>.zip` in the owner's `exports` bucket (7 days) and handed to the caller's App session
+  with nfs-server `bucket.grant_holdings` (the caller's `app_id`, the session's target; a test identity without `app_id`
+  receives nothing). The same head and job give the same bytes (fixed entry times; `printed_at` is the head Commit's time),
+  so `media.page`, which keys its cache on the content, answers a reprint from it.
+- `job`: `mode` from the canvas's `layout.mode`, `title` the canvas's title, `fonts` the root's `config.fonts` (`sans`,
+  `serif`, `mono`, non-empty names only), the rest as given.
+
+`AIWS_PRINT_SAMPLE_DIR=<dir> [AIWS_PRINT_RENDERER=<desktop dist>/aiws-print] cargo test -p aiworkspace-store --test print
+sample_packages -- --ignored` writes a flow and a free sample package (zipped and unpacked).
+
+## Presence and the work log (UI 框架 PRD §4.2, §4.5, §12, K2, K3)
+
+**Presence** is in memory, like the shows: nothing of it reaches the document, its history or a package, and a restart
+forgets it. Every window of a Workspace calls `presence.heartbeat { workspace_id, conn_id, surface_id?, name? }` when it
+opens and then every `interval_ms` (10 s); a connection without a heartbeat for `ttl_ms` (30 s, `AIWS_PRESENCE_TTL_MS` in
+tests) is gone, and `presence.leave { conn_id }` removes it at once (a connection id is its principal's own). `surface_id`
+is kept only when it names a live Surface the caller may read; `name` only from a guest (`≤ 32` characters, the name it
+chose); an account is shown by its principal. The answer — and `presence.list` — is `{ members, interval_ms, ttl_ms,
+server_ms }`: one member per principal (`devices` counts its windows; its `surface_id` is that of the window that changed
+Surface last), the caller first, then by arrival. Each member: `principal`, `self`, `guest`, `name`, `surface_id` (only a
+Surface the reader may read, else `null`), `devices`, `since`, `last_seen`, and — when the reader manages the Workspace,
+or about the reader itself (Q6) — `owner` and `groups: [{ group_id, title }]` (the logical groups it belongs to now; the
+client shows `owner` as “所有者” and no group as “访客”).
+
+**The work log** `ws.work_log { workspace_id, before?, limit?, filter? }` is one timeline, newest first, read from what is
+recorded anyway — never a copy of its own (`store/src/worklog.rs`):
+
+| `kind` | From | Who sees it |
+| --- | --- | --- |
+| `commit` (`import` for origin `import`) | `commits` (with `message`, `origin`, `seq`, `commit_id`, `run_id`, `undoes`) | when it touched something the reader may read now (as `doc.get_changes`) |
+| `run` (`phase: start \| end`, `stage`, `state`, `error_code`) | wish runs in `runs`: the start at `created_at`, the end when the state last left `queued … validating` (`detail.state_at`) | as `proc.get`: one's own, or any with `update` / `manage` on a readable wish |
+| `acl` (`action`, `detail`) | `acl_audit` | managers |
+| `session` (`phase`, `title`, `session_id`) | the session registry (`started_ms`, `ended_ms`) | as `session.list`: owner, presenter, participants, managers |
+| `show` (`phase`) | the non-public shows since the service started (in memory, 200 per Workspace) | readers of the presentation path |
+
+Every entry has `id`, `at`, `actor`, `actor_kind` (`agent` for origin `agent`, `macro` for origin `program` and for runs,
+`system` for origins `source` / `session`, else `person` — an undo, a purge or an import is that person's), `mine` and
+`target` (`{ entity_id, type_id, name, title, kind, deleted, surface_id }`: the first readable non-system entity a Commit
+touched, a run's wish, a show's path; `surface_id` is the Surface it is on — itself, the Surface above a Block, or the one
+whose content folder holds it — when readable) or `null`; a Commit also has `targets` (how many readable entities it
+touched). `filter: mine` keeps the caller's own entries; `automation` keeps Commits of origin `agent` / `program` and the
+runs. Pages: entries strictly older than `before` (the `next_before` of the previous page, `"<at>|<id>"`); each source
+looks at no more than 1 000 rows per call, so a page after a long stretch of unreadable rows may come back short (even
+empty) with `more: true` and a `next_before` to go on from. Commit messages are the author's text in the author's
+language (the Desktop writes the label of the edit); the client says the service's own messages and every other kind
+of entry in the reader's language.
 
 ## Connector (连接线方案 C1)
 
@@ -300,8 +453,9 @@ It may carry `title` (the label text), `config` (appearance, ≤ 64 KiB, not ins
 ## Block-controls (脑图方案, `notepads/done/aiworkspace-mindmap-todo.md` M0)
 
 Design: [脑图对象方案讨论](<../../../doc/workspace/脑图对象方案讨论.md>) v0.4. A **control** is a BlockTree container
-whose `kind` is a control id (`mindmap`, and `composite` — the host of every composite extension control, see
-“Composite controls” below; the list is `controls/core.json`, read by the core with `include_str!` and by the
+whose `kind` is a control id (`mindmap`; `composite` — the host of every composite extension control, see
+“Composite controls” below; the data controls `todo` and `calendar`, see “Data controls” at the end of this
+section; and `pdf-frame`, see “PDF Frame” there; the list is `controls/core.json`, read by the core with `include_str!` and by the
 Desktop): it lays out the Blocks it holds with a named algorithm the clients run (the shared module `controls/`), the
 core only judges shapes. A mind map's nodes are ordinary Cells: `parent_id` is the
 tree (a node's children are Cells under it), `order_key` the sibling order; edges are drawn, never stored.
@@ -310,7 +464,7 @@ tree (a node's children are Cells under it), `order_key` the sibling order; edge
   other value refused), `config` checked (`direction` right / left / both / down, `edge` curve / elbow / straight,
   `spacing { sibling?, level? }` in [0, 2000], `branch_colors` ≤ 64 colours; ≤ 64 KiB) and projected into the
   outline, `locked` as on a group. A control sits on a Surface, in a group, or inside another control (R24).
-- **Children** (`plan.rs` `child_allowed`): a control holds Cells, groups and controls; inside a tree control (the
+- **Children** (`plan.rs` `child_allowed`): a control holds Cells, groups and controls (a data control holds none); inside a tree control (the
   mind map) a Cell may hold Cells and containers too (its nearest container, walking up through Cells, is a control
   laying out a tree — `types::in_tree_control`). Anywhere else, a composite included, a Cell stays a leaf; `tree.move`
   of a Cell that holds Blocks out of a tree control is `CHILD_NOT_ALLOWED`. Connectors are drawn on the canvas, never
@@ -318,7 +472,8 @@ tree (a node's children are Cells under it), `order_key` the sibling order; edge
 - **`"auto"` placement** (`plan.rs` `check_placement`, protocol 1.1): each of `x`, `y`, `w`, `h` is a number or the
   string `"auto"` — not stored, computed by the control when shown; a number pins it. `x` / `y` may be `"auto"` only
   on a Block laid out by a control; `w` / `h` only on a control (its box wraps its children) or on a text view laid
-  out by one (`text_views` in `controls/core.json`: `mindnode`, `shape`, `richtext` — their size is their title's).
+  out by one (`text_views` in `controls/core.json`: `mindnode`, `shape`, `richtext`, `label` — their size is their
+  title's).
   A non-text view keeps a numeric size (also when its `view` changes). A control's own `x` / `y` name its origin
   (the first root's top-left), not its box. `"auto"` cannot leave a control (`tree.move` judges the new place). The
   children of a composite whose definition uses the `fixed` layout are not laid out: their `x` / `y` stay numbers.
@@ -347,6 +502,37 @@ generated into `aiws/controls.json` by `deno run -A tools/build_catalog.ts`). La
 `fixtures/mindmap/layout/*.json` (`MINDMAP_REGEN=1 deno test -A` after an intended change; the formula is not
 versioned, R18); outline cases shared with the service's parser: `fixtures/mindmap/outlines.json`.
 
+### Data controls (控件机制 TODO G2–G6, G13, G14)
+
+`todo` and `calendar` (`data_controls` in `controls/core.json`; `types.rs` `is_data_control`) show the records of the
+tables they bind as **projected Blocks**: a template of `label` / `shape` / `asset` nodes the clients instantiate per
+item, never stored, identity `<control>~<node>~<item>` (`controls/projection.ts`; an occurrence of a repeating event is
+the item `<record>@<original start>`). The container: `layout` implied (`{ mode: "data" }`), a numeric size (never
+`"auto"`), `bindings` checked as on a Cell (no `def_ref`, no `on`), no children at all (`child_allowed`); tables created
+with it in the same Commit under the canvas content folder are owned (`owns`, `plan.rs` `add_owns_edges`). The outline
+projects `bindings` (name → entity id) on data controls and composites. Layouts ship with the host
+(`controls/datalayout.ts`: `list`, `columns`, `month`, `time_grid`, `agenda`); gestures, writes, pop-overs, per-person
+views and the single-control page are the Desktop's (`ui/controls/data/`, `ui/controls/todo/`, `ui/controls/calendar/`).
+Their tables are the standard business tables (“Standard business tables” above). The public contracts are
+`aiws/contracts/todo.json` and `calendar.json` in `component.json`'s shape (`kind: "builtin"`, `version`, `config_schema`,
+`user_state`, `bindings` with `schema_id`, `templates`, `layouts`, `gestures`, `actions`, `agent`), generated from
+`controls/contracts.ts` by `deno run -A tools/build_catalog.ts` and returned by `control.describe { kind }` as
+`control.contract`.
+
+### PDF Frame (打印 TODO §3.3, T3)
+
+`pdf-frame` is the page decoration of a print: header, footer and page numbers, a standard control any canvas may hold
+(a Workspace may have several). Its `config` (checked by the core, unknown keys refused): `page` (`A` — A3, A4 and A5
+share it —, `Letter`, `16:9`, `4:3`, `custom` with `custom_w` / `custom_h` in mm), `orientation`, `header`, `footer`
+and `margin` (side margins, both sides) in the frame's own canvas units. Its numeric size keeps the page's shape: the
+width is stored, the height follows. Its only children are two groups with `slot: "header"` and `slot: "footer"` (one
+each, `SLOT_CONFLICT`), the bands the clients place full-width at the top and bottom; their Blocks (labels, pictures,
+shapes) are ordinary Cells with numeric placements relative to the band. A label's text may hold `{page}`, `{pages}`,
+`{title}` and `{date}`, filled per page by the print renderer. The layout and operations are `controls/pdfframe.ts`;
+the Desktop's control is `ui/controls/pdfframe/`. A print takes one frame of the page's shape (`print.package
+{ frame_id }`, “Printing” above): the frame scales to the page, its content area receives the page's content, the
+instance itself is never printed as content.
+
 ## Extension controls (扩展控件 P0 + P1, `notepads/done/aiworkspace-extension-p0-todo.md`, `notepads/done/aiworkspace-extension-p1-todo.md`)
 
 Design: [扩展实现思路](<../../../doc/workspace/BuckyOS AI Workspace 扩展实现思路.md>) v0.9 (D6 edit → build, A1–A7,
@@ -364,7 +550,7 @@ HTML `parent`, composite wish results and Workspace templates (P2 / P3) are the 
 | Place | Content | Role |
 | --- | --- | --- |
 | home working copy | `/home/<owner>/AI Workspace/<workspace>/controls/<name>/` (a suggestion; the definition never stores a path, each person remembers theirs in `user_state` `aiws:src:<def_entity_id>`) | the editing entry: any editor, IDE or Agent |
-| Workspace snapshot | under a folder (default `data/extensions`, created by the first build): the definition entity (`name` = its identity) and its unnamed source directory (`buckyos.dir`, one member per file) | what a build accepted: instances, exports, forks and `pull` read it |
+| Workspace snapshot | under a folder (default `data/extensions`, created by the first build): the definition entity (`name` = its identity) and its unnamed source directory (`buckyos.dir`, one member per file) | what a build accepted: instances, exports, clones and `pull` read it |
 | library | the caller's bucket `user/aiworkspace/<owner>/library` (key `<pkg_id>/<version>/<path>`) and `library.sqlite` in the service data folder | the controls this user may bring into any Workspace |
 
 A source directory holds at most 64 files; sub-folders are allowed (Q23): a file's name is its relative path
@@ -381,16 +567,17 @@ the core's “sibling names are unique” rule deduplicates concurrent builds an
 (one Workspace, one identity, one definition: Q1). The author is part of the identity, not the caller: whoever pulls
 and builds Alice's control keeps `author_did` Alice's. `def_id` stays the short host-local id.
 
-### `component.json` (`manifest_version: 3`, [schemas/component.schema.json](schemas/component.schema.json))
+### `component.json` (`manifest_version: 4`, [schemas/component.schema.json](schemas/component.schema.json))
 
 | Key | Shape |
 | --- | --- |
-| `manifest_version` | `1`, `2` or `3` (required). A build accepts every version up to its own and reads older ones as their newest form; newer versions only add optional keys (Q19). Version 2 adds `kind: composite` and non-empty `deps`, version 3 `events`, HTML `host_api: 3`, the declarative `button` and composite `events` / `grid`: an older file using one fails the build with a hint to raise it |
+| `manifest_version` | `1` … `4` (required). A build accepts every version up to its own and reads older ones as their newest form; newer versions only add optional keys (Q19). Version 2 adds `kind: composite` and non-empty `deps`, version 3 `events`, HTML `host_api: 3`, the declarative `button` and composite `events` / `grid`, version 4 (控件机制 TODO) `actions`, HTML `host_api: 4` and the composite `projections`, `media`, slot `visible`, events `from { projection }` and `on` (see “Manifest 4” below): an older file using one fails the build with a hint to raise it |
 | `ident` | `{ author_did, name }` (required) |
 | `kind` | `declarative` \| `html` \| `composite` (required). A composite has no `accepts` / `allow_no_source` (it is a container, not a Cell) and no `host_api` (it runs no code) |
 | `title` / `description` | ≤ 256 / ≤ 4000 characters (`title` required) |
-| `host_api` | positive integer: the host API the control was written for (`html.api_version` of an HTML control: 2, the default, or 3; the declarative interpreter is version 1) |
+| `host_api` | positive integer: the host API the control was written for (`html.api_version` of an HTML control: 2, the default, 3 or 4; the declarative interpreter is version 1) |
 | `events` | (version 3) `{ <name>: { title?, description?, params? } }`: the control's public events (next section, “Events and actions”); a composite declares its events in `composition.json` |
+| `actions` | (version 4) `[{ id, title, icon?, modes?, needs?, run }]`, ≤ 16: what the host offers on an instance's near toolbar (see “Manifest 4” below) |
 | `accepts`, `allow_no_source`, `default_size` | as on the definition: data types the main source may have, whether a Cell may have no source, `{ w, h }` |
 | `config_schema` | instance properties, the JSON Schema subset `type` / `enum` / `default` / `required` / `title` / `description` / `minimum` / `maximum` / `minLength` / `maxLength` (+ `properties` / `items` to nest); other keywords fail the build (A7). The Desktop validates values with it (`z.fromJSONSchema`) and builds the instance form from it; the core never checks values (Q15) |
 | `bindings` | named data inputs `{ <name>: { accepts?: [data types], required?: bool, title?, description? } }`, names `[a-z][a-z0-9_]{0,31}`, at most 32. An instance binds them in its Cell `bindings` (`{ <name>: { entity_id } }`); declarative items read them as `<name>.<expr>` (Q18), HTML through `aiws.input(name)` |
@@ -413,11 +600,11 @@ Besides the keys it always had (`def_id`, `version`, `kind`, `title`, `descripti
 | --- | --- |
 | `ident` | `{ author_did, name }`, checked as above; `name` equals `def_id` |
 | `manifest_version` | the `component.json` version it was built from (positive integer ≤ the core's) |
-| `source_dir` | `{ entity_id }`: the live `buckyos.dir` holding the build's source snapshot; a strong `def_source` reference (the directory cannot be deleted while the definition uses it; exports and forks carry it). Not called `source`: that key is a Source (D12), which makes an entity read-only |
+| `source_dir` | `{ entity_id }`: the live `buckyos.dir` holding the build's source snapshot; a strong `def_source` reference (the directory cannot be deleted while the definition uses it; exports and clones carry it). Not called `source`: that key is a Source (D12), which makes an entity read-only |
 | `bindings`, `catalog` | as in `component.json` |
 | `agent` | the self-description text, ≤ 64 KiB |
 | `provenance` | `{ pkg_id?, version?, digest? }`: the package an import came from (absent for a local build) |
-| `deps` | `[{ ident, entity_id }]` (≤ 32): the definitions it builds on, written by `ext.build` / `ext.import` only — any other Commit that changes it is `INVALID_OPERATION` (as the build record). Each entry is a strong `def_dep` reference: the target cannot be deleted while used (`REFERENCE_BROKEN`), exports and forks carry it, and a dependency that would close a cycle is `REFERENCE_CYCLE` (`data { entity_id, cycle }`) |
+| `deps` | `[{ ident, entity_id }]` (≤ 32): the definitions it builds on, written by `ext.build` / `ext.import` only — any other Commit that changes it is `INVALID_OPERATION` (as the build record). Each entry is a strong `def_dep` reference: the target cannot be deleted while used (`REFERENCE_BROKEN`), exports and clones carry it, and a dependency that would close a cycle is `REFERENCE_CYCLE` (`data { entity_id, cycle }`) |
 | `composition` | a composite's checked `composition.json`, inline (≤ 64 KiB). The core keeps its shape only (an object, ≤ 16 slots named `[a-z][a-z0-9_]{0,31}`, `events` shaped as below); what it means is the build's and the clients' (Q15) |
 | `events` | (P2) `{ <name>: { title?, description?, params?, from? } }`, written by builds and imports only (as `deps`); ≤ 16 names, ≤ 16 KiB |
 
@@ -433,14 +620,15 @@ dependency record `derived: { build: { input_digest, builder_version, built_at }
 
 A composite lays out Blocks the user (or an Agent) puts into its slots and draws a frame around them (R23: the
 Chrome is drawn, the content is real Blocks — selectable, annotatable, connectable, addressable). Its
-`composition.json` says three things and nothing else; it never creates or deletes user Blocks:
+`composition.json` says what the table lists and nothing else; it never creates or deletes user Blocks:
 
 | Key | Shape |
 | --- | --- |
 | `layout` | `{ algorithm: "stack" \| "fixed" \| "grid", direction?: "column" \| "row", spacing?, padding?, columns?, gap? }`. `stack` puts the slots' children one after another (`direction`, `spacing` px; default column); `fixed` keeps every child at its own `x` / `y`; `grid` (version 3) fills `columns` (1…12, required) cells per row, `gap` apart, in slot order (its slots' placement is `stack`). `padding` is a number or `{ t, r, b, l }`; numbers in [0, 2000]. The algorithms ship with the host (K2: `controls/`); none is loaded from a package |
 | `slots` | `{ <name>: { accepts?, min?, max?, placement?, title? } }`, ≤ 16 names `[a-z][a-z0-9_]{0,31}`. `accepts` lists `cell:<author_did>#<name>` (an instance of that render control: in `deps` or already in the Workspace, never a composite), a view type (`richtext`, `shape`, …) or `container` (a group or a control); absent: any Block. `min` (0…64) is what inserting an instance creates, `max` (1…1000) what the clients allow. `placement`: `stack` (default), `top` / `bottom` (before / after the stacked slots) or `free` (children keep their `x` / `y`; the only placement of a `fixed` layout) |
 | `chrome` | `{ background?, radius?, border?, title?: { text, slot? }, empty? }`: colours ≤ 64 characters, `radius` in [0, 200], `title.text` ≤ 256 (drawn while `slot`, when given, is empty), `empty` ≤ 1000 (what an empty instance shows) |
-| `events` | (version 3) `{ <name>: { from: { slot, event }, title?, description? } }`: re-raises an event of a child in that slot (next section) |
+| `events` | (version 3) `{ <name>: { from: { slot, event }, title?, description? } }`: re-raises an event of a child in that slot (next section); version 4 adds `from: { projection, role? }` and a default handler `on` |
+| `projections`, `media`, slot `visible` | (version 4) Blocks projected from data, a slot's media played from a config anchor, a slot shown to each viewer for a while: see “Manifest 4” below |
 
 String values may hold `{{config.<key>}}` (a whole `spacing` / `padding` / `radius` may be one); the key must be a
 property of `config_schema` (the instance's `config` value, its default when unset). The build checks all of it
@@ -678,7 +866,10 @@ inside a mounted HTML Block, `emit` is refused (the extension gets `{ handled: f
 
 The canvas has a local, unpersisted `interactive` flag (not in `user_state`), switched with ▶ / ✎ on the toolbar.
 Defaults: `edit` → design, `view` → run, a non-public `show` → run only for Blocks marked `presentation.live`,
-replay and guests → off and locked. In run mode clicking an HTML Block activates it (still within the `html` budget), a
+replay → off and locked; guests and phones run like anyone in view mode (owner 2026-11-12). A canvas mode not chosen
+yet is `view` for a guest without `update`, else `edit`. In view mode an HTML Block runs
+by itself while the canvas runs (within the `html` budget, over it its snapshot) and keeps running whatever is clicked
+or selected; in edit mode's run mode clicking an HTML Block activates it (also within the budget). A
 declarative `button` is enabled and handlers run; a composite's frame does not catch its children's clicks. In design
 mode a click selects and moves, an `emit` runs nothing and the Block shows a corner note “event X (design mode, not
 run)”; “Run once” stays. Writes from handlers and from `aiws.record().set` etc. need `policy.writes`, **or** view mode
@@ -698,6 +889,43 @@ longer mounts HTML Blocks automatically while editing: the same rules as the can
 
 A host older than the definition (`api_version` above what it runs) shows the static snapshot with “needs host API
 n” instead of failing (Q33).
+
+### Manifest 4 and HTML host API 4 (控件机制 TODO G13, G16–G22, H1–H6)
+
+`manifest_version` 4 (`types.rs` `MANIFEST_VERSION`; files of versions 1–3 read as before). Examples of everything
+below: [doc/workspace/control-examples](../../../doc/workspace/control-examples/README.md) (TV screen, time-limited,
+photo vote, listen together; built by `server/tests/ext.rs` `control_examples_and_manifest_4`).
+
+**Actions** (`component.json` `actions`, `store/src/ext.rs` `check_actions`; the build writes them into the definition's
+`actions`, the outline projects a composite definition's as `def_actions`): ≤ 16 of `{ id, title, icon?, modes?: ["edit"
+| "view"], needs?: [capabilities], run: Handler | [Handler, ≤ 4] }`. The Desktop offers each on an instance's near
+toolbar in the modes it names (default both) to whoever holds `needs`, also in view mode and before an HTML control runs
+(`ui/canvas/CanvasView.tsx`, `ui/extensions/actions.ts`). Handlers: `write` / `wish` / `open` / `notify` as in `on`;
+`config { props }` — the instance's own properties, an `entity.set_props` with per-property `expect`; `forward` — handed
+to the running HTML as the request `action:<id>` (a control that is not running is started first). Strings may hold
+`{{now}}` (the service clock) and `{{config.<key>}}`. The `write` and `config` operations of one action are one Commit,
+as the person who clicked.
+
+**Composite (`composition.json`, `check_composition`, `check_projections`, `check_event_keys`)**:
+
+| Key | Shape |
+| --- | --- |
+| `projections` | `{ <name>: { source, mark?, template, layout, placement?, max_items? } }`, ≤ 8. `source.kind`: `records` (a bound table), `members` (a bound directory: `name`, `object_id`, `media_type`, `size`), `counts` (the elements of a list field of a bound table counted, most first: `key`, `count`, `rank`; a select's elements by option label; `of` joins another projection's items by key, ties in its order; `top` 1…100) or `viewer` (`principal`, `first_open`, `remaining_ms`). `mark { binding, field, as }`: `item.<as>` is true when the viewer's own (submitter's) record lists the item. `template.nodes` 1…32 of `{ id, view: label \| shape \| asset, box?, config?, when?, role? }`, placeholders `{{item.…}}`, `{{viewer.…}}`, `{{config.<key>}}`. `layout { algorithm: list \| grid, columns? (grid), gap?, item: { w?, h } }`; `placement` `top` / `stack` / `bottom` places the region like a slot; `max_items` 1…1000. Never stored; identities `<control>.<projection>~<node>~<item>` |
+| `media` | `{ slot, anchor, loop? }`: the media Block in `slot` plays where `config.<anchor>` = `{ pos_ms, at_ms, playing }` says (at server time `at_ms` it was at `pos_ms`), for every viewer by the service clock, by Range from `asset.stream_url`, without activation (`ui/media/BroadcastMedia.tsx`); a viewer's own pause / mute / “back to live” stay local; the end holds the last frame unless `config.<loop>` is true. An empty slot offers whoever has `update` and `structure` “choose a video or sound” through the system file picker |
+| slot `visible` | `{ from: "first_open", for_ms }` (`for_ms` ≤ a year or `{{config.<key>}}`): each viewer sees the slot's Blocks for `for_ms` from their first opening, recorded once in their user state `block:<id>/first_open` by the service clock (`ui/controls/composite/visibility.ts`). A presentation, not access control: edit mode shows everything with the frame marked “time-limited”, static views and exports do not hide |
+| event `from { projection, role? }` | raised in run mode by a press on a projected node of that role (default `body`), params `{ item, projection }` |
+| event `on` | the default handler(s), run when the instance binds none for that event (`ui/extensions/events.ts` `runHandlers`) |
+
+**HTML host API 4** (`html.api_version` 4, `host_api: 4`, manifest 4; hosts run 2, 3 and 4, `aiws.version` is the
+declared one; `ui/extensions/htmlRuntime.ts`, `bridge.ts`):
+
+| Member | |
+| --- | --- |
+| `aiws.onConfig(cb) → unsubscribe` | the instance's `config` as it changes (also refreshes `aiws.context.config`) |
+| `aiws.serverNow()` | the service clock (`ws.time`, calibrated by half the shortest of three round trips) |
+| `aiws.userState.get(key)` / `set(key, value)` | this person's state of this Block, key `block:<entity_id>/<key>` (`[A-Za-z0-9_.:-]{1,64}`) |
+| `aiws.mediaUrl(binding, member?)` | a Range-playable address of a bound audio / video asset or of a member of a bound directory (`asset.stream_url`; a blob URL when no stream address is available) |
+| `aiws.on('action:<id>', handler)` | a declared action forwarded by the host (`forward`) |
 
 ### Source upgrades and migrations (`ext.upgrade`, Q30)
 
@@ -742,7 +970,7 @@ n” instead of failing (Q33).
 - The library refuses a package whose `manifest_version` is above what the service reads; `ext.list_library` reports
   each package's `manifest_version`, so a client older than a package marks it “needs a newer version” and does not
   import it.
-- On phones composite and HTML Blocks are read-only (no new capability).
+- On phones the children of a composite take touches and an HTML Block can be activated as on a computer (控件机制 TODO G22, H3: only guests and replay never run them).
 - Replay and public / guest views keep `interactive` false: HTML Blocks show their snapshot, events run nothing,
   composites lay out as usual.
 
@@ -809,52 +1037,220 @@ outline projects `ink_stroke` (the `stroke` id) on an ink Cell's envelope. The f
 `fixtures/ink/strokes.json` (a mouse line, a pen tap, a pressure stroke with tilt, a three-segment stroke) is
 written by `desktop/tests/datamodel/aiworkspace-ink.test.ts` and committed and read back by `core/tests/ink.rs`.
 
-## Wish runs (许愿格 v0.2)
+## Wish runs (许愿格; AI Native 第一期: analyze → code → run; 许愿格交互升级)
 
-Two `proc` programs (design §13). Runs live in `local.sqlite` `runs` (never exported); working files in
-`<ws>/runs/<run_id>/{work,xllm}`, the `llm.map` cache in `<ws>/cache/llm_map/`.
+One `proc` program for wishes (design §13; `notepads/aiws-ai-native-phase1-todo.md` §2; `notepads/aiws-wish-card-interaction-todo.md`).
+Runs live in `local.sqlite` `runs` (the working record of this deployment: progress, claims, leases; never exported); stage
+folders in `<ws>/runs/<run_id>/work`, the AI answer cache in `<ws>/cache/llm_map/`. The service runs no model and no program: every
+stage of `wish.xllm@1` executes on an executor — the starter's browser (`local`) or the starter's own Agent (`hosted`). The service takes
+the stage snapshot, answers the stage's tools, judges what the executor hands in, and **when the stage ends plans what it produced
+and writes it in one Commit** (origin `program`, written as the run, idempotency key `run/<run_id>`) together with the run's record
+in the wish's `history`. Nothing waits for a confirmation; what a run wrote is undone with `proc.rollback`.
 
 | Program | `params` |
 | --- | --- |
-| `wish.xllm@1` | `wish_id`, `stage: analyze \| execute \| rerun_program \| repair_program`, `parent_run_id?` + `feedback?` (a feedback round), `location?` (`{ surface_id, cell_id, selection, viewport }`, the task location of the map), `request?` (`aiws.request`) |
-| `wish.mock@1` | `wish_id`, `stage: execute`, `provided` — the browser Mock executor's results, planned and applied like a real run |
+| `wish.xllm@1` | `wish_id`, `stage: analyze \| code \| run`, `parent_run_id?` (code: a failed run to repair, or the previous round) + `feedback?` (a feedback round), `location?` (`{ surface_id, cell_id, selection, viewport }`, the task location of the map), `request?` (`aiws.request`), `execution?: { mode: local \| hosted, agent? }`, `session_id?` (the session the stage's Commit is written in: write locks it holds count) |
 
-States: `queued → snapshotting → running → validating → waiting_confirmation → applying → succeeded`, or
-`failed | cancelled | interrupted | conflict | rejected`. A service restart marks running runs `interrupted`
-(no automatic re-run); an `applying` run is reconciled through the Commit idempotency record
-`run/<run_id>/<plan_digest>`. `proc.get { run_id, choices? }` returns progress, the candidate and — while
-waiting — the preview of the plan for `choices` (`{ results: { <name>: keep | replace | new }, confirm_structure? }`);
-`proc.apply { run_id, plan_digest }` applies exactly that previewed plan in one Commit (origin `program`).
+States: `queued → snapshotting → running → validating → applying → succeeded`, or `failed | cancelled | interrupted` (active:
+`queued snapshotting running validating applying`). An executor's lapsed lease makes its run `interrupted` (resumed as a new
+attempt); an `applying` run found without its worker is reconciled through the Commit idempotency record `run/<run_id>`:
+`succeeded` when the Commit happened, else `interrupted` (nothing was written). `proc.get { run_id }` returns `state progress error
+usage aicc execution applied program_log record …`: `applied { status: accepted, commit: { commit_id, seq, … } }` once the stage
+wrote; `record` is the record it wrote into `history` (null before it ended, and for a cancelled or interrupted run). What the stage
+produced stays in the service.
 
-- **Analyze** (`llm.plan`): the model reads `WORKSPACE.md` (the context map) and the read-only tools
-  `ws_outline / ws_find / ws_profile / ws_neighbors / ws_read / ws_query`, and delivers through
-  `submit_analysis` (checked on the spot). Applying writes `analysis` (`wish.analysis.v2`; `basis.digest`
-  is computed by core) and the named `inputs`.
-- **Execute** (`llm.code`): bash tool group plus the read tools and `run_program / put_result / check_results /
-  finish`. The program (`program/main.js`, `export default async function main(aiws)`) runs under Deno:
-  `--allow-read=<work> --allow-write=<work>/output --allow-net`, time and memory limits from the config.
-  Reads of undeclared data are appended to the inputs. Feedback rounds start from the parent's program
-  and direct results on a new snapshot; `repair_program` changes only the program.
-- **Rerun program**: no model; `llm.map` calls only for items not in the cache.
+- **analyze** (`analyze_model`): the model reads `WORKSPACE.md` (the context map) and the read-only tools
+  `ws_outline / ws_find / ws_profile / ws_neighbors / ws_read / ws_query`, and delivers through `submit_analysis` (checked on the
+  spot). When it ends it writes `analysis` (`wish.analysis.v3`, no `approach`: every result comes from the macro; `basis.digest` is
+  computed by core) and the named `inputs`. An analysis that concludes inputs are missing (`status: needs_input` with `blockers`) is
+  not written: the run fails with `NEEDS_INPUT` and its record names them (`error.missing_inputs`); the user binds the input in the
+  wish's properties and analyzes again — a stored `analysis.status` is always `ready`. A blocker `{ code: "external_data", message,
+  wanted: { meaning, origin?, freshness?, fields?: [{ name, type?, description? }] } }` says the task needs data from outside the
+  Workspace: the run fails with `NEEDS_EXTERNAL_DATA` (the record's `missing_inputs` carry `wanted`); a data source that syncs it is
+  built first — by an Agent, which may write one (the browser cannot) — and the wish analyzed again. A `table` result of the output
+  contract may name a `schema_id` (built-in or defined here, see “Sources”): its table is created with it, a result field named like a
+  field id of the schema takes that id, and the standard controls bind it by on_bind. An analysis made elsewhere (Jarvis in a
+  conversation) is handed in with `proc.report { analysis }` on an analyze run the Agent started itself (`buckyos aiws run-start`).
+- **code** (`execute_model`): needs a current analysis (`NEEDS_ANALYSIS` otherwise). The read tools plus `run_program { source }` (the
+  executor runs the macro and hands it in with `proc.program`), `check_results`, `finish`; there is no direct writing. `finish` needs
+  a successful trial run with a manifest. When it ends only the macro is written (`program`: `{ language: js, api_version: 3, source,
+  digest, manifest, produces, run_id }`, with the refinements and appended inputs it brought and the analysis re-stated): the trial
+  run's results go into the record only (`summary.trial`, `checks`, `objects.log`). An error-level check the last trial run still
+  fails ends the coding with `CHECKS_FAILED` and no macro. A coding that stops without an accepted `finish` fails with
+  `DEPENDENCY_UNAVAILABLE` / `CODING_UNFINISHED`; its record's `error` carries `last_trial_error` (why the last trial run failed) and
+  `said` (what the executor's model said when it stopped, `proc.report { finished, summary }`). A repair or a feedback round starts
+  from the parent run's macro, else from the stored one.
+- **run**: needs that and a stored macro that still fits its inputs — `macro_check` (core) on the manifest: a declared field
+  deleted or of another type, an input gone or rebound, another program API → `NEEDS_CODING` with `data.reasons`; a renamed field
+  or table is no reason. The brief is `{ kind: program, source, manifest, budget }`; no model loop. Only the declared inputs and
+  fields are materialized, under the names they had when coded. A failed macro ends the run (`PROGRAM_FAILED`; an HTML result whose
+  code differs from the coded `code_digest`: `MACRO_CODE_CHANGED`; a refused AI call: its `AI_*` sub-code; a failed error-level
+  check: `CHECKS_FAILED`, nothing written). When it ends it writes the results and `last_run`; an HTML definition takes the code its
+  macro version fixed (the first run after a coding), later runs of that version move only its bindings.
 
-**Execution modes (内核架构改进 M3).** `proc.start { params: { …, execution: { mode: service | local | hosted } } }`
-(`wish.default_execution` when absent). Every run records its execution context (`detail.context`: trigger, executor,
-location, AI and compute attribution, the bound task digest, the declared outputs, expiry) or is refused with
-`EXECUTION_CONTEXT_MISSING`. `local`: the starter's browser is the executor — the `proc.start` answer carries a one-time
-`claim_token`; it claims, heartbeats and reports. `hosted`: the Owner's Agent (`ws.set_hosted_exec`) is given a Goal with the run
-reference and claim token (`goals.create` + `goals.activate` on its OpenDAN service) and does the same through
-`buckyos aiws run …`; without a Zone runtime the dispatch is recorded `unavailable` and the run waits to be claimed.
-`service`: the transitional in-service executor (xllm + Deno), selectable while `wish.allow_service_execution` is true (T3-9).
-Applying checks the delegation: a changed wish configuration is `DELEGATION_STALE`, a candidate of a superseded attempt
-or a cancelled run is `RUN_REVOKED`, and results may only land where the task declared (`OUTPUT_NOT_DECLARED`).
+**What a stage's end decides, without asking (许愿格交互升级 §3.3).** A result edited by hand is overwritten; rows and fields the wish
+wrote and no longer produces are deleted; a result not produced this time stays as it was — each is a warning of the record. A plan
+with problems (an output place gone, a result whose type cannot change in place, over one Commit's limits) or a failed pre-check
+(`PLAN_PROBLEMS`, `data.problems`), a Commit conflict (the wish or its outputs changed while it ran: `COMMIT_CONFLICT`) and a
+delegation that no longer holds (`DELEGATION_STALE`, `RUN_REVOKED`, below) fail the run: only its record is written.
 
-Configuration: in service mode `AiWorkspaceSettings.wish` (models `llm.plan / llm.code / llm.chat` through
-AICC, iterations, `max_output_tokens` (every stage sends it; Claude requires one), timeouts, program memory,
-`llm.map` item limit, `deno`). The service exchanges its startup assertion at verify-hub before it listens:
-AICC accepts only verify-hub sessions. Standalone:
-`--wish-config <json>` with `{ provider: { type: "openai", base_url, api_key_env }, analyze_model, … }`.
-Deno: `deno` setting → `AIWS_DENO` → `$BUCKYOS_ROOT/libexec/buckyos-tool/runtime/deno` → `PATH`
-(`deno.exe` on Windows). The Windows program subprocess retains `SystemRoot` after clearing its environment.
+**Check levels (D2).** Every program check of an analysis has `level: error | warning` (`submit_analysis` refuses one without it; a
+review check may leave it out): the analysis decides it, since running has no model in the loop. A failed `error` check fails a run
+(`CHECKS_FAILED`, nothing written) or a coding (no macro kept); a failed `warning` check is written and goes first in the record's
+warnings, so does an `error` check that did not run. A check the macro reports beyond the contract counts as a warning; review checks
+judge nothing.
+
+**Run records (`payload.history`, D7–D9).** Written by the service only — the stage's Commit, a Commit of the record alone when a run
+fails (not into any undo stack), a rollback; a person writing `history` is refused (`PERMISSION_DENIED`; core `check_history`).
+A cancelled or interrupted run has no record.
+
+```
+history: { analyze: [Record], code: [Record], run: [Record],   // newest first, at most 20 a stage (core HISTORY_PER_STAGE)
+           results_count }                                       // runs that wrote results; a rollback takes nothing off
+Record: { id (the run id; a rollback's rb_…), stage, action: analyze | code | repair | run | rollback, ok, at (the run's start),
+          ended_at, duration_ms, by, aicc?: { mode, user_id }, usage?: { model?, input_tokens?, output_tokens?, calls? },
+          error?: { code, sub_code?, detail, missing_inputs?: [{ label?, message, candidates? }] },
+          warnings: [string | { code, …params }] (failed warning checks first, then overwritten hand edits, deletions, the model's),
+          checks?: [{ id, kind, level?, status: passed | failed | not_run | review, text }],
+          summary: analyze { text?, results, checks } | code { text?, trial: { results, checks_passed, checks_total } }
+                   | run { created, updated } | rollback { of },
+          basis: { analysis?, program?, program_record? }, inputs: [{ entity_id, name?, label?, version?: { rev } }],
+          outputs: { analysis?: { results, checks }, program?: { digest, ai }, results?: [{ name, title?, type, entity_id, cells?, action: create | update }] },
+          objects: { prompt?, analysis?, program?, source?, log? }, commit_id?, rolled_back?: { id, by, at }, rollback_of? }
+```
+
+A warning the service gives is `{ code, …params }`, worded by the reader's client in the reader's language; what a model or an
+executor wrote (the analysis's and `finish`'s warnings) stays its own text. Codes: `check_failed { id, text }` (a warning-level
+check failed, or a check outside the contract), `check_not_run { id, text }` (an error-level check did not run),
+`uncited_numbers { name, numbers }` (numbers of a text result not among the macro's facts), `overwrote_manual { name }`,
+`overwrote_manual_cells { name, count }` (derived columns), `deleted_rows { name, count }`, `deleted_field { name, field }`,
+`changed_type { name, field, from, to }`, `changed_structure { name }`, `not_produced { name }` (its earlier version stays),
+`recreated_column { name, field }` (a derived column deleted by hand), `discarded_edits { count }` (a confirmed rollback). Core
+accepts at most 32 a record, a code `^[a-z][a-z0-9_]{0,63}$` with short texts, numbers or short lists of them.
+
+What is large is a content object of the Workspace a record names (`objects`): `prompt` the request as it was (analyze, code),
+`analysis` `{ analysis, inputs }` as the wish kept them, `program` the `program` value as written (`source` its source), `log` the
+macro's output (the last trial run, or the run; its first 256 KiB). They are referenced like assets (`core::types::asset_object_ids`:
+kept, exported and cloned with the wish); a `log` is a reference of kind `log`, readable with `update` on the wish only (it may print
+what a reader of the wish may not read); the others whoever reads the wish. History is at most 1 MiB (the oldest go first). A
+template (`ext.export_template`) leaves `history` out; `tree.clone` of a wish too. Summary text is the reader's: a record keeps
+materials, and the model's own summary as it wrote it.
+
+**Rollback (`proc.rollback { run_id, confirm?, session_id? }`, D3; `update` on the wish).** Only a stage's current record rolls back —
+the newest successful one not rolled back yet (else `NOT_CURRENT_RECORD`). A run's: the inverse of its Commit (`commit_ops`) without
+its `history` part, every expectation `any` — results it updated go back (hand edits it overwrote included), results and Blocks it
+created go, `last_run` goes back. A coding's: `program` back to the previous coding record's `objects.program`, or gone. An
+analysis's: `analysis` and `inputs` back to the previous analysis record's, or `analysis` gone (as it was, basis included: an
+internal write keeps the basis it restores). Edits made since that the rollback would discard (a Commit after the record's that
+touched what it wrote — rolled back runs and rollbacks aside; for a macro or an analysis, a value that differs from the record's)
+answer `{ status: needs_confirm, lost: [{ entity_id, title?, type_id, what: edited | deleted }], hidden_lost }` (only what the
+caller may read is named) and are discarded with `confirm: true`. Otherwise one Commit: `{ status: accepted, commit, record }` —
+the record is the new `rollback` one in front, the rolled back record is marked `rolled_back`. A cloned or imported Workspace keeps
+the records, not the Commits: a run record there does not roll back (`NOT_UNDOABLE`).
+
+**Usage (§2.9).** The model stages' usage is the executor's: `proc.report { …, usage: { model?, input_tokens?, output_tokens?,
+calls? } }` with `finished`, `error` or `analysis` (stored in the run's `usage`). A run's is its macro's AI calls (`results.ai`,
+`aiws.js` `aiStats`): `calls` = complete + map + image + video calls, `input_tokens` / `output_tokens` = complete + map, `model` the
+models joined with `, `; none when it called no model (cached answers are no calls).
+
+**Main status (core `freshness::main_status`, WASM `wish_main_status`).** From the wish's freshness and what the page knows of its
+runs (`{ active?: { stage, state }, last_failed?: { stage, error } }`), the first that holds of `needs_analysis` (next `analyze`;
+reasons `analysis_sources_changed`, `analysis_failed` with the failed analysis's code), `needs_coding` (`code`), `waiting_data`
+(`view_inputs`) / `no_access` (`none`), `cannot_run` (`fix`), `in_progress` (`cancel`), `stale` (`run`), `current` (`none`); a run of
+the stage that resolves the state is `in_progress` first. Nothing waits for a confirmation, and a missing input is a failed analysis,
+not a state.
+
+**The macro and its bridge.** The program host is `aiws/aiws.js` (API v3; guide: `aiws/README.md`). A macro starts with
+`aiws.declare({ inputs: { <name>: [fields] }, ai?, zone?, params?, resources? })`; reading anything undeclared throws. The
+service resolves the declaration into the **manifest** (`{ inputs: { <name>: { entity_id, type_id, fields: [{ field_id, name,
+type }] } }, results: { <name>: { type, code_digest? } }, ai?, zone?, params?, resources? }`, `core::wish::check_manifest`), shown in
+the wish's `body`. Every executor runs `lib/run.js` exactly the same way; what leaves the snapshot goes through its bridge
+(`globalThis.__aiwsBridge(op, req)`; the hosted runner speaks it over stdio, `lib/run.js --bridge`), answered by `aiws/host.js`:
+`sql` → `proc.tool sql`, `ai.complete` / `llm.map` → the executor's own AI session with `proc.tool llm_cache` (kept per AI-paying user:
+one person's executor never answers another's runs), `zone.fetch` → the executor's session, the Zone's hosts only (`ZONE_ONLY`), GET / HEAD
+only (`ZONE_READ_ONLY`), under a prefix of `declare.zone` only (`ZONE_NOT_DECLARED`; 权限需求 R34), `ai.image` / `ai.video` → one AICC
+generation with the executor's session (`helper.text_to_image`, `image.img2img` after `route.resolve` when the macro gives reference
+pictures, `helper.video_generate`; a running AICC task is followed in the task manager up to `budget.media_timeout_secs`), whose
+output (a named object) the executor imports with `asset.import_object { obj_id }`: the macro gets a media reference `{ kind,
+object_id, media_type, size, … }`, never the bytes, and writes it with `aiws.result.file(name, media)` — a file result
+`{ object_id }` that staging accepts only for an asset this Workspace has or staged (else the run fails: `… is not a file of this
+Workspace`), re-staged with its sniffed image size and a file name. Generations are cached in `llm_cache` by the request (the hit is
+imported again for the run). Waits for generated media do not count against the macro's time limit. Limits: the smaller of what the
+macro declares and the stage's `budget`; an undeclared AI capability is `AI_NOT_DECLARED`, a spent one `AI_BUDGET_EXCEEDED`.
+
+**Stage tools of an executor** (`proc.tool { run_id, attempt, name, args }`, answers `{ status: ok | error, text?, code? }`): the
+stage's model tools, and
+
+| Tool | Args → answer |
+| --- | --- |
+| `sql` | `{ query, params?, declare? }` → `{ sql: { columns, rows, truncated } }`: one SELECT over the declared table inputs only (table = input name; columns `_id`, the declared fields under their declared names, `"<f>#raw"`); a view input is its view's rows; coding resolves `declare` by field name, running uses the stored manifest. Per run at most `budget.sql_max_calls`. |
+| `llm_cache` | `{ get: [key…] }` → `{ hits: { key: value } }`; `{ put: [{ key, value }] }` → `{ ok }`. Keys `^[0-9a-f]{64}$` (at most 2000 a call), values up to 64 KiB. The service only keeps the answers. |
+
+`proc.claim` answers the stage brief with `budget { iterations, program_timeout_secs, max_output_tokens, map_model, complete_model,
+llm_map_max_items, ai_max_calls, ai_max_tokens, sql_max_calls, image_model, video_model, image_max_calls, video_max_calls,
+media_timeout_secs }`; `proc.files` answers `{ files, stage: { budget, manifest } }` —
+`context/` (only the inputs; no data or Block tree), `request.json`, `catalog/`, `lib/` (`aiws.js`, `run.js`, `host.js`),
+`program/main.js` when there is one — and over `snapshot_download_max_bytes` fails the run with `SNAPSHOT_TOO_LARGE`
+(`data { bytes, limit }`). `proc.program { source, results, log, files }` judges a macro run: coding answers what the model reads
+(previews, checks, manifest, problems); running, a failure ends the run. `proc.report { finished | analysis | error | progress }`;
+`usage?` beside them; results are never reported directly.
+
+**Execution modes (内核架构改进 M3; 浏览器优先; 2026-11-16).** `proc.start { params: { …, execution: { mode: local | hosted, agent? } } }`
+(`wish.default_execution` when absent; any other configured value counts as `local`). Every run records its execution context
+(`detail.context`: trigger, executor, location, AI and compute attribution, the bound task digest, the declared outputs, expiry) or is
+refused with `EXECUTION_CONTEXT_MISSING`. Either way the AI resources are the starter's own (`aicc: { mode: current_user, user_id:
+<starter> }`; an Account, or an Agent that started the run itself; anybody else is `AI_ATTRIBUTION_UNAVAILABLE`). `local`: the
+starter is the executor — the `proc.start` answer carries a one-time `claim_token`; it claims, heartbeats and reports. `hosted`: one of
+the starter's own Agents executes it — `agent` (its DID or AgentId; without it the starter's only Agent; none, or several without
+naming one, is `EXECUTION_CONTEXT_MISSING`, the latter with `data.agents`; somebody else's is `PERMISSION_DENIED`), checked against
+system-config `users/<starter>/agents/<id>/spec`, so only an account starts one. The context names it (`executor: { kind: agent,
+principal: <AgentId>, did, owner: <starter> }`, `compute` the starter); the service gives it a Goal with the run reference and claim
+token (`goals.create` + `goals.activate` on `/kapi/<AgentId>` through the node gateway, with the starter's session — an Agent takes work
+from its owner only), and it works through `buckyos aiws run-*` with its own session, its model calls billed to the starter. The run
+reads and writes as that Agent: judged as the starter while the Workspace configured nothing for it (权限需求 R16). Without a Zone
+runtime the dispatch is recorded `unavailable` and the run waits to be claimed. Where it was handed (`dispatch`: the Agent, its goal,
+why it failed) shows to the starter and managers; others see its `status` and `at`. The stage's end checks the delegation: a changed
+wish configuration is `DELEGATION_STALE`, the work of a superseded attempt or a cancelled run is `RUN_REVOKED`, and results may only
+land where the task declared (`OUTPUT_NOT_DECLARED`).
+
+**The macro identity (权限需求 §4.5, Q31–Q32).** Coding and running read and write as the macro identity: the trigger's permissions
+as they are now, bounded by the wish's group when it is bound with `intersection` (`acl.bind_macro`; `union` adds nothing until
+trusted executors). It bounds the stage snapshot, the macro's `sql`, the run token's reads (an input the group cannot read fails the
+run: `DEPENDENCY_UNAVAILABLE`), the pre-check and the Commit at the stage's end — judged as it is then; an analysis is written as its
+analyst. A run is written as that identity, and it always writes the wish (`last_run`, results) — so `proc.start` of `code` / `run` refuses with
+`PERMISSION_DENIED` / `MACRO_CANNOT_WRITE` (`data { missing, group_id }`) when the identity cannot update the wish or write where its
+results go: someone holding only `run` cannot run anything yet. An HTML page a run writes (origin `program`) needs no `manage`, but is
+`trusted` only when the identity manages the definition; a manager vouches later (`entity.set_keys trusted: true`), which is no
+hand edit of the result. `trusted` is this Workspace's state, not content: packages, templates, clones and versions carry the code
+without it, and whoever brings it in decides again. Only writes of `program` on a bound wish are audited (`macro.changed`). `aiws.zone.fetch` carries the
+runner's session: a macro written by someone with `update` reads, when a manager runs it, what that manager may read (a known risk,
+Q33). A wish's freshness shows each viewer what it may read: an input it cannot read is `input_problems: [{ reason: unreadable }]`
+and never a `needs_coding` reason about its fields; core `main_status` calls that `no_access` (next action `none`).
+
+Configuration: `AiWorkspaceSettings.wish` — `analyze_model`, `execute_model`, `map_model`, `complete_model`, `image_model`,
+`video_model` (AICC selectors), `analyze_tool_iterations`, `execute_tool_iterations`, `max_output_tokens`, `program_timeout_secs`,
+`llm_map_max_items`, `ai_max_calls`, `ai_max_tokens`, `sql_max_calls`, `image_max_calls`, `video_max_calls`, `media_timeout_secs`,
+`snapshot_download_max_bytes`, `default_execution`: what every stage hands its executor. Standalone: `--wish-config <json>` with the same keys.
+
+## Workspace settings and personal preferences (UI 框架 PRD §4.6, §12, K4)
+
+Shared configuration is content. The **Workspace's settings** are the root's `config` (an object of at most 64 KiB; the
+client owns the keys, `toolbar` first): written with `entity.set_keys` / `entity.unset_keys` / `entity.set_props { key:
+config }` on `root`, which needs `manage` on `/` besides the usual `update`; committed, undoable, carried by clones,
+packages and templates like the root's title. Every member reads them in `ws.get_info` (`settings`, `settings_rev`: the
+`config` key's version for `expect`), whatever it may read of the tree. `cover` is the one key the service checks
+(`root_cover`, UI 框架 PRD Q37): `{ object_id }` of an uploaded PNG, JPEG, GIF, WebP, AVIF or BMP picture of at most
+8 MiB, stored as `{ object_id, media_type, size }` from the verified content. It is an asset of the root (retained like
+any), so it travels with the settings: a self-contained package, a clone and a template carry its bytes; a package
+without assets lists it as missing, and where its bytes are absent `ws.list` has no cover. A **Surface's** toolbar is `config.toolbar` on the
+Surface; changing it needs `structure` on that Surface. A load (package, clone, template) and a replay take both as they
+are.
+
+**Personal preferences** are not: `user.get_prefs` / `user.set_prefs` keep one JSON object per principal in the service's
+`users.sqlite` (each Workspace has its own origin, so browser storage cannot carry a preference from one to another, nor
+to another device). They follow the person into every Workspace and are never exported, cloned or carried by a template.
+`ws.get_info { record_open: true }` (a Workspace session opening) records when the caller opened it there too; `ws.list`
+returns it as `opened_at`.
 
 ## Storage
 
@@ -875,7 +1271,7 @@ user/aiworkspace/<owner>/exports  (data, temp 7 d)  <ws>/export/<id>.bcanvas, <w
 named store reclaims what no binding holds. An asset is bound from its upload on: while staged (24 h unless a Commit
 references it), while an alive entity references it (`assets.ended_seq IS NULL`) and through its retention period as
 history (`history_retention_days`, 30 by default); `ws.purge_deleted` ends it at once. Every snapshot (checkpoints, exports,
-fork sources, import checks) and the versions a Commit generates are bound as one **retention set**: a DirObject naming every
+clone sources, import checks) and the versions a Commit generates are bound as one **retention set**: a DirObject naming every
 object of their closure, so the named store's cascade (which follows Dir / File / ChunkList, not `jobj`) keeps all of it.
 `ws.delete_checkpoint` / `ws.release_retention` unbind; the hourly sweep (`Service::sweep`) unbinds expired uploads and
 history and, after 30 days, what a trashed Workspace held. The `usage` ledger (`ws.get_info.usage`: `content`, `assets`,
@@ -889,7 +1285,7 @@ count on the owner's app pool (`storage_quota_mib`).
 (revoking there ends the audience's access here); any write right, a subtree's included, locks the Workspace
 for the show; a Workspace runs at most 4 clones at once and each counts on its quota (`clones`).
 
-`storage_schema_version` is 5 (FORMAT 1.0: `commit_deltas`, `usage`, `user_state.revision`, `refs.mode` / `integrity`, `entities.schema_id`, `grants.task_digest` / `outputs_json`; 5: `bucket_key` / `bucket_version` on `assets`, `snapshots`, `entity_versions` and `staged_assets`, no `retentions`); folders of an older version are refused, not migrated —
+`storage_schema_version` is 6 (FORMAT 1.0: `commit_deltas`, `usage`, `user_state.revision`, `refs.mode` / `integrity`, `entities.schema_id`, `grants.task_digest` / `outputs_json`; 5: `bucket_key` / `bucket_version` on `assets`, `snapshots`, `entity_versions` and `staged_assets`, no `retentions`; 6: every entity named — a version-5 folder is opened and its unnamed entities named in tree order, no Commit, see “Paths and names”); folders older than 5 are refused, not migrated —
 reinstall the data of a development Zone.
 
 One writer per Workspace (a mutex around its connections); a Commit is planned on an overlay,
@@ -905,6 +1301,182 @@ vector `fixtures/vectors/apply-log.json` (`core/tests/apply_log.rs`) proves a re
 its digest without any planner. Local, not-yet-accepted submissions are still planned on the replica for its
 provisional view.
 
+## Finding, reading and querying (核心 API 调整, `notepads/aiws-core-api-unification-todo.md`, design `notepads/aiws-core-api-design.md`)
+
+One interface for the vague reads — finding, plain-text reading, text and SQL queries — and the common properties;
+precise reads and writes stay with each type (`doc.read` with a selector, `doc.commit` with typed operations). Code:
+`core/src/naming.rs`, `path.rs`, `body.rs`, `search.rs`, `meta.rs`, `sqlview.rs`; `store/src/sql.rs`.
+
+### Paths and names
+
+- **Every entity but the root has a `name`** (R14, R19), unique among the live siblings that share its namespace (shared
+  names are seen by everyone; a personal or participant entity also meets its own scope). A name nobody chose
+  *follows* the entity: its title's name (`title`; a record's `p:title` / `p:name`; an asset's `title` or `file_name`) —
+  control characters dropped, `/` → `-`, no leading `~`, at most 64 characters — moved aside with `-2`, `-3`… when
+  taken; without a title a counter, `<prefix>-<n>` one above the largest `n` of that prefix among the siblings (deleted
+  ones too): a Block's view type (`text-3`, `table-1`), a container's kind (`group-2`), else a short type name
+  (`table`, `doc`, `record`, `file`, `note`, `wish`, `def`, `dir`, `viewport`, `path`, …). Tables and rich texts have
+  no title: their name is their label. Whether a name follows is not stored: it follows while it is still what the
+  rule gives. The planner names on `entity.create` (the normalized operation records the name, so replay and replicas
+  agree), renames with the title in the same Commit (`entity.set_keys`), moves a following name aside on `tree.move`
+  and `entity.restore`, and `entity.rename { name: null }` gives the name back to the rule. A name given on
+  `entity.create` that is just the title's name moves aside like a following one; any other name that is taken is
+  `NAME_CONFLICT`. Names: 1–128 characters, no `/`, no control characters, not starting with `~`, not `.` / `..`.
+  Storage schema 6: a version-5 store gets names for its unnamed entities when it is opened (`naming::backfill`, tree
+  order, no Commit); an imported package of an older build is named after its content root is verified.
+- **One path syntax** (R5) for `doc.resolve`, `doc.list` / `doc.find` / `doc.query`, `doc.read { path }`, the object
+  paths, the stage tools, the CLI and the HTML host's `aiws.resolve`: `/` is the root, each step a name
+  (`/data/销售`, `/surfaces/看板/text-3`); `~<entity_id>` starts at an entity (`~sales/…`). Every step must be readable
+  and live, otherwise `NOT_FOUND` (not readable and not existing look the same). A printed path starts at the highest
+  ancestor the caller reaches by names: an unreadable ancestor is never named, the path starts at `~<id>` below it.
+  When a caller sees several siblings of one name (a shared one and its own personal one; a reviewer and several
+  participants'), the name reaches the shared one, then the caller's own, then the first; the others are *shadowed*
+  (`shadowed: true` in a listing) and reached by `~<id>`.
+- **The outline** (`doc.outline`, the Desktop's two trees; UI 框架 PRD §4.1.1): every readable, alive entity in tree
+  order, each with its envelope and outline projections. A caller granted only part of the Workspace (one canvas
+  folder, one canvas, `/data/销售`), or refused an ancestor with an allowance below it, still gets what it reads in its
+  place: each unreadable ancestor of a readable entity comes before it as a **path node** —
+  `{ entity_id, type_id, kind? (a container's), parent_id, order_key, path_only: true }` and nothing else: no name or
+  title (a printed path does not name it either), no content, no capabilities. A path node stays unreadable: `doc.read`,
+  `doc.list`, paths through it are `NOT_FOUND` as before, and the readable entity's path starts at `~<id>` below it. An
+  entity outside the caller's scope (another's personal one) hides its subtree; an unreadable entity with nothing
+  readable below is not listed. Code: `core/src/read.rs` `outline` (the descent below an unreadable entity happens only
+  above a layer that allows `read`, `Access::read_layers`).
+- **Type filters** (`type`, `not_type`: a comma list or an array): short types `table`, `richtext`, `record`,
+  `annotation`, `block`, `container`, `asset`, `dir`, `wish`, `def`, `viewport`, `path`, `task`, `response`, `result`,
+  full `type_id`s, or `container:<kind>`. `doc.find` and text queries leave out `annotation`, `viewport`, `path`,
+  `task`, `response` and `result` unless `type` names them.
+
+### Common meta and body
+
+`doc.read { as: "meta" }` (also the summary property `meta` of an entity object) is what an entity is, without reading
+its text or its records: `entity_id`, `path`, `name`, `name_follows`, `title`, `type`, `type_id`, `kind` (container
+kind, Block view type, annotation kind), `schema_id`, `schema_version`, `scope`, `parent { entity_id, path }`,
+`version { content_rev, meta_rev, life_rev, struct_rev, epoch, head_seq }`, `body { state, format, format_version,
+etag, records, bytes, reason? }`, `data { mode: local | url_query | synced, write: edit | refresh | none, source?, derived? }`
+(data entities; `write` says who writes the content: Commits under `capabilities`, only the Source's refresh — edits are
+`SOURCE_READ_ONLY` — or nobody here, the rows being remote; `capabilities` and `ops` stay the ACL's and the type's),
+`children`, `capabilities` (the caller's, as everywhere), `ops` (the Commit operations its type takes: the `types` column
+of `schemas/operations.json`), `shows` (a Block: what it shows `{ entity_id, path, type }`, a table view with
+`view_sql`, `view_count_sql`, `view_group_sql?`, `view_diagnostics?` or `view_error`; a control: its bindings),
+`definition`, `ref`, `degraded?`, `lock_holder?`, `availability?`.
+
+`doc.read { as: "body" }` (the property `body`) is the entity in plain text (R6) — what Agents read, text queries match
+and a screen reader will speak: a sequence of parts joined by newlines, paged by parts (`max_bytes` 64…262 144,
+default 32 768; a part longer than a page is cut on a character boundary and marked `partial`), `next_cursor` bound to
+the `etag` (a changed body is `SNAPSHOT_EXPIRED`); `selector` reads one part; `parts: true` adds each part's
+`{ selector?, entity_id?, start, end }` (UTF-8 byte offsets in `text`). `state`: `full`, `definition` (a URL table:
+its definition only, rows are remote), `fallback` (the native JSON of an unknown or degraded entity, and of viewports,
+paths and session entities) or `unavailable` (`reason: binary | too_large`). Per type (`BODY_FORMAT_VERSION` 1):
+
+| Type | Format | Text |
+| --- | --- | --- |
+| rich text | `text/markdown` | each top-level block's Markdown (`richtext_block` parts) |
+| table | `text/csv` | header `_id,<field names>[,_body]`, then one record per line (`table_record` parts) in `record_id` order; values as shown (§“Display values”) |
+| record | `text/plain` | `<property>: <value>` per property (`doc_key` parts) |
+| annotation | `text/plain` | `Note on <target path>`, the quote, the text |
+| folder, data, surfaces | `text/plain` | one line per readable child: `<name>[/] <type or kind> "<title>"` |
+| canvas, group | `text/markdown` | `# <title>`, then each Block in reading order (top to bottom, left to right) as `[<name>] <Block text>` |
+| Block | `text/markdown` | its title (a text view: the title itself), what it shows by path (a table view: the table's path, the view in words, its columns and its SQL; a note: the note's text), `config` text keys. It never inlines the content of the data it shows |
+| control | `text/markdown` | a mind map's Markdown outline of its Blocks; a data control names the tables it shows |
+| asset | `text/plain` | file name, media type, size; the content of a text asset up to 256 KiB |
+| directory | `text/plain` | one line per member (`folder_member` parts) |
+| wish | `text/markdown` | title, prompt, inputs by path, output, last run state |
+| definition | `text/markdown` | title, description, agent text, config properties, bindings |
+
+**Display values** (body, the display columns of SQL): select → label; multi_select → labels joined `; ` (SQL: a JSON
+array of labels); object_ref → `<title> (<path>)` (SQL: the path), `~<id>` when unreadable; currency → `<code>
+<amount>` (SQL: the amount as REAL, the code in `<name>#currency`); decimal → the stored string (SQL: REAL); boolean →
+`true` / `false` (SQL: 1 / 0); date, datetime, text → as stored; json → compact JSON; formulas and empties → empty. The
+`etag` covers the field definitions and the referenced entities' versions: renaming an option or a referenced entity
+changes the body, not the record.
+
+### Discovery
+
+`doc.list { at?, type?, not_type?, schema?, limit?, cursor? }` lists the readable direct children of a node (default
+100, at most 1000); `doc.find { at?, depth?, name?, type?, not_type?, schema?, limit?, cursor? }` walks under a node
+in pre-order (not into what the caller cannot read; depth ≤ 16; default 50, at most 200; at most 20 000 entities per
+call, `complete: false` and a cursor otherwise), keeping the entities whose name or title contains `name`
+(case-insensitive, literal; `match: name | title`). Items: `entity_id`, `name`, `path`, `type`, `type_id`, `kind?`,
+`title`, `children`, `content_rev`, `body: { state, format }`, `schema_id?`, `scope?`, `shadowed?`. Cursors are bound
+to `head_seq` (a moved Workspace is `SNAPSHOT_EXPIRED`) and to the request.
+
+### Text and SQL queries
+
+`doc.query` takes exactly one of `text` or `sql` (R3, R11); the old table query (`view_id`, `source_id`, `filter`,
+`sorts`, `fields`, `group`, …) is refused, and a URL table's rows are `doc.source_query`.
+
+- **Text** `{ text, case?, at?, depth?, type?, not_type?, limit?, cursor? }`: a literal (1–256 characters; `regex` and
+  the like are refused), case-insensitive by Unicode lower-casing unless `case: true`, in names, titles and bodies —
+  what `body` reads, so a select is found by its label and a hit's `selector` (`table_cell`, `richtext_block`,
+  `doc_key`, `folder_member`) points into the text the caller reads. Containers are matched by name and title only
+  (their bodies are their children). The entity at `at` (unless the root) and its subtree in pre-order. One hit per
+  matching text, at most 5 per entity (`more` counts the rest), 20 by default, at most 100; `snippet` is 40 characters
+  on each side. No index: a call scans at most 8 MiB of text or 1 second; `coverage { complete, scanned, bytes,
+  skipped: [{ entity_id, reason: definition | binary | too_large }] }` says what was covered (`definition`: a URL
+  table, whose name, title and definition were searched but not its remote rows), and an empty answer means
+  "not there" only when `complete` is true (otherwise `next_cursor`, resuming inside a table at its record).
+- **SQL** `{ sql, params?, tables?, max_rows?, expect_head? }`: one SELECT run by SQLite itself (R12) on a read-only
+  connection, over **logical tables**: the temporary view of a local table, created the first time the statement names
+  it — by its path (`FROM "/data/销售"`), `"~<entity_id>"`, its id, or an alias of `tables: { alias: path | id }` (with
+  `tables`, only those). Columns: `_id` (record id), `_rev`, `_body` (the path of the record's body), `_record` (the
+  record as `doc.read` gives it, as JSON text: what the Desktop renders and edits), and per live field `"<name>"` (the
+  display value) and `"<name>#raw"` (the stored value: option ids, the exact decimal, a reference or currency object as
+  JSON text); a currency field also `"<name>#currency"`; a field named like a system column is `"<name>#field"`.
+  Joins, CTEs, sub-queries and window functions work. A logical table's column is an expression over JSON, so a join
+  on it cannot use an index: with large tables put the smaller side in `WITH d AS MATERIALIZED (SELECT … FROM "/data/部门")`
+  and join to `d` — SQLite then indexes it (100 000 × 1000 records: ~0.12 s instead of past the budget; the time-limit
+  error of a query over several tables says so). The store keeps `sqlite_stat1` of `table_records` for the planner
+  (refreshed at open when missing and after writes passing a tenth of the records; the STAT4 samples are dropped, they
+  make SQLite scan the large side once per row of the small one). An authorizer allows only SELECT, reads through the logical
+  tables and functions (not `load_extension` and the like): kernel tables, `table_records` directly, writes, `ATTACH`,
+  `PRAGMA` and recursive CTEs are `INVALID_OPERATION` / `SQL_NOT_ALLOWED`, a syntax error `SQL_ERROR`, a table the
+  caller cannot read or that does not exist `NOT_FOUND`, a URL table `NOT_MATERIALIZED`. Budgets: 16 KiB of SQL, 2
+  seconds (`LIMIT_EXCEEDED`, `data.limit: time`), `max_rows` (default 1000, at most 5000; more is `truncated: true`),
+  4 MiB of result (`LIMIT_EXCEEDED`, `bytes`). A query runs with the Workspace held: commits to it wait for it (at most
+  the 2 seconds; a text query at most its 1 second). Answer: `columns`, `rows`, `truncated`, `read: [{ table, entity_id,
+  path, content_rev }]` (the tables actually read, with their versions), `head_seq`. Comparisons, ordering and NULLs
+  are SQLite's; the functions `aiws_dec_cmp(a, b)`, `aiws_label`, `aiws_labels`, `aiws_pick` and the collation
+  `aiws_dec` (exact decimal order) are there for the compiled views. `expect_head: { epoch, seq }` refuses a Workspace
+  at another head (`SNAPSHOT_EXPIRED` / `HEAD_MISMATCH`): the Desktop sends its confirmed head and runs no SQL while it
+  has unconfirmed changes (R16). SQL runs on the service and on a wish stage's snapshot, never on a browser replica.
+- **Table views as SQL.** A table view Block keeps its definition (`filter`, `sorts`, `group`, `manual_order`,
+  `fields`); `sqlview::compile_view` turns it into the SELECT that gives the rows, the order and the group counts of
+  the evaluator (`filter::run_query`, kept for the browser replica, R16) — `store/tests/sql.rs` holds them side by side.
+  It appears in the Block's `meta.shows.view_sql`, is what the stage tools and wish inputs (`table_view`,
+  `table_query`) read through, and what the Desktop runs when a tab holds no replica (WASM `view_sql`). A view's
+  `row_limit` (B7-3) is a display limit only: the Block shows the first `row_limit` rows of that SQL (`meta.shows.row_limit`); the
+  data keeps every row.
+
+### Objects
+
+`obj://aiworkspace/<ws>` is a directory: its index (one index, R1) runs `op=ls` (default), `op=find&name=…` or
+`op=grep&text=…` with `at`, `type`, `not_type`, `schema`, `depth`, `case` in the URL query or in the `query` object of
+the action (`page_size`, `cursor` page it; method `doc.index`); rows link to entity objects (a body hit with its
+selector) and have the columns `type, kind, name, title, path, parent, on, selector, snippet`. An entity object's
+summary property is `meta`, then `body` (`?cursor=&max_bytes=&parts=true`, `?selector=`) and `content` (the native
+content; `?mode=fixed&version=<json>` reads that version or fails, R2). HTTP status by error code: `PERMISSION_DENIED`
+403; `NOT_FOUND`, `TARGET_DELETED`, `VERSION_NOT_RETAINED`, `REFERENCE_BROKEN` 404; `INVALID_OPERATION`, `INVALID_SCHEMA`,
+`UNSUPPORTED_VERSION` (a fixed version of `meta` / `body`) 400; others 500.
+
+Actions (AI Native 余下任务 C1; R43) are `proc.start` through the same kRPC entry with the caller's credentials, so an
+action is refused or started exactly as that call; there is no approval gate (Q11): the Profile gives each its
+`x-buckyos:risk`, and whether to ask the user first is the caller's (a page in its code, an Agent by its manual). An
+entity declares only those that apply to it (read from its `meta`, so a caller who cannot read it sees none): a wish
+`analyze`, `code`, `run` (`write`; `wish.xllm@1` with that stage, the input is the rest of its `params`), an entity a
+Source writes (`data.write: refresh`, not a session feed) `refresh` (`idempotent_write`; `source.refresh@1`). Each takes
+an `idempotency_key` (a new run per call without one) and answers the run. The root object's `controls` is the
+Block-controls catalogue (`control.list`).
+
+### Writing
+
+Precise writes are Commit operations by type through `doc.commit` (R8): `meta.ops` lists what a type takes and
+`schemas/operations.json` describes each (`types`, `capability`, `class`); the twelve the helpers build have `params`, a
+JSON Schema in `commit-request.schema.json` `$defs` (`core/tests/schemas.rs` holds them against the planner: what a
+helper builds conforms and is accepted, an unknown parameter is refused by both). The websdk builds the frequent ones
+(`aiws_write.ts`: rows and cells by field name and option label, fields, options, rich text blocks from Markdown,
+rename, move, properties — with `expect` from what was read and an idempotency key) and `buckyos aiws` has the verbs.
+
 ## Protocol
 
 kRPC: `POST /kapi/aiworkspace` with `{ "method", "params", "sys": [seq, session_token] }`.
@@ -918,46 +1490,77 @@ an **account** (principal = user id; *restricted* when its session carries a cei
 token is checked with `verify_session_token_opened(token, aiworkspace)` — a restricted session without the
 `aiworkspace` scope is refused before anything else; the class comes from the claims (`principal_kind`, `external`,
 `restricted`, `auth_method`), never from the shape of the principal. Restricted accounts, Externals and guests own
-nothing: `ws.create`, `ws.import`, `ws.fork` and `ws.list_subjects` refuse them
-(`session_kind_not_allowed`); `ws.list` shows them only Workspaces granted to them (by name, group, contact or a joined
-entry — never through `public` or `*`).
+nothing: `ws.create`, `ws.import`, `ws.clone` and `ws.list_subjects` refuse them
+(`session_kind_not_allowed`). `ws.list` shows anyone only the Workspaces it owns or whose entries or groups name it —
+never one it could only enter anonymously.
 
-**Grant subjects** and whom they match:
+**Permissions** (权限需求 `notepads/aiws-permission-system-prd.md` §4; `store/src/acl.rs`, `core/src/access.rs`). One ACL of
+entries `subject × resource → allow, deny` (9 capabilities), kept in `local.sqlite` (`acl_entries`), never in the
+document's history. Interfaces name a resource by the core API path (`/`, `/data/销售`, `~<id>/…`) or an entity id;
+storage binds the entity id (`""` = `/`), so a rename or a move keeps the entry with its entity. Each step of a path must
+be readable; personal and session scoped entities are not targets. Subjects:
 
-| Subject | Matches |
+| Subject | Who |
 | --- | --- |
-| `<user id>` / `<did>` | that account / that External (exact principal) |
-| `public` | everyone, guests included (a public link; never `manage`) |
-| `*` | unrestricted accounts only (not Limited, External, guests or services) |
-| `group:<id>` | accounts in that system user group (`users/<id>/settings.groups`) |
-| `contact:<owner_did>#<tag>` | DIDs in that owner's contact group (msg-center `contact.check_membership`, projections included); only the owner (caller DID = `<owner_did>`) may write such a grant, so nobody probes someone else's groups |
+| `<user id>` / `<did>` / `guest:…` / `link:…` | that single caller (an Agent's DID too: naming it anywhere here makes the Agent a subject of its own, Q29) |
+| `@<group id>` | the members of a logical group of this Workspace (`acl_groups`, `acl_members`) |
+| `@owner` | the owner (`local_meta.owner`): always everything, takes no entry, cannot be refused |
+| `@all` | everyone who may enter: group members, callers with an entry, `@guest` when it exists; never `manage` / `run` |
+| `@guest` | anonymous visitors and signed-in callers in no group — only while anonymous access is on (`acl.set_anonymous`); never `manage` / `run` |
+| `@creator` | for each entity, the principal that created it (`entities.created_by`); never `manage` |
+| `@pub:<entity id>` | the readers of that entity's inner-path publication (`ws.publish`), `read` only; they come through the publication routes, never into the Workspace |
+
+Group members (never another group): a principal, `group:<id>` (a system user group: `users/<id>/settings.groups`), `contact:<owner_did>#<tag>`
+(that owner's contact group, msg-center `contact.check_membership`; only the owner, caller DID = `<owner_did>`, adds one),
+`*` (every unrestricted account; not Limited, External, guests or services).
+
+A capability on entity E is decided by the nearest layer — E, each ancestor, then `/` — with an entry mentioning it; in that
+layer by the most specific tier mentioning it — single caller, then groups and `@creator`, then `@guest` and `@all` —
+and inside the tier a `deny` wins. Nothing mentions it: refused. Personal and session scopes are judged as before
+(`user:` / `presenter` / `participant:`). An **Agent** acts as itself; while no entry or membership names its DID here, it
+is judged as its owner (from its AgentSpec, never from the request) and Workspaces it creates belong to that owner (R16).
 
 Group and contact membership is settled per request, before the Workspace's writer is locked: the server lists the
-Workspace's `group:` / `contact:` subjects (every Workspace's for `ws.list`) and asks system-config (the account's
-groups; its DID from `users/<id>/doc`) and msg-center. A membership that cannot be checked refuses the request with
-`authorization_unavailable` unless the caller already holds every capability; nothing is cached. A show's notes are read
-with the presenter's memberships settled again at each `show.notes`.
+Workspace's `group:` / `contact:` members (every Workspace's for `ws.list`) and asks system-config (the account's
+groups; its DID from `users/<id>/doc`) and msg-center — for an Agent judged as its owner, the owner's. A membership that
+cannot be checked refuses the request with `authorization_unavailable` when that group holds any entry (one group less
+may turn a refusal into an allowance), never for the owner; nothing is cached. A show's notes are read with the
+presenter's memberships settled again at each `show.notes`.
+
+Only the owner (R17): giving or taking `manage` (an entry touching it, the members of a group holding it), `ws.delete`,
+a restore over the Workspace (`ws.import restore`). Managers do the rest: groups, members, entries
+without `manage` (denials included), anonymous access, share entries, publications, macro bindings, maintenance. Every
+change is one record in `acl_audit` (who, judged as whom, when, the object with its path then, before, after; `acl.audit`),
+bumps `acl_rev` (`ws.get_info`), wakes `doc.wait_changes { after_acl_rev }` and publishes the kevent
+`…/aiworkspace/<ws>/acl`. A purged entity takes its entries along; a deleted one keeps them for a restore.
+
+**The permission design** — group definitions, the entries of groups and fixed groups, macro bindings — travels with a
+template (`templates/<id>/permissions.json`, written when a manager exports), a Clone and a package (`permission_design`
+in the manifest) made by a manager, and loads into the new Workspace with no members and anonymous access off. Members,
+single callers' entries, the anonymous switch and share entries never travel; a restore over a Workspace keeps that
+Workspace's own.
 
 **Guests.** A link's visitor has no session: `sys[1]` (or the bearer of the asset route) carries a guest
 token instead, `gt_` + base64url of 32 random bytes (`name_lib::bearer_token` form) the browser made up and keeps. The caller is
-then `guest:<26 chars>` (derived from the token's SHA-256, never the token itself), reaches the grants of subject
-`public` and the active entries open to guests (as everyone does), and cannot own anything. `ws.get_info` returns `principal` so a guest
-learns who it is.
+then `guest:<26 chars>` (derived from the token's SHA-256, never the token itself), reaches `@guest`'s entries while
+anonymous access is on and what a share entry it joined gives, and cannot own anything. `ws.get_info` returns `principal`
+(and `judged_as`) so a guest learns who it is.
 
-**Share entries** (`local.sqlite` `share_entries`, beside the grants): a link that offers ways in — `methods`
-`{ guest, password, self_register, did_login }` (`self_register` implies `password`) — and a capability template (never
-`manage`) on the Workspace or an entity subtree, optionally until `expires_at` (unix seconds). The id names its Workspace,
-`<workspace_id>~se_<26 chars>`, so a link resolves without a service-wide index; the visitor's page is
+**Share entries** (`local.sqlite` `share_entries`, R8): a link that offers ways in — `methods`
+`{ guest, password, self_register, did_login }` (`self_register` implies `password`) — into one logical group (never one
+holding `manage` or `run`), optionally until `expires_at` (unix seconds) and for at most `max_joins` people. The id names
+its Workspace, `<workspace_id>~se_<26 chars>`, so a link resolves without a service-wide index; the visitor's page is
 `/sso/entry?service=aiworkspace&entry=<entry_id>`.
 
-- While an entry open to guests is active (not closed, not expired), every caller — guests, accounts, Externals,
-  services — gets the template on its scope, computed per request (anyone could come in anonymously anyway).
-- `ws.join_entry` gives a signed-in visitor (account or External) the template as a grant of its own (merged into
-  what it already holds there; `via_entry` records the entry), if the entry ∩ the Zone switches (`system/sso/settings`)
-  admit the session's sign-in method: `did_federation` needs `did_login`, any local method `password` /
-  `self_register`. An entry open to guests that does not admit the session still lets it in, as anyone: the join
-  succeeds with `granted: false` and writes no grant (the access ends with the entry). Joining again changes nothing;
-  nobody becomes the owner. Closing an entry does not take back joined grants (`ws.revoke` does).
+- Nobody gets anything from an entry without presenting it: `ws.join_entry` makes the visitor a member of the group
+  (`via_entry`). A signed-in visitor (account or External) joins if the entry ∩ the Zone switches (`system/sso/settings`)
+  admit the session's sign-in method — `did_federation` needs `did_login`, any local method `password` / `self_register`
+  — or if the entry is open to guests; a guest (its token) joins an entry open to guests. The entry page joins a signed-in
+  visitor itself; "continue as a guest" goes to the workspace's page with `?entry=<entry_id>`, which joins with that origin's
+  own guest token before the workspace opens (Desktop `StandalonePage`). Joining again changes nothing;
+  nobody becomes the owner. A member of a group is no longer in `@guest`.
+- `ws.close_entry { entry_id, remove_members? }` stops new joins; with `remove_members` those who joined through it leave
+  the group too.
 - `entry.describe` is public (no session): `buckyos_api::EntryDescription` (`state`, `resource: { kind: "workspace",
   title, owner_name, path }` — `path` is the workspace's page on its own origin, `https://aiws-<id>.<zonehost>/<workspace
   slug>`, or `/` without a public base —, the entry's own `methods`, `expires_at`) plus `ok: true`; a missing,
@@ -974,15 +1577,63 @@ session is a kRPC failure `{ error, code: "access_denied", data: AccessDenial }`
 `ws.join_entry` (it serves the Zone's entry page, which reads the shared kRPC wire); its other failures are plain kRPC
 errors.
 
-### Sources (内核架构改进 D12, D24, D26)
+### Sources (内核架构改进 D12, D24, D26; AI Native 余下任务 B0)
 
 A data entity (table, rich text, record, asset, directory) may carry a `source` key in its payload:
-`{ kind: url | workspace, url?, zone?, workspace_id?, entity_id?, mode: live | fixed, version?: { content_root }, query?, refresh?: { interval_s }, auth_mode: none | hosted, name? }`
-(checked by `check_source` in [core/src/types.rs](core/src/types.rs); credentials never belong in it). Such an entity is **read-only** for
+`{ kind: url | workspace | zone | session, url?, zone?, workspace_id?, entity_id?, path?, mode: live | fixed, version?: { content_root }, query?, refresh?: { interval_s ≥ 900 }, auth_mode: none | hosted, name?, def?, sync? }`
+(checked by `check_source` in [core/src/types.rs](core/src/types.rs); credentials never belong in it). `def` says what the data is:
+`{ meaning (≤ 2000 chars), origin?, primary_key?: [1–4 field ids], freshness?: { max_age_s }, limit?: 1–100000 }`. Such an entity is **read-only** for
 people and Blocks: every content write (`table.*` data operations, `richtext.*`, `dir.*`, `entity.set_keys` beyond `source` / `title` /
 `description`) is refused with `INVALID_OPERATION/SOURCE_READ_ONLY`; only a refresh writes it, as one Commit of origin `source` with the
-run id: `proc.start { program: "source.refresh@1", params: { entity_id } }` (`update` on the entity) — the service fetches (another Workspace of this service as `public`; otherwise one credential-less HTTP GET; `auth_mode: hosted` Sources wait for an Agent), diffs and commits; `proc.get` ends `succeeded` (`result`: the commit, `bytes`, `content_root` of a fixed Source) or `failed` (the last valid content stays). A `refresh.interval_s` Source is refreshed on the service's timer as the owner; fetched bytes count against `traffic_quota_bytes` (`ws.get_info.traffic`). The outline envelope shows `source` (kind, mode, origin,
-schedule). Publishing (`ws.publish`) is the other side: the `public` subject reads the entity, and its link
+run id: `proc.start { program: "source.refresh@1", params: { entity_id } }` (`run` or an editing right on the entity) — the service fetches (another Workspace of this service as `public`; a file of the owner's home; otherwise one credential-less HTTP GET; `auth_mode: hosted` Sources wait for an Agent), diffs and commits; `proc.get` (anyone who may read the entity) ends `succeeded` (`result`: the commit, `bytes`, `content_root` of a fixed Source, `schema_changes` — fields the refresh deleted or retyped, after which every wish reading them needs coding again) or `failed` (the last valid content stays). A `refresh.interval_s` Source is refreshed on the service's timer as the owner; fetched bytes count against `traffic_quota_bytes` (`ws.get_info.traffic`). Adding, changing (its `def` too) or removing an entity's `source` is the **workspace owner's** (an Agent judged as the owner included; `PERMISSION_DENIED` otherwise); imports, clones and the session service carry theirs.
+
+- **Zone files** (`kind: zone`, the “pull” of a sync program): `path` is `/home/<owner>/…` (no `.` / `..`), read as the workspace's current
+  owner — a path outside that owner's home fails, so a cloned workspace reads its new owner's home — from `zone_root/home/<owner>/…`
+  (`$BUCKYOS_ROOT/data` on a node, `--zone-root` standalone), never through a link out of the home, at most 32 MiB and 30 s. A table of
+  a Zone source names `def.primary_key` (`INVALID_SCHEMA/PRIMARY_KEY_REQUIRED`). The file is plain JSON / CSV / Markdown (read like a
+  URL's body), or a sync program's output `{ format: "aiws.sync.v1", status: ok | failed, error?, program?: { name, version },
+  business_time?, produced_at?, fields?, records: [{ <field_id>: value }], truncated? }`: `status: failed` fails the refresh with the
+  program's `error`; `fields` absent keeps the table's.
+- **Sync tasks** (AI Native 余下任务 §8.2): a Zone source may name the Agent's sync task that writes its file, `sync: { agent_id,
+  task_id }` (the owner's to set, like the rest of `source`); `path` is then exactly `/home/<owner>/agents/<agent_id>/sync/<task_id>/out.json`
+  (`check_source_sync`). A triggered refresh (`proc.start`, `run`) first has the Agent run the task: `sync.run { task_id, wait_ms:
+  120000 }` at `agent_gateway/<agent_id>` (`http://127.0.0.1:<node gateway port>/kapi` on a node, `--agent-gateway` standalone) with
+  the service's own session, only for an Agent of the workspace's current owner (its AgentSpec); then it reads the file as above. No
+  gateway, an Agent that is not the owner's, an unreachable Agent or a refusal (a disabled task) fails the refresh with
+  `DEPENDENCY_UNAVAILABLE/SYNC_UNAVAILABLE`, a run the Agent reports `failed` fails it with the run's `error`; the data stays at its
+  last valid version. The service's timer only reads the file again: the Agent host runs the task on its own schedule. The task
+  itself (program, schedule, hosts, secrets, enabling) is the Agent's `sync.*` kRPC, which the Desktop calls with the owner's session.
+- **Record identity** (B5-1): a fetched table (URL or Zone) is cut to `def.limit` rows in file order (`truncated`), and each row's
+  `record_id` is `wish::record_id_for_key` of its primary key values — `def.primary_key`, else an `id` column, else the refresh fails
+  with `PRIMARY_KEY_REQUIRED`; a row without its key fails the same way, two rows with one key fail with `DUPLICATE_KEY`; nothing is written.
+- **Full refresh** (B3-3): every refresh of a URL or Zone source replaces the whole data set — a record no longer in the output is
+  deleted (by the refresh's Commit, so it can be undone and read in history); there is no incremental sync on this path. A retry is
+  a new run with its own idempotency key; a failed fetch or a failed output writes nothing, and the same output again writes
+  nothing. Writing the output whole (a temporary file, then a rename) is the sync program's part.
+- **Data version** (B0-2): a refresh that changed the content or the version writes `data_version { synced_at, business_time?,
+  produced_at?, program?, records?, truncated?, content_root? }` in the same Commit (only a refresh writes it: `SOURCE_READ_ONLY`; it
+  goes with the Source); the same content and version again is `status: unchanged` and writes nothing.
+- **Pending** (B0-3): a fetched Source (not a session feed) on a table, rich text or asset without a `data_version` is defined but not
+  satisfied — no valid dependency: `doc.read { as: body }` gives its definition (`state: pending`, the fields of a table), a text query
+  covers its name and definition (`coverage.skipped: pending`), SQL and `table_rows` answer `INVALID_OPERATION/DATA_PENDING`. A wish
+  reading it has `input_problems: [{ input, entity_id, label?, reason: pending }]` (main status `waiting_data`); it can be analyzed and
+  coded (the snapshot holds the table with its fields and no rows, the coding brief says so), and its `run` stage is refused with
+  `NEEDS_INPUT` (`data.missing_inputs`).
+- **What a reader sees**: the outline envelope shows `source` (kind, mode, origin, schedule); `doc.read { as: "meta" }` gives
+  `data { mode: synced, write: refresh, source { kind, mode, url?, workspace_id?, entity_id?, path?, refresh? }, state: pending | valid,
+  version (the data_version), def, sync, attempt: { at, status: running | succeeded | failed, error?, run_id } (the last refresh, this
+  deployment's own: never exported or cloned), expired }` — `expired` when the business time, else the last successful sync, is older
+  than `def.freshness.max_age_s` (display only: nothing runs because of it). A URL table is `url_query`, `none`.
+- **User schemas** (B0-1): a `schema_id` is `<namespace>.<name>@<major>`; `buckyos.` has only the built-in schemas. The earliest created
+  live table carrying a `schema_id` and a `source.def` defines that schema (its field ids and types); another table created with it
+  must have those fields in their types and keeps them (`INVALID_SCHEMA`). A schema nobody defines has no rules (schema class:
+  `standard::check_table`, `check_field_change`).
+- **Downstream** (B7): a refresh that changed the data makes the results reading it stale; nothing runs by itself. A source refreshed
+  while a wish run ran does not stop the run's write: it is no precondition of it, the results record the version they read and read
+  stale at once (inputs people edit still guard the write).
+- **Not yet**: the 50-version retention of refresh Commits (B5-2) — the history keeps every Commit until history compaction exists.
+
+Publishing (`ws.publish`) is the other side: the `public` subject reads the entity, and its link
 `https://aiws-<workspace_id>.<zonehost>/<workspace_name>/<name>` (or `GET /kapi/aiworkspace/pub/<workspace_id>/<name>`) answers the
 publication — JSON (`format: buckyos.ai-workspace/pub/1.0`, `reference`, `content`; `?fixed=1` adds `content_root`; `?fixed=<root>` reads
 that pinned version) or, for a browser or crawler (`Accept: text/html`), a static HTML page with the title and the table or text.
@@ -1022,15 +1673,23 @@ they were judged where the Commit was admitted. The doc comment of each validato
 | table-source | `validate_table_meta` | primitive | `title_field_id` names a live text field; `data_mode` never changes; `embedded` carries no `source_ref` |
 | table-source | `check_query_reference` | schema | `url_query` source: absolute URL without credentials, `query` object without cursor, version `live_head` / `fixed_revision{source_revision}` |
 | table-source | `plan_table.rs` `check_unique` | primitive | `unique` is a kernel-enforced cross-record constraint (`UNIQUE_VIOLATION`) |
-| table-source | `plan_table.rs` `required` / `nullable` checks (insert, set/unset, add/update/migrate field) | primitive | required values present, nulls only where allowed, tightening re-scans the live records (`SCHEMA_CONFLICT`) |
+| table-source | `plan_table.rs` `required` / `nullable` checks (insert, set/unset, add/update/migrate field) | primitive | required values present, nulls only where allowed, tightening (`required`, `nullable`, `max_items`) re-scans the live records (`INVALID_OPERATION`, `data { field_id, violating_records, total }`; `unique`: `UNIQUE_VIOLATION`); restoring a required field over records created meanwhile is `SCHEMA_CONFLICT` |
+| table-source | `plan_table.rs` submitter (`insert_records`, `set_values`, `unset_values`, `delete_records`, `restore_records`, `add_field`, `update_field`, `restore_field`; `init_entity`) | primitive | at most one `submitter` field, `text` only; the service fills it, clients never write it (undo, import, replay keep it); one live record per submitter (`SUBMITTER_EXISTS`, `UNIQUE_VIOLATION` on internal paths); without `update` / `delete` an `append` holder writes only its own records; set or cleared only on an empty table (`SCHEMA_CONFLICT`) |
+| table-source | `FieldDef::normalize` (`max_items`) | primitive | a `multi_select` value holds at most `max_items` options (`INVALID_SCHEMA`) |
+| table-source | `FieldDef::default_value`; `plan_table.rs` `insert_records`, `update_field`, `migrate_field`, `delete_option` | primitive | a default is a canonical value of the field's type, not null or a formula, not on a submitter, unique or object_ref field; filled into the fields an insert does not give (not on internal writes); converted by a migration, kept in step with option deletion |
 | table-source | `plan_table.rs` `check_body` | primitive | a record body is a live rich text under this table and the body of no other record |
 | table-source | `plan_table.rs` `delete_field` / `migrate_field` | primitive | the title field cannot be deleted and stays a text field |
+| table-source (standard) | `standard::check_table` (from `validate_schema`) | schema | `schema_id` `buckyos.todo@1` / `buckyos.calendar@1`: created with every standard field in its type; `title_field_id` is `title`; a user `schema_id` is `<namespace>.<name>@<major>` outside `buckyos.`, a table created with a defined one has its fields; a Zone source names `def.primary_key` |
+| table-source (standard) | `plan_table.rs` `delete_field` / `migrate_field` → `standard::check_field_change` | schema | a standard field — or a field of a user schema in a table that follows it — is never deleted and keeps its type |
+| sourced entities | `check_source`, `check_data_version`, `require_source_owner` | primitive / schema | the Source's shape and `def`; `data_version` only with a Source and only from a refresh; a Source changed by the workspace owner only |
+| table-source (standard) | `standard::check_records` (end of `plan_commit`; records noted by `insert_records`, `set_values`, `unset_values`, `restore_records`) | schema | per record, on the Commit's final values: required fields; a timed event has `start` (and no dates), an all-day one `start_date` (and no times); `end` / `end_date` not before the start; `order` an order key; the `ext` keys with a meaning (RRULE subset, `exdate`, `recurrence_id` never with `rrule`, `tz`, `reminders`, …) |
 | richtext | `plan_richtext::create` / `apply_update` | primitive | document conforms to `buckyos.richtext.basic.v1`, block ids unique, CRDT update applies to a known base |
 | richtext | `entity_refs` (`richtext_ref_edge`) | reference | `object_embed` / `object_link` targets are indexed as references; existence judged by the planner's `check_ref_target` |
 | asset | `validate_asset` | primitive | `object_id` is a `type:hex` object id; `media_type` / `size` come from the verified content, never the client; `image { width, height }`; `poster` (an uploaded PNG / JPEG / WebP / GIF asset picturing the content: a video frame, a PDF's first page, a cover), `duration_ms`, `page_count` (positive integers); a new `object_id` without new values drops `image`, `poster`, `duration_ms`, `page_count` (`ASSET_CONTENT_KEYS`; doc/workspace/BuckyOS AI Workspace 多媒体对象.md) |
 | asset | `validate_asset` (object lookup) | reference | the object was uploaded and verified (`DEPENDENCY_UNAVAILABLE`); import tolerates a listed but missing object |
-| container | `container_primitive` (keys, kind, layout, system nodes) | primitive | tree node kinds `folder` / `surface` / `group` and the control kinds (`mindmap`, `composite`); `root` / `data` / `surfaces` only internal; kind never changes; `layout.mode` (implied by a control's kind; `def` for a composite); `system` only on a folder, `surface_id` only on a folder; `def_ref` / `bindings` only on a composite |
+| container | `container_primitive` (keys, kind, layout, system nodes) | primitive | tree node kinds `folder` / `surface` / `group` and the control kinds (`mindmap`, `composite`, `todo`, `calendar`, `pdf-frame`; a `pdf-frame`'s `config` keys and values, its bands' `slot`); `root` / `data` / `surfaces` only internal; kind never changes; `layout.mode` (implied by a control's kind; `def` for a composite, `data` for a data control); `system` only on a folder, `surface_id` only on a folder; `def_ref` / `on` only on a composite, `bindings` on a composite or a data control |
 | container | `container_primitive` (`content_folder_id`) | reference | a Surface's content folder exists, is a folder and sits under `canvas-content` |
+| container (root) | `root_cover` (`config.cover`, UI 框架 PRD Q37) | primitive, reference | judged when it changes: only `object_id`, `media_type`, `size`; the object is uploaded and a PNG, JPEG, GIF, WebP, AVIF or BMP picture of at most 8 MiB, media type and size from the verified content; a load takes one whose bytes it did not bring when it names `media_type` and `size` |
 | container (composite) | `composite_refs` | reference | `def_ref` is required, local, names a live `kind: composite` definition when created and never changes; `bindings` targets are data entities |
 | container | `check_slot` (`slot` of a group or a control) | reference | only inside a control; inside a composite required and a slot of the definition; elsewhere unique among siblings |
 | container | `container_schema` (`title`, `icon`, `config`, `locked`) | schema | preset icon id only on a Surface; `config` ≤ 64 KiB only on a Surface or a control, a mind map's values checked (`check_control_config`), a composite's left to its `config_schema` in the clients; `locked` only on a group or a control |
@@ -1041,7 +1700,7 @@ they were judged where the Commit was admitted. The doc comment of each validato
 | cell | `check_slot` (from `validate_primitive`, `check_position`) | reference | `slot` only inside a control; inside a composite required and a slot of the definition (several Blocks may share one); elsewhere unique among the live siblings (`SLOT_CONFLICT`); re-judged by `tree.move`; a connector never turns into a box or back |
 | cell, container (composite) | `check_on_shape` (from `validate_primitive` / `container_primitive`) | primitive | `on` (扩展控件 P2): ≤ 16 event names, each one handler or ≤ 4, each an object whose `kind` is write / wish / open / notify, ≤ 16 KiB; never on a connector, ink, or a container other than a composite |
 | cell, container | `entity.set_props` (`plan.rs`) | primitive | `key` config / bindings / on, ≤ 64 property names `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`, values ≤ 64 KiB; the key then goes through the entity's validators like a `set_keys` of it |
-| cell | `validate_cell` (table view configuration) | schema | `fields` / `filter` / `sorts` / `group` / `manual_order` only on table views, named fields live, ≤ 4 sorts, group field type |
+| cell | `validate_cell` (table view configuration) | schema | `fields` / `filter` / `sorts` / `group` / `manual_order` only on table views, named fields live, ≤ 4 sorts, group field type; `row_limit` (1–100000, a table view only) |
 | cell | `validate_cell` (`config.snapshot`) | primitive | an embedded snapshot is an AssetRef (checked by `validate_asset`) |
 | cell (connector) | `validate_connector` (shapes) | schema | `flip`, `route`, ≤ 64 `controls`, `label.t` in [0, 1]; `start` / `end` are `{ entity_id, anchor { kind: named, id } }` |
 | cell (connector) | `validate_connector` (endpoints) | reference | a bound endpoint is a readable Block or group on the connector's Surface, never itself or another line |
@@ -1056,7 +1715,7 @@ they were judged where the Commit was admitted. The doc comment of each validato
 | show-path | `validate_show_path` (Frame rule) | schema | a Frame target is on a free-layout Surface |
 | annotation | `validate_annotation` (fields) | schema | `kind` note / highlight, body ≤ 4000, `style` object, author fixed by the backend, only the author re-anchors |
 | annotation | `validate_annotation` (`target`, `anchor::check`) | reference | the target exists; range / quote anchors resolve on it (strict only outside import) |
-| wish | `validate_wish` (fields) | schema | prompt ≤ 20 000 chars, `executor`, `output_mode`, `output { container_id, surface_id, name, type }`, ≤ 200 inputs with unique names, size limits of `analysis` / `last_run` / `executor_config`, `knowledge` / `refinements` / `analysis` shapes (`wish.rs`) |
+| wish | `validate_wish` (fields) | schema | prompt ≤ 20 000 chars, `executor` (`xllm \| agent-work-session`), `output_mode`, `output { container_id, surface_id, name, type }`, ≤ 200 inputs with unique names, size limits of `analysis` / `last_run` / `executor_config`, `knowledge` / `refinements` / `analysis` (status `ready`, program checks with a `level`) / `history` shapes (`wish.rs`); `history` written by runs only (origin `program`, internal, replay), its objects uploaded |
 | wish | `check_input` (selector shape) | schema | a wish input is `entity`, `table_view { cell_id }` or `table_query { filter?, sorts?, fields? }`; `version { mode: follow \| fixed }` |
 | wish | `check_input` (targets), `validate_wish` (`program`) | reference | the input entity exists and a `table_view` cell is a table view of it; the program source object was uploaded |
 | block-def | `block_def_primitive` (`source_dir`, `deps`, `events`) | primitive, reference | `events` an object of ≤ 16 event names (each an object, ≤ 16 KiB), written by build / import / internal / replay Commits only; `deps` is `[{ ident, entity_id }]` (≤ 32, no repeats) and only build / import / internal / replay Commits change it; `source_dir` a live directory, each `deps` target a live definition, no cycle through `deps` (`REFERENCE_CYCLE`); judged when written |
@@ -1094,59 +1753,97 @@ content token (a hash) it stands for. New kinds are protocol changes.
 | `folder_member` `{ name }` | one member of a resource directory (`buckyos.dir`, D01, D25) | the member's own rev (`m:<name>`); a removed member is `TARGET_DELETED` |
 | `entity_prop` `{ key, name }` | one property of an object key (`config`, `bindings`, `on`) of a Cell or container (扩展控件 P2, Q28) | the property's own rev (`p:<key>.<name>`; 0 when never written) |
 
+**Workspace names (控件机制 TODO G9).** A Workspace may have a `name`, `^[a-z0-9][a-z0-9._-]{0,63}$`, given to `ws.create` or
+`ws.ensure` and never changed (no method changes it); the title stays independent and editable. It is unique among the
+Workspaces of one owner (`local_meta` `owner` and `name` of `local.sqlite`, never exported). `ws.ensure { name, title? }` returns
+the caller's Workspace of that name or creates it; concurrent calls create one (the service serializes the lookup and the
+creation over an `(owner, name)` index read from the folders on first use). `ws.delete` frees the name. `ws.clone`, `ws.import`
+`new` and a restore that creates a missing Workspace carry no name; a restore over an existing Workspace keeps its name; a show
+clone has none.
+
+**Workspace clone (`ws.clone`, `notepads/aiws-workspace-clone-todo.md`).** A materialized copy, not copy-on-write
+(`store/src/service.rs` `clone_workspace`): what the caller may read is materialized as a `clone_source` snapshot and loaded
+as a new Workspace (the path of `ws.import new`): a new id and epoch, the caller as owner, one import Commit, rich texts
+as new lineages. Immutable objects stay shared in the named store; the logical data (`doc.sqlite`) is a copy of its own
+and its full content and every asset count on the new Workspace's `usage` (kernel doc 11: what a Workspace is charged does
+not depend on deduplication below it). Entities the caller cannot read are left out and counted in `excluded_entities`.
+`cloned_from { workspace_id, snapshot }` (kept in `workspace_meta`, shown by `ws.get_info`, written into every snapshot
+root as `lineage.cloned_from`, so its checkpoints retain the source snapshot) is provenance only: no sync, no merge, and
+deleting the source does not touch the copy. Nothing of `local.sqlite` comes along — grants, entries, publications, runs,
+uploads, the name — and neither do personal entities. `ws.import new` records the package's snapshot
+the same way; a restore keeps what its package recorded. The caller must be able to own Workspaces (above) and have
+workspace-level `export` on the source. Not to be confused with `tree.clone` / `entity.clone` (a Commit copying a
+subtree inside one Workspace), a show clone (`clone_for_show`, the frozen baseline of a live show) or a session's run
+Workspace (`clone_for_session`).
+
 **Method levels (D11).** `stable` methods are the contract other Apps, Agents and SDKs may depend on: they change
 only with `protocol_version`, and each has a contract test against a recorded request / response shape
 (`server/tests/contract.rs`, `fixtures/protocol/stable-methods.json`; `AIWS_REGEN=1` re-records). `internal` methods serve the
-Desktop and diagnostics and change with it. `experimental` methods are not frozen yet: `proc.*` become stable when M3
-lands. The list is `server/src/lib.rs` `METHOD_LEVELS`; this table mirrors it.
+Desktop and diagnostics and change with it. `experimental` methods are not frozen yet (`proc.*` became stable with the
+browser-first execution and the three wish stages). The list is `server/src/methods.rs` `METHODS`; this table mirrors its levels, and the authorization table below is generated from it.
 
 | Method | Level | Params (besides `workspace_id`) |
 | --- | --- | --- |
-| `ws.create` | stable | `title`, `workspace_id?` |
-| `ws.list`, `ws.get_info`, `ws.delete`, `ws.fork` | stable | |
-| `ws.grant` / `ws.revoke` / `ws.list_grants` | stable | `subject`, `scope_entity_id?`, `capabilities[]`; `list_grants` returns every row (with `via_entry`) and the `owner` to a manager, only the rows that apply to the caller otherwise (`complete: false`, no owner). Subjects: see the table above |
-| `ws.list_subjects` | stable | principals a grant can name (static identities / zone users and `group:` subjects) |
-| `ws.create_entry` | stable | `capabilities[]`, `methods`, `scope_entity_id?`, `expires_at?` → `entry` (`manage` on the scope) |
-| `ws.list_entries` | stable | → `entries` on scopes the caller manages |
-| `ws.close_entry` | stable | `entry_id` (`workspace_id` optional, must match) → `entry` |
-| `ws.join_entry` | stable | `entry_id` only → `workspace_id`, `entry_id`, `scope_entity_id`, `capabilities`, `joined`, `granted`, `path` |
+| `ws.create` | stable | `title`, `workspace_id?`, `name?` (see “Workspace names”; a name the caller already uses is `INVALID_OPERATION` / `NAME_CONFLICT` with `data.workspace_id`) → `workspace_id`, `epoch`, `head_seq`, `title`, `name?` |
+| `ws.ensure` | stable | `name`, `title?` (default: the name), no `workspace_id` → `workspace_id`, `name`, `title`, `epoch`, `head_seq`, `created` — the caller's Workspace of that name, created when it has none (callers as for `ws.create`) |
+| `ws.time` | stable | none → `server_ms` (unix ms of the service clock); any session, guests included |
+| `ws.list`, `ws.get_info`, `ws.delete` | stable | (`ws.list` items and `ws.get_info` carry `name` when the Workspace has one; `ws.get_info.cloned_from` names the source of a clone or a `new` import. `ws.list` items also carry what the home page's cards show (UI 框架 PRD §9.2, K6): `owner_principal`, `updated_at` (the last accepted Commit, else the creation), `opened_at` (when the caller last opened it, or null), `public` (`anonymous` — anonymous access on and something granted to `@guest` — or `published` by path), `live_sessions` (live sessions of it as courseware) and `cover` (the picture chosen in the settings, `{ workspace_id, object_id, media_type }`, see “Covers”, or null). `ws.get_info` carries `settings` (the Workspace's shared settings, the root's `config`, see “Workspace settings”) and `settings_rev`; `record_open: true` records that the caller opened it now, for `opened_at`) |
+| `ws.clone` | stable | none → `workspace_id`, `epoch`, `head_seq`, `content_root`, `cloned_from { workspace_id, snapshot }`, `excluded_entities` — a new Workspace the caller owns, copied from what the caller may read (workspace-level `export`; see “Workspace clone”) |
+| `acl.set` | stable | `changes: [{ subject, resource?, allow?, deny? }]` (≤ 500): each replaces the subject's entry on the resource (path or id, default `/`; both empty removes it), all or none, one record; `manage` on each resource, the owner's when `manage` is touched |
+| `acl.query` | stable | `by: entity` (`resource`, `expand?`: every subject with entries on its chain, their effective capabilities, each entry's source — direct, inherited, workspace — and what a denial overrides; macros bound to those groups and who may change them; managers), `by: subject` (`subject?`: its entries; for a group, its members; for a single caller, its judgment — groups and how, `@guest`, judged as), `by: explain` (`resource`, `principal?`: each capability allowed or refused and by which entry), `by: all` (every entry with who wrote it, `complete: true`, for a manager; otherwise the entries that apply to the caller — its own, its groups', `@all`, `@guest` while it is a guest — without who wrote them). Anyone may ask about itself; the rest is the managers' |
+| `acl.groups` | stable | every group with its members (`via_entry`) for a manager; the caller's own groups otherwise |
+| `acl.set_group` / `acl.delete_group` | stable | `group_id` (`[a-z0-9][a-z0-9_-]{0,63}`, never `owner`, `all`, `guest`, `creator`, `pub`), `title?`, `description?`; deleting takes the group's entries, members and macro bindings along and closes its entries |
+| `acl.members` | stable | `group_id`, `add?`, `remove?`: principals, `group:<id>`, `contact:<your did>#<tag>`, `*` |
+| `acl.set_anonymous` | stable | `enabled`: whether `@guest` exists here |
+| `acl.bind_macro` | stable | `wish` (path or id), `group_id` (null unbinds), `mode: union \| intersection` (§4.5); whoever may change the wish holds the group's permissions through it, so the group never holds `manage` |
+| `acl.audit` | stable | `after?`, `limit?`: the operation record (`manage`) |
+| `ws.list_subjects` | stable | principals an entry or a group can name (static identities / zone users and `group:` member specs) |
+| `ws.create_entry` | stable | `group_id`, `methods`, `expires_at?`, `max_joins?` → `entry` (`manage`) |
+| `ws.list_entries` | stable | → `entries`, each with how many `joined` (`manage`) |
+| `ws.close_entry` | stable | `entry_id` (`workspace_id` optional, must match), `remove_members?` → `entry`, `removed_members` |
+| `ws.join_entry` | stable | `entry_id` only (a session or a guest token) → `workspace_id`, `entry_id`, `group_id`, `joined`, `path` |
 | `entry.describe` | stable | `entry_id` only, no session → `EntryDescription` |
 | `ws.get_user_state` / `ws.set_user_state` | stable | `entries: { key: value \| null }` — user work state per subject and Workspace in `local.sqlite`; never a Commit |
-| `ws.set_wish_aicc` | stable | `mode: workspace_owner \| current_user` — whose AI resources wish runs started here use (`manage`; AI Center Quota PRD §3.3) |
+| `user.get_prefs` / `user.set_prefs` | experimental | no `workspace_id`. The caller's own preferences across Workspaces (UI 框架 PRD §4.6, K4), one JSON object kept by the service (`users.sqlite`), never part of a Workspace, never exported, cloned or carried by a template: `get` → `prefs`, `revision`, `updated_at`; `set` takes `prefs` (the whole object) or `merge: { key: value \| null }` (top-level keys; null removes), and `expect?` (the revision read: `REVISION_CONFLICT` with `data.current` when it moved) → `prefs`, `revision`, `updated_at`. ≤ 500 keys of ≤ 128 bytes, ≤ 256 KiB. A guest or a link's visitor keeps none (`PERMISSION_DENIED`) |
 | `ws.import` | stable | `bucket_id` + `key` (the package the caller bound into its own `user/aiworkspace/<user>/exports`; a successful import consumes it) or `obj_id` (an unbound FileObject the caller may read, judged at the NDM gateway), `semantics: "restore" \| "new"`, `replace?` |
 | `ws.release_retention` | stable | maintenance (`manage`, D19): `kind`, `ref` — unbind what holds a `snapshot`, an `export` package or an unreferenced `staged` upload → `released` |
 | `ws.delete_checkpoint` | stable | maintenance (`manage`): `snapshot_id` — the snapshot row goes and its retention set is unbound; the named store reclaims what no binding holds |
 | `ws.purge_deleted` | stable | maintenance (`manage`): `entity_ids?` (default: every deleted entity) — content and references are given up for good (`entity.purge`), resources are reclaimable at once, undo and version restore answer `RESOURCE_RECLAIMED`, Block state is cleared |
 | `ws.clear_staged` | stable | maintenance (`manage`): staged uploads nobody referenced go, expired or not |
-| `doc.outline` | internal | — all readable entity envelopes in tree order |
-| `doc.resolve` | stable | `reference` or `path` |
-| `doc.read` | stable | `entity_id`, `selector?` — or `targets: [{ entity_id, selector? }]` |
-| `doc.list_children` | experimental | `entity_id`, `include_deleted?` |
+| `doc.outline` | internal | — all readable entity envelopes in tree order, each unreadable ancestor of one as a path node (see “Paths and names”) |
+| `doc.resolve` | stable | `reference` or `path` (the one path syntax, see “Paths and names”) → the reference, its `canonical` form, `path` |
+| `doc.read` | stable | `entity_id` or `path`; `as?: "content" \| "meta" \| "body"` (default `content`, the native content); `selector?`; `version?` (`{ epoch, seq }` / `{ object_id }`: a fixed version of the native content or `VERSION_NOT_RETAINED` / `REFERENCE_BROKEN`, never the head; `meta` / `body` of a fixed version are `UNSUPPORTED_VERSION`); `body` takes `cursor?`, `max_bytes?` (64…262 144, default 32 768), `parts?` — or `targets: [{ entity_id \| path, as?, selector?, … }]`. See “Common meta and body” |
+| `doc.list` | stable | `at?` (path or `entity_id`, default `/`), `type?`, `not_type?`, `schema?`, `limit?` (≤ 1000, default 100), `cursor?` → `at`, `items: [{ entity_id, name, path, type, type_id, kind?, title, children, content_rev, body: { state, format }, shadowed? }]`, `next_cursor?`, `head_seq` — the readable direct children |
+| `doc.find` | stable | `at?`, `depth?` (≤ 16), `name?` (a literal, case-insensitive, in the name or title), `type?`, `not_type?`, `schema?`, `limit?` (≤ 200, default 50), `cursor?` → `items` (with `match: name \| title`), `complete`, `visited`, `next_cursor?` — a pre-order walk of at most 20 000 entities per call |
 | `doc.list_annotations` | experimental | `target_ids?`, `parent_id?` — annotations anchored to those entities and/or placed under that parent, each with its resolved `anchor` |
-| `doc.query` | stable | `view_id` or `source_id`; `filter?`, `sorts?`, `fields?`, `group?`, `limit`, `cursor?`, `consistency?`, `source_revision?` |
+| `doc.query` | stable | exactly one of `text` (a text query: `text`, `case?`, `at?`, `depth?`, `type?`, `not_type?`, `limit?` (≤ 100), `cursor?` → `hits: [{ entity_id, path, type, on: name \| title \| body, selector?, snippet, more? }]`, `coverage: { complete, scanned, bytes, skipped }`, `next_cursor?`) or `sql` (one SELECT over the logical tables: `sql`, `params?`, `tables?`, `max_rows?` (≤ 5000), `expect_head?: { epoch, seq }` → `columns`, `rows`, `truncated`, `read: [{ table, entity_id, path, content_rev }]`). The old table query (`view_id`, `source_id`, `filter`, …) is refused. See “Text and SQL queries” |
+| `doc.index` | internal | `op: ls \| find \| grep` and the parameters of `doc.list` / `doc.find` / `doc.query { text }` — the index of the Workspace object (`obj://aiworkspace/<ws>?op=…`) |
+| `doc.source_query` | internal | `source_id` of a URL table (`data_mode: url_query`); `filter?`, `sorts?`, `fields?`, `limit`, `cursor?`, `consistency?`, `source_revision?` — its rows from the remote source (what `doc.query` did for URL tables) |
 | `doc.freshness` | experimental | `entity_ids[]` — dependency-based freshness of results and wishes (computed in core) |
 | `doc.relations` | experimental | `entity_id` — outgoing / incoming references, Blocks showing it, produced results; unreadable referrers only as `hidden_incoming` |
-| `doc.list_versions` | experimental | `entity_id` — addressable versions (generated results, checkpoints) with their commits |
+| `doc.list_versions` | stable | `entity_id` → `entity_id`, `content_rev`, `head_seq`, `versions: [{ content_rev, object_id, kind: generated \| checkpoint, created_at, derived, commit_id, author, origin, run_id, message, accepted_at }]` newest first — addressable versions (generated results, checkpoints) with their commits; versions whose content was reclaimed are left out |
 | `doc.restore_version` | experimental | `entity_id`, `content_rev` — the operations restoring that version (submitted as an ordinary Commit) |
 | `doc.source_capabilities` | internal | `source_id` (URL query tables) |
 | `doc.get_collab_state` | internal | `entity_id` |
 | `doc.prepare` / `doc.commit` | stable | the Commit request (design §2.6) |
+| `doc.stage` | stable | one part of a Commit too large for one request: `{ epoch, idempotency_key, part, operations }` → `{ part, digest, operations, expires_at }`; the final `doc.commit` / `doc.prepare` names the digests in `staged` (design §2.6) |
 | `doc.get_submission` | stable | `epoch`, `idempotency_key` |
 | `doc.undo` | stable | `epoch`, `commit_id`, `idempotency_key`, `mode?`, `plan_digest?`, `session_id?` |
 | `doc.get_changes` | stable | `epoch`, `after_seq`, `limit?`, `filter: { detail: "touched" }?` — each change carries `touched`, and (unless `touched` only) `ops` and the row delta `rows` (D20); `after_seq` below `base_seq` is `BASE_TOO_OLD` |
-| `doc.wait_changes` | stable | `epoch?`, `after_seq`, `timeout_ms?` (long poll) |
+| `doc.wait_changes` | stable | `epoch?`, `after_seq`, `timeout_ms?` (long poll) → `epoch`, `head_seq`, `timed_out`, `show_lock`, `server_ms` (unix ms when answering: clients calibrate against half the round trip, 控件机制 TODO G16) |
 | `doc.checkpoint`, `doc.export` | experimental | `mode: "share" \| "personal_backup"`, `self_contained`, `include_notes?`; `doc.export` → `export_id`, `manifest`, `download: { bucket_id, key, version, obj_id, token }` (the package in the owner's `exports` bucket, 7 days; `GET /bucket/v1/<bucket_id>/<key>?token=`) |
 | `asset.import_object` | stable | `workspace_id` and either `bucket_id` + `key` (the uploader's own binding in `user/aiworkspace/<user>/assets`) or `obj_id` (an unbound, ready NDM FileObject the caller may read) → `object_id`, `media_type`, `size`, `expires_at`, `bucket_id`, `key`, `version` (staged under `<workspace_id>/<object_id>` in the owner's `assets` bucket) |
 | `replica.bootstrap` | internal | → `replica_id`, `epoch`, `head_seq`, `principal`, `prepared_at`, `download` (as `doc.export`) |
-| `proc.start` / `proc.get` / `proc.apply` / `proc.cancel` | experimental | `program`, `params`, `idempotency_key`; `run_id`, `session_id?` — wish programs below |
-| `proc.list` | experimental | `wish_id?`, `limit?` — wish runs, newest first |
-| `proc.claim` | experimental | `run_id`, `claim_token`, `executor?` — an executor takes the run (M3): the next attempt, a `run_token` (bearer for `proc.heartbeat` / `proc.report` / reads of this Workspace) and a lease (90 s) |
-| `proc.heartbeat` | experimental | `run_id`, `attempt`, `progress?` — renews the lease; a lapsed lease makes the run `interrupted` (D15) |
-| `proc.report` | experimental | `run_id`, `attempt`, then `progress?`, or `error`, or `finished: true` (the stage host collected the candidate: T3-4), or the candidate itself: `results[]` + `read_set?` + `summary?` + `warnings?` + `assumptions?` (execute runs; the Mock executor's shape), or `analysis` (analyze runs). The service validates and plans it; a superseded attempt or a cancelled run gets `RUN_REVOKED` |
-| `proc.tool` | experimental | `run_id`, `attempt`, `name`, `args` — one stage tool call of the run's executor (the claim of a `wish.xllm@1` run opens the stage and answers `stage: { kind: model, system, user, tools, model, iterations }` or `{ kind: program, source }`): `ws_*`, `submit_analysis`, `put_result`, `check_results`, `finish`, and `llm_map` for a program's `aiws.llm.map`. Answers `{ status: ok \| error, text }` — `error` is for the model to correct |
-| `proc.program` | experimental | `run_id`, `attempt`, `source`, `results?` (what the program host wrote to `output/.aiws/results.json`), `log?`, `files?` (`{ "output/<path>": text \| { base64 } }`) — the executor ran the program; judged like the service's own `run_program` |
-| `proc.files` | experimental | `run_id`, `attempt` — the stage directory (`context/`, `request.json`, `catalog/`, `lib/`) as `{ path: { text } \| { base64 } }` for the executor's program host |
-| `ws.set_hosted_exec` | experimental | `config: { enabled, agent_id, allowed_wishes?, triggerers?, limits? }` (`manage`, D22) — the Owner's hosted execution; `ws.get_info.hosted_exec` returns it with its `digest` |
+| `print.package` | experimental | `surface_id`, `path_id?` (a free canvas: a presentation path through it), `paper: { name, width_mm, height_mm }` (as printed), `frame_id?` (a PDF Frame), `date`, `locale` → `obj_id` (the print package, a FileObject the caller's App session holds), `size`, `job`, `issues` — see “Printing” |
+| `proc.start` / `proc.get` / `proc.cancel` | stable | `program` (`wish.xllm@1`, `source.refresh@1`), `params`, `idempotency_key`; `run_id` — wish programs below; another program is `MISSING_EXTENSION` |
+| `proc.rollback` | stable | `run_id`, `confirm?`, `session_id?` — rolls a wish stage's current record back (“Wish runs”) → `{ status: needs_confirm, lost, hidden_lost }` or `{ status: accepted, commit, record }`; another record is `INVALID_OPERATION` / `NOT_CURRENT_RECORD` |
+| `proc.list` | stable | `wish_id?`, `limit?` — wish runs, newest first |
+| `proc.claim` | stable | `run_id`, `claim_token`, `executor?` — an executor takes the run (M3): the next attempt, a `run_token` (bearer for `proc.heartbeat` / `proc.report` / reads of this Workspace), a lease (90 s), and the stage it works on: `{ kind: model, stage, system, user, tools, model, iterations, source?, budget }` (analyze, code) or `{ kind: program, stage: run, source, manifest, budget }` |
+| `proc.heartbeat` | stable | `run_id`, `attempt`, `progress?` — renews the lease; a lapsed lease makes the run `interrupted` (D15) |
+| `proc.report` | stable | `run_id`, `attempt`, then `progress?`, or `error` (`{ code, detail }`: `EXECUTOR_FAILED`, an `AI_*` refusal, …), or `finished: true` (what the stage collected is written), or `analysis` (an analyze run whose analysis was made elsewhere); with any of them `usage?: { model?, input_tokens?, output_tokens?, calls? }` (the executor's model loop). Results are never reported directly (they come from the macro). The service validates, plans and writes; a superseded attempt or a cancelled run gets `RUN_REVOKED` |
+| `proc.tool` | stable | `run_id`, `attempt`, `name`, `args` — one call of the run's executor: a stage tool (`ws_*`, `submit_analysis`, `check_results`, `finish`), `sql` (a macro's `aiws.sql`) or `llm_cache` (the AI answer cache) — see “Wish runs”. Answers `{ status: ok \| error, text?, code? }` — `error` is for the model to correct |
+| `proc.program` | stable | `run_id`, `attempt`, `source`, `results?` (what the program host wrote to `output/.aiws/results.json`), `log?`, `files?` (`{ "output/<path>": text \| { base64 } }`) — the executor ran the macro: a trial run while coding (the model reads the answer), the run itself when running (a failure ends it: `PROGRAM_FAILED`, `MACRO_CODE_CHANGED`) |
+| `proc.files` | stable | `run_id`, `attempt` — the stage directory (`context/`, `request.json`, `catalog/`, `lib/`, `program/main.js`) as `{ path: { text } \| { base64 } }` plus `stage: { budget, manifest }`; over `snapshot_download_max_bytes` the run fails with `SNAPSHOT_TOO_LARGE` |
 | `ws.publish` | experimental | `entity_id`, `name?` (`manage`, D26) — the `public` subject may read the entity; the name (default: the entity's, slugified; a new name keeps the old as an alias) is the last segment of the link. Returns `name`, `path` (`/<workspace_name>/<name>`), `url` (on `https://aiws-<workspace_id>.<zonehost>` when the deployment knows its host) and the reference object |
 | `ws.unpublish` | experimental | `entity_id` (`manage`) — every name and the public grant go; referrers keep their records and read `unavailable` |
 | `ws.list_publications` | experimental | the names, entities, `url` and referrer counts (what the caller may read) |
@@ -1157,25 +1854,176 @@ lands. The list is `server/src/lib.rs` `METHOD_LEVELS`; this table mirrors it.
 | `ext.build`, `ext.export`, `ext.install`, `ext.list_library`, `ext.uninstall`, `ext.library_bundle`, `ext.import`, `ext.pack`, `ext.upgrade`, `ext.export_template`, `ext.create_from_template` | experimental | see “Extension controls” and “Extension controls P2 / P3” |
 | `lock.acquire` / `lock.renew` / `lock.release` / `lock.break` / `lock.list` | stable | `entity_ids[]`, `session_id`; `lock_ids[]`; `entity_id` |
 | `show.start` / `show.heartbeat` / `show.publish` / `show.command` / `show.watch` / `show.notes` / `show.end` | internal | see “Non-public shows” |
-| `session.create`, `session.list`, `session.list_mine`, `session.get`, `session.join`, `session.start`, `session.end`, `session.save`, `session.delete`, `session.set_access` | experimental | see “Presentation sessions” |
-| `session.invite`, `session.list_invites`, `session.revoke_invite`, `session.takeover`, `session.command`, `session.sample`, `session.notes`, `session.rtc` | experimental | see “Presentation sessions” |
+| `presence.heartbeat` / `presence.leave` / `presence.list` | internal | `conn_id` (heartbeat, leave), `surface_id?`, `name?` (a guest's) — see “Presence and the work log” |
+| `ws.work_log` | experimental | `before?`, `limit?` (≤ 200, default 50), `filter?: all \| mine \| automation` → `entries`, `next_before`, `more` — see “Presence and the work log” |
+| `session.create`, `session.list`, `session.list_mine`, `session.list_open`, `session.get`, `session.join`, `session.start`, `session.end`, `session.save`, `session.delete`, `session.set_access` | experimental | see “Presentation sessions” |
+| `session.invite`, `session.list_invites`, `session.revoke_invite`, `session.takeover`, `session.command`, `session.sample`, `session.notes`, `session.rtc`, `session.voice` | experimental | see “Presentation sessions” |
 | `session.task`, `session.claim`, `session.respond`, `session.review`, `session.publish`, `session.react`, `session.feed_sample` | experimental | see “Presentation sessions” |
 | `session.events`, `session.watch`, `session.replay`, `session.post`, `session.list_posts`, `session.delete_post` | experimental | see “Presentation sessions” |
-| `asset.stream_url` | experimental | `object_id` (read access as for the asset route) → `url` (`/kapi/aiworkspace/stream/<token>`, 6 h), `media_type`, `size` |
+| `asset.stream_url` | stable | `object_id` (read access as for the asset route; an uploader its own staged upload) → `url` (`/kapi/aiworkspace/stream/<token>`, 6 h), `media_type`, `size`, `expires_at` |
 | `diag.list_unretained`, `diag.verify_refs` | internal | |
+
+How each method is authorized (权限需求 R21): dispatch enforces the generic checks (who may own, the owner, membership,
+a capability on `/` or on a named entity) before the handler, which keeps its finer ones.
+
+<!-- authorization-table:begin (generated from server/src/methods.rs; AIWS_REGEN=1) -->
+| Method | Level | Authorization |
+| --- | --- | --- |
+| `ws.create` | stable | may own (unrestricted account or service) |
+| `ws.ensure` | stable | may own (unrestricted account or service) |
+| `ws.time` | stable | a session |
+| `ws.list` | stable | a session |
+| `ws.get_info` | stable | may enter |
+| `ws.delete` | stable | the owner |
+| `ws.clone` | stable | may own (unrestricted account or service); `export` on `/` |
+| `acl.set` | stable | `manage` on each resource; the owner when `manage` is touched |
+| `acl.query` | stable | may enter; anyone about itself, `manage` about others |
+| `acl.groups` | stable | may enter |
+| `acl.set_group` | stable | `manage` on `/` |
+| `acl.delete_group` | stable | `manage` on `/` |
+| `acl.members` | stable | `manage` on `/` |
+| `acl.set_anonymous` | stable | `manage` on `/` |
+| `acl.bind_macro` | stable | `manage` on `/` |
+| `acl.audit` | stable | `manage` on `/` |
+| `ws.list_subjects` | stable | may own (unrestricted account or service) |
+| `ws.create_entry` | stable | `manage` on `/` |
+| `ws.list_entries` | stable | `manage` on `/` |
+| `ws.close_entry` | stable | `manage` on `/` |
+| `ws.join_entry` | stable | a person presenting an active entry the Zone switches admit |
+| `entry.describe` | stable | none (no session) |
+| `ws.get_user_state` | stable | may enter |
+| `ws.set_user_state` | stable | may enter |
+| `ws.import` | stable | may own (unrestricted account or service); a restore over a Workspace: its owner |
+| `ws.release_retention` | stable | `manage` on `/` |
+| `ws.delete_checkpoint` | stable | `manage` on `/` |
+| `ws.purge_deleted` | stable | `manage` on `/` |
+| `ws.clear_staged` | stable | `manage` on `/` |
+| `doc.resolve` | stable | may enter; `read` on each entity |
+| `doc.read` | stable | may enter; `read` on each entity |
+| `doc.list` | stable | may enter; `read` on each entity |
+| `doc.find` | stable | may enter; `read` on each entity |
+| `doc.query` | stable | may enter; `read` on each entity |
+| `doc.prepare` | stable | each operation's capability on its target (`schemas/operations.json`) |
+| `doc.commit` | stable | each operation's capability on its target (`schemas/operations.json`) |
+| `doc.stage` | stable | may enter |
+| `doc.get_submission` | stable | may enter |
+| `doc.undo` | stable | each operation's capability on its target (`schemas/operations.json`) |
+| `doc.get_changes` | stable | may enter; `read` on each entity |
+| `doc.wait_changes` | stable | may enter |
+| `asset.import_object` | stable | a write right anywhere (the Commit that references it is judged where it writes) |
+| `lock.acquire` | stable | a write right on each entity |
+| `lock.renew` | stable | may enter |
+| `lock.release` | stable | may enter |
+| `lock.break` | stable | `manage` on `entity_id` |
+| `lock.list` | stable | may enter; `read` on each entity |
+| `doc.outline` | internal | may enter; `read` on each entity |
+| `doc.source_capabilities` | internal | may enter; `read` on each entity |
+| `doc.source_query` | internal | may enter; `read` on each entity |
+| `doc.index` | internal | may enter; `read` on each entity |
+| `doc.get_collab_state` | internal | `read` on `entity_id` |
+| `replica.bootstrap` | internal | may enter; `read` on each entity |
+| `show.start` | internal | `read` on `/`; a Workspace-level write right locks it; anyone else presents read-only |
+| `show.heartbeat` | internal | the presenter's read; a prompter token |
+| `show.publish` | internal | the presenter's read; a prompter token |
+| `show.command` | internal | the presenter's read; a prompter token |
+| `show.watch` | internal | the presenter's read; a prompter token |
+| `show.notes` | internal | the presenter's read; a prompter token |
+| `show.end` | internal | the presenter, or `manage` |
+| `presence.heartbeat` | internal | may enter |
+| `presence.leave` | internal | a session |
+| `presence.list` | internal | may enter |
+| `ws.work_log` | experimental | may enter; `read` on each entity; runs as `proc.get` shows them, sessions as `session.list`, the permission record to managers |
+| `diag.list_unretained` | internal | `manage` on `/` |
+| `diag.verify_refs` | internal | `manage` on `/` |
+| `doc.list_annotations` | experimental | may enter; `read` on each entity |
+| `doc.freshness` | experimental | may enter; `read` on each entity |
+| `doc.relations` | experimental | `read` on `entity_id` |
+| `doc.list_versions` | stable | `read` on `entity_id` |
+| `doc.restore_version` | experimental | `read` on `entity_id` |
+| `doc.checkpoint` | experimental | `export` on `/` |
+| `doc.export` | experimental | `export` on `/` |
+| `print.package` | experimental | may enter; `export` on the canvas, and on each canvas of a free canvas's path (the steps on others are left out); `read` on the PDF Frame; what is printed is what the caller may read |
+| `proc.start` | stable | a Source: `run` (or a write right) on it; a wish: `update` for analyze / code, `run` or a write right for run, on the wish; hosted: an account, executed by one of its own Agents |
+| `proc.get` | stable | one's own run, or `update` / `manage` on its wish |
+| `proc.cancel` | stable | one's own run, or `update` / `manage` on its wish |
+| `proc.rollback` | stable | `update` on the run's wish; the Commit's operations as the caller |
+| `proc.list` | stable | may enter |
+| `proc.claim` | stable | the executor the run's context names, with its claim token |
+| `proc.heartbeat` | stable | the run's token, while its attempt is current and running |
+| `proc.report` | stable | the run's token, while its attempt is current and running |
+| `proc.tool` | stable | the run's token, while its attempt is current and running |
+| `proc.program` | stable | the run's token, while its attempt is current and running |
+| `proc.files` | stable | the run's token, while its attempt is current and running |
+| `user.get_prefs` | experimental | a person's session (not a guest or a link): its own preferences only |
+| `user.set_prefs` | experimental | a person's session (not a guest or a link): its own preferences only |
+| `ws.publish` | experimental | `manage` on `entity_id` |
+| `ws.unpublish` | experimental | `manage` on the entity (on `/` once it is deleted) |
+| `ws.list_publications` | experimental | may enter; `read` on each entity |
+| `ws.list_referrers` | experimental | `read` on `entity_id` |
+| `control.list` | experimental | a session |
+| `control.describe` | experimental | a session |
+| `control.import` | experimental | each operation's capability on its target (`schemas/operations.json`) |
+| `control.export` | experimental | may enter; `read` on each entity |
+| `ext.build` | experimental | each operation's capability on its target (`schemas/operations.json`) |
+| `ext.export` | experimental | may enter; `read` on each entity |
+| `ext.install` | experimental | into the caller's own library (the control panel installs into anyone's) |
+| `ext.list_library` | experimental | may own (unrestricted account or service) |
+| `ext.uninstall` | experimental | may own (unrestricted account or service) |
+| `ext.library_bundle` | experimental | may own (unrestricted account or service) |
+| `ext.import` | experimental | may own (unrestricted account or service); each operation's capability on its target (`schemas/operations.json`) |
+| `ext.pack` | experimental | may own (unrestricted account or service); may enter; `read` on each entity |
+| `ext.upgrade` | experimental | may own (unrestricted account or service); each operation's capability on its target (`schemas/operations.json`) |
+| `ext.export_template` | experimental | may enter; `export` on each Surface; the permission design with `manage` |
+| `ext.create_from_template` | experimental | may own (unrestricted account or service) |
+| `asset.stream_url` | stable | the session's roles and links |
+| `session.create` | experimental | the session's roles and links |
+| `session.list` | experimental | the session's roles and links |
+| `session.list_mine` | experimental | the session's roles and links |
+| `session.list_open` | experimental | a session; each listed session is one the caller may open without a link |
+| `session.get` | experimental | the session's roles and links |
+| `session.join` | experimental | the session's roles and links |
+| `session.start` | experimental | the session's roles and links |
+| `session.end` | experimental | the session's roles and links |
+| `session.save` | experimental | the session's roles and links |
+| `session.delete` | experimental | the session's roles and links |
+| `session.set_access` | experimental | the session's roles and links |
+| `session.invite` | experimental | the session's roles and links |
+| `session.list_invites` | experimental | the session's roles and links |
+| `session.revoke_invite` | experimental | the session's roles and links |
+| `session.takeover` | experimental | the session's roles and links |
+| `session.command` | experimental | the session's roles and links |
+| `session.sample` | experimental | the session's roles and links |
+| `session.task` | experimental | the session's roles and links |
+| `session.claim` | experimental | the session's roles and links |
+| `session.respond` | experimental | the session's roles and links |
+| `session.review` | experimental | the session's roles and links |
+| `session.publish` | experimental | the session's roles and links |
+| `session.react` | experimental | the session's roles and links |
+| `session.events` | experimental | the session's roles and links |
+| `session.watch` | experimental | the session's roles and links |
+| `session.replay` | experimental | the session's roles and links |
+| `session.notes` | experimental | the session's roles and links |
+| `session.feed_sample` | experimental | the session's roles and links |
+| `session.post` | experimental | the session's roles and links |
+| `session.list_posts` | experimental | the session's roles and links |
+| `session.delete_post` | experimental | the session's roles and links |
+| `session.rtc` | experimental | the session's roles and links |
+| `session.voice` | experimental | the session's roles and links |
+<!-- authorization-table:end -->
+
+**Commit size.** Two limits. One *request* (`doc.commit`, `doc.stage`, any kRPC call) is at most `Limits.max_commit_bytes` (8 MiB, the HTTP body limit). One *Commit* — the staged parts plus the final request, and a compensating Commit of `doc.undo` — is at most `max_commit_total_bytes` (32 MiB) and `max_ops` (50 000 operations, `aiworkspace-core` `Limits`, shared with the browser replica). A client sends a Commit that does not fit one request as `doc.stage { part: 0..N-2 }` + `doc.commit { staged: [digests], operations: <last part> }`; the service assembles it and runs the ordinary pipeline: one transaction, one `commit_id`, one change event, one undo unit. Parts live one hour under `(principal, idempotency_key, part)`, count as `staged` usage and are consumed by the final `doc.commit` whatever its outcome (`doc.prepare` does not consume); missing or expired parts answer `SNAPSHOT_EXPIRED` / `STAGED_PARTS_MISSING` (stage again), a part whose digest is not the one named `IDEMPOTENCY_MISMATCH`, an assembled Commit over the limits `LIMIT_EXCEEDED`. The websdk's `commitWithParts` (used by `AiWorkspaceClient.commit` and the Desktop client) does the cutting (6 MiB parts): callers make one `commit` call per Commit. Importers (PDF, Office, draw.io, tables) write one Commit per import and refuse an import over the limits before sending anything.
 
 HTTP routes (same port, `Authorization: Bearer <session token>`):
 
 | Route | Use |
 | --- | --- |
-| `GET /kapi/aiworkspace/asset/<workspace_id>/<object_id>` | asset bytes from the named store, authorized through an entity that references the asset — an AssetRef's poster too (collaborators, guests and run tokens have no rights on the owner's bucket); served with the sniffed type for pictures, PDF, plain text, audio and video, as `application/octet-stream` otherwise (SVG, HTML) |
+| `GET /kapi/aiworkspace/asset/<workspace_id>/<object_id>` | asset bytes from the named store, authorized through an entity that references the asset — an AssetRef's poster too, the Workspace's cover (the root's settings) for whoever may enter it (collaborators, guests and run tokens have no rights on the owner's bucket); served with the sniffed type for pictures, PDF, plain text, audio and video, as `application/octet-stream` otherwise (SVG, HTML) |
 | `GET /kapi/aiworkspace/stream/<token>` | the bytes of one asset by `Range` (no bearer: the token from `asset.stream_url` is the credential), for `<video>` / `<audio>` |
 | `GET /kapi/aiworkspace/session/ws` | the session channel (WebSocket; the first message carries the session token or link) |
 
 Uploads go through NDM (above); export packages and replica databases are read from nfs-server's data plane,
 `GET /bucket/v1/<bucket_id>/<key>?token=<token>` with the `download` of `doc.export` / `replica.bootstrap`.
 | `GET /kapi/aiworkspace/schemas/richtext.basic.v1.json` | rich text schema definition (no auth) |
-| `POST /kapi/aiworkspace/wish-host/<token>/llm_map` | `aiws.llm.map` of a running wish program; the token is the run's (no session) |
 
 Operations (`operations[]` of a Commit): `entity.create|delete|restore|rename|set_keys|unset_keys|set_write_policy|set_derived|clone`,
 `data.pin`, `tree.move|place`, `dir.set_member|remove_member|replace`, `table.insert_records|delete_records|set_values|unset_values|set_body|add_field|update_field|delete_field|add_option|update_option|delete_option|migrate_field`,
@@ -1186,7 +2034,7 @@ Operations (`operations[]` of a Commit): `entity.create|delete|restore|rename|se
 
 - **Export/replica download routes carry the `workspace_id`** (`/export/<workspace_id>/<export_id>`): there is no service-level database to look an export id up in.
 - **Objects are in the zone's named store**, retained by bindings in the owner's buckets (Storage above); ids and encodings are ndn-lib's, verified in `store/tests/kernel.rs` (V01). The `objects` bucket is a `data` bucket of retention DirObjects, not an `object` bucket of `jobj` roots: binding a `jobj` would keep only that object.
-- **Files are single `mix256` chunks (≤ 32 MiB)**; ChunkList for larger assets and record files is not written.
+- **Files are single `mix256` chunks (≤ 32 MiB)**; ChunkList for larger assets and record files is not written. Larger audio / video uploads are the browser's chunk-list FileObjects: staged, referenced and streamed, but not packed by a self-contained export (listed as missing).
 - **Undo `partial` mode** determines the applicable part by probing each inverse operation on its own.
 - **URL query sources** only reach adapters registered in the service (`fixture://` generated source for tests). There is no general HTTP fetcher: a URL in a document cannot make the service issue arbitrary requests.
 - Extra methods: `doc.outline`, `doc.source_capabilities`, `diag.verify_refs`.

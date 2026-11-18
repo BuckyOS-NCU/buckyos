@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { Page } from '@playwright/test'
 import { buildOperations, convertPage, ImportReport, readDrawio } from '../../../aiworkspace/import-drawio/mod.ts'
-import { fitAll, mainMenu, openCanvas, test, expect, type Api } from './fixtures'
+import { chooseFromDevice, chooseFromZone, fitAll, mainMenu, openCanvas, test, expect, type Api } from './fixtures'
 
 const ALICE = 'tok-alice'
 const SHOTS = 'test-results/aiworkspace-drawio'
@@ -56,9 +56,7 @@ test('DR-render basic shapes, swimlanes and connectors from the fixtures draw in
 
 async function importFile(page: Page, file: string) {
   await expect(page.getByTestId('aiws-import-report')).toHaveCount(0)
-  const chooser = page.waitForEvent('filechooser')
-  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-drawio')
-  await (await chooser).setFiles(`${FIXTURES}/${file}`)
+  await chooseFromZone(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-file', 'aiws-menu-import-drawio'), `${FIXTURES}/${file}`)
 }
 
 const cellsOn = async (api: Api, ws: { workspace_id: string }, surface: string): Promise<Json[]> => {
@@ -355,9 +353,9 @@ test('DR-08 SVG shapes: pasted SVG becomes a recolourable shape; the library pan
   await page.getByTestId('aiws-color-d1242f').click()
   await expect.poll(async () => (await configOf(api, ws, star.entity_id)).config.stroke).toBe('#d1242f')
   await expect(page.getByTestId(`aiws-shape-${star.entity_id}`).locator('svg.aiws-shape-art')).toHaveCSS('--aiws-shape-stroke', '#d1242f')
-  // the library: search, click to place
+  // the library (the shape tool's second column, after the basic shapes): search, click to place
   await page.mouse.click(1200, 800)
-  await page.getByTestId('aiws-tool-library').click()
+  await page.getByTestId('aiws-tool-insert-shape').click()
   await expect(page.getByTestId('aiws-shape-library')).toBeVisible()
   await page.getByTestId('aiws-library-search').fill('decision')
   await expect(page.getByTestId('aiws-library-shape-mxgraph.flowchart.decision')).toBeVisible()
@@ -366,7 +364,7 @@ test('DR-08 SVG shapes: pasted SVG becomes a recolourable shape; the library pan
   await page.mouse.click(700, 400)
   await expect.poll(async () => (await cellsOn(api, ws, 'sf-d')).length).toBe(2)
   // drag a BPMN shape from the library onto the canvas
-  await page.getByTestId('aiws-tool-library').click()
+  await page.getByTestId('aiws-tool-insert-shape').click()
   await page.getByTestId('aiws-library-select').selectOption('bpmn')
   await page.getByTestId('aiws-library-shape-mxgraph.bpmn.user_task').dragTo(page.getByTestId('aiws-canvas'), { targetPosition: { x: 1000, y: 450 } })
   await expect.poll(async () => (await cellsOn(api, ws, 'sf-d')).length).toBe(3)
@@ -423,7 +421,7 @@ test('DR-10 export: a canvas imported from draw.io and exported again keeps its 
     await expect.poll(async () => (await cellsOn(api, ws, 'sf-d')).filter((e: Json) => e.view_type === 'connector').length).toBe(8)
   }
   const download = page.waitForEvent('download')
-  await mainMenu(page, 'aiws-menu-export-menu', 'aiws-menu-export-drawio')
+  await mainMenu(page, 'aiws-menu-surface', 'aiws-menu-export-drawio')
   const file = await download
   expect(file.suggestedFilename()).toBe('画布.drawio')
   const exported = readFileSync(await file.path(), 'utf8')
@@ -501,8 +499,6 @@ test('DR-11 the insert catalog: a swimlane pool with three lanes, objects dragge
   expect((await configOf(api, ws, shape.entity_id)).config).toMatchObject({ shape: 'svg', fill: '#1a7f37' })
   // import from the catalog
   await page.getByTestId('aiws-tool-catalog').click()
-  const chooser = page.waitForEvent('filechooser')
-  await page.getByTestId('aiws-catalog-import-drawio').click()
-  await (await chooser).setFiles(`${FIXTURES}/flowchart.drawio`)
+  await chooseFromDevice(page, () => page.getByTestId('aiws-catalog-import-drawio').click(), `${FIXTURES}/flowchart.drawio`)
   await expect.poll(async () => (await cellsOn(api, ws, 'sf-d')).filter((e: Json) => e.view_type === 'connector').length).toBe(8)
 })

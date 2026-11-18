@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Keep ext-core's facts in one piece and resolve its release (ExtTools TODO §3.10, T2a / T2b).
+"""Keep ext-core's facts in one piece and resolve its release (ExtTools TODO section 3.10, T2a / T2b).
 
-check-table   doc/app_service/paios容器需求.md §6.4 table B <-> ext-manifest.json provides <-> what the build pins
+check-table   the paios container requirements, section 6.4 table B <-> ext-manifest.json provides <-> what the build pins,
+              and the manifest's online items <-> the build's versions and pins
 resolve       the release manifest of the pinned version from R2, every tar checked with HEAD, as bin/ext-tools/ext_tools.json
 latest        latest.json of a release, for ext-core-latest and R2
 """
@@ -15,25 +16,25 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 EXT_CORE = ROOT / "publish" / "exttool" / "ext-core"
-TABLE_DOC = ROOT / "doc" / "app_service" / "paios容器需求.md"
+TABLE_DOC = ROOT / "doc" / "app_service" / "paios\u5bb9\u5668\u9700\u6c42.md"
 SCHEMA = "buckyos.ext-tools/v1"
 PLATFORMS = ("linux-x86_64", "linux-aarch64", "darwin-arm64", "darwin-x86_64", "windows-x86_64")
 DEFAULT_BASE_URL = "https://buckyos-installer.tbudr.top"
 # A row of table B names its tool in the source column: who has to pin it.
-CONDA_TOOLS = {"ffmpeg", "imagemagick", "poppler", "tesseract", "curl", "xz", "git", "tree", "unzip"}
-OFFICIAL_TOOLS = {"pandoc": "pandoc-", "python": "cpython-", "uv": "uv-", "node": "node-", "deno": "deno-", "jq": "jq-", "mingit": "MinGit-", "busybox": "busybox-"}
+CONDA_TOOLS = {"ffmpeg", "imagemagick", "poppler", "tesseract", "curl", "xz", "git", "tree", "unzip", "avahi", "libgbm"}
+OFFICIAL_TOOLS = {"pandoc": "pandoc-", "python": "cpython-", "uv": "uv-", "node": "node-", "deno": "deno-", "jq": "jq-", "mingit": "MinGit-", "busybox": "busybox-", "libreoffice": "LibreOffice_", "noto-cjk": "NotoSansCJK-", "chromium": "chrome-for-testing-", "playwright-core": "playwright-core-"}
 
 
 def table_commands(text):
     """The command column of table B."""
-    start = text.index("**表 B")
-    end = text.index("**表 C", start)
+    start = text.index("**\u8868 B")
+    end = text.index("**\u8868 C", start)
     commands = set()
     for line in text[start:end].splitlines():
         cells = line.split("|")
-        if len(cells) < 4 or not line.startswith("|") or cells[1].strip() in ("命令", "---"):
+        if len(cells) < 4 or not line.startswith("|") or cells[1].strip() in ("\u547d\u4ee4", "---"):
             continue
-        commands.update(re.findall(r"`([^`\s]+)`", re.sub(r"（.*?）", "", cells[1])))
+        commands.update(re.findall(r"`([^`\s]+)`", re.sub(r"\uff08.*?\uff09", "", cells[1])))
     return commands
 
 
@@ -51,6 +52,33 @@ def check_table(table_text, manifest, conda_env_text, sources_text):
     for tool, prefix in sorted(OFFICIAL_TOOLS.items()):
         if not re.search(rf"\s{re.escape(prefix)}", sources_text):
             errors.append(f"sources.sha256 pins nothing for {tool}")
+    return errors
+
+
+def check_online(manifest, build_text, sources_text):
+    """The online items a node downloads are the archives the build checked: the same version, layout and bytes."""
+    errors = []
+    pinned = {fields[0] for line in sources_text.splitlines() if (fields := line.split())}
+    versions = dict(re.findall(r"^([A-Z_]+)=(\S+)$", build_text, re.M))
+    items = {item["id"]: item for item in manifest.get("online", [])}
+    for name, item in sorted(items.items()):
+        for platform, entry in sorted(item["platforms"].items()):
+            if entry["sha256"] not in pinned:
+                errors.append(f"online {name} on {platform}: sources.sha256 does not pin the archive")
+    chromium = items.get("chromium")
+    if chromium is None:
+        return errors + ["ext-manifest.json declares no online item `chromium`"]
+    if chromium["version"] != versions.get("CHROMIUM_VERSION"):
+        errors.append(f"online chromium is {chromium['version']}, build.sh checks {versions.get('CHROMIUM_VERSION')}")
+    for platform in PLATFORMS:
+        entry = chromium["platforms"].get(platform)
+        if entry is None:
+            errors.append(f"online chromium has nothing for {platform}")
+            continue
+        if f"/{chromium['version']}/" not in entry["url"]:
+            errors.append(f"online chromium on {platform}: the address is not of {chromium['version']}")
+        if entry.get("into") != f"chromium-{versions.get('CHROMIUM_REVISION')}":
+            errors.append(f"online chromium on {platform}: not unpacked into chromium-{versions.get('CHROMIUM_REVISION')}, where Playwright looks")
     return errors
 
 
@@ -81,10 +109,23 @@ def resolve(version, base_url, fetch=fetch_json, head=head_size):
     if missing:
         raise ValueError(f"{version}: no payload for {', '.join(missing)}")
     for name, entry in package["platforms"].items():
-        entry["url"] = f"{base_url}/{entry['path']}"
-        size = head(entry["url"])
-        if size != entry["size"]:
-            raise ValueError(f"{entry['url']}: {size} bytes, the release says {entry['size']}")
+        source = entry.get("corresponding_source")
+        if not isinstance(source, dict):
+            raise ValueError(f"{version}/{name}: no corresponding source archive")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", source.get("manifest_sha256", "")):
+            raise ValueError(f"{version}/{name}: no valid source manifest checksum")
+        for artifact in (entry, source):
+            path = artifact.get("path", "")
+            if not path.startswith(f"ext-tools/ext-core/{version}/{name}/") or ".." in path.split("/"):
+                raise ValueError(f"{version}/{name}: invalid artifact path: {path}")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", artifact.get("sha256", "")):
+                raise ValueError(f"{version}/{name}: invalid artifact checksum")
+            if not isinstance(artifact.get("size"), int) or artifact["size"] <= 0:
+                raise ValueError(f"{version}/{name}: invalid artifact size")
+            artifact["url"] = f"{base_url.rstrip('/')}/{path}"
+            size = head(artifact["url"])
+            if size != artifact["size"]:
+                raise ValueError(f"{artifact['url']}: {size} bytes, the release says {artifact['size']}")
     return release
 
 
@@ -107,12 +148,10 @@ def main():
     latest_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "check-table":
-        errors = check_table(
-            TABLE_DOC.read_text(encoding="utf-8"),
-            json.loads((EXT_CORE / "ext-manifest.json").read_text()),
-            (EXT_CORE / "conda-env.yml").read_text(),
-            (EXT_CORE / "sources.sha256").read_text(),
-        )
+        manifest = json.loads((EXT_CORE / "ext-manifest.json").read_text())
+        sources = (EXT_CORE / "sources.sha256").read_text()
+        errors = check_table(TABLE_DOC.read_text(encoding="utf-8"), manifest, (EXT_CORE / "conda-env.yml").read_text(), sources)
+        errors += check_online(manifest, (EXT_CORE / "build.sh").read_text(encoding="utf-8"), sources)
         for error in errors:
             print(error, file=sys.stderr)
         return 1 if errors else 0

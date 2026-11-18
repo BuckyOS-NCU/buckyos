@@ -9,10 +9,10 @@ import { expect, test, type Page } from '@playwright/test'
 declare global {
   interface Window {
     __messageHubMock: import('../../../src/app/messagehub/mock/store').MessageHubMockStore
-    __messageHubMockTasks: import('../../../src/app/messagehub/mock/tasks').MockTaskSource
-    __messageHubTaskWatch: import('../../../src/app/messagehub/conversation/tasks/taskWatch').TaskWatch
-    __messageHubMockWorkCards: typeof import('../../../src/app/messagehub/mock/worksessions').mockWorkCards
-    __messageHubWorkCards: import('../../../src/app/messagehub/conversation/worksessions/watch').WorkCardsWatch
+    __messageHubMockTasks: import('../../../src/components/conversation/mock/tasks').MockTaskSource
+    __messageHubTaskWatch: import('../../../src/components/conversation/tasks/taskWatch').TaskWatch
+    __messageHubMockWorkCards: typeof import('../../../src/components/conversation/mock/worksessions').mockWorkCards
+    __messageHubWorkCards: import('../../../src/components/conversation/worksessions/watch').WorkCardsWatch
   }
 }
 
@@ -412,16 +412,8 @@ test('"Other…" turns a choice that accepts free text into the locked input; /s
   await expect(composer.getByTestId('composer-answer')).toHaveCount(0)
   expect(await lastSent(page, ASK_SESSION)).toEqual({ from: SELF, content: 'Both, README.md links to docs/index.md', relates_to: { rel: 'thread', target: ANCHOR }, machine: null, mentions: null })
 
-  // The stop button sends `/stop` as the command it is, not as an answer.
-  await ask(page, 'msg-qa-8', 'Delete the outdated pages?', { kind: 'choice', options: [{ id: 'y', label: 'Yes' }, { id: 'n', label: 'No' }] })
-  const before = (await anchors(page)).length
-  await composer.getByTestId('answer-stop').click()
-  await expect(composer.getByTestId('composer-answer')).toHaveCount(0)
-  expect(await lastSent(page, ASK_SESSION)).toEqual({ from: SELF, content: '/stop', relates_to: null, machine: null, mentions: null })
-  await expect.poll(() => anchors(page)).toHaveLength(before + 1)
-  await expect(page.getByTestId('conversation-history').getByTestId('message-bubble').last()).toContainText('/stop')
-
-  // Typed in a text answer, too.
+  // Typed `/stop` goes out as the command it is, not as an answer. (The stop button of the viewer's own Agent
+  // closes the Turn through the Agent's service instead: messagehub-agent-panel.spec.ts.)
   await ask(page, 'msg-qa-9', 'Anything else?', { kind: 'text' })
   await composer.getByRole('textbox', { name: 'Type your answer…' }).fill('/stop')
   await composer.getByRole('textbox', { name: 'Type your answer…' }).press('Enter')

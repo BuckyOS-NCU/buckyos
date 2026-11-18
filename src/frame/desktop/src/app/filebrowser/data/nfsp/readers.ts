@@ -22,7 +22,8 @@ import type {
 } from '../FolderReader'
 import { registerReaderProvider } from '../readerRegistry'
 import { registerTargetResolver } from '../targetResolver'
-import { dfsPathOf, parseViewUrl } from '../urls'
+import { archiveObjectUrl, archiveSplit, dfsPathOf, parseArchiveObjectUrl, parseViewUrl } from '../urls'
+import type { NfsBrowserClient } from '../../../../api/nfs_browser_client'
 import { effectiveListLimit, ensureSession, nfspClient } from './client'
 import { nfspToError } from './errors'
 import { watchDfsPath } from './invalidation'
@@ -35,7 +36,7 @@ import {
   refIdOf,
 } from './mapping'
 
-const LIST_WANT: WantGroup[] = ['base', 'access']
+const LIST_WANT: WantGroup[] = ['base', 'ident', 'access']
 
 const PROVISIONAL_FOLDER: LocationCapabilities = {
   kind: 'folder',
@@ -100,6 +101,15 @@ export abstract class NfspContainerReader implements FolderReader {
   /** Locator of the container (may resolve asynchronously for groups). */
   protected abstract locator(): Promise<LocatorLike>
 
+  /** The NFSP session this reader lists through (the computer uses its window's sudo session). */
+  protected client(): NfsBrowserClient {
+    return nfspClient()
+  }
+
+  protected ensure(): Promise<unknown> {
+    return ensureSession()
+  }
+
   /**
    * Cache mode for list calls. Group containers bypass the cache: direct
    * collection_patch invalidation and watch events address the collection
@@ -113,7 +123,7 @@ export abstract class NfspContainerReader implements FolderReader {
   protected abstract mapListing(listing: Listing, offset: number): FileItem[]
 
   async list(query: ListQuery): Promise<FileItemPage> {
-    await ensureSession()
+    await this.ensure()
     const at = await this.locator()
     const order = NFSP_ORDER_BY_SORT_KEY[query.sortKey]
     if (order !== this.chainOrder) {
@@ -152,7 +162,7 @@ export abstract class NfspContainerReader implements FolderReader {
     order: string | undefined,
     limit: number,
   ): Promise<Listing> {
-    const client = nfspClient()
+    const client = this.client()
     const base: ListOptions = { limit }
     if (order) base.order = order as ListOptions['order']
     const opts = { cache: this.cacheMode() }
@@ -215,7 +225,7 @@ export abstract class NfspContainerReader implements FolderReader {
     if (!this.clientUnsub) {
       // Cache-layer signal: watch SSE container_changed/resync and background
       // revalidation both land here (§8.4).
-      this.clientUnsub = nfspClient().onInvalidate((ref) => {
+      this.clientUnsub = this.client().onInvalidate((ref) => {
         if (ref === null || this.containerRefIds.has(refIdOf(ref))) this.notifyLocal()
       })
     }
@@ -250,10 +260,40 @@ class NfspDfsReader extends NfspContainerReader {
     return this.dfsPath ?? '/'
   }
 
+  /** Inside an archive the container's ref follows the archive file's version: list it fresh each time. */
+  protected cacheMode(): 'no-cache' | undefined {
+    return archiveSplit(this.dfsPath ?? '') ? 'no-cache' : undefined
+  }
+
   protected mapListing(listing: Listing): FileItem[] {
     return listing.entries.map((entry) =>
       mapEntryToItem(entry, { containerDfsPath: this.dfsPath ?? '/' }),
     )
+  }
+}
+
+/** archive://<objId>/archive/<member> reader: a folder inside an archive object (a chat attachment). */
+class NfspArchiveObjectReader extends NfspContainerReader {
+  private readonly objectId: string
+  private readonly innerPath: string
+
+  constructor(url: string, objectId: string, innerPath: string) {
+    super(url, { ...PROVISIONAL_FOLDER, acceptsContent: false })
+    this.objectId = objectId
+    this.innerPath = innerPath
+  }
+
+  protected async locator(): Promise<LocatorLike> {
+    return { type: 'object', obj_id: this.objectId, inner_path: this.innerPath }
+  }
+
+  protected mapListing(listing: Listing): FileItem[] {
+    return listing.entries.map((entry) => {
+      const item = mapEntryToItem(entry, {})
+      const inner = entry.target.ref.type === 'object' && entry.target.ref.inner_path ? entry.target.ref.inner_path : `${this.innerPath}/${entry.name}`
+      item.entry.path = archiveObjectUrl(this.objectId, inner)
+      return item
+    })
   }
 }
 
@@ -287,6 +327,14 @@ export function registerNfspReaders() {
     create: (url) => new NfspDfsReader(url),
   })
   registerReaderProvider({
+    scheme: 'archive',
+    create: (url) => {
+      const parts = parseArchiveObjectUrl(url)
+      if (!parts) throw new Error(`filebrowser: bad archive url "${url}"`)
+      return new NfspArchiveObjectReader(url, parts.objectId, parts.innerPath)
+    },
+  })
+  registerReaderProvider({
     scheme: 'view',
     create: (url) => {
       const parts = parseViewUrl(url)
@@ -298,7 +346,7 @@ export function registerNfspReaders() {
     const path = dfsPathOf(targetUrl)
     if (!path) return null
     await ensureSession()
-    const info = await nfspClient().resolve(path, ['base', 'access'])
+    const info = await nfspClient().resolve(path, ['base', 'ident', 'access'])
     if (!info) return null
     const name = path.split('/').filter(Boolean).pop() ?? path
     const item = mapEntryToItem(
@@ -312,6 +360,7 @@ export function registerNfspReaders() {
           attrs: {
             size: info.size,
             mtime: info.mtime,
+            obj_id: info.obj_id,
             access_urls: info.access_urls,
           },
         },

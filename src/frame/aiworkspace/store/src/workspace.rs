@@ -5,14 +5,14 @@
 
 use crate::docdb::{apply_changes, db_err, meta_get, meta_set, DocCache, SqlCtx, WriteStats};
 use crate::objects::{bucket_id, ObjectStore, ASSETS, OBJECTS};
-use crate::schema::{DOC_DDL, LOCAL_DDL, STORAGE_SCHEMA_VERSION};
-use aiworkspace_core::access::{Access, Cap, CapSet};
+use crate::schema::{DOC_DDL, LOCAL_ADDED_DDL, LOCAL_DDL, STORAGE_SCHEMA_VERSION};
+use aiworkspace_core::access::Cap;
 use aiworkspace_core::canonical::{canonical_json, sha256_hex};
 use aiworkspace_core::id::{check_id, check_idempotency_key, is_prefixed_id, prefixed_id};
 use aiworkspace_core::model::*;
 use aiworkspace_core::plan::{plan_commit, CommitFailure, CommitRequest, Limits, PlanEnv, PlannedOp, Touched};
 use aiworkspace_core::value::format_utc_ms;
-use aiworkspace_core::{richtext, Code, Deny, WsError, WsResult};
+use aiworkspace_core::{richtext, Code, WsError, WsResult};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -20,12 +20,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Wish blocks use the workspace owner's AICC (default).
-pub const WISH_AICC_WORKSPACE_OWNER: &str = "workspace_owner";
 /// Wish blocks use the AICC of the user who starts the run.
 pub const WISH_AICC_CURRENT_USER: &str = "current_user";
 
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+/// How long a part of a Commit waits for its final `doc.commit`.
+pub const STAGED_COMMIT_TTL_MS: i64 = 3600 * 1000;
 pub const LOCK_LEASE_MS: i64 = 60_000;
 pub const LOCK_IDLE_MS: i64 = 600_000;
 pub const COMPACT_UPDATES: i64 = 200;
@@ -61,35 +61,55 @@ pub struct Caller {
     pub run_scope: Option<String>,
     /// How the session was established (`password`, `exclusive_invite`, `did_federation`, `assertion`).
     pub auth_method: Option<String>,
-    /// `contact:<owner_did>#<tag>` subjects the service confirmed the caller belongs to.
+    /// `contact:<owner_did>#<tag>` member specs the service confirmed the caller belongs to.
     pub contacts: BTreeSet<String>,
-    /// `group:` / `contact:` subjects whose membership could not be checked: a decision depending on one is
+    /// `group:` / `contact:` member specs whose membership could not be checked: a decision depending on one is
     /// refused with `authorization_unavailable`, never taken from a stale answer.
     pub unconfirmed: BTreeSet<String>,
+    /// An Agent's owner (权限需求 R16), from a trusted source (its AgentSpec), memberships settled like the caller's:
+    /// a Workspace that configured nothing for the Agent judges it as this owner.
+    pub acting_for: Option<Box<Caller>>,
+    /// The reader of an inner-path publication (R26): it holds that publication's own subject and nothing else.
+    pub publication: Option<String>,
+    /// The wish whose macro this caller acts as (a coding or running stage, its run token): what it reads and writes
+    /// is the macro identity — its own permissions bounded by the wish's group when bound with `intersection`
+    /// (权限需求 §4.5 “读取也按宏身份”).
+    pub macro_of: Option<String>,
 }
 
-/// Grant subject that applies to everyone, signed in or not (a public link).
-pub const PUBLIC_SUBJECT: &str = "public";
-/// Grant subject that applies to every unrestricted account of the Zone.
-pub const ANY_AUTHENTICATED_SUBJECT: &str = "*";
+/// Member spec: every unrestricted account of the Zone.
+pub const ANY_ACCOUNT_MEMBER: &str = "*";
 pub const GUEST_PREFIX: &str = "guest:";
 pub const GUEST_TOKEN_PREFIX: &str = "gt";
-/// `group:<id>`: the members of a system user group.
+/// Member spec `group:<id>`: the members of a system user group.
 pub const GROUP_PREFIX: &str = "group:";
-/// `contact:<owner_did>#<tag>`: the DIDs in an owner's contact group (projections included).
+/// Member spec `contact:<owner_did>#<tag>`: the DIDs in an owner's contact group (projections included).
 pub const CONTACT_PREFIX: &str = "contact:";
+
+/// Whether a caller matches a group member spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberMatch {
+    Yes,
+    No,
+    /// The membership could not be checked (`authorization_unavailable` when a decision depends on it).
+    Unknown,
+}
 
 impl Caller {
     fn with_class(principal: &str, class: CallerClass) -> Caller {
-        Caller { principal: principal.to_string(), app_id: None, class, kind: None, run_scope: None, auth_method: None, contacts: BTreeSet::new(), unconfirmed: BTreeSet::new() }
+        Caller { principal: principal.to_string(), app_id: None, class, kind: None, run_scope: None, auth_method: None, contacts: BTreeSet::new(), unconfirmed: BTreeSet::new(),
+                 acting_for: None, publication: None, macro_of: None }
     }
     /// The holder of a run token (M3): acts as the run's principal, for that run only.
     pub fn run_token(principal: &str, run_id: &str) -> Caller {
         Caller { kind: Some("run".into()), run_scope: Some(run_id.to_string()), ..Self::with_class(principal, CallerClass::Service) }
     }
-    /// An Agent principal (its own DID): its Commits carry origin `agent`.
+    /// An Agent principal (its own DID): its Commits carry origin `agent`. `owner`: the account it belongs to.
     pub fn agent(principal: &str) -> Caller {
         Caller { kind: Some("agent".into()), ..Self::with_class(principal, CallerClass::Service) }
+    }
+    pub fn agent_of(principal: &str, owner: &str) -> Caller {
+        Caller { acting_for: Some(Box::new(Caller::user(owner))), ..Self::agent(principal) }
     }
     pub fn is_agent(&self) -> bool {
         self.kind.as_deref() == Some("agent")
@@ -106,6 +126,47 @@ impl Caller {
     }
     pub fn service(principal: &str) -> Caller {
         Self::with_class(principal, CallerClass::Service)
+    }
+    /// What the service does in its own name (权限需求 R14): maintenance, a session's timeline. It holds what the
+    /// Workspace's owner holds, and says so (`kind: internal`).
+    pub fn internal(owner: &str) -> Caller {
+        Caller { kind: Some("internal".into()), ..Self::with_class(owner, CallerClass::Service) }
+    }
+    /// What a run records of its trigger (权限需求 R14): the class it signed in as, so the service can act for it later
+    /// as the same kind of caller (memberships are settled again then, never recorded).
+    pub fn identity_json(&self) -> serde_json::Value {
+        let (class, restricted, did) = match &self.class {
+            CallerClass::Account { restricted, did, .. } => ("account", *restricted, did.clone()),
+            CallerClass::External { did } => ("external", true, Some(did.clone())),
+            CallerClass::Guest => ("guest", true, None),
+            CallerClass::Service => ("service", false, None),
+        };
+        serde_json::json!({ "principal": self.principal, "class": class, "restricted": restricted, "did": did, "kind": self.kind,
+                            "owner": self.acting_for.as_ref().map(|o| o.principal.clone()) })
+    }
+    /// The caller a run acts for, rebuilt from [`Self::identity_json`] (R14): its class and restriction, an Agent with its
+    /// owner; memberships empty until the service settles them. Never an unrestricted account made up from a name.
+    pub fn delegated(identity: &serde_json::Value, principal: &str) -> Caller {
+        let did = identity["did"].as_str().map(str::to_string);
+        let mut c = match identity["class"].as_str() {
+            Some("account") => Caller::with_class(principal, CallerClass::Account { restricted: identity["restricted"].as_bool().unwrap_or(true), did, groups: Vec::new() }),
+            Some("external") => Caller::external(principal),
+            Some("service") => Caller::service(principal),
+            _ => Caller::with_class(principal, CallerClass::Guest),
+        };
+        c.kind = identity["kind"].as_str().map(str::to_string);
+        if let Some(owner) = identity["owner"].as_str() {
+            c.acting_for = Some(Box::new(Caller::user(owner)));
+        }
+        c
+    }
+    /// Someone who has not signed in and presented nothing: what `@guest` (while anonymous access is on) gives.
+    pub fn anonymous() -> Caller {
+        Self::with_class(GUEST_PREFIX, CallerClass::Guest)
+    }
+    /// The reader of an inner-path publication: it reads under the publication's subject only (R26).
+    pub fn publication_reader(publication_id: &str) -> Caller {
+        Caller { publication: Some(publication_id.to_string()), ..Self::with_class(&format!("{}{publication_id}", crate::acl::PUB_PREFIX), CallerClass::Guest) }
     }
     /// An unauthenticated visitor: the principal is derived from a bearer token the browser made up
     /// (`name_lib::bearer_token` form, prefix `gt`) and keeps, so the same browser stays the same guest
@@ -134,9 +195,16 @@ impl Caller {
             CallerClass::Service => false,
         }
     }
-    /// Creates, imports and forks Workspaces and lists the Zone's principals: unrestricted accounts and services.
+    /// Creates, imports and clones Workspaces and lists the Zone's principals: unrestricted accounts and services.
     pub fn may_own(&self) -> bool {
         matches!(self.class, CallerClass::Account { restricted: false, .. } | CallerClass::Service)
+    }
+    /// Who owns what this caller creates: an Agent's Workspaces belong to its owner (R16).
+    pub fn owner_principal(&self) -> &str {
+        match (&self.acting_for, self.is_agent()) {
+            (Some(o), true) => &o.principal,
+            _ => &self.principal,
+        }
     }
     /// The same caller before the service settled its group and contact memberships (they are settled again).
     pub fn without_memberships(&self) -> Caller {
@@ -146,9 +214,10 @@ impl Caller {
         if let CallerClass::Account { groups, .. } = &mut c.class {
             groups.clear();
         }
+        c.acting_for = c.acting_for.map(|o| Box::new(o.without_memberships()));
         c
     }
-    /// The DID contact grants are checked against, once known.
+    /// The DID contact member specs are checked against, once known.
     pub fn did(&self) -> Option<&str> {
         match &self.class {
             CallerClass::Account { did, .. } => did.as_deref(),
@@ -156,54 +225,27 @@ impl Caller {
             _ => None,
         }
     }
-    /// Whether a grant naming `subject` applies: the exact principal, `public` (when `public` counts), `*` for
-    /// unrestricted accounts only, the caller's system groups, confirmed contact groups.
-    pub fn matches(&self, subject: &str, public: bool) -> bool {
-        if subject == self.principal {
-            return true;
+    /// Whether a logical group's member spec names this caller: the exact principal, `*` for unrestricted accounts,
+    /// the caller's system groups, confirmed contact groups.
+    pub fn matches_member(&self, member: &str) -> MemberMatch {
+        if member == self.principal {
+            return MemberMatch::Yes;
         }
-        if subject == PUBLIC_SUBJECT {
-            return public;
+        if self.unconfirmed.contains(member) {
+            return MemberMatch::Unknown;
         }
-        if let CallerClass::Account { restricted, groups, .. } = &self.class {
-            if subject == ANY_AUTHENTICATED_SUBJECT {
-                return !restricted;
+        let yes = match &self.class {
+            CallerClass::Account { restricted, groups, .. } => {
+                (member == ANY_ACCOUNT_MEMBER && !restricted) || member.strip_prefix(GROUP_PREFIX).is_some_and(|g| groups.iter().any(|x| x == g))
             }
-            if let Some(group) = subject.strip_prefix(GROUP_PREFIX) {
-                return groups.iter().any(|g| g == group);
-            }
-        }
-        subject.starts_with(CONTACT_PREFIX) && self.contacts.contains(subject)
+            _ => false,
+        } || (member.starts_with(CONTACT_PREFIX) && self.contacts.contains(member));
+        if yes { MemberMatch::Yes } else { MemberMatch::No }
     }
 }
 
 pub fn is_guest_principal(principal: &str) -> bool {
     principal.starts_with(GUEST_PREFIX)
-}
-
-/// A grant subject: a principal, `public`, `*`, `group:<id>` or `contact:<owner_did>#<tag>`. A contact group can only
-/// be named by its owner (`granter` is the caller's DID): nobody probes someone else's private groups through grants.
-fn check_subject(subject: &str, granter: Option<&str>) -> WsResult<()> {
-    let bad = |what: &str| Err(WsError::invalid_op(format!("invalid subject: {what}")));
-    if subject.is_empty() || subject.len() > 256 || subject.chars().any(char::is_whitespace) {
-        return bad("1–256 characters without spaces");
-    }
-    if let Some(group) = subject.strip_prefix(GROUP_PREFIX) {
-        if group.is_empty() {
-            return bad("group:<id>");
-        }
-    }
-    if let Some(contact) = subject.strip_prefix(CONTACT_PREFIX) {
-        match contact.split_once('#') {
-            Some((owner, tag)) if owner.starts_with("did:") && !tag.is_empty() => {
-                if granter != Some(owner) {
-                    return bad("a contact group grant names one of the caller's own groups (contact:<your did>#<tag>)");
-                }
-            }
-            _ => return bad("contact:<owner_did>#<tag>"),
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +307,13 @@ pub struct CommitOpts {
     /// The session service (第四期规划 §5.2–§5.3): the Commit's origin is `session`, the only one that writes tasks,
     /// responses and results (and, with them, the session feeds).
     pub as_session: bool,
+    /// Authorize with this instead of the caller's own permissions: a run's macro identity (权限需求 §4.5, R28). The
+    /// caller must still be able to enter the Workspace.
+    pub authorize_as: Option<aiworkspace_core::access::Access>,
+    /// Who did what, beside the writer (R16, R31): `judged_as`, `triggered_by`, `executed_by`, `macro`.
+    pub attribution: Option<Value>,
+    /// The id the Commit takes when accepted (a wish run's record names its Commit in the same Commit).
+    pub commit_id: Option<String>,
 }
 
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -295,9 +344,13 @@ pub struct Workspace {
     pub failpoint: Option<FailPoint>,
     /// Row counts written by the last accepted commit.
     pub last_stats: WriteStats,
+    /// Records of `table_records` when its planner statistics were last taken, and written since (`refresh_table_stats`).
+    table_stats: (usize, usize),
     /// Called after a commit became durable and was published in memory.
     pub on_commit: Option<Box<dyn Fn(u64) + Send>>,
     pub on_lock_change: Option<Box<dyn Fn() + Send>>,
+    /// Called after a permission change (权限需求 R4) with the new permission revision.
+    pub on_acl_change: Option<Box<dyn Fn(u64) + Send>>,
     /// Show locks of the service (third phase §8.1): a presented Workspace accepts no document writes.
     pub show_locks: Option<crate::show::ShowLocks>,
     /// Logical bytes this Workspace may occupy (D19); `None` = no quota.
@@ -314,12 +367,35 @@ pub struct Workspace {
 /// Default retention of resources only the history references: 30 days (D06).
 pub const HISTORY_RETENTION_MS: i64 = 30 * 24 * 3_600_000;
 
+/// The records `sqlite_stat1` holds for `table_records`, if it has been analyzed.
+fn table_stats(doc: &Connection) -> Option<usize> {
+    doc.query_row("SELECT stat FROM sqlite_stat1 WHERE tbl = 'table_records' AND idx = 'table_records'", [], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
+}
+
+/// Planner statistics of `table_records` (核心 API 调整 T0-6). SQL over the logical tables is planned from them:
+/// without them SQLite takes `source_id = ?` for about ten rows and never builds the automatic index a join needs
+/// (100 000 × 1000 records: past the 2 s budget instead of ~0.1 s). Only `sqlite_stat1` is kept: with the STAT4
+/// samples (the bundled SQLite is built with `SQLITE_ENABLE_STAT4`) the planner puts the smaller, materialized side
+/// of such a join outside and scans the large one for each of its rows (80 s). `ANALYZE` of 100 000 records takes ~25 ms.
+fn refresh_table_stats(doc: &Connection) -> WsResult<usize> {
+    doc.execute_batch("ANALYZE main.table_records").map_err(db_err)?;
+    let stat4: bool = doc.query_row("SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_stat4'", [], |_| Ok(true)).optional().map_err(db_err)?.unwrap_or(false);
+    if stat4 {
+        doc.execute("DELETE FROM sqlite_stat4 WHERE tbl = 'table_records'", []).map_err(db_err)?;
+    }
+    Ok(table_stats(doc).unwrap_or(0))
+}
+
 fn open_db(path: &Path, synchronous_full: bool) -> WsResult<Connection> {
     let conn = Connection::open(path).map_err(db_err)?;
     conn.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
     // an answered commit must survive power loss
     conn.pragma_update(None, "synchronous", if synchronous_full { "FULL" } else { "NORMAL" }).map_err(db_err)?;
     conn.pragma_update(None, "foreign_keys", "ON").map_err(db_err)?;
+    // a WAL that grew while a wish stage held its snapshot shrinks back once the snapshot ends (余下任务 D2)
+    conn.pragma_update(None, "journal_size_limit", 16 * 1024 * 1024).map_err(db_err)?;
     conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(db_err)?;
     Ok(conn)
 }
@@ -417,6 +493,31 @@ pub fn err_json(e: &WsError) -> Value {
     json!({ "ok": false, "error": e.to_json() })
 }
 
+/// Storage 5 → 6: every entity without a name gets the name the rule gives (in tree order), in one transaction
+/// with the version change. Not a Commit: no version moves, history is untouched.
+pub(crate) fn backfill_names(doc: &Connection) -> WsResult<()> {
+    let cache = RefCell::new(DocCache::default());
+    let names = {
+        let ctx = SqlCtx { conn: doc, local: None, cache: &cache, now: "" };
+        aiworkspace_core::naming::backfill(&ctx)?
+    };
+    doc.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
+    let r = (|| -> WsResult<()> {
+        let mut st = doc.prepare("UPDATE entities SET name = ?2 WHERE entity_id = ?1 AND name IS NULL").map_err(db_err)?;
+        for (id, name) in &names {
+            st.execute(params![id, name]).map_err(db_err)?;
+        }
+        Ok(())
+    })();
+    match r {
+        Ok(()) => doc.execute_batch("COMMIT").map_err(db_err),
+        Err(e) => {
+            let _ = doc.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 impl Workspace {
     pub fn now(&self) -> String {
         format_utc_ms((self.clock)())
@@ -463,9 +564,7 @@ impl Workspace {
             }
         }
         apply_changes(&doc, &changes, 0)?;
-        local
-            .execute("INSERT INTO grants (subject, scope_entity_id, capabilities) VALUES (?1, '', ?2)", params![owner, CapSet::ALL.0])
-            .map_err(db_err)?;
+        local.execute_batch(LOCAL_ADDED_DDL).map_err(db_err)?;
         local.execute("INSERT INTO local_meta (key, value) VALUES ('owner', ?1)", [owner]).map_err(db_err)?;
         drop(doc);
         drop(local);
@@ -478,11 +577,23 @@ impl Workspace {
         }
         let doc = open_db(&dir.join("doc.sqlite"), true)?;
         let local = open_db(&dir.join("local.sqlite"), false)?;
+        crate::acl::upgrade_local(&local)?;
+        local.execute_batch(LOCAL_ADDED_DDL).map_err(db_err)?;
         let get = |k: &str| -> WsResult<String> {
             meta_get(&doc, k)?.ok_or_else(|| WsError::io(format!("workspace_meta.{k} missing")))
         };
         // unknown storage or format versions are refused; the file is never modified or emptied
-        let storage: u32 = get("storage_schema_version")?.parse().unwrap_or(0);
+        let mut storage: u32 = get("storage_schema_version")?.parse().unwrap_or(0);
+        if storage == 5 {
+            backfill_names(&doc)?;
+            meta_set(&doc, "storage_schema_version", "6")?;
+            storage = 6;
+        }
+        if storage == 6 {
+            let owner: Option<String> = local.query_row("SELECT value FROM local_meta WHERE key = 'owner'", [], |r| r.get(0)).optional().map_err(db_err)?;
+            crate::acl::upgrade_doc_7(&doc, owner.as_deref())?;
+            storage = 7;
+        }
         if storage != STORAGE_SCHEMA_VERSION {
             return Err(WsError::new(Code::UnsupportedVersion, format!("storage_schema_version {storage} is not supported")));
         }
@@ -494,6 +605,10 @@ impl Workspace {
             .optional()
             .map_err(db_err)?
             .unwrap_or(false);
+        let analyzed = match table_stats(&doc) {
+            Some(n) => n,
+            None => refresh_table_stats(&doc)?,
+        };
         let ws = Workspace {
             session_events,
             dir: dir.to_path_buf(),
@@ -510,8 +625,10 @@ impl Workspace {
             clock,
             failpoint: None,
             last_stats: WriteStats::default(),
+            table_stats: (analyzed, 0),
             on_commit: None,
             on_lock_change: None,
+            on_acl_change: None,
             show_locks: None,
             quota: None,
             traffic_quota: None,
@@ -556,7 +673,8 @@ impl Workspace {
     pub fn clear_staged(&mut self, caller: &Caller) -> WsResult<Value> {
         self.require_ws(caller, Cap::Manage)?;
         let (removed, bytes) = self.drop_staged(None)?;
-        Ok(json!({ "ok": true, "removed": removed, "bytes": bytes }))
+        let (parts, part_bytes) = self.drop_staged_commits(None)?;
+        Ok(json!({ "ok": true, "removed": removed, "bytes": bytes, "commit_parts": parts, "commit_part_bytes": part_bytes }))
     }
 
     /// Unbind and forget the staged uploads no asset row took over (all, or those expired by `now`).
@@ -582,6 +700,83 @@ impl Workspace {
         }
         self.add_usage("staged", -bytes)?;
         Ok((removed, bytes))
+    }
+
+    /// Forget staged Commit parts (all, or those expired by `now`) and give their bytes back.
+    fn drop_staged_commits(&self, expired_by: Option<&str>) -> WsResult<(u64, i64)> {
+        let cond = if expired_by.is_some() { "WHERE expires_at <= ?1" } else { "WHERE ?1 IS NULL" };
+        let (n, bytes): (u64, i64) = self
+            .local
+            .query_row(&format!("SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM staged_commits {cond}"), [expired_by], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(db_err)?;
+        self.local.execute(&format!("DELETE FROM staged_commits {cond}"), [expired_by]).map_err(db_err)?;
+        self.add_usage("staged", -bytes)?;
+        Ok((n, bytes))
+    }
+
+    /// The parts of one key are consumed by its final `doc.commit`, whatever the outcome.
+    fn consume_staged(&self, principal: &str, idem_key: &str) {
+        let bytes: i64 = self
+            .local
+            .query_row("SELECT COALESCE(SUM(bytes), 0) FROM staged_commits WHERE principal = ?1 AND idem_key = ?2", params![principal, idem_key], |r| r.get(0))
+            .unwrap_or(0);
+        if bytes == 0 {
+            return;
+        }
+        let _ = self.local.execute("DELETE FROM staged_commits WHERE principal = ?1 AND idem_key = ?2", params![principal, idem_key]);
+        let _ = self.add_usage("staged", -bytes);
+    }
+
+    /// `doc.stage { workspace_id, epoch, idempotency_key, part, operations }`: hold part `part` of a Commit too
+    /// large for one request. Admission is that of `doc.commit`; the operations are judged by the final commit.
+    pub fn stage_commit(&mut self, caller: &Caller, req: &Value) -> WsResult<Value> {
+        let get = |k: &str| req.get(k).and_then(Value::as_str);
+        if get("workspace_id") != Some(self.workspace_id.as_str()) {
+            return Err(WsError::invalid_op("workspace_id does not match"));
+        }
+        self.check_epoch(get("epoch").unwrap_or(""))?;
+        let key = get("idempotency_key").ok_or_else(|| WsError::invalid_op("idempotency_key required"))?;
+        aiworkspace_core::id::check_idempotency_key(key)?;
+        let part = req.get("part").and_then(Value::as_u64).filter(|p| *p < 64).ok_or_else(|| WsError::invalid_op("part must be 0..63"))?;
+        let ops = req.get("operations").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or_else(|| WsError::invalid_op("operations must be a non-empty array"))?;
+        if ops.len() > self.limits.max_ops {
+            return Err(WsError::limit(format!("more than {} operations", self.limits.max_ops)));
+        }
+        if self.access(caller)?.is_empty() {
+            return Err(WsError::not_found("workspace not found"));
+        }
+        if let Some(lock) = self.show_lock() {
+            return Err(Self::show_locked_error(&lock));
+        }
+        if self.session_events && self.session_closed() {
+            return Err(WsError::sub(Code::PermissionDenied, "SESSION_CLOSED", "the session has ended: its workspace is a record now"));
+        }
+        let ops_json = Value::Array(ops.clone()).to_string();
+        let digest = sha256_hex(canonical_json(&req["operations"])?.as_bytes());
+        let bytes = ops_json.len() as i64;
+        let old: i64 = self
+            .local
+            .query_row("SELECT bytes FROM staged_commits WHERE principal = ?1 AND idem_key = ?2 AND part = ?3", params![caller.principal, key, part as i64], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(0);
+        let held: i64 = self
+            .local
+            .query_row("SELECT COALESCE(SUM(bytes), 0) FROM staged_commits WHERE principal = ?1 AND idem_key = ?2", params![caller.principal, key], |r| r.get(0))
+            .map_err(db_err)?;
+        if (held - old + bytes) as usize > self.limits.max_commit_total_bytes {
+            return Err(WsError::limit(format!("commit exceeds {} bytes", self.limits.max_commit_total_bytes)));
+        }
+        self.check_quota((bytes - old).max(0) as u64, false)?;
+        let expires = format_utc_ms((self.clock)() + STAGED_COMMIT_TTL_MS);
+        self.local
+            .execute(
+                "INSERT OR REPLACE INTO staged_commits (principal, idem_key, part, ops_json, bytes, digest, expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![caller.principal, key, part as i64, ops_json, bytes, digest, expires],
+            )
+            .map_err(db_err)?;
+        self.add_usage("staged", bytes - old)?;
+        Ok(json!({ "ok": true, "part": part, "digest": digest, "operations": ops.len(), "expires_at": expires }))
     }
 
     /// Unbind history-only assets: purged ones (`ended_seq = 0`) at once, the others once their last live
@@ -619,6 +814,7 @@ impl Workspace {
             return Ok(json!({ "staged": 0, "history": 0 }));
         }
         let (staged, _) = self.drop_staged(Some(&self.now()))?;
+        self.drop_staged_commits(Some(&self.now()))?;
         let history = self.release_history((self.clock)())?;
         Ok(json!({ "staged": staged, "history": history }))
     }
@@ -650,7 +846,7 @@ impl Workspace {
         let ops: Vec<Value> = ids.iter().map(|id| json!({ "op": "entity.purge", "entity_id": id })).collect();
         let req = json!({ "protocol_version": PROTOCOL_VERSION, "workspace_id": self.workspace_id, "epoch": self.epoch,
                           "idempotency_key": format!("purge/{}", random_id("")), "session_id": session_id, "message": "purge deleted entities", "operations": ops });
-        let opts = CommitOpts { internal: true, import: false, undoes: None, as_principal: None, maintenance: true, as_source: false, as_build: false, as_session: false };
+        let opts = CommitOpts { internal: true, import: false, undoes: None, as_principal: None, maintenance: true, as_source: false, as_build: false, as_session: false, authorize_as: None, attribution: None, commit_id: None };
         let r = self.commit(&req, caller, &opts);
         if r["status"] != json!("accepted") {
             return Err(WsError::new(Code::InvalidOperation, "purge was not accepted").with_data(r));
@@ -661,6 +857,8 @@ impl Workspace {
         }
         self.release_history((self.clock)())?;
         self.clear_block_state(&ids)?;
+        // permissions on what is gone for good go with it (权限需求 R20)
+        self.drop_entries_on(&ids)?;
         Ok(json!({ "ok": true, "purged": ids, "commit_id": r["commit_id"] }))
     }
 
@@ -700,291 +898,17 @@ impl Workspace {
         Ok(gone)
     }
 
-    /// A show clone judges access by the grants of the Workspace it was cloned from, as they are now (D17):
-    /// revoking there ends the show's audience here.
-    fn show_source_grants(&self) -> WsResult<Option<Vec<(String, String, u16, Option<String>)>>> {
-        let Some(source) = meta_get(&self.doc, "show_source")? else { return Ok(None) };
-        let Some(parent) = self.dir.parent() else { return Ok(None) };
-        let path = parent.join(&source).join("local.sqlite");
-        if !path.exists() {
-            return Ok(Some(Vec::new()));
-        }
-        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(db_err)?;
-        let mut st = conn.prepare("SELECT subject, scope_entity_id, capabilities, via_entry FROM grants ORDER BY subject, scope_entity_id").map_err(db_err)?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(db_err)?.collect::<rusqlite::Result<_>>().map_err(db_err)?;
-        Ok(Some(rows))
-    }
-
     pub fn title(&self) -> String {
         meta_get(&self.doc, "title").ok().flatten().unwrap_or_default()
-    }
-
-    // ---- grants ----
-
-    /// Effective grants of a caller: every grant row whose subject applies to it (see [`Caller::matches`]) and the
-    /// templates of the active entries open to guests — for every caller, since anyone may come in through them
-    /// anonymously (computed now, so closing one takes effect at the next request).
-    pub fn access(&self, caller: &Caller) -> WsResult<Access> {
-        self.access_with(caller, true)
-    }
-
-    fn access_with(&self, caller: &Caller, public: bool) -> WsResult<Access> {
-        let mut access = Access { principal: caller.principal.clone(), ws_caps: CapSet::NONE, scoped: BTreeMap::new() };
-        let mut add = |scope: String, caps: u16| {
-            if scope.is_empty() {
-                access.ws_caps = access.ws_caps.union(CapSet(caps));
-            } else {
-                let e = access.scoped.entry(scope).or_insert(CapSet::NONE);
-                *e = e.union(CapSet(caps));
-            }
-        };
-        let mut undecided = false;
-        let rows = match self.show_source_grants()? {
-            Some(source) => source,
-            None => self.grant_rows()?,
-        };
-        for (subject, scope, caps, _) in rows {
-            if caller.matches(&subject, public) {
-                add(scope, caps);
-            } else if caller.unconfirmed.contains(&subject) {
-                undecided = true;
-            }
-        }
-        if public {
-            for (scope, caps) in self.guest_entry_grants()? {
-                add(scope, caps);
-            }
-        }
-        // an unconfirmed membership could only add something to a caller that does not already hold everything
-        if undecided && access.ws_caps != CapSet::ALL {
-            return Err(WsError::refused(Code::PermissionDenied, Deny::AuthorizationUnavailable, "a group or contact membership could not be checked; retry later"));
-        }
-        Ok(access)
-    }
-
-    /// What `ws.list` counts: a restricted caller lists only Workspaces granted to it (by name, group, contact or a
-    /// joined entry), never those it merely could open through a public link.
-    pub fn listing_access(&self, caller: &Caller) -> WsResult<Access> {
-        self.access_with(caller, !caller.is_restricted())
-    }
-
-    fn grant_rows(&self) -> WsResult<Vec<(String, String, u16, Option<String>)>> {
-        let mut st = self.local.prepare_cached("SELECT subject, scope_entity_id, capabilities, via_entry FROM grants ORDER BY subject, scope_entity_id").map_err(db_err)?;
-        let rows = st
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .map_err(db_err)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(db_err)?;
-        Ok(rows)
-    }
-
-    /// Grant subjects whose membership the service settles per request: `group:` and `contact:`.
-    pub fn dynamic_subjects(&self) -> WsResult<Vec<String>> {
-        let mut st = self
-            .local
-            .prepare_cached("SELECT DISTINCT subject FROM grants WHERE subject LIKE 'group:%' OR subject LIKE 'contact:%' ORDER BY subject")
-            .map_err(db_err)?;
-        let rows = st.query_map([], |r| r.get(0)).map_err(db_err)?.collect::<rusqlite::Result<_>>().map_err(db_err)?;
-        Ok(rows)
     }
 
     pub fn owner(&self) -> WsResult<Option<String>> {
         self.local.query_row("SELECT value FROM local_meta WHERE key = 'owner'", [], |r| r.get(0)).optional().map_err(db_err)
     }
 
-    /// Whose AICC the wish blocks use (AI Center Quota PRD §3.3): `workspace_owner` (default) or
-    /// `current_user`.
-    pub fn wish_aicc_mode(&self) -> WsResult<String> {
-        let mode: Option<String> = self.local.query_row("SELECT value FROM local_meta WHERE key = 'wish_aicc_mode'", [], |r| r.get(0)).optional().map_err(db_err)?;
-        Ok(mode.unwrap_or_else(|| WISH_AICC_WORKSPACE_OWNER.to_string()))
-    }
-
-    /// `ws.set_wish_aicc`: the owner or a manager chooses; only runs accepted afterwards follow it.
-    pub fn set_wish_aicc_mode(&mut self, caller: &Caller, mode: &str) -> WsResult<Value> {
-        self.require_ws(caller, Cap::Manage)?;
-        if mode != WISH_AICC_WORKSPACE_OWNER && mode != WISH_AICC_CURRENT_USER {
-            return Err(WsError::invalid_op("mode must be workspace_owner or current_user"));
-        }
-        self.local.execute("INSERT OR REPLACE INTO local_meta (key, value) VALUES ('wish_aicc_mode', ?1)", [mode]).map_err(db_err)?;
-        Ok(json!({ "ok": true, "wish_aicc_mode": mode }))
-    }
-
-    /// The Owner's hosted execution configuration (D22, T3-7): `{ enabled, agent_id, allowed_wishes?: [ids],
-    /// triggerers?: [subjects], limits?: { max_runs_per_day?, max_tool_iterations? } }`; `digest` is what a run
-    /// binds to (D16: a changed configuration makes older delegations `DELEGATION_STALE`).
-    pub fn hosted_exec(&self) -> WsResult<Value> {
-        let raw: Option<String> = self.local.query_row("SELECT value FROM local_meta WHERE key = 'hosted_exec'", [], |r| r.get(0)).optional().map_err(db_err)?;
-        let mut v = raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or_else(|| json!({ "enabled": false }));
-        let digest = sha256_hex(aiworkspace_core::canonical::canonical_json(&v).unwrap_or_default().as_bytes())[..32].to_string();
-        v["digest"] = json!(digest);
-        Ok(v)
-    }
-
-    /// `ws.set_hosted_exec` (`manage`): the Owner's configuration; runs accepted afterwards bind to its digest.
-    pub fn set_hosted_exec(&mut self, caller: &Caller, config: &Value) -> WsResult<Value> {
-        self.require_ws(caller, Cap::Manage)?;
-        let o = config.as_object().ok_or_else(|| WsError::invalid_op("config must be an object"))?;
-        for k in o.keys() {
-            if !matches!(k.as_str(), "enabled" | "agent_id" | "allowed_wishes" | "triggerers" | "limits") {
-                return Err(WsError::invalid_op(format!("unknown hosted_exec key {k}")));
-            }
-        }
-        let enabled = o.get("enabled").and_then(Value::as_bool).unwrap_or(false);
-        if enabled && !o.get("agent_id").and_then(Value::as_str).is_some_and(|a| !a.is_empty() && a.len() <= 256) {
-            return Err(WsError::invalid_op("hosted execution needs the Owner's agent_id"));
-        }
-        for k in ["allowed_wishes", "triggerers"] {
-            if o.get(k).is_some_and(|v| !v.is_null() && !v.as_array().is_some_and(|a| a.iter().all(Value::is_string))) {
-                return Err(WsError::invalid_op(format!("{k} must be an array of strings")));
-            }
-        }
-        if o.get("limits").is_some_and(|l| !l.is_object()) {
-            return Err(WsError::invalid_op("limits must be an object"));
-        }
-        let text = Value::Object(o.clone()).to_string();
-        if text.len() > 16 * 1024 {
-            return Err(WsError::limit("hosted_exec configuration is limited to 16 KiB"));
-        }
-        self.local.execute("INSERT OR REPLACE INTO local_meta (key, value) VALUES ('hosted_exec', ?1)", [text]).map_err(db_err)?;
-        let v = self.hosted_exec()?;
-        Ok(json!({ "ok": true, "hosted_exec": v }))
-    }
-
-    /// May `caller` trigger a hosted run of `wish_id` under this configuration (D22)?
-    pub fn hosted_exec_admits(&self, caller: &Caller, wish_id: &str) -> WsResult<Value> {
-        let cfg = self.hosted_exec()?;
-        if cfg["enabled"] != json!(true) {
-            return Err(WsError::new(Code::ExecutionContextMissing, "hosted execution is not configured for this workspace: the owner sets it up (ws.set_hosted_exec)"));
-        }
-        if let Some(allowed) = cfg["allowed_wishes"].as_array() {
-            if !allowed.is_empty() && !allowed.iter().any(|w| w == wish_id) {
-                return Err(WsError::denied(format!("wish {wish_id} is not among the tasks the owner allows to run hosted")));
-            }
-        }
-        if let Some(who) = cfg["triggerers"].as_array() {
-            if !who.is_empty() && !who.iter().filter_map(Value::as_str).any(|s| caller.matches(s, true)) {
-                return Err(WsError::denied("the owner's hosted execution configuration does not admit this caller"));
-            }
-        }
-        Ok(cfg)
-    }
-
-    pub fn require_ws(&self, caller: &Caller, cap: Cap) -> WsResult<Access> {
-        let access = self.access(caller)?;
-        if access.is_empty() {
-            // no grant at all: the Workspace does not exist for this principal
-            return Err(WsError::not_found("workspace not found"));
-        }
-        if !access.ws_caps.has(cap) {
-            return Err(WsError::denied(format!("{} capability required", aiworkspace_core::access::cap_name(cap))));
-        }
-        Ok(access)
-    }
-
-    pub fn grant(&mut self, caller: &Caller, subject: &str, scope: Option<&str>, caps: &[String]) -> WsResult<Value> {
-        self.grant_with(caller, subject, scope, caps, None, None)
-    }
-
-    /// `ws.grant` with the delegation fields of a `run` grant (D16, D22): the digest of the task
-    /// configuration the granter confirmed and the outputs it declared. A run whose configuration no longer
-    /// matches the digest is `DELEGATION_STALE` (M3).
-    pub fn grant_with(&mut self, caller: &Caller, subject: &str, scope: Option<&str>, caps: &[String], task_digest: Option<&str>, outputs: Option<&Value>) -> WsResult<Value> {
-        self.require_ws(caller, Cap::Manage)?;
-        check_subject(subject, caller.did())?;
-        let caps = CapSet::parse(caps)?;
-        if (task_digest.is_some() || outputs.is_some()) && !caps.has(Cap::Run) {
-            return Err(WsError::invalid_op("task_digest and outputs belong to a run grant"));
-        }
-        if let Some(d) = task_digest {
-            if d.is_empty() || d.len() > 128 {
-                return Err(WsError::invalid_op("task_digest must be a short string"));
-            }
-        }
-        if let Some(o) = outputs {
-            if !o.is_array() || o.to_string().len() > 16 * 1024 {
-                return Err(WsError::invalid_op("outputs must be a small array of output declarations"));
-            }
-        }
-        if subject == PUBLIC_SUBJECT && caps.has(Cap::Manage) {
-            return Err(WsError::invalid_op("a public link cannot carry the manage capability"));
-        }
-        if let Some(s) = scope {
-            let now = self.now();
-            if self.ctx(&now).entity(s)?.is_none() {
-                return Err(WsError::not_found(format!("entity {s} not found")));
-            }
-        }
-        self.local
-            .execute(
-                "INSERT OR REPLACE INTO grants (subject, scope_entity_id, capabilities, via_entry, task_digest, outputs_json) VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
-                params![subject, scope.unwrap_or(""), caps.0, task_digest, outputs.map(Value::to_string)],
-            )
-            .map_err(db_err)?;
-        Ok(json!({ "ok": true }))
-    }
-
-    /// The delegation fields of the caller's `run` grants: `(scope, task_digest, outputs)`.
-    pub fn run_grants(&self, caller: &Caller) -> WsResult<Vec<(String, Option<String>, Option<Value>)>> {
-        let mut st = self.local.prepare_cached("SELECT subject, scope_entity_id, capabilities, task_digest, outputs_json FROM grants ORDER BY subject, scope_entity_id").map_err(db_err)?;
-        let rows: Vec<(String, String, u16, Option<String>, Option<String>)> = st
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-            .map_err(db_err)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .filter(|(subject, _, caps, ..)| CapSet(*caps).has(Cap::Run) && caller.matches(subject, true))
-            .map(|(_, scope, _, digest, outputs)| (scope, digest, outputs.and_then(|o| serde_json::from_str(&o).ok())))
-            .collect())
-    }
-
-    /// The caller may start a run here: `run` or any editing right on the Workspace (D16).
-    pub fn require_run(&self, caller: &Caller) -> WsResult<Access> {
-        let access = self.require_ws_any(caller)?;
-        if !access.ws_caps.may_run() {
-            return Err(WsError::denied("run capability required"));
-        }
-        Ok(access)
-    }
-
-    pub fn revoke(&mut self, caller: &Caller, subject: &str, scope: Option<&str>) -> WsResult<Value> {
-        self.require_ws(caller, Cap::Manage)?;
-        if self.owner()?.as_deref() == Some(subject) && scope.is_none() {
-            return Err(WsError::invalid_op("the owner's workspace grant cannot be revoked"));
-        }
-        let n = self
-            .local
-            .execute("DELETE FROM grants WHERE subject = ?1 AND scope_entity_id = ?2", params![subject, scope.unwrap_or("")])
-            .map_err(db_err)?;
-        Ok(json!({ "ok": true, "removed": n }))
-    }
-
-    /// `ws.list_grants`: the whole list for a manager; anyone else only sees the rows that apply to
-    /// them (their own subject, `public`, and `*`, groups and contacts where they match), never the complete name
-    /// list (phase two §6.3). A row a join wrote names its entry (`via_entry`).
-    pub fn list_grants(&self, caller: &Caller) -> WsResult<Value> {
-        let access = self.require_ws_any(caller)?;
-        let manage = access.ws_caps.has(Cap::Manage);
-        let rows: Vec<Value> = self
-            .grant_rows()?
-            .into_iter()
-            .filter(|(subject, ..)| manage || caller.matches(subject, true))
-            .map(|(subject, scope, caps, via)| {
-                let mut row = json!({ "subject": subject, "scope_entity_id": if scope.is_empty() { Value::Null } else { json!(scope) },
-                        "capabilities": CapSet(caps).names(), "via_entry": via.map(|v| self.entry_public_id(&v)) });
-                if let Ok((digest, outputs)) = self.local.query_row("SELECT task_digest, outputs_json FROM grants WHERE subject = ?1 AND scope_entity_id = ?2", params![subject, scope], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))) {
-                    if let Some(d) = digest {
-                        row["task_digest"] = json!(d);
-                    }
-                    if let Some(o) = outputs.and_then(|o| serde_json::from_str::<Value>(&o).ok()) {
-                        row["outputs"] = o;
-                    }
-                }
-                row
-            })
-            .collect();
-        let owner = if manage { self.owner()? } else { None };
-        Ok(json!({ "ok": true, "grants": rows, "complete": manage, "owner": owner, "principal": caller.principal }))
+    /// The name the Workspace was created with (控件机制 TODO G9): unique among its owner's, never changed, never exported.
+    pub fn name(&self) -> WsResult<Option<String>> {
+        self.local.query_row("SELECT value FROM local_meta WHERE key = 'name'", [], |r| r.get(0)).optional().map_err(db_err)
     }
 
     // ---- user work state (phase two §4.4): per subject, per Workspace, in local.sqlite ----
@@ -1190,23 +1114,21 @@ impl Workspace {
 
     pub fn info(&self, caller: &Caller) -> WsResult<Value> {
         let access = self.require_ws_any(caller)?;
-        Ok(json!({ "ok": true, "workspace_id": self.workspace_id, "title": self.title(), "epoch": self.epoch,
+        let mut info = json!({ "ok": true, "workspace_id": self.workspace_id, "title": self.title(), "epoch": self.epoch,
                    "head_seq": self.head_seq, "head_commit_id": self.head_commit_id, "base_seq": self.base_seq(), "format_version": FORMAT_VERSION,
                    "protocol_version": PROTOCOL_VERSION, "planner_version": aiworkspace_core::plan::PLANNER_VERSION,
                    "richtext_schema": aiworkspace_core::richtext::schema()["id"], "usage": self.usage()?,
                    "capabilities": access.ws_caps.names(), "principal": caller.principal,
-                   "forked_from": meta_get(&self.doc, "forked_from")?.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                   "cloned_from": meta_get(&self.doc, "cloned_from")?.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
                    "show_lock": self.show_lock().map(|l| l.to_json()), "purpose": self.purpose(),
-                   "wish_aicc_mode": self.wish_aicc_mode()?, "hosted_exec": self.hosted_exec()? }))
-    }
-
-    /// Any grant at all (workspace-level or scoped) is enough to know the Workspace exists.
-    pub fn require_ws_any(&self, caller: &Caller) -> WsResult<Access> {
-        let access = self.access(caller)?;
-        if access.is_empty() {
-            return Err(WsError::not_found("workspace not found"));
+                   "acl_rev": self.acl_rev(), "anonymous": self.anonymous()?, "judged_as": access.principal });
+        if access.is_owner() {
+            info["owner"] = json!(true);
         }
-        Ok(access)
+        if let Some(name) = self.name()? {
+            info["name"] = json!(name);
+        }
+        Ok(info)
     }
 
     fn check_epoch(&self, epoch: &str) -> WsResult<()> {
@@ -1234,15 +1156,24 @@ impl Workspace {
 
     /// `doc.commit`: always answers with the three-state result.
     pub fn commit(&mut self, req: &Value, caller: &Caller, opts: &CommitOpts) -> Value {
-        match self.commit_inner(req, caller, opts, false) {
+        let out = match self.commit_inner(req, caller, opts, false) {
             Ok(v) => v,
             Err(f) => f.to_json(),
+        };
+        if let Some(key) = req.get("idempotency_key").and_then(Value::as_str) {
+            self.consume_staged(&caller.principal, key);
         }
+        out
     }
 
     /// `doc.prepare`: steps 1–3 and the read-only part of step 4. Nothing is stored.
     pub fn prepare(&mut self, req: &Value, caller: &Caller) -> Value {
-        match self.commit_inner(req, caller, &CommitOpts::default(), true) {
+        self.prepare_with(req, caller, &CommitOpts::default())
+    }
+
+    /// [`Self::prepare`] under `opts` (a run's pre-check: written as the run, authorized as its macro identity).
+    pub fn prepare_with(&mut self, req: &Value, caller: &Caller, opts: &CommitOpts) -> Value {
+        match self.commit_inner(req, caller, opts, true) {
             Ok(v) => v,
             Err(f) => {
                 let mut v = f.to_json();
@@ -1262,12 +1193,23 @@ impl Workspace {
             return Err(reject(WsError::invalid_op("workspace_id does not match")));
         }
         self.check_epoch(&req.epoch).map_err(reject)?;
-        if req_json.to_string().len() > MAX_REQUEST_BYTES {
-            return Err(reject(WsError::limit("commit request exceeds 8 MiB")));
+        let request_bytes = req_json.to_string().len();
+        // a compensating Commit (undo / redo) carries the content it restores plus its expectations: whatever was
+        // accepted must stay undoable, so it gets twice the room of a request
+        let room = if opts.undoes.is_some() { 2 } else { 1 };
+        let max_bytes = self.limits.max_commit_total_bytes * room;
+        if request_bytes > max_bytes {
+            return Err(reject(WsError::limit(format!("commit exceeds {max_bytes} bytes"))));
         }
         let digest = CommitRequest::digest(req_json).map_err(reject)?;
         // the identity the Commit is written as (D08): the caller, or a run's execution identity
         let writer = opts.as_principal.clone().unwrap_or_else(|| caller.principal.clone());
+        // whoever may no longer enter does not get even its own earlier answers back (权限需求 V5)
+        let own = self.access(caller).map_err(reject)?;
+        if own.is_empty() {
+            return Err(reject(WsError::not_found("workspace not found")));
+        }
+        let access = opts.authorize_as.clone().unwrap_or(own);
         // idempotency comes before anything that depends on document state: a
         // successful create whose response was lost must not hit its own ID_CONFLICT
         let prior: Option<(String, String)> = self
@@ -1287,12 +1229,9 @@ impl Workspace {
             v["replayed"] = json!(true);
             return Ok(v);
         }
-        let access = self.access(caller).map_err(reject)?;
-        if access.is_empty() {
-            return Err(reject(WsError::not_found("workspace not found")));
-        }
         // the quota is checked before anything is planned (D19); the request size is the reservation
-        self.check_quota(req_json.to_string().len() as u64, opts.maintenance).map_err(reject)?;
+        // (staged parts were reserved when they were staged)
+        self.check_quota(request_bytes as u64, opts.maintenance).map_err(reject)?;
         // a presented Workspace is closed for writes, from every session (third phase §8.1)
         if let Some(lock) = self.show_lock() {
             return Err(reject(Self::show_locked_error(&lock)));
@@ -1300,6 +1239,10 @@ impl Workspace {
         // an ended session's run Workspace is its record: only the session service still writes (a published result)
         if self.session_events && !opts.internal && !opts.as_session && self.session_closed() {
             return Err(reject(WsError::sub(Code::PermissionDenied, "SESSION_CLOSED", "the session has ended: its workspace is a record now")));
+        }
+        // a run's result reaches the document only as the service writes it at the end of its stage, as the run (权限需求 R32, E6)
+        if req.run_id.is_some() && !dry_run && opts.as_principal.is_none() && !opts.as_source && !opts.internal {
+            return Err(reject(WsError::invalid_op("a Commit naming a run_id is a run's result: the service writes it when the run's stage ends")));
         }
         if let Some(run_id) = &req.run_id {
             let state: Option<String> = self
@@ -1318,6 +1261,36 @@ impl Workspace {
         // origin is the server's reading of who writes (D08); what the client wrote is ignored
         let origin = derive_origin(caller, opts, req.run_id.is_some());
         let mut req = req;
+        if !req.staged.is_empty() {
+            // the parts `doc.stage` holds come first: the assembled request is what gets planned
+            let mut st = self
+                .local
+                .prepare("SELECT part, ops_json, bytes, digest FROM staged_commits WHERE principal = ?1 AND idem_key = ?2 AND expires_at > ?3 ORDER BY part")
+                .map_err(|e| reject(db_err(e)))?;
+            let parts: Vec<(i64, String, i64, String)> = st
+                .query_map(params![caller.principal, req.idempotency_key, now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .and_then(|rows| rows.collect())
+                .map_err(|e| reject(db_err(e)))?;
+            drop(st);
+            let mut total = request_bytes;
+            let mut operations: Vec<Value> = Vec::new();
+            for (i, want) in req.staged.iter().enumerate() {
+                let Some((_, ops_json, bytes, digest)) = parts.iter().find(|p| p.0 == i as i64) else {
+                    return Err(reject(WsError::sub(Code::SnapshotExpired, "STAGED_PARTS_MISSING", format!("staged part {i} is missing or expired; stage the parts again"))));
+                };
+                if digest != want {
+                    return Err(reject(WsError::new(Code::IdempotencyMismatch, format!("staged part {i} is not the one this request names"))));
+                }
+                total += *bytes as usize;
+                if total > max_bytes {
+                    return Err(reject(WsError::limit(format!("commit exceeds {max_bytes} bytes"))));
+                }
+                let list: Vec<Value> = serde_json::from_str(ops_json).map_err(|e| reject(WsError::io(e.to_string())))?;
+                operations.extend(list);
+            }
+            operations.append(&mut req.operations);
+            req.operations = operations;
+        }
         req.origin = origin.to_string();
         let req = &req;
         let env = PlanEnv {
@@ -1332,7 +1305,9 @@ impl Workspace {
             schema_checks: !opts.import,
             replay: false,
             peer_id: self.peer_id,
-            limits: self.limits.clone(),
+            limits: Limits { max_ops: self.limits.max_ops * room, ..self.limits.clone() },
+            // who the writer was judged as records itself as the creator of what it makes (R6, R16)
+            creator: Some(if opts.as_principal.is_some() { writer.clone() } else { access.principal.clone() }),
         };
         // 2–3. plan on an overlay; the authoritative state is not touched
         let (ops, changes, lock_targets, reports, warnings, read_denied) = {
@@ -1342,7 +1317,24 @@ impl Workspace {
         };
         // 4. final checks inside the single writer: locks (authorization was evaluated on current grants above)
         self.check_locks(&lock_targets, caller, req.session_id.as_deref(), &now).map_err(reject)?;
-        let commit_id = random_id("cm_");
+        // a move that lets more subjects reach what moved is recorded, never refused (权限需求 R23, Q8)
+        let mut widened: Vec<Value> = Vec::new();
+        {
+            let ctx = self.ctx(&now);
+            for o in ops.iter().filter(|o| o.op["op"] == json!("tree.move")) {
+                let (Some(id), Some(to)) = (o.op["entity_id"].as_str(), o.op["new_parent_id"].as_str()) else { continue };
+                let Some(from) = ctx.edge(id).map_err(reject)?.map(|e| e.parent_id) else { continue };
+                if from == to {
+                    continue;
+                }
+                let gained = self.widened_by_move(&ctx, id, &from, to).map_err(reject)?;
+                if !gained.is_empty() {
+                    widened.push(json!({ "entity_id": id, "from_parent": from, "to_parent": to,
+                                         "gained": gained.iter().map(|(s, c)| json!({ "subject": s, "capabilities": c.names() })).collect::<Vec<_>>() }));
+                }
+            }
+        }
+        let commit_id = opts.commit_id.clone().unwrap_or_else(|| random_id("cm_"));
         let touched: Vec<&Touched> = ops.iter().flat_map(|o| o.touched.iter()).collect();
         let visible_touched: Vec<Value> = {
             let ctx = self.ctx(&now);
@@ -1378,6 +1370,9 @@ impl Workspace {
         if !warnings.is_empty() {
             result["warnings"] = json!(warnings);
         }
+        if !widened.is_empty() {
+            result["visibility_widened"] = json!(widened);
+        }
         if dry_run {
             let mut v = json!({ "status": "ok", "would_be_seq": seq, "touched": result["touched"], "request_digest": digest });
             if !reports.is_empty() {
@@ -1387,6 +1382,9 @@ impl Workspace {
         }
         self.fire(FailAt::BeforeTxn).map_err(reject)?;
         // one SQLite transaction: data, references, history, idempotency record, head
+        // an Agent judged as its owner is recorded with whom it was judged as (权限需求 R16)
+        let judged = (opts.attribution.is_none() && opts.authorize_as.is_none() && access.principal != caller.principal).then(|| json!({ "judged_as": access.principal }));
+        let opts = &CommitOpts { attribution: opts.attribution.clone().or(judged), ..opts.clone() };
         let stats = self
             .write_commit(req, caller, &writer, opts, &digest, seq, &commit_id, &now, &ops, &changes, &result)
             .map_err(reject)?;
@@ -1396,6 +1394,22 @@ impl Workspace {
             let _ = self.local.execute("DELETE FROM staged_assets WHERE object_id = ?1", [id]);
         }
         self.fire(FailAt::AfterCommit).map_err(reject)?;
+        for w in &widened {
+            let _ = self.audit(caller, "visibility.widened", &json!({ "entity_id": w["entity_id"], "commit_id": commit_id, "seq": seq }), Some(&json!({ "parent": w["from_parent"] })), Some(&json!({ "parent": w["to_parent"], "gained": w["gained"] })));
+        }
+        // a change to the macro of a wish bound to a group: whoever may change it holds the group through it (Q10, R19).
+        // Only the macro itself (`program`): a run's results and the wish's other keys are no change of the macro
+        let macro_writes: BTreeSet<&str> = ops
+            .iter()
+            .filter(|o| matches!(o.op["op"].as_str(), Some("entity.set_keys" | "entity.unset_keys")))
+            .filter(|o| o.op["keys"].as_array().is_some_and(|ks| ks.iter().any(|k| k["key"] == json!("program"))))
+            .filter_map(|o| o.op["entity_id"].as_str())
+            .collect();
+        for id in macro_writes {
+            if let Ok(Some((group, mode))) = self.macro_binding(id) {
+                let _ = self.audit(caller, "macro.changed", &json!({ "wish_id": id, "commit_id": commit_id, "seq": seq }), None, Some(&json!({ "group_id": group, "mode": mode })));
+            }
+        }
         // 5. publish
         self.publish(seq, &commit_id, changes, stats, &lock_targets, caller, req.session_id.as_deref(), &now);
         Ok(result)
@@ -1484,10 +1498,10 @@ impl Workspace {
         };
         tx.execute(
             "INSERT INTO commits (seq, commit_id, principal, app_id, session_id, origin, run_id, undo_group, undoes, idem_key, \
-             request_digest, message, accepted_at, result_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+             request_digest, message, accepted_at, result_json, attribution_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 seq, commit_id, writer, caller.app_id, req.session_id, req.origin, req.run_id, req.undo_group,
-                opts.undoes, req.idempotency_key, digest, req.message, now, result.to_string()
+                opts.undoes, req.idempotency_key, digest, req.message, now, result.to_string(), opts.attribution.as_ref().map(Value::to_string)
             ],
         )
         .map_err(db_err)?;
@@ -1529,6 +1543,14 @@ impl Workspace {
                caller: &Caller, session: Option<&str>, now: &str) {
         self.head_seq = seq;
         self.head_commit_id = commit_id.to_string();
+        // the planner statistics follow the tables once a tenth of them (at least 1000 records) was written
+        self.table_stats.1 += stats.records;
+        if self.table_stats.1 >= (self.table_stats.0 / 10).max(1000) {
+            match refresh_table_stats(&self.doc) {
+                Ok(n) => self.table_stats = (n, 0),
+                Err(e) => log::warn!("planner statistics of {} not refreshed: {e}", self.workspace_id),
+            }
+        }
         self.last_stats = stats;
         let updated: Vec<String> = changes.richtexts.keys().cloned().collect();
         {
@@ -1655,7 +1677,7 @@ impl Workspace {
                     "idempotency_key": idem, "session_id": req.get("session_id").cloned().unwrap_or(Value::Null),
                     "origin": "human", "message": format!("undo {target}"), "operations": ops })
         };
-        let opts = CommitOpts { internal: true, import: false, undoes: Some(target.to_string()), as_principal: None, maintenance: false, as_source: false, as_build: false, as_session: false };
+        let opts = CommitOpts { internal: true, import: false, undoes: Some(target.to_string()), as_principal: None, maintenance: false, as_source: false, as_build: false, as_session: false, authorize_as: None, attribution: None, commit_id: None };
         // applicability is the ordinary pipeline: every inverse carries `expect: { rev: S }`
         let dry = self.commit_inner(&build(&inverse), caller, &opts, true);
         let dry = match dry {

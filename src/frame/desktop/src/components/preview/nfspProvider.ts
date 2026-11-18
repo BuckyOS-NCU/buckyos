@@ -6,19 +6,22 @@
  * Pipeline calls map onto `repr` (ensure) / `get_repr` (query). nfs_server
  * advertises `repr` while any converter is present and lists in
  * `hello.repr.profiles` what it can produce (ffmpeg: image / video / audio /
- * thumbnail; LibreOffice: `preview-document`, a PDF). A format whose profile
+ * thumbnail; LibreOffice: `preview-document`, a PDF, and `preview-sheet`, an
+ * xlsx workbook; pandoc: `preview-html`). A format whose profile
  * is absent plans as Unsupported with the node's reason — never a fake
  * result. Results are read from the `preview-cache` bucket through the URL
  * (with a short-lived token) the node signs.
  */
 
 import { bucket, getActiveSessionToken } from 'buckyos'
-import { NfspError, type NodeInfo, type ReprRecord, type ReprResult, type ReprSource, type WireRef } from '../../api/nfsp_client'
+import type { NfsBrowserClient } from '../../api/nfs_browser_client'
+import { NfspError, type LocatorLike, type NodeInfo, type ReprRecord, type ReprResult, type ReprSource, type WireRef } from '../../api/nfsp_client'
 import { effectiveListLimit, ensureSession, nfspBaseUrl, nfspClient } from '../../app/filebrowser/data/nfsp/client'
-import { extensionOf, isPipelineDocument, mediaTypeFromExtension, rendererForMediaType } from './mediaTypes'
+import { extensionOf, mediaTypeFromExtension, pipelineDocumentProfile, rendererForMediaType } from './mediaTypes'
 import { asBucketObjectRef, bucketRefOf, resolveBucketSource } from './bucketSource'
 import { resolveNdmSource } from './ndmSource'
 import { cyfsPathToLocal, normalizeCyfsPath, parentCyfsPath } from './session'
+import { parentInnerPath } from '../../app/filebrowser/data/urls'
 import {
   isBlobRef,
   isCyfsPathRef,
@@ -51,6 +54,13 @@ function toPreviewError(err: unknown): PreviewError {
         return new PreviewError('UNSUPPORTED', 'The server does not support this operation', { detail: err.code })
       case 'NEED_PULL':
         return new PreviewError('NOT_FOUND', 'The content is not available on this node yet', { detail: err.code, retryable: true })
+      case 'PASSWORD_REQUIRED':
+      case 'PASSWORD_INVALID':
+        return new PreviewError('PERMISSION_DENIED', 'This archive member is encrypted', { detail: err.code })
+      case 'ARCHIVE_CORRUPT':
+        return new PreviewError('CORRUPTED', 'The archive is damaged', { detail: err.code })
+      case 'QUOTA_EXCEEDED':
+        return new PreviewError('TOO_LARGE', 'The content is larger than the server allows here', { detail: err.code })
       default:
         return new PreviewError(err.httpStatus >= 500 ? 'NETWORK' : 'INTERNAL', 'The content server rejected the request', { detail: err.code })
     }
@@ -64,14 +74,37 @@ function nodeIdOf(info: NodeInfo): string {
   return ref.type === 'live' ? ref.node_id : ref.obj_id
 }
 
+/** Which NFSP session a provider talks through and how it turns a source into a locator (the default: the user's session, DFS paths). */
+export interface NfspPreviewSession {
+  client: () => NfsBrowserClient
+  ensure: () => Promise<unknown>
+  locate: (source: ContentRef) => LocatorLike
+}
+
+function defaultLocate(source: ContentRef): LocatorLike {
+  if (isCyfsPathRef(source)) return cyfsPathToLocal(source.path)
+  if (isObjectIdRef(source)) return source.innerPath ? { type: 'object', obj_id: source.objectId, inner_path: source.innerPath } : { type: 'object', obj_id: source.objectId }
+  throw new PreviewError('INVALID_SOURCE', `Unsupported source kind "${source.kind}"`)
+}
+
+const DEFAULT_SESSION: NfspPreviewSession = { client: nfspClient, ensure: ensureSession, locate: defaultLocate }
+
 function absoluteUrl(url: string): string {
   return /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `${nfspClient().raw.baseUrl}${url}`
 }
 
-function readRefOf(info: NodeInfo, name: string | undefined): PreviewReadRef {
+function readRefOf(info: NodeInfo, name: string | undefined, session: NfspPreviewSession): PreviewReadRef {
   const access = info.access_urls?.find((u) => u.kind === 'read')
   const nodeId = nodeIdOf(info)
-  const raw = nfspClient().raw
+  const raw = session.client().raw
+  if (access && session !== DEFAULT_SESSION) {
+    // Capability read URLs (the computer's) already carry their grant; downloads add to them.
+    const url = absoluteUrl(access.url)
+    const download = new URL(url, window.location.href)
+    download.searchParams.set('download', '1')
+    if (name) download.searchParams.set('name', name)
+    return { kind: 'url', url, downloadUrl: download.toString() }
+  }
   return {
     kind: 'url',
     url: access ? absoluteUrl(access.url) : raw.readUrl(nodeId),
@@ -79,18 +112,12 @@ function readRefOf(info: NodeInfo, name: string | undefined): PreviewReadRef {
   }
 }
 
-function locatorOf(source: ContentRef): string | WireRef {
-  if (isCyfsPathRef(source)) return cyfsPathToLocal(source.path)
-  if (isObjectIdRef(source)) return { type: 'object', obj_id: source.objectId }
-  throw new PreviewError('INVALID_SOURCE', `Unsupported source kind "${source.kind}"`)
-}
-
-async function resolveNode(source: ContentRef, signal?: AbortSignal): Promise<NodeInfo> {
-  await ensureSession()
+async function resolveNode(source: ContentRef, session: NfspPreviewSession, signal?: AbortSignal): Promise<NodeInfo> {
+  await session.ensure()
   if (signal?.aborted) throw new PreviewError('CANCELLED', 'Cancelled')
   let info: NodeInfo | null
   try {
-    info = await nfspClient().resolve(locatorOf(source), [...WANT])
+    info = await session.client().resolve(session.locate(source), [...WANT])
   } catch (err) {
     throw toPreviewError(err)
   }
@@ -101,10 +128,9 @@ async function resolveNode(source: ContentRef, signal?: AbortSignal): Promise<No
 // ─── `repr` wire (frozen with nfs_server preview/rpc.rs and websdk nfsp.ts) ───
 
 function mapWireResult(result: ReprResult): PreviewResult {
-  // A document's result is a PDF (`result_type: "document"`).
-  const type: string = result.result_type
+  // `document` is a PDF; `sheet` (an xlsx workbook) and `html` name their renderers.
   return {
-    resultType: type === 'document' ? 'pdf' : result.result_type,
+    resultType: result.result_type === 'document' ? 'pdf' : result.result_type,
     readRef: { kind: 'url', url: absoluteUrl(result.read_url) },
     mediaType: result.media_type,
     sourceVersion: result.source_version,
@@ -134,7 +160,8 @@ function mapWireRecord(record: Exclude<ReprRecord, { state: 'unsupported' }>): P
 /** The nfs_server profile (preview/convert.rs) a request needs; null = only the node can tell. */
 function reprProfileOf(request: EnsurePreviewWorkRequest): string | null {
   if (request.targetProfile.purpose === 'thumbnail') return 'thumbnail'
-  if (isPipelineDocument(request.mediaType)) return 'preview-document'
+  const document = pipelineDocumentProfile(request.mediaType)
+  if (document) return document
   switch (rendererForMediaType(request.mediaType ?? '')) {
     case 'image':
       return 'preview-image'
@@ -148,7 +175,7 @@ function reprProfileOf(request: EnsurePreviewWorkRequest): string | null {
 }
 
 /** Where the node finds the bytes: an NFSP ref, a bucket binding or a named object. */
-function reprTarget(resolved: ResolvedPreviewSource): { at: WireRef | null; source?: ReprSource } | null {
+async function reprTarget(resolved: ResolvedPreviewSource): Promise<{ at: WireRef | null; source?: ReprSource } | null> {
   const bucketRef = bucketRefOf(resolved)
   if (bucketRef) {
     const parsed = bucket.parseBucketObjUrl(bucketRef.url)
@@ -157,17 +184,18 @@ function reprTarget(resolved: ResolvedPreviewSource): { at: WireRef | null; sour
   }
   if (resolved.providerHandle) return { at: resolved.providerHandle as WireRef }
   if (isObjectIdRef(resolved.originalSource) && resolved.sourceObjectId) return { at: null, source: { obj_id: resolved.sourceObjectId } }
+  if (resolved.pipelineObjectId) return { at: null, source: { obj_id: await resolved.pipelineObjectId() } }
   return null
 }
 
-export function createNfspPreviewProvider(): PreviewProvider {
+export function createNfspPreviewProvider(session: NfspPreviewSession = DEFAULT_SESSION): PreviewProvider {
   return {
     id: 'nfsp',
 
     async resolvePreviewSource(source, { signal }) {
       const bucketRef = asBucketObjectRef(source)
       if (bucketRef) return resolveBucketSource(bucketRef, signal)
-      if (isObjectIdRef(source)) {
+      if (isObjectIdRef(source) && !source.innerPath) {
         const endpoint = nfspBaseUrl()
         const token = new URL(endpoint).origin === window.location.origin ? await getActiveSessionToken() : null
         return resolveNdmSource(source, endpoint, token, signal)
@@ -184,10 +212,11 @@ export function createNfspPreviewProvider(): PreviewProvider {
           readRef: { kind: 'blob', blob },
         }
       }
-      const info = await resolveNode(source, signal)
+      const info = await resolveNode(source, session, signal)
       const name = info.name ?? (isCyfsPathRef(source) ? cyfsPathToLocal(source.path).split('/').pop() : undefined)
       const hint = name ? mediaTypeFromExtension(extensionOf(name)) : undefined
       const containerPath = isCyfsPathRef(source) ? parentCyfsPath(normalizeCyfsPath(source.path)) : null
+      const archiveParent = isObjectIdRef(source) && source.innerPath ? parentInnerPath(source.innerPath) : null
       return {
         originalSource: source,
         sourceObjectId: info.ref.type === 'object' ? info.ref.obj_id : undefined,
@@ -197,16 +226,18 @@ export function createNfspPreviewProvider(): PreviewProvider {
         size: info.size,
         objectType: info.kind,
         mediaTypeHints: hint ? [hint] : [],
-        readRef: readRefOf(info, name),
-        containerRef: containerPath ? { kind: 'cyfs-path', path: containerPath } : undefined,
+        readRef: readRefOf(info, name, session),
+        containerRef: containerPath
+          ? { kind: 'cyfs-path', path: containerPath }
+          : archiveParent && isObjectIdRef(source) ? { kind: 'object-id', objectId: source.objectId, innerPath: archiveParent } : undefined,
         providerHandle: info.ref,
       }
     },
 
     async enumerateContainer(container, { signal }) {
-      await ensureSession()
-      const client = nfspClient()
-      const at = locatorOf(container)
+      await session.ensure()
+      const client = session.client()
+      const at = session.locate(container)
       const containerLocal = isCyfsPathRef(container) ? cyfsPathToLocal(container.path) : null
       const items: PreviewSessionItemInput[] = []
       let cursor: string | undefined
@@ -230,7 +261,8 @@ export function createNfspPreviewProvider(): PreviewProvider {
             const path = containerLocal === '/' ? `/${entry.name}` : `${containerLocal}/${entry.name}`
             items.push({ id: entry.entry_ref, source: { kind: 'cyfs-path', path: normalizeCyfsPath(path) }, title: entry.name })
           } else if (entry.target.ref.type === 'object') {
-            items.push({ id: entry.entry_ref, source: { kind: 'object-id', objectId: entry.target.ref.obj_id }, title: entry.name })
+            const { obj_id: objectId, inner_path: innerPath } = entry.target.ref
+            items.push({ id: entry.entry_ref, source: innerPath ? { kind: 'object-id', objectId, innerPath } : { kind: 'object-id', objectId }, title: entry.name })
           }
           if (items.length >= MAX_ITEMS) return items
         }
@@ -240,8 +272,8 @@ export function createNfspPreviewProvider(): PreviewProvider {
     },
 
     async ensurePreviewWork(request) {
-      await ensureSession()
-      const raw = nfspClient().raw
+      await session.ensure()
+      const raw = session.client().raw
       const capability = raw.reprCapability
       const profile = reprProfileOf(request)
       const profiles = capability?.available ? capability.profiles : []
@@ -251,7 +283,7 @@ export function createNfspPreviewProvider(): PreviewProvider {
         return { kind: 'unsupported', reason: 'no-pipeline', detail: detail ?? 'The content server has no Preview Pipeline' }
       }
       const { source, runtimeProfile, targetProfile, options } = request
-      const target = reprTarget(source)
+      const target = await reprTarget(source)
       if (!target) return { kind: 'unsupported', reason: 'not-content', detail: 'The source has no stable content identity' }
       try {
         const record = await raw.repr(target.at, {
@@ -283,7 +315,7 @@ export function createNfspPreviewProvider(): PreviewProvider {
     async getPreviewWork(workKey, { signal }) {
       if (signal?.aborted) throw new PreviewError('CANCELLED', 'Cancelled')
       try {
-        const record = await nfspClient().raw.getRepr(workKey)
+        const record = await session.client().raw.getRepr(workKey)
         if (record.state === 'unsupported') throw new PreviewError('UNSUPPORTED', record.detail ?? 'No Preview Pipeline for this content')
         return mapWireRecord(record)
       } catch (err) {

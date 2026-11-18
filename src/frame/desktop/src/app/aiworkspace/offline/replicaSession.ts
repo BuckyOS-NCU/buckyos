@@ -20,14 +20,14 @@
 
 import { ServiceFailure, type AiwsClient } from '../api/client'
 import { OnlineWorkspaceSession, SESSION_STOP_CODES, SESSION_STOP_TEXT, browserOffline, refusedVersion, versionMismatch } from '../api/session'
-import type { CommitOptions, OfflineControls, ReadOk, SessionMode, SessionStatus, SubmissionEvent, WorkspaceSession } from '../api/session'
+import type { CommitOptions, ImportedAsset, OfflineControls, ReadOk, SessionMode, SessionStatus, SubmissionEvent, UploadControl, WorkspaceSession } from '../api/session'
 import { TransportError } from '../api/transport'
 import { aiwsT, localizedLabels } from '../i18n'
 import {
   PROTOCOL_VERSION,
   type CollabState, type CommitEvent, type CommitOutcome, type CommitRequest, type CommitResult, type EntityEnvelope, type Json, type LockInfo,
-  type Operation, type PrepareResult, type QueryPage, type QueryParams, type RunView, type Selector, type Touched, type WorkspaceInfo, type WishChoices,
-  type AnnotationContent, type ListAnnotationsParams, type Capability, type ShowLockInfo, type WishAiccMode, type HostedExecConfig, type BucketBinding, type ExtMigration, type ExtPackResult, type TemplateSpec,
+  type Operation, type PrepareResult, type QueryPage, type QueryParams, type RunView, type Selector, type SqlParams, type Touched, type WorkspaceInfo,
+  type AnnotationContent, type ListAnnotationsParams, type ShowLockInfo, type BucketBinding, type ExtMigration, type ExtPackResult, type TemplateSpec,
 } from '../api/types'
 import { StorageFailure, describeStorageFailure, type ReplicaClient } from './client'
 import { forgetPrepared, noteTitle, type OpenedReplica, type ReplicaLock } from './holder'
@@ -87,6 +87,9 @@ function reverted(touched: Touched[]): Touched[] {
 }
 
 export class ReplicaWorkspaceSession implements WorkspaceSession {
+  /** Offline there is no service clock to ask: the device's own is all there is. */
+  async serverTime() { return null }
+  async assetStreamUrl() { return null }
   readonly workspaceId: string
   readonly sessionId: string
   readonly offline: OfflineControls
@@ -110,10 +113,13 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
   private lockHolders = new Map<string, LockInfo>()
   private wakeAbort = new AbortController()
   private waitAbort: AbortController | null = null
+  /** The service has recorded this window's open (`ws.get_info { record_open }`, K6). */
+  private openRecorded = false
   private serial: Promise<unknown> = Promise.resolve()
   private readonly statusListeners = new Set<() => void>()
   private readonly changeListeners = new Set<(event: CommitEvent) => void>()
   private readonly submissionListeners = new Set<(event: SubmissionEvent) => void>()
+  private readonly aclListeners = new Set<() => void>()
   private readonly seqWaiters: { seq: number; resolve: () => void }[] = []
   private readonly onOnline = () => this.wake()
   private readonly offDeath: () => void
@@ -182,6 +188,13 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
   subscribeChanges(listener: (event: CommitEvent) => void) {
     this.changeListeners.add(listener)
     return () => { this.changeListeners.delete(listener) }
+  }
+
+  /** The permissions moved (权限需求 R4): the long poll wakes on `acl_rev`, the reconnect reads the caller's Workspace
+   * capabilities again; `info()` has them when the listeners are told. */
+  subscribeAcl(listener: () => void) {
+    this.aclListeners.add(listener)
+    return () => { this.aclListeners.delete(listener) }
   }
 
   whenApplied(seq: number): Promise<void> {
@@ -290,7 +303,7 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
         // its request simply has the abandoned long poll run out in the background)
         const poll = new AbortController()
         this.waitAbort = poll
-        const remote = this.client.waitChanges(this.ws, this.epoch, this.confirmedSeq, 25000, poll.signal)
+        const remote = this.client.waitChanges(this.ws, this.epoch, this.confirmedSeq, 25000, poll.signal, this.wsInfo.acl_rev)
         const wakeSignal = this.wakeAbort.signal
         const local = new Promise<null>((resolve) => { wakeSignal.addEventListener('abort', () => resolve(null), { once: true }) })
         const woke = await Promise.race([remote, local])
@@ -327,16 +340,24 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
   }
 
   private async reconnect() {
-    // 2. still allowed, same history?
-    const info = await this.client.wsGetInfo(this.ws)
+    // 2. still allowed, same history? (the first answer also records that this window opened it, UI 框架 PRD K6)
+    const info = await this.client.wsGetInfo(this.ws, { recordOpen: !this.openRecorded })
     if (!info.ok) { this.streamError(info.error.code, info.error.detail); return }
+    this.openRecorded = true
     if (versionMismatch(info)) { this.stop('VERSION_MISMATCH'); return }
     if (info.epoch !== this.epoch) { this.stop('EPOCH_MISMATCH'); return }
-    if (info.title !== this.wsInfo.title || info.capabilities.join() !== this.wsInfo.capabilities.join()) {
+    const shown = info.title !== this.wsInfo.title || info.capabilities.join() !== this.wsInfo.capabilities.join()
+    const aclMoved = (info.acl_rev ?? 0) !== (this.wsInfo.acl_rev ?? 0)
+    if (shown || aclMoved) {
       this.wsInfo = { ...info, head_seq: this.confirmedSeq }
       noteTitle(this.workspaceId, info.title)
       await this.replica.call('updateInfo', this.wsInfo)
-      this.emitChange({ seq: this.confirmedSeq, local: true, touched: [{ entity_id: 'root', change: 'renamed', rev: 0 }] })
+      if (shown) this.emitChange({ seq: this.confirmedSeq, local: true, touched: [{ entity_id: 'root', change: 'renamed', rev: 0 }] })
+      if (aclMoved) {
+        for (const listener of [...this.aclListeners]) {
+          try { listener() } catch (error) { console.error('[aiworkspace] permission listener failed', error) }
+        }
+      }
     }
     // 3. catch up and rebase
     await this.catchUp()
@@ -489,6 +510,14 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
     return this.replica.call('freshness', entityIds)
   }
   relations(entityId: string) { return this.replica.call('relations', entityId) }
+  /** SQL runs on the service (R16): at this tab's confirmed head and with no local change pending, so it reads what
+   * this tab shows; otherwise refused (offline) or `SNAPSHOT_EXPIRED` (the caller synchronizes and asks again). */
+  async sql(params: SqlParams) {
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.sql'))
+    if (this.rows.length > 0) throw new ServiceFailure({ code: 'SNAPSHOT_EXPIRED', sub_code: 'LOCAL_CHANGES', detail: aiwsT('aiworkspace.core.replica.sqlLocalChanges'), retryable: true })
+    return this.direct.sql({ ...params, expect_head: { epoch: this.epoch, seq: this.confirmedSeq } })
+  }
+
   async listVersions(entityId: string) {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.versions'))
     return this.direct.listVersions(entityId)
@@ -505,48 +534,24 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.writeUserState'))
     return this.direct.setUserState(entries)
   }
-  async listGrants() {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.readGrants'))
-    return this.direct.listGrants()
-  }
-  async grant(subject: string, capabilities: Capability[], scopeEntityId?: string) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.changeGrants'))
-    return this.direct.grant(subject, capabilities, scopeEntityId)
-  }
-  async revoke(subject: string, scopeEntityId?: string) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.changeGrants'))
-    return this.direct.revoke(subject, scopeEntityId)
-  }
   async listSubjects() {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.subjects'))
     return this.direct.listSubjects()
   }
-  async setWishAiccMode(mode: WishAiccMode) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.changeWishAicc'))
-    const applied = await this.direct.setWishAiccMode(mode)
-    this.wsInfo = { ...this.wsInfo, wish_aicc_mode: applied }
-    return applied
-  }
-  async setHostedExec(config: HostedExecConfig) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.changeWishAicc'))
-    const applied = await this.direct.setHostedExec(config)
-    this.wsInfo = { ...this.wsInfo, hosted_exec: applied }
-    return applied
-  }
   async publish(entityId: string, name?: string) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.changeWishAicc'))
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.onlineSetting'))
     return this.direct.publish(entityId, name)
   }
   async unpublish(entityId: string) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.changeWishAicc'))
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.onlineSetting'))
     return this.direct.unpublish(entityId)
   }
   async listPublications() {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.changeWishAicc'))
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.onlineSetting'))
     return this.direct.listPublications()
   }
   async listReferrers(entityId: string) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.changeWishAicc'))
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.onlineSetting'))
     return this.direct.listReferrers(entityId)
   }
   // extension controls need the service (builds read objects at the NDM gateway; the library is the service's)
@@ -712,9 +717,17 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
   lockBreak(entityId: string) { return this.direct.lockBreak(entityId) }
   lockList() { return this.direct.lockList() }
 
-  async uploadAsset(file: Blob, fileName?: string) {
+  /** A staged asset becomes known to the replica as it is to the service: the local plan of the Commit that names it
+   * (a directory member, an asset reference) checks it as the service will. */
+  private async noteAsset(asset: { object_id: string; media_type: string; size: number }) {
+    await this.replica.call('noteAsset', { object_id: asset.object_id, media_type: asset.media_type, size: asset.size })
+  }
+
+  async uploadAsset(file: Blob, fileName?: string, control?: UploadControl) {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.upload'))
-    return this.direct.uploadAsset(file, fileName)
+    const asset = await this.direct.uploadAsset(file, fileName, control)
+    await this.noteAsset(asset)
+    return asset
   }
 
   contentServer() { return this.direct.contentServer() }
@@ -726,7 +739,13 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
 
   async importAssets(files: File[], folder: boolean, signal?: AbortSignal) {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.upload'))
-    return this.direct.importAssets(files, folder, signal)
+    const items = await this.direct.importAssets(files, folder, signal)
+    const note = async (item: ImportedAsset): Promise<void> => {
+      if (item.kind === 'file') await this.noteAsset(item)
+      else for (const child of item.children) await note(child)
+    }
+    for (const item of items) await note(item)
+    return items
   }
 
   call<T>(method: string, params: Record<string, unknown>): Promise<T> {
@@ -750,29 +769,25 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.readRun'))
     return this.direct.procGet(runId)
   }
-  async procApply(runId: string) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.procApply'))
-    return this.direct.procApply(runId)
-  }
   async procCancel(runId: string) {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.cancelRun'))
     return this.direct.procCancel(runId)
   }
 
-  // wish runs happen on the service: offline nothing is started, read or applied (许愿格 §14.2)
-  async wishStart(program: 'wish.xllm@1' | 'wish.mock@1', params: Record<string, Json>, idempotencyKey?: string) {
+  // wish runs happen on the service: offline nothing is started, read or rolled back (许愿格 §14.2)
+  async wishStart(program: 'wish.xllm@1', params: Record<string, Json>, idempotencyKey?: string) {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.wishStart'))
     // the service must see what this device saved first: a run never works from an older wish
     if (this.offline.pending().some((row) => row.state === 'queued' || row.state === 'sending' || row.state === 'unknown')) throw new ServiceFailure({ code: 'PENDING_LOCAL_EDITS', retryable: true, detail: aiwsT('aiworkspace.core.replica.pendingLocalEdits') })
     return this.direct.wishStart(program, params, idempotencyKey)
   }
-  async wishGet(runId: string, choices?: WishChoices) {
+  async wishGet(runId: string) {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.readRun'))
-    return this.direct.wishGet(runId, choices)
+    return this.direct.wishGet(runId)
   }
-  async wishApply(runId: string, planDigest: string) {
-    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.wishApply'))
-    return this.direct.wishApply(runId, planDigest)
+  async procRollback(runId: string, confirm?: boolean) {
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.wishcard.offline.rollback'))
+    return this.direct.procRollback(runId, confirm)
   }
   async wishList(wishId: string, limit?: number) {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.listRuns'))
@@ -807,6 +822,29 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
     if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.wishStart'))
     return this.direct.procFiles(runId, attempt)
   }
+  async importObject(objId: string) {
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.core.replica.offline.wishStart'))
+    const asset = await this.direct.importObject(objId)
+    await this.noteAsset(asset)
+    return asset
+  }
+  // presence and the work log (UI 框架 PRD K2, K3): the service's, never queued
+  async presenceHeartbeat(surfaceId: string | null, name?: string) {
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.activity.offline.presence'))
+    return this.direct.presenceHeartbeat(surfaceId, name)
+  }
+  async presenceLeave() {
+    if (!this.isLive()) return
+    return this.direct.presenceLeave()
+  }
+  async presenceList() {
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.activity.offline.presence'))
+    return this.direct.presenceList()
+  }
+  async workLog(params?: Parameters<WorkspaceSession['workLog']>[0]) {
+    if (!this.isLive()) throw this.offlineFailure(aiwsT('aiworkspace.activity.offline.workLog'))
+    return this.direct.workLog(params)
+  }
 
   close() {
     if (this.disposed) return
@@ -818,6 +856,7 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
     this.statusListeners.clear()
     this.changeListeners.clear()
     this.submissionListeners.clear()
+    this.aclListeners.clear()
     this.seqWaiters.splice(0).forEach((waiter) => waiter.resolve())
     // the lock is released only after the database is closed: the next holder must find the files free
     this.released = this.serial.then(() => this.replica.close()).catch(() => undefined).then(() => this.lock.release())

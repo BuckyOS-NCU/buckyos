@@ -6,14 +6,15 @@
  * what hovering it offers and the type section of the near toolbar. They are registered like any
  * extension would be. */
 
-import { useCallback, type CSSProperties, type ReactNode } from 'react'
-import { ALargeSmall, ClipboardCopy, Columns3, Eye, File as FileIcon, FileText, Film, Image as ImageIcon, LayoutGrid, ListFilter, ListTree, Music, Play, Plus, Replace, Reply, Scan, Table, Type } from 'lucide-react'
+import { useCallback, useContext, type CSSProperties, type ReactNode } from 'react'
+import { ALargeSmall, ClipboardCopy, Columns3, Eye, File as FileIcon, FileText, Film, Image as ImageIcon, LayoutGrid, LetterText, ListFilter, ListTree, Music, Play, Plus, Replace, Reply, Scan, StickyNote, Table } from 'lucide-react'
 import { randomId } from '../../api/ids'
 import type { ReadOk } from '../../api/session'
-import type { AnnotationContent, Json, KeyedContent, Reference, RichTextContent } from '../../api/types'
+import type { AnnotationContent, Json, KeyedContent, Operation, Reference, RichTextContent } from '../../api/types'
 import { StaticRichText } from '../../richtext/RichTextEditor'
 import { isGuestPrincipal } from '../../api/transport'
-import { aiwsT } from '../../i18n'
+import { standardTableOp } from 'buckyos'
+import { aiwsT, currentAiwsLocale } from '../../i18n'
 import { useAiwsText } from '../../useAiwsText'
 import { authorLabel, readGuestName } from '../../state/guest'
 import { useEdit, useLoad, useStore, useVersion, useWorkspaceUi } from '../../state/hooks'
@@ -25,10 +26,13 @@ import { TableViewCell } from '../TableViewCell'
 import { sourceLabel } from './affordances'
 import { requestIntent, useOnFreeCanvas } from './editorToolbar'
 import { AssetCell, LockScope, NoteEditor, NoteReplies, RecordCell, RichTextCell, TableEditor } from './editors'
-import { cellOp, createOp, MAX_EMBED_DEPTH, replaceAccept, replaceAsset, setCellConfig } from './ops'
+import { cellOp, createOp, MAX_EMBED_DEPTH, replaceAccept, replaceAsset } from './ops'
 import { assetMediaType, mediaKindOf, playsInPlace } from '../media/kinds'
 import type { StagedPayload } from '../media/stage'
-import { blockRegistry, type BlockDefinition, type RenderContext, type ToolbarItem } from './registry'
+import { freeTableName, standardTableOf } from '../controls/data/source'
+import { blockRegistry, type BlockDefinition, type CreateArgs, type RenderContext } from './registry'
+import { PrintFragmentContext } from '../../print/renderer/context'
+import { PrintTable } from '../../print/renderer/PrintTable'
 import { frameDefinition } from './frameBlock'
 import { shapeDefinition } from './shapeBlock'
 
@@ -57,8 +61,11 @@ function useEmbedRenderer(depth: number) {
 
 function TableStatic(context: RenderContext) {
   const ui = useWorkspaceUi()
+  const flow = useContext(PrintFragmentContext)
   const source = context.source
   if (!source) return null
+  // a printed page has every row, laid out whole (打印 TODO T9)
+  if (context.mode === 'print') return <div className="aiws-block-static"><PrintTable cellId={context.cell.entity_id} width={flow?.width ?? context.size.w} height={flow ? null : context.size.h} /></div>
   return (
     <div className="aiws-block-static">
       <TableViewCell cellId={context.cell.entity_id} readOnly compact annotations={ui.annotations} onActivateAnnotation={ui.setActiveAnnotation} />
@@ -79,28 +86,51 @@ const canAppend = (context: RenderContext) => context.readOnlyReason === null &&
 
 const table: BlockDefinition = {
   type: 'table', version: 1, get title() { return aiwsT('aiworkspace.blocks.table.title') }, accepts: ['buckyos.table-source'], allowNoSource: false,
-  defaultSize: { w: 640, h: 320 }, cost: { editor: true, html: false },
+  defaultSize: { w: 640, h: 320 }, cost: { editor: true, html: false }, icon: Table,
   Static: TableStatic, Simplified: TableSimplified, Editor: TableEditorView,
-  catalog: { group: 'data', get description() { return aiwsT('aiworkspace.blocks.table.description') }, needs: 'none', standard: true },
-  actions: [{ id: 'edit', get label() { return aiwsT('aiworkspace.blocks.action.editContent') }, modes: ['edit'], needs: ['update'], onSource: true, run: (context) => context.activateEditor(), key: 'Enter' }],
+  catalog: {
+    group: 'data', get description() { return aiwsT('aiworkspace.blocks.table.description') }, needs: 'none', standard: true, toolPicker: 4,
+    variants: [
+      { id: 'todo', get title() { return aiwsT('aiworkspace.blocks.table.standardTodo') }, group: 'data', get description() { return aiwsT('aiworkspace.blocks.table.standardTodoDescription') }, config: { standard: 'todo' } },
+      { id: 'calendar', get title() { return aiwsT('aiworkspace.blocks.table.standardCalendar') }, group: 'data', get description() { return aiwsT('aiworkspace.blocks.table.standardCalendarDescription') }, config: { standard: 'calendar' } },
+    ],
+  },
+  // while editing, the table's own tools come from its editor (they also show which panel is open): its primary actions
+  // are offered while it is only selected
+  actions: [
+    { id: 'edit', get label() { return aiwsT('aiworkspace.blocks.action.editContent') }, modes: ['edit'], needs: ['update'], onSource: true, run: (context) => context.activateEditor(), key: 'Enter' },
+    { id: 'table-filter', icon: ListFilter, primary: true, get label() { return aiwsT('aiworkspace.blocks.table.filter') }, modes: ['edit'], when: (context) => !context.editorActive, run: (context) => openWith(context, 'filter') },
+    { id: 'table-fields', icon: Columns3, primary: true, get label() { return aiwsT('aiworkspace.blocks.table.fields') }, modes: ['edit'], needs: ['structure'], onSource: true, when: (context) => !context.editorActive, run: (context) => openWith(context, 'fields') },
+    { id: 'table-add', icon: Plus, primary: true, get label() { return aiwsT('aiworkspace.blocks.table.addRecord') }, modes: ['edit'], when: (context) => !context.editorActive && canAppend(context), run: (context) => openWith(context, 'add') },
+    // "copy as table" (表格数据导入 TODO §4.1): run by the table's editor, which knows the view's rows
+    { id: 'table-copy', icon: ClipboardCopy, primary: true, get label() { return aiwsT('aiworkspace.data.table.copyAsTable') }, modes: ['edit'], when: (context) => !context.editorActive, run: (context) => openWith(context, 'copy') },
+  ],
+  // the hover button is the "add record" action (reached by touch from the toolbar and the menu)
   hover: (context) => [
     ...sourceLabel(context, Table),
-    ...(canAppend(context) ? [{ id: 'add-row', kind: 'button' as const, at: 'bottom-out' as const, icon: Plus, label: aiwsT('aiworkspace.blocks.table.addRow'), run: (c: RenderContext) => openWith(c, 'add') }] : []),
+    ...(canAppend(context) ? [{ id: 'add-row', kind: 'button' as const, at: 'bottom-out' as const, icon: Plus, label: aiwsT('aiworkspace.blocks.table.addRow'), action: 'table-add' }] : []),
   ],
-  // while editing, the table's own tools come from its editor (they also show which panel is open)
-  toolbar: (context) => context.editorActive ? [] : [
-    { kind: 'button', id: 'table-filter', icon: ListFilter, label: aiwsT('aiworkspace.blocks.table.filter'), run: () => openWith(context, 'filter') },
-    ...(context.readOnlyReason === null && context.source?.capabilities.includes('structure') ? [{ kind: 'button' as const, id: 'table-fields', icon: Columns3, label: aiwsT('aiworkspace.blocks.table.fields'), run: () => openWith(context, 'fields') }] : []),
-    ...(canAppend(context) ? [{ kind: 'button' as const, id: 'table-add', icon: Plus, label: aiwsT('aiworkspace.blocks.table.addRecord'), run: () => openWith(context, 'add') }] : []),
-    // "copy as table" (表格数据导入 TODO §4.1): run by the table's editor, which knows the view's rows
-    { kind: 'button', id: 'table-copy', icon: ClipboardCopy, label: aiwsT('aiworkspace.data.table.copyAsTable'), run: () => openWith(context, 'copy') },
-  ],
-  create: (args) => (args.existingSourceId ? [cellOp(args, 'table', args.existingSourceId)] : [
+  create: (rawArgs) => {
+    const config = Object.entries(rawArgs.config ?? {}).filter(([key]) => key !== 'standard')
+    const args: CreateArgs = { ...rawArgs, config: config.length > 0 ? Object.fromEntries(config) : undefined }
+    if (args.existingSourceId) return [cellOp(args, 'table', args.existingSourceId)]
+    const standard = standardTableOf(rawArgs.config)
+    if (standard) {
+      const name = freeTableName(args.store, args.contentFolderId, args.title || aiwsT(standard.table === 'todo' ? 'aiworkspace.blocks.table.standardTodo' : 'aiworkspace.blocks.table.standardCalendar'))
+      const locale = currentAiwsLocale().startsWith('zh') ? 'zh' : 'en'
+      return [standardTableOp(standard.table, { entity_id: args.dataId, parent_id: args.contentFolderId, order_key: args.dataOrderKey, name, locale }) as unknown as Operation, cellOp(args, 'table', args.dataId)]
+    }
+    return newTableOps(args)
+  },
+}
+
+function newTableOps(args: CreateArgs): Operation[] {
+  return [
     createOp(args.dataId, 'buckyos.table-source', args.contentFolderId, args.dataOrderKey, {
       title_field_id: 'title', fields: [{ field_id: 'title', name: aiwsT('aiworkspace.blocks.table.fieldTitle'), type: 'text', required: true }, { field_id: 'done', name: aiwsT('aiworkspace.blocks.table.fieldDone'), type: 'boolean' }],
     }, args.title || undefined),
     cellOp(args, 'table', args.dataId),
-  ]),
+  ]
 }
 
 // ---- rich text
@@ -150,28 +180,19 @@ function firstText(node: { text?: string; content?: unknown[] } | undefined, lim
   return ''
 }
 
-/** Text size and colour of the whole Block: Cell configuration (§5.2), in the toolbar while selected or editing. */
-function textTools(context: RenderContext, store: WorkspaceStore): ToolbarItem[] {
-  const { size } = textStyle(context)
-  const color = context.payload.config?.text_color
-  // a Block's own configuration: the Cell, not the data, is written
-  const reason = context.capabilities.includes('update') && context.mode === 'edit' ? false : aiwsT('aiworkspace.blocks.noPermission')
-  const sizes = textSizes()
-  return [
-    { kind: 'menu', id: 'text-size', icon: ALargeSmall, label: aiwsT('aiworkspace.blocks.fontSize'), value: size, items: sizes, disabled: reason,
-      onPick: (value) => setCellConfig(context, store, { text_size: value === 'm' ? null : value }, aiwsT('aiworkspace.blocks.edit.change', { label: aiwsT('aiworkspace.blocks.fontSize'), value: sizes.find((t) => t.value === value)?.label ?? value })) },
-    { kind: 'color', id: 'text-color', label: aiwsT('aiworkspace.blocks.textColor'), palette: 'ink', value: typeof color === 'string' ? color : '', disabled: reason, onPick: (value) => setCellConfig(context, store, { text_color: value || null }, aiwsT('aiworkspace.blocks.textColor')) },
-  ]
-}
-
 const richtext: BlockDefinition = {
   type: 'richtext', version: 1, get title() { return aiwsT('aiworkspace.blocks.richtext.title') }, accepts: ['buckyos.richtext'], allowNoSource: false,
-  defaultSize: { w: 420, h: 220 }, cost: { editor: true, html: false },
+  defaultSize: { w: 420, h: 220 }, cost: { editor: true, html: false }, icon: LetterText,
+  traits: { typeToEdit: true, flowUntitled: true },
   Static: RichTextStatic, Simplified: RichTextSimplified, Editor: RichTextEditorView,
-  catalog: { group: 'text', get description() { return aiwsT('aiworkspace.blocks.richtext.description') }, needs: 'none', editAfterInsert: true, standard: true },
+  catalog: { group: 'text', get description() { return aiwsT('aiworkspace.blocks.richtext.description') }, needs: 'none', editAfterInsert: true, standard: true, toolPicker: 2 },
   actions: [{ id: 'edit', get label() { return aiwsT('aiworkspace.blocks.action.editContent') }, modes: ['edit'], needs: ['update'], onSource: true, run: (context) => context.activateEditor(), key: 'Enter' }],
-  hover: (context) => sourceLabel(context, Type),
-  toolbar: textTools,
+  hover: (context) => sourceLabel(context, LetterText),
+  // text size and colour of the whole Block: the Cell's configuration (§5.2), not its data
+  configFields: [
+    { key: 'text_size', id: 'text-size', get label() { return aiwsT('aiworkspace.blocks.fontSize') }, kind: 'select', quick: true, icon: ALargeSmall, default: 'm', get options() { return textSizes() } },
+    { key: 'text_color', id: 'text-color', get label() { return aiwsT('aiworkspace.blocks.textColor') }, kind: 'color', quick: true, palette: 'ink', default: '' },
+  ],
   create: (args) => (args.existingSourceId ? [cellOp(args, 'richtext', args.existingSourceId)] : [
     createOp(args.dataId, 'buckyos.richtext', args.contentFolderId, args.dataOrderKey, {
       content: { type: 'doc', content: [{ type: 'paragraph', attrs: { block_id: randomId('b') }, content: args.title ? [{ type: 'text', text: args.title }] : [] }] },
@@ -198,7 +219,7 @@ function RecordEditorView(context: RenderContext) {
 
 const record: BlockDefinition = {
   type: 'record', version: 1, get title() { return aiwsT('aiworkspace.blocks.record.title') }, accepts: ['buckyos.record'], allowNoSource: false,
-  defaultSize: { w: 360, h: 180 }, cost: { editor: false, html: false },
+  defaultSize: { w: 360, h: 180 }, cost: { editor: false, html: false }, icon: ListTree,
   Static: RecordStatic, Editor: RecordEditorView,
   catalog: { group: 'data', get description() { return aiwsT('aiworkspace.blocks.record.description') }, needs: 'none', editAfterInsert: true },
   actions: [{ id: 'edit', get label() { return aiwsT('aiworkspace.blocks.action.editContent') }, modes: ['edit'], needs: ['update'], onSource: true, run: (context) => context.activateEditor(), key: 'Enter' }],
@@ -227,13 +248,14 @@ function kindOfSource(context: RenderContext) {
 
 /** On a free canvas in edit mode "play" activates the Block: its Editor plays, and the canvas leaves it the pointer. */
 function AssetStatic(context: RenderContext) {
-  // a flow page has no near toolbar: the file facts and "replace" stay under the picture there
-  const bare = useOnFreeCanvas()
+  // a flow page has no near toolbar: the file facts and "replace" stay under the picture there (not on a printed page)
+  const print = context.mode === 'print'
+  const bare = useOnFreeCanvas() || print
   if (!context.source) return null
   return (
     <div className="aiws-block-static aiws-block-asset">
       <AssetCell entityId={context.source.entity_id} fit={fitOf(context)} readOnly={bare || context.readOnlyReason !== null || context.mode !== 'edit'} bare={bare}
-        media={{ cellId: context.cell.entity_id, onActivate: bare && context.mode === 'edit' ? context.activateEditor : undefined }} />
+        media={{ cellId: context.cell.entity_id, onActivate: bare && context.mode === 'edit' ? context.activateEditor : undefined, print }} />
     </div>
   )
 }
@@ -264,15 +286,10 @@ function AssetEditor(context: RenderContext) {
 function pickReplacement(context: RenderContext, store: WorkspaceStore) {
   const sourceId = context.source?.entity_id
   if (!sourceId) return
-  const input = document.createElement('input')
-  input.type = 'file'
   const accept = replaceAccept({ object_id: '', media_type: context.source?.media_type ?? undefined, file_name: context.source?.name ?? undefined })
-  if (accept) input.accept = accept
-  input.onchange = () => {
-    const file = input.files?.[0]
+  void context.pickFile(accept).then((file) => {
     if (file) void replaceAsset(store, sourceId, file).then((problem) => { if (problem) store.notify('error', problem) })
-  }
-  input.click()
+  })
 }
 
 /** Which Office document a file Block holds, by its name (Office 导入 TODO §6). */
@@ -323,34 +340,37 @@ const FIT_OPTIONS = [
 ]
 const KIND_ICON = { image: ImageIcon, video: Film, audio: Music, pdf: FileText, file: FileIcon }
 
+/** Why a PDF or Office file cannot become pages now (a new canvas needs `structure`, the import needs the service). */
+const expandReason = (store: WorkspaceStore): string | false => (!store.session.info().capabilities.includes('structure') ? aiwsT('aiworkspace.pdf.reason.noStructure') : store.session.status().kind !== 'live' ? aiwsT('aiworkspace.pdf.reason.offline') : false)
+const isOfficeDoc = (ext: string | null) => Boolean(ext && /^(docx?|docm|odt|rtf)$/.test(ext))
+const fittable = (context: RenderContext) => { const { kind } = kindOfSource(context); return kind === 'image' || kind === 'video' || kind === 'pdf' }
+
 const asset: BlockDefinition = {
   type: 'asset', version: 1, get title() { return aiwsT('aiworkspace.blocks.asset.title') }, accepts: ['buckyos.asset-ref'], allowNoSource: false,
-  defaultSize: { w: 320, h: 240 }, cost: { editor: false, html: false },
+  defaultSize: { w: 320, h: 240 }, cost: { editor: false, html: false }, icon: ImageIcon,
+  traits: { flowUntitled: true },
   Static: AssetStatic, View: AssetView, Editor: AssetEditor,
   resize: { aspect: 'locked' },
-  catalog: { group: 'data', get description() { return aiwsT('aiworkspace.blocks.asset.description') }, needs: 'file', standard: true },
-  actions: [{ id: 'replace', get label() { return aiwsT('aiworkspace.blocks.asset.replaceFile') }, modes: ['edit'], needs: ['update'], onSource: true, run: pickReplacement }],
+  catalog: { group: 'data', get description() { return aiwsT('aiworkspace.blocks.asset.description') }, needs: 'file', standard: true, toolPicker: 3 },
+  // replace, fit and preview (§4.4): play and preview also while reading
+  actions: [
+    { id: 'asset-play', icon: Play, primary: true, get label() { return aiwsT('aiworkspace.blocks.media.playShort') }, modes: ['edit', 'view'], when: (context) => kindOfSource(context).playable,
+      run: (context) => { if (context.mode === 'edit') context.activateEditor(); else requestIntent(context.cell.entity_id, 'open') } },
+    { id: 'asset-preview', icon: Eye, primary: true, get label() { return aiwsT('aiworkspace.blocks.asset.preview') }, modes: ['edit', 'view'], run: (context) => requestIntent(context.cell.entity_id, 'preview') },
+    { id: 'asset-replace', icon: Replace, primary: true, get label() { return aiwsT('aiworkspace.blocks.asset.replace') }, modes: ['edit'], needs: ['update'], onSource: true, run: pickReplacement },
+    { id: 'asset-expand-pdf', icon: LayoutGrid, primary: true, get label() { return aiwsT('aiworkspace.blocks.asset.expandPdf') }, modes: ['edit'], when: (context) => kindOfSource(context).kind === 'pdf',
+      disabled: (_context, store) => expandReason(store), run: (context, store) => { void expandPdf(context, store) } },
+    // a document becomes a flow page, slides become pages on a canvas (one id: the action is the same)
+    { id: 'asset-expand-office', icon: LayoutGrid, primary: true, get label() { return aiwsT('aiworkspace.office.expandDoc') }, modes: ['edit'], when: (context) => isOfficeDoc(officeKindOf(context)),
+      disabled: (_context, store) => expandReason(store), run: (context, store) => { void expandOffice(context, store) } },
+    { id: 'asset-expand-office', icon: LayoutGrid, primary: true, get label() { return aiwsT('aiworkspace.office.expandSlides') }, modes: ['edit'], when: (context) => Boolean(officeKindOf(context)) && !isOfficeDoc(officeKindOf(context)),
+      disabled: (_context, store) => expandReason(store), run: (context, store) => { void expandOffice(context, store) } },
+  ],
   hover: (context) => sourceLabel(context, KIND_ICON[kindOfSource(context).kind]),
-  toolbar: (context, store): ToolbarItem[] => {
-    const { kind, playable } = kindOfSource(context)
-    return [
-      ...(playable ? [{ kind: 'button' as const, id: 'asset-play', icon: Play, label: aiwsT('aiworkspace.blocks.media.playShort'),
-        run: () => { if (context.mode === 'edit') context.activateEditor(); else requestIntent(context.cell.entity_id, 'open') } }] : []),
-      ...(context.mode === 'edit' && context.source?.capabilities.includes('update') && context.readOnlyReason === null ? [{ kind: 'button' as const, id: 'asset-replace', icon: Replace, label: aiwsT('aiworkspace.blocks.asset.replace'), run: () => pickReplacement(context, store) }] : []),
-      ...(kind === 'image' || kind === 'video' || kind === 'pdf' ? [{ kind: 'menu' as const, id: 'asset-fit', icon: Scan, label: aiwsT('aiworkspace.blocks.asset.fit'), value: fitOf(context), items: FIT_OPTIONS,
-        disabled: context.capabilities.includes('update') && context.mode === 'edit' ? false as const : aiwsT('aiworkspace.blocks.noPermission'),
-        onPick: (value: string) => setCellConfig(context, store, { fit: value === 'contain' ? null : value }, aiwsT('aiworkspace.blocks.edit.change', { label: aiwsT('aiworkspace.blocks.asset.fit'), value: aiwsT(value === 'cover' ? 'aiworkspace.blocks.asset.fitCover' : 'aiworkspace.blocks.asset.fitContain') })) }] : []),
-      { kind: 'button', id: 'asset-preview', icon: Eye, label: aiwsT('aiworkspace.blocks.asset.preview'), run: () => requestIntent(context.cell.entity_id, 'preview') },
-      ...(kind === 'pdf' && context.mode === 'edit' ? [{ kind: 'button' as const, id: 'asset-expand-pdf', icon: LayoutGrid, label: aiwsT('aiworkspace.blocks.asset.expandPdf'),
-        disabled: !store.session.info().capabilities.includes('structure') ? aiwsT('aiworkspace.pdf.reason.noStructure') : store.session.status().kind !== 'live' ? aiwsT('aiworkspace.pdf.reason.offline') : false as const,
-        run: () => { void expandPdf(context, store) } }] : []),
-      ...(officeKindOf(context) && context.mode === 'edit' ? [{ kind: 'button' as const, id: 'asset-expand-office', icon: LayoutGrid,
-        label: aiwsT(/^(docx?|docm|odt|rtf)$/.test(officeKindOf(context) ?? '') ? 'aiworkspace.office.expandDoc' : 'aiworkspace.office.expandSlides'),
-        disabled: !store.session.info().capabilities.includes('structure') ? aiwsT('aiworkspace.pdf.reason.noStructure') : store.session.status().kind !== 'live' ? aiwsT('aiworkspace.pdf.reason.offline') : false as const,
-        run: () => { void expandOffice(context, store) } }] : []),
-    ]
-  },
-  configFields: [{ key: 'fit', get label() { return aiwsT('aiworkspace.blocks.asset.fitField') }, kind: 'select', options: FIT_OPTIONS }],
+  configFields: [
+    { key: 'fit', id: 'asset-fit', get label() { return aiwsT('aiworkspace.blocks.asset.fit') }, kind: 'select', quick: true, icon: Scan, default: 'contain', options: FIT_OPTIONS, when: fittable,
+      get: (context) => fitOf(context) },
+  ],
   create: (args) => {
     if (args.existingSourceId) return [cellOp(args, 'asset', args.existingSourceId)]
     const file = args.config?.file as StagedPayload | undefined
@@ -379,7 +399,7 @@ function NoteStatic(context: RenderContext) {
   return (
     <div className="aiws-note aiws-block-static" style={style} data-size={typeof payload?.style?.size === 'string' ? payload.style.size : 'm'} data-testid={`aiws-note-${id}`}>
       <div className="aiws-note-body">{payload?.body ?? '…'}</div>
-      <NoteReplies noteId={id} />
+      {context.mode !== 'print' && <NoteReplies noteId={id} />}
       {payload && authorLabel(payload) && <span className="aiws-note-author">{authorLabel(payload)}</span>}
       {entry && entry.state !== 'committed' && <span className="aiws-note-dot" data-testid="aiws-edit-state" data-state={entry.state} title={entry.detail ?? entry.state} />}
     </div>
@@ -398,11 +418,13 @@ function guestAuthorName(store: WorkspaceStore): { author_name?: string } {
 }
 
 /** Change the note's look (`style` of the annotation: the author's, or anyone's with `manage`). */
-async function setNoteStyle(store: WorkspaceStore, noteId: string, patch: Record<string, Json>, label: string) {
+/** The note's style with `patch` (its data, not the Block's configuration). */
+async function noteStyleOps(store: WorkspaceStore, context: RenderContext, patch: Record<string, Json>): Promise<Operation[]> {
+  const noteId = context.source?.entity_id
+  if (!noteId) return []
   const read = await store.session.read<AnnotationContent>(noteId)
   const style = { ...(read.content.payload.style ?? {}), ...patch }
-  const outcome = await store.submit({ editId: `key:${noteId}:style`, label, operations: [{ op: 'entity.set_keys', entity_id: noteId, keys: [{ key: 'style', value: style, expect: { rev: read.content.key_revs.style ?? 0 } }] }] })
-  if (outcome.status === 'rejected') store.notify('error', aiwsT('aiworkspace.blocks.note.notChanged', { code: outcome.code }))
+  return [{ op: 'entity.set_keys', entity_id: noteId, keys: [{ key: 'style', value: style, expect: { rev: read.content.key_revs.style ?? 0 } }] }]
 }
 
 /** Reply to a note: a new annotation whose target is the note (§7.3). */
@@ -413,24 +435,28 @@ function replyTo(context: RenderContext) {
   context.showAnnotations(id)
 }
 
+/** A note's look is its annotation's `style` (the author's, or anyone's with `manage`), not the Cell's configuration. */
+const noteStyleReason = (context: RenderContext): string | false => (context.mode === 'edit' && context.source?.capabilities.some((c) => c === 'comment' || c === 'manage') ? false : aiwsT('aiworkspace.blocks.note.noPermission'))
+
 const note: BlockDefinition = {
   type: 'note', version: 1, get title() { return aiwsT('aiworkspace.blocks.note.title') }, accepts: ['buckyos.annotation'], allowNoSource: false,
-  defaultSize: { w: 220, h: 160 }, cost: { editor: false, html: false },
+  defaultSize: { w: 220, h: 160 }, cost: { editor: false, html: false }, icon: StickyNote,
+  traits: { typeToEdit: true, flowUntitled: true, flowInsertable: false },
   Static: NoteStatic, Editor: NoteEditorView,
   chrome: 'none', resize: { aspect: 'locked' },
-  catalog: { group: 'text', get description() { return aiwsT('aiworkspace.blocks.note.description') }, needs: 'none', editAfterInsert: true, standard: true },
-  actions: [{ id: 'edit', get label() { return aiwsT('aiworkspace.blocks.note.edit') }, modes: ['edit'], needs: ['comment'], onSource: true, run: (context) => context.activateEditor(), key: 'Enter' }],
-  hover: (context) => (context.annotate ? [{ id: 'reply', kind: 'button', at: 'bottom-right-in', icon: Reply, label: aiwsT('aiworkspace.blocks.note.reply'), modes: ['edit', 'view'], run: replyTo }] : []),
-  toolbar: (context, store) => {
-    const noteId = context.source?.entity_id
-    if (!noteId) return []
-    const reason = context.mode === 'edit' && context.source?.capabilities.some((c) => c === 'comment' || c === 'manage') ? false : aiwsT('aiworkspace.blocks.note.noPermission')
-    return [
-      { kind: 'color', id: 'note-color', label: aiwsT('aiworkspace.blocks.note.color'), palette: 'fill', value: undefined, disabled: reason, onPick: (value) => { if (value) void setNoteStyle(store, noteId, { color: value }, aiwsT('aiworkspace.blocks.note.color')) } },
-      { kind: 'menu', id: 'note-size', icon: ALargeSmall, label: aiwsT('aiworkspace.blocks.fontSize'), items: textSizes(), disabled: reason, onPick: (value) => { void setNoteStyle(store, noteId, { size: value }, aiwsT('aiworkspace.blocks.note.fontSize')) } },
-      ...(context.annotate ? [{ kind: 'button' as const, id: 'note-reply', icon: Reply, label: aiwsT('aiworkspace.blocks.note.reply'), run: () => replyTo(context) }] : []),
-    ]
-  },
+  catalog: { group: 'text', get description() { return aiwsT('aiworkspace.blocks.note.description') }, needs: 'none', editAfterInsert: true, standard: true, toolPicker: 10 },
+  actions: [
+    { id: 'edit', get label() { return aiwsT('aiworkspace.blocks.note.edit') }, modes: ['edit'], needs: ['comment'], onSource: true, run: (context) => context.activateEditor(), key: 'Enter' },
+    { id: 'note-reply', icon: Reply, primary: true, get label() { return aiwsT('aiworkspace.blocks.note.reply') }, modes: ['edit', 'view'], when: (context) => Boolean(context.annotate), run: replyTo },
+  ],
+  // the hover button is the "reply" action
+  hover: (context) => (context.annotate ? [{ id: 'reply', kind: 'button', at: 'bottom-right-in', icon: Reply, label: aiwsT('aiworkspace.blocks.note.reply'), modes: ['edit', 'view'], action: 'note-reply' }] : []),
+  configFields: [
+    { key: 'color', id: 'note-color', get label() { return aiwsT('aiworkspace.blocks.note.color') }, kind: 'color', quick: true, palette: 'fill', readOnly: noteStyleReason, get: () => undefined,
+      ops: (context, store, value) => (typeof value === 'string' && value ? noteStyleOps(store, context, { color: value }) : Promise.resolve([])), editLabel: () => aiwsT('aiworkspace.blocks.note.color') },
+    { key: 'size', id: 'note-size', get label() { return aiwsT('aiworkspace.blocks.fontSize') }, kind: 'select', quick: true, icon: ALargeSmall, get options() { return textSizes() }, readOnly: noteStyleReason, get: () => undefined,
+      ops: (context, store, value) => (typeof value === 'string' ? noteStyleOps(store, context, { size: value }) : Promise.resolve([])), editLabel: () => aiwsT('aiworkspace.blocks.note.fontSize') },
+  ],
   create: (args) => (args.existingSourceId ? [cellOp(args, 'note', args.existingSourceId)] : [
     // a title given at insertion is the note's text (a note written first, then placed): the Block itself has none
     createOp(args.dataId, 'buckyos.annotation', args.contentFolderId, args.dataOrderKey, { kind: 'note', body: args.title ?? '', style: { color: '#fff2cc' }, ...guestAuthorName(args.store) }),

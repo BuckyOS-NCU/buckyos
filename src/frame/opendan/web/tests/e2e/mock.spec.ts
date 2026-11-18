@@ -26,8 +26,8 @@ test('sessions page lists the tree, the active view and filters', async ({ page 
 
   await page.getByLabel('run_state').selectOption('finished')
   await expect(sessions.locator('tbody tr')).toHaveCount(3)
-  await page.getByLabel('kind').selectOption('self_check')
-  await expect(sessions.locator('tbody tr')).toHaveCount(1)
+  await page.getByLabel('kind').selectOption('work')
+  await expect(sessions.locator('tbody tr')).toHaveCount(3)
   expect(errors).toEqual([])
 })
 
@@ -62,8 +62,8 @@ test('stop asks for confirmation and finishes the session', async ({ page }) => 
 
   await ops.getByRole('button', { name: 'Stop' }).click()
   await dialog.getByLabel('Reason (optional)').fill('wrong folder')
-  await dialog.getByRole('button', { name: 'Stop session' }).click()
-  await expect(page.getByTestId('operation-result')).toContainText('stop posted')
+  await dialog.getByRole('button', { name: 'Stop', exact: true }).click()
+  await expect(page.getByTestId('operation-result')).toContainText('stop(session) posted')
   await expect(page.getByTestId('session-summary')).toContainText('Stopped: wrong folder')
   await expect(ops.getByRole('button', { name: 'Stop' })).toHaveCount(0)
 })
@@ -114,6 +114,7 @@ test('agent state page shows perception, artifacts, behaviors, identity and hint
   await expect(page.getByTestId('agent-identity')).toContainText('personal agent of devtest')
 
   const hints = page.getByTestId('agent-hints')
+  await hints.getByLabel('Session').fill('ui-20261001-1')
   await hints.getByLabel('Tags').fill('report')
   await hints.getByRole('button', { name: 'Recall' }).click()
   await expect(hints.locator('tbody tr')).toHaveCount(1)
@@ -124,12 +125,12 @@ test('agent state page shows perception, artifacts, behaviors, identity and hint
 test('loader page shows modules, hosted sessions, inbox bridge and errors', async ({ page }) => {
   const errors = await open(page, 'loader')
   await expect(page.getByTestId('loader-info')).toContainText('did:bns:jarvis.devtest')
-  await expect(page.getByTestId('loader-modules').locator('tbody tr')).toHaveCount(5)
+  await expect(page.getByTestId('loader-modules').locator('tbody tr')).toHaveCount(4)
   await expect(page.getByTestId('loader-hosted').locator('tbody tr')).toHaveCount(3)
   await expect(page.getByTestId('loader-hosted')).toContainText('turn_open')
   await expect(page.getByTestId('loader-ui')).toContainText('session input queue is full')
   await expect(page.getByTestId('loader-errors').locator('tbody tr')).toHaveCount(2)
   await page.getByRole('button', { name: 'Refresh' }).click()
-  await expect(page.getByTestId('loader-modules').locator('tbody tr')).toHaveCount(5)
+  await expect(page.getByTestId('loader-modules').locator('tbody tr')).toHaveCount(4)
   expect(errors).toEqual([])
 })

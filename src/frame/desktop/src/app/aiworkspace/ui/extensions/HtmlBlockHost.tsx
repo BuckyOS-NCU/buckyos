@@ -1,21 +1,33 @@
 /* eslint-disable react-refresh/only-export-components -- Block definitions bundle their renderers */
 /* The `html` Block (phase two §10.4): a Block whose definition entity carries HTML / CSS / JS. In
- * edit and view mode it shows its last static snapshot (or a placeholder) and runs only after
- * explicit activation; while mounted, the extension talks to the host through `window.aiws`.
- * Crashes and silence fall back to the snapshot; other Blocks are unaffected. */
+ * edit mode it shows its last static snapshot (or a placeholder) and runs only after explicit
+ * activation; in view mode it runs by itself while the canvas runs (Q27, owner 11-12: a click elsewhere
+ * does not stop it), within the `html` budget. While mounted, the extension talks to the host through
+ * `window.aiws`. Crashes and silence fall back to the snapshot; other Blocks are unaffected. */
 
-import { useEffect, useRef, useState } from 'react'
+import { useContext, useEffect, useRef, useState } from 'react'
+import { FileCode2, Play } from 'lucide-react'
 import type { Json } from '../../api/types'
 import { aiwsT } from '../../i18n'
 import { useStore } from '../../state/hooks'
+import { serverClock } from '../../state/serverClock'
 import { useAiwsText } from '../../useAiwsText'
 import { AssetBlobImage } from './AssetBlobImage'
+import { useBudgetSlot } from '../blocks/budget'
 import { blockRegistry, type BlockDefinition, type RenderContext } from '../blocks/registry'
 import { cellOp } from '../blocks/ops'
 import { makeBridge } from './bridge'
 import { EventNote } from './EventNote'
 import { raiseEvent } from './events'
 import { HtmlRuntime } from './htmlRuntime'
+import { onForwardedAction } from './actions'
+import { PrintFragmentContext } from '../../print/renderer/context'
+import { holdPrint } from '../../print/renderer/ready'
+
+/** How long a printed page waits for an HTML Block to say it is ready, and then for its document to stop changing. */
+const PRINT_READY_MS = 15_000
+const PRINT_QUIET_MS = 300
+const PRINT_QUIET_MAX_MS = 4000
 
 function Snapshot(context: RenderContext & { label?: string }) {
   const { t } = useAiwsText()
@@ -31,24 +43,125 @@ function Snapshot(context: RenderContext & { label?: string }) {
 
 function HtmlStatic(context: RenderContext) {
   const { t } = useAiwsText()
+  const [confirming, setConfirming] = useState(false)
   const name = context.documentDefinition?.title ?? context.payload.title ?? t('aiworkspace.extension.html.title')
+  // code no manager vouched for (权限需求 R37): it runs with the viewer's rights, so the viewer is told before it starts
+  const untrusted = Boolean(context.documentDefinition) && !context.documentDefinition?.trusted
+  const cellId = context.cell.entity_id
   return (
     <>
       <Snapshot {...context} label={name} />
       {/* run mode (Q27): a click on the Block mounts it (within the `html` budget); design mode selects it */}
-      {context.interactive && context.depth === 0 && <button type="button" className="aiws-html-start" data-testid={`aiws-html-start-${context.cell.entity_id}`} aria-label={t('aiworkspace.extension.html.start', { name })} onClick={context.activateEditor} />}
-      <EventNote cellId={context.cell.entity_id} />
+      {context.interactive && context.depth === 0 && !confirming && <button type="button" className="aiws-html-start" data-testid={`aiws-html-start-${cellId}`} data-untrusted={untrusted ? 'true' : undefined} aria-label={t('aiworkspace.extension.html.start', { name })} onClick={untrusted ? () => setConfirming(true) : context.activateEditor} />}
+      {confirming && (
+        <div className="aiws-html-untrusted" role="alertdialog" data-testid={`aiws-html-untrusted-${cellId}`}>
+          <p>{t('aiworkspace.extension.html.untrusted')}</p>
+          <div className="aiws-html-untrusted-actions">
+            <button type="button" data-testid={`aiws-html-run-untrusted-${cellId}`} onClick={() => { setConfirming(false); context.activateEditor() }}>{t('aiworkspace.extension.html.runUntrusted')}</button>
+            <button type="button" onClick={() => setConfirming(false)}>{t('aiworkspace.common.cancel')}</button>
+          </div>
+        </div>
+      )}
+      <EventNote cellId={cellId} />
     </>
   )
 }
 
-/** Mounted after activation: the real runtime. */
-function HtmlActive(context: RenderContext) {
+/** The iframe's document has drawn: its pictures loaded and nothing changed for a moment (a cross-origin document: a
+ * short wait). */
+function frameQuiet(frame: HTMLIFrameElement | null): Promise<void> {
+  let doc: Document | null = null
+  try { doc = frame?.contentDocument ?? null } catch { doc = null }
+  if (!doc?.body) return new Promise((resolve) => window.setTimeout(resolve, 500))
+  const body = doc.body
+  return new Promise((resolve) => {
+    const start = performance.now()
+    let last = start
+    const observer = new MutationObserver(() => { last = performance.now() })
+    observer.observe(body, { subtree: true, childList: true, attributes: true, characterData: true })
+    const check = () => {
+      const now = performance.now()
+      const loading = [...body.querySelectorAll('img')].some((img) => !img.complete)
+      if (now - start > PRINT_QUIET_MAX_MS || (!loading && now - last >= PRINT_QUIET_MS)) { observer.disconnect(); resolve(); return }
+      window.setTimeout(check, 50)
+    }
+    check()
+  })
+}
+
+/** A printed page (打印 TODO T8): the definition's HTML runs as on a canvas — its reads come from the printed copy, its
+ * writes are refused (`modePolicy('print')`) — and the page waits until it said it is ready and stopped drawing. One
+ * that does not get there in time, or fails, prints its snapshot; without one, a placeholder. The pass that measures a
+ * flow page keeps the snapshot (the Block's box is the same either way). */
+function HtmlPrint(context: RenderContext) {
+  const store = useStore()
+  const { t } = useAiwsText()
+  const fragment = useContext(PrintFragmentContext)
+  const hostRef = useRef<HTMLDivElement>(null)
+  const [failed, setFailed] = useState(false)
+  const source = context.documentDefinition
+  const html = source?.kind === 'html' ? source.html : undefined
+  const htmlKey = html ? JSON.stringify(html) : ''
+  const measure = fragment?.measure ?? false
+  const cellId = context.cell.entity_id
+  useEffect(() => {
+    const host = hostRef.current
+    if (!host || !htmlKey || measure) return
+    const cell = store.outline.get(cellId)
+    if (!cell) return
+    const release = holdPrint()
+    const runtime = new HtmlRuntime(JSON.parse(htmlKey) as { html: string; css?: string; js?: string }, makeBridge(store, { cell, payload: context.payload, keyRevs: context.keyRevs, source: context.source, mode: 'print', interactive: false }))
+    let done = false
+    const finish = (ok: boolean) => {
+      if (done) return
+      done = true
+      window.clearTimeout(timer)
+      if (!ok) { runtime.dispose(); setFailed(true) }
+      release()
+    }
+    const timer = window.setTimeout(() => finish(false), PRINT_READY_MS)
+    // an extension that fails after it was ready prints its snapshot all the same
+    runtime.onCrash = () => { finish(false); runtime.dispose(); setFailed(true) }
+    runtime.mount(host).then(() => frameQuiet(host.querySelector('iframe'))).then(() => finish(true), () => finish(false))
+    return () => { finish(true); runtime.dispose() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one run per definition on a printed page
+  }, [store, htmlKey, cellId, measure])
+  const box = fragment ? { height: context.size.h } : undefined
+  if (!html || measure || failed) {
+    const snapshot = context.payload.config?.snapshot
+    return (
+      <div className="aiws-html-print" style={box}>
+        {snapshot?.object_id
+          ? <div className="aiws-html-static"><AssetBlobImage objectId={snapshot.object_id} mediaType={snapshot.media_type} alt={context.payload.title ?? ''} /></div>
+          : <div className="aiws-html-placeholder">{source?.title ?? context.payload.title ?? t('aiworkspace.extension.html.title')}<div className="aiws-muted">{t('aiworkspace.printrender.unprintable')}</div></div>}
+      </div>
+    )
+  }
+  return <div className="aiws-html-active aiws-html-print" style={box} data-testid={`aiws-html-print-${cellId}`}><div ref={hostRef} className="aiws-html-host" /></div>
+}
+
+function HtmlStaticOrPrint(context: RenderContext) {
+  return context.mode === 'print' ? <HtmlPrint {...context} /> : <HtmlStatic {...context} />
+}
+
+/** View mode: running while the canvas runs, as long as a slot of the `html` budget is free — not tied to what is
+ * selected or edited; otherwise its snapshot. Only code a manager vouched for runs by itself (权限需求 R37): an
+ * untrusted definition shows its snapshot, and starts on a click like in design mode. */
+function HtmlView(context: RenderContext) {
+  const trusted = Boolean(context.documentDefinition?.trusted)
+  const live = context.interactive && context.mode === 'view' && trusted
+  const slot = useBudgetSlot(live ? 'html' : null)
+  return live && slot ? <HtmlActive {...context} live /> : <HtmlStatic {...context} />
+}
+
+/** Mounted after activation (or by itself in view mode, `live`: nothing to stop or go back to): the real runtime. */
+function HtmlActive(context: RenderContext & { live?: boolean }) {
   const store = useStore()
   const { t } = useAiwsText()
   const hostRef = useRef<HTMLDivElement>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
+  const runtimeRef = useRef<HtmlRuntime | null>(null)
   const source = context.documentDefinition
   const html = source?.kind === 'html' ? source.html : undefined
   const htmlKey = html ? JSON.stringify(html) : ''
@@ -66,12 +179,24 @@ function HtmlActive(context: RenderContext) {
     // `emit` of this runtime only: a rebuild remounts with the new `html`, the old runtime's late events are dropped
     const onEmit = (name: string, params: Record<string, Json>) => (runtime.alive ? raiseEvent({ store, instanceId: cellId, event: name, params, mode, interactive, openEntity, alive: () => runtime.alive }) : Promise.resolve({ handled: false, event_id: null }))
     const runtime = new HtmlRuntime(src, makeBridge(store, { cell, payload: context.payload, keyRevs: context.keyRevs, source: context.source, mode, interactive, onEmit }))
+    runtimeRef.current = runtime
     let cancelled = false
     runtime.onCrash = (message) => { if (!cancelled) { runtime.dispose(); setFailure(message) } }
-    runtime.mount(host).catch((error: unknown) => { if (!cancelled) setFailure(error instanceof Error ? error.message : String(error)) })
-    return () => { cancelled = true; runtime.dispose() }
+    // the service's clock (H5): its offset now and whenever it is measured again
+    const clock = serverClock(store.session)
+    const offClock = clock.subscribe(() => runtime.pushClock(clock.now() - Date.now()))
+    // declared actions forwarded to the running HTML (H2): the request `action:<id>`
+    let offForward: () => void = () => undefined
+    runtime.mount(host).then(() => {
+      runtime.pushClock(clock.now() - Date.now())
+      offForward = onForwardedAction(cellId, (id) => { void runtime.request(`action:${id}`, null).catch((error: unknown) => store.notify('error', error instanceof Error ? error.message : String(error))) })
+    }).catch((error: unknown) => { if (!cancelled) setFailure(error instanceof Error ? error.message : String(error)) })
+    return () => { cancelled = true; offClock(); offForward(); runtime.dispose(); if (runtimeRef.current === runtime) runtimeRef.current = null }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [store, htmlKey, cellId, mode, interactive, attempt])
+  // the instance's properties as they change reach the running extension (H1)
+  const configKey = JSON.stringify(context.payload.config ?? {})
+  useEffect(() => { runtimeRef.current?.pushConfig(JSON.parse(configKey) as Json) }, [configKey])
   if (!html) return <div className="aiws-warning">{t('aiworkspace.extension.html.unavailable')}</div>
   if (failure) {
     return (
@@ -79,7 +204,7 @@ function HtmlActive(context: RenderContext) {
         <div className="aiws-error" role="alert">{t('aiworkspace.extension.html.failed', { error: failure })}</div>
         <Snapshot {...context} />
         <button type="button" className="aiws-link" onClick={() => { setFailure(null); setAttempt((n) => n + 1) }}>{t('aiworkspace.extension.html.runAgain')}</button>
-        <button type="button" className="aiws-link" onClick={deactivate}>{t('aiworkspace.extension.html.backToStatic')}</button>
+        {!context.live && <button type="button" className="aiws-link" onClick={deactivate}>{t('aiworkspace.extension.html.backToStatic')}</button>}
       </div>
     )
   }
@@ -87,7 +212,7 @@ function HtmlActive(context: RenderContext) {
     <div className="aiws-html-active" data-testid={`aiws-html-active-${context.cell.entity_id}`}>
       <div ref={hostRef} className="aiws-html-host" />
       <EventNote cellId={cellId} />
-      <div className="aiws-html-bar"><span className="aiws-muted">{t('aiworkspace.extension.html.mounted', { name: source?.title ?? context.payload.def_ref?.entity_id ?? '' })}</span><button type="button" className="aiws-link" onClick={deactivate}>{t('aiworkspace.extension.html.stop')}</button></div>
+      {!context.live && <div className="aiws-html-bar"><span className="aiws-muted">{t('aiworkspace.extension.html.mounted', { name: source?.title ?? context.payload.def_ref?.entity_id ?? '' })}</span><button type="button" className="aiws-link" onClick={deactivate}>{t('aiworkspace.extension.html.stop')}</button></div>}
     </div>
   )
 }
@@ -95,11 +220,12 @@ function HtmlActive(context: RenderContext) {
 export const htmlBlock: BlockDefinition = {
   type: 'html', version: 1, definitionKind: 'html', get title() { return aiwsT('aiworkspace.extension.html.title') }, accepts: ['buckyos.table-source', 'buckyos.richtext', 'buckyos.record', 'buckyos.asset-ref', 'buckyos.wish', 'buckyos.annotation'], allowNoSource: true,
   defaultSize: { w: 480, h: 320 }, cost: { editor: true, html: true },
-  Static: HtmlStatic, Editor: HtmlActive,
+  Static: HtmlStaticOrPrint, View: HtmlView, Editor: HtmlActive,
   catalog: { group: 'extension', get description() { return aiwsT('aiworkspace.extension.html.description') }, needs: 'definition' },
   actions: [
-    { id: 'run', get label() { return aiwsT('aiworkspace.extension.html.run') }, modes: ['edit'], run: (context) => context.activateEditor(), key: 'Enter' },
-    { id: 'open-def', get label() { return aiwsT('aiworkspace.extension.html.openDefinition') }, modes: ['edit', 'view'], when: (context) => Boolean(context.payload.def_ref), run: (context) => { if (context.payload.def_ref) context.openEntity(context.payload.def_ref.entity_id) } },
+    // primary (UI 框架 PRD §10.1): buttons of its toolbar, and in its menu
+    { id: 'run', icon: Play, primary: true, get label() { return aiwsT('aiworkspace.extension.html.run') }, modes: ['edit'], run: (context) => context.activateEditor(), key: 'Enter' },
+    { id: 'open-def', icon: FileCode2, primary: true, get label() { return aiwsT('aiworkspace.extension.html.openDefinition') }, modes: ['edit', 'view'], when: (context) => Boolean(context.payload.def_ref), run: (context) => { if (context.payload.def_ref) context.openEntity(context.payload.def_ref.entity_id) } },
   ],
   create: (args) => {
     // the definition reference is the Cell's `def_ref`, never part of its configuration

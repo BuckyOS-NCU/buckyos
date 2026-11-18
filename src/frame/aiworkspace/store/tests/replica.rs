@@ -305,9 +305,32 @@ fn replica_keeps_anchors_it_does_not_know() {
         "operations": [{ "op": "entity.create", "entity_id": "note-future", "type_id": "buckyos.annotation", "parent_id": "data",
             "order_key": "zz", "payload": { "target": { "entity_id": "notes", "selector": { "kind": "richtext_line", "line": 2 } },
                 "range": { "kind": "richtext_columns", "from": 1 }, "kind": "note", "body": "来自新版本" } }] });
-    let r = ws.commit(&req, &alice(), &CommitOpts { internal: true, import: true, undoes: None, as_principal: None, maintenance: false, as_source: false, as_build: false, as_session: false });
+    let r = ws.commit(&req, &alice(), &CommitOpts { internal: true, import: true, undoes: None, as_principal: None, maintenance: false, as_source: false, as_build: false, as_session: false, authorize_as: None, attribution: None, commit_id: None });
     assert_eq!(r["status"], "accepted", "{r}");
     catch_up(&ws, &alice(), &mut rep);
     let read = aiworkspace_core::read::read(&rep.working, &aiworkspace_core::access::Access::full("alice"), "note-future", None).unwrap();
     assert_eq!(read["content"]["anchor"], json!({ "state": "unsupported", "level": "entity" }));
+}
+
+#[test]
+fn an_asset_uploaded_after_the_replica_was_made_is_noted_and_then_plans_locally() {
+    let env = env();
+    let id = project(&env);
+    let h = env.svc.workspace(&id).unwrap();
+    let mut ws = h.lock().unwrap();
+    let mut rep = bootstrap(&mut ws, &alice(), 4444);
+    let made = rep.submit_local(&local(&rep, "dir/1", json!([{ "op": "entity.create", "entity_id": "files", "type_id": "buckyos.dir", "parent_id": "data", "order_key": "zz", "payload": { "members": {} } }])));
+    assert_eq!(made["status"], "saved_locally", "{made}");
+    // uploaded from the replica's window: the service has it, the replica does not yet
+    let staged = ws.stage_asset(&alice(), b"uploaded later").unwrap();
+    let object_id = staged["object_id"].as_str().unwrap().to_string();
+    let add = || json!([{ "op": "dir.set_member", "entity_id": "files", "name": "later.txt", "member": { "kind": "file", "object_id": object_id }, "expect": { "rev": 0 } }]);
+    let refused = rep.submit_local(&local(&rep, "dir/2", add()));
+    assert_eq!(refused["code"], "DEPENDENCY_UNAVAILABLE", "{refused}");
+    rep.note_asset(aiworkspace_core::model::AssetInfo { object_id: object_id.clone(), media_type: staged["media_type"].as_str().unwrap().to_string(), size: staged["size"].as_u64().unwrap() });
+    let saved = rep.submit_local(&local(&rep, "dir/3", add()));
+    assert_eq!(saved["status"], "saved_locally", "{saved}");
+    assert_eq!(rep.working.entities["files"].payload["members"]["later.txt"]["size"], json!(14));
+    assert_eq!(send_all(&mut ws, &alice(), &mut rep), vec![("dir/1".to_string(), "accepted".to_string()), ("dir/3".to_string(), "accepted".to_string())]);
+    assert_eq!(root_of(&rep.confirmed), ws.checkpoint_ro());
 }

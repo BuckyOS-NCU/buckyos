@@ -2,9 +2,10 @@
  * Only what the Desktop app reads is typed; unknown keys are preserved as `unknown`. */
 
 import type { StoredPlacement } from '@controls/placement'
+import type { OnBindStep, OnInitStep } from 'buckyos'
 import type { Composition } from '@controls/composite'
 
-export const PROTOCOL_VERSION = '1.1'
+export const PROTOCOL_VERSION = '1.2'
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
 
@@ -31,27 +32,76 @@ export interface WorkspaceSummary {
   capabilities: Capability[]
 }
 
+export interface ClonedFrom {
+  workspace_id: string
+  snapshot: string
+}
+
+/** One card of the home page (`ws.list`, UI 框架 PRD §9.2, K6). The caller's role follows from `capabilities`
+ * (`roleOf` in state/settings.ts). */
+export interface WorkspaceListItem extends WorkspaceSummary {
+  name?: string
+  /** Who owns it (a principal). */
+  owner_principal?: string | null
+  /** The last accepted Commit (else the creation), UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`. */
+  updated_at?: string | null
+  /** When the caller last opened it (a Workspace session started, `ws.get_info { record_open }`), or null. */
+  opened_at?: string | null
+  /** Reachable without being named: `anonymous` (anonymous access with something granted to `@guest`) or `published` by path. */
+  public?: boolean
+  anonymous?: boolean
+  published?: boolean
+  /** Live presentation sessions of it as courseware. */
+  live_sessions?: number
+  /** The card's cover (the Workspace's settings, Q37), or null: the card draws its placeholder. */
+  cover?: HomeCover | null
+}
+
+/** A home card's cover (UI 框架 PRD §9.2, Q37): the picture the Workspace's managers chose in its settings (a public
+ * class: its courseware's). The bytes are the asset route's, `asset/<workspace_id>/<object_id>`. */
+export interface HomeCover { workspace_id: string; object_id: string; media_type: string }
+
+/** The Workspace's cover as its settings hold it (`config.cover` on the root): an uploaded picture, its media type and
+ * size from the verified bytes. */
+export type WorkspaceCover = { object_id: string; media_type: string; size: number }
+
+/** The Workspace's shared settings (UI 框架 PRD §4.6, K4): the root's `config`, read in `ws.get_info`, written by
+ * `manage`. The keys are the client's — `toolbar` is the shared toolbar layer of the Workspace, `fonts` the families a
+ * print maps `sans` / `serif` / `mono` to (打印 TODO Q17, read through `@print/fonts` `readFontSettings`) — but
+ * `cover`, which the service checks (an uploaded picture, Q37). */
+export interface WorkspaceSettings { toolbar?: Json; cover?: WorkspaceCover; fonts?: Record<string, string>; [key: string]: Json | undefined }
+
+/** The caller's own preferences across Workspaces (`user.get_prefs` / `user.set_prefs`, K4): top-level keys merge. */
+export interface UserPrefsRead { prefs: Record<string, Json>; revision: number; updated_at: string | null }
+
 export interface WorkspaceInfo extends WorkspaceSummary {
   format_version: string
   protocol_version: string
   head_commit_id: string | null
-  forked_from: unknown
+  cloned_from: ClonedFrom | null
   /** The show presenting this Workspace (第三期规划 §8.1): document writes are closed until it ends. */
   show_lock?: ShowLockInfo | null
   /** `show` for the temporary clone of a show (§8.3). */
   purpose?: string | null
   /** Who the service takes the caller for (a guest of a public link only learns its principal here). */
   principal?: string
-  /** Whose AICC the wish blocks use (AI Center Quota PRD §3.3). */
-  wish_aicc_mode?: WishAiccMode
-  /** Where wish runs execute by default and whether the transitional in-service executor may be chosen (内核架构改进 D14). */
-  wish_execution?: { default: WishExecutionMode; service: boolean }
-  /** The owner's hosted execution configuration (D22): an Agent runs tasks for collaborators with `run`. */
-  hosted_exec?: HostedExecConfig
+  /** Where wish runs execute by default (内核架构改进 D14; 浏览器优先): this browser or the viewer's own Agent. */
+  wish_execution?: { default: WishExecutionMode }
   /** The Workspace's own origin for publication links (D21), `null` when the deployment has no host. */
   public_base?: string | null
   /** Bytes this Workspace's Sources fetched (D24). */
   traffic?: number
+  /** The permissions' revision (权限需求 R4): it moves with every entry, group, member, anonymous or binding change. */
+  acl_rev?: number
+  /** Anonymous access is on: `@guest` exists here (§4.2). */
+  anonymous?: boolean
+  /** Who the caller is judged as (an Agent nobody configured here: its owner, R16). */
+  judged_as?: string
+  /** The caller is the Workspace's owner. */
+  owner?: boolean
+  /** The Workspace's shared settings (the root's `config`, K4) and the version a conditional write expects. */
+  settings?: WorkspaceSettings
+  settings_rev?: number
 }
 
 /** Where a sourced entity's content comes from (内核架构改进 D12); such an entity is read-only for people and Blocks. */
@@ -75,13 +125,11 @@ export type SessionFeed = 'participants' | 'stage' | 'tasks' | 'my_responses' | 
 export interface Publication { entity_id: string; name: string; path: string; url?: string; reference: Reference; published_at: string; published_by: string; referrers: number; current?: boolean }
 export interface Referrer { referrer: { zone?: string | null; workspace_id?: string; entity_id?: string | null; principal?: string | null }; registered_at: string }
 
-/** The owner's hosted execution configuration (`ws.set_hosted_exec`, D22). */
-export interface HostedExecConfig { enabled: boolean; agent_id?: string; allowed_wishes?: string[]; triggerers?: string[]; limits?: Record<string, Json>; digest?: string }
+/** Where a wish run executes (内核架构改进 §9, D14; 浏览器优先): this browser, or the starter's own Agent (2026-11-16). */
+export type WishExecutionMode = 'local' | 'hosted'
 
-/** Where a wish run executes (内核架构改进 §9, D14): the service (transitional), this browser, or the owner's Agent. */
-export type WishExecutionMode = 'service' | 'local' | 'hosted'
-
-export type WishAiccMode = 'workspace_owner' | 'current_user'
+/** Whose AICC a run uses: the starter's own, wherever it executes. */
+export type WishAiccMode = 'current_user'
 /** Whose AICC a run uses, fixed when it was accepted: `user_id` pays, `operator_id` started it. */
 export interface WishRunAicc { mode: WishAiccMode; user_id: string; operator_id?: string }
 
@@ -94,6 +142,7 @@ export type TypeId =
   | 'buckyos.table-source'
   | 'buckyos.cell'
   | 'buckyos.asset-ref'
+  | 'buckyos.dir'
   | 'buckyos.annotation'
   | 'buckyos.wish'
   | 'buckyos.block-def'
@@ -133,7 +182,6 @@ export interface DerivedRecord {
   executor: string
   inputs: DerivedInput[]
   generated_rev: number
-  simulated?: boolean
   at?: string
   output_mode?: 'overwrite' | 'new'
   group?: string
@@ -146,7 +194,7 @@ export interface DerivedRecord {
   program_digest?: string
   model_judgment?: boolean
   external_data?: boolean
-  mode?: 'generate' | 'program'
+  mode?: 'code' | 'run'
 }
 
 export interface LockHolder {
@@ -167,6 +215,11 @@ export interface EntityEnvelope {
   layout?: { mode: 'flow' | 'free' | 'tree' } | null
   /** A control's attributes (outline only; a Surface's `config` is not projected). */
   config?: Record<string, Json> | null
+  /** A data control's or a composite's bound data, by binding name: one id, or a list for a `many` binding (控件机制 TODO
+   * G2; 控件 on_bind TODO Q2). */
+  bindings?: Record<string, string | string[]> | null
+  /** The business schema an entity follows (`buckyos.todo@1`, `buckyos.calendar@1`). */
+  schema_id?: string | null
   /** Folders: `canvas_content` (the area), `surface_content` (one Surface's folder) or `shows` (presentation paths). */
   system?: 'canvas_content' | 'surface_content' | 'shows' | null
   /** A content folder's Surface; a Surface's content folder. */
@@ -182,6 +235,10 @@ export interface EntityEnvelope {
   ink_stroke?: string | null
   parent_id?: string
   order_key?: string
+  /** A path node of the outline: the caller cannot read it and sees it only because something below it is readable
+   * (UI 框架 PRD §4.1.1). It has only its id, type, a container's kind, parent and order; `OutlineModel` keeps it out of
+   * `get`, `all` and `childrenOf` — the trees reach it through `node` and `treeChildrenOf`. */
+  path_only?: boolean
   placement?: StoredPlacement
   scope: string
   deleted: boolean
@@ -220,6 +277,8 @@ export interface EntityEnvelope {
   deps?: string[] | null
   composition?: Composition | null
   config_defaults?: Record<string, Json> | null
+  /** A composite definition's declared actions (manifest 4, 控件机制 TODO H2). */
+  def_actions?: Json[] | null
   /** The events a definition declares and the events an instance binds (扩展控件 P2; outline only). */
   def_events?: string[] | null
   on_events?: string[] | null
@@ -269,7 +328,7 @@ export interface Reference {
   workspace_id?: string
 }
 
-export type FieldType = 'text' | 'number' | 'decimal' | 'date' | 'datetime' | 'boolean' | 'select' | 'multi_select' | 'object_ref' | 'currency'
+export type FieldType = 'text' | 'number' | 'decimal' | 'date' | 'datetime' | 'boolean' | 'select' | 'multi_select' | 'object_ref' | 'currency' | 'json'
 
 export interface OptionDef { option_id: string; label: string }
 
@@ -287,6 +346,12 @@ export interface FieldDef {
   description?: string
   maintained_by?: 'human' | 'program'
   order_key?: string
+  /** A text field the service fills with the submitter (one per table; each person writes only their own record, G20). */
+  submitter?: boolean
+  /** A `multi_select` holds at most this many options (G20). */
+  max_items?: number
+  /** What a new record holds when its insert does not give this field (UI 框架 PRD §7.3); the service fills it in. */
+  default?: Json
   def_rev: number
   type_rev: number
   values_rev: number
@@ -354,18 +419,21 @@ export interface CellPayload {
   slot?: string
 }
 
-export type WishExecutor = 'mock' | 'xllm' | 'agent-work-session'
+export type WishExecutor = 'xllm' | 'agent-work-session'
 /** A wish input: what is read (`entity`, a saved table view, a table query) and the stable name programs use (许愿格 §4.1). */
 export interface WishInput { entity_id: string; selector?: Selector; version?: { mode: 'follow' | 'fixed'; rev?: number; hash?: string }; label?: string; name?: string; appended_by?: string }
 export type WishResultType = 'richtext' | 'record' | 'table' | 'table_columns' | 'image' | 'asset' | 'html' | 'video' | 'control'
 export interface WishView { renderer: string; config?: Record<string, Json>; title?: string; size?: { w: number; h: number } }
 export interface WishContractResult { name: string; type: WishResultType; title?: string; approach: 'program' | 'direct'; key?: string[]; target?: string; views?: WishView[]; description?: string; fields?: string[] }
-export interface WishCheckDef { id: string; kind: 'program' | 'review'; text: string }
+/** An acceptance check (许愿格交互升级 D2): the analysis gives a program check its level — `error` fails the run, `warning`
+ * is written in front of the run's record; a review check may go without one. */
+export interface WishCheckDef { id: string; kind: 'program' | 'review'; level?: 'error' | 'warning'; text: string }
 export interface WishBlocker { code: string; message: string; input_label?: string; candidates?: string[] }
-/** `wish.analysis.v2` as persisted (handles already bound to ids; `basis.digest` computed by the core). */
+/** `wish.analysis.v2` as persisted (handles already bound to ids; `basis.digest` computed by the core); only a ready
+ * analysis is written (an analysis that misses inputs fails, 许愿格交互升级 §3.3). */
 export interface WishAnalysis {
   schema_version: 'wish.analysis.v2'
-  status: 'ready' | 'needs_input'
+  status: 'ready'
   prompt: string
   context_prompt: string
   output_contract: { results: WishContractResult[]; placement?: string; dynamic?: boolean }
@@ -379,7 +447,7 @@ export interface WishAnalysis {
   summary?: string
 }
 export interface WishRefinement { text: string; at?: string; run_id?: string }
-export interface WishProgram { language: 'js'; api_version: number; source: string; digest: string; produces: string[]; run_id?: string; edited_by?: string }
+export interface WishProgram { language: 'js'; api_version: number; source: string; digest: string; manifest?: Json; produces: string[]; run_id?: string; edited_by?: string }
 export interface WishResultBinding { type: WishResultType; entity_id: string; approach?: 'program' | 'direct'; title?: string; cells?: string[]; key?: string[]; fields?: Record<string, string>; def_id?: string; target?: string }
 export interface WishCheckSummary { passed: number; failed: number; not_run: number; review: number; items: { id: string; kind: string; status: string; text: string }[] }
 export interface WishLastRun {
@@ -387,20 +455,83 @@ export interface WishLastRun {
   state: 'succeeded' | 'failed' | 'cancelled'
   at?: string
   seq?: number
-  mode?: 'generate' | 'program'
+  mode?: 'code' | 'run'
   executor?: string
   read_set?: DerivedInput[]
   produced?: string[]
   /** Results of the previous group that were not generated this time (not deleted, §10.2). */
   missing?: string[]
   group?: string
-  simulated?: boolean
   config_digest?: string
   program_digest?: string
   checks?: WishCheckSummary
   result_bindings?: { group?: string; folder?: string; results: Record<string, WishResultBinding> }
   error?: string
 }
+
+/** What a stage's model loop or a macro's AI calls used (许愿格交互升级 §2.9): the model actually answering, tokens in and
+ * out, calls. */
+export interface WishUsage { model?: string; input_tokens?: number; output_tokens?: number; calls?: number }
+export type WishRecordAction = 'analyze' | 'code' | 'repair' | 'run' | 'rollback'
+/** One entry of a wish's history (许愿格交互升级 §2.2, §3.4): one stage run, or one rollback. Small facts inline, the large
+ * contents (the request, the task contract, the macro, its log) as asset objects of the Workspace; the text a reader
+ * sees is made from these in the reader's language (`ui/wish/records.ts`). Written by the service only. */
+/** A warning the service gives a run record, coded (许愿格交互升级 §2.2); see `warningText`. */
+export interface WishRecordNotice { code: string; [param: string]: Json }
+export type WishRecordWarning = string | WishRecordNotice
+
+export interface WishRecord {
+  /** The run id of a stage run; `rb_…` for a rollback. */
+  id: string
+  stage: WishStage
+  action: WishRecordAction
+  ok: boolean
+  /** When the run started (its `created_at`). */
+  at: string
+  ended_at: string
+  duration_ms: number
+  by: string
+  aicc?: { mode: WishAiccMode; user_id: string }
+  /** Running: only when the macro used AI. */
+  usage?: WishUsage
+  /** `last_trial_error` / `said`: a coding that stopped without `finish` (`CODING_UNFINISHED`) — why its last trial run failed, and
+   * what the model said when it stopped. */
+  error?: { code: string; sub_code?: string; detail?: string; missing_inputs?: { label?: string; message: string; candidates?: string[]; wanted?: ExternalDataWanted }[]; last_trial_error?: string; said?: string }
+  /** The important ones first: failed warning checks, overwritten manual edits, deleted rows and fields, the model's warnings.
+   * The service's own are coded (`{ code, …params }`, said in the reader's language); the model's are its text. */
+  warnings: WishRecordWarning[]
+  checks?: { id: string; kind: 'program' | 'review'; level?: 'error' | 'warning'; status: 'passed' | 'failed' | 'not_run' | 'review'; text: string }[]
+  /** The material of the summary: analyze `{ text?, results, checks }`, code `{ text?, trial: { results, checks_passed,
+   * checks_total } }`, run `{ created, updated }`, rollback `{ of }`. */
+  summary: {
+    text?: string
+    results?: number
+    checks?: number
+    trial?: { results?: number; checks_passed?: number; checks_total?: number }
+    created?: number
+    updated?: number
+    of?: string
+    [key: string]: Json | undefined
+  }
+  basis: { analysis?: string; program?: string; program_record?: string }
+  inputs: { entity_id: string; name?: string; label?: string; version?: { rev?: number; hash?: string } }[]
+  outputs: {
+    analysis?: { results: number; checks: number }
+    program?: { digest: string; ai: boolean }
+    results?: { name: string; title?: string; type: WishResultType; entity_id: string; cells?: string[]; action: 'create' | 'update' }[]
+  }
+  /** Asset objects: the request as it was, the task contract (`{ analysis, inputs }`), the program value and its source, the
+   * macro's log (readable with `update` on the wish only). */
+  objects: { prompt?: string; analysis?: string; program?: string; source?: string; log?: string }
+  commit_id?: string
+  /** On a record that was rolled back. */
+  rolled_back?: { id: string; by: string; at: string }
+  /** On a rollback: the record it rolled back. */
+  rollback_of?: string
+}
+/** A wish's history (§2.2): each stage's records newest first (at most 20 each), and how many times a run built results. */
+export interface WishHistory { analyze: WishRecord[]; code: WishRecord[]; run: WishRecord[]; results_count: number }
+
 export interface WishPayload {
   title?: string
   prompt: string
@@ -414,12 +545,15 @@ export interface WishPayload {
   executor_config?: Record<string, Json>
   program?: WishProgram
   last_run?: WishLastRun
+  history?: WishHistory
 }
 
-// ---- wish runs on the service (proc.* with wish.xllm@1 / wish.mock@1)
+// ---- wish runs on the service (proc.* with wish.xllm@1)
 
-export type WishStage = 'analyze' | 'execute' | 'rerun_program' | 'repair_program'
-export type WishRunState = 'queued' | 'snapshotting' | 'running' | 'validating' | 'waiting_confirmation' | 'applying' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | 'conflict' | 'rejected'
+/** The three stages of a wish (AI Native 第一期 §2.1): the task contract, the macro (coding and its trial run), running the macro. */
+export type WishStage = 'analyze' | 'code' | 'run'
+/** A stage writes its product itself when it ends (许愿格交互升级 §3.3): nothing waits for a confirmation. */
+export type WishRunState = 'queued' | 'snapshotting' | 'running' | 'validating' | 'applying' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export interface WishRunProgress {
   phase?: string
   activity?: string
@@ -432,94 +566,63 @@ export interface WishRunProgress {
   llm_map?: { calls: number; cached: number; items: number }
   warning?: string
 }
-export interface WishResult {
-  name: string
-  type: WishResultType
-  title?: string
-  approach?: 'program' | 'direct'
-  views?: WishView[]
-  table?: { fields: { name: string; type?: string; options?: string[] }[]; key: string[]; rows: Record<string, Json>[] }
-  columns?: { target: string; target_id: string; fields: { name: string; type?: string }[]; values: Record<string, Record<string, Json>> }
-  record?: { properties: { name: string; type: string }[]; props: Record<string, Json> }
-  markdown?: string
-  file?: { media_type: string; size: number; image?: { width: number; height: number }; object_id?: string; file_name?: string }
-  html?: { html: string; css?: string; js?: string; bindings?: Record<string, string> }
-  /** A Block-control instance (a mind map, 脑图 TODO M3): its tree; `under` names the input node it grows. */
-  control?: { kind: string; config?: Record<string, Json>; nodes: { text: string; children: unknown[] }[]; under?: string }
-}
-export interface WishCheckResult { id: string; kind: 'program' | 'review'; text: string; status: 'passed' | 'failed' | 'not_run' | 'review'; detail?: Json; self_assessment?: Json }
-export interface WishCandidate {
-  results?: WishResult[]
-  facts?: Record<string, Json>
-  checks?: WishCheckResult[]
-  summary?: string
-  assumptions?: string[]
-  warnings?: string[]
-  review_notes?: Json[]
-  uncited_numbers?: { result: string; numbers: string[] }[]
-  external_data?: string[]
-  model_judgment?: string[]
-  refinements?: WishRefinement[]
-  program?: { digest: string; object_id?: string; produces?: string[] } | null
-  appended_inputs?: WishInput[]
-  mode?: 'generate' | 'program'
-  simulated?: boolean
-  /** Analysis stage. */
-  analysis?: WishAnalysis
-  inputs?: WishInput[]
-}
-export interface WishPlanChange { kind: string; field?: string; count?: number; destructive?: boolean; from?: string; to?: string | number; type?: string }
-export interface WishPlanSummary {
-  kind?: 'analysis'
-  mode?: 'overwrite' | 'new'
-  simulated?: boolean
-  group?: { group_id: string; folder_id: string; surface_id: string | null; exists: boolean; rect: Placement | null; title: string }
-  results?: { name: string; type: WishResultType; title?: string; entity_id: string; action: 'create' | 'update' | 'unchanged' | 'keep_manual' | 'new_copy'; approach?: string; blocks?: number; reordered?: boolean }[]
-  missing?: { name: string; entity_id: string }[]
-  manual?: { name: string; entity_id: string; cells?: number; field_deleted?: string }[]
-  structure?: { name: string; entity_id: string; changes: WishPlanChange[]; rows_before?: number; rows_after?: number }[]
-  destructive?: boolean
-  appended_inputs?: WishInput[]
-  program?: { from: string | null; to: string } | null
-  refinements?: WishRefinement[]
-  checks?: WishCheckResult[]
-  failed_checks?: number
-  problems: string[]
-  operations?: number
-  status?: string
-  inputs?: WishInput[]
-}
 export interface WishRunView {
   run_id: string
-  program: 'wish.xllm@1' | 'wish.mock@1'
+  program: 'wish.xllm@1'
   state: WishRunState
   stage: WishStage
   wish_id: string
   params: Record<string, Json>
-  simulated: boolean
   created_at: string
   updated_at: string
   warnings?: Json
   error?: (ServiceError & { data?: Json }) | null
-  usage?: Json
+  usage?: WishUsage | null
   progress?: WishRunProgress | null
-  candidate?: WishCandidate | null
-  preview?: { plan_digest: string; ready: boolean; summary: WishPlanSummary }
-  applied?: { plan_digest: string; status: 'accepted' | 'conflict' | 'rejected'; commit: CommitResult }
+  /** The stage's commit, once it ended and wrote (into the undo stack of the window that started it). */
+  applied?: { status: 'accepted'; commit: CommitResult }
+  /** The record this run wrote into the wish's history. */
+  record?: WishRecord | null
   parent_run_id?: string | null
   feedback?: string | null
   program_log?: string | null
   aicc?: WishRunAicc | null
   /** The execution context the run bound (§9.6). */
   context?: Record<string, Json> | null
-  /** Hosted runs: how the Agent was reached (`unavailable` carries the claim token for whoever hands it on). */
-  dispatch?: { status: string; claim_token?: string; detail?: string } | null
+  /** Hosted runs: how the starter's Agent was reached; its goal and detail only for the starter and the Workspace's managers. */
+  dispatch?: { status: string; at?: string; agent_id?: string; detail?: string } | null
   execution?: { mode: WishExecutionMode; attempt: number; lease_until?: string | null; executor?: Json }
   /** Once, to the browser that started a local run: what claims it. */
   claim_token?: string
 }
+/** What a rollback would lose (许愿格交互升级 §2.1): later edits of what it puts back; entities the caller cannot read only count. */
+export interface WishRollbackLoss { entity_id: string; title?: string; type_id?: string; what: 'edited' | 'deleted' }
+/** `proc.rollback`: asks first when later changes would be lost, else one commit and the new `rollback` record. */
+export type WishRollbackResult =
+  | { ok: true; status: 'needs_confirm'; lost: WishRollbackLoss[]; hidden_lost?: number }
+  | { ok: true; status: 'accepted'; commit: CommitResult; record: WishRecord }
 
 /** What `proc.claim` opens for an executor outside the service (T3-4): a model stage, or the program to re-run. */
+/** The limits a stage's executor works under (浏览器优先 T1-4, 第一期 §2.3–§2.4); a macro declares less. */
+export interface WishBudget {
+  iterations: number
+  program_timeout_secs: number
+  max_output_tokens: number
+  map_model: string
+  complete_model: string
+  llm_map_max_items: number
+  ai_max_calls: number
+  ai_max_tokens: number
+  sql_max_calls: number
+  image_model: string
+  video_model: string
+  image_max_calls: number
+  video_max_calls: number
+  media_timeout_secs: number
+}
+/** What an analysis said a task needs from outside the workspace (`NEEDS_EXTERNAL_DATA`, 余下任务 B2-1). */
+export interface ExternalDataWanted { meaning?: string; origin?: string; freshness?: string | { max_age_s?: number }; fields?: Array<string | { name?: string; field_id?: string }> }
+
 export interface WishStageBrief {
   kind: 'model' | 'program'
   stage: WishStage
@@ -528,11 +631,26 @@ export interface WishStageBrief {
   tools?: { name: string; description: string; parameters: Json }[]
   model?: string
   iterations?: number
+  /** The macro to start from (coding) or to run (running). */
   source?: string | null
+  /** Running: the stored macro's manifest. */
+  manifest?: Json
+  budget?: WishBudget
 }
 export interface WishClaim { run_id: string; attempt: number; run_token: string; lease_until: string; lease_ms: number; stage?: WishStageBrief }
-export interface WishToolAnswer { status: 'ok' | 'error'; text?: string; map?: Json }
-export interface WishChoices { results?: Record<string, 'keep' | 'replace' | 'new'>; confirm_structure?: boolean }
+export interface WishToolAnswer { status: 'ok' | 'error'; text?: string; code?: string; [key: string]: Json | undefined }
+/** `proc.files`: the stage directory, and the stage's budget and stored manifest. */
+export interface WishStageFiles { files: Record<string, { text?: string; base64?: string; skipped?: string }>; stage?: { budget?: WishBudget; manifest?: Json } }
+/** Why a wish's macro cannot run on its inputs as they are now (第一期 §2.7). */
+export interface NeedsCodingReason { code: 'no_macro' | 'api_version' | 'input_unbound' | 'input_changed' | 'input_missing' | 'field_deleted' | 'field_type_changed' | 'program_failed'; input?: string; field_id?: string; name?: string; from?: string; to?: string; run_code?: string }
+/** The one main state of a wish and its next action (PRD §5.8; core `main_status`). */
+export interface WishMainStatus {
+  main: 'needs_analysis' | 'needs_coding' | 'waiting_data' | 'no_access' | 'cannot_run' | 'in_progress' | 'stale' | 'current'
+  next_action: 'analyze' | 'code' | 'view_inputs' | 'fix' | 'cancel' | 'run' | 'none'
+  reasons: Json[]
+  /** The applied results are out of date, whatever the main state says. */
+  stale: boolean
+}
 
 export interface BlockDefPayload {
   def_id: string
@@ -545,6 +663,8 @@ export interface BlockDefPayload {
   default_size?: { w: number; h: number }
   declarative?: Record<string, Json>
   html?: { html: string; css?: string; js?: string; api_version?: number }
+  /** Who vouched for the HTML code (权限需求 R37): written by the service when a holder of `manage` writes or confirms it. */
+  trusted?: boolean | { by: string; rev: number }
   config_schema?: Json
   actions?: Json
   inspector?: Json
@@ -561,6 +681,10 @@ export interface BlockDefPayload {
   composition?: Composition
   /** P2 (Q26): the events the control raises (a composite's re-raise a child's, `from`). */
   events?: Record<string, ControlEvent>
+  /** (manifest 5) A composite's declared steps when placed (控件 on_bind TODO §2.6); an HTML control's `"script"` — its
+   * behavior.js handles `aiws.on('bind')` / `aiws.on('init_control')` (§2.9, host API 5). */
+  on_bind?: OnBindStep[] | 'script'
+  on_init_control?: OnInitStep[] | 'script'
 }
 
 /** An event a control declares (`component.json` `events`, a composite's `composition.json` `events`). */
@@ -568,7 +692,9 @@ export interface ControlEvent {
   title?: string
   description?: string
   params?: Record<string, { type: 'string' | 'number' | 'boolean' | 'object' | 'entity'; required?: boolean; description?: string }>
-  from?: { slot: string; event: string }
+  from?: { slot?: string; event?: string; projection?: string; role?: string }
+  /** (a composite's, manifest 4) what the event does when the instance binds no handler of its own. */
+  on?: EventHandler | EventHandler[]
 }
 
 /** One handler of an instance's `on` (Q26). Strings may hold `{{event.<param>}}` / `{{config.<key>}}`. */
@@ -580,7 +706,7 @@ export type EventHandler =
 export type EventBindings = Record<string, EventHandler | EventHandler[]>
 
 /** A named data input a control declares (its instances bind it in the Cell's `bindings`). */
-export interface ControlBinding { accepts?: string[]; required?: boolean; title?: string; description?: string }
+export interface ControlBinding { accepts?: string[]; required?: boolean; many?: boolean; schema_id?: string; title?: string; description?: string }
 
 /** One problem of a control's source (`ext.build`'s `BUILD_FAILED.data.diagnostics`). */
 export interface BuildDiagnostic { file: string; line?: number; col?: number; severity: 'error' | 'warning'; message: string; code?: string; instances?: { entity_id: string; title?: string | null }[]; dependents?: { ident: string; def_entity_id: string }[] }
@@ -665,7 +791,6 @@ export interface FreshnessInfo {
   wish_id?: string | null
   run_id?: string | null
   executor?: string | null
-  simulated?: boolean
   /** Generated under another configuration than the wish has now. */
   config_changed?: boolean
   approach?: 'program' | 'direct' | null
@@ -675,14 +800,14 @@ export interface FreshnessInfo {
   /** Wishes only. */
   wish?: boolean
   needs_analysis?: boolean
-  analysis_status?: 'ready' | 'needs_input' | null
+  analysis_status?: 'ready' | null
   input_problems?: { entity_id: string; reason: string }[]
   last_run?: WishLastRun | null
   produced?: string[]
   /** The current result group, per logical result. */
   results?: { name: string; type: string; entity_id?: string; approach?: string | null; status: FreshnessStatus; manual_modified?: boolean; external_data?: boolean; model_judgment?: boolean }[]
-  /** Program results are current but written ones are not: the text needs regenerating. */
-  direct_stale?: boolean
+  /** The stored macro does not fit its inputs as they are now: code the wish again (第一期 §2.7). */
+  needs_coding?: { reasons: NeedsCodingReason[] } | null
   checks?: WishCheckSummary | null
   error?: ServiceError
 }
@@ -716,7 +841,8 @@ export interface VersionInfo {
   accepted_at?: string | null
 }
 
-export interface Subject { subject: string; kind: 'user' | 'agent' | string }
+/** A principal or member spec `ws.list_subjects` offers: a Zone user, an Agent, an External DID, a system user group (`group:<id>`, with its `name`). */
+export interface Subject { subject: string; kind: 'user' | 'agent' | 'external' | 'group' | string; name?: string }
 
 export interface KeyedContent<P> { payload: P; key_revs: Record<string, number>; diagnostics?: Diagnostic[] }
 
@@ -781,6 +907,10 @@ export interface QueryParams {
   limit?: number
   cursor?: string
   consistency?: 'snapshot' | 'best_effort'
+  /** Counts per value of a field (a `multi_select` counts each option once; 控件机制 TODO G21). */
+  group?: string
+  group_order?: 'count_desc'
+  group_limit?: number
 }
 
 export interface QueryPage {
@@ -792,6 +922,26 @@ export interface QueryPage {
   source_id: string
   diagnostics?: Diagnostic[]
   data_mode?: string
+  /** With `group`: the counts per value. */
+  groups?: { key: string; count: number }[]
+}
+
+/** `doc.query { sql }` (核心 API 调整 §3.4): one SELECT over the logical tables. */
+export interface SqlParams {
+  sql: string
+  params?: Json[]
+  /** `{ alias: path | entity_id }`: the query names these tables by these aliases (and only these). */
+  tables?: Record<string, string>
+  max_rows?: number
+  /** The head the caller's own state is at: a different head is `SNAPSHOT_EXPIRED` / `HEAD_MISMATCH`. */
+  expect_head?: { epoch: string; seq: number }
+}
+export interface SqlResult {
+  columns: string[]
+  rows: Json[][]
+  truncated: boolean
+  read: { table: string; entity_id: string; path: string; content_rev: number | null }[]
+  head_seq: number
 }
 
 export interface CollabState {
@@ -880,8 +1030,7 @@ export interface LockInfo { entity_id: string; lock_id?: string; principal: stri
 export interface RunView {
   run_id: string
   program: string
-  state: 'planning' | 'running' | 'validating' | 'waiting_confirmation' | 'applying' | 'succeeded' | 'failed' | 'cancelled'
-  simulated: boolean
+  state: 'planning' | 'running' | 'validating' | 'applying' | 'succeeded' | 'failed' | 'cancelled'
   params: Record<string, Json>
   candidate: CommitRequest | null
   prepare: PrepareResult | null
@@ -895,32 +1044,82 @@ export interface RunView {
 export interface BucketDownload { bucket_id: string; key: string; version: number; obj_id: string; token: string }
 /** Where an upload is bound (`ndm` finalize `auto_bind`): the caller's own bucket of this service. */
 export interface BucketBinding { bucket_id: string; key: string }
-export interface StagedAsset { object_id: string; media_type: string; size: number; bucket_id: string; key: string; version: number }
+export interface StagedAsset { object_id: string; media_type: string; size: number; bucket_id: string; key: string; version: number; image?: { width: number; height: number } }
 
 export interface ExportResult { export_id: string; download: BucketDownload; manifest: { export_mode: string; content_root: string; self_contained: boolean; missing: unknown[]; excluded_entities: number; [key: string]: unknown } }
 
-/** `via_entry`: the share entry whose join wrote the row. Subjects: a principal (user id, External DID), `public`,
- * `*` (unrestricted accounts), `group:<id>`, `contact:<owner_did>#<tag>`. */
-export interface Grant { subject: string; scope_entity_id: string | null; capabilities: Capability[]; via_entry?: string | null }
-
-/** A share entry (hybrid SSO contract §8.3): its id names the workspace (`<workspace_id>~se_…`); times are unix seconds. */
+/** A share entry (hybrid SSO contract §8.3, 权限需求 R8): its id names the workspace (`<workspace_id>~se_…`); a visitor
+ * joins `group_id`; times are unix seconds. `joined`: how many came in through it (`ws.list_entries`). */
 export interface ShareEntry {
   entry_id: string
   workspace_id: string
-  scope_entity_id: string | null
-  capabilities: Capability[]
+  group_id: string
   methods: { guest: boolean; password: boolean; self_register: boolean; did_login: boolean }
   state: 'active' | 'closed' | 'expired'
   expires_at: number | null
+  max_joins: number | null
   created_by: string
   created_at: number
+  joined?: number
 }
 
-/** `ws.join_entry`: what the caller now holds through the entry — a grant of its own (`granted`), or, for an entry open
- * to guests that does not admit its sign-in method, the entry's access as anyone has it (no grant, ends with the entry). */
-export interface EntryJoin { workspace_id: string; entry_id: string; scope_entity_id: string | null; capabilities: Capability[]; joined: boolean; granted: boolean; path: string }
-/** `complete`: the caller is a manager and saw every row; otherwise only the rows that apply to them. */
-export interface GrantList { grants: Grant[]; complete: boolean; owner: string | null; principal: string }
+/** `ws.join_entry`: the caller is now a member of the entry's group (`joined` false: it already was). */
+export interface EntryJoin { workspace_id: string; entry_id: string; group_id: string; joined: boolean; path: string }
+
+/** One change of `acl.set`: the subject's entry on the resource (a path or an entity id; both lists empty removes it). */
+export interface AclChange { subject: string; resource?: string; allow?: Capability[]; deny?: Capability[] }
+/** How the service names a subject (权限需求 §4.2): a single caller, a logical group, a fixed group, a publication. */
+export type AclSubjectKind = 'single' | 'group' | 'fixed' | 'publication'
+/** A resource as the ACL interfaces return it: the entity (`null`: the Workspace, `/`) and its path for the caller. */
+export interface AclResource { entity_id: string | null; path: string }
+/** An entry as `acl.query { by: all }` lists it (`updated_*` for managers only). */
+export interface AclEntry { subject: string; kind: AclSubjectKind; resource: AclResource; allow: Capability[]; deny: Capability[]; updated_by?: string; updated_at?: string }
+/** `complete`: the caller is a manager and saw every entry; otherwise only those that apply to it. */
+export interface AclEntryList { entries: AclEntry[]; complete: boolean; owner: string | null; principal: string; anonymous: boolean }
+/** A member spec of a logical group: a principal, `group:<id>`, `contact:<did>#<tag>`, `*`; `via_entry` names the share entry it came through. */
+export interface AclMember { member: string; via_entry: string | null; added_by?: string; added_at?: string }
+export interface AclGroup { group_id: string; subject: string; title: string; description: string; member: boolean; created_by?: string; created_at?: string; members?: AclMember[] }
+/** Who a caller is judged as on one Workspace (§4.6 step 3). */
+export interface AclJudgment {
+  judged_as: string
+  owner: boolean
+  agent_as_owner: boolean
+  groups: { group_id: string; title: string | null; via: { member: string; via_entry: string | null }[] }[]
+  direct: boolean
+  guest: boolean
+  member: boolean
+}
+/** One entry of a subject along a resource's chain (`acl.query { by: entity }`); a refusal lists the allowances it overrides. */
+export interface AclEntityEntry {
+  resource: AclResource
+  source: 'direct' | 'inherited' | 'workspace'
+  allow: Capability[]
+  deny: Capability[]
+  overrides?: { subject: string; resource: AclResource; capabilities: Capability[] }[]
+}
+export interface AclEntitySubject { subject: string; kind: AclSubjectKind; principal?: string | null; title?: string; effective: Capability[]; entries: AclEntityEntry[]; members?: AclMember[] }
+/** A macro bound to a group with entries on the chain: whoever may change the macro (`editors`) holds the group's capabilities through it (Q10). */
+export interface AclMacroSource { wish: AclResource; group_id: string; mode: 'union' | 'intersection'; capabilities: Capability[]; editors: string[] }
+export interface AclEntityView { by: 'entity'; resource: AclResource; subjects: AclEntitySubject[]; macros: AclMacroSource[]; anonymous: boolean }
+export interface AclSubjectView {
+  by: 'subject'
+  subject: string
+  kind: AclSubjectKind
+  entries: { resource: AclResource; allow: Capability[]; deny: Capability[]; updated_by?: string; updated_at?: string }[]
+  group?: { group_id: string; title: string; description: string }
+  members?: AclMember[]
+  judgment?: AclJudgment
+}
+/** One capability of `acl.query { by: explain }`: the deciding entry, or none (the owner, or nothing mentions it). */
+export interface AclDecision {
+  capability: Capability
+  allowed: boolean
+  owner: boolean
+  decided_by: { subject: string; tier: 'single' | 'group' | 'everyone'; kind: 'allow' | 'deny'; resource: AclResource } | null
+}
+export interface AclExplain { by: 'explain'; principal: string; resource: AclResource; capabilities: AclDecision[]; effective: Capability[]; judgment: AclJudgment }
+/** One record of `acl.audit` (R19): who, judged as whom, when, what, before and after. */
+export interface AclAuditItem { seq: number; at: string; actor: string; judged_as: string | null; action: string; target: Json; before: Json; after: Json }
 
 export type WishPayloadRead = KeyedContent<WishPayload>
 export type BlockDefRead = KeyedContent<BlockDefPayload>
@@ -963,3 +1162,62 @@ export interface ShowNotes {
   stage?: StageSize | null
   steps: { id: string; kind: 'frame' | 'viewport'; target_id: string; title: string | null; enabled: boolean; missing: boolean; notes: string | null; caption: string | null }[]
 }
+
+// ---- presence and the work log (UI 框架 PRD §4.2, §4.5, K2, K3; service README “Presence and the work log”)
+
+/** One person who has the Workspace open (all its windows and devices together). `owner` / `groups` are present
+ * only about oneself, or to a reader who manages the Workspace (Q6). */
+export interface PresenceMember {
+  principal: string
+  self: boolean
+  guest: boolean
+  /** A guest's chosen name; null for an account (shown by its principal) or a guest that chose none. */
+  name: string | null
+  /** The canvas its most recently moved window shows, when the reader may read it. */
+  surface_id: string | null
+  devices: number
+  since: string
+  last_seen: string
+  owner?: boolean
+  groups?: { group_id: string; title: string }[]
+}
+export interface PresenceList { members: PresenceMember[]; interval_ms: number; ttl_ms: number; server_ms: number }
+
+export type WorkLogFilter = 'all' | 'mine' | 'automation'
+export type WorkLogKind = 'commit' | 'import' | 'run' | 'acl' | 'session' | 'show'
+export type WorkLogActorKind = 'person' | 'agent' | 'macro' | 'system'
+/** What “locate” needs: the entity, and the canvas it is on (itself, the one above a Block, the one whose content folder holds it). */
+export interface WorkLogTarget { entity_id: string; type_id?: string; name?: string | null; title?: string | null; kind?: string | null; deleted?: boolean; surface_id?: string | null }
+export interface WorkLogEntry {
+  /** Unique in the log: `c:<seq>`, `r:<run>:0|1`, `a:<seq>`, `s:<session>:0|1`, `h:<show>:0|1`. */
+  id: string
+  at: string
+  kind: WorkLogKind
+  /** run, session, show */
+  phase?: 'start' | 'end'
+  actor: string
+  actor_kind: WorkLogActorKind
+  mine: boolean
+  target: WorkLogTarget | null
+  // commits
+  /** The author's own text (in the author's language). */
+  message?: string | null
+  origin?: string
+  seq?: number
+  commit_id?: string
+  run_id?: string | null
+  undoes?: string | null
+  /** How many readable entities the Commit touched. */
+  targets?: number
+  // runs
+  stage?: WishStage
+  state?: WishRunState
+  error_code?: string | null
+  // permission changes
+  action?: string
+  detail?: Json
+  // sessions
+  title?: string | null
+  session_id?: string | null
+}
+export interface WorkLogPage { entries: WorkLogEntry[]; next_before: string | null; more: boolean }

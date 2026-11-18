@@ -239,7 +239,7 @@ pub(super) async fn apply_ui_reply(
             next.topic = r.topic;
             if !r.artifacts.is_empty() {
                 let id = crate::ids::h(&[run.run_id(), "structured_reply"]);
-                match super::reports::store_artifacts(sh, &id, &r.artifacts).await {
+                match super::reports::store_artifacts(sh, &id, &r.artifacts, crate::deliveries::DeliverySource::Reply).await {
                     Ok(a) => next.reply_artifacts = a,
                     Err(e) => {
                         log::warn!("session {}: reply artifacts not delivered: {e}", sh.dir.sid());
@@ -307,11 +307,13 @@ pub(super) fn decide_end(cfg: &SessionConfig, next: &mut Next, completed: u64) {
     }
 }
 
-/// Nobody answers the session: it has no queue, or its queue only brings it
-/// events, never an answer it waits for (a plan's forwarded user messages,
-/// a Todo's updates).
+/// Nobody answers the session: its queue takes no msg (or it has none), or
+/// only brings it events, never an answer it waits for (a plan's forwarded
+/// user messages, a Todo's updates).
 fn nobody_answers(cfg: &SessionConfig) -> bool {
-    cfg.channels.inputs.is_empty() || cfg.session.policy.wait_user_msg != WaitPolicy::Allowed
+    cfg.channels.inputs.is_empty()
+        || cfg.session.input_policy == InputPolicy::None
+        || cfg.session.policy.wait_user_msg != WaitPolicy::Allowed
 }
 
 /// A multi-Turn Work Session (simple Work Session TODO §3.3): every reply
@@ -521,7 +523,7 @@ pub(super) fn classify_done(
                 next.outcome = Some(Outcome::Failed);
                 next.turn_end = Some(TurnStatus::Failed);
                 next.error = Some(
-                    json!({"kind":"missing_end_report","message":"an explicit final report is required; this session has no input queue", "recoverable":false}),
+                    json!({"kind":"missing_end_report","message":"an explicit final report is required; nobody answers this session", "recoverable":false}),
                 );
             } else {
                 next.waiting = true;
@@ -979,8 +981,10 @@ pub(super) async fn commit_kept(
             marks.apply(l);
         }
     }
+    let mut closed = false;
     if let Some(status) = next.turn_end {
         if close_open_turn(sh, &mut s, &run_id, turn, status, next).await?.is_some() {
+            closed = true;
             bodies.push(WorklogBody::TurnEnded {
                 run_id: run_id.clone(),
                 turn,
@@ -996,7 +1000,9 @@ pub(super) async fn commit_kept(
     } else {
         RunState::Ready
     };
-    if next.waiting {
+    // A closed Activation lets go of what it started (TODO H0).
+    let let_go = closed && super::goal::is_goal(&s.config);
+    if next.waiting && !let_go {
         for task in &next.wait_tasks {
             if !s.state.watched_tasks.contains(task) {
                 s.state.watched_tasks.push(task.clone());
@@ -1195,11 +1201,13 @@ async fn commit_run_end(
             });
         }
     }
-    // The conversation's topic, from its structured reply (MEM §1120):
-    // hints are recalled by its tags from the next batch on, and other
-    // sessions see it through the registry. A reply without one keeps it.
+    // The conversation's topic, from its structured reply (MEM §1120): its
+    // tags are what the session keeps watching in Memory from the next
+    // batch on, until they decay; other sessions see it through the
+    // registry. A reply without one reinforces nothing (recall wiring TODO
+    // §3.3).
     if let Some(topic) = &next.topic {
-        s.state.topic = topic.clone();
+        super::memory_batch::apply_reply_topic(sh, s, topic);
     }
     // A plan that ends: what still runs of its TodoList ends stopped, and
     // where every Todo stands is recorded with the end (never a gate).
@@ -1363,10 +1371,15 @@ async fn commit_run_end(
     }
     // Background tasks the run started and that are still running (their
     // calls already returned): the session keeps following them after the
-    // run — until it finishes, which never re-opens for a task.
+    // run — until it finishes, which never re-opens for a task. A Goal
+    // Session lets go of them when the Activation closes (TODO H0): their
+    // ends would open new Activations nobody asked for, and a task id it only
+    // read about (a Work's) is not its own.
     if next.finished {
         s.state.watched_tasks.clear();
         s.state.pending_events.clear();
+    } else if turn_closed.is_some() && super::goal::is_goal(&s.config) {
+        s.state.watched_tasks.clear();
     } else {
         let resolver = sh.tasks.lock().expect("tasks").clone();
         if let Some(r) = resolver {

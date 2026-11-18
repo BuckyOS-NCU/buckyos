@@ -15,6 +15,7 @@ import { useAiwsText } from '../useAiwsText'
 import type { SessionChannel, Welcome } from './channel'
 import { SessionContext, useSession, type SessionUi } from './context'
 import { LiveStage } from './LiveStage'
+import { SessionReadersOf } from './ReadersOf'
 import { loadReplay, ReplayEngine, replaySession } from './replay'
 import { useSteps } from './steps'
 import type { SessionInfo, SessionPost } from './types'
@@ -102,6 +103,9 @@ export function ReplayRoom({ path, channel, welcome, roomState }: { store: Works
         {owner && state === 'ended' && <button type="button" className="is-primary" data-testid="aiws-session-save" onClick={() => { void save() }}>{t('aiworkspace.session.replay.save')}</button>}
         {owner && <button type="button" className="aiws-tool" aria-label={t('aiworkspace.session.replay.delete')} data-testid="aiws-session-delete" onClick={() => { void remove() }}><Trash2 size={16} /></button>}
       </div>
+      {(welcome.role === 'presenter' || welcome.role === 'owner') && state !== 'expired' && (
+        <div className="aiws-panel aiws-session-replay-access"><SessionReadersOf channel={channel} initial={welcome.session.readers_of} editable /></div>
+      )}
       {problem && <div className="aiws-error" role="alert" data-testid="aiws-session-replay-problem">{problem}</div>}
       {replay ? <ReplayPlayer engine={replay.engine} store={replay.store} path={path} live={live} channel={channel} timeRef={timeRef} />
         : !problem && <div className="aiws-session-center aiws-muted">{t('aiworkspace.session.replay.loading')}</div>}
@@ -116,6 +120,7 @@ function ReplayPlayer({ engine, store, path, live, channel, timeRef }: { engine:
   useSyncExternalStore(head.subscribe, head.snapshot)
   const steps = useSteps(store, path)
   const marks = useMemo(() => engine.marks(), [engine])
+  const spans = useMemo(() => engine.speakingSpans().filter((s) => s.principal !== live.info.presenter), [engine, live])
   const voice = useMemo(() => engine.voiceSegments(), [engine])
   const audio = useRef<HTMLAudioElement | null>(null)
   const [audioUrl, setAudioUrl] = useState<{ objectId: string; url: string } | null>(null)
@@ -166,6 +171,8 @@ function ReplayPlayer({ engine, store, path, live, channel, timeRef }: { engine:
             <input type="range" min={0} max={Math.max(1, engine.duration)} step={1} value={Math.round(now)} aria-label={t('aiworkspace.session.replay.position')} data-testid="aiws-session-replay-scrub"
               onChange={(event) => head.seek(Number(event.target.value))} />
             <div className="aiws-session-marks">
+              {spans.map((s, i) => <span key={`v${i}`} className="aiws-session-span" data-testid="aiws-session-speaking-span" title={t('aiworkspace.session.replay.spoke', { name: s.name || '…' })}
+                style={{ left: `${(s.start / Math.max(1, engine.duration)) * 100}%`, width: `${(Math.max(250, s.end - s.start) / Math.max(1, engine.duration)) * 100}%` }} />)}
               {marks.map((m, i) => <button key={i} type="button" className={`aiws-session-mark is-${m.kind}`} title={m.label} style={{ left: `${(m.t / Math.max(1, engine.duration)) * 100}%` }} onClick={() => head.seek(m.t)} />)}
             </div>
           </div>

@@ -1,6 +1,6 @@
 import { IconButton, useMediaQuery } from '@mui/material'
 import clsx from 'clsx'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ChevronRight,
   FolderPlus,
@@ -16,6 +16,7 @@ import {
   Upload as UploadIcon,
   X,
 } from 'lucide-react'
+import { ArchivePasswordDialog } from '../../components/preview/ArchivePasswordDialog'
 import { normalizeCyfsPath } from '../../components/preview/session'
 import type { ContentRef, PreviewSessionContext } from '../../components/preview/types'
 import { useI18n } from '../../i18n/provider'
@@ -49,18 +50,26 @@ import { DeleteDialog, ConflictDialog, BatchResults } from './dialogs/OperationD
 import type { DeleteRequest } from './dialogs/OperationDialogs'
 import { operationFeedback, useOperationFeedback } from './data/operationFeedback'
 import type { BatchTask } from './data/operationFeedback'
-import { MoveTargetDialog } from './dialogs/MoveTargetDialog'
 import { PermissionsDialog } from './dialogs/PermissionsDialog'
 import type { PermissionsRequest } from './dialogs/PermissionsDialog'
-import type { TargetRequest } from './dialogs/MoveTargetDialog'
 import { commandState } from './menu/commands'
-import { SHARE_DIALOG_PATH, useSystemDialog } from '../../sysdlg'
+import { SELECT_DIALOG_PATH, SHARE_DIALOG_PATH, useSystemDialog } from '../../sysdlg'
+import type { SelectedContent } from 'buckyos/content'
+import { classifyFileKind } from './data/fileKinds'
 import './filebrowser.css'
 import type { FileItem } from './data/FolderReader'
-import { installFileBrowserData } from './data/install'
+import { fileBrowserDataMode, installFileBrowserData } from './data/install'
 import { resolveReader } from './data/readerRegistry'
 import { collectionTitleSchema, entryNameSchema, validationFallback } from './data/schemas'
-import { useSidebarDevices, useSidebarDfs, useSidebarTopics } from './data/sidebarSources'
+import { dfsFolderChildren, forgetFolderChildren, useSidebarDfs, useSidebarHost, useSidebarTopics } from './data/sidebarSources'
+import { useMyHome, type MyHome } from './data/myHome'
+import { setIconSize, useIconSize, type IconSize } from './data/iconSize'
+import { useBrowseArchives } from './data/archiveBrowse'
+import { nfspClient } from './data/nfsp/client'
+import { hostChildren, hostContentRef, hostGrantExpiry, hostRootUrl, isHostUnlocked, isSudoRequired, lockHost, newHostSessionKey, onHostChanged, unlockHost } from './data/hostRealm'
+import { useSudoByPassword } from '../../components/sudo'
+import { isMockRuntime } from '../../runtime'
+import { mockHostRequestPassword } from './mock/host'
 import { toUiError } from './data/state'
 import { stashLocalInput, transferStore, type LocalUpload } from './data/transfers'
 import { describeUpload, droppedUploads, selectedUploads } from './data/localUploads'
@@ -74,6 +83,13 @@ import {
   displayPath,
   normalizeUrl,
   parentUrl,
+  parseDeviceUrl,
+  pathOfFileUri,
+  deviceUrl,
+  archiveRootOf,
+  archiveRootUrl,
+  archiveSplit,
+  isArchiveName,
 } from './data/urls'
 import type {
   BrowserTab,
@@ -90,11 +106,8 @@ installFileBrowserData()
 /** Stable empty list while topics are loading/errored — a fresh `[]` per render would re-run preview enrichment. */
 const NO_TOPICS: Topic[] = []
 
-/** Initial pane tabs — backend-independent defaults. */
-const DEFAULT_TABS: BrowserTab[] = [
-  { id: 'tab-home', title: 'Home', path: '/home' },
-  { id: 'tab-pictures', title: 'Pictures', path: '/home/Pictures' },
-]
+/** BuckyOS sudo for the computer tree lasts 30 minutes (Verify Hub's cap). */
+const HOST_SUDO_SECONDS = 30 * 60
 
 /** Session-local tab id (Volatile, §6.2) — module-level so the React
  * Compiler treats event-handler calls as opaque rather than render-impure. */
@@ -106,12 +119,31 @@ function itemOf(entry: FileEntry): FileItem {
   return { key: entry.id, entry }
 }
 
+/** The folder path file operations take: a DFS path, or the computer folder's device URL. */
+function writablePathOf(url: string): string | null {
+  return dfsPathOf(url) ?? (parseDeviceUrl(url) ? url : null)
+}
+
 type BrowserPane = ReturnType<typeof useBrowserPane>
 const FILE_DRAG_TYPE = 'application/x-buckyos-file-items'
 let draggedFiles: { token: string; pane: BrowserPane; items: FileItem[] } | null = null
 
-export function FileBrowserView({ windowId, openRequest }: { windowId?: string; openRequest?: { requestId: string; path: string } }) {
+type FileBrowserProps = { windowId?: string; openRequest?: { requestId: string; path: string } }
+
+/** Files opens on "My files" — the signed-in user's own home — once it is known, so `/home` never flashes. */
+export function FileBrowserView(props: FileBrowserProps) {
+  const home = useMyHome()
+  if (!home) return <div className="filebrowser flex h-full w-full items-center justify-center" style={{ background: 'var(--cp-bg)' }} data-testid="filebrowser-starting" aria-busy="true" />
+  return <FileBrowserWindow {...props} home={home} />
+}
+
+function FileBrowserWindow({ windowId, openRequest, home }: FileBrowserProps & { home: MyHome }) {
   const { t } = useI18n()
+  const homeUrl = normalizeUrl(home.path)
+  const myFilesLabel = t('filebrowser.sidebar.myFiles', 'My files')
+  // First open: one "My files" tab, or the folder the launch names (no extra history step).
+  const [initialTabs] = useState<BrowserTab[]>(() => [{ id: 'tab-home', title: myFilesLabel, path: openRequest?.path ?? home.path }])
+  const [openedAt] = useState(() => normalizeUrl(openRequest?.path ?? home.path))
   const isMobile = useMediaQuery('(max-width: 900px)')
   // Tailwind xl — the preview sidebar only exists at this width, so the
   // expand control in the status bar should follow the same gate.
@@ -128,8 +160,8 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
     return () => observer.disconnect()
   }, [isMobile])
 
-  const left = useBrowserPane(DEFAULT_TABS, windowId ? `${windowId}:left` : undefined)
-  const right = useBrowserPane([], windowId ? `${windowId}:right` : undefined)
+  const left = useBrowserPane(initialTabs, windowId ? `${windowId}:left` : undefined, home.path)
+  const right = useBrowserPane([], windowId ? `${windowId}:right` : undefined, home.path)
   const livePanes = useRef([left, right])
   useEffect(() => { livePanes.current = [left, right] }, [left, right])
   const [, refreshCopyCapability] = useState(0)
@@ -137,7 +169,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   const [closedTabs, setClosedTabs] = useState<BrowserTab[]>([])
   const [focusedSide, setFocusedSide] = useState<'left' | 'right'>('left')
   // A launch that names a folder (the Desktop folder, a folder on the desktop) shows it in the left pane.
-  const handledOpenRequest = useRef<string | null>(null)
+  const handledOpenRequest = useRef<string | null>(openRequest?.requestId ?? null)
   useEffect(() => {
     if (!openRequest || handledOpenRequest.current === openRequest.requestId) return
     handledOpenRequest.current = openRequest.requestId
@@ -145,7 +177,6 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
     setFocusedSide('left')
   }, [openRequest, left])
 
-  const [advancedMode, setAdvancedMode] = useState(false)
   const [listPreferences, setListPreferences] = useState<{ fullColumns: boolean; density: 'compact' | 'comfortable'; nameWidth: number }>(() => {
     try { return { fullColumns: false, density: 'compact', nameWidth: 260, ...JSON.parse(localStorage.getItem('files.listPreferences') ?? '{}') } }
     catch { return { fullColumns: false, density: 'compact', nameWidth: 260 } }
@@ -156,6 +187,8 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
     return next
   })
   const [toast, setToast] = useState<string | null>(null)
+  /** The root of an archive whose names are encrypted, waiting for its password. */
+  const [archivePassword, setArchivePassword] = useState<{ pane: BrowserPane; url: string; name: string } | null>(null)
   const [defaultApp, setDefaultApp] = useState<{ plans: HandlerPlan[]; request: Parameters<typeof openContent>[0]; name: string; size?: number; key: string; always: boolean; selector: string } | null>(null)
   const [previewCollapsed, setPreviewCollapsed] = useState(true)
   /** Toolbar clipboard, shared by both panes. */
@@ -165,7 +198,6 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(null)
   const { batchTask, conflictRequest } = useOperationFeedback()
   const { setBatchTask } = operationFeedback
-  const [targetRequest, setTargetRequest] = useState<TargetRequest | null>(null)
   const [permissionsRequest, setPermissionsRequest] = useState<PermissionsRequest | null>(null)
   const systemDialog = useSystemDialog()
   const busyRef = useRef(false)
@@ -175,8 +207,78 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   // Sidebar sources — separate async states so one failing source never
   // blanks the browser (§4.3).
   const dfsSource = useSidebarDfs()
-  const devicesSource = useSidebarDevices()
+  const hostSource = useSidebarHost()
   const topicsSource = useSidebarTopics()
+  const iconSize = useIconSize()
+  const browseArchivesOn = useBrowseArchives()
+  /** A `.zip` this server opens, with "Browse archives as folders" on, opens as a folder. */
+  const enterArchives = (item: FileItem) =>
+    browseArchivesOn && item.entry.kind !== 'folder' && item.entry.path.startsWith('/') && !archiveSplit(item.entry.path) &&
+    isArchiveName(item.entry.name) && nfspClient().raw.opensArchive(item.entry.name)
+
+  // ─── The computer (Desktop Lite): unlocked per window with BuckyOS sudo ───
+  const [hostKey] = useState(newHostSessionKey)
+  const [hostUnlocked, setHostUnlocked] = useState(false)
+  const hostInfo = hostSource.state.data ?? null
+  const requestSudo = useSudoByPassword()
+  const unlocking = useRef<Promise<boolean> | null>(null)
+  useEffect(() => onHostChanged(hostKey, () => setHostUnlocked(isHostUnlocked(hostKey))), [hostKey])
+  // Closing the window drops the token and the sudo session at once.
+  useEffect(() => () => lockHost(hostKey), [hostKey])
+  // The grant ends on time even when nothing is listing.
+  useEffect(() => {
+    if (!hostUnlocked) return
+    const expiry = hostGrantExpiry(hostKey)
+    if (!expiry) return
+    const timer = window.setTimeout(() => lockHost(hostKey), Math.max(0, expiry - Date.now()))
+    return () => window.clearTimeout(timer)
+  }, [hostKey, hostUnlocked])
+  /** Asks for the BuckyOS sudo password (once at a time); resolves true when the computer is unlocked. */
+  const unlockComputer = useCallback((): Promise<boolean> => {
+    if (unlocking.current) return unlocking.current
+    const attempt = (async () => {
+      const grant = await requestSudo({
+        aud: 'nfs-server',
+        expiresInSecs: HOST_SUDO_SECONDS,
+        title: t('filebrowser.host.unlockTitle', 'Unlock {{name}}', { name: hostInfo?.label ?? t('filebrowser.host.computer', 'this computer') }),
+        reason: t('filebrowser.host.unlockReason', 'See every folder on this computer.'),
+        confirmLabel: t('filebrowser.host.unlock', 'Unlock'),
+        // The sudo account is the user the file service knows.
+        ...(home.userId ? { username: home.userId } : {}),
+        ...(fileBrowserDataMode() === 'mock'
+          ? { username: 'devtest', appid: 'control-panel', requestPassword: mockHostRequestPassword }
+          : isMockRuntime() ? { appid: 'control-panel' } : {}),
+      }).catch(() => null)
+      if (!grant) return false
+      try {
+        await unlockHost(hostKey, { token: grant.sessionToken, expiresAtMs: grant.expiresAtMs })
+        return true
+      } catch {
+        return false
+      }
+    })().finally(() => { unlocking.current = null })
+    unlocking.current = attempt
+    return attempt
+  }, [requestSudo, hostKey, hostInfo, home.userId, t])
+  /** Runs an operation; a computer that relocked mid-way asks for sudo again and retries it once. */
+  const withHostRetry = useCallback(async <T,>(operation: () => Promise<T>): Promise<T> => {
+    try {
+      return await operation()
+    } catch (err) {
+      if (!isSudoRequired(err) || !await unlockComputer()) throw err
+      return operation()
+    }
+  }, [unlockComputer])
+  const hostRoot = hostRootUrl(hostKey)
+  /** Location input from the address bar: a pasted `file:` URI opens the computer folder it names. */
+  const toLocation = (input: string): string | null => {
+    const filePath = pathOfFileUri(input)
+    if (filePath === null) return input
+    if (!hostInfo) { showToast(t('filebrowser.host.unavailable', 'This computer\'s folders cannot be opened here')); return null }
+    return deviceUrl(hostKey, filePath)
+  }
+  const titledTabs = (tabs: BrowserTab[]) => tabs.map((tab) =>
+    tab.path === homeUrl ? { ...tab, title: myFilesLabel } : tab.path === hostRoot ? { ...tab, title: hostInfo?.label ?? tab.title } : tab)
   const topicList = topicsSource.state.data ?? NO_TOPICS
 
   // Live collection list (sidebar + "Add to Collection" submenu).
@@ -217,7 +319,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   }
 
   const handleNewTab = () => {
-    left.adoptTab({ id: newTabId(), title: 'Home', path: '/home' })
+    left.adoptTab({ id: newTabId(), title: myFilesLabel, path: home.path })
     setFocusedSide('left')
   }
 
@@ -292,15 +394,28 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
     left.navigate(url)
     setMobileSidebarOpen(false)
   }
+  /** Folders the computer's account cannot open stay closed (shown with a lock). */
+  const openable = (entry: FileEntry) => {
+    if (entry.accessLevel !== 'none' || !parseDeviceUrl(entry.path)) return true
+    showToast(t('filebrowser.host.noAccess', 'This computer account cannot open "{{name}}"', { name: entry.name }))
+    return false
+  }
 
   // ─── Preview App hand-off (PRD §14.1 / §14.4): Source + Session Context ───
   // Folder listings become a Container Context; views, collections and search
   // results hand over an explicit list of the loaded items instead.
 
-  const previewSourceOf = (item: FileItem): ContentRef => ({
-    kind: 'cyfs-path',
-    path: normalizeCyfsPath(item.entry.path),
-  })
+  const previewSourceOf = (item: FileItem): ContentRef =>
+    parseDeviceUrl(item.entry.path)
+      ? hostContentRef(item.entry)
+      : { kind: 'cyfs-path', path: normalizeCyfsPath(item.entry.path) }
+  /** Icon-view thumbnails read files in the Zone and on the unlocked computer. */
+  const thumbnailSource = useCallback((entry: FileEntry): ContentRef | null => {
+    // Members of an archive are decoded on read: no thumbnails for a whole listing of them.
+    if (entry.kind === 'folder' || entry.accessLevel === 'none' || archiveSplit(entry.path)) return null
+    if (entry.path.startsWith('/')) return { kind: 'cyfs-path', path: normalizeCyfsPath(entry.path) }
+    return parseDeviceUrl(entry.path) ? hostContentRef(entry) : null
+  }, [])
 
   const previewSessionOf = (pane: BrowserPane, item: FileItem): PreviewSessionContext => {
     const dfs = dfsPathOf(pane.currentUrl)
@@ -325,6 +440,10 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   }
 
   const handleOpenFile = (pane: BrowserPane, item: FileItem, opts?: { newWindow?: boolean }) => {
+    if (!opts?.newWindow && enterArchives(item)) {
+      pane.navigate(archiveRootUrl(item.entry.path))
+      return
+    }
     void openContent({
       source: previewSourceOf(item),
       session: previewSessionOf(pane, item),
@@ -362,7 +481,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
       return
     }
     if (item.entry.kind === 'folder') {
-      handleOpenFolder(item.entry.path)
+      if (openable(item.entry)) handleOpenFolder(item.entry.path)
       return
     }
     left.applySelection([item.key], new Map([[item.key, item]]))
@@ -442,7 +561,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   }
 
   const requestNewFolder = (pane: BrowserPane) => {
-    const parent = dfsPathOf(pane.currentUrl)
+    const parent = writablePathOf(pane.currentUrl)
     if (!parent || !pane.list.capabilities.acceptsContent) return
     setNamePrompt({
       title: t('filebrowser.actions.newFolder', 'New folder'),
@@ -451,14 +570,17 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
       schema: entryNameSchema,
       onSubmit: async (value) => {
         try {
-          if (await folderOps().nameExists(parent, value)) {
-            throw new Error(
-              t('filebrowser.error.nameConflict', '"{{name}}" already exists here', {
-                name: value,
-              }),
-            )
-          }
-          await folderOps().createFolder(parent, value)
+          await withHostRetry(async () => {
+            if (await folderOps().nameExists(parent, value)) {
+              throw new Error(
+                t('filebrowser.error.nameConflict', '"{{name}}" already exists here', {
+                  name: value,
+                }),
+              )
+            }
+            await folderOps().createFolder(parent, value)
+          })
+          forgetFolderChildren(pane.currentUrl)
         } catch (err) {
           throw asFormError(err)
         }
@@ -486,14 +608,17 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
           }
           if (value === item.entry.name) return
           const parent = item.entry.path.split('/').slice(0, -1).join('/') || '/'
-          if (await folderOps().nameExists(parent, value)) {
-            throw new Error(
-              t('filebrowser.error.nameConflict', '"{{name}}" already exists here', {
-                name: value,
-              }),
-            )
-          }
-          await folderOps().renameEntry(captured, value)
+          await withHostRetry(async () => {
+            if (await folderOps().nameExists(parent, value)) {
+              throw new Error(
+                t('filebrowser.error.nameConflict', '"{{name}}" already exists here', {
+                  name: value,
+                }),
+              )
+            }
+            await folderOps().renameEntry(captured, value)
+          })
+          if (captured.kind === 'folder') forgetFolderChildren(normalizeUrl(parent))
         } catch (err) {
           throw asFormError(err)
         }
@@ -518,7 +643,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   }
 
   const enqueueInputs = async (target: string, inputs: LocalUpload[]) => {
-    const parent = dfsPathOf(target)
+    const parent = writablePathOf(target)
     if (!parent) { showToast(t('filebrowser.operation.localUploadUnsupported', 'Local files can only be uploaded to a writable folder')); return }
     const resolveConflict = conflictResolver()
     let cancelled = false
@@ -529,7 +654,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
       try {
         let name = candidate.name
         entryNameSchema.parse(name)
-        const existing = await folderOps().statEntry(parent, name)
+        const existing = await withHostRetry(() => folderOps().statEntry(parent, name))
         if (existing) {
           const choice = await resolveConflict({ source: { id: '', path: name, name, kind: input.kind === 'file' ? 'other' : 'folder', sizeBytes: candidate.sizeBytes, modifiedAt: new Date().toISOString() }, target: existing, targetPath: parent })
           if (choice === 'cancel') { cancelled = true; transferStore.recordOutcome(target, candidate, 'cancelled', null, retry); continue }
@@ -568,21 +693,13 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
 
   // ─── Context menu (desktop) ───
 
-  /** Quick "Move to" targets: DFS roots and their first-level folders. */
+  /** Quick "Move to" targets: my files and the DFS roots (real storage destinations only). */
   const dfsRoots = dfsSource.state.data
   const moveTargets = useMemo(() => {
-    const targets: { label: string; path: string }[] = []
-    const visit = (nodes: DfsNode[], depth: number) => {
-      for (const node of nodes) {
-        // Only real storage destinations qualify (the Shared root is a collection now).
-        if (!node.path.startsWith('/')) continue
-        targets.push({ label: node.path, path: node.path })
-        if (node.children && depth < 1) visit(node.children, depth + 1)
-      }
-    }
-    visit(dfsRoots ?? [], 0)
-    return targets
-  }, [dfsRoots])
+    const roots: DfsNode[] = dfsRoots ?? []
+    const paths = [home.path, ...roots.map((node) => node.path).filter((path) => path.startsWith('/') && path !== home.path)]
+    return paths.map((path) => ({ label: path, path }))
+  }, [dfsRoots, home.path])
 
   const [contextMenu, setContextMenu] = useState<{
     side: 'left' | 'right'
@@ -656,22 +773,46 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
       const entries = current.entries.filter((entry) => !succeeded.has(entry.id))
       return entries.length ? { ...current, entries } : null
     })
-    setBatchTask((current) => ({ ...initial, ...current, taskId: copyTaskId, summary: monitorFailed ? undefined : current?.summary, results, running: false, cancelling: false, retry: () => {
+    const retry = () => {
       if (kind === 'copy') { void runBatch(pane, captured, kind, target, undefined, [], monitorFailed ? undefined : copyTaskId, monitorFailed ? requestKey : undefined, monitorFailed ? copyTaskId : undefined); return }
       const failed = new Set(results.filter((result) => result.status === 'failed').map((result) => result.entry.id))
       const current = livePanes.current.find((current) => current.activeTabId === pane.activeTabId && current.currentUrl === pane.currentUrl && [...current.selectedItemsMap.values()].every((item) => failed.has(item.entry.id)))
       void runBatch(current ?? pane, captured.filter((item) => failed.has(item.entry.id)), kind, target, cutClipboard, results.filter((result) => result.status !== 'failed'))
-    } }))
+    }
+    setBatchTask((current) => ({ ...initial, ...current, taskId: copyTaskId, summary: monitorFailed ? undefined : current?.summary, results, running: false, cancelling: false, retry }))
+    if (kind !== 'add-ref' && kind !== 'remove-ref') {
+      for (const folder of new Set([pane.currentUrl, ...(target ? [normalizeUrl(target)] : [])])) forgetFolderChildren(folder)
+    }
+    // The computer relocked under the operation: ask for sudo again, then redo what failed.
+    if (results.some((result) => result.error?.code === 'SUDO_REQUIRED')) void unlockComputer().then((ok) => { if (ok) retry() })
   }
 
   const moveSelected = (pane: BrowserPane, entries: FileEntry[], target: string, clip?: ClipboardState | null) => runBatch(pane, entries.map(itemOf), 'move', target, clip)
-  const requestCopy = (pane: BrowserPane, entries: FileEntry[]) => setTargetRequest({ entries, copy: true, initial: dfsPathOf(pane.currentUrl) ?? '/home', submit: (path) => void runBatch(pane, entries.map(itemOf), 'copy', path) })
-  const requestMove = (pane: BrowserPane, entries: FileEntry[]) => setTargetRequest({ entries, initial: dfsPathOf(pane.currentUrl) ?? '/home', submit: (path) => void moveSelected(pane, entries, path) })
+  const zonePath = (item: SelectedContent) => item.origin === 'zone' && item.source.kind === 'cyfs-path' ? item.source.path.slice('cyfs://'.length) : null
+  const pickDestination = async (pane: BrowserPane, entries: FileEntry[], copy: boolean): Promise<string | null> => {
+    const result = await systemDialog.open(SELECT_DIALOG_PATH, {
+      mode: 'folder', writable: true,
+      start: { kind: 'cyfs-path', path: normalizeCyfsPath(dfsPathOf(pane.currentUrl) ?? home.path) },
+      title: `${copy ? t('filebrowser.actions.copyTo', 'Copy to') : t('filebrowser.actions.moveTo', 'Move to')} · ${entries.length}`,
+      confirmLabel: copy ? t('filebrowser.operation.copyHere', 'Copy here') : t('filebrowser.operation.moveHere', 'Move here'),
+      exclude: entries.filter((entry) => entry.kind === 'folder' && entry.path.startsWith('/')).slice(0, 1000).map((entry) => ({ kind: 'cyfs-path' as const, path: normalizeCyfsPath(entry.path) })),
+    }, { id: 'files' })
+    return result.action === 'selected' ? zonePath(result.items[0]) : null
+  }
+  const requestCopy = (pane: BrowserPane, entries: FileEntry[]) => { void pickDestination(pane, entries, true).then((path) => { if (path) void runBatch(pane, entries.map(itemOf), 'copy', path) }) }
+  const requestMove = (pane: BrowserPane, entries: FileEntry[]) => { void pickDestination(pane, entries, false).then((path) => { if (path) void moveSelected(pane, entries, path) }) }
   const requestExisting = (pane: BrowserPane) => {
     const url = pane.currentUrl
-    setTargetRequest({ entries: [], initial: '/home', references: true, submit: (_, entries) => {
-      if (entries?.length) void runBatch(pane, entries.map(itemOf), 'add-ref', url)
-    } })
+    void systemDialog.open(SELECT_DIALOG_PATH, {
+      mode: 'open', multiple: true, title: t('filebrowser.operation.addExisting', 'Add existing files'), confirmLabel: t('filebrowser.operation.addReferences', 'Add references'),
+    }, { id: 'files-references' }).then((result) => {
+      if (result.action !== 'selected') return
+      const entries = result.items.flatMap((item): FileEntry[] => {
+        const path = zonePath(item)
+        return path ? [{ id: path, name: item.origin === 'zone' && item.hints.name || path.split('/').pop() || path, kind: classifyFileKind(path), path, modifiedAt: '', sizeBytes: item.origin === 'zone' ? item.hints.size : undefined }] : []
+      })
+      if (entries.length) void runBatch(pane, entries.map(itemOf), 'add-ref', url)
+    })
   }
   const pasteInto = (pane: BrowserPane) => {
     if (!clipboard) return
@@ -679,7 +820,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
       void runBatch(pane, clipboard.entries.map(itemOf), 'add-ref', pane.currentUrl)
       return
     }
-    const target = dfsPathOf(pane.currentUrl)
+    const target = writablePathOf(pane.currentUrl)
     if (target && pane.list.capabilities.acceptsContent && clipboard.mode === 'copy') void runBatch(pane, clipboard.entries.map(itemOf), 'copy', target)
     if (target && pane.list.capabilities.acceptsContent && clipboard.mode === 'cut') void moveSelected(pane, clipboard.entries, target, clipboard)
   }
@@ -691,7 +832,8 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
     if (!items.length) return
     setDeleteRequest({ items, location: displayPath(pane.currentUrl), references: false, submit: () => void runBatch(pane, items, 'delete') })
   }
-  const downloadEntries = (entries: FileEntry[]) => {
+  const downloadEntries = async (entries: FileEntry[]) => {
+    if (entries.some((entry) => parseDeviceUrl(entry.path)) && !isHostUnlocked(hostKey) && !await unlockComputer()) return
     const results: OperationResult[] = entries.map((entry) => {
       const url = folderOps().downloadUrl(entry)
       if (!url) return { entry, status: 'skipped', error: { code: 'UNSUPPORTED', messageKey: entry.kind === 'folder' ? 'filebrowser.operation.folderDownloadUnsupported' : 'filebrowser.toast.downloadUnavailable', fallback: entry.kind === 'folder' ? 'Folder download is not supported by this server' : 'Download is not available here', retryable: false } }
@@ -719,13 +861,13 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   const contextFor = (pane: BrowserPane, items: FileItem[]): FileMenuContext => ({
     target: items.length > 1 ? 'selection' : items.length ? 'item' : 'view',
     items, entries: items.map((item) => item.entry), currentUrl: pane.currentUrl,
-    viewMode: pane.viewMode, capabilities: pane.list.capabilities, sortKey: pane.sortKey,
+    viewMode: pane.viewMode, iconSize, capabilities: pane.list.capabilities, sortKey: pane.sortKey,
     collections: collections.map((item) => ({ id: item.id, title: item.title })), moveTargets,
     pane: { canOpenInNewTab: !isMobile, canOpenInRightPane: !isMobile && width >= 700 },
     clipboard, searching: !!pane.searchQuery, contextToken: pane.contextToken,
     loadedCount: pane.searchQuery ? pane.searchItems.length : pane.list.loadedKeys().length,
     busy: !!batchTask?.running || pane.enumerating,
-    otherPath: splitActive ? dfsPathOf(pane === left ? right.currentUrl : left.currentUrl) ?? undefined : undefined,
+    otherPath: splitActive ? writablePathOf(pane === left ? right.currentUrl : left.currentUrl) ?? undefined : undefined,
   })
   const toolbarPropsFor = (side: 'left' | 'right') => {
     const pane = paneFor(side)
@@ -815,7 +957,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
         if (first.entry.kind === 'folder') {
           // Group entries carry collection:// paths; folder refs carry their
           // original dfs path — navigation normalizes both.
-          pane.navigate(first.entry.path)
+          if (openable(first.entry)) pane.navigate(first.entry.path)
         } else {
           pane.applySelection([first.key], new Map([[first.key, first]]))
           handleOpenFile(pane, first)
@@ -823,6 +965,9 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
         break
       case 'preview-new-window':
         if (first && first.entry.kind !== 'folder') handleOpenFile(pane, first, { newWindow: true })
+        break
+      case 'preview-archive':
+        if (first && first.entry.kind !== 'folder') openPreview({ source: previewSourceOf(first), origin: { app: 'files', hostContext: pane.currentUrl, windowId } })
         break
       case 'preview-selection':
         handlePreviewItems(pane, items)
@@ -912,7 +1057,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
         requestNewGroup(pane)
         break
       case 'download':
-        downloadEntries(entries)
+        void downloadEntries(entries)
         break
       case 'rename':
         if (first) requestRename(pane, first)
@@ -960,6 +1105,9 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
         break
       case 'view-icon':
         pane.setViewMode('icon')
+        break
+      case 'icon-size':
+        setIconSize(String(action.args?.size ?? 'medium') as IconSize)
         break
       default:
         break
@@ -1020,7 +1168,8 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
 
   const focusedSelectedItem = focusedIsRight ? rightSelectedItem : leftSelectedItem
 
-  const mobileTitleText = (mobilePreviewOpen ? leftSelectedItem?.entry.name : undefined) ?? left.activeTab?.title ?? 'root'
+  const leftTabTitle = left.activeTab ? titledTabs([left.activeTab])[0].title : undefined
+  const mobileTitleText = (mobilePreviewOpen ? leftSelectedItem?.entry.name : undefined) ?? leftTabTitle ?? 'root'
   const mobileSubtitleText =
     (mobilePreviewOpen ? leftSelectedItem?.entry.summary : undefined) ??
     left.list.meta?.description ??
@@ -1045,7 +1194,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   } : null)
 
   const handleKeyDown = (event: React.KeyboardEvent) => {
-    if ((event.target as HTMLElement).closest('input, textarea, select, [contenteditable="true"], [role="dialog"]') || namePrompt || deleteRequest || targetRequest || conflictRequest) return
+    if ((event.target as HTMLElement).closest('input, textarea, select, [contenteditable="true"], [role="dialog"]') || namePrompt || deleteRequest || conflictRequest) return
     const pane = focusedPane
     const items = [...pane.selectedItemsMap.values()]
     const ctx = contextFor(pane, items)
@@ -1095,7 +1244,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
         const copying = event.ctrlKey || event.altKey
         const state = commandState(copying ? 'copy-to' : 'move-to', contextFor(source.pane, source.items))
         if (state.state !== 'available') { showToast(t(`filebrowser.commandReason.${state.reason}`, state.reason ?? 'This action is unavailable')); return }
-        const target = dfsPathOf(pane.currentUrl)
+        const target = writablePathOf(pane.currentUrl)
         if (!target || !pane.list.capabilities.acceptsContent) { showToast(t('filebrowser.operation.invalidDestination', 'Choose a writable folder outside the selected folders.')); return }
         void runBatch(source.pane, source.items, copying ? 'copy' : 'move', target)
         return
@@ -1115,12 +1264,17 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
     <DeleteDialog request={deleteRequest} onClose={() => setDeleteRequest(null)} />
     <ConflictDialog request={conflictRequest?.ownerId === windowId ? conflictRequest : null} />
     <CopyTasks ownerId={windowId} reveal={(path) => livePanes.current[0].revealOriginal(path)} />
-    {targetRequest && <MoveTargetDialog request={targetRequest} onClose={() => setTargetRequest(null)} />}
     {permissionsRequest && <PermissionsDialog key={permissionsRequest.path} request={permissionsRequest} onClose={() => setPermissionsRequest(null)} />}
     <BatchResults task={batchTask?.ownerId === windowId ? batchTask : null} onClose={() => setBatchTask(null)} />
     {dragTarget && <div className="pointer-events-none absolute inset-2 z-40 flex items-center justify-center rounded-xl border-2 border-dashed border-[color:var(--cp-accent)] bg-[color:var(--cp-surface)]/90 p-6">{t('filebrowser.operation.dropDestination', 'Drop into {{path}}', { path: displayPath(dragTarget) })}</div>}
   </>
 
+  const sidebarProps = (pane: BrowserPane) => ({
+    dfs: dfsSource, host: hostSource, topics: topicsSource, collections, homeUrl, openedAt,
+    hostUnlocked, hostRootUrl: hostRoot, loadChildren: dfsFolderChildren, loadHostChildren: hostChildren,
+    onUnlockHost: () => void unlockComputer().then((ok) => { if (ok) { pane.navigate(hostRoot); setMobileSidebarOpen(false) } }),
+    onCreateCollection: handleCreateCollection,
+  })
   const searchProps = (pane: BrowserPane) => ({
     scope: pane.searchScope, onScopeChange: pane.setSearchScope, currentUrl: pane.currentUrl,
     kind: pane.searchKind, modified: pane.searchModified, onFilterChange: pane.setSearchFilter,
@@ -1133,6 +1287,17 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
   })
   const listProps = (pane: BrowserPane) => ({
     ...listPreferences, onNameWidthChange: (nameWidth: number) => changeListPreferences({ nameWidth }),
+    ...(archiveRootOf(pane.currentUrl) ? {
+      onArchivePassword: () => {
+        const url = archiveRootOf(pane.currentUrl)
+        const outer = archiveSplit(dfsPathOf(pane.currentUrl) ?? '')?.outer ?? ''
+        if (url) setArchivePassword({ pane, url, name: outer.split('/').pop() ?? '' })
+      },
+      readOnlyNote: t('archive.readOnly', 'Files in an archive are read-only'),
+      emptyState: { title: archiveSplit(dfsPathOf(pane.currentUrl) ?? '')?.member ? t('archive.emptyFolder.title', 'This folder is empty') : t('archive.empty.title', 'This archive is empty') },
+    } : {}),
+    thumbnailSource,
+    onUnlock: () => void unlockComputer().then((ok) => { if (ok) pane.list.reload() }),
     scroll: pane.scroll, onScroll: pane.setScroll, revealIndex: pane.revealIndex,
     cutIds: clipboard?.mode === 'cut' ? new Set(clipboard.entries.map((entry) => entry.id)) : new Set<string>(),
     onSelectLoaded: pane.selectLoaded, onSelectAll: () => void pane.selectAll(),
@@ -1147,7 +1312,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
 
   // ─── Mobile layout ───
   if (isMobile) {
-    const crumbs = crumbsForUrl(left.currentUrl, left.list.meta?.title)
+    const crumbs = crumbsForUrl(left.currentUrl, left.list.meta?.title, hostInfo?.label)
 
     return (
       <div ref={rootRef} data-testid="filebrowser" tabIndex={-1} onKeyDown={handleKeyDown} {...dropProps(left)} className="filebrowser fb-mobile relative flex h-full w-full flex-col overflow-hidden" style={{ background: 'var(--cp-bg)' }}>
@@ -1400,15 +1565,9 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
               style={{ background: 'var(--cp-surface)' }}
             >
               <Sidebar
-                dfs={dfsSource}
-                devices={devicesSource}
-                topics={topicsSource}
-                collections={collections}
+                {...sidebarProps(left)}
                 activeUrl={left.currentUrl}
-                advancedMode={advancedMode}
-                onToggleAdvanced={setAdvancedMode}
                 onNavigate={left.navigate}
-                onCreateCollection={handleCreateCollection}
                 onAfterNavigate={() => setMobileSidebarOpen(false)}
                 compact
               />
@@ -1499,15 +1658,9 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
         className="flex shrink-0 flex-col overflow-hidden border-r border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_82%,transparent)] px-2 pt-2"
       >
         <Sidebar
-          dfs={dfsSource}
-          devices={devicesSource}
-          topics={topicsSource}
-          collections={collections}
+          {...sidebarProps(focusedPane)}
           activeUrl={focusedPane.currentUrl}
-          advancedMode={advancedMode}
-          onToggleAdvanced={setAdvancedMode}
           onNavigate={(url) => { focusedPane.navigate(url); setNavOverlayOpen(false) }}
-          onCreateCollection={handleCreateCollection}
         />
       </aside>}
 
@@ -1519,7 +1672,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
         onMouseDownCapture={() => setFocusedSide('left')}
       >
         <TopBar
-          tabs={left.tabs}
+          tabs={titledTabs(left.tabs)}
           activeTabId={left.activeTabId}
           onSelectTab={left.setActiveTabId}
           onCloseTab={handleCloseLeftTab}
@@ -1528,7 +1681,8 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
           onRestoreClosedTab={handleRestoreClosedTab}
           currentPath={left.currentUrl}
           locationTitle={left.list.meta?.title}
-          onNavigate={left.navigate}
+          computerLabel={hostInfo?.label}
+          onNavigate={(input) => { const target = toLocation(input); if (target) left.navigate(target) }}
           onBack={left.back}
           onForward={left.forward}
           onUp={left.goUp}
@@ -1537,6 +1691,8 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
           canUp={parentUrl(left.currentUrl) !== null}
           viewMode={left.viewMode}
           onViewModeChange={left.setViewMode}
+          iconSize={iconSize}
+          onIconSizeChange={setIconSize}
           searchQuery={left.searchQuery}
           onSearchChange={left.setSearchQuery}
           onCopyPath={() => copyText(copyPathText(left.currentUrl))}
@@ -1596,7 +1752,7 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
           onMouseDownCapture={() => setFocusedSide('right')}
         >
           <TopBar
-            tabs={right.tabs}
+            tabs={titledTabs(right.tabs)}
             activeTabId={right.activeTabId}
             onSelectTab={right.setActiveTabId}
             onCloseTab={handleCloseRightTab}
@@ -1604,7 +1760,8 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
             allowCloseLast
             currentPath={right.currentUrl}
             locationTitle={right.list.meta?.title}
-            onNavigate={right.navigate}
+            computerLabel={hostInfo?.label}
+            onNavigate={(input) => { const target = toLocation(input); if (target) right.navigate(target) }}
             onBack={right.back}
             onForward={right.forward}
             onUp={right.goUp}
@@ -1613,6 +1770,8 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
             canUp={parentUrl(right.currentUrl) !== null}
             viewMode={right.viewMode}
             onViewModeChange={right.setViewMode}
+            iconSize={iconSize}
+            onIconSizeChange={setIconSize}
             searchQuery={right.searchQuery}
             onSearchChange={right.setSearchQuery}
             onCopyPath={() => copyText(copyPathText(right.currentUrl))}
@@ -1699,6 +1858,16 @@ export function FileBrowserView({ windowId, openRequest }: { windowId?: string; 
       <TransfersPanel onOpenTarget={(path) => focusedPane.revealOriginal(path)} />
       <NamePromptDialog request={namePrompt} onClose={() => setNamePrompt(null)} />
 
+      {archivePassword ? (
+        <div className="fixed inset-0 z-[70]">
+          <ArchivePasswordDialog
+            name={archivePassword.name}
+            url={archivePassword.url}
+            onUnlocked={() => { archivePassword.pane.list.reload(); setArchivePassword(null) }}
+            onCancel={() => setArchivePassword(null)}
+          />
+        </div>
+      ) : null}
       {toast ? (
         <div className="pointer-events-none absolute bottom-8 left-1/2 -translate-x-1/2 rounded-full bg-black/80 px-3 py-1.5 text-xs text-white">
           {toast}

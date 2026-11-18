@@ -10,6 +10,7 @@ import type { PendingMeta, PendingRow } from '../offline/protocol'
 import { richTextSchemaDef, type AiwsCore } from '../api/wasm'
 import { aiwsT } from '../i18n'
 import { buildRichTextSchema, type RichTextSchemaDef } from '../richtext/schema'
+import { activityTestHooks } from './activityTestHooks'
 import { EditStore } from './edits'
 import { Emitter, VersionMap } from './emitter'
 import { FreshnessService } from './freshness'
@@ -41,6 +42,8 @@ export interface SubmitOptions {
   origin?: 'human' | 'agent' | 'program'
   /** The key the submission uses (a form Block's draft protocol, D13). */
   idempotencyKey?: string
+  /** A large Commit goes out in several requests: told before request `part` of `total` (the last one writes). */
+  onPart?: (part: number, total: number) => void
 }
 
 /** An input that is saved nowhere but in this window's memory (storage failure, unknown result): exportable. */
@@ -77,8 +80,9 @@ export class WorkspaceStore {
   /** Design / run mode of the canvas (扩展控件 P2, Q27): this window's choice, never persisted. */
   readonly runMode = new RunModeState()
   /** Where the user works on the canvas: the task location a wish run starts from (许愿格 §5.2). The
-   * selection is the last one that was not just a wish Block (clicking the wish must not lose it). */
-  readonly canvasFocus: { surfaceId: string | null; selection: string[]; viewport: Placement | null } = { surfaceId: null, selection: [], viewport: null }
+   * selection is the last one that was not just a wish Block (clicking the wish must not lose it); `current` is the
+   * selection as it is now, a wish included (what the Agent's panel is handed). */
+  readonly canvasFocus: { surfaceId: string | null; selection: string[]; current: string[]; viewport: Placement | null } = { surfaceId: null, selection: [], current: [], viewport: null }
 
   setCanvasFocus(patch: Partial<WorkspaceStore['canvasFocus']>) {
     Object.assign(this.canvasFocus, patch)
@@ -132,6 +136,7 @@ export class WorkspaceStore {
       hooks.replica = offline?.test ?? undefined
       hooks.outline = () => this.outline.all()
       hooks.commits = 0
+      hooks.activity = activityTestHooks(this)
     }
     if (offline) {
       // pending submissions of earlier runs of this replica: they are saved on this device, show them again
@@ -358,7 +363,7 @@ export class WorkspaceStore {
     const hooks = testHooks()
     if (hooks) hooks.commits = (hooks.commits ?? 0) + 1
     try {
-      outcome = await this.session.commit(options.operations, { message: label, preconditions: options.preconditions, origin: options.origin, idempotencyKey: options.idempotencyKey, meta: { editId, label, mine, hasMine, undoable: options.undoable !== false } })
+      outcome = await this.session.commit(options.operations, { message: label, preconditions: options.preconditions, origin: options.origin, idempotencyKey: options.idempotencyKey, onPart: options.onPart, meta: { editId, label, mine, hasMine, undoable: options.undoable !== false } })
     } catch (error) {
       outcome = { status: 'unknown', idempotency_key: '', detail: error instanceof Error ? error.message : String(error) }
     }

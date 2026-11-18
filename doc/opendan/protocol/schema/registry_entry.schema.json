@@ -207,6 +207,46 @@
       ],
       "type": "string"
     },
+    "PauseSource": {
+      "description": "Why a session is paused: who resumes it follows from it.",
+      "oneOf": [
+        {
+          "description": "Someone asked (`control(pause)`).",
+          "enum": [
+            "user"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Its parent session was paused; resumed with it.",
+          "enum": [
+            "parent"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The host restarted while it was working; resumed by hand, with the sub sessions the same restart interrupted.",
+          "enum": [
+            "interrupted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Its Goal was put to sleep; resumed when the Goal wakes.",
+          "enum": [
+            "goal"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Its Goal's period budget (or the agent's background total) ran out; resumed when the period resets.",
+          "enum": [
+            "budget"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ReportMode": {
       "description": "What a parent receives from a sub session without subscribing: the registry state stays the truth, these events only accelerate.",
       "oneOf": [
@@ -266,8 +306,7 @@
         {
           "enum": [
             "ui",
-            "work",
-            "self_check"
+            "work"
           ],
           "type": "string"
         },
@@ -332,8 +371,15 @@
           ]
         },
         "paused": {
-          "description": "Paused (`control(pause)`): it infers no more until resumed.",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PauseSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Paused: it infers no more until resumed. The value says why ([`super::state::PauseSource`])."
         },
         "pending_decision": true,
         "report_brief": {
@@ -533,6 +579,20 @@
     },
     "route_key": {
       "description": "What the session is bound to (a ui session: its mailbox address).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runtime_id": {
+      "description": "The runtime the session was frozen to (where its `shell` runs).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runtime_unavailable": {
+      "description": "The session is not finished and its runtime cannot be used now (switched off, removed, expired, not answering): why. The session is never moved to another runtime; the mark goes when the runtime is usable again or the session ends.",
       "type": [
         "string",
         "null"

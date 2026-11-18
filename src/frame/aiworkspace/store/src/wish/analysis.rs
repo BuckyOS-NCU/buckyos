@@ -1,7 +1,7 @@
-//! Host validation of an analysis (许愿格 §7.3): the model's `wish.analysis.v2` speaks in handles;
+//! Host validation of an analysis (许愿格 §7.3): the model's `wish.analysis.v3` speaks in handles;
 //! the host binds them to real data and ranges, rejects what cannot be bound, rewrites the context
 //! prompt so it no longer depends on run-local handles, and checks the output contract against the
-//! Renderer catalog and the production rules. Every problem is returned to the model in the same
+//! Renderer catalog. Every problem is returned to the model in the same
 //! run, so it can fix its answer.
 
 use super::context::{translate_fields, translate_filter, translate_sorts, Stage};
@@ -333,11 +333,17 @@ impl Stage {
             let at = format!("output_contract.results[{i}]");
             let mut r = r.clone();
             if let Some(m) = r.as_object_mut() {
-                m.retain(|k, _| matches!(k.as_str(), "name" | "type" | "title" | "approach" | "key" | "target" | "views" | "description" | "fields" | "kind" | "def"));
+                m.retain(|k, _| matches!(k.as_str(), "name" | "type" | "title" | "key" | "target" | "views" | "description" | "fields" | "kind" | "def" | "schema_id"));
             }
             if let Err(e) = check_contract_result(&r) {
                 problems.push(format!("{at}: {}", e.detail));
                 continue;
+            }
+            // a business schema of the result (B0-4): a built-in one, or one a table of this workspace defines
+            if let Some(sid) = r["schema_id"].as_str() {
+                if !aiworkspace_core::standard::is_standard_schema(sid) && aiworkspace_core::standard::user_schema_fields(&self.ctx(), sid)?.is_none() {
+                    problems.push(format!("{at}: schema_id {sid} is neither built in nor defined here (a table with that schema_id and a source.def defines it)"));
+                }
             }
             let ty = r["type"].as_str().unwrap_or("");
             if ty == "table" && !r.get("key").and_then(Value::as_array).is_some_and(|k| !k.is_empty()) {
@@ -347,7 +353,7 @@ impl Stage {
                 problems.push(format!("{at}: the target of table_columns must be the input name of a table input"));
             }
             if ty == "video" {
-                problems.push(format!("{at}: there is no real video generation tool yet, so a video result cannot be contracted"));
+                problems.push(format!("{at}: a video clip is an `asset` result (generated with aiws.ai.video, written with aiws.result.file)"));
             }
             for (vi, v) in r.get("views").and_then(Value::as_array).into_iter().flatten().enumerate() {
                 let renderer = v["renderer"].as_str().unwrap_or("");
@@ -398,6 +404,13 @@ impl Stage {
             if !c.is_empty() {
                 x["candidates"] = json!(c);
             }
+            // the data source an analysis asks for when the data is outside the Workspace (B2-1)
+            if let Some(w) = b.get("wanted").filter(|w| !w.is_null()) {
+                match aiworkspace_core::wish::check_wanted(w) {
+                    Ok(()) => x["wanted"] = w.clone(),
+                    Err(e) => problems.push(e.detail),
+                }
+            }
             blockers.push(x);
         }
         if !blockers.is_empty() {
@@ -432,7 +445,13 @@ impl Stage {
         if analysis["summary"].is_null() {
             analysis.as_object_mut().unwrap().remove("summary");
         }
-        if let Err(e) = check_analysis(&analysis) {
+        // inputs found missing: the run fails with the blockers (D6), the rest is still checked as it would be written
+        let mut written = analysis.clone();
+        if status == "needs_input" {
+            written["status"] = json!("ready");
+            written["blockers"] = json!([]);
+        }
+        if let Err(e) = check_analysis(&written) {
             problems.push(e.detail);
         }
         if !problems.is_empty() {

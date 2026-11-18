@@ -42,7 +42,7 @@ test('snapshot remains readable to collaborators and after package import', asyn
   })
   const read = await api.read(ALICE, ws.workspace_id, 'blk-ext')
   const id = read.content.payload.config.snapshot.object_id
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', capabilities: ['read'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', allow: ['read'] }] })
   const response = await fetch(`${api.base}/asset/${ws.workspace_id}/${id}`, { headers: { authorization: `Bearer ${BOB}` } })
   expect(await response.text()).toContain('中文快照')
   const ex = await api.rpc(ALICE, 'doc.export', { workspace_id: ws.workspace_id, mode: 'share', self_contained: true })
@@ -172,12 +172,18 @@ test('actions use the current payload and key revisions and respect view mode', 
       },
     }] })
   })
+  // not marked primary: in the Block's menu (the toolbar's "more"), not on the toolbar (UI 框架 PRD §10.1)
   await page.getByTestId('aiws-canvas-block-blk-kpi').click()
+  await expect(page.getByTestId('aiws-near-toolbar').locator('[data-near-index] [data-testid="aiws-near-write-config"]')).toHaveCount(0)
+  await page.getByTestId('aiws-near-more').click()
   await page.getByTestId('aiws-near-write-config').click()
   await expect.poll(async () => (await api.read(ALICE, ws.workspace_id, 'blk-kpi')).content.payload.config).toEqual({ accent: '#123456', note: 'from action' })
   await setCanvasMode(page, 'view')
+  await page.getByTestId('aiws-near-more').click()
   await expect(page.getByTestId('aiws-near-write-config')).toHaveCount(0)
+  await page.keyboard.press('Escape')
   await setCanvasMode(page, 'edit')
+  await page.getByTestId('aiws-near-more').click()
   await expect(page.getByTestId('aiws-near-write-config')).toBeVisible()
 })
 

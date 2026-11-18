@@ -1,13 +1,16 @@
 name: ext-core Release
 
 # Builds the five payloads of the ext-core extension package and, on a release tag
-# or an explicit dispatch, publishes them (ExtTools TODO §3.10):
+# or an explicit dispatch, publishes them (ExtTools TODO section 3.10):
 #   ext-core-v<version>   immutable
 #   ext-core-latest       rolling, with latest.json
 # and mirrors them to R2, where installers, build-all and developers take them from.
-# The .pikg is on R2 only: at over 3 GiB it is past the 2 GiB a GitHub release asset may have.
-# The gate is every platform unpacking its tar on a clean machine and running smoke/
-# with no network and no tool of the builder on the PATH. Any failure publishes nothing.
+# All payloads and their corresponding source archives are on R2. Assets below
+# GitHub's 2 GiB limit are also attached to the GitHub release.
+# The gate is every platform unpacking its tar on a clean machine, laid out as a node
+# has it, downloading its online items (Chrome for Testing) from the manifest's addresses
+# and running smoke/ with no network and no tool of the builder on the PATH. Any failure
+# publishes nothing.
 # Pull requests and plain dispatches only build and upload workflow artifacts.
 
 on:
@@ -24,7 +27,7 @@ on:
     paths:
       - 'publish/exttool/ext-core/**'
       - '.github/scripts/ext_tools.py'
-      - '.github/scripts/test_ext_tools.py'
+      - '.github/scripts/test_ext_*.py'
       - '.github/workflows/ext-core.yml'
 
 permissions:
@@ -42,7 +45,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
-      - run: python3 -m unittest discover -s .github/scripts -p 'test_ext_tools.py'
+      - uses: astral-sh/setup-uv@v6
+      - run: python3 -m unittest discover -s .github/scripts -p 'test_ext_*.py'
+      - run: uv run python -m unittest discover -s publish/exttool/ext-core -p 'test_*.py'
       - run: python3 .github/scripts/ext_tools.py check-table
       - id: version
         run: echo "version=$(python3 -c 'import json; print(json.load(open("publish/exttool/ext-core/ext-manifest.json"))["version"])')" >> "$GITHUB_OUTPUT"
@@ -66,9 +71,13 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - name: msiextract, for LibreOffice's msi
+        if: matrix.platform == 'windows-x86_64'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends msitools
       - name: Build the payload
         working-directory: publish/exttool/ext-core
-        run: ./build.sh --platform '${{ matrix.platform }}' --archive --out "$RUNNER_TEMP/payload" --dist "$RUNNER_TEMP/dist"
+        run: PYTHON="$(uv run --project "$GITHUB_WORKSPACE" python -c 'import sys; print(sys.executable)')" ./build.sh --platform '${{ matrix.platform }}' --archive --out "$RUNNER_TEMP/payload" --dist "$RUNNER_TEMP/dist"
       - uses: actions/upload-artifact@v6
         with:
           name: ext-core-${{ matrix.platform }}
@@ -88,18 +97,51 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: publish/exttool/ext-core
       - uses: actions/download-artifact@v6
         with:
           name: ext-core-${{ matrix.platform }}
           path: ${{ runner.temp }}/dist
+      # The tools directory of a node: the payload in a version directory, its launchers copied to bin/, store/ext-core
+      # pointing into it. The browser is an online item and is not in the payload yet.
+      - name: Lay the payload out as a node has it
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/tools"
+          package="$tools/versions/ext-core/ci"
+          mkdir -p "$package" "$tools/store"
+          tar -xzf "$RUNNER_TEMP"/dist/ext-core-*-${{ matrix.platform }}.tar.gz -C "$package"
+          cp -R "$package/bin" "$tools/bin"
+          ln -s ../versions/ext-core/ci/store/ext-core "$tools/store/ext-core"
+      - name: Without the browser its commands say so
+        run: |
+          set -euo pipefail
+          docker run --rm --network none -v "$RUNNER_TEMP/tools:/some/where/else:ro" \
+            -e PATH=/some/where/else/bin:/usr/bin:/bin ubuntu:24.04 sh -euc '
+              cd /tmp
+              status=0; chromium --version || status=$?; [ "$status" -eq 127 ]
+              printf "<p>x</p>" > a.html
+              status=0; page-render --html a.html --pdf a.pdf || status=$?; [ "$status" -eq 6 ]
+              agent-browser version
+              page-render --version'
+      - name: Download the online items as a node does, from the manifest's addresses
+        run: python3 publish/exttool/ext-core/place_online.py --payload "$RUNNER_TEMP/tools/versions/ext-core/ci" --tools "$RUNNER_TEMP/tools" --platform '${{ matrix.platform }}'
       - name: A bare container, no network, a path of its own
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/unpacked"
-          tar -xzf "$RUNNER_TEMP"/dist/ext-core-*.tar.gz -C "$RUNNER_TEMP/unpacked"
-          docker run --rm --network none -v "$RUNNER_TEMP/unpacked:/some/where/else:ro" \
+          docker run --rm --network none -v "$RUNNER_TEMP/tools:/some/where/else:ro" \
             -e PATH=/some/where/else/bin:/usr/bin:/bin ubuntu:24.04 \
-            sh -euc 'cd /tmp; for script in /some/where/else/smoke/*.sh; do echo "== $script"; sh "$script"; done'
+            sh -euc 'cd /tmp; for script in /some/where/else/versions/ext-core/ci/smoke/*.sh; do echo "== $script"; sh "$script"; done'
+      # The payload carries the modules of browser/ without their tests: put them next to the modules they test.
+      - name: The tests of agent-browser and page-render, on the payload's node and playwright-core and the downloaded browser
+        run: |
+          set -euo pipefail
+          cp -R publish/exttool/ext-core/browser/test "$RUNNER_TEMP/tools/versions/ext-core/ci/store/ext-core/browser/test"
+          docker run --rm --network none -v "$RUNNER_TEMP/tools:/some/where/else:ro" \
+            -e PATH=/some/where/else/bin:/usr/bin:/bin ubuntu:24.04 \
+            sh -euc 'cd /some/where/else/store/ext-core/browser; node --test "test/*.test.mjs"'
 
   smoke-macos:
     name: smoke ${{ matrix.platform }}
@@ -113,20 +155,39 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: publish/exttool/ext-core
       - uses: actions/download-artifact@v6
         with:
           name: ext-core-${{ matrix.platform }}
           path: ${{ runner.temp }}/dist
-      - name: Unpack as the installer does and run with the system's tools off the PATH
+      - name: Lay the payload out as a node has it, download its online items and run with the system's tools off the PATH
+        env:
+          EXT_CORE_SMOKE_ARTIFACTS: ${{ runner.temp }}/ext-core-smoke
         run: |
           set -euo pipefail
-          target="$RUNNER_TEMP/some where/else"
-          mkdir -p "$target"
-          tar -xzf "$RUNNER_TEMP"/dist/ext-core-*.tar.gz -C "$target"
-          for script in "$target"/smoke/*.sh; do
+          tools="$RUNNER_TEMP/some where/else"
+          package="$tools/versions/ext-core/ci"
+          mkdir -p "$package" "$tools/store"
+          tar -xzf "$RUNNER_TEMP"/dist/ext-core-*-${{ matrix.platform }}.tar.gz -C "$package"
+          cp -R "$package/bin" "$tools/bin"
+          ln -s ../versions/ext-core/ci/store/ext-core "$tools/store/ext-core"
+          status=0; PATH="$tools/bin:/usr/bin:/bin" chromium --version || status=$?
+          test "$status" -eq 127
+          python3 publish/exttool/ext-core/place_online.py --payload "$package" --tools "$tools" --platform '${{ matrix.platform }}'
+          for script in "$package"/smoke/*.sh; do
             echo "== $script"
-            PATH="$target/bin:/usr/bin:/bin" sh "$script"
+            PATH="$tools/bin:/usr/bin:/bin" sh "$script"
           done
+      - name: Keep failed conversion files
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: smoke-diagnostics-${{ matrix.platform }}
+          path: ${{ runner.temp }}/ext-core-smoke
+          if-no-files-found: ignore
+          retention-days: 7
 
   smoke-windows:
     name: smoke windows-x86_64
@@ -134,27 +195,49 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: publish/exttool/ext-core
       - uses: actions/download-artifact@v6
         with:
           name: ext-core-windows-x86_64
           path: ${{ runner.temp }}/dist
       # The letter has to be in the machine's ANSI code page (1252 here): tar, fontconfig and tesseract
       # read paths through it, so a Chinese path works on a Chinese Windows and not on this runner.
+      # The tools directory is laid out as a node has it: the payload in a version directory, its launchers
+      # copied to bin\, store\ext-core a junction into it, and the online items downloaded into online\.
       - name: A path with a space and a non-ASCII letter
         shell: pwsh
+        env:
+          EXT_CORE_SMOKE_ARTIFACTS: ${{ runner.temp }}/ext-core-smoke
         run: |
           $ErrorActionPreference = 'Stop'
-          $target = Join-Path $env:RUNNER_TEMP 'outils é tools'
-          New-Item -ItemType Directory -Path $target | Out-Null
-          $tar = (Get-ChildItem "$env:RUNNER_TEMP\dist\ext-core-*.tar.gz").FullName
-          tar -xzf $tar -C $target
+          $tools = Join-Path $env:RUNNER_TEMP ('outils ' + [char]0xe9 + ' tools')
+          $package = Join-Path $tools 'versions\ext-core\ci'
+          New-Item -ItemType Directory -Path $package, (Join-Path $tools 'store') | Out-Null
+          $tar = (Get-ChildItem "$env:RUNNER_TEMP\dist\ext-core-*-windows-x86_64.tar.gz").FullName
+          tar -xzf $tar -C $package
           if ($LASTEXITCODE -ne 0) { throw "tar failed: $LASTEXITCODE" }
-          $env:PATH = "$target\bin;$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
-          foreach ($script in Get-ChildItem "$target\smoke\*.ps1") {
+          Copy-Item -Recurse (Join-Path $package 'bin') (Join-Path $tools 'bin')
+          New-Item -ItemType Junction -Path (Join-Path $tools 'store\ext-core') -Target (Join-Path $package 'store\ext-core') | Out-Null
+          & (Join-Path $tools 'bin\chromium.cmd') --version
+          if ($LASTEXITCODE -ne 127) { throw "chromium without its browser exited $LASTEXITCODE, not 127" }
+          python publish\exttool\ext-core\place_online.py --payload $package --tools $tools --platform windows-x86_64
+          if ($LASTEXITCODE -ne 0) { throw "place_online failed: $LASTEXITCODE" }
+          $env:PATH = "$tools\bin;$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+          foreach ($script in Get-ChildItem "$package\smoke\*.ps1") {
             Write-Host "== $script"
             powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script.FullName
             if ($LASTEXITCODE -ne 0) { throw "$script failed" }
           }
+      - name: Keep failed conversion files
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: smoke-diagnostics-windows-x86_64
+          path: ${{ runner.temp }}/ext-core-smoke
+          if-no-files-found: ignore
+          retention-days: 7
 
   pikg:
     name: Package and manifest
@@ -163,6 +246,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+      - name: Make room for five source archives and payloads
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
       - uses: actions/download-artifact@v6
         with:
           pattern: ext-core-*
@@ -214,6 +299,8 @@ jobs:
       VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v6
+      - name: Make room for the complete release and its sources
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
       - uses: actions/download-artifact@v6
         with:
           pattern: ext-core-*
@@ -237,10 +324,12 @@ jobs:
           version = os.environ["VERSION"]
           release = json.loads((dist / "manifest.json").read_text())
           package = release["packages"]["ext-core"]
-          for entry in list(package["platforms"].values()) + [package["pikg"]]:
+          entries = list(package["platforms"].values())
+          sources = [entry["corresponding_source"] for entry in entries]
+          for entry in sources + entries + [package["pikg"]]:
               target = r2 / entry["path"]
               target.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copy2(dist / entry["file"], target)
+              os.link(dist / entry["file"], target)
           shutil.copy2(dist / "manifest.json", r2 / "ext-tools" / "ext-core" / version / "manifest.json")
           shutil.copy2(dist / "latest.json", r2 / "ext-tools" / "ext-core" / "latest.json")
           PY
@@ -256,23 +345,45 @@ jobs:
           multipart-concurrent: false
           keep-file-fresh: false
           output-file-url: false
+      - name: Verify the published binaries and corresponding sources are available
+        run: python3 .github/scripts/ext_tools.py resolve --version "$VERSION" --output "$RUNNER_TEMP/verified-ext-tools.json"
+      - name: Prepare GitHub assets and source download links
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          dist = Path(os.environ["RUNNER_TEMP"]) / "dist"
+          release = json.loads((dist / "manifest.json").read_text())
+          package = release["packages"]["ext-core"]
+          assets = [p.name for p in sorted(dist.glob("*.tar.gz")) if p.stat().st_size < 2 * 1024**3]
+          (dist / "github-assets.txt").write_text("\n".join(assets + ["manifest.json", "latest.json"]) + "\n")
+          lines = [f"ext-core {package['version']}", "", "The runtime archives include third-party license texts. Matching source archives include source, patches and build recipes. All artifacts are available on R2; artifacts below GitHub's 2 GiB limit are also attached here.", "", "Corresponding source downloads:", ""]
+          for platform, entry in package["platforms"].items():
+              source = entry["corresponding_source"]
+              lines.append(f"- [{platform}](https://buckyos-installer.tbudr.top/{source['path']}) - `{source['sha256']}`")
+          lines.extend(["", f"[Release manifest](https://buckyos-installer.tbudr.top/ext-tools/ext-core/{package['version']}/manifest.json) includes the runtime and .pikg locations and checksums."])
+          (dist / "release-notes.md").write_text("\n".join(lines) + "\n")
+          PY
       - name: Publish ext-core-v${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/dist"
+          mapfile -t assets < github-assets.txt
           if gh release view "ext-core-v$VERSION" >/dev/null 2>&1; then
-            gh release upload "ext-core-v$VERSION" ./*.tar.gz manifest.json latest.json
+            gh release upload "ext-core-v$VERSION" "${assets[@]}"
+            gh release edit "ext-core-v$VERSION" --notes-file release-notes.md
           else
-            gh release create "ext-core-v$VERSION" --target "$GITHUB_SHA" --title "ext-core $VERSION" --notes "ext-core $VERSION: see publish/exttool/ext-core. The .pikg is over GitHub's 2 GiB limit: it is on R2, at the path manifest.json gives." --latest=false ./*.tar.gz manifest.json latest.json
+            gh release create "ext-core-v$VERSION" --target "$GITHUB_SHA" --title "ext-core $VERSION" --notes-file release-notes.md --latest=false "${assets[@]}"
           fi
       - name: Refresh ext-core-latest
         run: |
           set -euo pipefail
           git push --force origin "$GITHUB_SHA:refs/tags/ext-core-latest"
           cd "$RUNNER_TEMP/dist"
+          mapfile -t assets < github-assets.txt
           if gh release view ext-core-latest >/dev/null 2>&1; then
-            gh release upload ext-core-latest --clobber ./*.tar.gz manifest.json latest.json
-            gh release edit ext-core-latest --title "ext-core (latest: $VERSION)" --prerelease --latest=false
+            gh release upload ext-core-latest --clobber "${assets[@]}"
+            gh release edit ext-core-latest --title "ext-core (latest: $VERSION)" --notes-file release-notes.md --prerelease --latest=false
           else
-            gh release create ext-core-latest --title "ext-core (latest: $VERSION)" --notes "The newest ext-core; pinned versions are the ext-core-v* releases." --prerelease --latest=false ./*.tar.gz manifest.json latest.json
+            gh release create ext-core-latest --title "ext-core (latest: $VERSION)" --notes-file release-notes.md --prerelease --latest=false "${assets[@]}"
           fi

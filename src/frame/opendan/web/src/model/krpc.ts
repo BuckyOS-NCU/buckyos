@@ -60,7 +60,7 @@ const initSdk = async (): Promise<boolean> => {
   return true
 }
 
-const sessionToken = async (): Promise<string | null> => {
+export const sessionToken = async (): Promise<string | null> => {
   if (Date.now() < noTokenUntil) return null
   sdkReady ??= initSdk().catch(() => false)
   const token = (await sdkReady) ? await getActiveSessionToken().catch(() => null) : null
@@ -144,10 +144,14 @@ export const createKrpcDataModel = (): OpenDanDataModel => {
     runtimeExtTools: (runtimeId) => call('runtimes.ext_tools', { runtime_id: runtimeId }),
     runtimeSettings: () => call('runtimes.settings'),
     setRuntimeSetting: (patch) => call('runtimes.settings_set', { ...patch }),
+    runtimeImpact: (runtimeId) => call('runtimes.impact', { runtime_id: runtimeId }),
+    removeRuntime: (runtimeId) => call('runtimes.remove', { runtime_id: runtimeId }),
     sessions: () => call('sessions.query'),
     activeSessions: () => call('activity.active', { limit: 50 }),
     session: (sid, worklog = 40) => call('session.read', { sid, worklog }),
-    stopSession: (sid, reason) => call('session.stop', { sid, ...(reason ? { reason } : {}) }),
+    stopSession: (sid, scope, reason) => call('session.stop', { sid, scope, ...(reason ? { reason } : {}) }),
+    resumeSession: (sid) => call('session.resume', { sid }),
+    deleteSession: (sid) => call('sessions.delete', { sid }),
     decideSession: (sid, decision, note) => call('session.decide', { sid, decision, ...(note ? { note } : {}) }),
     postMessage: (sid, text) => call('session.post', { sid, text }),
     artifacts: () => call('artifacts.list'),
@@ -161,7 +165,16 @@ export const createKrpcDataModel = (): OpenDanDataModel => {
     },
     behavior: (name) => call('behaviors.get', { name }),
     identity: () => call('behaviors.identity'),
-    recallHints: (tags, maxHints = 8) => call('cognition.recall_hints', { query: { tags, max_hints: maxHints } }),
+    queryMemory: (session, words) =>
+      call('cognition.query', {
+        session,
+        query: { text: words.join(' '), tags: words, include_recent_perceptions: true, limit: 20 },
+      }),
+    memoryOverview: () => call('memory.overview'),
+    memoryList: (layer, limit, cursor) => call('memory.list', { layer, limit, ...(cursor ? { cursor } : {}) }),
+    memoryRead: async (reference) => ({ detail: await call('memory.read', { reference }) }),
+    memoryForget: (reference, expectedRevision) =>
+      call('memory.forget', { reference, ...(expectedRevision != null ? { expected_revision: expectedRevision } : {}) }),
     goals: () => call('goals.list'),
     goal: (goalId) => call('goals.get', { goal_id: goalId }),
     goalRevision: (goalId, revision) => call('goals.revision', { goal_id: goalId, revision }),
@@ -177,5 +190,23 @@ export const createKrpcDataModel = (): OpenDanDataModel => {
       call('goals.reopen', { goal_id: goalId, request: { reason, fresh_state: freshState } }),
     restartGoal: (goalId, reason, carryState = false) =>
       call('goals.restart', { goal_id: goalId, request: { reason, carry_state: carryState } }),
+    reviseGoal: (goalId, request) => call('goals.revise', { goal_id: goalId, request }),
+    setGoalCheck: (goalId, request) => call('goals.set_check', { goal_id: goalId, request }),
+    goalCheckScript: (goalId, version) => call('goals.check_script', { goal_id: goalId, ...(version != null ? { version } : {}) }),
+    skills: () => call('skills.list'),
+    skillsState: () => call('skills.state'),
+    uiSkills: () => call('skills.ui_get'),
+    skillsStatus: (runtimeId) => call('skills.status', runtimeId ? { runtime_id: runtimeId } : {}),
+    skillInstallPlan: (source, runtimeId) => call('skills.install_plan', { ...source, ...(runtimeId ? { runtime_id: runtimeId } : {}) }),
+    skillDrafts: () => call('skills.drafts'),
+    skillDraftFile: (slug, file) => call('skills.draft_file', { slug, file }),
+    installSkills: (source, planDigest, replace = false) =>
+      call('skills.install', { ...source, plan_digest: planDigest, ...(replace ? { replace: true } : {}) }),
+    removeSkill: (kind, name) => call('skills.remove', { kind, name }),
+    setSkillEnabled: (kind, name, enabled, reason) => call('skills.set_enabled', { kind, name, enabled, ...(reason ? { reason } : {}) }),
+    setUiSkills: (names) => call('skills.ui_set', { names }),
+    importSkill: (request) => call('skills.import', { ...request }),
+    discardSkillDraft: (slug) => call('skills.draft_discard', { slug }),
+    setCrystallize: (enabled) => call('skills.crystallize_set', { enabled }),
   }
 }

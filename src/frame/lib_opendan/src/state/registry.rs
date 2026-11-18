@@ -214,6 +214,7 @@ impl FsRegistry {
             if *t == stamp {
                 let mut e = e.clone();
                 e.unreachable = self.layout.unreachable_mark(sid).exists();
+                e.runtime_unavailable = self.runtime_mark(sid);
                 return Ok(Some(e));
             }
         }
@@ -225,12 +226,18 @@ impl FsRegistry {
             .expect("registry cache")
             .insert(sid.to_string(), (stamp, entry.clone()));
         entry.unreachable = self.layout.unreachable_mark(sid).exists();
+        entry.runtime_unavailable = self.runtime_mark(sid);
         Ok(Some(entry))
+    }
+
+    fn runtime_mark(&self, sid: &str) -> Option<String> {
+        std::fs::read_to_string(self.layout.runtime_mark(sid)).ok()
     }
 
     fn write_entry(&self, entry: &RegistryEntry) -> Result<()> {
         let mut e = entry.clone();
         e.unreachable = false;
+        e.runtime_unavailable = None;
         self.cache
             .lock()
             .expect("registry cache")
@@ -270,6 +277,11 @@ impl FsRegistry {
         }
         if let Some(g) = &q.goal_id {
             if e.goal_id.as_deref() != Some(g.as_str()) {
+                return false;
+            }
+        }
+        if let Some(r) = &q.runtime_id {
+            if e.runtime_id.as_deref().map(crate::protocol::canonical_runtime) != Some(crate::protocol::canonical_runtime(r)) {
                 return false;
             }
         }
@@ -388,13 +400,13 @@ mod id_tests {
         assert_eq!(first, "work-20260101-25");
         let other = reserve_session_id_on_date(
             &layout,
-            SessionKind::SelfCheck,
+            SessionKind::Ui,
             "default",
             None,
             "20260101",
         )
         .unwrap();
-        assert_eq!(other, "sc-20260101-26");
+        assert_eq!(other, "ui-20260101-26");
         assert_eq!(
             std::fs::read_to_string(custom.path().join("work-20260101-24")).unwrap(),
             "keep"
@@ -473,8 +485,7 @@ mod id_tests {
                             SessionKind::Work,
                             SessionKind::Ui,
                             SessionKind::Goal,
-                            SessionKind::SelfCheck,
-                        ][i % 4];
+                        ][i % 3];
                         let sid = reserve_session_id_on_date(
                             layout,
                             kind,
@@ -628,6 +639,76 @@ impl SessionRegistry for FsRegistry {
         Ok(marked)
     }
 
+    async fn mark_runtime(&self, runtime_id: &str, reason: Option<&str>) -> Result<Vec<RegistryEntry>> {
+        let mut marked = Vec::new();
+        let on_runtime = RegistryQuery { runtime_id: Some(runtime_id.to_string()), ..Default::default() };
+        for mut e in self.query(&on_runtime).await? {
+            let mark = self.layout.runtime_mark(&e.session_id);
+            match reason.filter(|_| e.status.run_state != RunState::Finished) {
+                Some(reason) if e.runtime_unavailable.as_deref() != Some(reason) => {
+                    fsutil::atomic_replace(&mark, reason.as_bytes())?;
+                    if e.runtime_unavailable.replace(reason.to_string()).is_none() {
+                        marked.push(e);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    let _ = std::fs::remove_file(&mark);
+                }
+            }
+        }
+        Ok(marked)
+    }
+
+    async fn delete(&self, sid: &str) -> Result<Vec<String>> {
+        let root = self
+            .read_entry(sid)?
+            .ok_or_else(|| OpenDanError::NotFound(format!("session {sid}")))?;
+        if root.kind != SessionKind::Work {
+            return Err(OpenDanError::InvalidArgument(format!(
+                "session {sid} is a {} session: only work sessions are deleted",
+                root.kind.as_str()
+            )));
+        }
+        let mut all = vec![root];
+        let mut at = 0;
+        while at < all.len() {
+            let below = self.children_of(&[all[at].session_id.clone()]).await?;
+            all.extend(below);
+            at += 1;
+        }
+        let unfinished: Vec<&str> = all
+            .iter()
+            .filter(|e| e.status.run_state != RunState::Finished)
+            .map(|e| e.session_id.as_str())
+            .collect();
+        if !unfinished.is_empty() {
+            return Err(OpenDanError::InvalidArgument(format!(
+                "not finished yet: {} (stop them or wait, then delete)",
+                unfinished.join(", ")
+            )));
+        }
+        let mut deleted = Vec::new();
+        for e in all.iter().rev() {
+            let dir = Path::new(&e.location);
+            if dir.join(STATE_DIR).is_dir() {
+                std::fs::remove_dir_all(dir).map_err(|err| OpenDanError::io(dir, err))?;
+            }
+            let entry = self.layout.registry_entry(&e.session_id);
+            match std::fs::remove_file(&entry) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(OpenDanError::io(&entry, err)),
+            }
+            let _ = std::fs::remove_file(self.layout.unreachable_mark(&e.session_id));
+            let _ = std::fs::remove_file(self.layout.runtime_mark(&e.session_id));
+            self.cache.lock().expect("registry cache").remove(&e.session_id);
+            deleted.push(e.session_id.clone());
+        }
+        deleted.reverse();
+        Ok(deleted)
+    }
+
     async fn post_input(&self, sid: &str, input: &PostedInput) -> Result<u64> {
         let entry = self
             .read_entry(sid)?
@@ -641,6 +722,15 @@ impl SessionRegistry for FsRegistry {
             return Err(OpenDanError::SessionFinished(sid.to_string()));
         }
         input.validate()?;
+        if matches!(input.input, SessionInput::Msg(_))
+            && crate::session::SessionDir::open(&entry.location)
+                .and_then(|d| d.config())
+                .is_ok_and(|c| c.session.input_policy == InputPolicy::None)
+        {
+            return Err(OpenDanError::InvalidArgument(format!(
+                "session {sid} takes no messages: its queue only takes controls (pause, resume, stop). Say it to the plan or the conversation that started it, or stop it and start the work again"
+            )));
+        }
         let queue = entry
             .input_queue
             .clone()
@@ -681,14 +771,19 @@ impl SessionRegistry for FsRegistry {
                     });
                 }
                 let lock_path = sd.state_dir().join(POST_LOCK_FILE);
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .open(&lock_path)
-                    .map_err(|e| OpenDanError::io(&lock_path, e))?;
-                fs2::FileExt::lock_exclusive(&file)
-                    .map_err(|e| OpenDanError::io(&lock_path, e))?;
+                let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let lock = loop {
+                    if let Some(lock) = crate::lock::FileLock::try_acquire(&lock_path)? {
+                        break lock;
+                    }
+                    if std::time::Instant::now() >= give_up {
+                        return Err(OpenDanError::Busy {
+                            resource: lock_path.display().to_string(),
+                            holder: None,
+                        });
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                };
                 // Re-read under the lock.
                 let state = sd.state()?;
                 let stats = client.get_queue_stats(&queue).await.map_err(missing)?;
@@ -702,7 +797,7 @@ impl SessionRegistry for FsRegistry {
                         pending,
                     });
                 }
-                Some(file)
+                Some(lock)
             }
             // The directory is not readable from here (another host): the
             // consumer still validates every record.

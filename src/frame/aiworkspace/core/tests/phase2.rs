@@ -301,6 +301,66 @@ fn a_resource_directory_is_a_value_container_isomorphic_with_a_dir_object() {
 }
 
 #[test]
+fn a_directory_holds_its_own_sub_folders_empty_or_not() {
+    use aiworkspace_core::canonical::{chunk_id, dir_object, file_object, DirMember};
+    use aiworkspace_core::materialize::{dir_object_of, ObjectSink};
+    use aiworkspace_core::types::dir_payload_from_dir_object;
+    struct Sink;
+    impl ObjectSink for Sink {
+        fn put_object(&mut self, t: &str, text: &str) -> aiworkspace_core::WsResult<String> {
+            Ok(aiworkspace_core::canonical::named_object(t, &serde_json::from_str(text).unwrap())?.0)
+        }
+        fn put_file(&mut self, bytes: &[u8]) -> aiworkspace_core::WsResult<String> {
+            Ok(file_object(bytes.len() as u64, &chunk_id(bytes))?.0)
+        }
+    }
+    let mut ws = MemWorkspace::new();
+    let (fid, _) = file_object(5, &chunk_id(b"hello")).unwrap();
+    ws.store.assets.insert(fid.clone(), AssetInfo { object_id: fid.clone(), media_type: "text/plain".into(), size: 5 });
+    // an empty sub-folder is a `folder` member; a folder may hold names below it and other folders (UI 框架 PRD Q25)
+    let seq = ws.ok(json!([{ "op": "entity.create", "entity_id": "d", "type_id": TYPE_DIR, "parent_id": DATA_ID, "order_key": "a", "name": "d",
+        "payload": { "members": { "empty": { "kind": "folder" }, "docs": { "kind": "folder" }, "docs/a.txt": { "kind": "file", "object_id": fid }, "docs/old": { "kind": "folder" } } } }]));
+    assert_eq!(ws.store.entities["d"].payload["members"]["empty"], json!({ "kind": "folder" }));
+    // one level more inside an empty folder: a change of this directory, nothing else is created
+    let entities = ws.store.entities.len();
+    let seq2 = ws.ok(json!([{ "op": "dir.set_member", "entity_id": "d", "name": "empty/2026", "member": { "kind": "folder" }, "expect": { "rev": 0 } }]));
+    assert_eq!(ws.store.entities.len(), entities);
+    assert!(!ws.store.refs.iter().any(|r| r.src_entity_id == "d" && r.kind == "member"));
+    // a folder takes no other key; a name is a file or a folder, never both
+    assert_eq!(code(&ws.fail(json!([{ "op": "dir.set_member", "entity_id": "d", "name": "x", "member": { "kind": "folder", "entity_id": "d" }, "expect": { "rev": 0 } }]))), "INVALID_SCHEMA");
+    assert_eq!(code(&ws.fail(json!([{ "op": "dir.set_member", "entity_id": "d", "name": "docs/a.txt/b", "member": { "kind": "folder" }, "expect": { "rev": 0 } }]))), "INVALID_SCHEMA");
+    assert_eq!(code(&ws.fail(json!([{ "op": "dir.set_member", "entity_id": "d", "name": "docs", "member": { "kind": "file", "object_id": fid }, "expect": { "rev": seq } }]))), "INVALID_SCHEMA");
+    assert_eq!(code(&ws.fail(json!([{ "op": "entity.create", "entity_id": "bad", "type_id": TYPE_DIR, "parent_id": DATA_ID, "order_key": "b",
+        "payload": { "members": { "a": { "kind": "file", "object_id": fid }, "a/b": { "kind": "file", "object_id": fid } } } }]))), "INVALID_SCHEMA");
+    // removing a folder with what is under it is one Commit; one undo brings all of it back
+    let seq3 = ws.ok(json!([
+        { "op": "dir.remove_member", "entity_id": "d", "name": "docs", "expect": { "rev": seq } },
+        { "op": "dir.remove_member", "entity_id": "d", "name": "docs/a.txt", "expect": { "rev": seq } },
+        { "op": "dir.remove_member", "entity_id": "d", "name": "docs/old", "expect": { "rev": seq } }]));
+    let names = |ws: &MemWorkspace| ws.store.entities["d"].payload["members"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(names(&ws), ["empty", "empty/2026"]);
+    ws.undo(seq3).map_err(|f| f.to_json()).unwrap();
+    assert_eq!(names(&ws), ["docs", "docs/a.txt", "docs/old", "empty", "empty/2026"]);
+    // its text lists folders as `name/`
+    let text = aiworkspace_core::body::read_body(&ws.store, &Access::full("alice"), &ws.store.entities["d"], &json!({}), None).unwrap()["text"].as_str().unwrap().to_string();
+    assert!(text.contains("empty/2026/") && text.contains("docs/old/"), "{text}");
+    // materialized: an empty folder is the empty DirObject, a folder holding members is said by them
+    let (empty, _) = dir_object(&[]).unwrap();
+    let (id, total) = dir_object_of(&ws.store, &ws.store.entities["d"], &mut Sink, 0).unwrap();
+    let (expect, _) = dir_object(&[
+        DirMember { name: "docs/a.txt".into(), object_id: fid.clone(), size: 5, is_file: true },
+        DirMember { name: "docs/old".into(), object_id: empty.clone(), size: 0, is_file: false },
+        DirMember { name: "empty/2026".into(), object_id: empty.clone(), size: 0, is_file: false },
+    ]).unwrap();
+    assert_eq!((id, total), (expect, 5));
+    // and an empty DirObject that is not an imported child comes back as a folder
+    let payload = dir_payload_from_dir_object(&json!({ "body": { "empty": empty } }), &std::collections::BTreeMap::new()).unwrap();
+    assert_eq!(payload["members"]["empty"], json!({ "kind": "folder" }));
+    ws.undo(seq2).map_err(|f| f.to_json()).unwrap();
+    assert_eq!(names(&ws), ["docs", "docs/a.txt", "docs/old", "empty"]);
+}
+
+#[test]
 fn two_trees_and_system_nodes() {
     let mut ws = MemWorkspace::new();
     // the system nodes exist from the start and are untouchable
@@ -310,11 +370,11 @@ fn two_trees_and_system_nodes() {
         assert_eq!(code(&ws.fail(json!([{ "op": "entity.rename", "entity_id": id, "name": "x", "expect": { "rev": 0 } }]))), "INVALID_OPERATION");
     }
     assert_eq!(ws.store.edges[CANVAS_CONTENT_ID].parent_id, DATA_ID);
-    // a surface needs its content folder under canvas-content; nothing but surfaces goes under `surfaces`
+    // a surface needs its content folder under canvas-content; nothing but surfaces and canvas folders goes under `surfaces`
     assert_eq!(code(&ws.fail(json!([{ "op": "entity.create", "entity_id": "s-bad", "type_id": TYPE_CONTAINER, "parent_id": SURFACES_ID, "order_key": "a",
         "payload": { "kind": "surface" } }]))), "INVALID_SCHEMA");
-    assert_eq!(sub(&ws.fail(json!([{ "op": "entity.create", "entity_id": "f-bad", "type_id": TYPE_CONTAINER, "parent_id": SURFACES_ID, "order_key": "a",
-        "payload": { "kind": "folder" } }]))), "CHILD_NOT_ALLOWED");
+    assert_eq!(sub(&ws.fail(json!([{ "op": "entity.create", "entity_id": "g-bad", "type_id": TYPE_CONTAINER, "parent_id": SURFACES_ID, "order_key": "a",
+        "payload": { "kind": "group" } }]))), "CHILD_NOT_ALLOWED");
     assert_eq!(sub(&ws.fail(json!([{ "op": "entity.create", "entity_id": "p-bad", "type_id": TYPE_CONTAINER, "parent_id": SURFACES_ID, "order_key": "a",
         "payload": { "kind": "page" } }]))), "CHILD_NOT_ALLOWED");
     ws.ok(json!(surface("s1", "free")));
@@ -358,6 +418,68 @@ fn two_trees_and_system_nodes() {
     assert_eq!(find("c1")["view_type"], "table");
     assert_eq!(find("c1")["source_id"], "t1");
     assert!(find("s1").get("icon").is_none());
+}
+
+fn folder(id: &str, parent: &str, title: &str) -> Value {
+    json!({ "op": "entity.create", "entity_id": id, "type_id": TYPE_CONTAINER, "parent_id": parent, "order_key": "a", "payload": { "kind": "folder", "title": title } })
+}
+
+fn surface_in(id: &str, parent: &str, title: &str) -> Vec<Value> {
+    vec![
+        json!({ "op": "entity.create", "entity_id": format!("{id}-content"), "type_id": TYPE_CONTAINER, "parent_id": CANVAS_CONTENT_ID, "order_key": "a",
+                "payload": { "kind": "folder", "system": "surface_content", "surface_id": id, "title": title } }),
+        json!({ "op": "entity.create", "entity_id": id, "type_id": TYPE_CONTAINER, "parent_id": parent, "order_key": "b",
+                "payload": { "kind": "surface", "layout": { "mode": "flow" }, "title": title, "content_folder_id": format!("{id}-content") } }),
+    ]
+}
+
+/// Canvas folders (UI 框架 PRD §4.1.1, Q5, K1): real folders under `surfaces`, any depth, holding canvases and folders
+/// only; their names follow their titles; a canvas's path runs through them; they stay in their tree, go only when
+/// empty, and a grant on one covers the canvases in it.
+#[test]
+fn canvas_folders_nest_and_hold_canvases_only() {
+    use aiworkspace_core::path;
+    let mut ws = MemWorkspace::new();
+    ws.ok(json!([folder("f-diary", SURFACES_ID, "日记"), folder("f-nov", "f-diary", "2026/11"), folder("f-diary2", SURFACES_ID, "日记")]));
+    let mut ops = surface_in("s1", "f-nov", "11-13");
+    ops.extend(surface_in("s2", SURFACES_ID, "首页"));
+    ws.ok(json!(ops));
+    let name = |ws: &MemWorkspace, id: &str| ws.store.entities[id].name.clone().unwrap();
+    assert_eq!((name(&ws, "f-diary"), name(&ws, "f-nov"), name(&ws, "f-diary2")), ("日记".into(), "2026-11".into(), "日记-2".into()));
+    let full = Access::full("alice");
+    assert_eq!(path::path_of(&ws.store, &full, "s1").unwrap(), "/surfaces/日记/2026-11/11-13");
+    assert_eq!(path::resolve(&ws.store, &full, "/surfaces/日记/2026-11/11-13").unwrap(), "s1");
+    assert_eq!(aiworkspace_core::plan::canvas_surfaces(&ws.store).unwrap().iter().map(|e| e.entity_id.as_str()).collect::<Vec<_>>(), vec!["s1", "s2"]);
+    // data, Blocks and groups never go into a canvas folder; canvases never into a data folder; no system role
+    ws.ok(json!([folder("data-f", DATA_ID, "资料")]));
+    assert_eq!(sub(&ws.fail(json!([table("t-bad", "f-diary")]))), "CHILD_NOT_ALLOWED");
+    assert_eq!(sub(&ws.fail(json!([cell("c-bad", "f-diary", None, "label", json!({ "x": 0, "y": 0, "w": 1, "h": 1 }))]))), "CHILD_NOT_ALLOWED");
+    assert_eq!(sub(&ws.fail(json!(surface_in("s-bad", "data-f", "x")))), "CHILD_NOT_ALLOWED");
+    assert_eq!(code(&ws.fail(json!([{ "op": "entity.create", "entity_id": "f-sys", "type_id": TYPE_CONTAINER, "parent_id": "f-diary", "order_key": "z",
+        "payload": { "kind": "folder", "system": "shows" } }]))), "INVALID_SCHEMA");
+    // moving a canvas into another folder changes its path, not its id; a folder never crosses trees
+    let rev = ws.store.edges["s1"].struct_rev;
+    let moved = ws.ok(json!([{ "op": "tree.move", "entity_id": "s1", "new_parent_id": "f-diary2", "order_key": "a", "expect": { "rev": rev } }]));
+    assert_eq!(path::path_of(&ws.store, &full, "s1").unwrap(), "/surfaces/日记-2/11-13");
+    assert_eq!(sub(&ws.fail(json!([{ "op": "tree.move", "entity_id": "f-nov", "new_parent_id": DATA_ID, "order_key": "a" }]))), "CHILD_NOT_ALLOWED");
+    assert_eq!(sub(&ws.fail(json!([{ "op": "tree.move", "entity_id": "data-f", "new_parent_id": "f-diary", "order_key": "a" }]))), "CHILD_NOT_ALLOWED");
+    assert_eq!(sub(&ws.fail(json!([{ "op": "tree.move", "entity_id": "data-f", "new_parent_id": SURFACES_ID, "order_key": "a" }]))), "CHILD_NOT_ALLOWED");
+    ws.ok(json!([{ "op": "tree.move", "entity_id": "f-nov", "new_parent_id": SURFACES_ID, "order_key": "c" }]));
+    assert_eq!(path::path_of(&ws.store, &full, "f-nov").unwrap(), "/surfaces/2026-11");
+    // a grant on a folder covers the canvases in it, wherever they came from
+    let bob = Access::granted("bob", CapSet::NONE, [("f-diary2".to_string(), CapSet::of(Cap::Read).union(CapSet::of(Cap::Update)))]);
+    assert!(bob.can(&ws.store, "s1", Cap::Update).unwrap());
+    assert!(!bob.can(&ws.store, "s2", Cap::Read).unwrap());
+    // only an empty canvas folder goes; undo puts the canvas back where it was
+    let f = ws.fail(json!([{ "op": "entity.delete", "entity_id": "f-diary2", "expect": { "rev": ws.store.entities["f-diary2"].life_rev } }]));
+    assert_eq!(sub(&f), "FOLDER_NOT_EMPTY", "{f}");
+    let f = ws.fail(json!([{ "op": "entity.delete", "entity_id": "f-diary2", "subtree": { "delete": ["s1"] }, "expect": { "rev": ws.store.entities["f-diary2"].life_rev } }]));
+    assert_eq!(sub(&f), "FOLDER_NOT_EMPTY", "{f}");
+    ws.ok(json!([{ "op": "entity.delete", "entity_id": "f-diary", "expect": { "rev": ws.store.entities["f-diary"].life_rev } }]));
+    assert!(!ws.store.entities["f-diary"].alive());
+    assert!(ws.undo(moved).is_ok());
+    assert_eq!(ws.store.edges["s1"].parent_id, "f-nov");
+    assert_eq!(path::path_of(&ws.store, &full, "s1").unwrap(), "/surfaces/2026-11/11-13");
 }
 
 #[test]
@@ -459,13 +581,13 @@ fn cells_without_source_and_block_definitions() {
 }
 
 fn analysis(prompt: &str, context: &str) -> Value {
-    json!({ "schema_version": "wish.analysis.v2", "status": "ready", "prompt": prompt, "context_prompt": context,
-            "output_contract": { "results": [{ "name": "摘要", "type": "richtext", "approach": "direct" }] }, "checks": [], "blockers": [], "warnings": [] })
+    json!({ "schema_version": "wish.analysis.v3", "status": "ready", "prompt": prompt, "context_prompt": context,
+            "output_contract": { "results": [{ "name": "摘要", "type": "richtext" }] }, "checks": [], "blockers": [], "warnings": [] })
 }
 
 fn wish(id: &str, parent: &str, inputs: Value) -> Value {
     json!({ "op": "entity.create", "entity_id": id, "type_id": TYPE_WISH, "parent_id": parent, "order_key": "w", "name": id,
-            "payload": { "title": "许愿格", "prompt": "总结表格", "executor": "mock", "inputs": inputs,
+            "payload": { "title": "许愿格", "prompt": "总结表格", "executor": "xllm", "inputs": inputs,
                          "output": { "container_id": parent, "name": "摘要", "type": TYPE_RICHTEXT }, "output_mode": "overwrite" } })
 }
 
@@ -499,7 +621,7 @@ fn wishes_dependency_records_freshness_and_relations() {
         { "entity_id": "t1", "selector": { "kind": "table_field_values", "field_id": "n" }, "version": { "mode": "follow", "rev": n_values } },
         { "entity_id": "r1", "selector": { "kind": "doc_key", "key": "p:owner" }, "version": { "mode": "fixed", "rev": owner_rev } }
     ]);
-    let derived = json!({ "wish_id": "w1", "run_id": "run-1", "executor": "mock", "simulated": true, "inputs": read_set });
+    let derived = json!({ "wish_id": "w1", "run_id": "run-1", "executor": "xllm", "inputs": read_set });
     let apply = ws.ok(json!([
         { "op": "entity.create", "entity_id": "sum-1", "type_id": TYPE_RICHTEXT, "parent_id": "s1-content", "order_key": "x", "name": "摘要",
           "payload": { "content": { "type": "doc", "content": [{ "type": "paragraph", "attrs": { "block_id": "p1" }, "content": [{ "type": "text", "text": "共 1 行（模拟）" }] }] } } },
@@ -541,7 +663,7 @@ fn wishes_dependency_records_freshness_and_relations() {
     assert_eq!(f["changed_inputs"][0]["selector"]["field_id"], "n");
     assert_eq!(entity_freshness(&ws.store, &alice, "w1").unwrap()["status"], "stale");
     // the same stale result seen through an upstream dependency: upstream_stale, not current
-    let derived2 = json!({ "wish_id": "w1", "run_id": "run-2", "executor": "mock",
+    let derived2 = json!({ "wish_id": "w1", "run_id": "run-2", "executor": "xllm",
                            "inputs": [{ "entity_id": "sum-1", "version": { "mode": "follow", "rev": ws.store.entities["sum-1"].content_rev } }] });
     ws.ok(json!([record("r-down", "s1-content", "x"), { "op": "entity.set_derived", "entity_id": "r-down", "derived": derived2 }]));
     let f = entity_freshness(&ws.store, &alice, "r-down").unwrap();
@@ -562,7 +684,7 @@ fn wishes_dependency_records_freshness_and_relations() {
     assert_eq!(f["status"], "unavailable");
     assert_eq!(f["inputs"][2]["reason"], "deleted");
     // unreadable input: unknown, with nothing about it leaked
-    let carol = Access { principal: "carol".into(), ws_caps: CapSet::NONE, scoped: [("s1-content".to_string(), CapSet(Cap::Read as u16)), ("s1".to_string(), CapSet(Cap::Read as u16))].into() };
+    let carol = Access::granted("carol", CapSet::NONE, [("s1-content".to_string(), CapSet(Cap::Read as u16)), ("s1".to_string(), CapSet(Cap::Read as u16))]);
     let f = entity_freshness(&ws.store, &carol, "sum-1").unwrap();
     assert_eq!(f["status"], "unknown");
     assert_eq!(f["inputs"][0]["readable"], false);
@@ -590,7 +712,7 @@ fn delete_precheck_names_only_readable_referrers() {
     ws.ok(json!(surface("s1", "free")));
     ws.ok(json!([table("t1", DATA_ID), cell("c1", "s1", Some("t1"), "table", json!({ "x": 0, "y": 0, "w": 1, "h": 1 }))]));
     // bob reads the data tree but not the Surface holding the Block that references the table
-    let bob = Access { principal: "bob".into(), ws_caps: CapSet(Cap::Delete as u16), scoped: [(DATA_ID.to_string(), CapSet(Cap::Read as u16 | Cap::Delete as u16))].into() };
+    let bob = Access::granted("bob", CapSet(Cap::Delete as u16), [(DATA_ID.to_string(), CapSet(Cap::Read as u16 | Cap::Delete as u16))]);
     let env = ws.env("bob", "human", None, false);
     let life = ws.store.entities["t1"].life_rev;
     let f = ws.commit_with(&bob, &env, &MemWorkspace::request(json!([{ "op": "entity.delete", "entity_id": "t1", "expect": { "rev": life } }]))).err().unwrap().to_json();
@@ -634,7 +756,7 @@ fn packages_carry_dependency_records_and_refuse_old_formats() {
     let mut ws = MemWorkspace::new();
     ws.ok(json!(surface("s1", "free")));
     ws.ok(json!([table("t1", DATA_ID), record("r1", "s1-content", "林"),
-        { "op": "entity.set_derived", "entity_id": "r1", "derived": { "wish_id": "t1", "run_id": "run-9", "executor": "mock", "inputs": [{ "entity_id": "t1", "version": { "mode": "follow", "rev": 1 } }] } },
+        { "op": "entity.set_derived", "entity_id": "r1", "derived": { "wish_id": "t1", "run_id": "run-9", "executor": "xllm", "inputs": [{ "entity_id": "t1", "version": { "mode": "follow", "rev": 1 } }] } },
         cell("c1", "s1", Some("r1"), "record", json!({ "x": 1, "y": 2, "w": 3, "h": 4 }))]));
     let mut sink = Mem::default();
     let m = materialize(&ws.store, &mut sink, &|_| Ok(true), &mut |_, _| None).unwrap();

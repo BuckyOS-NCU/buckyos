@@ -1,8 +1,8 @@
-/* UI improvement §16 (UI-M01…M07): the canvas on a phone. An emulated Pixel 7 (touch, small screen) opens a
- * workspace in its tab: a free canvas in view mode, one toolbar with the canvas icon and switcher, and Miro-style
- * touch gestures driven through real multi-touch input (CDP), not synthetic DOM events; a flow page in edit mode
- * (§16.5). What the phone does to the view is asserted on the camera transform; that it leaves the shared work
- * state alone, through a desktop. */
+/* UI improvement §16 (UI-M01…M07), UI 框架 PRD §6: the canvas on a phone. An emulated Pixel 7 (touch, small screen)
+ * opens a workspace in its tab: a free canvas in view mode under the phone's title zone (canvas icon and picker, the
+ * phone's main menu), and Miro-style touch gestures driven through real multi-touch input (CDP), not synthetic DOM
+ * events; a flow page in edit mode (§16.5). What the phone does to the view is asserted on the camera transform; that it
+ * leaves the shared work state alone, through a desktop. */
 
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -36,6 +36,15 @@ class Fingers {
     await this.up()
   }
 }
+
+/** ⋯ of the phone's title zone, then the entries by test id, each a tap (a group goes one level in). */
+async function phoneMenu(page: Page, ...testIds: string[]) {
+  await page.getByTestId('aiws-main-menu').tap()
+  const menu = page.getByTestId('aiws-main-menu-list')
+  for (const id of testIds) await menu.getByTestId(id).tap()
+}
+
+const zoomOf = async (page: Page) => Number(await page.getByTestId('aiws-canvas').getAttribute('data-zoom'))
 
 async function openOnPhone(page: Page, workspaceId: string) {
   await openWorkspacePage(page, ALICE, workspaceId)
@@ -82,25 +91,25 @@ function quarterly(api: Api, title: string) {
   return api.demo(ALICE, 'quarterly', title)
 }
 
-test('UI-M01 a phone opens the canvas in view mode with one toolbar: canvas icon and switcher, zoom; it writes nothing a desktop would inherit except the canvas it chose', async ({ page, api, browser }) => {
+test('UI-M01 a phone opens the canvas in view mode under its title zone: canvas icon and picker, its main menu; it writes nothing a desktop would inherit except the canvas it chose', async ({ page, api, browser }) => {
   const ws = await quarterly(api, `phone ${Date.now()}`)
   await openOnPhone(page, ws.workspace_id)
   const viewport = page.viewportSize()!
 
-  // view mode only, one toolbar: no main toolbar, no object toolbar, no data-source view
+  // view mode only, the phone's title zone (UI 框架 PRD §6.1): no desktop title zone, collaboration zone or object toolbar
   await expect(page.getByTestId('aiws-workspace')).toHaveAttribute('data-phone', 'true')
   await expect(page.getByTestId('aiws-canvas')).toHaveAttribute('data-mode', 'view')
   await expect(page.getByTestId('aiws-main-toolbar')).toHaveCount(0)
+  await expect(page.getByTestId('aiws-view-toolbar')).toHaveCount(0)
   await expect(page.getByTestId('aiws-object-toolbar')).toHaveCount(0)
-  await expect(page.getByTestId('aiws-main-menu')).toHaveCount(0)
-  const toolbar = page.getByTestId('aiws-view-toolbar')
+  const toolbar = page.getByTestId('aiws-phone-title')
   await expect(toolbar.getByTestId('aiws-surface-switch')).toContainText('经营分析')
   await expect(toolbar.getByTestId('aiws-surface-switch').locator('svg').first()).toBeVisible()
-  await expect(toolbar.getByTestId('aiws-zoom-menu')).toBeVisible()
+  await expect(toolbar.getByTestId('aiws-main-menu')).toBeVisible()
   const bar = (await toolbar.boundingBox())!
   expect(bar.x).toBeGreaterThanOrEqual(0)
   expect(bar.x + bar.width).toBeLessThanOrEqual(viewport.width + 0.5)
-  for (const id of ['aiws-annotate-start', 'aiws-zoom-menu', 'aiws-principal', 'aiws-share']) {
+  for (const id of ['aiws-surface-switch', 'aiws-main-menu']) {
     const b = (await toolbar.getByTestId(id).boundingBox())!
     expect(b.x + b.width, id).toBeLessThanOrEqual(viewport.width)
   }
@@ -114,14 +123,15 @@ test('UI-M01 a phone opens the canvas in view mode with one toolbar: canvas icon
     expect(b.x + b.width, id).toBeLessThanOrEqual(viewport.width)
   }
 
-  // the switcher: the workspace's canvases to pick from, nothing to rename, delete or create
+  // the picker over the whole screen (UI 框架 PRD §4.1.1): a phone makes flow pages and folders (§6.5, Q9), every row has its menu
   await toolbar.getByTestId('aiws-surface-switch').tap()
   const list = page.getByTestId('aiws-surface-list')
   await expect(list).toBeVisible()
   await expect(list.getByTestId('aiws-workspace-title')).toContainText('phone')
   await expect(list.getByTestId('aiws-phone-note')).toBeVisible()
-  await expect(list.getByTestId('aiws-surface-new')).toHaveCount(0)
-  await expect(list.getByTestId('aiws-surface-more-sf-detail')).toHaveCount(0)
+  await expect(list.getByTestId('aiws-surface-new')).toContainText('新建流式页')
+  await expect(list.getByTestId('aiws-surface-new-folder')).toBeVisible()
+  await expect(list.getByTestId('aiws-surface-more-sf-detail')).toBeVisible()
   const listBox = (await list.boundingBox())!
   expect(listBox.x + listBox.width).toBeLessThanOrEqual(viewport.width)
   await list.getByTestId('aiws-surface-item-sf-detail').getByRole('menuitem').tap()
@@ -129,12 +139,13 @@ test('UI-M01 a phone opens the canvas in view mode with one toolbar: canvas icon
   await expect(toolbar.getByTestId('aiws-surface-switch')).toContainText('数据明细')
   await expect(list).toHaveCount(0)
 
-  // the phone's own viewport: zoom in with the toolbar; a desktop afterwards still edits, at its own viewport
-  await toolbar.getByTestId('aiws-zoom-menu').tap()
-  await page.getByTestId('aiws-zoom-25').tap()
-  await expect(page.getByTestId('aiws-zoom')).toHaveText('25%')
+  // the phone's own viewport: zoom with the menu's 视图; a desktop afterwards still edits, at its own viewport
+  await phoneMenu(page, 'aiws-menu-view', 'aiws-menu-zoom', 'aiws-menu-zoom-25')
+  await expect.poll(() => zoomOf(page)).toBe(0.25)
   await page.waitForTimeout(1500) // the user work state goes out after 0.8 s
-  const desktop = await browser.newContext({ viewport: { width: 1600, height: 1000 } })
+  // a desktop of its own: a context made in this file starts from the phone it uses (Pixel 7: touch, a phone's screen)
+  const desktop = await browser.newContext({ userAgent: devices['Desktop Chrome'].userAgent, isMobile: false, hasTouch: false, deviceScaleFactor: 1,
+    viewport: { width: 1600, height: 1000 }, screen: { width: 1600, height: 1000 } })
   const other = await desktop.newPage()
   await openWorkspacePage(other, ALICE, ws.workspace_id)
   await expect(other.getByTestId('aiws-workspace')).not.toHaveAttribute('data-phone', 'true')
@@ -190,7 +201,7 @@ test('UI-M02 touch gestures on the phone canvas: pan and glide, pinch, double ta
   const kept = cam.toScreen(anchor)
   expect(Math.abs(kept.x - mid.x)).toBeLessThan(4)
   expect(Math.abs(kept.y - mid.y)).toBeLessThan(4)
-  await expect(page.getByTestId('aiws-zoom')).toHaveText(`${Math.round(cam.zoom * 100)}%`)
+  expect(Math.abs(await zoomOf(page) - cam.zoom)).toBeLessThan(0.01)
 
   // two-finger tap zooms out ×2 about the fingers; double tap on a blank spot zooms in ×2 there
   const zoom1 = cam.zoom
@@ -209,9 +220,8 @@ test('UI-M02 touch gestures on the phone canvas: pan and glide, pinch, double ta
   expect(Math.abs(still.x - spot.x)).toBeLessThan(2)
   expect(Math.abs(still.y - spot.y)).toBeLessThan(2)
 
-  // double tap on a Block zooms to it (no editing in view mode); first the whole canvas again, from the toolbar
-  await page.getByTestId('aiws-zoom-menu').tap()
-  await page.getByTestId('aiws-fit-all').tap()
+  // double tap on a Block zooms to it (no editing in view mode); first the whole canvas again, from the menu's 视图
+  await phoneMenu(page, 'aiws-menu-view', 'aiws-menu-fit-all')
   cam = await settled(page)
   const sales = cam.toScreen({ x: 40 + 450, y: 190 + 60 })
   await fingers.tap(sales)
@@ -222,12 +232,13 @@ test('UI-M02 touch gestures on the phone canvas: pan and glide, pinch, double ta
   expect(fitted.x).toBeGreaterThanOrEqual(cam.box.x)
   await expect(page.locator('.aiws-frame-block.is-editing')).toHaveCount(0)
 
-  // a tap selects the Block under the finger (the near toolbar shows); a tap on a blank spot clears it
+  // a tap selects the Block under the finger (its context window shows, UI 框架 PRD §6.4); a tap on a blank spot clears it
   await page.waitForTimeout(400)
   const center = { x: fitted.x + fitted.width / 2, y: fitted.y + fitted.height / 2 }
   await fingers.tap(center)
   await expect(page.getByTestId('aiws-selection-blk-sales')).toBeVisible()
-  await expect(page.getByTestId('aiws-near-toolbar')).toBeVisible()
+  await expect(page.getByTestId('aiws-ctxwin')).toBeVisible()
+  await expect(page.getByTestId('aiws-near-toolbar')).toHaveCount(0)
   // the selected table scrolls under one finger; the camera stays
   const scroller = page.getByTestId('aiws-canvas-block-blk-sales').locator('.aiws-table-scroll')
   expect(await scroller.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true)
@@ -260,14 +271,14 @@ test('UI-M02 touch gestures on the phone canvas: pan and glide, pinch, double ta
   expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(seq)
 })
 
-test('UI-M03 the guide on a phone (第三期规划 §7.3): offered in the one toolbar, taps turn its pages, the canvas stays put', async ({ page, api }) => {
+test('UI-M03 the guide on a phone (第三期规划 §7.3): offered in the phone\'s menu, taps turn its pages, the canvas stays put', async ({ page, api }) => {
   const ws = await api.rpc(ALICE, 'ws.create', { title: `m03 ${Date.now()}` }) as { workspace_id: string; epoch: string }
   const fixture = JSON.parse(readFileSync(resolve('../aiworkspace/fixtures/presentation/commits.json'), 'utf8')) as { commits: { operations: Record<string, unknown>[] }[] }
   for (const [index, commit] of fixture.commits.entries()) expect((await api.commit(ALICE, ws, commit.operations, `presentation/${index + 1}`)).status).toBe('accepted')
   await openOnPhone(page, ws.workspace_id)
-  // the phone has no show (a stage needs a large screen); the guide is there
-  await expect(page.getByTestId('aiws-show-start')).toHaveCount(0)
-  await page.getByTestId('aiws-guide-start').tap()
+  // the phone's menu (UI 框架 PRD §6.1): 协作 → 使用引导 ▸ → the guide
+  await phoneMenu(page, 'aiws-menu-collab', 'aiws-menu-guides')
+  await page.getByTestId('aiws-main-menu-list').locator('.aiws-menu-phone > .aiws-menu-entry > button[role="menuitem"]').first().tap()
   await expect(page.getByTestId('aiws-guide')).toHaveAttribute('data-step', 'g1')
   await page.screenshot({ path: 'test-results/aiworkspace-presentation/m03-guide.png' })
   await page.getByTestId('aiws-guide-next').tap()
@@ -276,13 +287,18 @@ test('UI-M03 the guide on a phone (第三期规划 §7.3): offered in the one to
   await expect(page.getByTestId('aiws-guide')).toHaveCount(0)
 })
 
-test('UI-M04 notes on a phone: a public link guest long-presses blank canvas or uses the annotate menu, writes the note and finds it where it asked', async ({ page, api }) => {
+test('UI-M04 notes on a phone: a public link guest long-presses blank canvas, writes the note and finds it where it asked; the menu\'s 评论 comments on the selection', async ({ page, api }) => {
   const ws = await quarterly(api, `m04 ${Date.now()}`)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'public', capabilities: ['read', 'comment'] })
+  // public: anonymous access on and `@guest` reading and commenting (权限需求 §4.2)
+  await api.rpc(ALICE, 'acl.set_anonymous', { workspace_id: ws.workspace_id, enabled: true })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: '@guest', allow: ['read', 'comment'] }] })
   await openWorkspacePage(page, { guest: true }, ws.workspace_id)
-  await expect(page.getByTestId('aiws-principal')).toHaveAttribute('data-guest', 'true')
   await expect(page.getByTestId('aiws-canvas')).toHaveAttribute('data-mode', 'view')
-  const principal = await page.getByTestId('aiws-principal').getAttribute('data-principal')
+  // who this guest is: the "me" row of the online members, from the status bar (UI 框架 PRD §6.1)
+  await page.getByTestId('aiws-status-online').tap()
+  const principal = await page.getByTestId('aiws-member-me').getAttribute('data-principal')
+  expect(principal).toMatch(/guest/)
+  await page.getByTestId('aiws-members-sheet-close').tap()
   const fingers = await Fingers.of(page)
   const notes = async () => (await api.outline(ALICE, ws.workspace_id)).filter((e: { type_id: string; view_type?: string; parent_id: string }) => e.type_id === 'buckyos.cell' && e.view_type === 'note' && e.parent_id === 'sf-analysis')
   const seq = await api.headSeq(ALICE, ws.workspace_id)
@@ -316,17 +332,11 @@ test('UI-M04 notes on a phone: a public link guest long-presses blank canvas or 
   await expect(page.getByTestId(`aiws-note-${placed.source_id}`)).toContainText('手机上的便签')
   await page.screenshot({ path: 'test-results/aiworkspace-mobile/m04-placed.png' })
 
-  // the annotate button offers both kinds of annotation; a note from there lands in the middle of the view
-  await page.getByTestId('aiws-annotate-start').tap()
-  await expect(page.getByTestId('aiws-annotate-object')).toBeVisible()
-  await page.screenshot({ path: 'test-results/aiworkspace-mobile/m04-annotate-menu.png' })
-  await page.getByTestId('aiws-annotate-note').tap()
-  await draft.getByLabel('便签内容').fill('第二张')
-  await draft.getByTestId('aiws-note-draft-save').tap()
-  await expect.poll(async () => (await notes()).length).toBe(2)
-  const second = (await notes()).find((n: { entity_id: string }) => n.entity_id !== placed.entity_id)
-  const centre = (await camera(page)).toWorld({ x: cam.box.x + cam.box.width / 2, y: cam.box.y + cam.box.height / 2 })
-  expect(Math.abs(second.placement.x + second.placement.w / 2 - centre.x)).toBeLessThan(cam.box.width / cam.zoom / 2)
+  // the menu's 评论 (协作) comments on what is selected — the new note —, in the comments sheet
+  await expect(page.getByTestId(`aiws-selection-${placed.entity_id}`)).toBeVisible()
+  await phoneMenu(page, 'aiws-menu-collab', 'aiws-menu-annotate')
+  await expect(page.locator('[data-testid="aiws-side-panel"][data-tab="annotations"]')).toBeVisible()
+  await page.screenshot({ path: 'test-results/aiworkspace-mobile/m04-annotate.png' })
 })
 
 test('UI-M05 a mind map on a phone (脑图 R14): read and fold only — a tap selects a node, its fold handle folds the branch, nothing is written', async ({ page, api }) => {
@@ -351,7 +361,7 @@ test('UI-M05 a mind map on a phone (脑图 R14): read and fold only — a tap se
   expect((await api.rpc(ALICE, 'ws.get_info', { workspace_id: ws.workspace_id })).head_seq).toBe(seq)
 })
 
-test('UI-M06 extension controls on a phone (扩展控件 M6): read-only — a tap on an HTML control mounts nothing, a composite lays out, nothing is written', async ({ page, api }) => {
+test('UI-M06 extension controls on a phone (扩展控件 M6; 控件机制 G22, H3): they run — an HTML control by itself, a tap elsewhere does not stop it, a composite lays out; looking writes nothing', async ({ page, api }) => {
   const ws = await api.freeCanvas(ALICE, `phone ext ${Date.now()}`)
   const card = await api.build(ALICE, ws.workspace_id, 'hello-card')
   const board = await api.build(ALICE, ws.workspace_id, 'hello-board')
@@ -365,42 +375,45 @@ test('UI-M06 extension controls on a phone (扩展控件 M6): read-only — a ta
   await openOnPhone(page, ws.workspace_id)
   await expect(page.getByTestId('aiws-canvas')).toHaveAttribute('data-mode', 'view')
   const seq = (await api.rpc(ALICE, 'ws.get_info', { workspace_id: ws.workspace_id })).head_seq
-  await expect(page.getByTestId('aiws-html-static-hc')).toBeVisible()
-  await expect(page.getByTestId('aiws-run-toggle')).toHaveCount(0)
-  await expect(page.getByTestId('aiws-html-start-hc')).toHaveCount(0)
+  // phones run controls like any view mode (G22): HTML controls by themselves (owner 11-12), one in a composite's slot too
+  await expect(page.getByTestId('aiws-html-active-hc')).toBeVisible()
+  await expect(page.getByTestId('aiws-html-active-bc')).toBeVisible()
+  await expect(page.locator('.aiws-html-frame')).toHaveCount(2)
+  await expect(page.frameLocator('.aiws-html-frame').first().locator('#title')).toHaveText('Phone')
+  // a tap on the empty canvas selects nothing and stops nothing
   const fingers = await Fingers.of(page)
-  const box = (await page.getByTestId('aiws-html-static-hc').boundingBox())!
-  await fingers.tap({ x: box.x + box.width / 2, y: box.y + box.height / 2 })
+  const viewport = page.viewportSize()!
+  await fingers.tap({ x: viewport.width - 30, y: viewport.height - 120 })
   await page.waitForTimeout(500)
-  await expect(page.locator('.aiws-html-frame')).toHaveCount(0)
+  await expect(page.locator('.aiws-html-frame')).toHaveCount(2)
+  await expect(page.getByTestId('aiws-html-active-hc')).toBeVisible()
   await expect(page.getByTestId('aiws-composite-chrome-board')).toBeVisible()
-  await expect(page.getByTestId('aiws-html-static-bc')).toBeVisible()
   expect((await api.rpc(ALICE, 'ws.get_info', { workspace_id: ws.workspace_id })).head_seq).toBe(seq)
 })
 
-test('UI-M07 a phone edits a flow page (§16.5): typing in place, ＋ inserts below, ⋮⋮ moves (menu or finger) and deletes, undo in the one toolbar; a free canvas stays view only', async ({ page, api }) => {
+test('UI-M07 a phone edits a flow page (§16.5): typing in place, ＋ inserts above, ⋮⋮ moves (menu or finger) and deletes, undo in the title zone; a free canvas stays view only', async ({ page, api }) => {
   const ws = await api.sample(ALICE, `phone flow ${Date.now()}`)
   // a free canvas after the page
   expect((await api.commit(ALICE, ws, [
     { op: 'entity.create', entity_id: 'free-content', type_id: 'buckyos.container', parent_id: 'canvas-content', order_key: 'z', payload: { kind: 'folder', system: 'surface_content', surface_id: 'free', title: 'Free' } },
     { op: 'entity.create', entity_id: 'free', type_id: 'buckyos.container', parent_id: 'surfaces', order_key: 'z', payload: { kind: 'surface', layout: { mode: 'free' }, title: 'Free', content_folder_id: 'free-content' } },
   ])).status).toBe('accepted')
-  const order = async () => ((await api.rpc(ALICE, 'doc.list_children', { workspace_id: ws.workspace_id, entity_id: 'surface-main' })).children as { entity_id: string; type_id: string }[])
+  const order = async () => ((await api.children(ALICE, ws.workspace_id, 'surface-main')) as { entity_id: string; type_id: string }[])
     .filter((child) => child.type_id === 'buckyos.cell').map((child) => child.entity_id)
   const frame = (id: string) => page.getByTestId(`aiws-cell-frame-${id}`)
   const viewport = page.viewportSize()!
   await openWorkspacePage(page, ALICE, ws.workspace_id)
   await expect(page.getByTestId('aiws-conn')).toHaveAttribute('data-status', 'live')
 
-  // the page opens in edit mode with the phone's one toolbar, now with undo / redo
+  // the page opens in edit mode under the phone's title zone, now with undo / redo
   await expect(page.getByTestId('aiws-workspace')).toHaveAttribute('data-phone', 'true')
   await expect(page.getByTestId('aiws-flow')).toHaveAttribute('data-mode', 'edit')
   await expect(page.getByTestId('aiws-main-toolbar')).toHaveCount(0)
   await expect(page.getByTestId('aiws-object-toolbar')).toHaveCount(0)
-  const toolbar = page.getByTestId('aiws-view-toolbar')
+  const toolbar = page.getByTestId('aiws-phone-title')
   await expect(toolbar.getByTestId('aiws-undo')).toBeDisabled()
   await expect(toolbar.getByTestId('aiws-redo')).toBeDisabled()
-  for (const id of ['aiws-surface-switch', 'aiws-undo', 'aiws-redo', 'aiws-annotate-start', 'aiws-principal', 'aiws-share']) {
+  for (const id of ['aiws-surface-switch', 'aiws-undo', 'aiws-redo', 'aiws-main-menu']) {
     const b = (await toolbar.getByTestId(id).boundingBox())!
     expect(b.x, id).toBeGreaterThanOrEqual(0)
     expect(b.x + b.width, id).toBeLessThanOrEqual(viewport.width)
@@ -422,7 +435,13 @@ test('UI-M07 a phone edits a flow page (§16.5): typing in place, ＋ inserts be
   await expect.poll(async () => JSON.stringify(await api.ast(ALICE, ws.workspace_id, 'notes'))).toContain('typed on a phone')
   await expect(toolbar.getByTestId('aiws-undo')).toBeEnabled()
 
-  // ＋ inserts below the Block; its menu stays on the screen
+  // the Block being edited shows ＋ on the line above it: it inserts before the Block; its menu stays on the screen
+  await expect(page.getByTestId('aiws-flow-plus-cell-notes')).toBeVisible()
+  await expect(page.getByTestId('aiws-flow-plus-cell-all-tasks')).toBeHidden()
+  const notesPlus = (await page.getByTestId('aiws-flow-plus-cell-notes').boundingBox())!
+  const notesGrip = (await page.getByTestId('aiws-flow-handle-cell-notes').boundingBox())!
+  expect(Math.abs(notesPlus.x - notesGrip.x)).toBeLessThan(1)
+  expect(notesPlus.y + notesPlus.height).toBeLessThanOrEqual(notesGrip.y + 1)
   await page.getByTestId('aiws-flow-plus-cell-notes').tap()
   const addMenu = page.getByTestId('aiws-flow-add-menu')
   await expect(addMenu).toBeVisible()
@@ -431,14 +450,19 @@ test('UI-M07 a phone edits a flow page (§16.5): typing in place, ＋ inserts be
   expect(addBox.x + addBox.width).toBeLessThanOrEqual(viewport.width)
   await addMenu.getByTestId('aiws-flow-add-table').tap()
   await expect.poll(async () => (await order()).length).toBe(6)
-  const added = (await order())[1]
-  expect(await order()).toEqual(['cell-notes', added, 'cell-all-tasks', 'cell-open-tasks', 'cell-info', 'cell-diagram'])
+  const added = (await order())[0]
+  expect(await order()).toEqual([added, 'cell-notes', 'cell-all-tasks', 'cell-open-tasks', 'cell-info', 'cell-diagram'])
   await expect(frame(added)).toBeVisible()
 
-  // ⋮⋮ opens the Block's menu: move down
+  // ⋮⋮ opens the Block's menu: move down, twice
+  await page.getByTestId(`aiws-flow-handle-${added}`).tap()
+  await page.getByTestId('aiws-flow-block-menu').getByTestId(`aiws-down-${added}`).tap()
+  await expect.poll(order).toEqual(['cell-notes', added, 'cell-all-tasks', 'cell-open-tasks', 'cell-info', 'cell-diagram'])
   await page.getByTestId(`aiws-flow-handle-${added}`).tap()
   await page.getByTestId('aiws-flow-block-menu').getByTestId(`aiws-down-${added}`).tap()
   await expect.poll(order).toEqual(['cell-notes', 'cell-all-tasks', added, 'cell-open-tasks', 'cell-info', 'cell-diagram'])
+  await expect.poll(() => page.locator('[data-testid="aiws-flow"] > [data-cell-id]').evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-cell-id'))))
+    .toEqual(['cell-notes', 'cell-all-tasks', added, 'cell-open-tasks', 'cell-info', 'cell-diagram'])
 
   // a finger on ⋮⋮ drags the Block: dropped on the lower half of the table below, it goes after it
   const fingers = await Fingers.of(page)
@@ -478,5 +502,5 @@ test('UI-M07 a phone edits a flow page (§16.5): typing in place, ＋ inserts be
   await list.getByTestId('aiws-surface-item-free').getByRole('menuitem').tap()
   await expect(page.getByTestId('aiws-canvas')).toHaveAttribute('data-mode', 'view')
   await expect(toolbar.getByTestId('aiws-undo')).toHaveCount(0)
-  await expect(toolbar.getByTestId('aiws-zoom-menu')).toBeVisible()
+  await expect(toolbar.getByTestId('aiws-main-menu')).toBeVisible()
 })

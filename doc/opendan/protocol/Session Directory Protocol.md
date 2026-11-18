@@ -2,6 +2,8 @@
 
 版本 6 · 2026-10-10（2026-10-16 补 TodoList：`todos.json`、`todo_view_rev`；2026-11-02 删 Todo 执行器的 `call.todo` / `entry.todo`，补 `paused` / `resume_run`；同日补 `retry`（可重试错误的退避与上限）与窗口上限）· 由 `libopendan` 反写（`src/protocol/{config,behavior,report,state,summary,worklog,misc,input}.rs`）。Round / Step / Turn 的定义见 [LLM Context readme](../../llm_context/readme.md)；本文的 Turn 规则均为当前实现。
 
+本文定义持久字段、状态提交与恢复。stop / pause / resume 的控制语义、Goal 生命周期与子工作级联统一见 [Session Control Protocol](<Session Control Protocol.md>)；下文保留这些行为对应的存储表示，不另设控制规则。
+
 ## 1. 目录结构
 
 ```text
@@ -41,7 +43,6 @@
 | kind / 前缀 | 身份键规则 |
 |---|---|
 | work / `work` | 无幂等键时生成随机身份键；带幂等键时用 `work-H("work", agent_did, creator_principal, key)` 预留短 ID |
-| self_check / `sc` | `sc-H("self_check", agent_did)` 预留单例短 ID |
 | goal / `goal` | `goal-H("goal", agent_did, goal_id, epoch)` 预留短 ID（epoch 为十进制字符串）；只由宿主为 Goal 创建（[Agent State Protocol](<Agent State Protocol.md>) §9），普通创建与子 Session 创建都拒绝 `goal` 类 |
 | ui / `ui` | `ui-H("ui", agent_did, route_key)` 预留短 ID；`route_key` 是该 Session 绑定的会话（OpenDAN 的 UI Session 用 msg-center 的 `MailboxAddress` 字符串）。未给 `route_key` 的本地对话补一个 `local:<幂等键或 uuid>`。OpenDAN 的多代 UI Session 用 `ui-H("ui", agent_did, route_key, <代次>)` 预留各代短 ID |
 
@@ -57,7 +58,7 @@ Schema：`schema/session_config.schema.json`。要点：
   "config_rev": 1,                    // 运行中可改的字段（订阅）变化时 +1
   "session": {
     "session_id": "...", "agent_did": "did:bns:jarvis.alice",
-    "kind": "work | self_check | ui | goal", "class": "work",
+    "kind": "work | ui | goal", "class": "work",
     "created_at_ms": 0,
     "created_by": { "principal": "app:app2@alice", "via": "app" },
     "driver": { "principal": "app:app2@alice" },   // 推进身份，创建后不变
@@ -85,7 +86,7 @@ Schema：`schema/session_config.schema.json`。要点：
     "frozen": { "catalog_rev": "sha256:…", "frozen_at_ms": 0, "frozen_by": "app:xagent@alice",   // 从 Agent 的 behavior 目录冻结（schema behavior_config）
                 "identity": { "role": "…", "self": "…", "i18n": {} },
                 "behaviors": { "plan": { /* BehaviorConfig */ } } },
-    "initial_inputs": [ /* 无输入队列的 Session：创建时给出的 msg 逻辑记录（≤ 64），发布后不变 */ ],
+    "initial_inputs": [ /* 队列不收 msg 的 Session（input_policy = none）或无队列的 Session：创建时给出的 msg 逻辑记录（≤ 64），发布后不变 */ ],
     "on_init": null, "on_input": null, "on_context_switch": null,   // 输入模板；缺省内建
     "input": { "mode": "batch | single", "media": "reference | inline" },
     "history_render": { "drop_kinds": ["created","turn_started","input_batch","decide","compaction",
@@ -96,8 +97,9 @@ Schema：`schema/session_config.schema.json`。要点：
   "runtime": { "requirement": { "runtime_id": null, "tools": ["node"], "app_tools": [] },
                "tool_plan": null, "env": {},
                "frozen": { "runtime_id": "host", "connector": { "type": "node_executor", "node_did": "did:dev:…", "profile_id": "agent-…" },
-                           "revision": 3, "selected_by": "explicit | inherited | default", "computer": "observe",
-                           "baseline": "standard | extended", "platform": { "os": "macos", "arch": "aarch64", "shell": "zsh" } } },
+                           "revision": 3, "selected_by": "explicit | inherited | private",
+                           "caps": { "os": "macos", "arch": "aarch64", "shell": "zsh", "baseline": "standard | extended" },
+                           "grant": { "ops": ["exec", "read", "…"], "roots": ["/Users/owner"], "computer": "observe", "expires_at_ms": null } } },
   "workspace": null | { "workspace_id": "ws-…", "access": "read_write" },
   "workspace_binding": null | { "workspace_id": "ws-…", "revision": 1, "location_revision": 1, "runtime_host": "host:…", "location": { "runtime_id": "local", "directory": "/abs" }, "access": "read_write" },
   "artifact_id": null,
@@ -127,7 +129,7 @@ Schema：`schema/session_config.schema.json`。要点：
   - 会话的初始 behavior（`prompt.behavior`）没有自己的条目时，视为使用会话基础配置的 `switch_context` 目标。交接到其它没有条目的 behavior 是配置错误：当前 Turn 以 `failed` 结束（`last_error.kind = behavior_config`）；发生在子 context 内时作为失败结果交回调用方。
   - 表在每次推进开始时校验，非法（未知 mode、fork 带 system 等）则不做任何推理。旧的 `extensions.opendan.process_modes` 不再接受。
 - 工具 `call_behavior({behavior, task})`：在 `prompt.llm_context.tools.tools` 中以 `{"name": "call_behavior"}` 显式装配后，context 可以用工具调用（或 behavior action）发起子 context（目标必须是 `create_sub_context` / `fork`）。调用只登记，交接在调用方的 run 段结束时发生（§8）。只由会话自己的 runner 提供；xllm 不具备该工具，拒绝接手装配了它的 run。
-- `session.policy`（版本 6）：Session 模板（`work / ui / self_check / goal`，`agent.toml [session.<class>]` 可覆盖）在创建时解析的结果，随配置冻结。
+- `session.policy`（版本 6）：Session 模板（`work / ui / goal`，`agent.toml [session.<class>]` 可覆盖）在创建时解析的结果，随配置冻结。
   - `completion`：`natural`（缺省）沿用普通 function-call `Done` 和已获准结束报告的 end_condition；`explicit_report` 仅获准的结束报告可正常关闭 Session。普通 Done 完成 Turn：有输入队列则等待，无队列则 `finished + failed`、`missing_end_report`。`agent.toml [session.<class>] completion` 可覆盖模板值。
   - `wait_user_msg`：`WAIT_USER_MSG` 在该 Session 的含义。`allowed`：Turn 保持打开等输入（已交付回复则完成该 Turn）；`finish_failed`：Turn 以 `failed` 关闭、Session `finished + failed`，`last_error.kind = needs_user_input`，问题写入 report（不影响工具 / task 等待）；`finish_completed`：按交付结果处理；`end_turn`：没有人此刻回答，Turn 以 `completed` 关闭（带着它的问题），Session 不结束、继续等下一个输入（Goal Session）。
   - `observe`：`off` 不注入半订阅快照；`events` 注入快照；`events_and_active` 另在受控输入里给出活动 Session 列表。`load_hints`：是否装配 hints。
@@ -135,7 +137,7 @@ Schema：`schema/session_config.schema.json`。要点：
 - `session.origin.report`：父 Session 怎么收到这个子 Session 的汇报（由创建者选择）：`final` = 需要关注（等输入 / 等决定）与结束；`progress` = 另加进度；`none` 或缺省 = 不推送，父只能读登记表。父对子的关注是隐式的（按 `origin.parent_session` 查登记表），不需要订阅，父也不需要输入队列，见 [Session Input Protocol](<Session Input Protocol.md>) §10。
 - `prompt.frozen`（版本 5）：Session 构造时从 Agent 的 behavior 目录（[Agent State Protocol](<Agent State Protocol.md>) §7）冻结的身份文本与 behavior 配置。范围 = 入口 behavior + `meta.next` 声明的闭包；之后目录的修改不影响该 Session。冻结同时为每个 behavior 生成 `extensions.opendan.behaviors.<name>`（`mode / prompt / input / llm_context / inherit`；入口 behavior 未声明进入模式时为 `switch_context`，其它 behavior 未声明是配置错误），应用提供的同名条目与之不同则拒绝。创建者读不到目录时留空，由驱动者在首次推进（绑定之后、任何推理之前）冻结并替换配置（`config_rev + 1`）；首次用到闭包之外的 behavior 时补冻结（`config_rev + 1`，worklog `control_applied{command: behavior_frozen}`）。有 `frozen` 的 Session 的 system 段只来自冻结材料与配置；既没有 `frozen` 又读不到目录时 RecoveryBlocked，不猜。未采用冻结的 Session 仍直接使用 `extensions.opendan.behaviors`。
 - Goal Session（`kind = goal`，模板 `goal`）：`turns = unbounded`、`wait_user_msg = end_turn`、有输入队列、`observe = events_and_active`、`load_hints = true`，隐式主动订阅 `_goal_activation`（`source = system:goal`）。一个 Activation = 一个逻辑 Turn；Session 只随它的 Goal 结束（§4 `state.goal`）。模板槽 `prompt.goal_activation`（behavior 的 `prompt.goal_activation` 覆盖）是 Goal 头的模板，变量 `goal`（缺省用内建 XML `<goal_activation …>`）。
-- `prompt.initial_inputs`（版本 5）：没有输入队列的 Session 的首批输入。只允许 `msg` 记录；Runner 把它当作只读输入源 `_bootstrap`（index 从 1 起），按同样的路由、消费策略与 receipt 消费，`state.inputs["_bootstrap"]` 记录进度，确认是空操作。有输入队列的 Session 不使用它（投递到队列）。
+- `prompt.initial_inputs`（版本 5）：队列只收控制命令的 Session（`session.input_policy = none`，例如纯 Work）以及没有队列的 Session 的首批输入。队列收 msg 的 Session 不能带它（首批消息投进队列）。只允许 `msg` 记录；Runner 把它当作只读输入源 `_bootstrap`（index 从 1 起），按同样的路由、消费策略与 receipt 消费，`state.inputs["_bootstrap"]` 记录进度，确认是空操作。有输入队列的 Session 不使用它（投递到队列）。
 - 输入队列是可选的：`channels.inputs` 为空的 Session 不能被投递（`post` / 队列型控制返回错误），stop 由驱动进程自己发起，等待工具 / task / 子 Session 仍靠轮询推进。
 
 ## 4. state.json（提交点）
@@ -156,7 +158,7 @@ Schema：`schema/session_state.schema.json`。
   "result": null | { "answer": "...", "answer_ref": "report.md", "artifact_ref": {...}, "discard_report": {...} },
   "turn_seq": 5,                               // 最近打开的 Turn 编号（第一个输入批次之前为 0）
   "open_turn": null | { "index": 5, "run_id": "…", "input_seq": 3, "hook": "on_input",
-                        "inputs": ["q#121"], "has_msg": true, "at_ms": 0 },   // 进行中的 Turn；(run_id, input_seq) = 打开它的输入批次；has_msg：输入里有消息（不只是事件），为 false 时省略
+                        "inputs": ["q#121"], "has_msg": true, "msg_keys": ["cymsg:…"], "at_ms": 0 },   // 进行中的 Turn；(run_id, input_seq) = 打开它的输入批次；has_msg：输入里有消息（不只是事件），为 false 时省略；msg_keys：其中各条消息的 key（ObjId），control(retract) 按它认出要撤回的输入是不是这个 Turn 的，空时省略
   "turns_completed": 4,                        // 以 completed 关闭的 Turn 数
   "current_behavior": "plan", "process_entry": "plan",
   "process_stack": [ { "entry": "plan", "role": "parked | caller", "run_id": "…",
@@ -192,7 +194,7 @@ Schema：`schema/session_state.schema.json`。
   "one_line_status": "…", "last_error": null,   // Turn 开着时是实时一句话（调用带 intent 就是 intent，否则 running <tool> / waiting for N task(s) …），Turn 关闭、结束时写结局句
   "pending_decision": null, "stop_requested": false,
   "turn_stop_requested": false,                // 只停当前 Turn（control(stop, scope = turn)，或 Goal Session 收到的任何 stop），false 时省略
-  "paused": { "at_ms": 0, "reason": "…", "by": "…", "in_run": true },   // control(pause)：不再推理，直到 resume（缺省省略）；in_run：暂停打断了 Turn 内的 run
+  "paused": { "source": "user", "at_ms": 0, "reason": "…", "by": "…", "in_run": true },   // 暂停：不再推理，直到 resume（缺省省略）。source：user（control(pause)）| parent（父 Session 被暂停）| interrupted（宿主重启时它正在工作，§10）| goal（它的 Goal 休眠了），见 Session Control Protocol §5；in_run：暂停打断了 Turn 内的 run
   "resume_run": false,                         // resume 之后，被暂停在 Turn 内的 run 从检查点接着推理（运行时清除；false 时省略）
   "retry": { "attempts": 2, "since_ms": 0, "not_before_ms": 0, "applied_input_seq": 3 },   // live run 连续停在可重试错误：已排的重试次数、第一次的时刻、下次推理不早于、当时 run 收到的批次数（缺省省略），见 §7“run 的预算”
   "goal": null | {                             // Goal Session：它拥有的 Goal State 与进行中的 Activation，见下
@@ -223,7 +225,7 @@ Schema：`schema/session_state.schema.json`。
 - `outbox`（出站，驱动者配置了出站 sink 时才产生）：Turn 关闭的那次提交里，由 `reply` 给出信封、sink 填内容，生成完整的 MsgObject 连同幂等键写入，`status = pending`；`created_at_ms` 在这里定死。提交之后驱动者把 `pending` 条目按序交给 sink：成功 → `sent`（记 `msg_id` / `deliveries`）；被拒 → `failed`（记 `error`，不重试）；没送到 → 保持 `pending`，`attempts + 1`，退避后由之后的 drive 原样重发（同一个键、同一个 MsgObject，ObjId 不变）。发送失败不让 Turn 失败，也不阻塞后续输入；排在它后面的条目等它。`channels.outbound` 存在而 `reply` 的 `to / to_session / kind` 与它不一致时，条目直接记为 `failed`（`route_mismatch`），不发送。有父 Session 的 Session、以及回复对象是 Agent 自己时不产生条目。已结束（`sent` / `failed`）的条目保留最近 16 条供展示。
 - `outbox[].purpose`（可缺省，缺省为 `reply`）与占位：`reply` 是 Turn 的回复作为独立消息；`placeholder` 是 Turn 进行中发出的占位（键 `<sid>:<turn>:placeholder`）；`final_edit` 是以 `relates_to = {rel: edit, target: <占位 ObjId>}` 替换占位的回复。占位只在 Turn 绑定了 task、由消息打开、打开超过 `placeholder_delay`（默认 3 秒）或已发生首次工具调用、且 sink 给出占位消息（宿主有文案、目标可编辑）时产生。Turn 关闭时：占位从未交给 sink（`pending` 且 `attempts = 0`）则撤销占位、回复照常独立发出；否则回复是 `final_edit`，sink 没有正文可给时用结束摘要收尾。占位被拒或放弃后，同一 Turn 的 `final_edit` 改回 `reply`。Turn 的 task id 以顶层扩展字段 `agent_task = {task_id}` 写在锚点消息上（占位，或没有占位时的回复本身），edit 不带。
 - `turn_tasks`（驱动者配置了 task 钩子 `TurnTaskSink` 时才产生）：`{turn, task_id, has_msg, opened_at_ms, placeholder?, closed?, summary?, error?, reported}`。Turn 打开后幂等创建 task（键 = `(session_id, turn)`）并写入绑定；关闭 Turn 的那次提交写 `closed`（TurnStatus）与结果摘要；task 服务收下终态后 `reported = true`，没送到则由之后的 drive 重试。绑定独立于 outbox 的清理，已上报的保留最近 64 条。task 创建失败的 Turn 没有绑定，也就没有占位，回复照常。子 Session 的 `origin.parent_task` 取自创建它时父 Session 打开的 Turn 的绑定，它的每个 Turn 的 task 都以此为父。
-- `run_state` 迁移：`created → ready ⇄ running ⇄ waiting → finished`；进入 finished 后不能回到 running。stop / decide 只能由驱动者执行，其它参与方投递 control。
+- `run_state` 迁移：`created → ready ⇄ running ⇄ waiting → finished`；进入 finished 后不能回到 running。`paused` 是独立的控制字段，不是 `run_state` 的一个值；run.json 的 `status = paused` 也可能只是等待依赖或上下文交接，不能据此判定 Session 被用户暂停。控制只能由驱动者执行，其它参与方投递 control，作用域与合法状态见 [Session Control Protocol](<Session Control Protocol.md>)。
 - `goal`（Goal Session）：首次推进时从 `state/goals/<id>/state.json` 载入（文件不存在 → 初始 Goal State；文件仍是更早的 epoch → 宿主尚未准备，拒绝推进）。之后 Goal State 只在本 Session 的提交里改变（`state.rev + 1`）：打开 Activation 的 receipt（`extra.goal_activation`）写入 `activation`；消费某个 Work 的结束（`_child` finished）把它记入 `state.absorbed` 与 `activation.absorbed`；`control(goal_skills)` 改 `state.current_skills`；关闭 Turn 的那次提交取出 `activation`、按 Goal 结果更新 Goal State、把 Activation 记录放进 `unwritten`。提交之后驱动者发布（`write_state`，再按 `(epoch, seq)` 追加 `unwritten`），最后提交 `published_rev` 与清空的 `unwritten`；中途崩溃由之后的 drive 补写，只写一次、不重新推理（fixture 16）。`ending` 由 Goal 的状态闸门写入（Goal 归档 / 达成 / 进入新 epoch），随后按 `stop_requested` 的路径在下一个提交点结束 Session（`outcome` 取 `ending.outcome`；`cascade = false` 时不向子 Session 投递 stop）。
 
 **逻辑 Turn**（当前实现）：Turn = AgentSession 的一次逻辑 Input → result，与 run、`LLMContext` Outcome、输入批次 `(run_id, input_seq)` 都不一一对应，不能用 run 数或 Outcome 数推算 Turn 数。
@@ -263,7 +265,7 @@ Schema：`schema/session_state.schema.json`。
 | assistant_message | 同上（只用于 function call run） | run_id, turn, assistant, tool_calls[{call_id, tool, args(键排序), effect}]：一次模型 response（一个 Round）及其原生工具调用；不是 Step |
 | step | 同上（只用于 behavior run） | run_id, turn, step_index, behavior?, assistant, actions[{call_id, tool, args(键排序), effect}], correction?（解析失败 / 策略拒绝产生的合成纠错 Step 为 true，缺省 false） |
 | action_result | 同上 | run_id, turn, call_id, status(ok/error/unresolved/cancelled), result：原生工具结果（function call，`[not executed]` / `[unresolved…` 记为 unresolved，`[cancelled]` 记为 cancelled）或 action 结果（behavior） |
-| outcome | run 结束 / 挂起 / 保活 / 中途重写 | run_id, turn, kind（run 结束：done/wait/process_done/budget/error/stopped；run 为它启动的工作保活：wait；process 挂起：suspended；中途重写：context_rewritten）, next_behavior?, report?。保留 run 的其它结果（上下文上限暂停、中断、可重试错误）不写 outcome |
+| outcome | run 结束 / 挂起 / 保活 / 中途重写 | run_id, turn, kind（run 结束：done/wait/process_done/budget/error/stopped；run 为它启动的工作保活：wait；显式暂停：paused；process 挂起：suspended；中途重写：context_rewritten）, next_behavior?, report?。其它可恢复挂起的快照与恢复规则见 §7、§10；outcome 描述本段执行的结局，不单独决定 Session 是否暂停或 Turn 是否关闭 |
 | turn_ended | 关闭 Turn 的同一次提交 | run_id（stop 时没有 run 则为空串）, turn, status(completed/failed/budget_exhausted/stopped), at_ms |
 | compaction | 生成新 summary.json | summary_start_seq, made_by |
 | decide | 应用 decide | decision, by, report |
@@ -439,11 +441,11 @@ XML 的 `<report end="true">` 与工具 `is_end=true` 使用相同的宿主校�
 { "schema": "opendan.binding/6", "runtime_id": "rt-…", "connector": "native | node_executor", "target": {"host":"host:…", "uid":"1000"}, "workdir": "/abs", "workspace": null, "bound_at_ms": 0, "bound_by": "rn-…" }
 ```
 
-- `runtime.frozen`（2026-11-04 起为**工作 runtime**，[runtime 工作模型 TODO](../../../notepads/opendan-agent-runtime-lifecycle-todo.md) §0.3）：创建时由 `api::freeze_runtime` 一次解析并冻结的工作 runtime——`shell()` 在哪执行。UI / chat 类 Session 恒为私有 runtime（`selected_by: private`）；其它 Session 取显式 `--runtime`（`explicit`）> 继承父 Session（`inherited`）> 私有（`private`）；owner 的默认 runtime 不参与。冻结的是 `runtime_id`、`connector`（`native | node_executor | ssh`）、`revision`、`caps`（声明的 `baseline`、已知平台）与 `grant`，恢复与重试只用它。`connector` 为 `node_executor` 的 Session 经 Node Executor 执行，binding 的 `workdir` 是节点上的目录（`C:\…` 等按目标 OS 书写，控制侧不 canonicalize），`target` 含 node_did / profile_id / store_id / workdir_roots / identity_mode。幂等重建比较 `runtime.runtime_id()`：同 idempotency key 换 runtime 是冲突。
+- `runtime.frozen`（2026-11-04 起为**工作 runtime**，[runtime 工作模型 TODO](../../../notepads/opendan-agent-runtime-lifecycle-todo.md) §0.3）：创建时由 `api::freeze_runtime` 一次解析并冻结的工作 runtime——`shell()` 在哪执行。UI / chat 类 Session 恒为私有 runtime（`selected_by: private`）；其它 Session 取显式 `--runtime`（`explicit`）> 继承父 Session（`inherited`）> 私有（`private`）；owner 的默认 runtime 不参与。冻结的是 `runtime_id`、`connector`（`native | node_executor | ssh`）、`revision`、`caps`（声明的 `baseline`、已知平台）与 `grant`（这台 runtime 允许什么：`ops / roots / computer / expires_at_ms`），恢复与重试只用它。登记表条目的 `runtime_id` 是它的副本。`connector` 为 `node_executor` 的 Session 经 Node Executor 执行，binding 的 `workdir` 是节点上的目录（`C:\…` 等按目标 OS 书写，控制侧不 canonicalize），`target` 含 node_did / profile_id / store_id / workdir_roots / identity_mode。幂等重建比较 `runtime.runtime_id()`：同 idempotency key 换 runtime 是冲突。
 - **两种 Session 形态**：工作 runtime 为私有的 Session 是多 runtime session——有 `agent-session`，可经 `agent-session run --runtime <id|workspace> [--cwd] [--timeout] -- <cmd>`（单条命令，`--` 后多个词是命令和它的参数，一个词是交给目标 shell 的命令行；走宿主的 `runtime_exec`，记录在 Session 的 `state/runtime_ops/<op_id>.json` 与 Agent 的 `state/runtime_ops/`）与 `agent-session copy` 访问任何已登记且可用的 runtime；工作 runtime 为其它 runtime 的 Session 是单机 session——只有 runtime 层工具（`shell / read / write …`），节点上**不安装** `agent-session` helper，不能访问别的 runtime，它要的材料由创建者事先放到位（或 workspace 就在那台机器上）。binding 不为此升版。
 
 - 首次推进时用不覆盖发布写入（`link` / `renameat2(NOREPLACE)`），之后不变；runtime_id 不同必须拒绝（RuntimeMismatch），发生在任何推理之前。
-- workdir：始终是工作 runtime 上的 Session 工作目录（私有为 SessionDir，节点为 `<账户 home>/.opendan/<agent>/sessions/<sid>`，账户 home 由执行器 `describe` 报告且必须在授予的 roots 内）；显式 Runtime workdir 必须与它一致，否则绑定失败。Workspace 不改变默认位置：`binding.workspace` 保存创建时固化的 `workspace_binding` 快照（其 `location.runtime_id` 即 Workspace 的 runtime，可与 session-runtime 不同），运行及恢复时核验稳定身份和位置修订，失效终态失败、不重绑。见 [Agent Workspace Protocol](<Agent Workspace Protocol.md>)。版本 4 的 binding（workdir 曾是 Workspace 目录）读取即阻塞，不迁移。
+- workdir：始终是工作 runtime 上的 Session 工作目录（私有为 SessionDir，节点为 `<账户 home>/.opendan/<agent>/sessions/<sid>`，账户 home 由执行器 `describe` 报告；不在授予的 roots 内时改用第一个 root 下的 `.opendan/<agent>`）；显式 Runtime workdir 必须与它一致，否则绑定失败。Workspace 不改变默认位置：`binding.workspace` 保存创建时固化的 `workspace_binding` 快照（其 `location.runtime_id` 即 Workspace 的 runtime，可与 session-runtime 不同），运行及恢复时核验稳定身份和位置修订，失效终态失败、不重绑。见 [Agent Workspace Protocol](<Agent Workspace Protocol.md>)。版本 4 的 binding（workdir 曾是 Workspace 目录）读取即阻塞，不迁移。
 - 节点 Session 的工作目录里另有 `.opendan/session.json`（Session 上下文：agent、session、runtime、workdir、`state_url`、workspace 视图）与 `.opendan/session.token`（只对本 Agent 服务、本 Session 有效的 token，24 小时，每次绑定重写）：给节点上的标准工具（`buckyos`、AICC 命令）取服务身份用（`session.service_token`），单机 session 的 `report` 走 runner 的 report 工具，不依赖 helper；节点上恰好装着 `agent-session`（host 的 agent-tools 清单含它）时它仍能经 kRPC（`session.helper / session.task / session.token_refresh`）找 AgentService，但手册不引导单机 session 用它。见 [Agent State Protocol](<Agent State Protocol.md>)。
 - `state/transfers/<transfer_id>.json`：`agent-session copy` 的记录（源 / 目的的 runtime 与实际路径、临时文件、大小、整文件 hash、`transferring | verifying | committed | failed | cancelled`、失败步骤）；同一调用的重试据此核验目标而不重复覆盖。
 - binding.json 核验打开后的 runtime_id、connector、target、workdir，不只比较声明的 connector；每次推进都要幂等修复并核验环境：`.runtime/bin` 按期望集合（tool_plan 墓碑 + `agent-session` 包装脚本）重写，`.manifest.json`（条目 → sha256）最后写入；核验失败（缺文件、内容不符、不可执行）不得推理，下次推进修复。
@@ -454,6 +456,7 @@ XML 的 `<report end="true">` 与工具 `is_end=true` 使用相同的宿主校�
 
 ## 10. 恢复顺序（drive 开头）
 
+0. 宿主重启后的第一次驱动（只对宿主这次启动之前就存在的 Session，由宿主的 Supervisor 在它的第一次登记表扫描期间发起）：取到 session 锁、读到已提交的 `state.json` 之后，先判定这个 Session 重启前是不是正在工作（判定规则见 Session Control Protocol §8）。是的话写 `state.paused`（`source = interrupted`）与 `control_applied{command: pause, input.src: "_runner"}`，本次驱动到此为止：下面的恢复步骤照常在以后的驱动里做，但暂停期间不推理，从检查点继续要等 `resume`。`xagent` 直接驱动的 Session 没有这一步。
 1. 取 session 锁（身份必须等于 `session.driver.principal`）；校验 schema 主版本（`state.json` 必须是 `/6`、`session_config.json` 必须是 `/7`，否则 RecoveryBlocked；不迁移，也不按旧字段读取）。
 2. 登记表 `location` 必须等于本目录，否则不推进。
 3. 截掉 worklog 未提交尾部（文件短于 `committed_bytes` → RecoveryBlocked）。

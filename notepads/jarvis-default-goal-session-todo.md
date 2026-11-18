@@ -2,7 +2,7 @@
 
 日期：2026-10-23
 
-状态：**P0 已实施（2026-10-23，未提交 git，DV 未验收）**，实施记录见 §11；P1、P2 待做。§0–§10 保留为方案与验收标准，与代码不一致处以 §11 为准。
+状态：**P0 已实施（2026-10-23）并已提交；宿主侧 DV 见 §11.6，容器形态未验**，实施记录见 §11；P1、P2 待做，排期见 [Goal Session 继续推进 TODO](opendan-goal-session-next-todo.md) 的 E1、E2。§0–§10 保留为方案与验收标准，与代码不一致处以 §11 为准。
 
 读者：后续 codeagent。路径相对 `buckyos/`，实施前重新核对源码；不要把旧 TODO 的实施记录当作当前接口。
 
@@ -323,7 +323,7 @@ T01–T07 合在一起等于 Memory S 阶段加 Goal 发现加 workflow 加 deci
 ### T02 — 接通可信感知与认知模型
 
 - [x] 将 Runner/CLI 的感知入口接入 Memory facade，补来源、主体、scope、anchors、cites 和幂等；自动 run 摘要仍按 Runtime 证据处理（`runner/consolidation.rs::perceive` + `xagent ctl perceive`；§11.1）。`Caller.default_subjects` 按 T01 已确认的规则由宿主绑定（UI：对话 peer；Work：Origin 创建者；Goal：Goal owner），并在有 Workspace 绑定时附上工作区 id；grants 为同一主体集合加 Agent 自身。模型不能自行扩大主体集合。
-- [ ] （移出本文，见 §8.0）真实 Session 的 recall/read 和推理前 Memory 装配接 `Memory::query_topic/query/read` 与 `ObservationState` 观察路径，绑定可信 Caller grants/base scope，观察状态随 Session 持久化。只有模型输入可靠提交后才接受新 snapshot/read_set，失败显露 unavailable、不推进水位。由 Memory S 阶段 TODO 实施，不能只验证库级读取；本文 P0 不依赖它。
+- [x] （移出本文，见 §8.0；2026-11-09 由[召回接线 TODO](agent-memory-recall-wiring-todo.md) 实施，未提交，V03 的跨会话部分见该文 §8 回放，本机 Zone Agent 的 DV 未做）真实 Session 的 recall/read 和推理前 Memory 装配接 `Memory::query_topic/query/read` 与 `ObservationState` 观察路径，绑定可信 Caller grants/base scope，观察状态随 Session 持久化。只有模型输入可靠提交后才接受新 snapshot/read_set，失败显露 unavailable、不推进水位。由 Memory S 阶段 TODO 实施，不能只验证库级读取；本文 P0 不依赖它。
 - [x] 在 `agent_memory/model.rs`、`state.rs`、`recall.rs` 及 `lib_opendan/memory` 中完成创建时间投影、稳定度、独立证据时间、到期复核与读取展示（schema 4.0）。
 - [x] 收口普通 Session 的 `agent-memory` 写能力：Session shell（StableEnv）内写动词一律 `ReadOnly` 拒绝；管理写入只在非 Session 环境；整理写入只经 `Consolidator` 与当前 lease。
 
@@ -339,7 +339,7 @@ T01–T07 合在一起等于 Memory S 阶段加 Goal 发现加 workflow 加 deci
 - [x] 修改 `opendan` 配置/Loader、GoalHost 和 Jarvis 源模板，接稳定内置目标、独立 behavior、30m机会/2h基线、廉价摘要与恢复状态（`host/maintenance.rs`，`[session.goal.maintenance]`，`behaviors/memory_maintenance.toml`）。
 - [x] pause/archive/disable、重启、多 Agent 隔离、升级（`policy_version` 只 revise 标记）、通用 Goal 不受影响：`tests/memory_maintenance.rs`、`tests/goal_session.rs` 全部通过。
 - [x] status 摘要：`schedule.json.gate` 与 `GoalState.maintenance`，经 `goals.schedule/goals.state` 读出；Goal 头另有 `<memory_maintenance …>` 块。
-- [ ] 按 §2.1 实现 WebUI：Home 的 Goals 区域、`#/goal/<goal_id>` 详情页、activate 操作（实施中，结果见 §11.4）。owner 的 pause/resume/reopen/restart 不需要新入口：`goals.set_status/reopen/restart` 经 Agent State 门面以 `GoalCaller{session: None}` = owner 侧放行，服务端 `authorize_agent_method` 的既有单测 `read_only_agent_writes_only_its_own_state` 已覆盖这三个方法。
+- [x] 按 §2.1 实现 WebUI：Home 的 Goals 区域、`#/goal/<goal_id>` 详情页、activate 与状态操作（已实施，结果见 §11.4；经 zone 网关登录的真实 Zone 未验）。owner 的 pause/resume/reopen/restart 不需要新入口：`goals.set_status/reopen/restart` 经 Agent State 门面以 `GoalCaller{session: None}` = owner 侧放行，服务端 `authorize_agent_method` 的既有单测 `read_only_agent_writes_only_its_own_state` 已覆盖这三个方法。
 
 ### T05 — 发现、确认与正式对象落地
 
@@ -349,6 +349,8 @@ T01–T07 合在一起等于 Memory S 阶段加 Goal 发现加 workflow 加 deci
 - [ ] UI 显式计划请求复用该流程，不能把必须执行的指令仅写成感知后等待默认整理。
 
 ### T06 — 可选 decision 优化
+
+> 2026-11-10 已取消（owner 裁决，见 [Goal Session 继续推进 TODO](opendan-goal-session-next-todo.md) §8 第 12 条）：改用不花 token 的检查脚本，§7 的 decision 预检和验收 V14、V15 不再做，`decision` 配置项随那份 TODO 的 H6 删除。同一次裁决还定了：内置整理 Goal 的检查改成脚本，包里的脚本只是初始状态，Goal 可以自己演化，硬保障对它打开，所以 V01 的“无材料不调用模型”要改成“无材料时只有硬保障那一次”。
 
 - [ ] T02—T05 在无 decision 模型时已能工作，再增加 §7 的异步预检、能力探测、阈值、持久缓存、退避、独立计账与硬预算边界，以及 §7 末尾的 `resume_gate` 回投入口。默认配置保持 `off`。
 - [ ] 启用/禁用 decision 不改变整理语义、授权语义和最大拖延窗口，只改变成本与运行次数。
@@ -477,3 +479,17 @@ Mock/虚拟时钟用于确定性和崩溃测试；集成验收另外验证真实
 5. **WebUI**：Playwright 打开 `http://127.0.0.1:10048/`（`data: krpc`）：Home 的 Goals 区域有内置徽标、`Memory maintenance`、最近 decision `acted`；详情页 `#/goal/g-…` 按 epoch 分组、4 个 Session 链接、Maintenance 块（gate + receipts）、Archive 禁用、`Next opportunity 19:30:00 (gate no_work)`（截图在证据目录）。控制台一条 `405`：页面某个 POST 打到静态目录处理器（`dir_server.rs:693 Method not allowed: POST`），是 debug 形态无登录时 SDK 的请求，与本次改动无关。
 
 - 已知风险：`StaleLease`（锁文件被删重建）只记 `failed` 与 `last_error`，需人工处理；`pending_work` 仍全量 replay（TD-22）；`related_view` 只按 scope 重叠选已知认知，上限 24 条；行为提示词未经真实模型调优。
+
+### 11.7 整理语义、捕获指引与注入显露（2026-11-08）
+
+按[捕获／保留／权重 TODO](agent-memory-capture-retain-weight-todo.md) §6 的 T0–T5 实施，记录、夹具与回放结果在该文 §6 各任务的实施记录里。与本节相关的变化：
+
+- `memory_maintenance.toml` 改为以“整理后应持有的认知列表”为目标：六问准入、按“聚合 → 还原证据关系 → 最小结论 → 对照已知 → 处置 → 复查列表”的顺序、`explicit`／`weight`／`stability` 的取值依据和一组虚构例子；`begin` 的 `rules` 同步给出精简版。
+- §11.2 的 `related_view` 与上面“只按 scope 重叠选已知认知”的风险已改：引用必带、Agent 自身认知总是候选、按与本批材料的词重合排序后截断 24 条。
+- 表达审阅（建议，不是规则）、`explicit` 不能配 `inference`、提交结果带 `pending`／`next`，见需求文档 A.4.1。
+- 行为提示词已用真实模型回放：`cargo test -p libopendan --test memory_replay -- --ignored --nocapture`（夹具 `src/frame/lib_opendan/tests/fixtures/memory_consolidation/`，报告 `src/target/memory-replay/`）。
+
+### 11.8 检查脚本取代宿主 gate（2026-11-11）
+
+[Goal Session 继续推进 TODO](./opendan-goal-session-next-todo.md) 的 H6 实施（记录在该单 §10）：§6.1 的确定性 gate 从宿主（`host/maintenance.rs::decide`）搬进检查脚本 `goal_checks/memory_maintenance.ts`，随 Jarvis 包分发，播种时成为这个 Goal 的脚本；Goal 可以改写它，包升级不覆盖改过的。脚本经宿主的只读调用 `memory.status` 取 Memory 的版本向量和完整检查（完整检查仍在 Rust 里）。`schedule.json.gate` 删除，检查结果记在 `schedule.json` 的 `last_check / stats / check_state`。清理重试、未完成回执由宿主在每个检查槽 drive 一次 Session 完成。`[session.goal.maintenance] decision` 删除（T06 取消）。V01 的“无材料不调用模型”改为“无材料时只有硬保障那一次”（缺省 72 小时，用例 `without_material_only_the_hard_guarantee_infers`）。
+

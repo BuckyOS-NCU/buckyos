@@ -1,31 +1,45 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useMediaQuery } from '@mui/material'
-import { CheckCheck, ChevronRight, House, ImagePlay, LogIn, MessageSquare, MessageSquarePlus, PanelLeftClose, SquarePen, Users } from 'lucide-react'
+import { CheckCheck, ChevronRight, House, X, ImagePlay, LogIn, MessageSquare, MessageSquarePlus, PanelLeftClose, SquarePen, Users } from 'lucide-react'
 import './messagehub.css'
 import { useI18n } from '../../i18n/provider'
 import { ConversationView } from './ConversationView'
 import { ForwardMessageForm } from './ForwardDialog'
-import { InMemoryConversationMessageReader } from './conversation/history/data-source'
-import { useMessageMediaHost } from './conversation/media/context'
-import { MessageMediaHost } from './conversation/media/MessageMediaHost'
-import type { ConversationComposerSubmitPayload } from './conversation/input/ConversationComposer'
+import { InMemoryConversationMessageReader } from '../../components/conversation/history/data-source'
+import type { ConversationMessageReader } from '../../components/conversation/history/types'
+import type { MessageObject } from '../../components/conversation/model/msgobj'
+import { useMessageMediaHost } from '../../components/conversation/media/context'
+import { MessageMediaHost } from '../../components/conversation/media/MessageMediaHost'
 import { EntityDetails } from './EntityDetails'
+import { AgentSessionPanel } from './agentpanel/AgentSessionPanel'
+import { AgentWorklog } from '../../components/conversation/worklog/AgentWorklog'
+import { conversationInputState } from '../../components/conversation/input/inputState'
+import { useSwipe } from '../../components/conversation/swipe'
 import { MessageDetails } from './MessageDetails'
-import type { WorklogDestination } from './conversation/worklog/model'
-import { messageObjId } from './conversation/history/relations'
+import type { WorklogDestination } from '../../components/conversation/worklog/model'
+import { messageObjId } from '../../components/conversation/history/relations'
 import { friendlyDidName } from './api/projection'
 import { EntityList, type EntityPreferencePatch } from './EntityList'
 import type { HeaderMenuItem, HubIdentity } from './EntityListHeader'
 import { CreateGroupForm } from './GroupDialogs'
 import { resolveMessageHubContext, type MessageHubContextRequest, type SharedLaunch } from './launch'
 import { ShareIntake } from './ShareIntake'
-import { useMessageHubStore, useMessageHubReady, useMessageHubRuntime, type OutgoingPayload } from './store'
-import { creationReason, viewerSessionKey } from './sessionModel'
+import { useMessageHubStore, useMessageHubReady, useMessageHubRuntime } from './store'
+import { AgentControlsContext } from '../../components/conversation/agentControls'
+import { ConversationClockContext } from '../../components/conversation/clock'
+import { getAgentPanelSource } from './agentpanel/source'
+import { messageHubClock } from './conversationSource'
+import { creationReason, latestActiveSession, sessionDescription, viewerSessionKey } from './sessionModel'
 import { usePaneResizer } from './paneResize'
 import { WindowDialogProvider, useWindowDialog } from '../../desktop/windows/dialogs'
 import { SessionDetails } from './SessionDetails'
-import { CreateSessionForm, ManageSessionForm, hubButtonClass } from './SessionDialogs'
-import type { MessageHubContext, Session } from './types'
+import { CreateSessionForm, ManageSessionForm } from './SessionDialogs'
+import { hubButtonClass } from '../../components/conversation/DialogFocus'
+import { NewChatForm, type NewChatTarget } from './NewChatDialog'
+import { ProfileDetails } from './ProfileDetails'
+import { confirmGroupAction } from '../../components/conversation/confirmDialog'
+import { ENTITY_INFO_DIALOG_PATH, useSystemDialog, type EntityInfoDialogParams } from '../../sysdlg'
+import type { Entity, MessageHubContext, Session } from './types'
 import { SessionSidebar } from './SessionSidebar'
 import { useNetworkDialogs } from '../../components/network/dialogs'
 import {
@@ -48,7 +62,15 @@ import { didDisplayName } from '../../presentation/model'
 import { useCurrentUser } from '../../presentation/currentUser'
 
 const EMPTY_READER = InMemoryConversationMessageReader.empty()
+/** The Agent panel is a little wider than the other details: its work tree has controls on every row. */
+const AGENT_PANEL_WIDTH = 380
+const AGENT_PANEL_KEY = 'buckyos.messagehub.agentPanelOpen.v1'
+/** Whether the viewer left the Agent panel open on the desktop layout the last time (it never opens by itself otherwise). */
+const agentPanelRemembered = () => { try { return localStorage.getItem(AGENT_PANEL_KEY) === '1' } catch { return false } }
+const rememberAgentPanel = (open: boolean) => { try { if (open) localStorage.setItem(AGENT_PANEL_KEY, '1'); else localStorage.removeItem(AGENT_PANEL_KEY) } catch { /* this page only */ } }
+type DetailsTarget = 'entity' | 'session' | 'message' | 'profile' | 'agent' | 'worklog'
 const EMPTY_SESSIONS: Session[] = []
+const EMPTY_TIMELINE: readonly MessageObject[] = []
 const noConfirmation = () => undefined
 
 interface MessageHubViewProps {
@@ -112,7 +134,7 @@ function MessageHubOwnerGate({ initialEntityId, initialSessionId, initialMessage
   if (ownerStatus.phase === 'error') return <div role="alert" className="flex h-full flex-col items-center justify-center gap-3 p-6"><p>{t('messagehub.loadFailed')}</p><p className="max-w-md break-words text-xs text-[color:var(--cp-muted)]">{ownerStatus.message}</p><button type="button" className={hubButtonClass} onClick={() => void store.ensureOwner(context, true)}>{t('messagehub.retry')}</button></div>
   return <div className="relative flex h-full min-h-0 flex-col text-[color:var(--cp-text)]">
     {context.mode === 'observe' && <div className="flex shrink-0 items-center justify-between gap-2 border-b border-[color:var(--cp-border)] p-2 text-xs" data-testid="owner-banner"><span>{t('messagehub.observing')} · {didDisplayName(context.ownerDid)} · {t('messagehub.readOnly')}</span><button type="button" className={hubButtonClass} onClick={() => onExit(JSON.stringify(requested))}>{t('messagehub.exitObserver')}</button></div>}
-    <div className="relative min-h-0 flex-1"><MessageMediaHost windowId={windowId}><WindowDialogProvider key={JSON.stringify(context)} surface={isDesktop ? 'desktop' : 'mobile'} permissions={{ fullscreen: false }}>{initialShare && context.mode === 'self' ? <ShareIntake context={context} share={initialShare} confirmationFor={noConfirmation} /> : null}<MessageHubContent key={`${JSON.stringify(context)}:${initialEntityId}:${initialSessionId}:${initialMessageId}`} initialEntityId={initialEntityId} initialSessionId={initialSessionId} initialMessageId={initialMessageId} linkedMessageDetails={linkedMessageDetails} context={context} onHome={onHome} /></WindowDialogProvider></MessageMediaHost></div>
+    <div className="relative min-h-0 flex-1"><ConversationClockContext.Provider value={messageHubClock(store)}><AgentControlsContext.Provider value={getAgentPanelSource()}><MessageMediaHost windowId={windowId}><WindowDialogProvider key={JSON.stringify(context)} surface={isDesktop ? 'desktop' : 'mobile'} permissions={{ fullscreen: false }}>{initialShare && context.mode === 'self' ? <ShareIntake context={context} share={initialShare} confirmationFor={noConfirmation} /> : null}<MessageHubContent key={`${JSON.stringify(context)}:${initialEntityId}:${initialSessionId}:${initialMessageId}`} initialEntityId={initialEntityId} initialSessionId={initialSessionId} initialMessageId={initialMessageId} linkedMessageDetails={linkedMessageDetails} context={context} onHome={onHome} /></WindowDialogProvider></MessageMediaHost></AgentControlsContext.Provider></ConversationClockContext.Provider></div>
   </div>
 }
 
@@ -146,6 +168,7 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
   const store = useMessageHubStore()
   const dialog = useWindowDialog()
   const dialogs = useNetworkDialogs()
+  const systemDialog = useSystemDialog()
   const mediaHost = useMessageMediaHost()
   const identity = useHubIdentity(context)
   const networkOnline = useNetworkOnline()
@@ -200,7 +223,13 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
   const [showSessionSidebar, setShowSessionSidebar] = useState(false)
   // A message link only applies to the session it names: without that session the message is not looked up elsewhere.
   const [linkedMessageId] = useState(() => initialMessageId && findRequestedSession(resolvedInitialEntityId) ? initialMessageId : null)
-  const [detailsTarget, setDetailsTarget] = useState<'entity' | 'session' | 'message' | null>(() => linkedMessageId && isDesktop && linkedMessageDetails ? 'message' : null)
+  /** The Agent panel a conversation with one of the viewer's own Agents opens with on the desktop layout, when it was left open. */
+  const restingDetails = (entityId: string | null): DetailsTarget | null => isDesktop && entityId && agentPanelRemembered() && store.isOwnAgent(context, entityId) ? 'agent' : null
+  const [detailsTarget, setDetailsTarget] = useState<DetailsTarget | null>(() => linkedMessageId && isDesktop && linkedMessageDetails ? 'message' : restingDetails(resolvedInitialEntityId))
+  const [panelWorklog, setPanelWorklog] = useState<(WorklogDestination & { request: number }) | null>(null)
+  const [rotating, setRotating] = useState(false)
+  const [locateMessageId, setLocateMessageId] = useState<string | null>(null)
+  const [profile, setProfile] = useState<EntityInfoDialogParams | null>(null)
   const [detailMessageId, setDetailMessageId] = useState<string | null>(linkedMessageId)
   const [detailWorklog, setDetailWorklog] = useState<(WorklogDestination & { request: number }) | null>(null)
   const showDetails = detailsTarget !== null
@@ -278,13 +307,17 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
     const choices = store.connections(context, selectedEntity.id)
     return choices.some(choice => !creationReason(context, selectedEntity, store.policy(context, selectedEntity.id), choice.binding)) ? undefined : creationReason(context, selectedEntity, store.policy(context, selectedEntity.id), choices[0]?.binding)
   })() : undefined
-  const openCreate = (entityId: string | null = selectedEntityId) => {
+  const openCreate = () => {
+    const entity = selectedEntity
+    if (!entity) return
     const epoch = ++contextEpoch.current, trigger = document.activeElement
     setDefaultSessionError(false)
-    void dialog.open({ title: t('messagehub.newSession'), size: 'sm', dismissible: false, renderBody: controls => <CreateSessionForm context={context} entityId={entityId} onCancel={() => { contextEpoch.current++; controls.close() }} onCreated={session => {
+    void dialog.open({ title: `${t('messagehub.newSession')}: ${entity.name}`, size: 'sm', dismissible: false, renderBody: controls => <CreateSessionForm context={context} entityId={entity.id} onCancel={() => { contextEpoch.current++; controls.close() }} onCreated={session => {
       controls.close()
       if (contextEpoch.current !== epoch) return
-      setSelectedEntityId(session.entityId); setSelectedSessionId(session.id); setArchived(false); setDetailsTarget(null); setMobileView('conversation')
+      setSelectedEntityId(session.entityId); setSelectedSessionId(session.id); setArchived(false); setDetailsTarget(restingDetails(session.entityId)); setMobileView('conversation')
+      // The touch layout's session list covers the conversation the new session opens in.
+      if (!isDesktop) setShowSessionSidebar(false)
     }} /> }).then(() => { if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus() })
   }
   const openManage = (session: Session) => {
@@ -296,9 +329,10 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
     }} /> }).then(() => { if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus() })
   }
   const sidebarProps = {
-    onCreate: () => openCreate(), onManage: openManage, onToggleArchived: () => { contextEpoch.current++; setArchived(value => !value); setSelectedSessionId(null); setDetailsTarget(null); setDefaultSessionError(false) }, archived,
+    onCreate: openCreate, onManage: openManage, onToggleArchived: () => { contextEpoch.current++; setArchived(value => !value); setSelectedSessionId(null); setDetailsTarget(null); setDefaultSessionError(false) }, archived,
     archivedCount: archivedSessions.length, archivedUnread: archivedSessions.reduce((sum, session) => sum + session.unreadCount, 0), canManage, creationReason: createReason, titleFor: (session: Session) => store.title(context, session),
     statusFor: (session: Session) => store.runtimeFor(context, session.id).map(state => t(`messagehub.runtime.${state.status}`)).join(' · '),
+    descriptionFor: (session: Session) => sessionDescription(session, store.preferences(context, session.id)) || (selectedEntity?.type === 'group' ? store.groupSession(context, selectedEntity.id, session.id)?.description ?? '' : ''),
     badgeFor: (session: Session) => selectedEntity?.type === 'group' && store.groupSession(context, selectedEntity.id, session.id)?.hasGuests ? t('messagehub.group.hasGuests') : undefined,
   }
 
@@ -310,7 +344,7 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
       setSelectedSessionId(getDefaultSessionId(id))
       setDefaultSessionError(false)
       resolveDefaultSession(id, epoch)
-      setDetailsTarget(null)
+      setDetailsTarget(restingDetails(id))
       setShowSessionSidebar(false)
 
       if (!isDesktop) {
@@ -318,6 +352,31 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
       }
     }
   )
+
+  /** Opens an entity on the session that saw its latest activity; its default session when it has none yet. */
+  const enterEntity = (id: string) => {
+    const epoch = ++contextEpoch.current
+    const latest = latestActiveSession(store.sessions(context, id, 'active'))
+    setArchived(false)
+    setSelectedEntityId(id)
+    setSelectedSessionId(latest?.id ?? null)
+    setDefaultSessionError(false)
+    if (!latest) resolveDefaultSession(id, epoch)
+    setDetailsTarget(restingDetails(id))
+    setShowSessionSidebar(false)
+    if (!isDesktop) setMobileView('conversation')
+  }
+
+  const openNewChat = () => {
+    const trigger = document.activeElement
+    void dialog.open<NewChatTarget>({ title: t('messagehub.newChat'), size: 'sm', dismissible: false, renderBody: controls => <NewChatForm context={context} onCancel={() => controls.close()} onEnter={target => controls.close(target)} /> }).then((target) => {
+      if (!target) { if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus(); return }
+      if (!target.listed) store.addPeer(context, target.id, { name: target.name, type: target.type === 'agent' ? 'agent' : 'person' })
+      setSearchQuery('')
+      setFilter('all')
+      enterEntity(target.id)
+    })
+  }
 
   const openCreateGroup = (members: string[] = []) => {
     const trigger = document.activeElement
@@ -347,23 +406,54 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
     setShowSessionSidebar(false)
   }, [])
 
+  // In a conversation with one of the viewer's own Agents the picture, the name and the subtitle all open the Agent panel.
   const handleOpenDetails = (target: 'entity' | 'session' = 'entity') => {
-    setDetailsTarget(target)
+    const agent = target === 'entity' && !!selectedEntityId && store.isOwnAgent(context, selectedEntityId)
+    setDetailsTarget(agent ? 'agent' : target)
+    if (agent && isDesktop) rememberAgentPanel(true)
     if (!isDesktop) setMobileView('details')
   }
 
-  const handleCloseDetails = useCallback(() => {
+  const handleCloseDetails = () => {
+    // A work log opened from the Agent panel goes back to the panel.
+    if (detailsTarget === 'worklog') { setDetailsTarget('agent'); return }
     if (isDesktop) {
+      if (detailsTarget === 'agent') rememberAgentPanel(false)
       setDetailsTarget(null)
       return
     }
 
+    if (detailsTarget === 'agent') setDetailsTarget(null)
     setMobileView('conversation')
-  }, [isDesktop])
+  }
+
+  const toggleAgentPanel = () => {
+    if (detailsTarget === 'agent' || detailsTarget === 'worklog') { rememberAgentPanel(false); setDetailsTarget(null) }
+    else handleOpenDetails('entity')
+  }
+
+  /** A participant's profile: a details page on the touch layout, the system's entity info dialog on the desktop one. */
+  const openProfile = (did: string, name: string) => {
+    const entity = store.findEntity(context, did)
+    const type = entity?.type ?? 'person'
+    const params: EntityInfoDialogParams = { did, name: entity?.name ?? name, avatar: store.avatarOf(context, did), kind: type === 'agent' ? 'agent' : type === 'group' ? 'group' : 'user', canMessage: canManage && did !== context.ownerDid && (Boolean(entity) || canOpenPeer(did)) }
+    if (!isDesktop) { setProfile(params); setDetailsTarget('profile'); setMobileView('details'); return }
+    const trigger = document.activeElement
+    void systemDialog.open(ENTITY_INFO_DIALOG_PATH, params).then((result) => {
+      if (result.action === 'message') messageProfile(result.person.did, result.person.name, result.person.kind === 'agent' ? 'agent' : type)
+      else if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus()
+    })
+  }
+  const messageProfile = (did: string, name: string, type: Entity['type']) => {
+    if (!store.findEntity(context, did)) store.addPeer(context, did, { name, type: type === 'agent' ? 'agent' : 'person' })
+    handleSelectEntity(did)
+  }
 
   const handleSelectSession = (id: string) => {
     contextEpoch.current++; setSelectedSessionId(id); setDefaultSessionError(false)
     if (detailsTarget === 'message') setDetailsTarget(null)
+    if (detailsTarget === 'worklog') setDetailsTarget('agent')
+    setLocateMessageId(null)
     if (!isDesktop) setShowSessionSidebar(false)
   }
 
@@ -398,68 +488,104 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
   const isResizingEntityList = entityListResizer.active
   const isResizingSessionSidebar = sessionSidebarResizer.active
 
-  const toOutgoing = (payload: ConversationComposerSubmitPayload): OutgoingPayload => ({ content: payload.content, signal: payload.signal, attachments: payload.attachments.map(({ file, relativePath, directory }) => ({ file, relativePath, directory })), ...(payload.relatesTo ? { relatesTo: payload.relatesTo } : {}), ...(payload.mentions ? { mentions: payload.mentions } : {}), ...(payload.machine ? { machine: payload.machine } : {}), ...(payload.voice ? { voice: payload.voice } : {}), ...(payload.localId ? { localId: payload.localId, submittedAt: payload.submittedAt } : {}) })
-  const handleSendMessage = async (payload: ConversationComposerSubmitPayload) => {
-    if (!activeSession || !selectedEntityId) throw Error('session_missing')
-    await store.send(context, activeSession.id, toOutgoing(payload), writeConfirmations[activeSession.id])
-  }
-  const handleQueueChange = (queued: ConversationComposerSubmitPayload[]) => {
-    if (activeSession) store.stageOutgoing(context, activeSession.id, queued.map(toOutgoing))
-  }
-  const handleResend = async (message: import('./protocol/msgobj').MessageObject) => {
-    if (!activeSession) throw Error('session_missing')
-    await store.resend(context, activeSession.id, message, writeConfirmations[activeSession.id])
-  }
-  const openForward = (message: import('./protocol/msgobj').MessageObject) => {
+  const openForward = (message: import('../../components/conversation/model/msgobj').MessageObject) => {
     void dialog.open({ title: t('messagehub.forward.title'), size: 'sm', dismissible: false, renderBody: controls => <ForwardMessageForm context={context} message={message} confirmationFor={sessionId => writeConfirmations[sessionId]} onCancel={() => controls.close()} onDone={() => controls.close()} /> })
   }
-  const openMessageDetails = (message: import('./protocol/msgobj').MessageObject, worklog?: WorklogDestination) => {
+  const openMessageDetails = (message: import('../../components/conversation/model/msgobj').MessageObject, worklog?: WorklogDestination) => {
     const id = messageObjId(message)
     if (!id) return
     setDetailMessageId(id)
-    setDetailWorklog(worklog ? { ...worklog, request: Date.now() } : null)
+    setDetailWorklog(previous => worklog ? { ...worklog, request: (previous?.request ?? 0) + 1 } : null)
     setDetailsTarget('message')
     if (!isDesktop) setMobileView('details')
   }
   const conversationProps = {
-    onResend: handleResend,
     onOpenMessage: openMessageDetails,
-    focusMessageId: activeSession && activeSession.id === initialSessionId ? linkedMessageId : null,
+    focusMessageId: locateMessageId ?? (activeSession && activeSession.id === initialSessionId ? linkedMessageId : null),
+    agentPanel: selectedEntityId && store.isOwnAgent(context, selectedEntityId) ? { open: detailsTarget === 'agent' || detailsTarget === 'worklog', onToggle: toggleAgentPanel } : undefined,
+    sendBlockedReason: rotating ? t('messagehub.agentPanel.newConversationPending') : undefined,
     onForward: openForward,
-    context, access, title: activeSession ? store.title(context, activeSession) : '', onCreate: () => openCreate(), creationReason: createReason,
+    context, confirmation: activeSession ? writeConfirmations[activeSession.id] : undefined, confirmed,
+    title: activeSession ? store.title(context, activeSession) : '', creationReason: createReason,
+    muted: activeSession ? store.preferences(context, activeSession.id).muted : false,
+    onToggleMute: canManage ? () => { void toggleMute() } : undefined,
+    onClearHistory: canManage ? () => { void clearHistory() } : undefined,
+    onOpenProfile: openProfile,
     defaultSessionError, onRetryDefaultSession: () => { if (selectedEntityId) handleSelectEntity(selectedEntityId) },
-    historyStatus: activeSession ? store.historyStatus(context, activeSession.id) : 'ready' as const,
-    hasOlder: activeSession ? store.hasOlder(context, activeSession.id) : false,
-    onLoadOlder: () => activeSession ? store.loadOlder(context, activeSession.id) : Promise.resolve(false),
-    onVisibleMessages: (recordIds: string[]) => { if (activeSession) void store.markRead(context, activeSession.id, recordIds) },
     onOpenEntity: handleSelectEntity,
     onOpenSessionDetails: () => handleOpenDetails('session'), onOpenDetails: () => handleOpenDetails('entity'),
-    draft: activeSession ? store.draft(context, activeSession.id) : '',
-    draftAttachments: activeSession ? store.attachments(context, activeSession.id) : [],
-    onAttachmentsChange: (attachments: import('./conversation/input/attachmentDraft').ComposerAttachmentInput[]) => activeSession ? store.saveAttachments(context, activeSession.id, attachments) : undefined,
-    onDraftChange: (value: string) => { if (activeSession) return store.saveDraft(context, activeSession.id, value) },
-    showActions: activeSession ? store.preferences(context, activeSession.id).showActions : true,
   }
-  const detailsPane = detailsTarget === 'message' && activeSession && selectedEntity && detailMessageId ? <MessageDetails key={`${viewerSessionKey(context, activeSession.id)}:${detailMessageId}`} context={context} entityId={selectedEntity.id} sessionId={activeSession.id} messageId={detailMessageId} initialWorklog={detailWorklog ?? undefined} reader={messageReader} displayName={did => did === context.ownerDid ? t('messagehub.you') : store.findEntity(context, did)?.name ?? friendlyDidName(did, false)} onClose={handleCloseDetails} /> : detailsTarget === 'session' && activeSession && selectedEntity && access ? <SessionDetails key={viewerSessionKey(context, activeSession.id)} session={activeSession} entity={selectedEntity} context={context} access={access} showActions={conversationProps.showActions} onShowActions={async showActions => { await store.updatePreferences(context, activeSession.id, { showActions }) }} onClose={handleCloseDetails} onManage={() => openManage(activeSession)} onWrite={enabled => setWriteConfirmations(previous => ({ ...previous, [activeSession.id]: enabled ? JSON.stringify(activeSession.binding) : '' }))} /> : detailsTarget === 'entity' && entityDetail ? <EntityDetails entity={entityDetail} context={context} onClose={handleCloseDetails} onCreateGroup={canManage ? openCreateGroup : undefined} /> : null
+  // Pinning the entity's default session is enough to lift the entity and leaves its other sessions' order alone;
+  // unpinning and muting cover every session, as the entity is pinned while any of them is and muted while all are.
+  const updateEntityPreferences = async (entityIds: string[], patch: EntityPreferencePatch) => {
+    const targets = entityIds.flatMap(id => 'pinned' in patch && patch.pinned ? [store.defaultSession(context, id) ?? store.sessions(context, id)[0]].filter((session): session is Session => Boolean(session)) : store.sessions(context, id))
+    await Promise.all(targets.map(session => store.updatePreferences(context, session.id, patch)))
+  }
+  const sessionDetailsProps = activeSession && selectedEntity && access ? { session: activeSession, entity: selectedEntity, context, access, showActions: store.preferences(context, activeSession.id).showActions, onShowActions: async (showActions: boolean) => { await store.updatePreferences(context, activeSession.id, { showActions }) }, onClose: handleCloseDetails, onManage: () => openManage(activeSession), onWrite: (enabled: boolean) => setWriteConfirmations(previous => ({ ...previous, [activeSession.id]: enabled ? JSON.stringify(activeSession.binding) : '' })) } : null
+  const timeline = (messageReader as ConversationMessageReader).timeline ?? EMPTY_TIMELINE
+  const agentPane = (detailsTarget === 'agent' || detailsTarget === 'worklog') && entityDetail ? <AgentSessionPanel
+    key={activeSession ? viewerSessionKey(context, activeSession.id) : entityDetail.id}
+    entity={entityDetail} session={activeSession} context={context}
+    answering={conversationInputState(timeline, context.ownerDid).mode === 'answer'}
+    timeline={timeline}
+    onClose={handleCloseDetails}
+    onEntityPreferences={canManage ? updateEntityPreferences : undefined}
+    onOpenWorklog={destination => { setPanelWorklog(previous => ({ ...destination, request: (previous?.request ?? 0) + 1 })); setDetailsTarget('worklog'); if (!isDesktop) setMobileView('details') }}
+    onLocateMessage={id => { setLocateMessageId(id); if (!isDesktop) setMobileView('conversation') }}
+    onForward={openForward}
+    onRotating={setRotating}
+    sessionDetails={sessionDetailsProps ? <SessionDetails key={viewerSessionKey(context, sessionDetailsProps.session.id)} {...sessionDetailsProps} embedded /> : null}
+    entityDetails={<EntityDetails entity={entityDetail} context={context} onClose={handleCloseDetails} onCreateGroup={canManage ? openCreateGroup : undefined} embedded />}
+  /> : null
+  const worklogPane = detailsTarget === 'worklog' && panelWorklog ? <section className="flex h-full flex-col bg-[color:var(--cp-surface)]" data-testid="agent-panel-worklog">
+    <header className="flex shrink-0 items-center justify-between border-b border-[color:var(--cp-border)] py-1 pl-4 pr-1"><h2 className="min-w-0 truncate text-sm font-semibold">{panelWorklog.title}</h2><button type="button" className="flex min-h-11 min-w-11 items-center justify-center" aria-label={t('messagehub.close')} title={t('messagehub.close')} onClick={handleCloseDetails}><X size={18} /></button></header>
+    <AgentWorklog key={panelWorklog.request} initial={panelWorklog} onExit={handleCloseDetails} />
+  </section> : null
+  // The panel stays mounted under a work log opened from it, so going back finds it as it was left.
+  const agentDetails = agentPane ? <div className="relative h-full" data-testid="agent-details"><div className="h-full" hidden={!!worklogPane} inert={!!worklogPane}>{agentPane}</div>{worklogPane ? <div className="absolute inset-0">{worklogPane}</div> : null}</div> : null
+  const detailsPane = agentDetails ?? (detailsTarget === 'profile' && profile ? <ProfileDetails key={profile.did} params={{ canMessage: true, ...profile }} onMessage={profile.canMessage === false ? undefined : person => messageProfile(person.did, person.name, person.kind === 'agent' ? 'agent' : 'person')} onClose={handleCloseDetails} /> : detailsTarget === 'message' && activeSession && selectedEntity && detailMessageId ? <MessageDetails key={`${viewerSessionKey(context, activeSession.id)}:${detailMessageId}`} context={context} entityId={selectedEntity.id} sessionId={activeSession.id} messageId={detailMessageId} initialWorklog={detailWorklog ?? undefined} reader={messageReader} displayName={did => did === context.ownerDid ? t('messagehub.you') : store.findEntity(context, did)?.name ?? friendlyDidName(did, false)} onClose={handleCloseDetails} /> : detailsTarget === 'session' && sessionDetailsProps ? <SessionDetails key={viewerSessionKey(context, sessionDetailsProps.session.id)} {...sessionDetailsProps} /> : detailsTarget === 'entity' && entityDetail ? <EntityDetails entity={entityDetail} context={context} onClose={handleCloseDetails} onCreateGroup={canManage ? openCreateGroup : undefined} onEntityPreferences={canManage ? updateEntityPreferences : undefined} /> : null)
   const entityListExtras = { hasMore: store.hasMoreEntities(context), onLoadMore: () => store.loadMoreEntities(context), onCreateGroup: canManage ? () => openCreateGroup() : undefined }
-  const newSessionLabel = t('messagehub.newSession')
+  const newChatLabel = t('messagehub.newChat')
   const newGroupLabel = t('messagehub.group.create')
   const createItems: HeaderMenuItem[] = [
-    { key: 'session', label: newSessionLabel, icon: <MessageSquarePlus size={16} />, onSelect: () => openCreate(null), disabled: !canManage, testId: 'new-session' },
+    { key: 'chat', label: newChatLabel, icon: <MessageSquarePlus size={16} />, onSelect: openNewChat, disabled: !canManage, testId: 'new-chat' },
     { key: 'group', label: newGroupLabel, icon: <Users size={16} />, onSelect: () => openCreateGroup(), disabled: !canManage, testId: 'new-group' },
     { key: 'join', label: t('messagehub.group.joinGroup'), icon: <LogIn size={16} />, onSelect: () => { void openJoinGroup() }, disabled: !canManage, testId: 'join-group' },
   ]
+  const reportFailure = (title: string, body: string) => {
+    if (contextActive.current) void dialog.open({
+      title, size: 'sm',
+      renderBody: () => <p role="alert" className="text-sm">{body}</p>,
+      renderActions: controls => <button type="button" className={hubButtonClass} onClick={() => controls.close()}>{t('messagehub.close')}</button>,
+    })
+  }
+  const toggleMute = async () => {
+    if (!activeSession || !canManage) return
+    const muted = store.preferences(context, activeSession.id).muted
+    try {
+      await store.updatePreferences(context, activeSession.id, { muted: !muted })
+    } catch {
+      reportFailure(t(muted ? 'messagehub.unmute' : 'messagehub.mute'), t('messagehub.sessionMenu.failed'))
+    }
+  }
+  const clearHistory = async () => {
+    const session = activeSession
+    if (!session || !canManage) return
+    const title = t('messagehub.sessionMenu.clearHistory')
+    if (!await confirmGroupAction(dialog, t, { title, body: t('messagehub.sessionMenu.clearHistoryConfirm', undefined, { name: store.title(context, session) }), confirm: title })) return
+    try {
+      await store.clearHistory(context, session.id)
+    } catch {
+      reportFailure(title, t('messagehub.sessionMenu.failed'))
+    }
+  }
   const markAllRead = async () => {
     if (!canManage || markingAllRead) return
     setMarkingAllRead(true)
     try {
       await store.markAllRead(context)
     } catch {
-      if (contextActive.current) void dialog.open({
-        title: t('messagehub.header.markAllRead'), size: 'sm',
-        renderBody: () => <p role="alert" className="text-sm">{t('messagehub.header.markAllReadFailed')}</p>,
-        renderActions: controls => <button type="button" className={hubButtonClass} onClick={() => controls.close()}>{t('messagehub.close')}</button>,
-      })
+      reportFailure(t('messagehub.header.markAllRead'), t('messagehub.header.markAllReadFailed'))
     } finally {
       if (contextActive.current) setMarkingAllRead(false)
     }
@@ -473,12 +599,6 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
   const ownerStatus = store.ownerStatus(context)
   const refreshing = ownerStatus.phase === 'ready' && ownerStatus.refreshing
   const syncStatus = !networkOnline ? t('messagehub.sync.offline') : refreshing ? t('states.loading') : store.syncStatus(context) === 'connecting' ? t('messagehub.sync.connecting') : undefined
-  // Pinning the entity's default session is enough to lift the entity and leaves its other sessions' order alone;
-  // unpinning and muting cover every session, as the entity is pinned while any of them is and muted while all are.
-  const updateEntityPreferences = async (entityIds: string[], patch: EntityPreferencePatch) => {
-    const targets = entityIds.flatMap(id => 'pinned' in patch && patch.pinned ? [store.defaultSession(context, id) ?? store.sessions(context, id)[0]].filter((session): session is Session => Boolean(session)) : store.sessions(context, id))
-    await Promise.all(targets.map(session => store.updatePreferences(context, session.id, patch)))
-  }
   const entityListHeader = {
     identity, syncStatus, createItems, moreItems,
     onEntityPreferences: canManage ? updateEntityPreferences : undefined,
@@ -486,13 +606,16 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
   }
   const conversationSpace = layoutWidth - (isEntityListCollapsed ? ENTITY_LIST_COLLAPSED_WIDTH : entityListWidth)
   const sessionSidebarInline = conversationSpace - sessionSidebarWidth >= CONVERSATION_MIN_READING_WIDTH
-  const detailsWidth = detailsTarget === 'message' ? 640 : DETAILS_PANEL_WIDTH
+  const detailsWidth = detailsTarget === 'message' || detailsTarget === 'worklog' ? 640 : detailsTarget === 'agent' ? AGENT_PANEL_WIDTH : DETAILS_PANEL_WIDTH
   const detailsInline = conversationSpace - (showSessionSidebar && sessionSidebarInline ? sessionSidebarWidth : 0) - detailsWidth >= CONVERSATION_MIN_READING_WIDTH
   const closeDesktopDrawer = (event: React.KeyboardEvent) => {
     if (event.key !== 'Escape' || event.defaultPrevented) return
-    if (showDetails && !detailsInline) { event.preventDefault(); setDetailsTarget(null) }
+    if (showDetails && !detailsInline) { event.preventDefault(); handleCloseDetails() }
     else if (showSessionSidebar && !sessionSidebarInline) { event.preventDefault(); setShowSessionSidebar(false) }
   }
+
+  // On the touch layout a swipe to the right over the Agent panel goes back to the conversation.
+  const panelSwipe = useSwipe({ onRight: !isDesktop && detailsTarget === 'agent' ? handleCloseDetails : undefined })
 
   const desktopSessionSidebarPane = showSessionSidebar && !sessionSidebarInline ? (
     <>
@@ -582,14 +705,9 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
               key={activeSession ? viewerSessionKey(context, activeSession.id) : selectedEntityId}
               entity={selectedEntity}
               session={activeSession}
-              messageReader={messageReader}
-              selfDid={context.ownerDid}
-              onBack={handleBack}
+                                          onBack={handleBack}
               onOpenSessionSidebar={() => setShowSessionSidebar(true)}
-              onSendMessage={handleSendMessage}
-              onQueueChange={handleQueueChange}
-              sessionCount={sessions.length}
-              otherSessionsUnread={otherSessionsUnread}
+                                                        otherSessionsUnread={otherSessionsUnread}
             />
 
             {showSessionSidebar ? (
@@ -617,7 +735,7 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
         ) : null}
 
         {mobileView === 'details' && detailsPane ? (
-          <div className="absolute inset-0 z-50 h-full">
+          <div className="absolute inset-0 z-50 h-full" data-testid="mobile-details" {...panelSwipe}>
             {detailsPane}
           </div>
         ) : null}
@@ -717,39 +835,24 @@ function MessageHubContent({ initialEntityId, initialSessionId, initialMessageId
               key={activeSession ? viewerSessionKey(context, activeSession.id) : selectedEntityId}
             entity={selectedEntity}
             session={activeSession}
-            messageReader={messageReader}
-            selfDid={context.ownerDid}
-            onBack={handleBack}
+                                    onBack={handleBack}
             onOpenSessionSidebar={() => setShowSessionSidebar((prev) => !prev)}
-            onSendMessage={handleSendMessage}
-            onQueueChange={handleQueueChange}
-            sessionCount={sessions.length}
-            otherSessionsUnread={otherSessionsUnread}
+                                                otherSessionsUnread={otherSessionsUnread}
             leadingPane={desktopSessionSidebarPane}
             isSessionSidebarOpen={showSessionSidebar}
           />
         ) : (
-          <EmptyConversation action={<div className="flex flex-wrap justify-center gap-2"><button className={`${hubButtonClass} flex items-center gap-2`} type="button" disabled={!canManage} onClick={() => openCreate(null)}><SquarePen size={16} />{newSessionLabel}</button><button className={`${hubButtonClass} flex items-center gap-2`} type="button" disabled={!canManage} onClick={() => openCreateGroup()}><Users size={16} />{newGroupLabel}</button></div>} />
+          <EmptyConversation action={<div className="flex flex-wrap justify-center gap-2"><button className={`${hubButtonClass} flex items-center gap-2`} type="button" disabled={!canManage} onClick={openNewChat}><SquarePen size={16} />{newChatLabel}</button><button className={`${hubButtonClass} flex items-center gap-2`} type="button" disabled={!canManage} onClick={() => openCreateGroup()}><Users size={16} />{newGroupLabel}</button></div>} />
         )}
       </div>
 
-      {showDetails && entityDetail && detailsInline ? (
-        <div
-          className="h-full flex-shrink-0"
-          style={{
-            width: detailsWidth,
-            borderLeft: '1px solid var(--cp-border)',
-          }}
-        >
-          {detailsPane}
-        </div>
-      ) : null}
-      {showDetails && entityDetail && !detailsInline ? (
+      {/* One element for both placements, so a pane that changes width (a work log opened from the Agent panel) is not mounted again. */}
+      {showDetails && entityDetail ? (
         <>
-          <div className="absolute inset-0 z-40" style={{ background: 'rgba(15, 23, 42, 0.18)' }} onClick={handleCloseDetails} />
+          {detailsInline ? null : <div className="absolute inset-0 z-40" style={{ background: 'rgba(15, 23, 42, 0.18)' }} onClick={handleCloseDetails} />}
           <div
-            className="absolute inset-y-0 right-0 z-50"
-            style={{
+            className={detailsInline ? 'h-full flex-shrink-0' : 'absolute inset-y-0 right-0 z-50'}
+            style={detailsInline ? { width: detailsWidth, borderLeft: '1px solid var(--cp-border)' } : {
               width: detailsWidth,
               maxWidth: '90%',
               borderLeft: '1px solid var(--cp-border)',

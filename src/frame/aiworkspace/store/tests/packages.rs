@@ -1,4 +1,4 @@
-//! Snapshots, packages, fork, privacy, assets, unknown content and URL tables
+//! Snapshots, packages, clone, privacy, assets, unknown content and URL tables
 //! (V04, V05, V14, V20, V22, V24).
 
 mod common;
@@ -60,7 +60,7 @@ fn v04_export_import_roundtrip() {
     assert_eq!(ws.read(&bob(), "diagram", None).unwrap()["content"]["availability"], "available");
     assert_eq!(ws.read(&bob(), "notes", None).unwrap()["content"]["content"]["content"][3]["attrs"]["ref"]["entity_id"], "cell-open-tasks");
     assert_eq!(ws.verify_refs().unwrap()["ok"], true);
-    assert_eq!(ws.query(&bob(), &json!({ "view_id": "cell-open-tasks" }), &other.svc.sources).unwrap()["total"], 4);
+    assert_eq!(view_ids(&ws, &bob(), "cell-open-tasks").unwrap().len(), 4);
     let epoch_imported = ws.epoch.clone();
     drop(ws);
     // the importer owns the copy; opening a package grants nothing on the original
@@ -106,9 +106,11 @@ fn v04_export_import_roundtrip() {
     assert_eq!(third.svc.list_workspaces(&bob()).unwrap()["workspaces"], json!([]));
 }
 
-/// V05: a Fork is independent, has the same content root at birth, and carries no session state.
+/// V05: a Clone is a materialized copy: independent, the same content root at birth, no session state, its
+/// `cloned_from` is provenance only (the source can go), and it counts its full content as its own usage.
 #[test]
-fn v05_fork() {
+fn v05_clone() {
+    use aiworkspace_core::materialize::ObjectSource;
     let env = env();
     let id = project(&env);
     {
@@ -119,36 +121,80 @@ fn v05_fork() {
             "order_key": "r", "scope": "personal", "payload": { "target": { "entity_id": "tasks" }, "kind": "note", "body": "私人" } }]));
     }
     let source_root = env.svc.workspace(&id).unwrap().lock().unwrap().checkpoint(&alice()).unwrap().content_root;
-    let f = env.svc.fork(&alice(), &id).unwrap();
-    let fid = f["workspace_id"].as_str().unwrap().to_string();
-    assert_ne!(fid, id);
+    let source_usage = env.svc.workspace(&id).unwrap().lock().unwrap().usage().unwrap();
+    let f = env.svc.clone_workspace(&alice(), &id).unwrap();
+    let cid = f["workspace_id"].as_str().unwrap().to_string();
+    assert_ne!(cid, id);
     assert_eq!(f["content_root"], json!(source_root), "internal references carry no workspace_id, so nothing is rewritten");
-    let (lineage_src, lineage_fork) = {
+    assert_eq!(f["cloned_from"]["workspace_id"], json!(id));
+    assert!(f.get("forked_from").is_none(), "{f}");
+    let source_snapshot = f["cloned_from"]["snapshot"].as_str().unwrap().to_string();
+    let (lineage_src, lineage_copy) = {
         let a = env.svc.workspace(&id).unwrap().lock().unwrap().get_collab_state(&alice(), "notes").unwrap()["lineage_id"].clone();
-        let b = env.svc.workspace(&fid).unwrap().lock().unwrap().get_collab_state(&alice(), "notes").unwrap()["lineage_id"].clone();
+        let b = env.svc.workspace(&cid).unwrap().lock().unwrap().get_collab_state(&alice(), "notes").unwrap()["lineage_id"].clone();
         (a, b)
     };
-    assert_ne!(lineage_src, lineage_fork, "a fork starts new collaboration lineages");
-    let h = env.svc.workspace(&fid).unwrap();
-    let mut fork = h.lock().unwrap();
-    assert_eq!(fork.info(&alice()).unwrap()["forked_from"]["workspace_id"], json!(id));
-    assert!(fork.read(&bob(), "tasks", None).is_err(), "grants are not copied");
-    assert!(fork.read(&alice(), "bob-private", None).is_err(), "personal entities are not copied");
-    assert_eq!(fork.list_grants(&alice()).unwrap()["grants"].as_array().unwrap().len(), 1);
-    assert_eq!(fork.read(&alice(), "note-budget", None).unwrap()["content"]["anchor"]["state"], "resolved");
+    assert_ne!(lineage_src, lineage_copy, "a clone starts new collaboration lineages");
+    let h = env.svc.workspace(&cid).unwrap();
+    let mut copy = h.lock().unwrap();
+    assert_eq!(copy.info(&alice()).unwrap()["cloned_from"], f["cloned_from"]);
+    assert!(copy.read(&bob(), "tasks", None).is_err(), "grants are not copied");
+    assert!(copy.read(&alice(), "bob-private", None).is_err(), "personal entities are not copied");
+    assert_eq!(copy.acl_query(&alice(), &json!({ "by": "entity", "resource": "/" }), None).unwrap()["subjects"].as_array().unwrap().len(), 1, "only @owner");
+    assert_eq!(copy.read(&alice(), "note-budget", None).unwrap()["content"]["anchor"]["state"], "resolved");
+    // C7: the objects are shared in the named store, the usage is not: the copy counts its whole content and every
+    // asset as its own (kernel doc 11), nothing stays staged, nothing counts on the source
+    let usage = copy.usage().unwrap();
+    assert!(usage["content"].as_i64().unwrap() > 0, "{usage}");
+    assert!(source_usage["assets"].as_i64().unwrap() > 0, "{source_usage}");
+    assert_eq!(usage["assets"], source_usage["assets"], "{usage} vs {source_usage}");
+    assert_eq!(usage["staged"].as_i64().unwrap_or(0), 0, "{usage}");
+    assert_eq!(usage["clones"].as_i64().unwrap_or(0), 0, "{usage}");
     // diverge
-    let rv = cell_rev(&fork, &alice(), "task-42", "owner");
-    ok(&mut fork, &alice(), set_cell("task-42", "owner", json!("fork 里改的"), rv));
-    assert_ne!(fork.checkpoint(&alice()).unwrap().content_root, source_root);
-    drop(fork);
+    let rv = cell_rev(&copy, &alice(), "task-42", "owner");
+    ok(&mut copy, &alice(), set_cell("task-42", "owner", json!("副本里改的"), rv));
+    assert_ne!(copy.checkpoint(&alice()).unwrap().content_root, source_root);
+    drop(copy);
     let h = env.svc.workspace(&id).unwrap();
     let mut src = h.lock().unwrap();
     assert_eq!(src.checkpoint(&alice()).unwrap().content_root, source_root, "the source is untouched");
     assert_eq!(src.read(&alice(), "tasks", Some(&json!({ "kind": "table_cell", "record_id": "task-42", "field_id": "owner" }))).unwrap()["content"]["value"], "林");
-    // bob (no manage, has export) may fork what he can read
+    assert_eq!(src.usage().unwrap()["clones"].as_i64().unwrap_or(0), 0, "a Workspace clone does not count on its source");
+    // bob (no manage, has export) may clone what he can read
     drop(src);
-    assert!(env.svc.fork(&bob(), &id).is_ok());
-    assert_eq!(env.svc.fork(&Caller::user("mallory"), &id).unwrap_err().code.as_str(), "NOT_FOUND");
+    assert!(env.svc.clone_workspace(&bob(), &id).is_ok());
+    assert_eq!(env.svc.clone_workspace(&Caller::user("mallory"), &id).unwrap_err().code.as_str(), "NOT_FOUND");
+    // C5: provenance only. Deleting the source leaves the copy whole: readable, writable, its snapshots still
+    // naming where it came from
+    env.svc.delete_workspace(&alice(), &id).unwrap();
+    let h = env.svc.workspace(&cid).unwrap();
+    let mut copy = h.lock().unwrap();
+    assert_eq!(copy.read(&alice(), "tasks", Some(&json!({ "kind": "table_cell", "record_id": "task-42", "field_id": "owner" }))).unwrap()["content"]["value"], "副本里改的");
+    let rv = cell_rev(&copy, &alice(), "task-42", "owner");
+    ok(&mut copy, &alice(), set_cell("task-42", "owner", json!("来源删除之后"), rv));
+    assert_eq!(copy.info(&alice()).unwrap()["cloned_from"]["workspace_id"], json!(id));
+    let cp = copy.checkpoint(&alice()).unwrap();
+    let snap: Value = serde_json::from_str(&copy.objects.get_object(&cp.snapshot_id).unwrap()).unwrap();
+    assert_eq!(snap["lineage"], json!({ "cloned_from": { "workspace_id": id, "snapshot": source_snapshot } }), "{snap}");
+    assert!(copy.objects.get_object(&source_snapshot).is_ok(), "the copy's snapshots retain the one it came from");
+}
+
+/// `ws.import new` records the package's snapshot the same way, and a restore of a clone's package keeps it.
+#[test]
+fn import_new_records_cloned_from() {
+    let env = env();
+    let id = project(&env);
+    let (pkg, manifest) = export(&env, &id, &alice(), "share", true);
+    let other = common::env();
+    let r = other.svc.import(&alice(), &pkg, "new", false).unwrap();
+    let nid = r["workspace_id"].as_str().unwrap().to_string();
+    let cloned = other.svc.workspace(&nid).unwrap().lock().unwrap().info(&alice()).unwrap()["cloned_from"].clone();
+    assert_eq!(cloned, json!({ "workspace_id": id, "snapshot": manifest["snapshot"] }));
+    // its package carries the lineage; restoring that package elsewhere keeps it
+    let (pkg2, _) = export(&other, &nid, &alice(), "share", true);
+    let third = common::env();
+    third.svc.import(&alice(), &pkg2, "restore", false).unwrap();
+    assert_eq!(third.svc.workspace(&nid).unwrap().lock().unwrap().info(&alice()).unwrap()["cloned_from"], cloned);
 }
 
 /// V14: share packages and replicas carry no private drafts, no deleted text, no other people's personal content.
@@ -472,26 +518,26 @@ fn v24_url_query_table() {
                      "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-42" } } }]));
     assert_eq!(src.rows_generated.load(Ordering::Relaxed), 0, "saving the definition and the view fetched nothing");
     // on-demand paging through the view; only the requested page is produced
-    let p1 = ws.query(&alice(), &json!({ "view_id": "cell-events", "limit": 20 }), &env.svc.sources).unwrap();
+    let p1 = ws.source_query(&alice(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-42" }, "limit": 20 }), &env.svc.sources).unwrap();
     assert_eq!(p1["rows"].as_array().unwrap().len(), 20);
     assert_eq!(p1["rows"][0]["values"]["project_id"], "project-42");
     assert_eq!(p1["rows"][0]["record_id"], "ev-000000042");
     assert_eq!((p1["data_mode"].as_str(), p1["consistency"].as_str(), p1["source_revision"].as_str()), (Some("url_query"), Some("snapshot"), Some("snap-1000000")));
     assert_eq!(src.rows_generated.load(Ordering::Relaxed), 20);
-    let p2 = ws.query(&alice(), &json!({ "view_id": "cell-events", "limit": 20, "cursor": p1["next_cursor"], "source_revision": p1["source_revision"], "consistency": "snapshot" }), &env.svc.sources).unwrap();
+    let p2 = ws.source_query(&alice(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-42" }, "limit": 20, "cursor": p1["next_cursor"], "source_revision": p1["source_revision"], "consistency": "snapshot" }), &env.svc.sources).unwrap();
     assert_eq!(p2["rows"][0]["record_id"], "ev-000001042");
     assert!(src.rows_generated.load(Ordering::Relaxed) < 100, "never a full fetch of the million rows");
     // cache isolation: same URL, different query / different principal
-    let again = ws.query(&alice(), &json!({ "view_id": "cell-events", "limit": 20, "cursor": p1["next_cursor"], "source_revision": p1["source_revision"] }), &env.svc.sources).unwrap();
+    let again = ws.source_query(&alice(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-42" }, "limit": 20, "cursor": p1["next_cursor"], "source_revision": p1["source_revision"] }), &env.svc.sources).unwrap();
     assert_eq!(again["from_cache"], true);
-    let other_q = ws.query(&alice(), &json!({ "source_id": "events", "limit": 20, "cursor": p1["next_cursor"], "source_revision": p1["source_revision"],
+    let other_q = ws.source_query(&alice(), &json!({ "source_id": "events", "limit": 20, "cursor": p1["next_cursor"], "source_revision": p1["source_revision"],
         "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-7" } }), &env.svc.sources).unwrap();
     assert!(other_q.get("from_cache").is_none());
     assert_eq!(other_q["rows"][0]["values"]["project_id"], "project-7");
-    assert_eq!(ws.query(&bob(), &json!({ "view_id": "cell-events", "limit": 20, "cursor": p1["next_cursor"], "source_revision": p1["source_revision"] }), &env.svc.sources)
+    assert_eq!(ws.source_query(&bob(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-42" }, "limit": 20, "cursor": p1["next_cursor"], "source_revision": p1["source_revision"] }), &env.svc.sources)
         .unwrap_err().code.as_str(), "PERMISSION_DENIED", "another principal never gets alice's cached page");
     // filters the source cannot push down are refused, not dropped
-    assert_eq!(ws.query(&alice(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "amount", "operator": "gt", "value": "5" } }), &env.svc.sources)
+    assert_eq!(ws.source_query(&alice(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "amount", "operator": "gt", "value": "5" } }), &env.svc.sources)
         .unwrap_err().code.as_str(), "INVALID_OPERATION");
     // read-only in this phase; the definition itself is ordinary versioned document state
     assert_eq!(commit(&mut ws, &alice(), json!([{ "op": "table.insert_records", "source_id": "events", "records": [{ "record_id": "x", "values": {} }] }]))["sub_code"], "SOURCE_READ_ONLY");
@@ -503,16 +549,16 @@ fn v24_url_query_table() {
     url_table(&mut ws, "events-live", "fixture://live?rows=500&row_key=0&snapshot=0", json!({}));
     let caps = ws.source_capabilities(&alice(), "events-live", &env.svc.sources).unwrap();
     assert_eq!((&caps["capabilities"]["consistent_paging"], &caps["capabilities"]["stable_row_key"]), (&json!(false), &json!(false)));
-    let live = ws.query(&alice(), &json!({ "source_id": "events-live", "limit": 5 }), &env.svc.sources).unwrap();
+    let live = ws.source_query(&alice(), &json!({ "source_id": "events-live", "limit": 5 }), &env.svc.sources).unwrap();
     assert_eq!(live["consistency"], "best_effort");
     assert!(live["rows"][0].get("record_id").is_none(), "page positions are never passed off as record ids");
     assert!(live.get("source_revision").is_none());
-    assert_eq!(ws.query(&alice(), &json!({ "source_id": "events-live", "limit": 5, "consistency": "snapshot" }), &env.svc.sources)
+    assert_eq!(ws.source_query(&alice(), &json!({ "source_id": "events-live", "limit": 5, "consistency": "snapshot" }), &env.svc.sources)
         .unwrap_err().code.as_str(), "DEPENDENCY_UNAVAILABLE");
     // unknown scheme: the definition is kept, the source is reported unavailable, nothing is fetched
     url_table(&mut ws, "events-http", "https://data.example.com/datasets/events", json!({}));
     assert_eq!(ws.source_capabilities(&alice(), "events-http", &env.svc.sources).unwrap()["available"], false);
-    assert_eq!(ws.query(&alice(), &json!({ "source_id": "events-http" }), &env.svc.sources).unwrap_err().code.as_str(), "DEPENDENCY_UNAVAILABLE");
+    assert_eq!(ws.source_query(&alice(), &json!({ "source_id": "events-http" }), &env.svc.sources).unwrap_err().code.as_str(), "DEPENDENCY_UNAVAILABLE");
     assert!(commit(&mut ws, &alice(), json!([{ "op": "entity.create", "entity_id": "bad-url", "type_id": "buckyos.table-source", "parent_id": "data", "order_key": "x",
         "payload": { "data_mode": "url_query", "source_ref": { "kind": "url_query", "source_url": "https://user:pw@host/x" } } }]))["status"] == "rejected", "credentials never go into a document");
 
@@ -533,13 +579,13 @@ fn v24_url_query_table() {
     let h2 = other.svc.workspace(r["workspace_id"].as_str().unwrap()).unwrap();
     let mut ws2 = h2.lock().unwrap();
     assert_eq!(ws2.read(&alice(), "events", None).unwrap()["content"]["payload"]["source_ref"]["source_url"], url);
-    assert_eq!(ws2.query(&alice(), &json!({ "view_id": "cell-events", "limit": 3 }), &other.svc.sources).unwrap()["rows"][0]["record_id"], "ev-000000042");
+    assert_eq!(ws2.source_query(&alice(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-42" }, "limit": 3 }), &other.svc.sources).unwrap()["rows"][0]["record_id"], "ev-000000042");
     // offline: content that was never fetched is not presented as available
     src2.offline.store(true, Ordering::Relaxed);
-    assert_eq!(ws2.query(&alice(), &json!({ "view_id": "cell-events", "limit": 3, "cursor": "999" }), &other.svc.sources).unwrap_err().code.as_str(), "DEPENDENCY_UNAVAILABLE");
+    assert_eq!(ws2.source_query(&alice(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-42" }, "limit": 3, "cursor": "999" }), &other.svc.sources).unwrap_err().code.as_str(), "DEPENDENCY_UNAVAILABLE");
     src2.offline.store(false, Ordering::Relaxed);
     // materialize just the chosen slice into an embedded table: that slice gets a content identity
-    let page = ws2.query(&alice(), &json!({ "view_id": "cell-events", "limit": 3 }), &other.svc.sources).unwrap();
+    let page = ws2.source_query(&alice(), &json!({ "source_id": "events", "filter": { "op": "cmp", "field_id": "project_id", "operator": "eq", "value": "project-42" }, "limit": 3 }), &other.svc.sources).unwrap();
     let records: Vec<Value> = page["rows"].as_array().unwrap().iter().map(|r| json!({ "record_id": r["record_id"], "values": r["values"] })).collect();
     ok(&mut ws2, &alice(), json!([
         { "op": "entity.create", "entity_id": "events-slice", "type_id": "buckyos.table-source", "parent_id": "data", "order_key": "y",
@@ -551,4 +597,35 @@ fn v24_url_query_table() {
     assert!(cp.objects["events-slice"].starts_with("jobj:"));
     assert_eq!(cp.unresolved.len(), 3, "the URL dependencies are still reported as not fixed");
     let _ = Service::open; // keep the import used on all cfgs
+}
+
+/// Canvas folders (UI 框架 PRD §4.1.1, Q5, K1) travel in a package and a Clone: the folders, the canvas in them, its
+/// path; the folder's grant decides over the canvas.
+#[test]
+fn canvas_folders_travel_in_packages_and_clones() {
+    let env = env();
+    let id = project(&env);
+    {
+        let h = env.svc.workspace(&id).unwrap();
+        let mut ws = h.lock().unwrap();
+        ok(&mut ws, &alice(), json!([
+            { "op": "entity.create", "entity_id": "cf-a", "type_id": "buckyos.container", "parent_id": "surfaces", "order_key": "y", "payload": { "kind": "folder", "title": "归档" } },
+            { "op": "entity.create", "entity_id": "cf-b", "type_id": "buckyos.container", "parent_id": "cf-a", "order_key": "a", "payload": { "kind": "folder", "title": "2026" } },
+            { "op": "entity.create", "entity_id": "sf-deep-content", "type_id": "buckyos.container", "parent_id": "canvas-content", "order_key": "y", "payload": { "kind": "folder", "system": "surface_content", "surface_id": "sf-deep", "title": "深处" } },
+            { "op": "entity.create", "entity_id": "sf-deep", "type_id": "buckyos.container", "parent_id": "cf-b", "order_key": "a", "payload": { "kind": "surface", "layout": { "mode": "flow" }, "title": "深处", "content_folder_id": "sf-deep-content" } },
+        ]));
+        ws.acl_set(&alice(), &json!([{ "subject": "bob", "resource": "/surfaces/归档", "allow": ["read"] }])).unwrap();
+        let r = ws.resolve(&bob(), Some(&json!({ "entity_id": "sf-deep" })), None).unwrap();
+        assert_eq!(r["path"], "~cf-a/2026/深处", "bob reads from the folder down");
+        assert!(ws.read(&bob(), "sf-deep", None).is_ok());
+    }
+    let path_in = |ws: &aiworkspace_store::Workspace| ws.resolve(&alice(), None, Some("/surfaces/归档/2026/深处")).unwrap()["path"].clone();
+    let (pkg, _) = export(&env, &id, &alice(), "share", true);
+    let other = common::env();
+    let r = other.svc.import(&alice(), &pkg, "new", false).unwrap();
+    let imported = r["workspace_id"].as_str().unwrap().to_string();
+    assert_eq!(path_in(&other.svc.workspace(&imported).unwrap().lock().unwrap()), "/surfaces/归档/2026/深处");
+    let f = env.svc.clone_workspace(&alice(), &id).unwrap();
+    let cid = f["workspace_id"].as_str().unwrap().to_string();
+    assert_eq!(path_in(&env.svc.workspace(&cid).unwrap().lock().unwrap()), "/surfaces/归档/2026/深处");
 }

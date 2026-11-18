@@ -15,7 +15,7 @@
   "manifest_version": {
    "type": "integer",
    "minimum": 1,
-   "maximum": 3
+   "maximum": 5
   },
   "purpose": {
    "const": "aiws"

@@ -1,6 +1,20 @@
-import { expect, test as base, type Page } from '@playwright/test'
+import { expect, test as base, type FrameLocator, type Locator, type Page } from '@playwright/test'
 import { readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { pickLocal, putZoneFile, selectDialog, selectEmbedFrame, selectRow } from '../e2e/fixtures/selectDialog'
+import { queryBySql } from '../../src/app/aiworkspace/api/tableQuery'
+import type { QueryPage, QueryParams } from '../../src/app/aiworkspace/api/types'
+import * as wasmCore from '../../src/app/aiworkspace/wasm/aiworkspace_wasm.js'
+
+let wasmReady = false
+/** The core compiled to WASM, as the Desktop loads it (the view compiler of `queryBySql`). */
+export function core(): typeof wasmCore {
+  if (!wasmReady) {
+    wasmCore.initSync({ module: readFileSync(resolve('src/app/aiworkspace/wasm/aiworkspace_wasm_bg.wasm')) })
+    wasmReady = true
+  }
+  return wasmCore
+}
 
 const BACKEND_FIXTURE = resolve('../aiworkspace/fixtures/project-workspace/commits.json')
 export const VECTORS_PATH = resolve('../aiworkspace/fixtures/vectors/object-ids.json')
@@ -64,6 +78,29 @@ export class Api {
     return body.result
   }
 
+  /** The rows of a table or a table view (`source_id` / `view_id`, filter, sorts, …) as a session without a replica reads
+   * them: the view compiled to SQL by the core and run with `doc.query { sql }` (核心 API 调整 §3.5). */
+  async table(token: string, workspaceId: string, params: QueryParams): Promise<QueryPage> {
+    const fail = (e: { code: string; detail?: string }) => Object.assign(new Error(`${e.code}: ${e.detail ?? ''}`), e)
+    const ok = async (method: string, p: Json) => {
+      const r = await this.rpc(token, method, { workspace_id: workspaceId, ...p })
+      if (r?.ok === false) throw fail(r.error)
+      return r
+    }
+    return queryBySql({
+      read: async (ids) => (await ok('doc.read', { targets: ids.map((entity_id) => ({ entity_id })) })).results,
+      sql: (p) => ok('doc.query', p),
+      sourceQuery: (p) => ok('doc.source_query', p),
+      viewSql: (table, fields, view, projection) => core().view_sql(table, fields, view, projection),
+      fail,
+    }, params)
+  }
+
+  /** The readable children of a node (`doc.list`). */
+  async children(token: string, workspaceId: string, at: string): Promise<Json[]> {
+    return (await this.rpc(token, 'doc.list', { workspace_id: workspaceId, at, limit: 1000 })).items
+  }
+
   async commit(token: string, ws: { workspace_id: string; epoch: string }, operations: Json[], key = `test/${Date.now()}/${Math.random().toString(36).slice(2)}`): Promise<Json> {
     return this.rpc(token, 'doc.commit', { protocol_version: '1.0', workspace_id: ws.workspace_id, epoch: ws.epoch, idempotency_key: key, session_id: 'test-api', operations })
   }
@@ -85,7 +122,8 @@ export class Api {
     return { workspace_id: ws.workspace_id, epoch: ws.epoch }
   }
 
-  /** One of the phase-two demos (§11), replayed through the public interface like the app does. */
+  /** One of the phase-two demos (§11), replayed through the public interface like the app does. Its wishes are on the
+   * real executor: a run started in the browser talks to the scripted model (mock-llm.mjs, the dev override's `llm`). */
   async demo(token: string, kind: 'quarterly' | 'film', title: string): Promise<{ workspace_id: string; epoch: string }> {
     const { quarterlyDemoCommits, filmDemoCommits } = await import('../../src/app/aiworkspace/api/demos')
     const { setAiwsLocale } = await import('../../src/app/aiworkspace/i18n')
@@ -97,6 +135,33 @@ export class Api {
       expect(result.status, JSON.stringify(result)).toBe('accepted')
     }
     return { workspace_id: ws.workspace_id, epoch: ws.epoch }
+  }
+
+  /** The "sample" template as the app creates it: the shared sample, then its "任务汇总" wish on the flow page
+   * (`wish-task-summary`, Block `cell-task-summary`; 许愿格交互升级 §3.10 D, D10). The wish's commit is the one of
+   * `api/sample.ts` `sampleWishCommit` (that module imports the fixture JSON, which the spec loader cannot). */
+  async sampleWithWish(token: string, title: string): Promise<{ workspace_id: string; epoch: string }> {
+    const ws = await this.sample(token, title)
+    const { aiwsText, setAiwsLocale } = await import('../../src/app/aiworkspace/i18n')
+    setAiwsLocale(SPEC_LOCALE)
+    const { t } = aiwsText()
+    const name = t('aiworkspace.samplewish.wish.title')
+    const result = await this.commit(token, ws, [
+      { op: 'entity.create', entity_id: 'wish-task-summary', type_id: 'buckyos.wish', parent_id: 'surface-main-content', order_key: 'a', name, payload: {
+        title: name, prompt: t('aiworkspace.samplewish.wish.prompt', { tasks: '任务' }), executor: 'xllm', output_mode: 'overwrite',
+        inputs: [{ entity_id: 'tasks', version: { mode: 'follow' } }],
+        output: { container_id: 'surface-main-content', surface_id: 'surface-main', name: t('aiworkspace.samplewish.wish.output') } } },
+      { op: 'entity.create', entity_id: 'cell-task-summary', type_id: 'buckyos.cell', parent_id: 'surface-main', order_key: 'gm', placement: { x: 0, y: 0, w: 420, h: 300 },
+        payload: { view: { type: 'wish' }, source_ref: { entity_id: 'wish-task-summary' }, title: t('aiworkspace.samplewish.block.wish') } },
+    ])
+    expect(result.status, JSON.stringify(result)).toBe('accepted')
+    return ws
+  }
+
+  /** A wish's history (许愿格交互升级 §2.2): its records by stage, newest first, and how many runs made results. */
+  async history(token: string, workspaceId: string, wishId: string): Promise<{ analyze: Json[]; code: Json[]; run: Json[]; results_count: number }> {
+    const h = (await this.read(token, workspaceId, wishId)).content.payload.history ?? {}
+    return { analyze: h.analyze ?? [], code: h.code ?? [], run: h.run ?? [], results_count: h.results_count ?? 0 }
   }
 
   async outline(token: string, workspaceId: string): Promise<Json[]> {
@@ -120,10 +185,12 @@ export class Api {
     return (await this.rpc(token, 'ws.get_info', { workspace_id: workspaceId })).head_seq
   }
 
-  /** `ext.build` of a control from files given as text or JSON (or a folder of `doc/workspace/hello-controls`). */
+  /** `ext.build` of a control from files given as text or JSON (or a folder of `doc/workspace/hello-controls`, or a path under `doc/workspace`). */
   async build(token: string, workspaceId: string, files: Record<string, unknown> | string, extra: Json = {}): Promise<Json> {
+    // a name: a folder of hello-controls; a path: a folder under doc/workspace (control-examples/controls/<name>)
+    const dir = typeof files === 'string' ? resolve(files.includes('/') ? '../../../doc/workspace' : '../../../doc/workspace/hello-controls/controls', files) : ''
     const list = typeof files === 'string'
-      ? readdirSync(resolve('../../../doc/workspace/hello-controls/controls', files)).map((name) => ({ name, base64: readFileSync(resolve('../../../doc/workspace/hello-controls/controls', files, name)).toString('base64') }))
+      ? readdirSync(dir).map((name) => ({ name, base64: readFileSync(resolve(dir, name)).toString('base64') }))
       : Object.entries(files).map(([name, v]) => ({ name, base64: Buffer.from(typeof v === 'string' ? v : JSON.stringify(v), 'utf8').toString('base64') }))
     const built = await this.rpc(token, 'ext.build', { workspace_id: workspaceId, files: list, ...extra })
     expect(built.status, JSON.stringify(built)).toBe('accepted')
@@ -147,6 +214,11 @@ export class Api {
   }
 }
 
+/** The scripted OpenAI-format model of the suite (mock-llm.mjs): a wish run executed in the browser talks to it. */
+export function scriptedModel(): { baseUrl: string } {
+  return { baseUrl: `http://127.0.0.1:${process.env.AIWS_E2E_LLM_PORT}/v1` }
+}
+
 /** A workspace's own origin on the dev server (T4-8): `http://aiws-<label>.localhost:<port>`. */
 export function workspaceOrigin(workspaceId: string, port: string | number = process.env.AIWS_E2E_WEB_PORT ?? ''): string {
   return `http://aiws-${workspaceId.replace(/^ws_/, '')}.localhost:${port}`
@@ -168,8 +240,8 @@ export async function openWorkspacePage(page: Page, who: string | { guest: true 
 /** Open the Desktop shell and the AI Workspace app in it, talking to the standalone backend as `token`, and
  * end on the workspace list (a normal start restores the last workspace: it is closed again here). */
 export async function openApp(page: Page, token: string) {
-  // keeps what an earlier init script put there (the local executor spec adds its model endpoint)
-  await page.addInitScript((value) => { let prev: Record<string, unknown> = {}; try { prev = JSON.parse(window.localStorage.getItem('aiworkspace.dev') ?? '{}') as Record<string, unknown> } catch { prev = {} }; window.localStorage.setItem('aiworkspace.dev', JSON.stringify({ ...prev, token: value })) }, token)
+  // keeps what an earlier init script put there; wish runs in this browser talk to the scripted model (mock-llm.mjs)
+  await page.addInitScript(({ value, llm }) => { let prev: Record<string, unknown> = {}; try { prev = JSON.parse(window.localStorage.getItem('aiworkspace.dev') ?? '{}') as Record<string, unknown> } catch { prev = {} }; window.localStorage.setItem('aiworkspace.dev', JSON.stringify({ llm, ...prev, token: value })) }, { value: token, llm: scriptedModel() })
   // the mock Desktop loads its scenario state after the first paint and resets the windows then: an icon clicked
   // before that is lost, so the click waits for the loading to settle
   await page.goto('/?scenario=normal', { waitUntil: 'networkidle' })
@@ -188,7 +260,30 @@ export async function backToList(page: Page): Promise<string | null> {
     await closeWorkspace(page)
   }
   await expect(page.getByTestId('aiws-list')).toBeVisible({ timeout: 30_000 })
+  await showAllWorkspaces(page)
   return restored
+}
+
+/** The home starts on "Recent" when it has any (UI framework PRD §9.1): the specs find their workspaces under "All
+ * workspaces", which the window then keeps while it lives. Nothing to pick when the list cannot be read (offline). */
+export async function showAllWorkspaces(page: Page) {
+  const list = page.getByTestId('aiws-list')
+  await expect(list).not.toHaveAttribute('data-state', 'loading', { timeout: 30_000 })
+  if (await list.getAttribute('data-state') === 'ready') await list.getByTestId('aiws-home-tab-all').click()
+}
+
+/** A home card's ⋯ menu → an item. The menu floats over the list and a scroll closes it: it is opened once the card
+ * has been brought into view. */
+export async function cardMenu(page: Page, workspaceId: string, item: string) {
+  const card = page.locator(`[data-testid="aiws-workspace-card"][data-workspace-id="${workspaceId}"]`)
+  const more = card.getByTestId('aiws-home-card-more')
+  const entry = card.getByTestId(item)
+  await more.scrollIntoViewIfNeeded()
+  await expect(async () => {
+    if (!await entry.isVisible()) await more.click()
+    await expect(entry).toBeVisible({ timeout: 2000 })
+  }).toPass({ timeout: 20_000 })
+  await entry.click()
 }
 
 /** Open the main menu and click through items by test id (an item with a submenu opens it on click). */
@@ -201,9 +296,9 @@ export async function mainMenu(page: Page, ...testIds: string[]) {
   }
 }
 
-/** Main menu → 关闭工作区 (the leave check passes when nothing is unsaved). */
+/** Main menu → 工作区 → 关闭工作区 (the leave check passes when nothing is unsaved). */
 export async function closeWorkspace(page: Page) {
-  await mainMenu(page, 'aiws-back')
+  await mainMenu(page, 'aiws-menu-workspace', 'aiws-back')
 }
 
 /** The zoom control of the presenter toolbar → 适应全部. */
@@ -218,28 +313,68 @@ export async function zoomIn(page: Page) {
   await page.keyboard.press('Escape')
 }
 
-/** Main menu → 画布模式 → edit / view / presentation_edit. */
+/** Main menu → 画布 → 画布模式 → edit / view / presentation_edit. */
 export async function setCanvasMode(page: Page, mode: 'edit' | 'view' | 'presentation_edit') {
-  await mainMenu(page, 'aiws-menu-canvas-mode', `aiws-mode-${mode}`)
+  await mainMenu(page, 'aiws-menu-surface', 'aiws-menu-canvas-mode', `aiws-mode-${mode}`)
 }
 
-/** Show one tab of the right panel (main menu → 视图 → tab), unless it is already shown. */
-export async function openSide(page: Page, tab: 'inspector' | 'relations' | 'annotations' | 'collab' | 'edits') {
+/** Show one tab of the side drawer (main menu → 视图 → 面板 → tab), unless it is already shown. */
+export async function openSide(page: Page, tab: 'inspector' | 'relations' | 'annotations') {
+  // properties are the floating properties panel (UI 框架 PRD §10.2), not a tab of the side drawer
+  if (tab === 'inspector') return openProperties(page)
   if (await page.locator(`[data-testid="aiws-side-panel"][data-tab="${tab}"]`).isVisible()) return
-  await mainMenu(page, 'aiws-menu-view', `aiws-menu-side-${tab}`)
+  await mainMenu(page, 'aiws-menu-view', 'aiws-menu-panels', `aiws-menu-side-${tab}`)
   await expect(page.locator(`[data-testid="aiws-side-panel"][data-tab="${tab}"]`)).toBeVisible()
 }
 
-/** The save-state panel: connection, offline actions and the edits that are not committed. */
-export async function openStatus(page: Page) {
-  if (await page.getByTestId('aiws-status-detail').isVisible()) return
-  await page.getByTestId('aiws-status').click()
-  await expect(page.getByTestId('aiws-status-detail')).toBeVisible()
+/** The properties panel of the selection (F2; the page's when nothing is selected), UI 框架 PRD §10.2. */
+export async function openProperties(page: Page) {
+  if (await page.getByTestId('aiws-props-panel').isVisible()) return
+  await page.keyboard.press('F2')
+  await expect(page.getByTestId('aiws-props-panel')).toBeVisible()
 }
 
-/** Main menu → 开发工具 → 受控加工（Mock）. */
-export async function openMock(page: Page) {
-  await mainMenu(page, 'aiws-menu-dev', 'aiws-side-mock')
+/** The status panel (UI framework PRD §4.5), opened from the status bar, with its "connection and offline" part
+ * unfolded: the edits that are not committed, connection details and the offline actions. */
+export async function openStatus(page: Page) {
+  if (!await page.getByTestId('aiws-status-detail').isVisible()) await page.getByTestId('aiws-status').click()
+  await expect(page.getByTestId('aiws-status-detail')).toBeVisible()
+  const connection = page.getByTestId('aiws-status-connection')
+  if (!await connection.evaluate((el) => (el as HTMLDetailsElement).open)) await page.getByTestId('aiws-status-connection-toggle').click()
+}
+
+/** Main menu → 协作 → 成员与权限… (UI 框架 PRD §8.1): the data mode with the Workspace's permission editor as its tab. */
+export async function openPermissions(page: Page) {
+  await mainMenu(page, 'aiws-menu-collab', 'aiws-menu-members')
+  await expect(page.getByTestId('aiws-detail-permissions')).toBeVisible()
+}
+
+/** Back from the data mode (the permission editor's tab included) to the canvas. */
+export async function closePermissions(page: Page) {
+  await page.getByTestId('aiws-top-canvas').click()
+  await expect(page.getByTestId('aiws-canvas')).toBeVisible()
+}
+
+/** Unfold rows of the data mode's object tree, outermost first (a row already unfolded stays so). */
+export async function expandTree(page: Page, ...entityIds: string[]) {
+  for (const id of entityIds) {
+    const item = page.locator(`[data-testid="aiws-tree-item"][data-entity-id="${id}"]`)
+    if (await item.getAttribute('aria-expanded') === 'false') await item.locator('.aiws-tree-toggle').first().click()
+    await expect(item).toHaveAttribute('aria-expanded', 'true')
+  }
+}
+
+/** The data mode's object tree: the context menu of a row (a right click), then entries by test id (a submenu opens on
+ * hover). `entityId` null: the tree's ＋ (where the current object is). */
+export async function treeMenu(page: Page, entityId: string | null, ...testIds: string[]) {
+  if (entityId) await page.getByTestId(`aiws-tree-${entityId}`).click({ button: 'right' })
+  else await page.getByTestId('aiws-dm-tree-add').click()
+  await expect(page.getByTestId('aiws-dm-menu')).toBeVisible()
+  for (const id of testIds) {
+    const item = page.getByTestId(id)
+    if (await item.getAttribute('aria-haspopup') === 'menu') await item.hover()
+    else await item.click()
+  }
 }
 
 export async function openWorkspace(page: Page, token: string, workspaceId: string) {
@@ -277,17 +412,74 @@ export async function hooks(page: Page): Promise<{ commits: number; canvas: { bl
   })
 }
 
+/** A wish's card (许愿格交互升级 §3.1), wherever it is shown. */
+export function wishCard(page: Page | Locator, wishId: string): Locator {
+  return page.getByTestId(`aiws-wish-card-${wishId}`)
+}
+
+type WishAction = 'analyze' | 'code' | 'repair' | 'run'
+const STAGE_OF: Record<WishAction, 'analyze' | 'code' | 'run'> = { analyze: 'analyze', code: 'code', repair: 'code', run: 'run' }
+
+/** Wait until a stage of a wish that was just started has ended: a record newer than `before` heads its stage's list in
+ * the wish's history, and the card shows nothing under way. Returns that record. */
+export async function wishStageEnded(page: Page, api: Api, token: string, workspaceId: string, wishId: string, stage: 'analyze' | 'code' | 'run', before: string | undefined, timeout = 60_000): Promise<Json> {
+  let record: Json
+  await expect.poll(async () => { record = (await api.history(token, workspaceId, wishId))[stage][0]; return Boolean(record && record.id !== before) }, { timeout }).toBe(true)
+  await expect(wishCard(page, wishId)).toHaveAttribute('data-running', '', { timeout: 15_000 })
+  return record
+}
+
+/** Click a wish card's next step — on `tab` when given — expecting it to be `action`, and wait for that stage to end
+ * (§3.3: it writes when it ends, nothing to apply). Returns the stage's new record. */
+export async function wishStep(page: Page, api: Api, token: string, workspaceId: string, wishId: string, action: WishAction, options: { tab?: 'prompt' | 'analysis' | 'macro' | 'results'; timeout?: number } = {}): Promise<Json> {
+  const card = wishCard(page, wishId)
+  if (options.tab) await card.getByTestId(`aiws-wish-tab-${options.tab}`).click()
+  const stage = STAGE_OF[action]
+  const before = (await api.history(token, workspaceId, wishId))[stage][0]?.id as string | undefined
+  const next = card.getByTestId('aiws-wish-next')
+  await expect(next).toHaveAttribute('data-action', action)
+  await expect(next).toBeEnabled()
+  await next.click()
+  return wishStageEnded(page, api, token, workspaceId, wishId, stage, before, options.timeout)
+}
+
+/** The card's run button (§3.6): run the stored macro and wait for the run to end. Returns its record. */
+export async function wishRun(page: Page, api: Api, token: string, workspaceId: string, wishId: string, timeout?: number): Promise<Json> {
+  const before = (await api.history(token, workspaceId, wishId)).run[0]?.id as string | undefined
+  const run = wishCard(page, wishId).getByTestId('aiws-wish-run')
+  await expect(run).toHaveAttribute('data-state', 'ready')
+  await run.click()
+  return wishStageEnded(page, api, token, workspaceId, wishId, 'run', before, timeout)
+}
+
+/** Analyze, code and run a wish from its card, the three steps of §3.3 (each written as it ends). */
+export async function wishThreeSteps(page: Page, api: Api, token: string, workspaceId: string, wishId: string): Promise<void> {
+  await wishStep(page, api, token, workspaceId, wishId, 'analyze', { tab: 'prompt' })
+  await wishStep(page, api, token, workspaceId, wishId, 'code', { tab: 'analysis' })
+  await wishStep(page, api, token, workspaceId, wishId, 'run', { tab: 'macro' })
+}
+
 /** Talk to the backend as `who` (`{ guest: true }` for nobody) in the specs' language, on every origin this page visits
  * (a workspace's own origin starts with an empty storage). */
 export async function asUser(page: Page, who: string | { guest: true }) {
-  await page.addInitScript(({ who, localeKey, locale }) => {
-    window.localStorage.setItem('aiworkspace.dev', JSON.stringify(typeof who === 'string' ? { token: who } : who))
+  await page.addInitScript(({ who, localeKey, locale, llm }) => {
+    window.localStorage.setItem('aiworkspace.dev', JSON.stringify(typeof who === 'string' ? { token: who, llm } : who))
     window.localStorage.setItem(localeKey, locale)
-  }, { who, localeKey: LOCALE_STORAGE_KEY, locale: SPEC_LOCALE })
+  }, { who, localeKey: LOCALE_STORAGE_KEY, locale: SPEC_LOCALE, llm: scriptedModel() })
 }
 
-export const test = base.extend<{ api: Api }>({
+/** The test accounts' preferences across Workspaces (UI 框架 PRD §4.6, §12: the tool zones' switches, the status bar,
+ * the home's category and filters) follow a person from test to test on the shared backend: every test starts without. */
+async function resetPrefs(api: Api) {
+  for (const token of ['tok-alice', 'tok-bob']) await api.rpc(token, 'user.set_prefs', { prefs: {} }).catch(() => undefined)
+}
+
+export const test = base.extend<{ api: Api; freshPrefs: void }>({
   api: async ({}, use) => { await use(new Api()) },
+  freshPrefs: [async ({}, use) => {
+    try { await resetPrefs(new Api()) } catch { /* no backend in this run */ }
+    await use()
+  }, { auto: true }],
   // the specs' language on every origin, the workspace origins `aiws-<label>.localhost` included
   context: async ({ context }, use) => {
     await context.addInitScript(({ localeKey, locale }) => { if (!window.localStorage.getItem(localeKey)) window.localStorage.setItem(localeKey, locale) }, { localeKey: LOCALE_STORAGE_KEY, locale: SPEC_LOCALE })
@@ -299,3 +491,67 @@ export const test = base.extend<{ api: Api }>({
   },
 })
 export { expect }
+
+// ---- the system file picker (sysdlg/select): every file the Workspace takes in is chosen there
+
+/** A file the specs choose, from the Zone or from this device. */
+export type PickedFile = { name: string; mimeType: string; buffer: Buffer }
+/** Where the specs put the files they choose from the Zone (the mock Desktop runtime's file data). */
+export const ZONE_DIR = '/home/Documents/aiws-e2e'
+
+const asPayload = (file: PickedFile | string): PickedFile => typeof file === 'string'
+  ? { name: file.slice(file.lastIndexOf('/') + 1), mimeType: 'application/octet-stream', buffer: readFileSync(file) } : file
+
+/** The picker over this page: in the Desktop window (path A), or framed over a Workspace's own page (path C). */
+export async function openedPicker(page: Page): Promise<{ dialog: Locator; frame: FrameLocator | null }> {
+  const inWindow = selectDialog(page)
+  const framed = selectDialog(selectEmbedFrame(page))
+  // (a frame locator cannot be part of `or`)
+  await expect.poll(async () => await inWindow.isVisible() || await framed.isVisible(), { timeout: 30_000 }).toBe(true)
+  return await inWindow.isVisible() ? { dialog: inWindow, frame: null } : { dialog: framed, frame: selectEmbedFrame(page) }
+}
+
+const HOME_LABEL = /^(我的文件|My files)$/
+
+/** From the picker's home root ("我的文件") down through `segments`, the folders below the home folder. */
+export async function zoneGoto(dialog: Locator, segments: string[]) {
+  const locations = dialog.getByTestId('select-locations')
+  if (await locations.evaluate((el) => el.tagName === 'SELECT')) {
+    const label = (await locations.locator('option').allTextContents()).find((text) => HOME_LABEL.test(text.trim()))
+    await locations.selectOption({ label: label?.trim() ?? '我的文件' })
+  } else await locations.getByRole('button', { name: HOME_LABEL }).click()
+  for (const segment of segments) await selectRow(dialog, segment).click()
+}
+const belowHome = (dir: string) => dir.split('/').filter(Boolean).slice(1)
+
+/** Choose files from the Zone in the picker `open` brings up. They are put into the mock Zone first — of this page,
+ * which reads them, and of the framed system page, which lists them (path C) — then picked in their folder. */
+export async function chooseFromZone(page: Page, open: () => Promise<unknown>, files: PickedFile | string | Array<PickedFile | string>, dir = ZONE_DIR) {
+  const list = (Array.isArray(files) ? files : [files]).map(asPayload)
+  for (const file of list) await putZoneFile(page, `${dir}/${file.name}`, file.buffer, file.mimeType)
+  await open()
+  const { dialog } = await openedPicker(page)
+  const framed = page.frames().find((frame) => /\/embed\/sysdlg\/select/.test(frame.url()))
+  if (framed) for (const file of list) await putZoneFile(framed, `${dir}/${file.name}`, file.buffer, file.mimeType)
+  await zoneGoto(dialog, belowHome(dir))
+  for (const file of list) await selectRow(dialog, file.name).click()
+  await dialog.getByTestId('select-confirm').click()
+}
+
+/** Choose a whole Zone folder (its files put into the mock Zone first) in the folder picker `open` brings up. */
+export async function chooseFolderFromZone(page: Page, open: () => Promise<unknown>, dir: string, files: Array<{ path: string; buffer: Buffer }>) {
+  for (const file of files) await putZoneFile(page, `${dir}/${file.path}`, file.buffer)
+  await open()
+  const { dialog } = await openedPicker(page)
+  const framed = page.frames().find((frame) => /\/embed\/sysdlg\/select/.test(frame.url()))
+  if (framed) for (const file of files) await putZoneFile(framed, `${dir}/${file.path}`, file.buffer)
+  await zoneGoto(dialog, belowHome(dir))
+  await dialog.getByTestId('select-confirm').click()
+}
+
+/** Choose files (or a folder) from this device: the picker's "This device" entry, then the browser's own picker. */
+export async function chooseFromDevice(page: Page, open: () => Promise<unknown>, files: string | string[] | PickedFile | PickedFile[]) {
+  await open()
+  const { dialog } = await openedPicker(page)
+  await pickLocal(page, files, dialog)
+}

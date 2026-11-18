@@ -1,7 +1,7 @@
 //! HTTP binding (NFSP §4): control plane `POST /nfs/v1/{method}`, batch,
 //! watch SSE, the data-plane read endpoint, and the minimal tus upload area.
 
-use crate::acl::{Actor, Level};
+use crate::acl::{with_host_grant, Actor, HostGrant, Level, HOST_ROOT};
 use crate::auth::{authenticate, Credentials};
 use crate::error::*;
 use crate::fsutil::{content_type_for, join_root};
@@ -93,6 +93,7 @@ pub fn build_router(state: SharedState) -> Router {
     router
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::share::serving::host_guard))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::bucket::s3::host_route))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::bucket::reflow::host_route))
         .with_state(state)
 }
 
@@ -128,6 +129,9 @@ async fn control_handler(
     let creds = Credentials::from_headers(&headers);
     let actor = match authenticate(&state, &creds).await {
         Ok(a) => a,
+        Err(e) if env.session.as_deref().and_then(|s| state.sessions.sudo_exp(s)).is_some() => {
+            return envelope_error(&state, sudo_required(format!("the sudo session ended ({}); unlock again", e.message)))
+        }
         Err(e) => return envelope_error(&state, e),
     };
     if !(method == "hello" || method == "bye" || method.starts_with("share.")) {
@@ -135,8 +139,9 @@ async fn control_handler(
             return envelope_error(&state, e);
         }
     }
+    let grant = crate::auth::host_grant_for(&state, &creds, &actor).await;
     if method == "hello" {
-        return match op_hello(&state, &env, actor) {
+        return match op_hello(&state, &env, actor, grant) {
             Ok(v) => envelope_ok(&state, v),
             Err(e) => envelope_error(&state, e),
         };
@@ -145,6 +150,25 @@ async fn control_handler(
         Ok(s) => s,
         Err(e) => return envelope_error(&state, e),
     };
+    let grant = grant.and_then(|g| {
+        let sudo_exp = state.sessions.sudo_exp(&session)?;
+        (sudo_exp > crate::fsutil::unix_now() as u64).then_some(HostGrant { exp: g.exp.min(sudo_exp) })
+    });
+    let ctx = crate::archive::RequestCtx::from_headers(&headers);
+    crate::archive::scope(ctx, with_host_grant(grant, control_in_session(state, method, env, actor, session, creds, headers))).await
+}
+
+async fn control_in_session(
+    state: SharedState,
+    method: String,
+    env: Envelope,
+    actor: Actor,
+    session: String,
+    creds: Credentials,
+    headers: HeaderMap,
+) -> Response {
+    let at = env.at.as_ref().and_then(|a| serde_json::to_value(a).ok()).unwrap_or(Value::Null);
+    crate::archive::prepare(&state, &actor, &headers, &[&at, &env.args]).await;
     if method.starts_with("copy_") {
         return match crate::copy::dispatch(&state, &actor, &method, &env.args, creds.bearer()).await {
             Ok(value) => envelope_ok(&state, value),
@@ -224,7 +248,7 @@ fn envelope_error(state: &SharedState, e: NfsError) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-fn op_hello(state: &SharedState, env: &Envelope, actor: Actor) -> NfsResult<Value> {
+fn op_hello(state: &SharedState, env: &Envelope, actor: Actor, grant: Option<HostGrant>) -> NfsResult<Value> {
     if let Some(versions) = env.args["versions"].as_array() {
         if !versions.iter().any(|v| v.as_str() == Some(PROTOCOL_VERSION)) {
             return Err(NfsError::new(
@@ -257,8 +281,15 @@ fn op_hello(state: &SharedState, env: &Envelope, actor: Actor) -> NfsResult<Valu
     if let Err(e) = state.ensure_home(&actor) {
         log::warn!("create home for {:?} failed: {}", actor.user_id(), e.message);
     }
-    let session = state.sessions.create(actor);
-    Ok(json!({
+    let mut realms = vec![json!({"id": "dfs", "writable": true})];
+    if let (Some(host), Actor::Admin(Some(_))) = (&state.config.host, &actor) {
+        realms.push(json!({"id": "host", "writable": true, "label": host.label}));
+    }
+    if let Some(g) = grant {
+        crate::access::host_audit(&actor, "unlock", format_args!("exp={}", g.exp));
+    }
+    let session = state.sessions.create(actor, grant.map(|g| g.exp));
+    let mut out = json!({
         "version": PROTOCOL_VERSION,
         "session": session,
         "identity": identity,
@@ -269,9 +300,14 @@ fn op_hello(state: &SharedState, env: &Envelope, actor: Actor) -> NfsResult<Valu
             "replay_window": state.config.replay_window,
             "attr_ttl_ms": 5000,
         },
-        "realms": [ {"id": "dfs", "writable": true} ],
+        "realms": realms,
         "repr": repr.map(|p| p.describe()).unwrap_or_else(|| json!({"available": false, "detail": "the named store is not configured"})),
-    }))
+        "archive": crate::archive::describe(state),
+    });
+    if let Some(g) = grant {
+        out["sudo_exp"] = json!(g.exp);
+    }
+    Ok(out)
 }
 
 async fn dispatch(
@@ -350,6 +386,8 @@ async fn dispatch(
         "list_acls" => state.op_list_acls(actor),
         "repr" => crate::preview::rpc::op_repr(state, actor, env, headers).await,
         "get_repr" => crate::preview::rpc::op_get_repr(state, actor, args).await,
+        "archive.unlock" => crate::archive::op_unlock(state, actor, env).await,
+        "archive.forget" => crate::archive::op_forget(state, actor, env).await,
         other => Err(NfsError::new(
             ErrorCode::Unsupported,
             format!("unknown method '{}'", other),
@@ -533,10 +571,42 @@ async fn read_handler(
     if let Err(e) = crate::auth::require_file_actor(&actor) {
         return envelope_error(&state, e);
     }
+    let host = node_id.starts_with("nh_") && state.handles.decode(&node_id).is_ok_and(|h| h.r == HOST_ROOT);
+    let grant = if host {
+        let exp = q.get("hx").and_then(|hx| state.handles.verify_read(&node_id, hx));
+        let owner = match &actor {
+            Actor::Admin(Some(user)) => crate::auth::is_zone_owner(&state, user).await,
+            _ => false,
+        };
+        match exp.filter(|&exp| owner && exp > crate::fsutil::unix_now() as u64) {
+            Some(exp) => Some(HostGrant { exp }),
+            None => return envelope_error(&state, crate::access::host_denied(&actor)),
+        }
+    } else {
+        None
+    };
+    let ctx = crate::archive::RequestCtx::from_headers(&headers);
+    crate::archive::scope(ctx, async move {
+        crate::archive::prepare(&state, &actor, &headers, &[&Value::String(node_id.clone())]).await;
+        with_host_grant(grant, read_node(state, node_id, q, headers, actor)).await
+    })
+    .await
+}
+
+async fn read_node(state: SharedState, node_id: String, q: HashMap<String, String>, headers: HeaderMap, actor: Actor) -> Response {
     let node = match state.resolve_ref_for(&actor, &WireRef::live(node_id, 0), Level::Read, "read") {
         Ok(n) => n,
         Err(e) => return envelope_error(&state, e),
     };
+    if let Node::Archive(a) = &node {
+        return crate::archive::read_member(&state, &actor, a, &headers, &q).await;
+    }
+    if matches!(&node, Node::Native { meta, .. } if meta.special) {
+        return envelope_error(
+            &state,
+            NfsError::new(ErrorCode::PermissionDenied, "device files, FIFOs and sockets cannot be read").with("reason", json!("special_file")),
+        );
+    }
     let (root, rel, name) = match &node {
         Node::Native { root, rel, meta, .. } if meta.kind != "dir" => {
             (root.clone(), rel.clone(), node.display_name())
@@ -580,10 +650,8 @@ async fn read_handler(
     {
         return StatusCode::NOT_MODIFIED.into_response();
     }
-    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-    let (start, end, status) = match parse_range(range, len) {
-        Ok(Some((s, e))) => (s, e, StatusCode::PARTIAL_CONTENT),
-        Ok(None) => (0, len.saturating_sub(1), StatusCode::OK),
+    let range = match parse_range(headers.get(header::RANGE).and_then(|v| v.to_str().ok()), len) {
+        Ok(r) => r,
         Err(_) => {
             return (
                 StatusCode::RANGE_NOT_SATISFIABLE,
@@ -592,14 +660,35 @@ async fn read_handler(
                 .into_response()
         }
     };
-    let mut file = match tokio::fs::File::open(&full).await {
+    let file = match tokio::fs::File::open(&full).await {
         Ok(f) => f,
         Err(e) => return envelope_error(&state, NfsError::from(e)),
     };
-    if start > 0 {
+    serve_file(file, 0, len, range, &etag, &name, &q, false).await
+}
+
+/// Serves `len` bytes of `file` starting at `base` as a whole body or a
+/// parsed range of it, under the Desktop-origin content policy (D24).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_file(
+    mut file: tokio::fs::File,
+    base: u64,
+    len: u64,
+    range: Option<(u64, u64)>,
+    etag: &str,
+    name: &str,
+    q: &HashMap<String, String>,
+    immutable: bool,
+) -> Response {
+    let (start, end, status) = match range {
+        Some((s, e)) => (s, e, StatusCode::PARTIAL_CONTENT),
+        None => (0, len.saturating_sub(1), StatusCode::OK),
+    };
+    if base + start > 0 {
         use tokio::io::AsyncSeekExt;
-        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
-            return envelope_error(&state, NfsError::from(e));
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(base + start)).await {
+            let e = NfsError::from(e);
+            return (StatusCode::from_u16(e.code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), axum::Json(json!({"ok": false, "error": e.to_json()}))).into_response();
         }
     }
     let content_len = if len == 0 { 0 } else { end - start + 1 };
@@ -609,7 +698,7 @@ async fn read_handler(
         .header(header::CONTENT_LENGTH, content_len)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, etag)
-        .header(header::CACHE_CONTROL, "private, no-cache");
+        .header(header::CACHE_CONTROL, if immutable { "private, max-age=31536000, immutable" } else { "private, no-cache" });
     if status == StatusCode::PARTIAL_CONTENT {
         builder = builder.header(
             header::CONTENT_RANGE,
@@ -617,10 +706,10 @@ async fn read_handler(
         );
     }
     let want_download = q.contains_key("download");
-    let file_name = q.get("name").filter(|_| want_download).unwrap_or(&name);
+    let file_name = q.get("name").filter(|_| want_download).map(String::as_str).unwrap_or(name);
     let mut response = builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     // This route shares the Desktop origin: what is in a file never runs here (D24).
-    ndn_lib::apply_content_policy(response.headers_mut(), content_type_for(&name), Some(file_name), want_download);
+    ndn_lib::apply_content_policy(response.headers_mut(), content_type_for(name), Some(file_name), want_download);
     response
 }
 

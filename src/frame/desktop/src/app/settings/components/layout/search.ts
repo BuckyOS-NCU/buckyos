@@ -15,6 +15,8 @@ export const settingsSearchTerms: Record<SettingsPage, ReadonlyArray<readonly [s
     ["settings.general.storageUsage", "Storage Usage"],
     ["settings.general.support", "Support & Debug"],
     ["settings.general.copySystemInfo", "Copy System Info"],
+    ["settings.openSource.title", "Open-source software"],
+    ["settings.openSource.license", "License"],
   ],
   'storage': [
     ["settings.storage.title", "Storage by app"],
@@ -46,6 +48,12 @@ export const settingsSearchTerms: Record<SettingsPage, ReadonlyArray<readonly [s
   'ext-tools': [
     ["settings.extTools.title", "Extension tools"],
     ["settings.extTools.provides", "Commands"],
+  ],
+  'agent-runtimes': [
+    ["settings.runtimes.nodes", "Nodes"],
+    ["settings.runtimes.devices", "Devices"],
+    ["settings.cluster.addDevice", "Add device"],
+    ["settings.runtimes.assign", "Assign to Agent"],
   ],
   'cluster': [
     ["settings.cluster.thisNode", "This node"],

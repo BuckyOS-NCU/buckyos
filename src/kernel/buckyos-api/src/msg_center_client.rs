@@ -422,6 +422,9 @@ pub const MSG_CENTER_STORAGE_QUOTA_MIB: u64 = 100 * 1024;
 /// A chat zone outgrows the per-bucket default of one million keys.
 const MSG_CENTER_BUCKET_MAX_OBJECTS: u64 = 100_000_000;
 pub const METHOD_MSG_COLLECT_ATTACHMENT: &str = "msg.collect_attachment";
+/// Makes an attachment the caller reads readable to the caller's own session, which then
+/// commits it into the caller's files (nfs-server `commit_object`).
+pub const METHOD_MSG_PREPARE_SAVE_ATTACHMENT: &str = "msg.prepare_save_attachment";
 /// Asked of the sender's Zone for a recipient: a short read token for one attachment key.
 pub const METHOD_MSG_ATTACHMENT_TICKET: &str = "msg.attachment_ticket";
 
@@ -499,6 +502,7 @@ const METHOD_MSG_CREATE_SESSION: &str = "msg.create_session";
 const METHOD_MSG_ARCHIVE_SESSION: &str = "msg.archive_session";
 const METHOD_MSG_RESTORE_SESSION: &str = "msg.restore_session";
 const METHOD_MSG_DELETE_SESSION: &str = "msg.delete_session";
+const METHOD_MSG_CLEAR_SESSION: &str = "msg.clear_session";
 const METHOD_MSG_GET_SESSION_STATE: &str = "msg.get_session_state";
 
 const METHOD_CONTACT_RESOLVE_DID: &str = "contact.resolve_did";
@@ -2867,6 +2871,26 @@ impl MsgCenterClient {
         }
     }
 
+    pub async fn clear_session(
+        &self,
+        owner: DID,
+        session_id: String,
+    ) -> std::result::Result<OwnerSessionState, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_clear_session(owner, session_id, RPCContext::default())
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = MsgCenterSessionRefReq::new(owner, session_id);
+                let req_json = serialize_to_json(&req, "MsgCenterSessionRefReq")?;
+                let result = client.call(METHOD_MSG_CLEAR_SESSION, req_json).await?;
+                parse_rpc_response(result, "OwnerSessionState")
+            }
+        }
+    }
+
     pub async fn get_session_state(
         &self,
         owner: DID,
@@ -3981,6 +4005,19 @@ pub trait MsgCenterHandler: Send + Sync {
         ))
     }
 
+    /// Hide every record the owner's session holds now and keep the session
+    /// itself (`Message Center.md` §5.8).
+    async fn handle_clear_session(
+        &self,
+        _owner: DID,
+        _session_id: String,
+        _ctx: RPCContext,
+    ) -> std::result::Result<OwnerSessionState, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            METHOD_MSG_CLEAR_SESSION.to_string(),
+        ))
+    }
+
     async fn handle_get_session_state(
         &self,
         _owner: DID,
@@ -4501,6 +4538,14 @@ impl<T: MsgCenterHandler> RPCHandler for MsgCenterServerHandler<T> {
                 let result = self
                     .0
                     .handle_delete_session(ref_req.owner, ref_req.session_id, ctx)
+                    .await?;
+                RPCResult::Success(json!(result))
+            }
+            METHOD_MSG_CLEAR_SESSION => {
+                let ref_req = MsgCenterSessionRefReq::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_clear_session(ref_req.owner, ref_req.session_id, ctx)
                     .await?;
                 RPCResult::Success(json!(result))
             }

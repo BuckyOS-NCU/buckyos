@@ -9,7 +9,7 @@
 //!   state/goals/<goal_id>/               goal, state, activations, schedule
 //!   state/workspaces/<wid>.json          workspace registrations
 //!   state/runtimes/<runtime_id>.json     runtime registrations
-//!   memory/ notebook/ cognition (agent_tool)
+//!   memory/                            the Memory component
 //!   .locks/memory_consolidation.lease  .locks/artifact/<aid>.lease
 //! ```
 
@@ -54,6 +54,11 @@ impl AgentLayout {
 
     pub fn unreachable_mark(&self, sid: &str) -> PathBuf {
         self.sessions_dir().join(".unreachable").join(sid)
+    }
+
+    /// Why the runtime an unfinished session was frozen to cannot be used now.
+    pub fn runtime_mark(&self, sid: &str) -> PathBuf {
+        self.sessions_dir().join(".runtime_unavailable").join(sid)
     }
 
     pub fn perception_dir(&self) -> PathBuf {
@@ -136,10 +141,6 @@ impl AgentLayout {
 
     pub fn memory_dir(&self) -> PathBuf {
         self.root.join("memory")
-    }
-
-    pub fn notebook_dir(&self) -> PathBuf {
-        self.root.join("notebook")
     }
 
 }

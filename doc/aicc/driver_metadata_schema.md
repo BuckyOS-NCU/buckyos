@@ -191,9 +191,15 @@ suffix uses `default_effort`; a specification fixes `effort`. Tree expansion and
 request routing retain that selected exact variant. Final wire parameter locking
 is separate Provider/Adapter work.
 
-LLM directories require Manual admission. The `llm` root is a namespace and
-`llm.fallback` starts empty. Tasks, specifications and families have no implicit
-Parent fallback. Explicit fallback retains original task/request requirements.
+LLM directories require Manual admission. The `llm` root is a namespace.
+Tasks, specifications and families have no implicit Parent fallback. The builtin
+usecases fall back explicitly (`target_logical`) to `llm.fallback`, which only
+references non-`direct_only` specifications in cost tiers (cheap/fast 4.0, value
+3.0, standard 2.0, premium/specialised 1.0) and is itself `disabled`. Explicit
+fallback retains original task/request requirements and the requested task's
+scheduler; direct `llm.fallback` requests use `cost_first`. A new non-direct_only
+specification must be placed in `llm.fallback`; the single-model coverage test
+fails otherwise.
 Legacy `llm.{driver}.{model}` names are not aliases.
 
 Overlays retain `factory -> system -> user -> session` precedence. Item and
@@ -316,10 +322,10 @@ Old inventory caches and removed Provider fields are rejected.
 Pricing belongs to Provider Rules/discovery and supports `source_url`,
 `verified_at`, `ratio_exception`, cache reads/writes (including one-hour writes),
 audio/image token rates, tiers and time windows. Discovery and catalog share
-validation. Output/input token price ratios above 500 require a non-empty
-`ratio_exception`; a ratio of exactly 500 is accepted. Cache read prices above
-input prices and cache write prices above 10 times input prices also require an
-explanation. Missing active rates or uncovered tiers return unknown. `AiUsage`
+validation. Output/input token price ratios have no upper limit and do not
+require `ratio_exception`. Cache read prices above input prices and cache write
+prices above 10 times input prices require a non-empty `ratio_exception`.
+Missing active rates or uncovered tiers return unknown. `AiUsage`
 input/output totals include cache/reasoning tokens; modality/cache counts are
 subsets. Undeclared provider `reported_cost` is never assumed USD.
 
@@ -350,3 +356,21 @@ OpenRouter Jev 渠道通过 Provider Rules `capability_limits` 将上述模型�
 子集并整体替换它，OpenRouter discovery 再用 `/api/v1/videos/models` 的事实覆盖输出字段。三处使用同一
 校验，未知字段拒绝；没有合同的模型不进入 `video.generate` 路由。合同字段、执行顺序与 Provider 支持矩阵
 见 [统一视频生成协议](video_generation.md)。
+
+## Reviewed parameter descriptions
+
+`capabilities.image_generation_parameters` records vendor image parameter enums,
+defaults and numeric bounds. `capabilities.sampling_parameters` records fixed or
+bounded sampling values; `effective_max` distinguishes the sampling ceiling from
+the accepted API range. `active_parameters` is the activated parameter count;
+`thinking_required` describes a model that cannot disable reasoning. These are
+model metadata descriptions exposed with the existing capability map, not new
+request validators or provider options. Image dimensions and every quality tier
+are not automatically exercised by a default success cell.
+
+Wire normalization continues to use Provider Rules `request_rules`. In particular,
+Kimi K3.1 Pro's fixed sampling fields are omitted on native Kimi, SN and OpenRouter;
+this follows the vendor recommendation to omit them and rely on fixed defaults.
+The strict mock accepts the documented fixed values if supplied and rejects other
+values, so omission does not become an invented vendor prohibition. Source review
+and remaining validation scope: [2026-11-02 review](driver_metadata_review_20261102.md).

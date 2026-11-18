@@ -8,39 +8,40 @@ import type { AiwsClient } from '../../api/client'
 import type { EntityEnvelope, WorkspaceInfo } from '../../api/types'
 import { localizedLabels } from '../../i18n'
 import { workspacePageUrl, WORKSPACE_ROUTE, zoneOrigin } from '../../links'
-import { useUserState } from '../../state/hooks'
+import { useStore, useUserState } from '../../state/hooks'
 import { CANVAS_MODES, type CanvasMode } from '../blocks/registry'
 import type { OfflineActions } from '../WorkspaceView'
 
 /** `show` is a show's stage: never stored, it takes over the window until the show ends (第三期规划 §7.2). */
 export type TopMode = 'sources' | 'canvas' | 'show'
 
-/** The right panel shows one kind of content at a time (§3.2). */
-export type SideTab = 'inspector' | 'relations' | 'annotations' | 'collab' | 'edits' | 'wish'
+/** The side drawer shows one kind of content at a time (UI 框架 PRD §3.2): the collaboration content went to the
+ * members and permissions entry, the change status to the status panel (§4.5). */
+export type SideTab = 'inspector' | 'relations' | 'annotations'
 export const SIDE_TAB_LABEL: Readonly<Record<SideTab, string>> = localizedLabels({
   inspector: 'aiworkspace.shell.side.inspector', relations: 'aiworkspace.shell.side.relations', annotations: 'aiworkspace.shell.side.annotations',
-  collab: 'aiworkspace.shell.side.collab', edits: 'aiworkspace.shell.side.edits', wish: 'aiworkspace.shell.side.wish',
 })
-export const CANVAS_SIDE_TABS: SideTab[] = ['inspector', 'relations', 'annotations', 'collab', 'edits']
-export const SOURCES_SIDE_TABS: SideTab[] = ['collab', 'edits']
+/** Properties are the floating properties panel, not a tab (UI 框架 PRD §10.2). */
+export const CANVAS_SIDE_TABS: SideTab[] = ['relations', 'annotations']
 
 export type DialogRequest =
-  | { kind: 'new'; tab: 'canvas' | 'workspace' | 'template' }
+  | { kind: 'new'; tab: 'canvas' | 'workspace' | 'template'; /** The canvas folder a new canvas goes into (画布选择器“在此新建画布”). */ folderId?: string }
   | { kind: 'share' }
   | { kind: 'export' }
   | { kind: 'import' }
   | { kind: 'help' }
-  | { kind: 'mock' }
   /** Workspace controls (扩展控件 P0): definitions, builds, library, export. */
   | { kind: 'extensions'; defId?: string }
   /** Export → Save as template… (扩展控件 P3, Q32). */
   | { kind: 'save-template' }
   | { kind: 'delete-surface'; surface: EntityEnvelope }
 
-/** Personal layout preferences (user work state, `ui:*`); "restore default layout" clears them. */
+/** Personal layout preferences; "restore default layout" clears them. The tool zones' switches (and whether the status
+ * bar is expanded) are the person's across Workspaces (UI 框架 PRD §4.6, §12; ui/framework/personal.ts); the grid, the
+ * side drawer and the pinned extension controls are this Workspace's user state (`ui:*`). */
 export interface LayoutPrefs { objectToolbar: boolean; viewToolbar: boolean; grid: boolean }
-export const PREF_KEYS = { objectToolbar: 'ui:object-toolbar', viewToolbar: 'ui:view-toolbar', grid: 'ui:grid' } as const
-export const LAYOUT_KEYS = ['ui:object-toolbar', 'ui:view-toolbar', 'ui:grid', 'ui:side', 'ui:pinned-defs'] as const
+export const PREF_KEYS = { grid: 'ui:grid' } as const
+export const LAYOUT_KEYS = ['ui:grid', 'ui:side', 'ui:pinned-defs', 'ui:data-layout'] as const
 
 /** A running guide (第三期规划 §7.3): which path, which of its steps. */
 export interface GuideState { pathId: string; index: number }
@@ -71,11 +72,11 @@ export function usePhone(): boolean {
 }
 
 export interface ShellApi {
-  /** Workspace-level calls outside the open session (create, fork, import, export). */
+  /** Workspace-level calls outside the open session (create, clone, import, export). */
   client: AiwsClient
   /** Leave the workspace (after the leave check) and show the list. */
   close: () => void
-  /** Leave this workspace and open another one (new workspace, template result, fork). */
+  /** Leave this workspace and open another one (new workspace, template result, clone). */
   openWorkspace: (workspaceId: string) => void
   offline: OfflineActions
   topMode: TopMode
@@ -86,6 +87,8 @@ export interface ShellApi {
   side: SideTab | null
   setSide: (tab: SideTab | null) => void
   openDialog: (request: DialogRequest) => void
+  /** "成员与权限…" (UI 框架 PRD §4.2, §8.1): the data mode with the Workspace's permission editor as its tab. */
+  openPermissions: () => void
   prefs: LayoutPrefs
   setPref: (key: keyof LayoutPrefs, value: boolean) => void
   resetLayout: () => void
@@ -93,7 +96,7 @@ export interface ShellApi {
   /** A phone (§16): the canvas only, with one toolbar — a free canvas in view mode, a flow page in edit mode (§16.5);
    * nothing about it is written to the shared work state. */
   phone: boolean
-  /** The Mock processing panel and other developer tools are shown (dev server or dev override). */
+  /** Developer tools are shown (dev server or dev override). */
   devTools: boolean
   /** Who this window acts as; a dev-override identity has no login session to end; a guest came through a public link;
    * a restricted session (Limited account, External DID) owns no workspace (hybrid SSO, from the current identity). */
@@ -118,12 +121,15 @@ export interface ShellApi {
 export const ShellContext = createContext<ShellApi | null>(null)
 
 /** The canvas sub-mode (user work state `canvas:mode`); a phone views a free canvas and edits a flow page (§16.5),
- * and leaves the stored mode alone. */
+ * and leaves the stored mode alone. Not chosen yet: a guest of a public link who may not change the document views it
+ * (and its controls run, Q27; owner 11-12), everyone else edits. */
 export function useCanvasMode(): CanvasMode {
   const shell = useContext(ShellContext)
+  const store = useStore()
   const state = useUserState<CanvasMode>('canvas:mode')
   if (shell?.phone) return shell.activeSurface && shell.activeSurface.layout?.mode !== 'free' ? 'edit' : 'view'
-  return state && CANVAS_MODES.includes(state) ? state : 'edit'
+  if (state && CANVAS_MODES.includes(state)) return state
+  return shell?.identity.guest && !store.session.info().capabilities.includes('update') ? 'view' : 'edit'
 }
 
 export const ZOOM_PRESETS = [25, 50, 75, 100, 150, 200]

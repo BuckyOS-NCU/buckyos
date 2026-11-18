@@ -2,7 +2,7 @@
 //!
 //! What gets hashed is content only: no entity id, name, tree position, `rev`,
 //! author or time. So renaming or moving an entity keeps its content ObjectId,
-//! equal content gives equal ids, and a Fork has the same ContentRoot as its source.
+//! equal content gives equal ids, and a Clone (`ws.clone`) has the same ContentRoot as its source.
 
 use crate::canonical::{canonical_json, named_object, parse_strict, ObjId, OBJ_TYPE_JSON};
 use crate::error::{WsError, WsResult};
@@ -55,14 +55,25 @@ fn file_ref(sink: &mut dyn ObjectSink, lines: &[Value]) -> WsResult<Value> {
 }
 
 /// The DirObject (`cydir`) of a directory entity, child directories materialized first (D25): returns its
-/// id and the bytes under it. The object text goes to the sink.
+/// id and the bytes under it. The object text goes to the sink. A `folder` member is the empty DirObject when
+/// nothing is under it, else its members say it.
 pub fn dir_object_of(ctx: &dyn ReadCtx, e: &EntityRow, sink: &mut dyn ObjectSink, depth: usize) -> WsResult<(ObjId, u64)> {
     if depth > 64 {
         return Err(WsError::limit("directory nesting exceeds 64"));
     }
+    let all = e.payload.get("members").and_then(Value::as_object);
+    let holding: BTreeSet<&str> = all.into_iter().flatten().flat_map(|(name, _)| name.match_indices('/').map(|(i, _)| &name[..i])).collect();
     let mut members = Vec::new();
-    for (name, m) in e.payload.get("members").and_then(Value::as_object).into_iter().flatten() {
+    for (name, m) in all.into_iter().flatten() {
         match m["kind"].as_str() {
+            Some("folder") => {
+                if holding.contains(name.as_str()) {
+                    continue;
+                }
+                let (id, text) = crate::canonical::dir_object(&[])?;
+                sink.put_object(crate::canonical::OBJ_TYPE_DIR, &text)?;
+                members.push(crate::canonical::DirMember { name: name.clone(), object_id: id, size: 0, is_file: false });
+            }
             Some("file") => members.push(crate::canonical::DirMember { name: name.clone(), object_id: m["object_id"].as_str().unwrap_or("").to_string(), size: m["size"].as_u64().unwrap_or(0), is_file: true }),
             Some("dir") => {
                 let child_id = m["entity_id"].as_str().unwrap_or("");
@@ -137,6 +148,13 @@ pub fn entity_content(ctx: &dyn ReadCtx, e: &EntityRow, sink: &mut dyn ObjectSin
             json!({ "editor_schema": richtext::EDITOR_SCHEMA, "doc": doc })
         }
         TYPE_DIR => dir_content(ctx, e, sink)?,
+        TYPE_BLOCK_DEF => {
+            // who vouched for the code is this Workspace's decision (权限需求 R37), never content: a package, a template
+            // or a version carries the code, and whoever brings it in decides again
+            let mut payload = e.payload.clone();
+            payload.remove("trusted");
+            Value::Object(payload)
+        }
         _ => Value::Object(e.payload.clone()),
     })
 }
@@ -240,6 +258,29 @@ pub fn materialize_with(
     cached: &mut dyn FnMut(&EntityRow, Option<&ObjId>) -> Option<ObjId>,
     strip_notes: bool,
 ) -> WsResult<Materialized> {
+    materialize_stripped(ctx, sink, visible, cached, &|e| strip_notes.then(|| without_notes(e)).flatten())
+}
+
+/// A template's content (README "Workspace templates"): without speaker notes, and without the run records of its
+/// wishes (许愿格交互升级 D8) — a new Workspace starts their history anew.
+pub fn materialize_template(ctx: &dyn ReadCtx, sink: &mut dyn ObjectSink, visible: &dyn Fn(&EntityRow) -> WsResult<bool>) -> WsResult<Materialized> {
+    materialize_stripped(ctx, sink, visible, &mut |_, _| None, &|e| {
+        let mut out = without_notes(e);
+        if e.type_id == TYPE_WISH && e.payload.contains_key("history") {
+            out.get_or_insert_with(|| e.clone()).payload.remove("history");
+        }
+        out
+    })
+}
+
+/// `strip` gives the entity as it is materialized when that differs from what it is (never through `cached`).
+fn materialize_stripped(
+    ctx: &dyn ReadCtx,
+    sink: &mut dyn ObjectSink,
+    visible: &dyn Fn(&EntityRow) -> WsResult<bool>,
+    cached: &mut dyn FnMut(&EntityRow, Option<&ObjId>) -> Option<ObjId>,
+    strip: &dyn Fn(&EntityRow) -> Option<EntityRow>,
+) -> WsResult<Materialized> {
     let mut included: BTreeSet<String> = BTreeSet::new();
     let (mut lines, mut objects, mut unresolved, mut excluded) = (Vec::new(), BTreeMap::new(), Vec::new(), 0);
     for (e, edge) in shared_entities(ctx)? {
@@ -249,7 +290,7 @@ pub fn materialize_with(
             continue;
         }
         included.insert(e.entity_id.clone());
-        let object_id = match (strip_notes.then(|| without_notes(&e)).flatten(), cached(&e, None)) {
+        let object_id = match (strip(&e), cached(&e, None)) {
             (Some(stripped), _) => content_object(ctx, &stripped, sink)?,
             (None, Some(id)) => id,
             (None, None) => {
@@ -309,11 +350,11 @@ pub fn materialize_with(
     Ok(Materialized { content_root: put_json(sink, &root)?, objects, excluded, unresolved })
 }
 
-pub fn snapshot_root(workspace_id: &str, seq: u64, commit_id: &str, content_root: &str, forked_from: Option<&Value>) -> Value {
+pub fn snapshot_root(workspace_id: &str, seq: u64, commit_id: &str, content_root: &str, cloned_from: Option<&Value>) -> Value {
     let mut v = json!({ "ws_type": "buckyos.workspace-snapshot", "format_version": FORMAT_VERSION,
                         "workspace_id": workspace_id, "seq": seq, "commit_id": commit_id, "content": content_root });
-    if let Some(f) = forked_from {
-        v["lineage"] = json!({ "forked_from": f });
+    if let Some(f) = cloned_from {
+        v["lineage"] = json!({ "cloned_from": f });
     }
     v
 }
@@ -475,6 +516,10 @@ pub fn load_ops(src: &dyn ObjectSource, content_root: &str, collab: &dyn Fn(&str
     // the root's own keys (layout/title) and policy
     let root_entry = &by_id[ROOT_ID];
     let root_obj = parse_strict(&src.get_object(root_entry["object_id"].as_str().unwrap_or(""))?)?;
+    // the Workspace's cover (its settings, UI 框架 PRD Q37)
+    if let Some(content) = root_obj["content"].as_object() {
+        assets.extend(types::asset_object_ids(TYPE_CONTAINER, content).into_iter().map(str::to_string));
+    }
     let keys: Vec<Value> = root_obj["content"]
         .as_object()
         .into_iter()

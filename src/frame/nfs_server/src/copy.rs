@@ -1,4 +1,4 @@
-use crate::acl::{Actor, Level};
+use crate::acl::{Actor, Level, HOST_ROOT};
 use crate::error::*;
 use crate::fsutil::{file_id, join_root, normalize_rel, validate_name};
 use crate::namespace::Node;
@@ -47,12 +47,26 @@ impl Identity {
         })
     }
     fn check(&self, path: &Path) -> NfsResult<Metadata> {
-        let m = std::fs::symlink_metadata(path)?;
+        self.check_at(path, false)
+    }
+    fn check_at(&self, path: &Path, follow: bool) -> NfsResult<Metadata> {
+        let m = meta_of(path, follow)?;
         if Self::of(&m)? != *self {
             return Err(stale("file identity changed"));
         }
         Ok(m)
     }
+}
+
+fn meta_of(path: &Path, follow: bool) -> std::io::Result<Metadata> {
+    if follow {
+        std::fs::metadata(path)
+    } else {
+        std::fs::symlink_metadata(path)
+    }
+}
+fn is_host_path(path: &str) -> bool {
+    path.trim_start_matches('/').split('/').next() == Some(HOST_ROOT)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,8 +90,14 @@ struct Row {
     modified: Option<SystemTime>,
     mode: u32,
     ctime: Option<(i64, i64)>,
+    /// An archive member source: `{"ref": <its ref>, "user": <task creator>}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive: Option<Value>,
 }
 impl Row {
+    fn follows_source(&self) -> bool {
+        self.parent.is_none() && is_host_path(&self.source)
+    }
     fn result(&self) -> NfsCopyItemResult {
         NfsCopyItemResult {
             id: self.id,
@@ -254,12 +274,28 @@ fn native(state: &SharedState, value: &Value) -> NfsResult<(String, Identity)> {
         Node::Native { root, rel, .. } => {
             let path = format!("/{root}{}{}", if rel.is_empty() { "" } else { "/" }, rel);
             let full = local(state, &path)?;
-            Ok((path, Identity::of(&std::fs::symlink_metadata(full)?)?))
+            Ok((path, Identity::of(&meta_of(&full, root == HOST_ROOT)?)?))
         }
         _ => Err(NfsError::new(
             ErrorCode::Unsupported,
             "only local filesystem entities can be copied",
         )),
+    }
+}
+/// The archive a source or destination ref points into, if any.
+fn archive_ref(value: &Value) -> Option<WireRef> {
+    let r: WireRef = serde_json::from_value(value.clone()).ok()?;
+    match &r {
+        WireRef::Object { inner_path: Some(p), .. } if p == crate::archive::INNER_ROOT || p.starts_with("/archive/") => Some(r),
+        WireRef::Live { node_id, .. } if node_id.starts_with("na_") || node_id.starts_with("no_") => Some(r),
+        _ => None,
+    }
+}
+fn archive_node(state: &SharedState, r: &WireRef) -> NfsResult<crate::archive::ArchiveNode> {
+    match state.resolve_ref(r)? {
+        Node::Archive(a) if !a.is_dir() => Ok(*a),
+        Node::Archive(_) => Err(NfsError::new(ErrorCode::Unsupported, "folders in an archive cannot be copied; copy its files").with("reason", json!("archive_folder"))),
+        _ => Err(stale("not an archive member")),
     }
 }
 fn handle_path(state: &SharedState, value: &Value) -> Option<(String, String)> {
@@ -272,14 +308,41 @@ fn handle_path(state: &SharedState, value: &Value) -> Option<(String, String)> {
 }
 /// Checked on the paths the signed handles name, so stale sources still
 /// become per-item failures instead of rejecting the task.
-fn authorize_input(state: &SharedState, actor: &Actor, input: &NfsCopyInput) -> NfsResult<()> {
+fn authorize_input(state: &SharedState, actor: &Actor, input: &NfsCopyInput, started: bool) -> NfsResult<()> {
+    let host_ok = |root: &str, rel: &str| {
+        if started {
+            state.config.host.is_some() && matches!(actor, Actor::Admin(Some(_)))
+        } else {
+            state.acls.level(actor, root, rel) >= Level::Write
+        }
+    };
+    if archive_ref(&input.destination_ref).is_some() {
+        return Err(crate::archive::read_only());
+    }
     for source in &input.sources {
+        if let Some(r) = archive_ref(&source.source_ref) {
+            if !started {
+                let node = state.resolve_ref(&r)?;
+                state.require(actor, &node, Level::Read, "read")?;
+            }
+            continue;
+        }
         if let Some((root, rel)) = handle_path(state, &source.source_ref) {
+            if root == HOST_ROOT {
+                if !host_ok(&root, &rel) {
+                    return Err(crate::access::host_denied(actor));
+                }
+                continue;
+            }
             state.require_subtree(actor, &root, &rel, Level::Read, "read")?;
         }
     }
     if let Some((root, rel)) = handle_path(state, &input.destination_ref) {
-        if state.acls.level(actor, &root, &rel) < Level::Write {
+        if root == HOST_ROOT {
+            if !host_ok(&root, &rel) {
+                return Err(crate::access::host_denied(actor));
+            }
+        } else if state.acls.level(actor, &root, &rel) < Level::Write {
             return Err(crate::access::denied("write", actor));
         }
     }
@@ -290,12 +353,35 @@ fn authorize_input(state: &SharedState, actor: &Actor, input: &NfsCopyInput) -> 
 async fn authorize_task(state: &SharedState, task: &Task) -> NfsResult<()> {
     let input: NfsCopyInput = serde_json::from_value(task.input.clone())?;
     let user = task.creator.user_id.clone();
-    let actor = if crate::auth::is_zone_owner(state, &user).await {
-        Actor::Admin(Some(user))
-    } else {
-        Actor::User(user)
-    };
-    authorize_input(state, &actor, &input)
+    let owner = crate::auth::is_zone_owner(state, &user).await;
+    let actor = if owner { Actor::Admin(Some(user.clone())) } else { Actor::User(user.clone()) };
+    authorize_input(state, &actor, &input, true)?;
+    let ctx = crate::archive::current();
+    for source in &input.sources {
+        let Some(r) = archive_ref(&source.source_ref) else { continue };
+        let obj = match &r {
+            WireRef::Object { obj_id, .. } => Some(obj_id.clone()),
+            WireRef::Live { node_id, .. } if node_id.starts_with("no_") => state
+                .handles
+                .open("no_", node_id)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|v| v["o"].as_str().map(String::from)),
+            _ => None,
+        };
+        if let Some(obj) = obj {
+            let principal = crate::ndm::Principal::new(user.clone(), format!("app:{}", task.creator.app_id), task.creator.app_id.clone(), None);
+            if !(owner || crate::ndm::holds(state, &principal, &obj)) {
+                return Err(crate::access::denied("read", &actor));
+            }
+            if let Some(ctx) = &ctx {
+                ctx.grant(&obj);
+            }
+        }
+        let at = serde_json::to_value(&r).unwrap_or(Value::Null);
+        crate::archive::prepare(state, &actor, &axum::http::HeaderMap::new(), &[&at]).await;
+    }
+    Ok(())
 }
 fn local(state: &SharedState, path: &str) -> NfsResult<PathBuf> {
     let normalized = normalize_rel(path)?;
@@ -306,7 +392,7 @@ fn local(state: &SharedState, path: &str) -> NfsResult<PathBuf> {
         .ok_or_else(|| stale("export no longer exists"))?;
     let root_path = std::fs::canonicalize(&root.path)?;
     let full = join_root(&root_path, rel);
-    if !rel.is_empty() {
+    if !rel.is_empty() && root_id != HOST_ROOT {
         let parent = full.parent().ok_or_else(|| invalid("missing parent"))?;
         let mut current = root_path.clone();
         for component in parent
@@ -396,7 +482,11 @@ pub async fn dispatch(
             for source in &input.sources {
                 validate_name(&source.name)?;
             }
-            authorize_input(state, nfs_actor, &input)?;
+            authorize_input(state, nfs_actor, &input, false)?;
+            let host_destination = handle_path(state, &input.destination_ref).is_some_and(|(root, _)| root == HOST_ROOT);
+            if host_destination || input.sources.iter().any(|s| is_host_path(&s.source_path)) {
+                crate::access::host_audit(nfs_actor, "copy", format_args!("sources={:?} destination_ref={}", input.sources.iter().map(|s| &s.source_path).collect::<Vec<_>>(), input.destination_ref));
+            }
             let existing = api
                 .list_tasks(ListTasksReq {
                     creator_user_id: Some(actor.user_id.clone()),
@@ -552,7 +642,8 @@ pub async fn dispatch(
 
 fn spawn(state: SharedState, id: String) {
     tokio::spawn(async move {
-        if let Err(e) = execute(&state, &id).await {
+        let ctx = std::sync::Arc::new(crate::archive::RequestCtx::default());
+        if let Err(e) = crate::archive::scope(ctx, execute(&state, &id)).await {
             log::error!("copy task {id}: {e}");
         }
     });
@@ -652,7 +743,29 @@ fn initialize(state: &SharedState, task: &Task) -> NfsResult<()> {
             modified: None,
             mode: 0,
             ctime: None,
+            archive: None,
         };
+        if let Some(r) = archive_ref(&source.source_ref) {
+            match archive_node(state, &r) {
+                Ok(a) => {
+                    let m = a.member().cloned().ok_or_else(|| stale("the member is gone"))?;
+                    row.identity = Some(Identity { dev: 0, ino: 0, kind: "file".into(), birth: None });
+                    row.size = m.size;
+                    row.modified = std::time::UNIX_EPOCH.checked_add(Duration::from_secs(m.mtime.max(0) as u64));
+                    row.mode = 0o644;
+                    row.archive = Some(json!({"ref": r, "user": task.creator.user_id}));
+                }
+                Err(e) => {
+                    row.state = "failed".into();
+                    row.error = Some(e.to_json());
+                }
+            }
+            tx.execute(
+                "INSERT INTO copy_item(task,id,parent,state,payload) VALUES(?1,?2,NULL,?3,?4)",
+                params![task.task_id, row.id, row.state, serde_json::to_string(&row)?],
+            )?;
+            continue;
+        }
         let result = (|| -> NfsResult<()> {
             let (source_path, identity) = native(state, &source.source_ref)?;
             if source_path != source.source_path {
@@ -695,7 +808,7 @@ fn check_parent(state: &SharedState, id: &str, row: &Row) -> NfsResult<PathBuf> 
         row.target_parent.clone()
     }
     .ok_or_else(|| stale("destination parent identity unavailable"))?;
-    identity.check(&path)?;
+    identity.check_at(&path, row.parent.is_none() && is_host_path(&row.target))?;
     Ok(path)
 }
 fn check_baseline(baseline: &Metadata, current: &Metadata) -> NfsResult<()> {
@@ -1066,12 +1179,16 @@ async fn process(
         state.copies.save(id, row)?;
         return Ok(());
     }
+    if row.archive.is_some() {
+        return process_archive(state, api, id, row).await;
+    }
     let source = local(state, &row.source)?;
+    let follow = row.follows_source();
     let baseline = row
         .identity
         .as_ref()
         .ok_or_else(|| stale("source identity unavailable"))?
-        .check(&source)?;
+        .check_at(&source, follow)?;
     let kind = row.identity.as_ref().unwrap().kind.clone();
     if kind == "special" {
         return Err(NfsError::new(
@@ -1131,7 +1248,7 @@ async fn process(
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            source_options.custom_flags(0x20000 | 0x800);
+            source_options.custom_flags(if follow { 0x800 } else { 0x20000 | 0x800 });
         }
         let source_file = source_options.open(&source)?;
         check_baseline(&baseline, &source_file.metadata()?)?;
@@ -1177,7 +1294,7 @@ async fn process(
         output.flush().await?;
         output.sync_all().await?;
         check_baseline(&baseline, &source_file.metadata().await?)?;
-        check_baseline(&baseline, &std::fs::symlink_metadata(&source)?)?;
+        check_baseline(&baseline, &meta_of(&source, follow)?)?;
         preserve(row, &temporary)?;
     }
     File::open(temporary.parent().unwrap())?.sync_all()?;
@@ -1189,9 +1306,65 @@ async fn process(
     state.copies.save(id, row)?;
     commit_file(state, id, row)
 }
+async fn process_archive(state: &SharedState, api: &TaskManagerClient, id: &str, row: &mut Row) -> NfsResult<()> {
+    let spec = row.archive.clone().unwrap_or_default();
+    let r: WireRef = serde_json::from_value(spec["ref"].clone())?;
+    let a = archive_node(state, &r)?;
+    let actor = Actor::User(spec["user"].as_str().unwrap_or_default().to_string());
+    if !choose_target(state, id, row)? {
+        return Ok(());
+    }
+    let temporary = join(parent(&row.target), &format!(".bucky-copy-{id}-{}", row.id));
+    row.temporary = Some(temporary.clone());
+    row.state = "creating".into();
+    state.copies.save(id, row)?;
+    let temporary = local(state, &temporary)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&temporary)?;
+    row.copy_identity = Some(Identity::of(&file.metadata()?)?);
+    state.copies.save(id, row)?;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let copy = crate::archive::copy_member_to(state, &actor, &a, file, cancel.clone(), progress.clone());
+    tokio::pin!(copy);
+    let result = loop {
+        tokio::select! {
+            done = &mut copy => break done,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if cancelled(api, id).await? {
+                    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                row.written = progress.load(std::sync::atomic::Ordering::Relaxed);
+                state.copies.save(id, row)?;
+                checkpoint(state, api, id).await?;
+            }
+        }
+    };
+    result?;
+    row.written = progress.load(std::sync::atomic::Ordering::Relaxed);
+    preserve(row, &temporary)?;
+    File::open(temporary.parent().unwrap())?.sync_all()?;
+    check_parent(state, id, row)?;
+    if cancelled(api, id).await? {
+        return Err(internal("copy cancellation requested"));
+    }
+    row.state = "prepared".into();
+    state.copies.save(id, row)?;
+    commit_file(state, id, row)
+}
 fn check_recorded_source(state: &SharedState, row: &Row) -> NfsResult<()> {
+    if let Some(spec) = &row.archive {
+        let r: WireRef = serde_json::from_value(spec["ref"].clone())?;
+        return archive_node(state, &r).map(|_| ());
+    }
     let source = local(state, &row.source)?;
-    let current = row.identity.as_ref().unwrap().check(&source)?;
+    let current = row.identity.as_ref().unwrap().check_at(&source, row.follows_source())?;
     if current.modified().ok() != row.modified || (current.is_file() && current.len() != row.size) {
         return Err(stale("source changed before copy commit"));
     }
@@ -1251,7 +1424,7 @@ fn commit_file(state: &SharedState, id: &str, row: &mut Row) -> NfsResult<()> {
 }
 fn expand_directory(state: &SharedState, id: &str, row: &mut Row) -> NfsResult<()> {
     let source = local(state, &row.source)?;
-    row.identity.as_ref().unwrap().check(&source)?;
+    row.identity.as_ref().unwrap().check_at(&source, row.follows_source())?;
     let mut db = state.copies.db.lock().unwrap();
     let tx = db.transaction()?;
     let mut next: i64 = tx.query_row(
@@ -1286,6 +1459,7 @@ fn expand_directory(state: &SharedState, id: &str, row: &mut Row) -> NfsResult<(
             modified: None,
             mode: 0,
             ctime: None,
+            archive: None,
         };
         match std::fs::symlink_metadata(entry.path())
             .map_err(NfsError::from)
@@ -1309,10 +1483,11 @@ fn expand_directory(state: &SharedState, id: &str, row: &mut Row) -> NfsResult<(
         )?;
         next += 1;
     }
-    if let Node::Native {
+    let bindings_parent = if is_host_path(&row.source) { None } else { Some(state.resolve_dfs_path(&row.source)?) };
+    if let Some(Node::Native {
         anchored: Some(entity),
         ..
-    } = state.resolve_dfs_path(&row.source)?
+    }) = bindings_parent
     {
         for binding in state.db.bindings_by_parent(entity.node_id)? {
             let child = Row {
@@ -1337,6 +1512,7 @@ fn expand_directory(state: &SharedState, id: &str, row: &mut Row) -> NfsResult<(
                 modified: None,
                 mode: 0,
                 ctime: None,
+                archive: None,
             };
             tx.execute(
                 "INSERT INTO copy_item(task,id,parent,state,payload) VALUES(?1,?2,?3,?4,?5)",

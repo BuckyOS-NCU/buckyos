@@ -1,9 +1,15 @@
 /* A flow-layout Surface (phase two §8.1; 流式页交互改进 §2): a document column in Notion's manner. Blocks and
  * groups follow in sibling order with no frame of their own; in edit mode every editor is live, so clicking puts
- * the caret where it lands. Hovering a Block shows its handles in the left margin: ＋ inserts below, ⋮⋮ drags it
- * to another place (or into a group) and, clicked, selects it and opens its menu. Below the last Block a click
- * continues writing. Moves are auto-merge (`tree.place` / `tree.move`). A phone edits a page the same way (UI
- * improvement §16.5): touch has no hover, so the handles stay faintly shown and a finger drags ⋮⋮. */
+ * the caret where it lands. Hovering a Block shows its handles in one column of the left margin: ⋮⋮ beside its first
+ * line drags it to another place (or into a group) and, clicked, selects it and opens its menu; ＋ on the line above
+ * inserts before it. Below the last Block a click continues writing. Moves are auto-merge (`tree.place` /
+ * `tree.move`). A phone edits a page the same way (UI improvement §16.5): touch has no hover, so ⋮⋮ stays faintly
+ * shown, ＋ shows for the Block being edited, and a finger drags ⋮⋮.
+ *
+ * A Block's title row (UI 框架 PRD §6.2) carries its tools: the type's icon, at most two primary actions, its quick
+ * properties and ⋯ — the Block's whole menu (§10.3), which the canvas view builds and shows (the same list as on a free
+ * canvas), as do ⋮⋮, a right click and Shift+F10. Whether a type has a heading line and whether ＋ offers it is the
+ * type's own declaration (`traits`). */
 
 import { useContext, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { GripVertical, Plus } from 'lucide-react'
@@ -17,19 +23,15 @@ import { useAiwsText } from '../../useAiwsText'
 import { BlockHost } from '../blocks/BlockHost'
 import { requestIntent } from '../blocks/editorToolbar'
 import { FlowBlockContext, type FlowBlockApi } from '../blocks/flowContext'
-import { richtextToMindmap } from '../controls/mindmap/convert'
 import { controlRegistry } from '../controls/registry'
-import { modePolicy, type CanvasMode } from '../blocks/registry'
-import { MenuList, useOverlayMounted, type MenuItem } from '../shell/popover'
+import { blockRegistry, modePolicy, type CanvasMode } from '../blocks/registry'
+import { FlowRowTools, FlowTitleOnly } from '../blockui/FlowTools'
+import { insideSheet, MenuList, useOverlayMounted, type MenuItem } from '../shell/popover'
 import { useShell } from '../shell/shellContext'
 import { registryEntries, type CatalogEntry } from './catalog'
-import { deleteOps, flowChildren, moveInFlow } from './flowOps'
+import { flowChildren } from './flowOps'
 import { accepted, renameBase, renameSurface, surfaceWriteReason } from './surfaceManage'
-
-/** Types a page shows a heading line for (a table, a record…); text, pictures and notes carry their own. */
-const UNTITLED = new Set(['richtext', 'asset', 'note', 'shape', 'frame'])
-/** Kinds offered by ＋ (canvas-only ones left out). */
-const FLOW_SKIP = new Set(['note', 'shape', 'frame', 'connector'])
+import { FormatScope } from '../phone/FormatBar'
 
 interface DropTarget { parentId: string; refId: string | null; before: boolean; line: { top: number; left: number; width: number } }
 
@@ -44,8 +46,8 @@ export interface FlowSurfaceProps {
   insertAt: (entry: CatalogEntry, parentId: string, afterId: string | null) => void
   /** Insert a group into `parentId` right after `afterId`. */
   insertGroup: (parentId: string, afterId: string | null) => void
-  /** Open the Block's properties in the side panel. */
-  onInspect: (id: string) => void
+  /** Select the Block (or group) and open its menu at a point of the canvas area. */
+  onBlockMenu: (id: string, at: { x: number; y: number }) => void
 }
 
 export function FlowSurface(props: FlowSurfaceProps) {
@@ -115,8 +117,8 @@ export function FlowSurface(props: FlowSurfaceProps) {
       : { op: 'tree.move', entity_id: id, new_parent_id: target.parentId, order_key: key }] })
   }
 
-  /** Press on ⋮⋮: a drag moves the item, a click selects it and opens its menu. */
-  const startHandle = (event: ReactPointerEvent<HTMLButtonElement>, entity: EntityEnvelope, openMenu: () => void) => {
+  /** Press on ⋮⋮: a drag moves the item, a tap selects it and opens its menu. */
+  const startHandle = (event: ReactPointerEvent<HTMLButtonElement>, entity: EntityEnvelope, onTap: () => void) => {
     if (event.button !== 0) return
     event.preventDefault()
     const handle = event.currentTarget
@@ -146,7 +148,7 @@ export function FlowSurface(props: FlowSurfaceProps) {
       handle.removeEventListener('pointercancel', end)
       setDrag(null)
       if (dragging) { if (target && e.type === 'pointerup') drop(entity.entity_id, target) }
-      else if (e.type === 'pointerup') { onSelect(new Set([entity.entity_id])); openMenu() }
+      else if (e.type === 'pointerup') { onSelect(new Set([entity.entity_id])); onTap() }
     }
     handle.addEventListener('pointermove', move)
     handle.addEventListener('pointerup', end)
@@ -172,12 +174,19 @@ export function FlowSurface(props: FlowSurfaceProps) {
   )
 }
 
-/** A point of the canvas area just below `element` (where the insert menu opens). */
+/** A point of the canvas area just below `element` (where the insert menu and the Block menu open). */
 function menuPoint(element: HTMLElement): { x: number; y: number } {
   const area = element.closest('.aiws-canvas-main') ?? element.offsetParent
   const box = area?.getBoundingClientRect() ?? { left: 0, top: 0 }
   const r = element.getBoundingClientRect()
   return { x: Math.round(r.left - box.left), y: Math.round(r.bottom - box.top + 4) }
+}
+
+/** The point of the canvas area where a right click happened. */
+function contextPoint(event: { clientX: number; clientY: number; currentTarget: Element }): { x: number; y: number } {
+  const area = event.currentTarget.closest('.aiws-canvas-main')
+  const box = area?.getBoundingClientRect() ?? { left: 0, top: 0 }
+  return { x: Math.round(event.clientX - box.left), y: Math.round(event.clientY - box.top) }
 }
 
 /** The page title, renamed in place (UI improvement §5: the version read when editing starts is expected). */
@@ -212,7 +221,7 @@ function PageTitle({ surface, mode }: { surface: EntityEnvelope; mode: CanvasMod
 }
 
 interface ItemProps extends FlowSurfaceProps {
-  startHandle: (event: ReactPointerEvent<HTMLButtonElement>, entity: EntityEnvelope, openMenu: () => void) => void
+  startHandle: (event: ReactPointerEvent<HTMLButtonElement>, entity: EntityEnvelope, onTap: () => void) => void
   dragging: string | null
   policy: ReturnType<typeof modePolicy>
 }
@@ -234,17 +243,19 @@ function ContainerFlow({ container, ...props }: ItemProps & { container: EntityE
   )
 }
 
-/** ＋ and ⋮⋮ in the left margin of a hovered Block or group, with the ＋ menu and the item menu. */
-function Gutter({ entity, siblings, index, kind, ...props }: ItemProps & { entity: EntityEnvelope; siblings: EntityEnvelope[]; index: number; kind: 'block' | 'group' }) {
+/** ⋮⋮ and ＋ stacked in the left margin of a hovered Block or group: ⋮⋮ beside its first line drags, or (clicked) selects
+ * it and opens its menu — the Block's whole menu, shown by the canvas view (§10.3); ＋ on the line above opens the menu
+ * that inserts before it. */
+function Gutter({ entity, kind, ...props }: ItemProps & { entity: EntityEnvelope; siblings: EntityEnvelope[]; index: number; kind: 'block' | 'group' }) {
   const store = useStore()
   const { t } = useAiwsText()
-  const [open, setOpen] = useState<'add' | 'menu' | null>(null)
-  useOverlayMounted(open !== null)
+  const [open, setOpen] = useState(false)
+  useOverlayMounted(open)
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!open) return
-    const onDown = (event: PointerEvent) => { if (!ref.current?.contains(event.target as Node)) setOpen(null) }
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.stopPropagation(); setOpen(null) } }
+    const onDown = (event: PointerEvent) => { if (!ref.current?.contains(event.target as Node) && !insideSheet(event.target)) setOpen(false) }
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') { event.stopPropagation(); setOpen(false) } }
     window.addEventListener('pointerdown', onDown, true)
     window.addEventListener('keydown', onKey, true)
     return () => { window.removeEventListener('pointerdown', onDown, true); window.removeEventListener('keydown', onKey, true) }
@@ -253,47 +264,40 @@ function Gutter({ entity, siblings, index, kind, ...props }: ItemProps & { entit
   const parentId = entity.parent_id ?? props.surfaceId
   const parent = store.outline.get(parentId)
   const canInsert = policy.insert && Boolean(parent?.capabilities.includes('structure'))
-  const canMove = policy.layout && entity.capabilities.includes('structure')
-  const canDelete = policy.layout && entity.capabilities.includes('delete')
   if (!policy.select && !canInsert) return null
   const name = entity.title ?? entity.name ?? (kind === 'group' ? t('aiworkspace.canvas.group') : entity.view_type ?? 'Block')
+  // before this item: right after the one above it, first when it is the first
+  const afterId = props.siblings[props.index - 1]?.entity_id ?? null
   const addItems: MenuItem[] = [
-    ...registryEntries().filter((entry) => entry.catalog.standard && !FLOW_SKIP.has(entry.definition.type)).map((entry): MenuItem => ({
-      id: `add-${entry.definition.type}`, testId: `aiws-flow-add-${entry.definition.type}`, label: entry.title, run: () => props.insertAt(entry, parentId, entity.entity_id),
+    // a type that is canvas-only says so itself (`traits.flowInsertable`)
+    ...registryEntries().filter((entry) => entry.catalog.standard && entry.definition.traits?.flowInsertable !== false).map((entry): MenuItem => ({
+      id: `add-${entry.definition.type}`, testId: `aiws-flow-add-${entry.definition.type}`, label: entry.title, run: () => props.insertAt(entry, parentId, afterId),
     })),
-    { id: 'add-group', testId: 'aiws-flow-add-group', label: t('aiworkspace.canvas.group'), run: () => props.insertGroup(parentId, entity.entity_id) },
+    { id: 'add-group', testId: 'aiws-flow-add-group', label: t('aiworkspace.canvas.group'), run: () => props.insertGroup(parentId, afterId) },
     { id: 'sep-add', separator: true },
     { id: 'add-more', testId: 'aiws-flow-add-more', label: t('aiworkspace.canvas.flow.more'), run: () => { if (ref.current) props.onInsertMenu(parentId, menuPoint(ref.current)) } },
   ]
-  const menuItems: MenuItem[] = [
-    { id: 'up', testId: `aiws-up-${entity.entity_id}`, label: t('aiworkspace.canvas.flow.moveUp'), hint: 'Ctrl+Shift+↑', disabled: !canMove || index === 0, run: () => moveInFlow(store, entity, -1) },
-    { id: 'down', testId: `aiws-down-${entity.entity_id}`, label: t('aiworkspace.canvas.flow.moveDown'), hint: 'Ctrl+Shift+↓', disabled: !canMove || index === siblings.length - 1, run: () => moveInFlow(store, entity, 1) },
-    { id: 'inspect', testId: `aiws-inspect-${entity.entity_id}`, label: t('aiworkspace.canvas.inspector.title'), hint: 'F2', run: () => props.onInspect(entity.entity_id) },
-    // a text's lists as a mind map right after it (脑图方案 §8)
-    ...(entity.view_type === 'richtext' && canInsert ? [{ id: 'to-mindmap', testId: `aiws-to-mindmap-${entity.entity_id}`, label: t('aiworkspace.mindmap.fromList'), run: () => { void richtextToMindmap(store, null, entity, props.surfaceId) } }] : []),
-    { id: 'sep-delete', separator: true },
-    { id: 'delete', testId: kind === 'group' ? `aiws-delete-group-${entity.entity_id}` : `aiws-delete-block-${entity.entity_id}`, danger: true,
-      label: kind === 'group' ? t('aiworkspace.canvas.flow.deleteGroup') : t('aiworkspace.common.delete'), hint: 'Delete', disabled: !canDelete,
-      run: () => { void store.submit({ editId: `entity:${entity.entity_id}`, label: aiwsT(kind === 'group' ? 'aiworkspace.canvas.flow.deleteGroupLabel' : 'aiworkspace.canvas.flow.deleteBlockLabel', { name }), operations: deleteOps(store, entity) }) } },
-  ]
+  const openMenu = (anchor: HTMLElement) => props.onBlockMenu(entity.entity_id, menuPoint(anchor))
   return (
     <div ref={ref} className={`aiws-flow-gutter${open ? ' is-open' : ''}`} onPointerDown={(event) => event.stopPropagation()}>
       {canInsert && (
-        <button type="button" className="aiws-flow-handle" aria-label={t('aiworkspace.canvas.flow.insertBelow')} title={t('aiworkspace.canvas.flow.insertBelow')} data-testid={`aiws-flow-plus-${entity.entity_id}`} aria-expanded={open === 'add'}
-          onMouseDown={(event) => event.preventDefault()} onClick={() => setOpen(open === 'add' ? null : 'add')}><Plus size={16} aria-hidden="true" /></button>
+        <button type="button" className="aiws-flow-handle aiws-flow-plus" aria-label={t('aiworkspace.canvas.flow.insertAbove')} title={t('aiworkspace.canvas.flow.insertAbove')} data-testid={`aiws-flow-plus-${entity.entity_id}`} aria-expanded={open}
+          onMouseDown={(event) => event.preventDefault()} onClick={() => setOpen(!open)}><Plus size={16} aria-hidden="true" /></button>
       )}
       {policy.select && (
         <button type="button" className="aiws-flow-handle aiws-flow-grip" aria-label={t('aiworkspace.canvas.flow.handleNamed', { name })} title={t('aiworkspace.canvas.flow.handle')} data-testid={`aiws-flow-handle-${entity.entity_id}`}
-          aria-expanded={open === 'menu'} onPointerDown={(event) => props.startHandle(event, entity, () => setOpen('menu'))}
-          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); props.onSelect(new Set([entity.entity_id])); setOpen('menu') } }}>
+          aria-haspopup="menu" onPointerDown={(event) => { const handle = event.currentTarget; props.startHandle(event, entity, () => openMenu(handle)) }}
+          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); props.onSelect(new Set([entity.entity_id])); openMenu(event.currentTarget) } }}>
           <GripVertical size={16} aria-hidden="true" />
         </button>
       )}
-      {open === 'add' && <MenuList items={addItems} label={t('aiworkspace.canvas.flow.insertBelow')} className="aiws-popover aiws-popover-start aiws-flow-menu" testId="aiws-flow-add-menu" onDone={() => setOpen(null)} />}
-      {open === 'menu' && <MenuList items={menuItems} label={name} className="aiws-popover aiws-popover-start aiws-flow-menu" testId="aiws-flow-block-menu" onDone={() => setOpen(null)} />}
+      {open && <MenuList items={addItems} label={t('aiworkspace.canvas.flow.insertAbove')} className="aiws-popover aiws-popover-start aiws-flow-menu" testId="aiws-flow-add-menu" onDone={() => setOpen(false)} />}
     </div>
   )
 }
+
+/** Inside an editor or a field a right click is the browser's (spelling, paste); elsewhere on a Block it is the Block's menu. */
+const OWN_CONTEXT_MENU = 'input, textarea, select, iframe, [contenteditable="true"], [contenteditable="plaintext-only"], .aiws-popover, .aiws-menu'
 
 function FlowGroup({ group, siblings, index, ...props }: ItemProps & { group: EntityEnvelope; siblings: EntityEnvelope[]; index: number }) {
   const store = useStore()
@@ -303,11 +307,19 @@ function FlowGroup({ group, siblings, index, ...props }: ItemProps & { group: En
   // a composite's Blocks fill its slots: they are added on the canvas, where the slots show
   const canInsert = policy.insert && group.kind !== 'composite' && group.capabilities.includes('structure')
   const children = flowChildren(store, group.entity_id)
+  // an extension's composite is a control (§6.2): its title row has the actions it declares and ⋯, as a titled Block's
+  const composite = group.kind === 'composite'
+  const name = group.title ?? group.name ?? (composite ? store.outline.get(group.def_id ?? '')?.title : null) ?? t('aiworkspace.canvas.group')
+  const title = <div className="aiws-fgroup-title" data-row-title="" data-testid={composite ? `aiws-flow-composite-title-${group.entity_id}` : undefined}>{name}</div>
   return (
     <section className={`aiws-group aiws-fgroup${isSelected ? ' is-selected' : ''}${props.dragging === group.entity_id ? ' is-dragged' : ''}`} data-testid={`aiws-group-${group.entity_id}`}
-      data-cell-id={group.entity_id} data-parent-id={group.parent_id ?? undefined} data-flow-item="group" tabIndex={-1}>
+      data-cell-id={group.entity_id} data-parent-id={group.parent_id ?? undefined} data-flow-item="group" data-kind={group.kind ?? undefined} tabIndex={-1}
+      onContextMenu={composite ? (event) => { if (!policy.select || (event.target as HTMLElement).closest(OWN_CONTEXT_MENU) || (event.target as HTMLElement).closest('[data-flow-item]') !== event.currentTarget) return; event.preventDefault(); props.onBlockMenu(group.entity_id, contextPoint(event)) } : undefined}>
       <Gutter entity={group} siblings={siblings} index={index} kind="group" {...props} />
-      <div className="aiws-fgroup-title">{group.title ?? group.name ?? t('aiworkspace.canvas.group')}</div>
+      {composite && policy.select
+        ? <FlowRowTools cellId={group.entity_id} mode={props.mode} editorActive={policy.editContent} selected={isSelected} untitled={false} title={title}
+            onMore={(anchor) => props.onBlockMenu(group.entity_id, menuPoint(anchor))} />
+        : title}
       <ContainerFlow container={group} {...props} />
       {canInsert && (
         <div className="aiws-fgroup-tail" data-flow-item="tail" data-flow-into={group.entity_id}>
@@ -320,16 +332,24 @@ function FlowGroup({ group, siblings, index, ...props }: ItemProps & { group: En
   )
 }
 
-/** A control on a page (脑图方案 §6.3): one self-contained Block — its own drawing, moved and deleted as a whole. */
+/** A control on a page (脑图方案 §6.3): one self-contained Block — its own drawing, moved and deleted as a whole. Its title
+ * row is a titled Block's (§6.2): the type's icon, its title, its primary actions and quick properties, ⋯. */
 function FlowControl({ control, siblings, index, ...props }: ItemProps & { control: EntityEnvelope; siblings: EntityEnvelope[]; index: number }) {
   const def = controlRegistry.get(control.kind)
   const { t } = useAiwsText()
   const Flow = def?.Flow
+  const isSelected = props.selected.has(control.entity_id)
+  // a control is a titled type: its row shows even before it has a title of its own
+  const title = <div className="aiws-fblock-title" data-row-title="" data-testid={`aiws-flow-control-title-${control.entity_id}`}>{control.title || def?.title || control.kind}</div>
   return (
-    <section className={`aiws-cell aiws-fblock aiws-fcontrol${props.selected.has(control.entity_id) ? ' is-selected' : ''}${props.dragging === control.entity_id ? ' is-dragged' : ''}`} tabIndex={-1}
-      data-testid={`aiws-flow-control-${control.entity_id}`} data-cell-id={control.entity_id} data-parent-id={control.parent_id ?? undefined} data-flow-item="block" data-kind={control.kind}>
+    <section className={`aiws-cell aiws-fblock aiws-fcontrol${isSelected ? ' is-selected' : ''}${props.dragging === control.entity_id ? ' is-dragged' : ''}`} tabIndex={-1}
+      data-testid={`aiws-flow-control-${control.entity_id}`} data-cell-id={control.entity_id} data-parent-id={control.parent_id ?? undefined} data-flow-item="block" data-kind={control.kind}
+      onContextMenu={(event) => { if (!props.policy.select || (event.target as HTMLElement).closest(OWN_CONTEXT_MENU)) return; event.preventDefault(); props.onBlockMenu(control.entity_id, contextPoint(event)) }}>
       <Gutter entity={control} siblings={siblings} index={index} kind="block" {...props} />
-      {control.title && <div className="aiws-fblock-title">{control.title}</div>}
+      {props.policy.select
+        ? <FlowRowTools cellId={control.entity_id} mode={props.mode} editorActive={props.policy.editContent} selected={isSelected} untitled={false} title={title}
+            onMore={(anchor) => props.onBlockMenu(control.entity_id, menuPoint(anchor))} />
+        : <FlowTitleOnly entityId={control.entity_id} title={title} />}
       {Flow ? <Flow containerId={control.entity_id} mode={props.mode} /> : <div className="aiws-muted">{t('aiworkspace.mindmap.unknownKind', { kind: control.kind ?? '' })}</div>}
     </section>
   )
@@ -359,7 +379,9 @@ function FlowBlock({ cell, siblings, index, ...props }: ItemProps & { cell: Enti
   }
   const source = cell.source_id ? store.outline.get(cell.source_id) : undefined
   const title = cell.title ?? (source ? source.title ?? source.name ?? '' : '')
-  const showTitle = !UNTITLED.has(cell.view_type ?? '')
+  // a type whose content carries its own heading (text, pictures, notes) says so (`traits.flowUntitled`)
+  const showTitle = !blockRegistry.get(cell.view_type ?? '')?.traits?.flowUntitled
+  const openMenu = (anchor: HTMLElement) => props.onBlockMenu(cell.entity_id, menuPoint(anchor))
   // Esc in a field hands the selection to the page (Notion): the next Esc clears it. Rich text does the same
   // through FlowBlockContext (ProseMirror swallows Esc); a field that used Esc itself (cancel) prevents it.
   const onKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
@@ -376,14 +398,22 @@ function FlowBlock({ cell, siblings, index, ...props }: ItemProps & { cell: Enti
       <section ref={ref} className={`aiws-cell aiws-fblock${isSelected ? ' is-selected' : ''}${props.dragging === cell.entity_id ? ' is-dragged' : ''}`} tabIndex={-1}
         data-testid={`aiws-cell-frame-${cell.entity_id}`} data-cell-id={cell.entity_id} data-cell-source={cell.source_id ?? undefined} data-view={cell.view_type ?? undefined}
         data-mode={mode} data-parent-id={cell.parent_id ?? undefined} data-flow-item="block"
-        onKeyDown={onKeyDown} onPointerDown={() => { if (props.selected.size > 0) props.onSelect(new Set()) }}>
+        onKeyDown={onKeyDown} onPointerDown={() => { if (props.selected.size > 0) props.onSelect(new Set()) }}
+        onContextMenu={(event) => { if (!policy.select || (event.target as HTMLElement).closest(OWN_CONTEXT_MENU)) return; event.preventDefault(); props.onBlockMenu(cell.entity_id, contextPoint(event)) }}>
         <Gutter entity={cell} siblings={siblings} index={index} kind="block" {...props} />
-        {showTitle && <BlockTitle cell={cell} title={title} canRename={policy.writes && mode === 'edit' && cell.capabilities.includes('update')} />}
+        {policy.select && (
+          <FlowRowTools cellId={cell.entity_id} mode={mode} editorActive={html ? running : policy.editContent} selected={isSelected} untitled={!showTitle} onMore={openMenu}
+            title={showTitle ? <BlockTitle cell={cell} title={title} canRename={policy.writes && mode === 'edit' && cell.capabilities.includes('update')} /> : undefined} />
+        )}
+        {showTitle && !policy.select && <BlockTitle cell={cell} title={title} canRename={false} />}
         <div className="aiws-cell-body">
           {html && !running && !runMode.interactive && policy.editContent && !phone && <button type="button" className="aiws-link" data-testid={`aiws-flow-run-${cell.entity_id}`} onClick={() => setRunning(true)}>{t('aiworkspace.extension.html.run')}</button>}
           {/* every other editor of a page in edit mode is live (phase two §8.1): no activation step */}
-          <BlockHost cellId={cell.entity_id} mode={mode} view="canvas" selected={isSelected} editorActive={html ? running : policy.editContent}
-            onActivate={html ? () => setRunning(true) : undefined} onDeactivate={html ? () => setRunning(false) : undefined} />
+          {/* a phone's text editor hands its format tools to the bar over the keyboard (UI 框架 PRD §4.4) */}
+          <FormatScope id={cell.entity_id} enabled={phone && cell.view_type === 'richtext'}>
+            <BlockHost cellId={cell.entity_id} mode={mode} view="canvas" selected={isSelected} editorActive={html ? running : policy.editContent}
+              onActivate={html ? () => setRunning(true) : undefined} onDeactivate={html ? () => setRunning(false) : undefined} />
+          </FormatScope>
         </div>
       </section>
     </FlowBlockContext.Provider>
@@ -409,13 +439,13 @@ function BlockTitle({ cell, title, canRename }: { cell: EntityEnvelope; title: s
   }
   if (text !== null) {
     return (
-      <input className="aiws-fblock-title aiws-fblock-title-input" aria-label={t('aiworkspace.canvas.blockTitle')} data-testid={`aiws-cell-title-input-${cell.entity_id}`} autoFocus value={text} placeholder={t('aiworkspace.canvas.noTitle')}
+      <input className="aiws-fblock-title aiws-fblock-title-input" aria-label={t('aiworkspace.canvas.blockTitle')} data-row-title="" data-testid={`aiws-cell-title-input-${cell.entity_id}`} autoFocus value={text} placeholder={t('aiworkspace.canvas.noTitle')}
         onChange={(event) => setText(event.target.value)} onBlur={() => { void save(text.trim()) }}
         onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void save(text.trim()) } else if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setText(null) } }} />
     )
   }
   return (
-    <div className={`aiws-fblock-title${canRename ? ' is-editable' : ''}${title ? '' : ' is-empty'}`} data-testid={`aiws-cell-title-${cell.entity_id}`}
+    <div className={`aiws-fblock-title${canRename ? ' is-editable' : ''}${title ? '' : ' is-empty'}`} data-row-title="" data-testid={`aiws-cell-title-${cell.entity_id}`}
       title={canRename ? t('aiworkspace.canvas.clickToRename') : undefined} onClick={() => { if (canRename) setText(title) }}>
       {title || t('aiworkspace.canvas.noTitle')}
     </div>

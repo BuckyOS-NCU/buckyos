@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 const USAGE: &str = "\
 xagent — drive an Agent Session for one Turn (or keep driving it)
 
-  xagent new    --agent <did> --objective <text> [--class work|ui|self_check] [--parent <dir>]
+  xagent new    --agent <did> --objective <text> [--class work|ui] [--parent <dir>]
                 [--behavior <name>] [--cmd-skill <name>]... [--llm-context <json|@file>] [--runtime <id>] [--workspace <id>]
                 [--subscribe <spec>]... [--msg <text>] [--key <idem>]
                 [--until turn|finished|idle|outcomes:<n>] [--no-run]
@@ -46,7 +46,7 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
                 [--no-bridge] [--detach-children]
   xagent serve  <session_dir|sid>... [--idle-unload <secs>] [--no-bridge]
   xagent post   <sid> (--msg <text> [--from <did>] [--attach <obj_id>[=<name>]]... [--reply-to <obj_id>] | --json <file | ->)
-  xagent ctl    <sid> (stop | pause | resume [--reason <t>] | decide accept|discard [--note <t>] | subscribe <spec> | unsubscribe <id>
+  xagent ctl    <sid> (stop [--scope session|turn|archive] | pause | resume [--reason <t>] | decide accept|discard [--note <t>] | subscribe <spec> | unsubscribe <id>
                        | activity [--summary <t>] [--touch <ref>]... [--clear] | perceive <text>)
   xagent status <sid> [--worklog <n>] [--report] [--run] [--events]
   xagent list   --agent <did> [--active]
@@ -64,22 +64,28 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
                  | unregister <id> --expected-revision <n>
   xagent goal   create --objective <text> [--title <t>] [--lifecycle achieve|maintain] [--achieved-when <t>]
                        [--healthy-state <t>] [--distance <t>] [--constraint <t>]... [--skill <name>[=<ref>]]...
-                       [--workspace <id>] [--path <p>]... [--object <o>]... [--every <secs>] [--min-interval <secs>]
+                       [--workspace <id>] [--path <p>]... [--object <o>]... [--every <secs> | --cron <expr> [--timezone <iana>]]
+                       [--check <script.ts>] [--min-interval <secs>] [--guarantee <secs ≥ 3600, 0 = off>]
                        [--start] [--behavior <b>] [--budget <json|@file>] [--key <idem>] [--json <request|@file>]
   xagent goal   list | show [<id>] [--state] [--activations <n>] [--changes <n>] [--revisions] [--epochs] [--schedule]
-  xagent goal   revise <id> --expected-revision <n> [--objective ..] [--title ..] [--every ..] [--budget <json>]
-                       [--json <patch|@file>] [--reason <t>]
+  xagent goal   revise <id> --expected-revision <n> [--objective ..] [--title ..] [--every ..|--cron ..] [--timezone ..]
+                       [--min-interval <secs>] [--guarantee <secs>] [--budget <json>] [--json <patch|@file>] [--reason <t>]
+  xagent goal   check show [<id>] [--version <n>] | run [<id>] [--script <file.ts>]
+                | set [<id>] [--script <file.ts> | --restore | --clear] [--every <secs> | --cron <expr>] [--timezone <iana>] [--reason <t>]
+                       (the check script and its timetable; a goal session changes its own)
   xagent goal   pause|resume|archive [<id>] [--reason <t>] | achieved [<id>] --evidence <t>
   xagent goal   reopen <id> --reason <t> [--fresh-state] | restart <id> --reason <t> [--carry-state]
   xagent goal   activate <id> [--reason <t>] | post <id> --msg <t>
-  xagent goal   skills add <name>[=<ref>] [--note <t>] | skills remove <name>     (inside a goal session)
+  xagent goal   skills add <name>[=<ref>] [--note <t>] | skills remove <name>     (inside a goal session; a name without
+                       a ref takes the installed goal skill of that name, `skill list --kind goal`)
   xagent goal   serve [--llm-context <json|@file>] [--idle-unload <secs>]      (host the agent's goals and sessions)
   xagent schema <dir>
 
   <spec> = active|semi:object:<id>[#<event>] | semi:session:<sid>[:watch=f1,f2] | active|semi:timer:<name>
 
   inside a session's shell (as `agent-session`; the session comes from the environment):
-  ctl activity ... | ctl perceive <text> | recall <tag>... | note <text> | sessions [--active] [--children] [--json]
+  ctl activity ... | ctl perceive <text> | sessions [--active] [--children] [--json]
+  recall <word|tag>... [--object <path>]... [--alias <name>]... [--limit <n>] [--json] | recall --read <ref> [--json]
   read-session <sid> [--report] [--worklog <n>] | artifact head <aid> | artifact list
   create-worksession --title <t> --objective <t> [--msg <t>]... [--attach <obj_id>[=<name>]]... [--context recent:<n>|none]
         [--class <c>] [--behavior <b>] [--cmd-skill <name>]... [--workspace inherit|none|<id>] [--runtime inherit|<id>]
@@ -87,8 +93,17 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
         (--title: a short name of the work, at most 60 chars, shown where the work is listed;
          --cmd-skill: up to 8 manuals from `skill list`, fixed for the session's life; none given: a work
          session inherits its parent work's, a conversation's or a goal's are not inherited; its end comes back as input)
-  skill list [--kind cmd|goal] [--json] | skill install <x.pikg | dir> [--replace] | skill remove <name> [--kind cmd|goal]
+  skill list [--kind work|plan|goal] [--scope ui|work] [--all] [--stats] [--json]   (installing, removing, disabling: the owner's — Skills page or `buckyos skill`)
+  skill revise <name> --file <new SKILL.md> --reason <why> [--kind work|plan|goal]   rewrite the text of a manual that is not a package's; the old text is kept
   skill status [--runtime <id>] [--json]   the commands each manual relies on, on that runtime, and the extension package that would bring what is missing
+  sync list | get <task_id> | enable|disable|delete <task_id>
+  sync put <task_id> --title <t> --program <file.ts> --every <secs ≥ 900> [--hosts <h1,h2>] [--inputs <json|@file>] [--secret <NAME>]...
+  sync try <task_id> [--program <file.ts>] [--hosts <h1,h2>] [--inputs <json|@file>] [--secret <NAME>]...
+  sync run <task_id> [--wait <secs ≤ 120, default 120>]
+        the agent's sync tasks, the programs behind AI Workspace data sources (manual aiworkspace_sync): `put` installs or
+        changes one (a changed program raises its version; it then runs every --every seconds); `try` runs the task, or
+        the draft given, once and writes nothing; `run` syncs now. Credentials are entered by the owner, never here.
+        (run / try exit 0 succeeded, 1 failed, 3 still running)
   post <sid> --msg <t>
   todo add <title> (--content <t> | --content - | --content-file <path>) [--accept <criterion>]... [--scope <t>] [--evidence <t>]... [--skill <cmd_skill>]...
            [--after <todo_id>|none]... [--batch <b>] [--runtime <id>] [--workspace inherit|none|<id>] [--behavior <b>]
@@ -116,8 +131,16 @@ xagent — drive an Agent Session for one Turn (or keep driving it)
   runtime list [--available] [--json] | get <id> | check <id> | baseline [--level standard|extended] [--json] | workspace ...
         (workspace list, runtime list and sessions: readable text by default; --json for structured output)
   goal ... (ui sessions: create / show / post / pause / resume / archive / reopen / restart / activate;
-            goal sessions: show / skills add|remove / achieved --evidence / archive --reason)
-  notify send --title <t> [--message <text>] [--level quiet|normal|timely|urgent] [--expires-in <dur>] [--key <k>]
+            goal sessions: show / skills add|remove / check show|run|set / achieved --evidence / archive --reason)
+  goal check run [--script <file.ts>]   run the check script (or a draft) the way the host does: same Deno, read and
+        network only, same ctx and state; nothing is recorded. Test a script with it before `goal check set`.
+  goal check set [--script <file.ts> | --restore | --clear] [--every <secs ≥ 60> | --cron <expr>] [--timezone <iana>] --reason <t>
+        the script each scheduled check runs (`export default async function check(ctx, state)` returning
+        {run, reason?, state?, notify?: {title, message?, url?, level?}}; the host sends `notify` without an
+        inference) and how often; `--restore` goes back to the package's script of a built-in goal
+  notify send --title <t> [--message <text>] [--url <link>] [--level quiet|normal|timely|urgent] [--expires-in <dur>] [--key <k>]
+         (tell the user something; the system picks the channel. --url: where opening it lands, e.g. a page or
+          app made for this; something the user must answer goes in a goal's `questions`, not here)
   notify list [--open] [--any-source] [--session <sid>] [--goal <id>] | show <notify_id>
   notify answer <notify_id> (--option <value> | --text <t>) | ack <notify_id> | cancel <notify_id> [--reason <r>]
          (answer / ack: on the user's behalf, for a notification the user answered in this conversation;
@@ -891,7 +914,15 @@ async fn cmd_ctl(mut a: Args) -> R<i32> {
             .unwrap_or_else(|| format!("{prefix}-{}", uuid::Uuid::new_v4().simple()))
     };
     let (key, command) = match cmd.as_str() {
-        "stop" => (key("stop"), ControlCommand::stop(a.get("reason"))),
+        "stop" => {
+            let scope = match a.get("scope").as_deref() {
+                None | Some("session") => StopScope::Session,
+                Some("turn") => StopScope::Turn,
+                Some("archive") => StopScope::Archive,
+                Some(s) => return Err(bad(format!("bad --scope {s} (session | turn | archive)"))),
+            };
+            (key("stop"), ControlCommand::Stop { reason: a.get("reason"), scope })
+        }
         "pause" => (key("pause"), ControlCommand::Pause { reason: a.get("reason") }),
         "resume" => (key("resume"), ControlCommand::Resume { reason: a.get("reason") }),
         "decide" => {
@@ -1113,35 +1144,150 @@ fn cmd_schema(mut a: Args) -> R<i32> {
 
 // ---- commands of a session's own shell (layer ② session tools) ----
 
+/// `recall <words>... [--object <path>]... [--alias <name>]... [--limit <n>]
+/// [--json]` and `recall --read <ref> [--json]`: the session's active Memory
+/// query (§6.3). Who asks is the session the shell belongs to (its host
+/// binds it), never an argument: what it may see is that session's.
 async fn cmd_recall(a: Args) -> R<i32> {
+    let sid = env_sid().ok_or_else(|| {
+        bad("recall runs in a session's shell ($OPENDAN_SESSION_ID): what it may see is that session's")
+    })?;
     let c = ctx(&a, None, false).await?;
-    let hints = c
-        .agent
-        .cognition()
-        .recall_hints(&crate::state::RecallQuery {
-            tags: a.pos.iter().cloned().collect(),
-            max_hints: a.num("max")?.unwrap_or(5),
-        })
-        .await?;
-    print(&hints);
+    if let Some(reference) = a.get("read") {
+        let v = c.agent.cognition().read(&sid, &reference).await?;
+        if a.has("json") {
+            print(&v);
+        } else {
+            print!("{}", render_memory_read(&v));
+        }
+        return Ok(0);
+    }
+    let words: Vec<String> = a.pos.iter().map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect();
+    // Every word is a tag too; one a tag cannot be is only text.
+    let tags: Vec<String> = words
+        .iter()
+        .filter(|w| agent_tool::agent_memory::normalize_tags(std::slice::from_ref(*w)).is_ok())
+        .cloned()
+        .collect();
+    let q = crate::memory::MemoryQuery {
+        text: Some(words.join(" ")).filter(|t| !t.is_empty()),
+        tags,
+        objects: a.all("object"),
+        aliases: a.all("alias"),
+        // Notes not yet consolidated come back too, apart (§6.3.1).
+        include_recent_perceptions: true,
+        limit: a.num("limit")?.unwrap_or(10),
+        ..Default::default()
+    };
+    let r = c.agent.cognition().query(&sid, &q).await?;
+    if a.has("json") {
+        print(&r);
+    } else {
+        print!("{}", render_query(&r));
+    }
     Ok(0)
 }
 
-async fn cmd_note(mut a: Args) -> R<i32> {
-    let text = a.next("<text>")?;
-    let c = ctx(&a, None, false).await?;
-    let note = crate::state::NotebookNote {
-        notebook_id: a.get("notebook").unwrap_or_else(|| "default".into()),
-        title: a
-            .get("title")
-            .unwrap_or_else(|| text.lines().next().unwrap_or_default().chars().take(80).collect()),
-        content: text,
-        tags: a.all("tag"),
-        session_id: env_sid(),
+/// The answer of `recall`, in the lines a batch's background uses.
+fn render_query(r: &crate::memory::QueryResult) -> String {
+    use crate::memory::{Change, ChangeKind, RecallStatus};
+    use crate::runner::memory_batch::line;
+    if r.status == RecallStatus::NotTriggered {
+        return "nothing to look up by: give words, tags, --object or --alias\n".into();
+    }
+    let corrections: std::collections::BTreeMap<String, String> = r
+        .corrections
+        .iter()
+        .map(|h| (h.reference.clone(), h.summary.clone()))
+        .collect();
+    let lines = |hints: &[crate::memory::Hint]| -> String {
+        hints
+            .iter()
+            .map(|h| {
+                let c = Change { kind: ChangeKind::Recalled, hint: h.clone() };
+                format!("- {}\n", line(&c, &corrections).text)
+            })
+            .collect()
     };
-    c.agent.cognition().notebook_append(&note, &c.who).await?;
-    print(&json!({ "noted": note.title }));
-    Ok(0)
+    let mut out = String::new();
+    out.push_str(&format!("cognitions ({}{}):\n", r.cognitions.len(), if r.next_cursor.is_some() { ", more with a larger --limit" } else { "" }));
+    out.push_str(&lines(&r.cognitions));
+    if r.cognitions.is_empty() {
+        out.push_str("- none found (that is not \"never said\": try other words, or --object)\n");
+    }
+    out.push_str(&format!(
+        "noted, not yet consolidated ({}; not conclusions, the consolidation may still change or drop them):\n",
+        r.recent_perceptions.len()
+    ));
+    out.push_str(&lines(&r.recent_perceptions));
+    let more = r.pending_in_scope.saturating_sub(r.recent_perceptions.len());
+    if more > 0 {
+        out.push_str(&format!("({more} more notes in range wait for consolidation and did not match)\n"));
+    }
+    for a in &r.ambiguous_aliases {
+        out.push_str(&format!(
+            "ambiguous: `{}` could be {} — ask, or pass --object\n",
+            a.alias,
+            a.candidates
+                .iter()
+                .map(|c| format!("{} ({})", c.canonical_name, c.object_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(t) = &r.last_consolidated_at {
+        out.push_str(&format!("last consolidation: {t}\n"));
+    }
+    out.push_str("Read one in full (where it comes from, its revisions): recall --read <ref>\n");
+    out
+}
+
+/// `recall --read <ref>`: a cognition with its evidence and revisions, or a
+/// note with its state.
+fn render_memory_read(v: &crate::memory::MemoryRead) -> String {
+    use crate::memory::{Change, ChangeKind, MemoryRead};
+    use crate::runner::memory_batch::line;
+    let mut out = String::new();
+    match v {
+        MemoryRead::Cognition { cognition, provenance } => {
+            let corrections: std::collections::BTreeMap<String, String> = cognition
+                .corrections
+                .iter()
+                .map(|h| (h.reference.clone(), h.summary.clone()))
+                .collect();
+            let c = Change { kind: ChangeKind::Recalled, hint: cognition.hint.clone() };
+            out.push_str(&format!("{}\n", line(&c, &corrections).text));
+            out.push_str(&format!(
+                "status: {} (current revision {}, {})\n",
+                cognition.item.status, cognition.current_revision, cognition.current_status
+            ));
+            if !provenance.current_basis.is_empty() {
+                out.push_str("evidence:\n");
+                for b in &provenance.current_basis {
+                    out.push_str(&format!(
+                        "- {}{}{}\n",
+                        b.content,
+                        b.occurred_at.as_ref().map(|t| format!(" ({t})")).unwrap_or_default(),
+                        b.event_ref.as_ref().map(|e| format!(" [source {e}]")).unwrap_or_default()
+                    ));
+                }
+            }
+            if provenance.revisions.len() > 1 {
+                out.push_str("revisions:\n");
+                for r in &provenance.revisions {
+                    out.push_str(&format!("- @{} {} {}: {}\n", r.revision, r.status, r.noticed_at, r.statement));
+                }
+            }
+            if !provenance.absorbed.is_empty() {
+                out.push_str(&format!("consolidated from notes: {}\n", provenance.absorbed.join(", ")));
+            }
+        }
+        MemoryRead::Perception { perception } => {
+            let c = Change { kind: ChangeKind::Recalled, hint: perception.hint.clone() };
+            out.push_str(&format!("{}\n", line(&c, &Default::default()).text));
+        }
+    }
+    out
 }
 
 fn brief(e: &RegistryEntry) -> Value {
@@ -1196,8 +1342,8 @@ async fn cmd_sessions(a: Args) -> R<i32> {
             if e.status.needs_input {
                 println!("  Needs input: agent-session post {} --msg <text>", e.session_id);
             }
-            if e.status.paused {
-                println!("  Paused");
+            if let Some(source) = e.status.paused {
+                println!("  Paused ({})", source.as_str());
             }
             if e.status.acceptance != Acceptance::NotApplicable {
                 println!("  Acceptance: {}", list_label(e.status.acceptance));
@@ -1376,16 +1522,13 @@ fn cmd_skills_arg(a: &Args, flag: &str) -> Option<Vec<String>> {
 fn skill_kind(a: &Args) -> R<Option<SkillKind>> {
     match a.get("kind").as_deref() {
         None => Ok(None),
-        Some("cmd") => Ok(Some(SkillKind::Cmd)),
-        Some("goal") => Ok(Some(SkillKind::Goal)),
-        Some(k) => Err(bad(format!("bad --kind {k} (cmd | goal)"))),
+        Some(k) => SkillKind::parse(k).map(Some).ok_or_else(|| bad(format!("bad --kind {k} (work | plan | goal)"))),
     }
 }
 
-/// `skill list [--kind cmd|goal] [--json]` / `skill install <x.pikg | dir> [--replace]`
-/// / `skill remove <name> [--kind cmd|goal]`: the agent's skills. A new
-/// session takes the manuals installed when it is created; running sessions
-/// keep theirs.
+/// `skill list [--kind work|plan|goal] [--scope ui|work] [--all] [--stats] [--json]` / `skill status` /
+/// `skill revise`: the agent's skills. Installing, removing, disabling and the UI set are the owner's (the Skills page,
+/// `buckyos skill …`). A new session takes the manuals as they are when it is created; running sessions keep theirs.
 async fn cmd_skill_status(c: &Ctx, a: &Args) -> R<i32> {
     let report = c.agent.behaviors().skills_status(a.get("runtime").as_deref()).await?;
     if a.has("json") {
@@ -1394,76 +1537,213 @@ async fn cmd_skill_status(c: &Ctx, a: &Args) -> R<i32> {
     }
     println!("runtime {}", report["runtime_id"].as_str().unwrap_or(""));
     for skill in report["skills"].as_array().cloned().unwrap_or_default() {
-        let status = &skill["status"];
-        let state = match status["state"].as_str() {
-            Some("ready") => "ready".to_string(),
-            Some("ready_system") => "ready (system)".to_string(),
-            _ => {
-                let missing: Vec<String> = status["commands"]
-                    .as_object()
-                    .map(|c| c.iter().filter(|(_, v)| v["present"] == false).map(|(k, _)| k.clone()).collect())
-                    .unwrap_or_default();
-                let packages: Vec<&str> = status["recommended_packages"].as_array().map(|p| p.iter().filter_map(|x| x["id"].as_str()).collect()).unwrap_or_default();
-                let advice = if packages.is_empty() { String::new() } else { format!("; extension package: {}", packages.join(", ")) };
-                format!("partial (missing {}{advice})", missing.join(", "))
+        let status = &skill["commands"];
+        let state = if let Some(unmet) = skill["unmet"].as_str() {
+            format!("not available here: {unmet}")
+        } else {
+            match status["state"].as_str() {
+                Some("ready") => "ready".to_string(),
+                Some("ready_system") => "ready (system)".to_string(),
+                _ => {
+                    let missing: Vec<String> = status["commands"]
+                        .as_object()
+                        .map(|c| c.iter().filter(|(_, v)| v["present"] == false).map(|(k, _)| k.clone()).collect())
+                        .unwrap_or_default();
+                    let packages: Vec<&str> = status["recommended_packages"].as_array().map(|p| p.iter().filter_map(|x| x["id"].as_str()).collect()).unwrap_or_default();
+                    let advice = if packages.is_empty() { String::new() } else { format!("; extension package: {}", packages.join(", ")) };
+                    format!("partial (missing {}{advice})", missing.join(", "))
+                }
             }
         };
-        println!("{:<24} {state}", skill["name"].as_str().unwrap_or(""));
+        let off = skill["off"].as_str().map(|why| format!(" — OFF: {why}")).unwrap_or_default();
+        println!("{:<24} {state}{off}", skill["name"].as_str().unwrap_or(""));
     }
     Ok(0)
 }
 
 async fn cmd_skill(mut a: Args) -> R<i32> {
-    let sub = a.next("list | status | install | remove")?;
+    let sub = a.next("list | status | revise")?;
     let c = ctx(&a, None, false).await?;
     match sub.as_str() {
         "status" => return cmd_skill_status(&c, &a).await,
         "list" => {
-            let skills = c.agent.behaviors().skills(skill_kind(&a)?).await?;
+            let scope = match a.get("scope").as_deref() {
+                None => None,
+                Some("ui") => Some(true),
+                Some("work") => Some(false),
+                Some(s) => return Err(bad(format!("bad --scope {s} (ui | work)"))),
+            };
+            let skills: Vec<SkillMeta> = c
+                .agent
+                .behaviors()
+                .skills(skill_kind(&a)?)
+                .await?
+                .into_iter()
+                .filter(|s| a.has("all") || s.enabled)
+                .filter(|s| match scope {
+                    None => true,
+                    Some(ui) => s.kind == SkillKind::Work && if ui { s.scope.ui() } else { s.scope.work() },
+                })
+                .collect();
             if a.has("json") {
                 print(&skills);
                 return Ok(0);
             }
             if skills.is_empty() {
-                println!("no skills installed");
+                println!("no skills");
             }
             for s in &skills {
-                let mut line = format!("{}  [{}] {}", s.name, s.kind.as_str(), s.description);
-                if s.baseline != buckyos_api::RuntimeBaseline::Standard || !s.platforms.is_empty() {
-                    line.push_str(&format!(" — needs: {} environment", s.baseline.as_str()));
-                    if !s.platforms.is_empty() {
-                        line.push_str(&format!(" on {}", s.platforms.join(", ")));
-                    }
-                }
-                if !s.requires.is_empty() {
-                    line.push_str(&format!(" — requires: {}", s.requires));
-                }
-                if !s.tools.is_empty() {
-                    line.push_str(&format!(" — commands: {}", s.tools.join(", ")));
-                }
-                if let Some(i) = &s.install {
-                    line.push_str(&format!(" — from {} {}", i.package, i.version));
-                }
-                println!("{line}");
+                println!("{}", skill_line(s, a.has("stats")));
             }
             Ok(0)
         }
-        "install" => {
-            let path = PathBuf::from(a.next("<skill package: .pikg file or directory>")?);
-            let pkg = crate::skills::read_source(&path)?;
-            let r = c.agent.behaviors().install_skills(&pkg, a.has("replace"), &c.who).await?;
-            print(&r);
-            Ok(0)
-        }
-        "remove" => {
+        "revise" => {
             let name = a.next("<name>")?;
-            let kind = skill_kind(&a)?.unwrap_or(SkillKind::Cmd);
-            let m = c.agent.behaviors().remove_skill(kind, &name, &c.who).await?;
-            print(&json!({ "removed": m }));
+            let kind = skill_kind(&a)?.unwrap_or(SkillKind::Work);
+            let path = a.get("file").ok_or_else(|| bad("skill revise <name> --file <new SKILL.md> --reason <why>"))?;
+            let reason = a.get("reason").filter(|r| !r.trim().is_empty()).ok_or_else(|| bad("--reason says what the sessions that used the manual showed"))?;
+            let text = std::fs::read_to_string(&path).map_err(|e| bad(format!("{path}: {e}")))?;
+            let who = env_sid().map(|sid| format!("session:{sid}")).unwrap_or_else(|| c.who.clone());
+            let m = c.agent.behaviors().revise_skill(kind, &name, &text, &reason, &who).await?;
+            print(&json!({ "revised": m }));
             Ok(0)
         }
-        other => Err(bad(format!("unknown skill command `{other}` (list | install | remove)"))),
+        "install" | "remove" | "disable" | "enable" | "ui" | "ui-add" | "ui-remove" => Err(bad(format!(
+            "skill {sub} is the owner's: tell the user to open the agent's Skills page, or to run `buckyos skill {} … --agent <agent id>`",
+            if sub == "ui" { "ui-add" } else { sub.as_str() }
+        ))),
+        other => Err(bad(format!("unknown skill command `{other}` (list | status | revise)"))),
     }
+}
+
+// ----------------------------------------------------------------------
+// sync — the agent's sync tasks (`sync.*` of its own service)
+// ----------------------------------------------------------------------
+
+/// The agent's own service: `--state-url` / `$OPENDAN_AGENT_STATE_URL` (a
+/// development host), else the zone's route to it (`/kapi/<agent_id>`) as
+/// the agent's app, with the session token its host hands the session.
+async fn agent_service(a: &Args) -> R<::kRPC::kRPC> {
+    let timeout = Duration::from_millis(crate::sync::WAIT_MAX_MS + 30_000);
+    if let Some(url) = a.env_or("state-url", crate::state::ENV_AGENT_STATE_URL) {
+        return Ok(::kRPC::kRPC::new_with_timeout(&url, None, timeout));
+    }
+    let unreachable = |why: String| Fail { code: 1, msg: format!("the agent's service is not reachable from here: {why}") };
+    crate::notify::ZoneNotify::for_session_process().await.map_err(unreachable)?;
+    let agent_id = std::env::var("BUCKYOS_APP_ID").map_err(|_| unreachable("the session token names no app".into()))?;
+    let runtime = buckyos_api::get_buckyos_api_runtime().map_err(|e| unreachable(e.to_string()))?;
+    runtime
+        .get_zone_service_krpc_client_with_default_timeout(&agent_id, Some(timeout.as_secs()))
+        .await
+        .map_err(|e| unreachable(e.to_string()))
+}
+
+/// `--program <file.ts>` (or `@file.ts`; a session on another runtime sends the text itself).
+fn program_arg(a: &Args) -> R<Option<String>> {
+    a.get("program")
+        .map(|v| match v.strip_prefix('@') {
+            Some(_) => file_or_inline(&v),
+            None if Path::new(&v).is_file() => Ok(std::fs::read_to_string(&v)?),
+            None => Ok(v),
+        })
+        .transpose()
+}
+
+/// `sync list | get | put | try | run | enable | disable | delete`: the
+/// agent's sync tasks, through its own service (which runs them).
+async fn cmd_sync(mut a: Args) -> R<i32> {
+    let sub = a.next("sync command (list | get | put | try | run | enable | disable | delete)")?;
+    let inputs = a.get("inputs").map(|v| json_arg::<Value>(&v)).transpose()?;
+    let secrets = a.has("secret").then(|| a.all("secret"));
+    let (method, params) = match sub.as_str() {
+        "list" => ("sync.list", json!({})),
+        "get" | "delete" => (if sub == "get" { "sync.get" } else { "sync.delete" }, json!({ "task_id": a.next("<task_id>")? })),
+        "enable" | "disable" => ("sync.set_enabled", json!({ "task_id": a.next("<task_id>")?, "enabled": sub == "enable" })),
+        "put" => {
+            let task_id = a.next("<task_id>")?;
+            let usage = "sync put <task_id> --title <t> --program <file.ts> --every <secs> [--hosts <h1,h2>] [--inputs <json>] [--secret <NAME>]...";
+            ("sync.put", json!({
+                "task_id": task_id,
+                "title": a.get("title").ok_or_else(|| bad(usage))?,
+                "program": program_arg(&a)?.ok_or_else(|| bad(usage))?,
+                "hosts": comma_list(&a, "hosts"),
+                "schedule": { "every_secs": a.num::<u64>("every")?.ok_or_else(|| bad(usage))? },
+                "inputs": inputs,
+                "secrets": secrets,
+            }))
+        }
+        "try" => {
+            let task_id = a.next("<task_id>")?;
+            ("sync.try", json!({
+                "task_id": task_id,
+                "program": program_arg(&a)?,
+                "hosts": a.has("hosts").then(|| comma_list(&a, "hosts")),
+                "inputs": inputs,
+                "secrets": secrets,
+            }))
+        }
+        "run" => {
+            let task_id = a.next("<task_id>")?;
+            let wait = a.num::<u64>("wait")?.unwrap_or(120).saturating_mul(1000).min(crate::sync::WAIT_MAX_MS);
+            ("sync.run", json!({ "task_id": task_id, "wait_ms": wait }))
+        }
+        other => return Err(bad(format!("unknown sync command `{other}` (list | get | put | try | run | enable | disable | delete)"))),
+    };
+    let client = agent_service(&a).await?;
+    let v = client.call(method, params).await.map_err(|e| match e {
+        ::kRPC::RPCErrors::ReasonError(text) => Fail::from(crate::state::krpc::error_from_wire(&text)),
+        other => Fail { code: 1, msg: format!("{method}: {other}") },
+    })?;
+    print(&v);
+    let status = match sub.as_str() {
+        "run" => v["run"]["status"].as_str(),
+        "try" => v["run"]["status"].as_str(),
+        _ => None,
+    };
+    Ok(match status {
+        Some("failed") => 1,
+        Some("running") => 3,
+        _ => 0,
+    })
+}
+
+/// One skill as `skill list` prints it.
+fn skill_line(s: &SkillMeta, stats: bool) -> String {
+    let kind = match (s.kind, s.scope) {
+        (SkillKind::Work, SkillScope::Ui) => "ui".to_string(),
+        (SkillKind::Work, SkillScope::UiWork) => "ui,work".to_string(),
+        (kind, _) => kind.as_str().to_string(),
+    };
+    let mut line = format!("{}  [{kind}] {}", s.name, s.description);
+    if s.baseline != buckyos_api::RuntimeBaseline::Standard || !s.platforms.is_empty() {
+        line.push_str(&format!(" — needs: {} environment", s.baseline.as_str()));
+        if !s.platforms.is_empty() {
+            line.push_str(&format!(" on {}", s.platforms.join(", ")));
+        }
+    }
+    if !s.requires.is_empty() {
+        line.push_str(&format!(" — requires: {}", s.requires));
+    }
+    if !s.references.is_empty() {
+        line.push_str(&format!(" — references: {}/{}/{}/ ({})", s.kind.dir(), s.name, SKILL_REFERENCES, s.references.len()));
+    }
+    if s.kind != SkillKind::Work {
+        line.push_str(&format!(" — read: $OPENDAN_AGENT_ROOT/{}", s.kind.manual(&s.name)));
+    }
+    if let Some(i) = &s.install {
+        line.push_str(&format!(" — from {} {}", i.package, i.version));
+    }
+    line.push_str(&format!(" — {} bytes", s.size));
+    if let Some(why) = s.why_off() {
+        line.push_str(&format!(" — OFF: {why}"));
+    }
+    if stats {
+        match &s.usage {
+            Some(u) => line.push_str(&format!(" — frozen {} times, last {}", u.frozen, u.last_ms)),
+            None => line.push_str(" — never frozen"),
+        }
+    }
+    line
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,23 +1824,7 @@ async fn check_todo_skills(c: &Ctx, names: &[String]) -> R<()> {
     if names.is_empty() {
         return Ok(());
     }
-    crate::state::check_cmd_skill_names(names)?;
-    let installed: Vec<String> = c
-        .agent
-        .behaviors()
-        .skills(Some(SkillKind::Cmd))
-        .await?
-        .into_iter()
-        .map(|m| m.name)
-        .collect();
-    for n in names {
-        if !installed.contains(n) {
-            return Err(bad(format!(
-                "--skill {n}: the agent has no such cmd_skill (installed: {}; see `agent-session skill list`)",
-                installed.join(", ")
-            )));
-        }
-    }
+    crate::state::check_named_skills(c.agent.behaviors(), names).await.map_err(|e| bad(format!("--skill: {e}")))?;
     Ok(())
 }
 
@@ -2154,8 +2418,6 @@ async fn cmd_runtime(mut a: Args) -> R<i32> {
                                 ops: Vec::new(),
                                 roots: a.all("root").into_iter().map(PathBuf::from).collect(),
                                 computer: Default::default(),
-                                install: Default::default(),
-                                workspace: false,
                                 expires_at_ms: a.num("expires-at-ms")?,
                             },
                         },
@@ -2258,6 +2520,18 @@ async fn cmd_runtime_run(argv: Vec<String>) -> R<i32> {
     print(&record);
     Ok(if op.timed_out { 124 } else { op.exit_code })
 }
+/// The user's time zone of the calling session (a cron timetable without
+/// `--timezone` takes it), if it has one.
+async fn session_timezone(c: &Ctx) -> Option<String> {
+    let sid = env_sid()?;
+    let e = c.agent.sessions().lookup(&sid).await.ok()??;
+    SessionDir::open(&e.location).ok()?.config().ok()?.session.timezone.filter(|t| !t.is_empty())
+}
+
+fn read_text_file(path: &str) -> R<String> {
+    std::fs::read_to_string(path).map_err(|e| bad(format!("read {path}: {e}")))
+}
+
 /// The caller of a goal operation: inside a session its kind decides what it
 /// may do (`$OPENDAN_SESSION_ID`), outside the owner side.
 fn goal_caller(c: &Ctx) -> GoalCaller {
@@ -2403,7 +2677,12 @@ async fn cmd_goal(mut a: Args) -> R<i32> {
                 req.distance_evaluation = t;
             }
             req.constraints.extend(a.all("constraint"));
-            req.initial_skills.extend(skills_arg(&a));
+            for mut k in skills_arg(&a) {
+                if k.reference.is_none() {
+                    k.reference = crate::goal::goal_skill_ref(c.agent.as_ref(), &k.name).await;
+                }
+                req.initial_skills.push(k);
+            }
             if let Some(w) = a.get("workspace") {
                 req.scope.workspace = Some(w);
             }
@@ -2412,8 +2691,23 @@ async fn cmd_goal(mut a: Args) -> R<i32> {
             if let Some(n) = a.num::<u64>("every")? {
                 req.schedule.every_secs = Some(n);
             }
+            if let Some(expr) = a.get("cron") {
+                req.schedule.cron = Some(expr);
+                req.schedule.timezone = match a.get("timezone") {
+                    Some(t) => Some(t),
+                    None => session_timezone(&c).await,
+                };
+            } else if let Some(t) = a.get("timezone") {
+                req.schedule.timezone = Some(t);
+            }
             if let Some(n) = a.num::<u64>("min-interval")? {
                 req.schedule.min_interval_secs = Some(n);
+            }
+            if let Some(n) = a.num::<u64>("guarantee")? {
+                req.schedule.guarantee_secs = Some(n);
+            }
+            if let Some(f) = a.get("check") {
+                req.check_script = Some(read_text_file(&f)?);
             }
             if a.has("start") {
                 req.schedule.start_on_create = true;
@@ -2463,13 +2757,30 @@ async fn cmd_goal(mut a: Args) -> R<i32> {
             if let Some(t) = a.get("distance") {
                 req.distance_evaluation = Some(t);
             }
-            if let Some(n) = a.num::<u64>("every")? {
+            let touches_schedule = ["every", "cron", "timezone", "min-interval", "guarantee"].iter().any(|k| a.get(k).is_some());
+            if touches_schedule {
                 let mut s = goals
                     .get(&id)
                     .await?
                     .ok_or_else(|| bad(format!("goal {id} does not exist")))?
                     .schedule;
-                s.every_secs = Some(n);
+                if let Some(n) = a.num::<u64>("every")? {
+                    s.every_secs = Some(n);
+                    s.cron = None;
+                }
+                if let Some(c) = a.get("cron") {
+                    s.cron = Some(c);
+                    s.every_secs = None;
+                }
+                if let Some(t) = a.get("timezone") {
+                    s.timezone = Some(t);
+                }
+                if let Some(n) = a.num::<u64>("min-interval")? {
+                    s.min_interval_secs = Some(n);
+                }
+                if let Some(n) = a.num::<u64>("guarantee")? {
+                    s.guarantee_secs = Some(n);
+                }
                 req.schedule = Some(s);
             }
             if let Some(b) = a.get("budget") {
@@ -2548,6 +2859,84 @@ async fn cmd_goal(mut a: Args) -> R<i32> {
                 print(&json!({ "posted": index, "key": key, "session_id": goal.session.sid }));
             }
         }
+        "check" => {
+            let op = a.next("show | run | set")?;
+            let id = goal_id_arg(&c, &mut a).await?;
+            let goal = goals
+                .get(&id)
+                .await?
+                .ok_or_else(|| bad(format!("goal {id} does not exist")))?;
+            match op.as_str() {
+                "show" => {
+                    let version = a.num::<u64>("version")?;
+                    let d = crate::goal::defaults(c.agent.agent_root(), crate::goal::GOAL_CLASS);
+                    print(&json!({
+                        "goal_id": id,
+                        "timetable": crate::goal_time::Timetable::of(&goal, &d).map(|t| t.describe()),
+                        "script": goal.schedule.check,
+                        "source": goals.check_script(&id, version).await?,
+                        "schedule": goals.schedule(&id).await?,
+                        "hard_interval_secs": crate::goal::min_interval_secs(&goal, &d),
+                        "hard_guarantee_secs": crate::goal::guarantee_secs(&goal, &d),
+                    }));
+                }
+                "run" => {
+                    let draft = a.get("script").map(PathBuf::from);
+                    if let Some(p) = &draft {
+                        if !p.is_file() {
+                            return Err(bad(format!("--script {}: no such file", p.display())));
+                        }
+                    }
+                    let draft = match draft {
+                        Some(p) => Some(std::fs::canonicalize(&p).unwrap_or(p)),
+                        None => None,
+                    };
+                    let work = std::env::temp_dir().join("opendan-goal-checks");
+                    let runner: Box<dyn crate::goal_check::CheckRunner> = match crate::goal_check::DenoCheckRunner::discover(work) {
+                        Some(d) => Box::new(d),
+                        None => Box::new(crate::goal_check::MissingRunner),
+                    };
+                    let run = crate::goal_check::run_for(
+                        c.agent.as_ref(),
+                        runner.as_ref(),
+                        &goal,
+                        draft.as_deref(),
+                        &crate::goal_check::CheckWhen::new("test"),
+                        crate::now_ms(),
+                    )
+                    .await?;
+                    let code = if run.verdict.is_ok() { 0 } else { 1 };
+                    print(&json!({
+                        "outcome": run.outcome().as_str(),
+                        "run": run.verdict.as_ref().ok().map(|v| v.run),
+                        "reason": run.verdict.as_ref().ok().and_then(|v| v.reason.clone()),
+                        "state": run.verdict.as_ref().ok().and_then(|v| v.state.clone()),
+                        "notify": run.verdict.as_ref().ok().and_then(|v| v.notify.clone()),
+                        "error": run.verdict.as_ref().err(),
+                        "log": run.log,
+                        "elapsed_ms": run.elapsed_ms,
+                    }));
+                    return Ok(code);
+                }
+                "set" => {
+                    let mut req = crate::state::GoalCheckChange {
+                        script: a.get("script").map(|f| read_text_file(&f)).transpose()?,
+                        restore_package: a.has("restore"),
+                        clear_script: a.has("clear"),
+                        every_secs: a.num::<u64>("every")?,
+                        cron: a.get("cron"),
+                        timezone: a.get("timezone"),
+                        reason: a.get("reason"),
+                        ..Default::default()
+                    };
+                    if req.cron.is_some() && req.timezone.is_none() && goal.schedule.timezone.is_none() {
+                        req.timezone = session_timezone(&c).await;
+                    }
+                    print(&goals.set_check(&id, &req, &caller).await?);
+                }
+                other => return Err(bad(format!("goal check {other}: show | run | set"))),
+            }
+        }
         "skills" => {
             // A change of the Goal State: applied by the session's driver.
             let sid = env_sid().ok_or_else(|| bad("goal skills runs inside a goal session ($OPENDAN_SESSION_ID)"))?;
@@ -2557,7 +2946,7 @@ async fn cmd_goal(mut a: Args) -> R<i32> {
                 "add" => {
                     let (n, r) = match name.split_once('=') {
                         Some((n, r)) => (n.to_string(), Some(r.to_string())),
-                        None => (name.clone(), None),
+                        None => (name.clone(), crate::goal::goal_skill_ref(c.agent.as_ref(), &name).await),
                     };
                     ControlCommand::GoalSkills {
                         add: vec![GoalSkill {
@@ -2707,6 +3096,12 @@ async fn cmd_notify(mut a: Args) -> R<i32> {
             };
             if c.agent.agent_root().is_some() {
                 complete_notify_source(c.agent.as_ref(), &mut source).await;
+            }
+            if let Some(url) = a.get("url").map(|u| u.trim().to_string()).filter(|u| !u.is_empty()) {
+                if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with('/')) {
+                    return Err(bad(format!("--url {url}: a link (https://…) or a path of this Zone (/…)")).into());
+                }
+                source.link = Some(url);
             }
             req.source = Some(source);
             let v = notify.send(req).await?;
@@ -2909,12 +3304,6 @@ async fn remote_main(remote: crate::session_context::SessionClient, cmd: String,
         println!("{}", resp.text);
         return Ok(resp.exit_code());
     }
-    if cmd == "skill" && argv.first().map(String::as_str) == Some("install") {
-        return Err(bad(
-            "skill install reads the package where the command runs, and this runtime is not the agent's: \
-install it from a session on the agent's own runtime, or with `buckyos skill install`",
-        ));
-    }
     let (argv, stdin) = inline_files(argv)?;
     let mut full = vec![cmd];
     full.extend(argv);
@@ -2959,10 +3348,10 @@ async fn real_main() -> R<i32> {
     let extra: &[&str] = match (cmd.as_str(), argv.first().map(String::as_str)) {
         ("status", _) => &["run"],
         ("todo", _) => &["json", "clear-accept"],
-        ("skill", _) => &["json", "replace"],
+        ("skill", _) => &["json", "all", "stats"],
         ("runtime", Some("baseline")) => &["json", "check", "overlay"],
         ("runtime", Some("check")) => &["full"],
-        ("workspace" | "runtime", Some("list")) | ("sessions", _) => &["json"],
+        ("workspace" | "runtime", Some("list")) | ("sessions", _) | ("recall", _) => &["json"],
         ("copy", _) => &["replace"],
         _ => &[],
     };
@@ -2985,7 +3374,6 @@ async fn real_main() -> R<i32> {
         "workspace" => cmd_workspace(a).await,
         "runtime" => cmd_runtime(a).await,
         "recall" => cmd_recall(a).await,
-        "note" => cmd_note(a).await,
         "sessions" => cmd_sessions(a).await,
         "read-session" => cmd_read_session(a).await,
         "artifact" => cmd_artifact(a).await,
@@ -2996,6 +3384,7 @@ async fn real_main() -> R<i32> {
         "todo" => cmd_todo(a).await,
         "task" => cmd_task(a).await,
         "skill" => cmd_skill(a).await,
+        "sync" => cmd_sync(a).await,
         "copy" => cmd_copy(a).await,
         other => {
             eprintln!("xagent: unknown command `{other}`\n\n{USAGE}");
@@ -3017,14 +3406,21 @@ fn session_cli() -> Option<PathBuf> {
 
 /// Run the `xagent` command line and exit with its status.
 pub fn main() -> ! {
-    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
-    let code = match rt.block_on(real_main()) {
-        Ok(code) => code,
-        Err(f) => {
-            eprintln!("xagent: {}", f.msg);
-            f.code
-        }
-    };
+    let code = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+            match rt.block_on(real_main()) {
+                Ok(code) => code,
+                Err(f) => {
+                    eprintln!("xagent: {}", f.msg);
+                    f.code
+                }
+            }
+        })
+        .expect("start xagent thread")
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
     std::process::exit(code);
 }
 

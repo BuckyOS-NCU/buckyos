@@ -8,7 +8,7 @@
 
 - Rust workspace 位于 `src/Cargo.toml`，Cargo 命令在 `src/` 下执行；在仓库根目录执行时使用 `--manifest-path src/Cargo.toml`。
 - Python 开发脚本使用 `uv run`，依赖由根目录 `pyproject.toml` 管理，要求 Python 3.12+，通过 Git `main` 分支引入 `buckyos-devkit`。
-- 完整构建需要 Rust、当前平台的 C/C++ 构建工具、Node.js/npm、pnpm 和 Deno；运行容器应用需要 Docker。环境准备入口见 `README_zhCN.md` 和 `devenv.py`。
+- 完整构建需要 Rust、当前平台的 C/C++ 构建工具、CMake（aiworkspace 的 libopus 从源码编译）、Node.js/npm、pnpm 和 Deno；运行容器应用需要 Docker。环境准备入口见 `README_zhCN.md` 和 `devenv.py`。
 - `src/buckyos-build.py` 是仓库构建入口：先准备 SDK/CLI 分发包，再调用 devkit 的 `buckyos-build`。直接运行 devkit 命令会绕过这一步。
 - 同级 `buckyos-websdk` 仓库存在时从源码构建 SDK/CLI；不存在时使用 npm 发布的 `buckyos@latest`。本地源码构建失败会中止，不回退到发布包。可通过 `BUCKYOS_SDK_TOOL_SOURCE` 指定源码位置、`BUCKYOS_SDK_TOOL_DENO` 指定 Deno。
 - `--skip-web` 和 `-s` 构建也会准备 SDK/CLI。使用预构建分发包时，`BUCKYOS_SDK_TOOL_ARTIFACT`、`BUCKYOS_SDK_TOOL_RELEASE_MANIFEST`、`BUCKYOS_SDK_TOOL_DENO`、`BUCKYOS_SDK_TOOL_SBOM` 四项必须齐全；单独设置 Deno 路径不会进入预构建模式。具体判断以 `src/buckyos-build.py` 为准。
@@ -30,7 +30,7 @@ uv run buckyos-build.py --skip-web
 uv run start.py
 # 只重启，跳过安装文件更新
 uv run start.py --skip-update
-# 全新安装，生成 dev 配置并启动（devtest / test.buckyos.io）
+# 全新安装，生成 dev 配置并启动（devtest / test.buckyos.io）,非linux开发环境要加 --edition lite
 uv run start.py --all
 # 同上，并删除 data/ 与 storage/（用户文件、服务库、named store），得到空 Zone
 uv run start.py --all --wipe-data
@@ -81,7 +81,7 @@ uv run src/start.py --skip-update
 
 node-daemon 从不拉取 paios 镜像。开发安装（没有 `$BUCKYOS_ROOT/bin/paios-images/paios_images.json`）直接使用本地的 `<repo>:latest-<arch>`，缺失时 deploy 报错；`uv run build.py` 会预拉取 `paios/aios`、`paios/exttool` 的 `latest-<arch>`（被 `devenv.json` 覆盖的除外），`start.py` 启动后发现缺镜像会打印 `docker pull` 命令。更新到新的 `latest` 用 `docker pull`；镜像变化后重启或等下一次状态检查，Worker 容器会按新镜像重建。正式安装包带清单和镜像 tar，锁定到配套镜像（见 `doc/app_service/rust_app_loader.md` §9.1.1）。
 
-扩展工具包（`ffmpeg`、`pandoc`、`python3` 这一层）不在工作镜像里，来自节点的 `$BUCKYOS_ROOT/tools`（Linux 上 Docker 卷 `buckyos-tools` 就是这个目录，容器只读挂到 `/opt/buckyos/tools`），由 node_daemon 的 reconciler 按 Zone 的期望状态安装（`buckyos ext-tools`、Desktop “设置 > 扩展工具”）。首次安装从 `$BUCKYOS_ROOT/bin/ext-tools/` 的种子解包。开发环境里种子由 `src/tools/prepare_ext_tools.py` 准备到 `src/rootfs/bin/ext-tools/`（`buckyos-build.py`、`start.py --all` 会调用，已有就不重下；发布构建设 `BUCKYOS_EXT_TOOLS_SKIP=1` 跳过，payload 只带 CI 写入的钉版清单）。修改 `ext-core` 本身时：`publish/exttool/ext-core/build.sh --platform linux-x86_64`（macOS 的 payload 只能在 Mac 上构建），`uv run src/tools/prepare_ext_tools.py --local <payload 目录>`，删除 `$BUCKYOS_ROOT/tools/installs/ext-core.json` 后重启即重新播种。
+扩展工具包（`ffmpeg`、`pandoc`、`python3` 这一层）不在工作镜像里，来自节点的 `$BUCKYOS_ROOT/tools`（Linux 上 Docker 卷 `buckyos-tools` 就是这个目录，容器只读挂到 `/opt/buckyos/tools`），由 node_daemon 的 reconciler 按 Zone 的期望状态安装（`buckyos ext-tools`、Desktop “设置 > 扩展工具”）。首次安装从 `$BUCKYOS_ROOT/bin/ext-tools/` 的种子解包。开发环境里种子由 `src/tools/prepare_ext_tools.py` 准备到 `src/rootfs/bin/ext-tools/`（`buckyos-build.py`、`start.py --all` 会调用，已有就不重下；发布构建设 `BUCKYOS_EXT_TOOLS_SKIP=1` 跳过，payload 只带 CI 写入的钉版清单）。修改 `ext-core` 本身时：`publish/exttool/ext-core/build.sh --platform linux-x86_64`（macOS 的 payload 只能在 Mac 上构建），`uv run src/tools/prepare_ext_tools.py --local <payload 目录>`，删除 `$BUCKYOS_ROOT/tools/installs/ext-core.json` 后重启即重新播种。包里声明的在线项（清单的 `online`：`ext-core` 的 Chromium，`ext-fonts` 的各个字体族，后者 `auto: false`，只在管理员要时下载）不在 payload 和种子里：包装好以后节点自己从上游下载一次到 `$BUCKYOS_ROOT/tools/online/<item>/`，状态在旁边的 `<item>.json`；失败不自动重试，手工触发用 `buckyos ext-tools download ext-core <item>` 或 Desktop “设置 > 扩展工具”，开发时也可以删掉 `tools/online/<item>.json` 等下一轮（约 15 秒）重新自动下载（机制见 `doc/app_service/paios容器需求.md` §6.4 “在线项”）。
 
 修改 ExtTool 种子镜像（预热的 uv / deno 缓存）时，使用 `./build_exttool --image local/exttool-test --arch amd64`（ARM64 使用 `aarch64`），并在运行时 `devenv.json` 设置 `exttool`。卷只在新建时从种子镜像填充一次，要换内容就在确认无容器使用后 `docker volume rm buckyos-tools` 再启动。
 
@@ -181,10 +181,10 @@ WebUI 在各自目录运行 `pnpm install`、`pnpm build`。Desktop 和 OpenDAN 
 
 ## cmd_skills 联动维护
 
-cmd_skills 是 Agent 完成一类事的命令手册（加可选命令），是对应功能的交付物，不是一次性文档。机制与写法见 [OpenDAN Agent 开发指南](doc/sdk/OpenDAN_Agent_Dev_Guide.md) §2.3–2.4。
+skill 是 Agent 完成一类事的手册，是对应功能的交付物，不是一次性文档：work skill（`cmd_skills/`，一类事的命令手册；`scope` 含 `ui` 的是对话用的 ui skill）、plan skill（`plan_skills/`，拆解、排序、验收一类目标的方法，不写命令）、goal skill（`goal_skills/`）。机制与写法见 [OpenDAN Agent 开发指南](doc/sdk/OpenDAN_Agent_Dev_Guide.md) §2.3–2.4，编写与发行见 [skill 开发快速上手](doc/sdk/skill-dev-quickstart.md)。
 
-- **位置**：内置手册源码在 `src/apps/jarvis_agent/agent/cmd_skills/<name>.md`（随 Jarvis 的 `agent` 子包分发）；front matter 的 `name` / `description` / `requires` 是发现索引，由 `agent-session skill list`（`src/frame/lib_opendan/src/skills.rs`）输出。选择说明在 Jarvis 的 `behaviors/{analyze_intent,goal,plan}.toml`，UI 默认手册在 `agent.toml` 的 `default_cmd_skills`；冻结在 `src/frame/lib_opendan/src/state/behaviors.rs`，装配在 `runner/assembler.rs`（`## Commands`），命令 PATH 在 `runtime/mod.rs`（`tools/<skill>/bin`）。skill 包样例在 `test/skills_pikg_sample/`。
-- **工具实现原则**：访问 BuckyOS 的 Agent 工具优先用 TypeScript 基于 buckyos-websdk 编写，源码随 runtime 可读、Agent 可据此派生。人也会用的系统、App、发布命令放 websdk `cli/modules`（`buckyos` 命令唯一源码）；Agent 专用的配方类工具（AIGC、媒体合成）放 `src/tools/buckyos-agent`；某个 skill 自带的命令放 skill 包的 `tools/<skill>/bin`。xllm 等 runtime 层保留 Rust。
+- **位置**：内置手册源码在 `src/apps/jarvis_agent/agent/cmd_skills/<name>/SKILL.md` 与 `plan_skills/<name>/SKILL.md`（可带 `references/`，随 Jarvis 的 `agent` 子包分发）；front matter 的 `name` / `description` / `requires` / `commands` / `scope` / `baseline` / `platforms` 是发现索引，由 `agent-session skill list [--kind work|plan|goal] [--scope ui|work]`（`src/frame/lib_opendan/src/skills.rs`）输出。选择说明是 Jarvis 的 `behaviors/skill_select_rule.inc`，由 `analyze_intent` / `goal` / `plan_simple` 三个 behavior 包含；plan skill 由 `plan_simple.toml` 的分析步按需读取。UI 默认手册在 `agent.toml` 的 `default_cmd_skills`，owner 用 `buckyos skill ui` 改的集合记在 `.meta/skills_state.json`；安装、删除、禁用只有 owner 能做（Skills 页或 `buckyos skill`），Agent 侧只产出 `skills_drafts/<slug>/` 草稿（`behaviors/skill_import.toml` + 手册 `skill_authoring`，以及缺省关闭的 `behaviors/skill_crystallize.toml`）；冻结在 `src/frame/lib_opendan/src/state/behaviors.rs`，装配在 `runner/assembler.rs`（`## Commands`）。skill 是纯文本，只有 `SKILL.md` 与 `references/`：不带命令，也不带安装脚本，安装就是校验加复制；包里出现 `tools/` 或非文本文件会被拒绝。skill 包样例在 `test/skills_pikg_sample/`。
+- **工具实现原则**：访问 BuckyOS 的 Agent 工具优先用 TypeScript 基于 buckyos-websdk 编写，源码随 runtime 可读、Agent 可据此派生。人也会用的系统、App、发布命令放 websdk `cli/modules`（`buckyos` 命令唯一源码）；Agent 专用的配方类工具（AIGC、媒体合成）放 `src/tools/buckyos-agent`；skill 手册要用、标准层没有的命令做成扩展包（`app_type = ext_tools` 的 pikg），手册只在 `commands` 里写命令名。xllm 等 runtime 层保留 Rust。
 - **同一变更内检查手册**：修改用户可见的 CLI、API、配置、运行路径或发布流程时，按下表找出受影响的手册，在同一变更中更新手册与示例；判断不受影响时写明依据，不能只因代码编译通过就跳过。跨仓库（websdk、devkit、cyfs-gateway）的实现变化也要检查 BuckyOS 分发的手册。手册指向当前源码或命令 schema（`--help`、`buckyos command describe`），不复制会过期的接口说明。
 
 | 实现变更 | 检查的手册与验证 |
@@ -195,11 +195,12 @@ cmd_skills 是 Agent 完成一类事的命令手册（加可选命令），是�
 | xllm 参数、模型路由、工具开关、上下文/behavior 协议 | `xllm`：示例调用、结构化结果、上下文与执行边界 |
 | SDK/Tool、PIKG/AppDoc、devkit、Installer/Repo/BNS、系统/镜像发布 | `buckyos_dev_release`、`buckyos_app_dev` 及相关场景：构建、包验证、测试安装、发布回读 |
 | AIWorkspace schema/RPC、对象/资源、renderer、Wish/Block 执行器、模板格式、`proc.*` 执行器协议 | `aiworkspace_run`：领取 run、读快照、跑程序、交结果、心跳；`aiworkspace_template_dev`：新建、导出导入、引用、运行和发布 |
-| skill 安装 kRPC、PIKG 的 `agent_skills` 子包、AgentRoot 的 `cmd_skills/` / `goal_skills/` / `tools/` 布局 | `opendan_agent_dev` 及所有内置手册的打包位置：安装、列表、选择、删除 |
-| AgentRootFS、Loader、Session/Behavior、cmd_skill 冻结/装配、PATH/helper、模板和扩展分发 | `opendan_agent_dev`、`ui_core` 及受影响的专项手册：发现/选择/执行、冻结与升级 |
+| skill 的 kRPC（`skills.*`：安装计划与确认、删除、禁用、UI 集合、导入、草稿）、`buckyos skill` / `agent-session skill` 子命令、PIKG 的 `agent_skills` 子包、AgentRoot 的 `cmd_skills/` / `plan_skills/` / `goal_skills/`（`<name>/SKILL.md` + `references/`）/ `skills_drafts/` 布局、front matter 字段与 lint | `skill_authoring`、`opendan_agent_dev`、`ui_core`（owner 才能安装的说法与命令）、`behaviors/{skill_import,skill_crystallize,skill_select_rule.inc}`、`doc/sdk/skill-dev-quickstart.md`、`test/skills_pikg_sample/` 及所有内置手册的打包位置：owner 安装（含草稿）、列表、选择、禁用、删除 |
+| Agent 浏览器：Agent Service 的 `browser.*` kRPC 与写给会话的 `[browser …]` 记录、`agent-browser` 的子命令 / 输出 / 退出码、`reflow` 命令与重排库规则（`doc/opendan/protocol/Agent Browser Protocol.md`）、ext-core 里浏览器和 `playwright-core` 的版本 | `browser`（含 `references/reflow.md`）、`buckyos_app_dev` 的 Page tests、`ui_core` 里对 `[browser …]` 记录的说明：手册里的命令和脚本对着 `--help` 与真浏览器重跑（`publish/exttool/ext-core/browser/test/`），真实 Zone 的做法见 `test/agent_browser_dv/` |
+| AgentRootFS、Loader、Session/Behavior、手册冻结/装配（含 `scope`、plan 的 `<skill_candidates>`）、PATH/helper、模板和扩展分发 | `opendan_agent_dev`、`ui_core`、三份内置 plan skill 及受影响的专项手册：发现/选择/执行、冻结与升级 |
 
 - **完成条件**：提交说明列出受影响的 skills、修改或无需修改的依据、验证命令与结果、尚未实测的 provider / 平台。删除失效命令，不用兼容说明掩盖当前版本不可用；同步生成来源与分发产物，不能只改打包副本。
-- **回归**：手册纯文字改动核对路径、命令和链接；CLI、协议、runtime 或打包变更运行相关用例（`cargo test -p libopendan --test xagent_lib work_sessions_take`、`--test xagent_cli skills_are`、`cargo test -p opendan`）和最小场景。真实生成、发布等需要环境的测试如实标为未验证，不能用 mock 通过替代。
+- **回归**：手册纯文字改动核对路径、命令和链接；CLI、协议、runtime 或打包变更运行相关用例（`cargo test -p libopendan --lib skills`、`--test xagent_lib work_sessions_take`、`--test xagent_cli skills_are`、`cargo test -p opendan`；改内置 behavior 后至少确认每个 `behaviors/*.toml` 仍能解析）和最小场景。真实生成、发布等需要环境的测试如实标为未验证，不能用 mock 通过替代。
 
 ## 常用术语与领域知识
 

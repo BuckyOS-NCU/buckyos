@@ -14,6 +14,21 @@ interface ErrorShape {
 }
 
 const BY_CODE: Record<string, ErrorShape> = {
+  ARCHIVE_CORRUPT: {
+    messageKey: 'archive.corrupt',
+    fallback: 'The archive is damaged.',
+    retryable: false,
+  },
+  PASSWORD_REQUIRED: {
+    messageKey: 'archive.password.title',
+    fallback: 'Password required',
+    retryable: false,
+  },
+  PASSWORD_INVALID: {
+    messageKey: 'archive.password.invalid',
+    fallback: 'The password is not right.',
+    retryable: false,
+  },
   NOT_FOUND: {
     messageKey: 'filebrowser.error.notFound',
     fallback: 'This item no longer exists',
@@ -69,6 +84,11 @@ const BY_CODE: Record<string, ErrorShape> = {
     fallback: 'This operation is not supported by the server',
     retryable: false,
   },
+  SUDO_REQUIRED: {
+    messageKey: 'filebrowser.host.sudoRequired',
+    fallback: 'Unlock this computer to see its folders',
+    retryable: true,
+  },
   INVALID_ARGUMENT: {
     messageKey: 'filebrowser.error.invalidRequest',
     fallback: 'The server rejected this request',
@@ -79,6 +99,9 @@ const BY_CODE: Record<string, ErrorShape> = {
 /** Normalize any thrown value from the NFSP client stack into a UiError. */
 export function nfspToUiError(err: unknown): UiError {
   if (isUiErrorLike(err)) return err
+  if (err instanceof NfspError && err.details.reason === 'unauthenticated') {
+    return { code: 'UNAUTHENTICATED', messageKey: 'filebrowser.error.unauthenticated', fallback: 'Your session has ended — sign in again', retryable: true, details: { code: err.code } }
+  }
   const code = backendCodeOf(err)
   if (code !== null) {
     const shape = BY_CODE[code] ?? {

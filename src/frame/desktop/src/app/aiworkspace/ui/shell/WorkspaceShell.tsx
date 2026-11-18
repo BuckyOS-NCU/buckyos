@@ -17,27 +17,33 @@ import { BlockHost } from '../blocks/BlockHost'
 import { CanvasView, type CanvasFocus } from '../canvas/CanvasView'
 import { SurfaceDeleteDialog } from '../canvas/surfaceManage'
 import { surfacesOf } from '../canvas/surfaceOps'
-import { DataSourceView } from '../sources/DataSourceView'
-import { PermissionsPanel } from '../sources/PermissionsPanel'
+import { DataModeStage } from '../datamode/DataModeView'
+import { dataTabsOf, onDataEditorRequest, openDataEditor, PERMISSIONS_TAB } from '../datamode/tabs'
 import type { OfflineActions } from '../WorkspaceView'
 import type { Json } from '../../api/types'
 import { pathsOf } from '../../presentation/model'
 import { openShow, resumeShow } from '../../presentation/showSession'
 import { StartShowDialog } from '../../presentation/StartShowDialog'
 import { StageView, type ShowSession } from '../../presentation/StageView'
-import { ExportDialog, HelpDialog, ImportDialog, MockDialog, NewDialog } from './dialogs'
-import { MainToolbar } from './MainToolbar'
+import { ExportDialog, HelpDialog, ImportDialog, NewDialog } from './dialogs'
 import { ShareDialog } from './ShareDialog'
-import { LAYOUT_KEYS, PREF_KEYS, ShellContext, SOURCES_SIDE_TABS, usePhone, type DialogRequest, type GuideState, type LayoutPrefs, type ShellApi, type SideTab, type SizeClass, type TopMode } from './shellContext'
-import { SidePanel } from './SidePanel'
-import { StatusDetail, StatusDock } from './StatusSummary'
+import { LAYOUT_KEYS, PREF_KEYS, ShellContext, usePhone, type DialogRequest, type GuideState, type LayoutPrefs, type ShellApi, type SideTab, type SizeClass, type TopMode } from './shellContext'
 import { TableImportHost } from '../import/TableImportDialog'
 import { OfficeImportHost } from '../import/ImportOfficeDialog'
+import { BindDialogHost } from '../controls/data/BindDialogs'
+import { PermissionsHost } from '../permissions'
+import { FrameworkHost } from '../framework/FrameworkHost'
+import { expandStatus, personalZoneShown, resetPersonalLayout, setPersonalZone } from '../framework/personal'
+import { useUserPrefs } from '../../state/prefs'
+import { isDataControl } from '@controls/contract'
+import { ControlPage } from '../controls/data/ControlPage'
+import { onControlPage, requestRecordFocus } from '../controls/data/focus'
+import type { RecordTarget } from '../../links'
 
 export type { TopMode } from './shellContext'
 
 /** Where a link or an explicit open asked to land (UI improvement §4 rule 1). */
-export interface LaunchTarget { surfaceId?: string | null; blockId?: string | null }
+export interface LaunchTarget extends RecordTarget { surfaceId?: string | null; blockId?: string | null }
 
 /** Annotations in scope: under `parentId` or anchored to anything under it (plus the sources of Blocks there). */
 function useAnnotations(parentId: string | null, entities: EntityEnvelope[]): AnnotationMark[] {
@@ -94,11 +100,13 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
   const surfaces = useMemo(() => surfacesOf(store), [store, outlineVersion])
 
   // ---- top-level view and the active Surface (§4 rules 2–4: the remembered Surface, else the first readable one);
-  // a phone shows the canvas only (§16) and leaves the stored view alone
+  // a phone keeps its view in this window and leaves the stored one alone: the canvas first, the data mode when asked
+  // (UI 框架 PRD §5.6: the main menu's "数据模式", a canvas's "展开", data opened from a comment or a property)
   const phone = usePhone()
   const modeState = useUserState<TopMode>('mode')
-  const mode: TopMode = modeState === 'sources' && !phone ? 'sources' : 'canvas'
-  const setTopMode = useCallback((next: TopMode) => store.userState.set('mode', next), [store])
+  const [phoneMode, setPhoneMode] = useState<TopMode>('canvas')
+  const mode: TopMode = phone ? phoneMode : modeState === 'sources' ? 'sources' : 'canvas'
+  const setTopMode = useCallback((next: TopMode) => { if (phone) setPhoneMode(next === 'sources' ? 'sources' : 'canvas'); else store.userState.set('mode', next) }, [store, phone])
   const remembered = useUserState<string>('surface:active')
   const activeSurface = surfaces.find((s) => s.entity_id === remembered) ?? surfaces[0] ?? null
   const selectSurface = useCallback((surfaceId: string) => store.userState.set('surface:active', surfaceId), [store])
@@ -107,16 +115,26 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
   const sideState = useUserState<SideTab>('ui:side')
   const side = sideState ?? null
   const setSide = useCallback((tab: SideTab | null) => store.userState.set('ui:side', tab), [store])
-  const objectToolbar = useUserState<boolean>(PREF_KEYS.objectToolbar)
-  const viewToolbar = useUserState<boolean>(PREF_KEYS.viewToolbar)
+  // the tool zones' switches are the person's across Workspaces (UI 框架 PRD §4.6, §12); the grid is this Workspace's
+  const personal = useUserPrefs(client.transport)
   const grid = useUserState<boolean>(PREF_KEYS.grid)
-  const prefs: LayoutPrefs = { objectToolbar: objectToolbar ?? true, viewToolbar: viewToolbar ?? true, grid: grid ?? true }
-  const setPref = useCallback((key: keyof LayoutPrefs, value: boolean) => store.userState.set(PREF_KEYS[key], value), [store])
-  const resetLayout = useCallback(() => { for (const key of LAYOUT_KEYS) store.userState.set(key, null) }, [store])
+  const prefs: LayoutPrefs = { objectToolbar: personalZoneShown(personal, 'tools'), viewToolbar: personalZoneShown(personal, 'collab'), grid: grid ?? true }
+  const setPref = (key: keyof LayoutPrefs, value: boolean) => {
+    if (key === 'grid') store.userState.set(PREF_KEYS.grid, value)
+    else void setPersonalZone(personal, key === 'objectToolbar' ? 'tools' : 'collab', !value)
+  }
+  const resetLayout = () => { for (const key of LAYOUT_KEYS) store.userState.set(key, null); void resetPersonalLayout(personal) }
 
   const [selected, setSelected] = useState<string | null>(null)
   // a link's target is the first focus request (the Surface becomes active below, once the outline says it exists)
   const [focus, setFocus] = useState<CanvasFocus | null>(() => (target?.surfaceId ? { surfaceId: target.surfaceId, blockId: target.blockId ?? null, nonce: 1 } : null))
+  // a link to a record of a data control (G12): the control turns to it once it is drawn
+  useEffect(() => { if (target?.blockId && target.record) requestRecordFocus(target.blockId, target.record, target.occurrence) }, [target])
+  // a data control as its own page (G14): asked by the link (`page=control`), by a record link on a phone, or by its menu
+  const [pageChoice, setPageChoice] = useState<string | null | undefined>(undefined)
+  useEffect(() => onControlPage((id) => setPageChoice(id)), [])
+  const linkPage = target?.blockId && (target.page === 'control' || (phone && target.record && isDataControl(store.outline.get(target.blockId)?.kind))) ? target.blockId : null
+  const pageControl = pageChoice === undefined ? linkPage : pageChoice
   const [draft, setDraft] = useState<CapturedAnchor | null>(null)
   const [activeAnnotation, setActiveAnnotation] = useState<string | null>(null)
   const [dialog, setDialog] = useState<DialogRequest | null>(null)
@@ -184,15 +202,15 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
     }
   }, [loaded, target, surfaces, store, t])
 
-  // a new problem that needs a decision opens the save-state panel: problems stay visible (§10)
+  // a new problem that needs a decision opens the status panel (UI 框架 PRD §4.5): problems stay visible (§10)
   const edits = useEdits()
   let attention = 0
   for (const entry of edits.values()) if (entry.state === 'needs_attention') attention += 1
   const attentionSeen = useRef(0)
   useEffect(() => {
-    if (attention > attentionSeen.current) store.userState.set('ui:side', 'edits')
+    if (attention > attentionSeen.current) expandStatus(client.transport)
     attentionSeen.current = attention
-  }, [attention, store])
+  }, [attention, client])
 
   // ---- window size class of the application container (§11)
   const rootRef = useRef<HTMLDivElement>(null)
@@ -205,8 +223,8 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
     return () => observer.disconnect()
   }, [])
 
-  /** Show an entity: a Block focuses its Surface on the canvas; data opens in the data-source view (on a phone,
-   * which has no data-source view, a Block that shows the data — the one on the current canvas first). */
+  /** Show an entity: a Block focuses its Surface on the canvas; data opens its standard editor in a tab of its own in
+   * the data mode — on a phone too, full screen (UI 框架 PRD §5.3, §5.6). */
   const openEntity = useCallback((entityId: string) => {
     const entity = store.outline.get(entityId)
     if (!entity) return
@@ -216,20 +234,18 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
       if (!surfaceId) return
       setFocus({ surfaceId, blockId, nonce: Date.now() })
       store.userState.set('surface:active', surfaceId)
-      if (!phone) setTopMode('canvas')
+      setTopMode('canvas')
     }
     if (entity.type_id === 'buckyos.cell' || isCanvasContainer(entity)) { focusBlock(entityId); return }
-    if (entity.kind === 'surface') { setFocus({ surfaceId: entityId, blockId: null, nonce: Date.now() }); store.userState.set('surface:active', entityId); if (!phone) setTopMode('canvas'); return }
-    if (phone) {
-      const views = store.outline.all().filter((e) => e.type_id === 'buckyos.cell' && e.source_id === entityId && !e.deleted && surfaceOf(e.entity_id))
-      const view = views.find((e) => surfaceOf(e.entity_id) === store.userState.get('surface:active')) ?? views[0]
-      if (view) focusBlock(view.entity_id)
-      else store.notify('info', t('aiworkspace.shell.workspace.notOnCanvas', { name: entity.title ?? entity.name ?? entityId }))
-      return
-    }
-    setSelected(entityId)
+    if (entity.kind === 'surface') { setFocus({ surfaceId: entityId, blockId: null, nonce: Date.now() }); store.userState.set('surface:active', entityId); setTopMode('canvas'); return }
+    openDataEditor(entityId)
+  }, [store, setTopMode])
+  // "open this object's editor in the data mode" from anywhere (openDataEditor: the canvas's "查看数据", a phone's "展开",
+  // "成员与权限…"): the data mode, with the object's tab current
+  useEffect(() => onDataEditorRequest(({ entityId, ...options }) => {
+    dataTabsOf(store).open(entityId, options)
     setTopMode('sources')
-  }, [store, setTopMode, phone, t])
+  }), [store, setTopMode])
   const annotate = useCallback((anchor: CapturedAnchor) => {
     setDraft(anchor)
     if (store.userState.get('mode') !== 'sources') store.userState.set('ui:side', 'annotations')
@@ -264,7 +280,7 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
 
   const shell: ShellApi = {
     client, close: onClose, openWorkspace: onOpenWorkspace, offline, topMode: showSession ? 'show' : mode, setTopMode, surfaces, activeSurface, selectSurface,
-    side, setSide, openDialog: setDialog, prefs, setPref, resetLayout, size, phone, devTools, identity, logout: onLogout, login: onLogin, home: onHome,
+    side, setSide, openDialog: setDialog, openPermissions: () => openDataEditor(PERMISSIONS_TAB), prefs, setPref, resetLayout, size, phone, devTools, identity, logout: onLogout, login: onLogin, home: onHome,
     runOffline, offlineBusy, offlineError, clearOfflineError: () => setOfflineError(null),
     startShow: (request) => setStartRequest({ pathId: request?.pathId ?? null, stepId: request?.stepId ?? null }),
     guide, setGuide,
@@ -273,7 +289,8 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
   // Ctrl/Cmd+Z goes to the UndoCoordinator: exactly one step per key press (design §2.7)
   useEffect(() => {
     let active = true
-    const onPointer = (event: PointerEvent) => { active = Boolean(rootRef.current?.contains(event.target as Node)) }
+    // dialogs and sheets of this workspace are mounted beside it in the app's root: a pointer there keeps the keys here
+    const onPointer = (event: PointerEvent) => { const target = event.target as Node; active = Boolean(rootRef.current?.contains(target) || rootRef.current?.closest('.aiws-root')?.contains(target)) }
     const onKey = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.altKey || event.defaultPrevented || event.isComposing) return
       // the stage of a show never undoes the workspace's edits
@@ -304,17 +321,8 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
           <WorkspaceUiContext.Provider value={ui}>
             <div className="aiws-stage">
               {showSession ? <StageView session={showSession} client={client} onExit={endShow} /> : mode === 'sources' ? (
-                <div className="aiws-sources-stage">
-                  <div className="aiws-sources-bar"><MainToolbar canvas={null} /></div>
-                  <div className="aiws-sources-row">
-                    <div className="aiws-sources-work">
-                      <DataSourceView selected={selected} onSelect={setSelected} />
-                      <StatusDock />
-                    </div>
-                    <SidePanel tabs={SOURCES_SIDE_TABS} render={(tab) => (tab === 'collab' ? <PermissionsPanel /> : <StatusDetail />)} />
-                  </div>
-                </div>
-              ) : <CanvasView focus={focus} />}
+                <DataModeStage onActive={setSelected} />
+              ) : pageControl && store.outline.get(pageControl) ? <ControlPage containerId={pageControl} onBack={() => setPageChoice(null)} /> : <CanvasView focus={focus} />}
             </div>
             {startRequest && !showSession && (
               <StartShowDialog initialPathId={startRequest.pathId} initialStepId={startRequest.stepId} onClose={() => setStartRequest(null)} transport={client.transport}
@@ -325,17 +333,19 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
                   setShowSession(session)
                 }} />
             )}
-            {dialog?.kind === 'new' && <NewDialog client={client} store={store} initialTab={dialog.tab} onClose={() => setDialog(null)} onCreatedSurface={(id) => { selectSurface(id); setTopMode('canvas') }} onOpenWorkspace={onOpenWorkspace} />}
+            {dialog?.kind === 'new' && <NewDialog client={client} store={store} initialTab={dialog.tab} folderId={dialog.folderId} onClose={() => setDialog(null)} onCreatedSurface={(id) => { selectSurface(id); setTopMode('canvas') }} onOpenWorkspace={onOpenWorkspace} />}
             {dialog?.kind === 'share' && <ShareDialog onClose={() => setDialog(null)} />}
             {dialog?.kind === 'export' && <ExportDialog client={client} workspace={{ workspace_id: workspaceInfo.workspace_id, title: workspaceInfo.title }} onClose={() => setDialog(null)} />}
             {dialog?.kind === 'import' && <ImportDialog client={client} onClose={() => setDialog(null)} onOpenWorkspace={onOpenWorkspace} />}
             {dialog?.kind === 'help' && <HelpDialog onClose={() => setDialog(null)} />}
-            {dialog?.kind === 'mock' && <MockDialog onClose={() => setDialog(null)} />}
             {dialog?.kind === 'extensions' && <ExtensionsDialog initialDefId={dialog.defId} phone={phone} onClose={() => setDialog(null)} />}
             {dialog?.kind === 'save-template' && <SaveTemplateDialog initialSurfaceId={activeSurface?.entity_id ?? null} onClose={() => setDialog(null)} />}
             {dialog?.kind === 'delete-surface' && <SurfaceDeleteDialog key={dialog.surface.entity_id} surface={dialog.surface} onClose={() => setDialog(null)} onDeleted={(next) => { if (next) selectSurface(next) }} />}
             <TableImportHost />
             <OfficeImportHost />
+            <BindDialogHost />
+            <PermissionsHost />
+            <FrameworkHost />
           </WorkspaceUiContext.Provider>
         )}
       </ShellContext.Provider>

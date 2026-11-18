@@ -22,6 +22,7 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
         module = _load_build_script()
         with (
             patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_license_materials", return_value=0),
             patch.object(module, "_prepare_sdk_tool_distribution") as sdk,
             patch.object(module.subprocess, "run", return_value=module.subprocess.CompletedProcess([], 0)) as run,
         ):
@@ -40,6 +41,7 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
 
         with (
             patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_license_materials", return_value=0),
             patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
             patch.object(module, "_prepare_agent_tools", return_value=0) as agent_tools,
             patch.object(module, "_prepare_ext_tools", return_value=1),
@@ -60,6 +62,7 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
         module = _load_build_script()
         with (
             patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_license_materials", return_value=0),
             patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
             patch.object(module, "_prepare_agent_tools", return_value=0),
             patch.object(module, "_prepare_ext_tools", return_value=0),
@@ -206,6 +209,7 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
         module = _load_build_script()
         with (
             patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_license_materials", return_value=0),
             patch.object(module, "_prepare_sdk_tool_distribution", return_value=17),
             patch.object(module.subprocess, "run") as run,
         ):
@@ -253,6 +257,45 @@ class BuckyosBuildEntrypointTests(unittest.TestCase):
             run.assert_not_called()
             module._prepare_ext_tools({})
             run.assert_called_once()
+
+    def test_rebuilt_desktop_preserves_manually_maintained_inventory(self) -> None:
+        module = _load_build_script()
+        for args in ([], ["--select"], ["-s", "desktop"]):
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as temporary:
+                script = Path(temporary) / "src" / "buckyos-build.py"
+                desktop = script.parent / "frame" / "desktop"
+                index = desktop / "dist" / "index.html"
+                index.parent.mkdir(parents=True)
+                index.write_text("old", encoding="utf-8")
+                inventory = desktop / "public" / "open-source"
+                (inventory / "licenses").mkdir(parents=True)
+                reviewed = {
+                    "index.json": '{"packages": [], "notices": ["Reviewed catalog"]}',
+                    "licenses/a.json": '{"a": [{"name": "LICENSE", "text": "Reviewed text"}]}',
+                }
+                for name, content in reviewed.items():
+                    (inventory / name).write_text(content, encoding="utf-8")
+
+                def build(command, **kwargs):
+                    self.assertEqual(command, ["/runtime/buckyos-build", *args])
+                    index.write_text("fresh desktop", encoding="utf-8")
+                    return module.subprocess.CompletedProcess(command, 0)
+
+                with (
+                    patch.object(module, "__file__", str(script)),
+                    patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+                    patch.object(module, "_prepare_license_materials", return_value=0),
+                    patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
+                    patch.object(module, "_prepare_agent_tools", return_value=0),
+                    patch.object(module, "_prepare_ext_tools", return_value=0),
+                    patch.object(module.subprocess, "run", side_effect=build) as run,
+                    patch.object(module, "_assemble_macos_runtime", return_value=0) as assemble,
+                ):
+                    self.assertEqual(module.main(args), 0)
+                run.assert_called_once()
+                assemble.assert_called_once()
+                for name, content in reviewed.items():
+                    self.assertEqual((inventory / name).read_text(encoding="utf-8"), content)
 
 
 if __name__ == "__main__":

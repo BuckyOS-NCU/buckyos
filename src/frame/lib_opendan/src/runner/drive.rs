@@ -124,12 +124,11 @@ async fn drive_locked(
         return finished_result(&session);
     }
     let mut deps = deps.clone();
+    let mut workspace_error = None;
     if !session.state.is_finished() {
         match crate::runtime::verify_workspace(deps.agent.as_ref(), &session.config).await {
             Ok(()) => {}
-            Err(error @ OpenDanError::WorkspaceBindingInvalid(_)) => {
-                return fail_workspace(&mut session, &lease, deps.agent.as_ref(), &error).await;
-            }
+            Err(error @ OpenDanError::WorkspaceBindingInvalid(_)) => workspace_error = Some(error),
             Err(OpenDanError::Busy { holder, .. }) => return DriveResult::Busy { holder },
             Err(error) => {
                 return DriveResult::Error {
@@ -139,12 +138,14 @@ async fn drive_locked(
             }
         }
     }
-    match crate::runtime::session_runtime(sd, &session.config, &deps.runtime) {
-        Ok(r) => deps.runtime = r,
-        Err(e) => return DriveResult::BindFailed { error: e.to_json() },
+    if workspace_error.is_none() {
+        match crate::runtime::session_runtime(sd, &session.config, &deps.runtime) {
+            Ok(r) => deps.runtime = r,
+            Err(e) => return DriveResult::BindFailed { error: e.to_json() },
+        }
     }
     // A finished session that takes no more input gave its queue back.
-    let takes_input = session.state.takes_input();
+    let takes_input = workspace_error.is_none() && session.state.takes_input();
     let mut sources = if takes_input {
         match deps.inputs.open(&session.config).await {
             Ok(s) => s,
@@ -191,6 +192,16 @@ async fn drive_locked(
         external_stop_applied: AtomicBool::new(false),
         behavior_functions: Default::default(),
     });
+    if let Some(error) = workspace_error {
+        if let Err(e) = super::goal::load(&sh).await {
+            log::warn!("session {}: goal state not loaded: {e}", sd.sid());
+        }
+        let mut session = sh.session.lock().await;
+        let result = fail_workspace(&sh, &mut session, &error).await;
+        drop(session);
+        Box::pin(super::goal::flush(&sh)).await;
+        return result;
+    }
     super::live_tasks::register(sh.agent().agent_did(), sd.sid(), &sh);
     let r = Box::pin(drive_inner(&sh, until)).await;
     let failure = sh
@@ -201,8 +212,9 @@ async fn drive_locked(
     if let Some(message) = failure {
         let mut session = sh.session.lock().await;
         let error = OpenDanError::WorkspaceBindingInvalid(message);
-        let result = fail_workspace(&mut session, &sh.lease, sh.agent(), &error).await;
+        let result = fail_workspace(&sh, &mut session, &error).await;
         drop(session);
+        Box::pin(super::goal::flush(&sh)).await;
         release_sources(&sh).await;
         return result;
     }
@@ -218,7 +230,10 @@ async fn drive_locked(
         }
         Err(error @ OpenDanError::WorkspaceBindingInvalid(_)) => {
             let mut session = sh.session.lock().await;
-            fail_workspace(&mut session, &sh.lease, sh.agent(), &error).await
+            let result = fail_workspace(&sh, &mut session, &error).await;
+            drop(session);
+            Box::pin(super::goal::flush(&sh)).await;
+            result
         }
         Err(OpenDanError::Busy { holder, .. }) => DriveResult::Busy { holder },
         Err(OpenDanError::RunBusy { run_id }) => DriveResult::RunBusy { run_id },
@@ -249,12 +264,9 @@ async fn binding_error(error: &OpenDanError) -> Value {
     detail
 }
 
-async fn fail_workspace(
-    session: &mut Session,
-    lease: &Lease,
-    agent: &dyn crate::state::AgentStateClient,
-    error: &OpenDanError,
-) -> DriveResult {
+async fn fail_workspace(sh: &Shared, session: &mut Session, error: &OpenDanError) -> DriveResult {
+    let lease = &sh.lease;
+    let agent = sh.agent();
     let persist: Result<()> = async {
         session.reset_to_committed(lease)?;
         let mut unresolved_tasks: std::collections::BTreeSet<String> =
@@ -337,6 +349,7 @@ async fn fail_workspace(
                 at_ms: crate::now_ms(),
             });
         }
+        Box::pin(super::goal::fail_session(sh, session, &detail)).await?;
         session.append_worklog(lease, bodies)?;
         session.commit_state(lease)?;
         agent
@@ -600,6 +613,55 @@ pub(super) async fn ensure_frozen(sh: &Arc<Shared>, behavior: Option<&str>) -> R
             },
             command: "behavior_frozen".into(),
             detail: serde_json::json!({ "behaviors": added, "config_rev": rev }),
+        }],
+    )?;
+    commit_and_report(sh, &mut s).await
+}
+
+/// A conversation whose history was compacted since its prompt was frozen
+/// takes the agent's current prompt for the runs that follow: identity,
+/// behaviors and manuals are frozen again (`control_applied{prompt_refrozen}`).
+/// Work sessions keep what they were created with.
+async fn refresh_frozen(sh: &Arc<Shared>) -> Result<()> {
+    let (cfg, compacted_at) = {
+        let s = sh.session.lock().await;
+        (s.config.clone(), s.dir.summary_opt().ok().flatten().map(|m| m.updated_at_ms))
+    };
+    let (Some(frozen), Some(at)) = (&cfg.prompt.frozen, compacted_at) else {
+        return Ok(());
+    };
+    if cfg.session.kind != SessionKind::Ui || at <= frozen.frozen_at_ms {
+        return Ok(());
+    }
+    let mut next = match crate::state::refrozen(&cfg, sh.agent().behaviors(), sh.agent_root.as_deref(), &sh.deps.who).await {
+        Ok(next) => next,
+        Err(e) => {
+            log::warn!("session {}: prompt not refreshed: {e}", sh.dir.sid());
+            return Ok(());
+        }
+    };
+    let changed = next
+        .prompt
+        .frozen
+        .as_ref()
+        .map(|new| crate::state::frozen_changes(frozen, new))
+        .unwrap_or_default();
+    next.config_rev = cfg.config_rev;
+    let mut s = sh.session.lock().await;
+    s.config = next;
+    s.write_config(&sh.lease)?;
+    let rev = s.config.config_rev;
+    s.append_worklog(
+        &sh.lease,
+        vec![WorklogBody::ControlApplied {
+            input: InputRef {
+                src: "_runner".into(),
+                index: 0,
+                key: format!("prompt_refrozen@{rev}"),
+                kind: INPUT_TYPE_CONTROL.into(),
+            },
+            command: "prompt_refrozen".into(),
+            detail: serde_json::json!({ "changed": changed, "config_rev": rev }),
         }],
     )?;
     commit_and_report(sh, &mut s).await
@@ -1248,10 +1310,18 @@ impl StopMonitor {
 
     /// Stop watching; the task (and its hold on the drive's shared state,
     /// the lease included) is gone when this returns.
-    async fn finish(self) -> bool {
+    async fn finish(mut self) -> bool {
         self.task.abort();
-        let _ = self.task.await;
+        let _ = (&mut self.task).await;
         self.seen.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for StopMonitor {
+    /// A drive that is dropped (its host shutting down) takes its monitor
+    /// along: nothing keeps the lease after it.
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -1328,6 +1398,69 @@ async fn external_stop(sh: &Arc<Shared>) -> Result<()> {
     commit_and_report(sh, &mut s).await
 }
 
+/// Reason of the pause a host restart leaves on the sessions it interrupted.
+pub const INTERRUPTED_REASON: &str = "interrupted by a restart of the host";
+
+/// The host restarted: a session that was working is not advanced by
+/// itself. It is paused as interrupted — judged from its committed state,
+/// under its lease, before anything of it is recovered or inferred — and
+/// goes on with a `resume`.
+///
+/// Working: a Work that is not finished and does not wait for its user
+/// (one that waits for the work it started would tick and infer by
+/// itself); any other session in the middle of a Turn that does not wait
+/// for an answer.
+async fn mark_interrupted(sh: &Arc<Shared>, since_ms: u64) -> Result<Option<DriveResult>> {
+    let mut s = sh.session.lock().await;
+    let st = &s.state;
+    if st.is_finished() || st.paused.is_some() || st.stop_requested || s.config.session.created_at_ms > since_ms {
+        return Ok(None);
+    }
+    // A run kept after a retryable error infers again by itself.
+    let waits_for_user = st.run_state == RunState::Waiting && !st.follows_work() && st.retry.is_none();
+    let working = match s.config.session.kind {
+        SessionKind::Work => !waits_for_user,
+        _ => st.open_turn.is_some() && !waits_for_user,
+    };
+    if !working {
+        return Ok(None);
+    }
+    let in_run = st.live_run.is_some() && st.run_state != RunState::Waiting;
+    s.state.paused = Some(Paused {
+        source: PauseSource::Interrupted,
+        at_ms: crate::now_ms(),
+        reason: Some(INTERRUPTED_REASON.to_string()),
+        by: sh.deps.who.clone(),
+        in_run,
+    });
+    s.state.resume_run = false;
+    let rev = s.state.rev;
+    s.append_worklog(
+        &sh.lease,
+        vec![WorklogBody::ControlApplied {
+            input: InputRef {
+                src: "_runner".into(),
+                index: 0,
+                key: format!("pause@{rev}"),
+                kind: INPUT_TYPE_CONTROL.into(),
+            },
+            command: "pause".into(),
+            detail: serde_json::json!({
+                "reason": INTERRUPTED_REASON,
+                "from": sh.deps.who,
+                "source": "interrupted",
+                "applied": true,
+            }),
+        }],
+    )?;
+    commit_and_report(sh, &mut s).await?;
+    log::info!("session {}: was working when the host stopped; interrupted until resumed", sh.dir.sid());
+    Ok(Some(DriveResult::Idle {
+        rev: s.state.rev,
+        run_state: s.state.run_state,
+    }))
+}
+
 async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
     {
         let session = sh.session.lock().await;
@@ -1339,6 +1472,11 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
                 .is_some_and(|e| e["kind"] == "workspace_binding_invalid")
         {
             return Ok(finished_result(&session));
+        }
+    }
+    if let Some(since_ms) = sh.deps.recovering.as_ref().filter(|r| r.take()).map(|r| r.since_ms) {
+        if let Some(r) = mark_interrupted(sh, since_ms).await? {
+            return Ok(r);
         }
     }
     verify_workspace_admission(sh).await?;
@@ -1414,7 +1552,6 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
                 agent_root: sh.agent_root.clone(),
                 input_queue: s.config.channels.kmsg().map(|(_, q, _)| q.to_string()),
                 trace_id: s.sid().to_string(),
-                cmd_skills: crate::runtime::frozen_cmd_skills(&s.config),
                 workspace: s.config.workspace_binding.clone(),
                 extra_env: s
                     .config
@@ -1521,6 +1658,9 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
             Some(Gate::Paused(g)) => (Some(g.clone()), true),
             _ => (None, false),
         };
+        if goal_paused {
+            Box::pin(super::goal::stop_if_dormant(sh, false)).await?;
+        }
         if sh.session.lock().await.state.turn_stop_requested {
             let reason = "the activation was stopped".to_string();
             Box::pin(end_turn(sh, live.take(), &env, TurnStatus::Stopped, &reason))
@@ -1641,6 +1781,15 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
                 InputMode::Batch => sh.deps.options.input_batch_max.max(1),
             };
             picked = select_batch(candidates, take);
+            // A Goal's events wait at its gate (the hard interval, the
+            // budgets) before they open an Activation.
+            if is_goal && state.open_turn.is_none() && !picked.is_empty() {
+                if let Some(g) = &goal_def {
+                    if Box::pin(super::goal::hold_events(sh, g, &picked)).await? {
+                        picked.clear();
+                    }
+                }
+            }
         }
         let state = sh.session.lock().await.state.clone();
         // One controlled input per batch: `on_init` → `on_context_switch` →
@@ -1669,24 +1818,20 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
         // versions the input shows.
         let mut background: Option<(std::collections::BTreeMap<String, String>, Vec<EventReceipt>)> =
             None;
+        // The Memory observation after this batch (recall wiring TODO §3).
+        let mut memory_receipt = None;
         if triggered {
             let me = sh.agent().sessions().lookup(sh.dir.sid()).await?;
             let policy = &cfg.session.policy;
-            let hints = if sh.deps.options.load_hints
-                && policy.load_hints
-                && (!state.bootstrap_done || !picked.is_empty())
-            {
-                sh.agent()
-                    .cognition()
-                    .recall_hints(&crate::state::RecallQuery {
-                        tags: state.topic.tags.clone(),
-                        max_hints: 5,
-                    })
-                    .await
-                    .unwrap_or_default()
+            let now_ms = crate::now_ms();
+            // Forget, recall and observe before anything is decided on this
+            // batch (its first batch included).
+            let memory = if super::memory_batch::wanted(sh, &cfg, &state, !picked.is_empty()) {
+                Some(super::memory_batch::prepare(sh, &cfg, &state, &picked, now_ms).await)
             } else {
-                Vec::new()
+                None
             };
+            let hints = memory.as_ref().map(|m| m.texts()).unwrap_or_default();
             let active = if policy.observe == ObserveScope::EventsAndActive {
                 sh.agent()
                     .activity()
@@ -1696,7 +1841,6 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
             } else {
                 Vec::new()
             };
-            let now_ms = crate::now_ms();
             let items: Vec<InputItem> = picked
                 .iter()
                 .filter_map(|m| match &m.input {
@@ -1769,15 +1913,20 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
                     runtime_status: &material.runtime_status,
                     active: &material.active,
                     events: &views,
-                    hints: &material.hints,
                     tunnel: tunnel.as_deref(),
                 })
             } else {
                 super::background::event_lines(&views)
             };
             candidates.extend(super::observe::task_lines(sh, &state).await);
-            let (lines, mut map) =
+            // A Memory failure is said once while it lasts; the clues are
+            // deduplicated by the session's observation, not by this map.
+            candidates.extend(memory.as_ref().and_then(|m| m.error_line()));
+            let (mut lines, mut map) =
                 super::background::select(candidates, &state.background_shown, now_ms);
+            if let Some(m) = &memory {
+                lines.extend(m.lines.iter().cloned());
+            }
             material.background = lines;
             msg = sh
                 .deps
@@ -1794,6 +1943,7 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
                 );
                 shown.retain(|e| placed.contains(&format!("event:{}", e.key)));
                 background = Some((map, shown));
+                memory_receipt = memory.map(|m| super::memory_batch::settle(m, text, now_ms));
             }
             match &msg {
                 Some(text) => {
@@ -1966,7 +2116,10 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
             // running.
             Some(l) => restart_clock(sh, l)?,
             None if state.live_run.is_some() => Box::pin(open_state_live_run(sh, &env)).await?,
-            None => Box::pin(new_run_context(sh, &binding, &env)).await?,
+            None => {
+                refresh_frozen(sh).await?;
+                Box::pin(new_run_context(sh, &binding, &env)).await?
+            }
         };
         if state.resume_run {
             let mut s = sh.session.lock().await;
@@ -1981,6 +2134,7 @@ async fn drive_inner(sh: &Arc<Shared>, until: StopWhen) -> Result<DriveResult> {
                     hook,
                     picked: &picked,
                     background: background.take(),
+                    memory: memory_receipt.take(),
                     text,
                     media,
                     goal: goal_opening,

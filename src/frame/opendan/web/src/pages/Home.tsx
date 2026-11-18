@@ -1,9 +1,10 @@
-import { useMemo, useRef, useState } from 'react'
+import { useMemo, useState } from 'react'
 import clsx from 'clsx'
 import {
   Check,
   ChevronRight,
   Copy,
+  Globe,
   ImagePlus,
   MessageCircle,
   Minus,
@@ -22,18 +23,20 @@ import {
   type RegistryEntry,
   type UiBinding,
 } from '../model'
+import { pickFile } from '../pickFile'
+import { outerTarget, pauseLabel, topInterrupted } from '../runtimes'
+import { Dialog } from '../shell'
 import { ErrorBox } from '../ui'
 import { GoalList } from './Goals'
-import { RuntimeList, WorkspaceList } from './Workspaces'
+import { MemoryCard } from './Memory'
+import { RuntimeList } from './Runtimes'
+import { SkillsCard } from './Skills'
+import { WorkspaceList } from './Workspaces'
 
 const AVATAR_SIZE = 192
 const NAME_MAX = 64
 const BIO_MAX = 500
 const TOP_MODELS = 3
-
-// Inside the desktop's app window the page is framed: a link to MessageHub
-// leaves the frame.
-const outerTarget = window.top === window.self ? undefined : '_top'
 
 function Avatar({ profile, src, className }: { profile: AgentProfile; src?: string | null; className?: string }) {
   const image = src === undefined ? profile.avatar : src
@@ -71,9 +74,14 @@ function ProfileDialog({ profile, onClose }: { profile: AgentProfile; onClose: (
   const [avatar, setAvatar] = useState(profile.avatar)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>(null)
-  const file = useRef<HTMLInputElement>(null)
-
-  const pick = async (picked?: File) => {
+  const pick = async () => {
+    let picked: File | null
+    try {
+      picked = await pickFile([{ mime: 'image/*' }])
+    } catch (e) {
+      setError(e)
+      return
+    }
     if (!picked) return
     try {
       setAvatar(await toAvatar(picked))
@@ -122,8 +130,7 @@ function ProfileDialog({ profile, onClose }: { profile: AgentProfile; onClose: (
         <div className="mb-4 flex items-center gap-4">
           <Avatar profile={{ ...profile, display_name: name || profile.display_name }} src={avatar} className="h-20 w-20 text-3xl" />
           <div className="flex flex-col items-start gap-1">
-            <input ref={file} type="file" accept="image/*" className="hidden" aria-label={t('changePhoto')} onChange={(e) => void pick(e.target.files?.[0])} />
-            <button type="button" className="tap border border-line" onClick={() => file.current?.click()}>
+            <button type="button" className="tap border border-line" onClick={() => void pick()}>
               <ImagePlus size={16} />
               {t('changePhoto')}
             </button>
@@ -218,6 +225,21 @@ function AgentCard({ profile }: { profile: AgentProfile }) {
           </span>
           <ChevronRight size={18} className="shrink-0 text-mute" />
         </a>
+        {profile.desktop_url && (
+          <a
+            href={`${profile.desktop_url}/?agent_browser=${encodeURIComponent(profile.agent_did)}`}
+            target={outerTarget}
+            className="flex min-h-12 items-center gap-3 border-t border-line px-4"
+            data-testid="open-agent-browser"
+          >
+            <Globe size={18} className="shrink-0 text-mute" />
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-medium">{t('agentBrowser')}</span>
+              <span className="block truncate text-xs text-mute">{t('agentBrowserHint')}</span>
+            </span>
+            <ChevronRight size={18} className="shrink-0 text-mute" />
+          </a>
+        )}
       </div>
       {editing && <ProfileDialog profile={profile} onClose={() => setEditing(false)} />}
     </section>
@@ -228,10 +250,12 @@ function AgentCard({ profile }: { profile: AgentProfile }) {
 // someone starts it or answers it. The label follows the session's own state:
 // a finished session is done, whatever its acceptance.
 const isWorking = (e: RegistryEntry) =>
-  e.status.run_state === 'running' ||
-  e.status.run_state === 'ready' ||
-  Boolean(e.status.turn_open) ||
-  (e.status.run_state === 'waiting' && !e.status.needs_input)
+  e.status.run_state !== 'finished' &&
+  !e.status.paused &&
+  (e.status.run_state === 'running' ||
+    e.status.run_state === 'ready' ||
+    Boolean(e.status.turn_open) ||
+    (e.status.run_state === 'waiting' && !e.status.needs_input))
 const isWaiting = (e: RegistryEntry) => e.status.run_state !== 'finished' && !isWorking(e)
 const isFailed = (e: RegistryEntry) => e.status.run_state === 'finished' && e.status.outcome === 'failed'
 
@@ -241,6 +265,7 @@ const sessionStatus = (e: RegistryEntry): { key: TextKey; tone: string } => {
     if (e.status.outcome === 'stopped') return { key: 'stStopped', tone: 'text-mute' }
     return { key: 'stDone', tone: 'text-ok' }
   }
+  if (e.status.paused) return { key: pauseLabel[e.status.paused], tone: 'text-warn' }
   if (isWorking(e)) return { key: 'stRunning', tone: 'text-accent' }
   if (e.status.run_state === 'created') return { key: 'stCreated', tone: 'text-mute' }
   return { key: 'stWaitingInput', tone: 'text-mute' }
@@ -319,6 +344,61 @@ function Overview({ entries }: { entries?: RegistryEntry[] }) {
   )
 }
 
+// What stopping an interrupted session means follows its kind: a conversation or a Goal session only gives up the
+// Turn the restart cut short, a work ends.
+const stopScope = (e: RegistryEntry) => (e.kind === 'ui' || e.kind === 'goal' ? 'turn' : 'session')
+
+/** Sessions the host's restart cut short wait here until the owner resumes them. */
+function Interrupted({ entries, bindings, refresh }: { entries: RegistryEntry[]; bindings: Map<string, UiBinding>; refresh: () => Promise<unknown> }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<unknown>()
+  const [stopping, setStopping] = useState<RegistryEntry | null>(null)
+  const top = topInterrupted(entries)
+  const count = entries.filter((e) => e.status.paused === 'interrupted').length
+  if (!count) return null
+  const run = async (action: () => Promise<unknown>) => {
+    setBusy(true)
+    setError(undefined)
+    try {
+      await action()
+    } catch (cause) {
+      setError(cause)
+    } finally {
+      await refresh()
+      setBusy(false)
+    }
+  }
+  return (
+    <section className="card border-warn p-4" data-testid="interrupted" role="status">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="min-w-0 flex-1 text-sm font-semibold text-warn">{t('interruptedTitle', { n: count })}</h2>
+        <button className="tap bg-accent text-panel" disabled={busy} data-testid="resume-all"
+          onClick={() => void run(async () => { for (const e of top) await dataModel.resumeSession(e.session_id) })}>
+          {t('resumeAll')}
+        </button>
+      </div>
+      <p className="mt-1 text-xs text-mute">{t('interruptedHint')}</p>
+      <ErrorBox error={error} />
+      <ul className="mt-1 divide-y divide-line">
+        {top.map((e) => (
+          <li key={e.session_id} className="flex items-center gap-2 py-1" data-testid={`interrupted-${e.session_id}`}>
+            <a href={sessionHref(e.session_id)} className="flex min-h-11 min-w-0 flex-1 items-center truncate text-sm">{sessionTitle(e, bindings.get(e.session_id))}</a>
+            <button className="tap border border-line px-3 text-xs" disabled={busy} onClick={() => void run(() => dataModel.resumeSession(e.session_id))}>{t('resume')}</button>
+            <button className="tap border border-line px-3 text-xs text-bad" disabled={busy} onClick={() => setStopping(e)}>{t('stop')}</button>
+          </li>
+        ))}
+      </ul>
+      {stopping && (
+        <Dialog title={t('stopInterruptedTitle')} busy={busy} danger label={t('stop')} testId="interrupted-stop" onClose={() => setStopping(null)}
+          onSubmit={() => void run(() => dataModel.stopSession(stopping.session_id, stopScope(stopping))).then(() => setStopping(null))}>
+          <p className="my-3 break-words text-sm">{sessionTitle(stopping, bindings.get(stopping.session_id))}</p>
+          <p className="mb-4 text-sm text-mute">{t(stopScope(stopping) === 'turn' ? 'stopInterruptedTurnHint' : 'stopInterruptedWorkHint')}</p>
+        </Dialog>
+      )}
+    </section>
+  )
+}
+
 interface Tree {
   roots: RegistryEntry[]
   children: Map<string, RegistryEntry[]>
@@ -339,7 +419,6 @@ const toTree = (entries: RegistryEntry[]): Tree => {
 
 const KIND_LABEL: Partial<Record<RegistryEntry['kind'], TextKey>> = {
   work: 'kindWork',
-  self_check: 'kindSelfCheck',
   goal: 'kindGoal',
 }
 
@@ -419,9 +498,13 @@ function SessionRow({
   )
 }
 
-function SessionList({ entries, profile, loading }: { entries?: RegistryEntry[]; profile: AgentProfile; loading: boolean }) {
-  const bindingList = useQuery(['ui.bindings'], () => dataModel.uiBindings())
-  const bindings = useMemo(() => new Map((bindingList.data ?? []).map((b) => [b.session_id, b])), [bindingList.data])
+function SessionList({ entries, profile, loading, bindings, bindingError }: {
+  entries?: RegistryEntry[]
+  profile: AgentProfile
+  loading: boolean
+  bindings: Map<string, UiBinding>
+  bindingError?: unknown
+}) {
   const tree = useMemo(() => toTree(entries ?? []), [entries])
   const [open, setOpen] = useState<Set<string>>(new Set())
   const toggle = (sid: string) =>
@@ -452,7 +535,7 @@ function SessionList({ entries, profile, loading }: { entries?: RegistryEntry[];
         <MessageCircle size={18} />
         {t('openDefault')}
       </a>
-      <ErrorBox error={bindingList.error} />
+      <ErrorBox error={bindingError} />
       {tree.roots.length ? (
         <ul className="-mx-2 divide-y divide-line">
           {tree.roots.map((e) => (
@@ -469,19 +552,26 @@ function SessionList({ entries, profile, loading }: { entries?: RegistryEntry[];
 export default function HomePage() {
   const profile = useQuery(['agent.profile'], () => dataModel.profile())
   const sessions = useQuery(['sessions.query'], () => dataModel.sessions())
+  const bindingList = useQuery(['ui.bindings'], () => dataModel.uiBindings())
+  const bindings = useMemo(() => new Map((bindingList.data ?? []).map((b) => [b.session_id, b])), [bindingList.data])
   return (
     <div className="home mx-auto max-w-5xl">
       <ErrorBox error={profile.error ?? sessions.error} />
       {profile.data ? (
-        <div className="grid grid-cols-[minmax(0,1fr)] items-start gap-3 lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
-          <div className="grid grid-cols-[minmax(0,1fr)] gap-3">
-            <AgentCard profile={profile.data} />
-            <Overview entries={sessions.data} />
-            <GoalList />
-            <WorkspaceList entries={sessions.data} />
-            <RuntimeList />
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-3">
+          <Interrupted entries={sessions.data ?? []} bindings={bindings} refresh={() => sessions.mutate()} />
+          <div className="grid grid-cols-[minmax(0,1fr)] items-start gap-3 lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]">
+            <div className="grid grid-cols-[minmax(0,1fr)] gap-3">
+              <AgentCard profile={profile.data} />
+              <Overview entries={sessions.data} />
+              <MemoryCard />
+              <GoalList />
+              <SkillsCard />
+              <WorkspaceList entries={sessions.data} />
+              <RuntimeList />
+            </div>
+            <SessionList entries={sessions.data} profile={profile.data} loading={sessions.isLoading} bindings={bindings} bindingError={bindingList.error} />
           </div>
-          <SessionList entries={sessions.data} profile={profile.data} loading={sessions.isLoading} />
         </div>
       ) : (
         !profile.error && <p className="py-10 text-center text-sm text-mute">{t('loading')}</p>

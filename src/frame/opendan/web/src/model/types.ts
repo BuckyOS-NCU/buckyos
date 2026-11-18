@@ -1,10 +1,13 @@
-export type SessionKind = 'ui' | 'work' | 'self_check' | 'goal'
+export type SessionKind = 'ui' | 'work' | 'goal'
 export type RunState = 'created' | 'ready' | 'running' | 'waiting' | 'finished'
 export type Outcome = 'succeeded' | 'failed' | 'stopped'
 export type Acceptance = 'n/a' | 'pending' | 'accepted' | 'discarded'
 export type TurnStatus = 'completed' | 'failed' | 'budget_exhausted' | 'stopped'
 export type OutboxStatus = 'pending' | 'sent' | 'failed'
 export type Decision = 'accept' | 'discard'
+/** `user`: the owner; `parent`: with its parent session; `interrupted`: the host restarted; `goal`: with its dormant Goal; `budget`: its Goal's budget ran out. */
+export type PauseSource = 'user' | 'parent' | 'interrupted' | 'goal' | 'budget'
+export type StopScope = 'turn' | 'session'
 
 export interface Touching {
   kind: string
@@ -30,8 +33,8 @@ export interface SessionStatus {
   /** Waiting, and only someone's input can move it. */
   needs_input?: boolean
   turn_open?: boolean
-  /** Paused (`control(pause)`): it infers no more until resumed. */
-  paused?: boolean
+  /** It infers no more until resumed; the value says what paused it. */
+  paused?: PauseSource
   /** Backing off after retryable errors: it infers again from then on (epoch ms). */
   retry_not_before_ms?: number
   activity: Activity
@@ -46,6 +49,8 @@ export interface Origin {
   reason_messages?: string[]
   report?: string
   created_by_call?: string
+  /** The Goal whose activation started this work. */
+  goal?: { goal_id: string; revision?: number; epoch?: number; activation_seq?: number; at_ms?: number }
 }
 
 export interface RegistryEntry {
@@ -67,6 +72,9 @@ export interface RegistryEntry {
   scope?: { objects?: string[]; paths?: string[] }
   status: SessionStatus
   unreachable?: boolean
+  /** The runtime an unfinished session is on, and why it cannot be used now. */
+  runtime_id?: string
+  runtime_unavailable?: string
   location_rev: number
 }
 
@@ -257,9 +265,8 @@ export interface WorkspaceBinding extends WorkspaceRef {
   location: WorkspaceLocation
 }
 
-/** A runtime the agent's sessions and workspaces may use (`state/runtimes/`, record version 4). */
+/** A runtime the agent's sessions and workspaces may use (`state/runtimes/`, record version 5). */
 export type ComputerAccess = 'none' | 'observe' | 'control'
-export type InstallGrant = 'none' | 'agent_bin' | 'system'
 
 /** How a runtime is reached: the record's only type tag. */
 export type RuntimeConnector =
@@ -289,6 +296,8 @@ export interface ExtCheck {
   status: 'ok' | 'partial' | 'none' | 'system'
   missing: string[]
   system: string[]
+  /** Commands that are there and wait for their online item to be downloaded; not missing. */
+  waiting?: string[]
 }
 
 /** The last check of a runtime's tools against its declaration: a hint, never the declaration. */
@@ -318,13 +327,11 @@ export interface RuntimeCaps {
   tools_check?: ToolsCheck | null
 }
 
-/** What this agent may do there: the node policy narrowed by the owner, with the daemon URL's term. */
+/** What this runtime allows: its own configuration, with the daemon URL's term. */
 export interface RuntimeGrant {
   ops: string[]
   roots: string[]
   computer: ComputerAccess
-  install: InstallGrant
-  workspace: boolean
   expires_at_ms?: number | null
 }
 
@@ -333,7 +340,6 @@ export interface RuntimeUsage {
   last_used_at_ms?: number | null
   last_session_id?: string | null
   workspaces: number
-  skill_commands: string[]
 }
 
 export interface KnownRuntime {
@@ -408,29 +414,32 @@ export interface RuntimeExtTools {
   packages: Record<string, { version: string; origin: 'seed' | 'desired'; commands: Record<string, string> }>
 }
 
-/** `AgentSettings.runtimes` as the owner chose them for this agent. */
 export type RuntimeBaseline = 'standard' | 'extended'
 
-/** The owner's grant beyond the node policy (`AgentRuntimeSettings.grant`). */
-export interface RuntimeGrantSetting {
-  install?: InstallGrant
-  workspace?: boolean | null
-  roots?: string[]
-  expires_at_ms?: number | null
-}
-
 export interface RuntimeSettings {
-  runtimes: Record<string, { enabled: boolean; computer: ComputerAccess; target: unknown; baseline?: RuntimeBaseline | null; grant?: RuntimeGrantSetting | null }>
+  runtimes: Record<string, { enabled: boolean; target: unknown }>
   default_runtime_id: string
+  /** The owner's choice; it stays while that runtime is switched off. */
+  configured_default_runtime_id: string | null
 }
 
 export interface RuntimeSettingPatch {
   runtime_id: string
   enabled?: boolean
-  computer?: ComputerAccess
-  baseline?: RuntimeBaseline | null
   default?: boolean
-  grant?: RuntimeGrantSetting | null
+}
+
+/** `runtimes.impact`: what switching a runtime off or removing it touches. */
+export interface RuntimeImpact {
+  runtime_id: string
+  owner_default: boolean
+  /** Sessions that started run on it and it is usable: it cannot be switched off or removed now. */
+  blocking: boolean
+  running_sessions: string[]
+  active_sessions: { session_id: string; kind: SessionKind; class: string; title: string; run_state: string }[]
+  pending_todos: { session_id: string; todo_id: string; title: string; status: string }[]
+  workspaces: { workspace_id: string; name: string; directory: string; lifecycle: string }[]
+  usage: RuntimeUsage
 }
 
 export interface ArtifactHead {
@@ -464,11 +473,25 @@ export interface IdentityText {
   i18n?: Record<string, string>
 }
 
+/** A Memory clue (`libopendan::memory::Hint`), as far as the page shows it. */
 export interface Hint {
+  layer: 'cognition' | 'perception' | 'clarification'
+  /** `item_x@3`, or `<sid>:<seq>` for a note not yet consolidated. */
+  reference: string
   id: string
-  time: string
-  sentence: string
-  kind: string
+  summary: string
+  kind?: string
+  state: string
+  observed_at?: string
+  session_id?: string
+}
+
+/** `cognition.query` (an active Memory query as one session). */
+export interface MemoryQueryResult {
+  status: 'not_triggered' | 'recalled' | 'unchanged'
+  cognitions: Hint[]
+  recent_perceptions: Hint[]
+  pending_in_scope: number
 }
 
 export interface ModuleStatus {
@@ -560,7 +583,7 @@ export type GoalLifecycle = 'achieve' | 'maintain'
 export type GoalStatus = 'active' | 'paused' | 'achieved' | 'archived'
 export type EpochStart = 'created' | 'reopened' | 'restarted'
 export type EpochEnd = 'archived' | 'achieved' | 'restarted'
-export type ActivationReasonKind = 'created' | 'scheduled' | 'child' | 'feedback' | 'manual' | 'reopened' | 'restarted' | 'event' | 'answer'
+export type ActivationReasonKind = 'created' | 'scheduled' | 'child' | 'feedback' | 'manual' | 'reopened' | 'restarted' | 'event' | 'answer' | 'guarantee'
 export type ActivationOutcome = 'completed' | 'failed' | 'budget_exhausted' | 'stopped' | 'needs_input'
 export type ActivationDecision = 'no_action' | 'acted' | 'created_work' | 'needs_info' | 'unknown'
 export type GoalQuestionStatus = 'open' | 'answered' | 'dismissed' | 'expired' | 'canceled'
@@ -592,6 +615,7 @@ export interface GoalSkill {
 export interface ActivationBudget {
   max_total_tokens?: number
   max_runs?: number
+  max_wall_secs?: number
 }
 
 export interface PeriodBudget {
@@ -606,10 +630,49 @@ export interface GoalBudget {
   period?: PeriodBudget
 }
 
+/** `state/goals/<id>/checks/<version>.ts`. */
+export interface GoalCheckScript {
+  version: number
+  sha256: string
+  /** `package:<path>` | `owner` | `ui_session:<sid>` | `goal_session:<sid>`. */
+  source: string
+  /** The package script a built-in Goal started from: what "restore" copies again. */
+  package?: string
+  updated_at_ms: number
+}
+
+/** The gates of a run opportunity: hard guarantee, hard interval, period budget (`GoalBudget`) and the check. */
 export interface GoalScheduleSpec {
+  /** Check timetable (at least 60). */
   every_secs?: number
+  cron?: string
+  /** IANA zone of `cron`. */
+  timezone?: string
+  /** Changed through `goals.set_check` only. */
+  check?: GoalCheckScript
+  /** Absent: the agent's default. */
   min_interval_secs?: number
+  /** Absent: the agent's default; 0: off. */
+  guarantee_secs?: number
   start_on_create?: boolean
+}
+
+export interface GoalRevise {
+  expected_revision: number
+  reason?: string
+  budget?: GoalBudget
+  schedule?: GoalScheduleSpec
+}
+
+/** A change of the check script and timetable (not a content revision). */
+export interface GoalCheckChange {
+  script?: string
+  restore_package?: boolean
+  clear_script?: boolean
+  every_secs?: number
+  cron?: string
+  timezone?: string
+  reason?: string
 }
 
 export interface GoalEpoch {
@@ -816,6 +879,23 @@ export interface MaintenanceState {
   last_error?: string
 }
 
+export type HoldReason = 'min_interval' | 'period_budget' | 'agent_budget'
+
+/** Events waiting for the gate right now. */
+export interface GoalHold {
+  reason: HoldReason
+  since_ms: number
+  until_ms?: number
+  checked_at_ms: number
+}
+
+/** Events the gate held in the current period. */
+export interface GoalHolds {
+  period_start_ms: number
+  min_interval: number
+  budget: number
+}
+
 export interface GoalState {
   schema: string
   goal_id: string
@@ -831,6 +911,10 @@ export interface GoalState {
   recent_works?: RecentWork[]
   current_skills?: GoalSkill[]
   usage: GoalUsage
+  /** Activations in a row that ended `no_action`. */
+  consecutive_no_action: number
+  holding?: GoalHold
+  holds: GoalHolds
   last_error?: unknown
   maintenance?: MaintenanceState
   updated_at_ms?: number
@@ -842,38 +926,38 @@ export interface PendingFire {
   missed: number
 }
 
-export interface MaintenancePending {
-  new?: number
-  due?: number
-  waiting?: number
-  retry_cleanup?: number
-  next_deadline?: string
-  oldest_at_ms?: number
+export type CheckOutcome = 'true' | 'false' | 'error'
+
+/** The last check the host ran. */
+export interface CheckRecord {
+  at_ms: number
+  outcome: CheckOutcome
+  reason?: string
+  script_version: number
+  elapsed_ms: number
+  /** Title of the notification the check had the host send. */
+  notified?: string
+  /** It ran while the gate held the goal's inferences (`min_interval | period_budget | agent_budget | guarantee`): a `true` was set aside. */
+  held?: string
 }
 
-/** `no_work | no_change | active | mechanical | paused | disabled | unknown | backoff | period_budget`. */
-export interface MaintenanceGate {
-  status: string
-  last_checked_slot?: number
-  last_baseline_slot?: number
-  last_checked_at_ms?: number
-  last_full_check_at_ms?: number
-  last_skip_reason?: string
-  last_inputs_digest?: string
-  pending?: MaintenancePending
-  due_reviews?: number
-  next_review_at?: string
-  unfinished_receipts?: number
-  last_run_at_ms?: number
-  last_run_slot?: number
-  backoff_until_ms?: number
-  backoff_level?: number
-  last_error?: string
+/** What the gate did in the current period. */
+export interface GateStats {
+  period_start_ms: number
+  skipped_min_interval: number
+  skipped_budget: number
+  checks_true: number
+  checks_false: number
+  checks_error: number
+  guarantees: number
+  /** Notifications the checks had the host send (no inference). */
+  notified: number
 }
 
 export interface SkippedFire {
   slot: number
   at_ms: number
+  /** `paused | not_active | min_interval | period_budget | agent_budget | check_false | check_error | guarantee`. */
   reason: string
 }
 
@@ -881,7 +965,8 @@ export interface GoalSchedule {
   schema: string
   goal_id: string
   backend: string
-  every_secs?: number
+  /** `every:<secs>` | `cron:<expr>@<zone>`. */
+  timetable?: string
   last_slot?: number
   pending?: PendingFire
   last_posted_key?: string
@@ -889,6 +974,215 @@ export interface GoalSchedule {
   start_posted_epoch?: number
   skipped?: SkippedFire[]
   last_error?: string
-  gate?: MaintenanceGate
+  last_check?: CheckRecord
+  /** Checks in a row that failed. */
+  check_errors: number
+  last_check_error?: string
+  check_state?: unknown
+  stats: GateStats
+  guarantee_posted_for_ms: number
+  /** A built-in Goal switched off in `agent.toml`: no session, no checks. */
+  switched_off: boolean
   updated_at_ms?: number
+}
+
+/** Skills (`libopendan::skills`, `protocol::SkillMeta`). */
+export type SkillKind = 'work' | 'plan' | 'goal'
+export type SkillOrigin = 'package' | 'installed' | 'imported' | 'local'
+
+export interface SkillDisabled {
+  at_ms: number
+  by: string
+  reason?: string
+}
+
+/** How often sessions were created with a manual. */
+export interface SkillUsage {
+  frozen: number
+  last_ms: number
+  recent_sessions?: string[]
+}
+
+export interface SkillInstallState {
+  risk?: { level: string; accepted_by: string; accepted_at_ms: number; plan_digest: string } | null
+}
+
+export interface SkillInstallRecord {
+  package: string
+  version: string
+  digest: string
+  pikg_digest?: string | null
+  installed_at_ms: number
+  installed_by: string
+  imported_from?: unknown
+}
+
+export interface SkillMeta {
+  kind: SkillKind
+  name: string
+  /** `ui` | `ui,work`; absent: work. */
+  scope?: string
+  description: string
+  requires?: string
+  origin: SkillOrigin
+  install?: SkillInstallRecord | null
+  baseline?: RuntimeBaseline
+  platforms?: string[]
+  commands?: string[]
+  /** Bytes of the manual's body. */
+  size: number
+  references?: string[]
+  enabled: boolean
+  disabled?: SkillDisabled | null
+  usage?: SkillUsage | null
+  install_state?: SkillInstallState | null
+}
+
+export interface SkillAudit {
+  at_ms: number
+  by: string
+  action: string
+  skill?: string
+  note?: string
+}
+
+/** `.meta/skills_state.json`. */
+export interface SkillsState {
+  disabled?: Record<string, SkillDisabled>
+  ui_cmd_skills?: string[] | null
+  /** By `<kind>:<name>`; `none`: work created without any manual. */
+  usage?: Record<string, SkillUsage>
+  install?: Record<string, SkillInstallState>
+  audit?: SkillAudit[]
+  /** The owner's switch of the skill crystallization Goal; absent: the agent package's default. */
+  crystallize?: boolean
+}
+
+/** The manuals every new conversation takes. */
+export interface UiSkills {
+  names: string[]
+  source: 'state' | 'template'
+  total_bytes: number
+  available?: string[]
+}
+
+export interface SkillCommandsStatus {
+  /** `ready_system`: complete, some from the owner's own installation. */
+  state: 'ready' | 'ready_system' | 'partial'
+  commands: Record<string, { present: boolean; provided_by?: string | null }>
+  recommended_packages?: { id: string; version: string; requires_chain?: string[]; provides: string[] }[]
+  no_package?: string[]
+  /** Commands whose package is installed while the online item they run is not downloaded to the node yet. */
+  waiting_online?: { package: string; item: string; commands: string[] }[]
+}
+
+/** One work skill on one runtime (`skills.status`). */
+export interface SkillRuntimeStatus {
+  name: string
+  scope?: string
+  enabled?: boolean
+  /** Switched off by the owner. */
+  off?: boolean
+  requires?: string
+  /** Why a session on this runtime does not take it. */
+  unmet?: string | null
+  commands: SkillCommandsStatus
+}
+
+export interface SkillsStatus {
+  runtime_id: string
+  skills: SkillRuntimeStatus[]
+}
+
+export interface SkillPackage {
+  package: string
+  version: string
+  pikg_digest?: string
+  files: Record<string, { content: string }>
+}
+
+/** What `skills.install_plan` / `skills.install` take: a package, or a draft on the AgentRoot. */
+export type SkillSource = { package: SkillPackage } | { draft: string }
+
+export interface SkillFinding {
+  code: string
+  level: 'error' | 'block' | 'high' | 'medium' | 'low'
+  where: string
+  note: string
+}
+
+export interface PlannedSkill extends SkillMeta {
+  /** Origin of the skill of the same name it would replace. */
+  replaces?: string | null
+}
+
+export interface InstallPlan {
+  package: string
+  version: string
+  digest: string
+  plan_digest: string
+  skills: PlannedSkill[]
+  risk: { level: 'low' | 'medium' | 'high'; findings: SkillFinding[] }
+  command_status?: { name: string; commands: string[]; status: SkillCommandsStatus }[]
+  /** The runtime the manuals' commands were checked on. */
+  checked_runtime_id?: string
+}
+
+export interface SkillDraft {
+  slug: string
+  /** `draft.json`: `imported_from`, how the text was split, what was verified, the risk text. */
+  draft: unknown
+  skills: SkillMeta[]
+  files: string[]
+  updated_at_ms: number
+  error?: string | null
+}
+
+export interface SkillImportRequest {
+  text: string
+  name?: string
+  scope?: string
+  source?: string
+}
+
+export type MemoryLayer = 'cognition' | 'perception'
+
+/** One line of the owner's view of Memory (`memory.list`, `memory.overview`). */
+export interface MemoryEntry {
+  layer: MemoryLayer
+  reference: string
+  summary: string
+  kind: string
+  /** Cognition: `active | disputed`. Perception: `pending | deferred | absorbed | duplicate | discarded`. */
+  state: string
+  at_ms: number
+  revised_at_ms?: number
+  /** A cognition: its current revision (what a delete expects). */
+  revision?: number
+  subjects: string[]
+  session_id?: string
+  deletable: boolean
+  /** A perception already consolidated: the cognitions that took it in. */
+  absorbed_into?: string[]
+  /** A perception whose body was cleaned. */
+  cleared?: boolean
+}
+
+export interface MemoryOverview {
+  cognitions: { current: number }
+  perceptions: { total: number; pending: number }
+  last_consolidation_at_ms: number | null
+  maintenance_goal_id: string | null
+  recent: { cognitions: MemoryEntry[]; perceptions: MemoryEntry[] }
+}
+
+export interface MemoryPage {
+  entries: MemoryEntry[]
+  next_cursor?: string | null
+}
+
+/** `memory.read`: the entry, its revision (cognition) and the record itself (a cognition with its sources). */
+export interface MemoryDetail {
+  /** What `memory.read` returns, shown as it is. */
+  detail: unknown
 }

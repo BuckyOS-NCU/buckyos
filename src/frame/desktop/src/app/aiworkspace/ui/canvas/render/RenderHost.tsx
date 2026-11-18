@@ -33,7 +33,8 @@
  *
  * Writing (手写笔 TODO D1, D2): with the pen or the eraser as the tool the canvas is a writing area. It takes every
  * press before Blocks, editors and handles do; a pen or the mouse writes or erases (ink/input.ts), touches follow the
- * writing rules of touch.ts, the camera stays put while a stroke runs, and the stroke is drawn on two screen-space
+ * writing rules of touch.ts — except on a phone that has seen no pen, where one finger writes and a second one turns the
+ * stroke into a pan and zoom (UI 框架 PRD §6.3, Q17) —, the camera stays put while a stroke runs, and the stroke is drawn on two screen-space
  * canvases above the content until its Block has drawn it (ink/paint.ts). Ink Blocks are drawn wherever they cross
  * the view (no mount budget, no placeholder) and hit where their line is, not anywhere in their box.
  *
@@ -73,12 +74,14 @@ import { groupAt, movedPlacement, relativeTo, topLevel, type Laid } from '../lay
 import { foldBook } from '../../controls/folds'
 import { nodeMeasurer } from '../../controls/measure'
 import { isFixedComposite } from '../../controls/composite/model'
-import { controlRegistry, type ControlChromeProps } from '../../controls/registry'
+import { controlRegistry, isBoxControl, type ControlChromeProps } from '../../controls/registry'
+import { ShellContext } from '../../shell/shellContext'
 import { Camera, intersects, type Rect } from './camera'
 import { SpatialIndex } from './spatialIndex'
 import { TouchGestures, type OneFingerDrag, type Point, type TouchActions } from './touch'
 import { inkBook } from '../../../ink/book'
 import { ERASER_PX, InkInput, type InkControl, type InkHost } from '../../../ink/input'
+import { penSeen } from '../../../ink/device'
 import { INK_VIEW, touches, widePoints, type InkStyle } from '../../../ink/model'
 import { InkCanvas } from '../../../ink/paint'
 
@@ -149,8 +152,9 @@ export interface RenderHostProps {
   /** The pointer tool (UI improvement §7.2): `hand` pans with the primary button and never selects; `connector` draws a line;
    * `pen` writes and `eraser` erases whole strokes (手写笔 TODO). */
   tool?: 'select' | 'hand' | 'connector' | 'pen' | 'eraser'
-  /** The pen's style and the touch lock while writing; `control` lets the view ask whether a stroke runs, and drop it. */
-  ink?: { style: InkStyle; touchLock: boolean; control: InkControl } | null
+  /** The pen's style and the touch lock while writing; `control` lets the view ask whether a stroke runs, and drop it;
+   * `fingers`: one finger writes (a phone until it has seen a pen). */
+  ink?: { style: InkStyle; touchLock: boolean; control: InkControl; fingers?: boolean } | null
   /** A one-shot placement: the pointer carries a preview of this size; a primary click places it. */
   placing?: { w: number; h: number; label: string } | null
   onPlace?: (world: { x: number; y: number }) => void
@@ -260,8 +264,10 @@ function scrollerWithin(target: Element | null, frame: HTMLElement | undefined):
   return null
 }
 
-/** Three culling levels with hysteresis (§9.3 rule 3): mounted near the viewport, hidden in the DOM further out, unmounted beyond. */
-function computeMounts(prev: Map<string, MountState>, camera: Camera, laid: Map<string, Laid>, index: SpatialIndex, pinned: Set<string>): Map<string, MountState> {
+/** Three culling levels with hysteresis (§9.3 rule 3): mounted near the viewport, hidden in the DOM further out, unmounted beyond.
+ * A printed page (`print`) mounts exactly what its page shows (`prefetch`), all of it at full detail. */
+function computeMounts(prev: Map<string, MountState>, camera: Camera, laid: Map<string, Laid>, index: SpatialIndex, pinned: Set<string>, print = false): Map<string, MountState> {
+  if (print) return new Map([...pinned].filter((id) => laid.has(id)).map((id) => [id, 'mounted' as const]))
   const free = (item: { id: string; line?: unknown }) => Boolean(item.line) || laid.get(item.id)?.entity.view_type === INK_VIEW
   const near = camera.visibleWorld(MOUNT_MARGIN)
   const far = camera.visibleWorld(HIDE_MARGIN)
@@ -321,6 +327,7 @@ export function RenderHost(props: RenderHostProps) {
   const [settled, setSettled] = useState(0)
   const pointerTypeRef = useRef('mouse')
   const pointer = usePointerType()
+  const shellPhone = useContext(ShellContext)?.phone ?? false
   const sizes = HANDLES[pointer]
   const [touch] = useState(() => new TouchGestures(camera))
   // ---- writing: the input, the live layer, the strokes being erased
@@ -332,6 +339,8 @@ export function RenderHost(props: RenderHostProps) {
     begin: () => undefined, draw: () => undefined, stroke: () => undefined, dropped: () => undefined, erase: () => undefined, eraseEnd: () => undefined,
   }))
   const [input] = useState(() => new InkInput(inkHost))
+  /** A finger writes (a phone that has seen no pen; the host object follows the props after every render). */
+  const fingerInk = () => Boolean(inkHost.fingers?.())
   const inkBaseRef = useRef<HTMLCanvasElement>(null)
   const inkTailRef = useRef<HTMLCanvasElement>(null)
   /** Strokes hidden by the eraser: until their deletion is back, or put back when it is refused or cancelled. */
@@ -399,7 +408,7 @@ export function RenderHost(props: RenderHostProps) {
     const observer = root ? new ResizeObserver(() => { camera.setViewportSize(root.clientWidth, root.clientHeight); setSettled((n) => n + 1); inkCanvas.redraw() }) : null
     if (root && observer) observer.observe(root)
     // a show's stage draws no overlay: a flight moves the transform only, React renders nothing per frame (第三期规划 §9.3)
-    const offChange = mode === 'show' ? () => undefined : camera.onChange(() => forceOverlay((n) => n + 1))
+    const offChange = mode === 'show' || mode === 'print' ? () => undefined : camera.onChange(() => forceOverlay((n) => n + 1))
     return () => { offChange(); observer?.disconnect(); camera.attach(null) }
   }, [camera, mode, inkCanvas])
 
@@ -412,14 +421,15 @@ export function RenderHost(props: RenderHostProps) {
     for (const id of prefetch ?? []) set.add(id)
     return set
   }, [selection, editing, hover, prefetch])
-  const [mounts, setMounts] = useState<Map<string, MountState>>(() => computeMounts(new Map(), camera, laid, index, pinned))
+  const print = mode === 'print'
+  const [mounts, setMounts] = useState<Map<string, MountState>>(() => computeMounts(new Map(), camera, laid, index, pinned, print))
   // the camera settling is an event: recompute from the listener (never inside an effect)
-  useEffect(() => camera.onSettle(() => { setSettled((n) => n + 1); setMounts((prev) => computeMounts(prev, camera, laid, index, pinned)) }), [camera, laid, index, pinned])
+  useEffect(() => camera.onSettle(() => { setSettled((n) => n + 1); setMounts((prev) => computeMounts(prev, camera, laid, index, pinned, print)) }), [camera, laid, index, pinned, print])
   // a new layout or a new pinned set recomputes during render (derived state)
   const [inputsSeen, setInputsSeen] = useState({ laid, index, pinned })
   if (inputsSeen.laid !== laid || inputsSeen.index !== index || inputsSeen.pinned !== pinned) {
     setInputsSeen({ laid, index, pinned })
-    setMounts((prev) => computeMounts(prev, camera, laid, index, pinned))
+    setMounts((prev) => computeMounts(prev, camera, laid, index, pinned, print))
     // erased strokes leave the hidden set once they left the layout
     if ([...erasing].some((id) => !laid.has(id))) setErasing(new Set([...erasing].filter((id) => laid.has(id))))
   }
@@ -848,7 +858,14 @@ export function RenderHost(props: RenderHostProps) {
     if (!inkOn) return
     event.stopPropagation()
     pointerTypeRef.current = event.pointerType
-    if (event.pointerType === 'touch') { event.preventDefault(); touch.down(event.nativeEvent); return }
+    if (event.pointerType === 'touch') {
+      event.preventDefault()
+      const first = touch.fingers() === 0
+      touch.down(event.nativeEvent)
+      // a phone without a pen: the first finger writes (a second one comes as navigation, `moving` drops the stroke)
+      if (first && fingerInk() && !props.gesturesPaused) input.down(event.nativeEvent)
+      return
+    }
     if (props.gesturesPaused) return
     // the middle button, or Space with the primary one, still pans
     if (event.pointerType === 'mouse' && (event.button === 1 || (event.button === 0 && spaceHeld.current))) { if (!dragRef.current && !input.busy()) beginPointer(event); return }
@@ -1257,7 +1274,7 @@ export function RenderHost(props: RenderHostProps) {
       // the camera stays put while a stroke runs (its points are where the pen was on the page)
       if (input.busy()) { event.preventDefault(); return }
       const target = event.target instanceof Element ? event.target : null
-      const scrollable = target?.closest<HTMLElement>('.aiws-table-scroll, .aiws-prose-host, textarea, .aiws-html-host')
+      const scrollable = target?.closest<HTMLElement>('.aiws-table-scroll, .aiws-prose-host, .aiws-wc-body, textarea, .aiws-html-host')
       const dx = event.shiftKey ? event.deltaY : event.deltaX
       const dy = event.shiftKey ? 0 : event.deltaY
       if (scrollable && !event.ctrlKey && !event.metaKey &&
@@ -1338,7 +1355,11 @@ export function RenderHost(props: RenderHostProps) {
       begin: beginTouch,
       delegateMove: (event) => trackPointer(event.clientX, event.clientY),
       delegateEnd: finishDrag,
-      moving: (on) => { setDragging(on); worldRef.current?.classList.toggle('is-moving', on) },
+      moving: (on) => {
+        // a second finger on a phone's writing: the stroke of the first is dropped, the two pan and zoom
+        if (on && input.busy() && input.byTouch()) input.cancel()
+        setDragging(on); worldRef.current?.classList.toggle('is-moving', on)
+      },
       tap: tapAt,
       doubleTap: doubleTapAt,
       twoFingerTap: (p) => camera.animateTo(camera.zoomedAt(p.x, p.y, 0.5)),
@@ -1399,7 +1420,8 @@ export function RenderHost(props: RenderHostProps) {
       capture: (pointerId: number) => { try { rootRef.current?.setPointerCapture(pointerId) } catch { /* the pointer is gone already */ } },
       release: (pointerId: number) => { try { if (rootRef.current?.hasPointerCapture(pointerId)) rootRef.current.releasePointerCapture(pointerId) } catch { /* released */ } },
       interrupt: () => {
-        touch.penDown()
+        // a finger's stroke leaves the touches to the gestures (a second finger navigates)
+        if (pointerTypeRef.current !== 'touch') touch.penDown()
         if (dragRef.current) finishDrag(true)
         stopEdgePan()
         camera.stopAnimation()
@@ -1422,9 +1444,10 @@ export function RenderHost(props: RenderHostProps) {
       dropped: () => inkCanvas.end(),
       erase: eraseAlong,
       eraseEnd: endErase,
+      fingers: () => Boolean(props.ink?.fingers) && !penSeen(),
     } satisfies InkHost)
     props.ink?.control.attach(input)
-    touch.setInk({ on: inkOn, locked: Boolean(props.ink?.touchLock), busy: () => input.busy() })
+    touch.setInk({ on: inkOn, locked: Boolean(props.ink?.touchLock) && !fingerInk(), busy: () => input.busy() && !input.byTouch() })
   })
   // another tool, another canvas or unmounting drops the stroke under way (saved strokes stay)
   useEffect(() => () => input.cancel(), [input, props.tool, props.surfaceId])
@@ -1478,7 +1501,7 @@ export function RenderHost(props: RenderHostProps) {
     rootRef.current?.setPointerCapture(event.pointerId)
     setDragging(true)
     shiftHeld.current = event.shiftKey
-    dragRef.current = { kind: 'resize', id, handle, startX: event.clientX, startY: event.clientY, start: { ...l.rect }, rotation: l.rotation, aspect: metaSink.get(id)?.aspect ?? 'free', current: { ...l.rect }, lines: [...(adjacency.get(id) ?? []), ...(l.backingId ? adjacency.get(l.backingId) ?? [] : [])], backing: l.backingId }
+    dragRef.current = { kind: 'resize', id, handle, startX: event.clientX, startY: event.clientY, start: { ...l.rect }, rotation: l.rotation, aspect: metaSink.get(id)?.aspect ?? controlRegistry.get(l.control?.kind)?.resize?.aspect ?? 'free', current: { ...l.rect }, lines: [...(adjacency.get(id) ?? []), ...(l.backingId ? adjacency.get(l.backingId) ?? [] : [])], backing: l.backingId }
     worldRef.current?.classList.add('is-moving')
   }
   const beginRotate = (event: ReactPointerEvent<Element>, id: string) => {
@@ -1516,9 +1539,21 @@ export function RenderHost(props: RenderHostProps) {
   const zoom = camera.settledZoom
   // lines depend on the zoom only through screen-sized details (1 px minimum width, markers): steps of 25 % re-render them
   const lineZoom = Math.pow(1.25, Math.round(Math.log(zoom) / Math.log(1.25)))
-  /** What a control draws under its Blocks (its edges). */
+  /** What a control draws under its Blocks (its edges); a data control's body (its projected records), which takes
+   * the pointer in view mode, or once the control is selected in edit mode (until then its frame moves it). */
   const chromeOf = (l: Laid): ReactNode => {
-    const Chrome = controlRegistry.get(l.control?.kind)?.Chrome
+    const def = controlRegistry.get(l.control?.kind)
+    if (def?.Body) {
+      const Body = def.Body
+      const id = l.entity.entity_id
+      const active = mode === 'view' || mode === 'show' || (selection.size === 1 && selection.has(id) && !dragging && !l.locked)
+      return (
+        <div className="aiws-data-body" data-active={active ? 'true' : undefined} data-testid={`aiws-data-body-${id}`}>
+          <Body containerId={id} mode={mode} active={active} size={{ w: l.rect.w, h: l.rect.h }} zoom={zoom} host="canvas" pointerType={pointer} phone={shellPhone} />
+        </div>
+      )
+    }
+    const Chrome = def?.Chrome
     if (!Chrome) return null
     return <Chrome container={l} laid={laid} mode={mode} zoom={zoom} preview={nodePreview?.control === l.entity.entity_id ? nodePreview.preview : null} />
   }
@@ -1591,8 +1626,9 @@ export function RenderHost(props: RenderHostProps) {
   const hoverLaid = hover && !selection.has(hover) ? laid.get(hover) : undefined
   const hoverShape = hoverLaid ? shapeFor(hoverLaid.entity.entity_id) : null
   const hoverMeta = hover ? metaSink.get(hover) : undefined
-  // a control is sized by its layout: no handles of its own
-  const single = selected.length === 1 && policy.layout && canLayout(selected[0].id) && !selected[0].locked && !selected[0].line && !laid.get(selected[0].id)?.control && editing !== selected[0].id && !dragging ? selected[0] : null
+  // a control is sized by its layout: no handles of its own (a data control is sized like a Block)
+  const singleControl = selected.length === 1 ? laid.get(selected[0].id)?.control : undefined
+  const single = selected.length === 1 && policy.layout && canLayout(selected[0].id) && !selected[0].locked && !selected[0].line && (!singleControl || isBoxControl(singleControl.kind)) && editing !== selected[0].id && !dragging ? selected[0] : null
   const singleLaid = single ? laid.get(single.id) : undefined
   const handles = single ? (['nw', 'ne', 'se', 'sw'] as const).map((h, i) => ({ h, ...corners(single.rect, single.rotation)[i] })) : []
   const edges = single ? (['n', 'e', 's', 'w'] as const).map((h, i) => {
@@ -1680,7 +1716,7 @@ export function RenderHost(props: RenderHostProps) {
   // fold handles of mind map nodes (脑图方案 §7.3): screen-sized, just past the side the branch grows from, outside the
   // resize zones; shown on the hovered and selected nodes and always on folded ones. Folding is the reader's own state:
   // every mode may fold (not a show's stage, not while writing or dragging).
-  const folds = mode === 'show' || inkOn || dragging || props.placing ? [] : [...laid.values()].flatMap((l) => {
+  const folds = mode === 'show' || mode === 'print' || inkOn || dragging || props.placing ? [] : [...laid.values()].flatMap((l) => {
     const n = l.node
     const id = l.entity.entity_id
     if (!n?.hasChildren || !(n.collapsed || hover === id || selection.has(id))) return []

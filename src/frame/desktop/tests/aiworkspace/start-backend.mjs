@@ -51,10 +51,12 @@ writeFileSync(bucketSpecs, JSON.stringify({
 }))
 const nfs = spawn(nfsBinary, ['--data-dir', join(root, 'nfs'), '--export', `home=${exported}`, '--named-store', store, '--bucket-specs', bucketSpecs, '--listen', `127.0.0.1:${process.env.AIWS_E2E_NDM_PORT}`, '--log-level', 'warn'], { stdio: 'inherit' })
 const auth = join(root, 'tokens.json')
-// a Limited account (restricted session) and an External DID stand for the hybrid SSO visitors (entries.spec.ts)
+// a Limited account (restricted session) and an External DID stand for the hybrid SSO visitors (entries.spec.ts); alice's
+// Agent is the MessageHub mock's own one, which "使用我的 Agent" hands a run to (wish.spec.ts)
 writeFileSync(auth, JSON.stringify({
   tokens: {
     'tok-alice': { principal: 'alice', auth_method: 'password' },
+    'tok-coder': { principal: 'did:buckyos:agent:codeassistant', class: 'agent', owner: 'alice', app_id: 'codeassistant.test.buckyos.io' },
     'tok-bob': { principal: 'bob', auth_method: 'password' },
     'tok-lim': { principal: 'acme-c1', restricted: true, auth_method: 'password' },
     'tok-ext': { principal: 'did:bns:carol', class: 'external', auth_method: 'did_federation' },
@@ -77,7 +79,11 @@ env.AIWS_VOICE_SEGMENT_MS ??= '1000'
 delete env.AIWS_FAILPOINT
 // workspace pages live on `aiws-<label>.localhost:<dev server port>` (T4-8): the dev server serves aiws.html there
 const publicBase = process.env.AIWS_E2E_PUBLIC_BASE ? ['--public-base', process.env.AIWS_E2E_PUBLIC_BASE] : []
-const child = spawn(binary, ['--data-dir', join(root, 'data'), '--listen', `127.0.0.1:${port}`, '--auth-file', auth, '--fixture-sources', '--wish-config', wishConfig, '--nfs-server', ndmBase, '--named-store-config', storeConfig, ...publicBase, '--log-level', 'warn'], { stdio: 'inherit', env })
+// the print renderer goes into print packages from the Desktop build (`print.package`): AIWS_E2E_WEB, else this
+// app's own dist when it holds one
+const webDir = process.env.AIWS_E2E_WEB ?? resolve(here, '../../dist')
+const web = existsSync(join(webDir, 'aiws-print', 'index.html')) ? ['--web', webDir] : []
+const child = spawn(binary, ['--data-dir', join(root, 'data'), '--listen', `127.0.0.1:${port}`, '--auth-file', auth, '--fixture-sources', '--wish-config', wishConfig, '--nfs-server', ndmBase, '--named-store-config', storeConfig, ...publicBase, ...web, '--log-level', 'warn'], { stdio: 'inherit', env })
 
 let stopping = false
 const stop = () => {

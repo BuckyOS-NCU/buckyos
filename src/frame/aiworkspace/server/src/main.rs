@@ -3,7 +3,7 @@
 //! Standalone (independent testing):
 //!
 //!   aiworkspace --data-dir ./aiws-data --listen 127.0.0.1:4120 \
-//!               --auth-file tokens.json [--fixture-sources] [--log-level info] \
+//!               --auth-file tokens.json [--fixture-sources] [--log-level info] [--zone-root dir] [--agent-gateway url] \
 //!               [--nfs-server http://127.0.0.1:3290 --named-store-config store.json]
 //!
 //!   tokens.json: { "tokens": { "<token>": { "principal": "alice" } } }
@@ -48,12 +48,14 @@ fn main() {
         .arg(Arg::new("nfs-server").long("nfs-server").requires("named-store-config").requires("data-dir").help("Standalone: the nfs-server origin holding the buckets and the NDM gateway"))
         .arg(Arg::new("named-store-config").long("named-store-config").requires("nfs-server").help("Standalone: NamedDataMgr configuration of that nfs-server's named store"))
         .arg(Arg::new("fixture-sources").long("fixture-sources").action(ArgAction::SetTrue).help("Register the generated fixture:// data source (dev/test)"))
-        .arg(Arg::new("wish-config").long("wish-config").help("Wish runs (standalone): JSON { provider: { type, base_url, api_key_env }, analyze_model, execute_model, map_model, deno, … }"))
+        .arg(Arg::new("wish-config").long("wish-config").help("Wish runs (standalone): JSON { analyze_model, execute_model, map_model, complete_model, program_timeout_secs, default_execution, … } (the stage budget executors get)"))
         .arg(Arg::new("public-base").long("public-base").help("Standalone: the origin publications are linked at, with {workspace_id} substituted, e.g. http://aiws-{workspace_id}.localhost:4120"))
         .arg(Arg::new("web").long("web").help("Standalone: the Desktop build directory (holds aiws.html) the AI Workspace page is served from on a Workspace's own host"))
+        .arg(Arg::new("zone-root").long("zone-root").help("Standalone: the folder holding home/<user>/… that Zone sources (source.kind zone) read, as $BUCKYOS_ROOT/data on a node"))
+        .arg(Arg::new("agent-gateway").long("agent-gateway").help("Standalone: where Agents serve kRPC (<url>/<agent_id>), as the node gateway's /kapi on a node: a synced source's refresh runs its sync task there"))
         .arg(Arg::new("log-level").long("log-level").default_value("info"))
         .get_matches();
-    // wish runs drive the xllm loop on worker threads: deep futures need more than the default stack
+    // deep futures need more than the default stack
     let rt = tokio::runtime::Builder::new_multi_thread().thread_stack_size(8 * 1024 * 1024).enable_all().build().expect("tokio runtime");
     if let Some(data_dir) = matches.get_one::<String>("data-dir") {
         let level = matches.get_one::<String>("log-level").unwrap().clone();
@@ -83,7 +85,9 @@ fn main() {
             }
         }
         let nfs = matches.get_one::<String>("nfs-server").map(|origin| (origin.trim_end_matches('/').to_string(), PathBuf::from(matches.get_one::<String>("named-store-config").unwrap())));
-        let limits = Limits { public_base: matches.get_one::<String>("public-base").cloned(), web_dir: aiworkspace_server::pages::locate_web_dir(matches.get_one::<String>("web").map(String::as_str)), ..Limits::default() };
+        let limits = Limits { public_base: matches.get_one::<String>("public-base").cloned(), web_dir: aiworkspace_server::pages::locate_web_dir(matches.get_one::<String>("web").map(String::as_str)),
+                              zone_root: matches.get_one::<String>("zone-root").map(PathBuf::from), agent_gateway: matches.get_one::<String>("agent-gateway").map(|u| u.trim_end_matches('/').to_string()),
+                              ..Limits::default() };
         rt.block_on(run(PathBuf::from(data_dir), listen, Arc::new(tokens), limits, fixtures, None, wish, Objects::Standalone(nfs)));
     } else {
         init_logging("aiworkspace", true);
@@ -139,6 +143,8 @@ async fn buckyos_service_main(fixtures: bool) {
             std::process::exit(1);
         }
     };
+    // Agents serve their kRPC behind this node's gateway (`/kapi/<agent_id>`, routed by the scheduler)
+    let agent_gateway = format!("http://127.0.0.1:{}/kapi", runtime.node_gateway_port);
     if let Err(e) = set_buckyos_api_runtime(runtime) {
         log::error!("register aiworkspace runtime failed: {:?}", e);
         std::process::exit(1);
@@ -147,11 +153,14 @@ async fn buckyos_service_main(fixtures: bool) {
         max_commit_bytes: settings.max_commit_bytes as usize,
         max_wait_ms: settings.max_wait_ms,
         max_asset_bytes: settings.max_asset_bytes,
+        max_media_bytes: settings.max_media_bytes,
         workspace_quota_bytes: settings.quota_bytes,
         history_retention_ms: settings.history_retention_days as i64 * 24 * 3_600_000,
         traffic_quota_bytes: settings.traffic_quota_bytes,
         public_base,
         web_dir,
+        zone_root: Some(buckyos_kit::get_buckyos_root_dir().join("data")),
+        agent_gateway: Some(agent_gateway),
         ..Limits::default()
     };
     // wake-up hints over kevent: only "there is a new head", never content or entity ids
@@ -169,6 +178,11 @@ async fn buckyos_service_main(fixtures: bool) {
                     buckyos_api::obj_event_key("aiworkspace", &[workspace_id.as_str()], "locks"),
                     serde_json::json!({ "counter": counter }),
                 ),
+                // permissions changed (权限需求 R4): clients read their capabilities again
+                Wake::Acl { workspace_id, acl_rev } => (
+                    buckyos_api::obj_event_key("aiworkspace", &[workspace_id.as_str()], "acl"),
+                    serde_json::json!({ "acl_rev": acl_rev }),
+                ),
             };
             if let Err(e) = client.pub_event(&path, data).await {
                 log::debug!("kevent publish {path} failed: {:?}", e); // clients fall back to wait_changes
@@ -178,7 +192,7 @@ async fn buckyos_service_main(fixtures: bool) {
     let listen = format!("127.0.0.1:{}", AIWORKSPACE_SERVICE_PORT);
     log::info!("aiworkspace buckyos mode: data in {}", data_dir.display());
     // models are reached through AICC with this service's session, on behalf of the user each run is charged to
-    let wish = WishConfig::from_settings(&settings.wish, serde_json::json!({ "type": "buckyos" }));
+    let wish = WishConfig::from_settings(&settings.wish);
     run(data_dir, listen, Arc::new(RuntimeAuth), limits, fixtures, Some(tx), wish, Objects::Zone).await;
 }
 

@@ -92,8 +92,8 @@ pub fn record_schema(payload: &JsonMap) -> WsResult<BTreeMap<String, FieldDef>> 
         let key = o.remove("key").ok_or_else(|| bad("property needs key"))?;
         o.insert("field_id".into(), key);
         let def = FieldDef::from_value(&Value::Object(o))?;
-        if def.unique {
-            return Err(bad("unique is not supported on record properties"));
+        if def.unique || def.submitter || def.default.is_some() {
+            return Err(bad("unique, submitter and default are not supported on record properties"));
         }
         if out.insert(def.field_id.clone(), def).is_some() {
             return Err(bad("duplicate property key"));
@@ -158,18 +158,34 @@ pub fn record_nested(payload: &JsonMap) -> Value {
 const CELL_KEYS: &[&str] = &[
     "source_ref", "view", "title", "fields", "filter", "sorts", "group", "manual_order", "options", "config", "def_ref", "bindings", "locked",
     "flip", "start", "end", "route", "controls", "label", "presentation",
-    "data_ownership", "slot", "on",
+    "data_ownership", "slot", "on", "row_limit",
 ];
+/// The most rows a table view's `row_limit` may name (B7-3; none: all rows).
+pub const MAX_ROW_LIMIT: u64 = 100_000;
 /// Named data bindings of a Block (`aiws` v2): at most this many names.
 pub const MAX_BINDINGS: usize = 32;
+/// Data one `many` binding names at most (控件 on_bind TODO Q2: a list of references).
+pub const MAX_BINDING_ITEMS: usize = 32;
+
+/// The references one binding holds: itself, or the items of a `many` binding's list.
+pub fn binding_targets(v: &Value) -> Vec<&Value> {
+    match v {
+        Value::Array(list) => list.iter().collect(),
+        other => vec![other],
+    }
+}
 /// Largest canonical size of a Block's `config` / a definition's body.
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 pub const MAX_BLOCK_DEF_BYTES: usize = 512 * 1024;
 /// Version of the `window.aiws` Block host API (`aiws` v2) the wish planner writes into html results.
 pub const HTML_API_VERSION: u64 = 2;
-/// The newest Block host API a control may be written for (扩展控件 P2: `emit`, `createBlock.parent`, `interactive`);
-/// hosts run every version from 2 on.
-pub const HTML_API_LATEST: u64 = 3;
+/// The newest Block host API a control may be written for (扩展控件 P2: `emit`, `createBlock.parent`, `interactive`;
+/// 5: `aiws.on('bind')` / `aiws.on('init_control')` run before placing, 控件 on_bind TODO §2.9; 6: `aiws.query(sql,
+/// params?)` is one SQL SELECT over the logical tables, 核心 API 调整 R17 — 5 and older have no `aiws.query`); hosts run
+/// every version from 2 on.
+pub const HTML_API_LATEST: u64 = 6;
+/// The host API from which an HTML control may decide its bindings in its script (`on_bind: "script"`).
+pub const HTML_BIND_API: u64 = 5;
 /// Events one control declares, handlers one event of an instance binds, and the size of an instance's `on` (Q26).
 pub const MAX_EVENTS: usize = 16;
 pub const MAX_EVENT_HANDLERS: usize = 4;
@@ -222,10 +238,11 @@ fn view_source_type(view_type: &str) -> Option<&'static str> {
     })
 }
 
-const DATA_SOURCE_TYPES: &[&str] = &[TYPE_TABLE, TYPE_RICHTEXT, TYPE_RECORD, TYPE_ASSET, TYPE_WISH, TYPE_ANNOTATION, TYPE_BLOCK_DEF];
+const DATA_SOURCE_TYPES: &[&str] = &[TYPE_TABLE, TYPE_RICHTEXT, TYPE_RECORD, TYPE_ASSET, TYPE_WISH, TYPE_ANNOTATION, TYPE_BLOCK_DEF, TYPE_DIR];
 
-/// Named data bindings of a Block or a composite (`{ <name>: { entity_id, selector? } }`, at most
-/// `MAX_BINDINGS`); the targets are judged (reference class) when `check`.
+/// Named data bindings of a Block or a composite (`{ <name>: { entity_id, selector? } | [{ entity_id, selector? }, …] }`,
+/// at most `MAX_BINDINGS`, a list — a binding declared `many` — of at most `MAX_BINDING_ITEMS`, an empty one dropped);
+/// the targets are judged (reference class) when `check`.
 fn normalize_bindings(p: &Planner, payload: &mut JsonMap, check: bool) -> WsResult<()> {
     match payload.get("bindings").cloned() {
         None => {}
@@ -237,11 +254,8 @@ fn normalize_bindings(p: &Planner, payload: &mut JsonMap, check: bool) -> WsResu
                 return Err(WsError::limit(format!("at most {MAX_BINDINGS} bindings")));
             }
             let mut norm = Map::new();
-            for (name, target) in b {
-                if !crate::wish::is_input_name(&name) || name == "source" {
-                    return Err(bad(format!("binding name {name:?} must be an identifier other than source")));
-                }
-                let t = target.as_object().ok_or_else(|| bad("binding must be { entity_id, selector? }"))?;
+            let one = |target: &Value| -> WsResult<Value> {
+                let t = target.as_object().ok_or_else(|| bad("binding must be { entity_id, selector? } or a list of them"))?;
                 if t.keys().any(|k| !matches!(k.as_str(), "entity_id" | "selector")) {
                     return Err(bad("binding: unknown key"));
                 }
@@ -257,7 +271,30 @@ fn normalize_bindings(p: &Planner, payload: &mut JsonMap, check: bool) -> WsResu
                 if let Some(sel) = t.get("selector") {
                     nt.insert("selector".into(), sel.clone());
                 }
-                norm.insert(name, Value::Object(nt));
+                Ok(Value::Object(nt))
+            };
+            for (name, target) in b {
+                if !crate::wish::is_input_name(&name) || name == "source" {
+                    return Err(bad(format!("binding name {name:?} must be an identifier other than source")));
+                }
+                match &target {
+                    Value::Array(list) => {
+                        if list.len() > MAX_BINDING_ITEMS {
+                            return Err(WsError::limit(format!("binding {name}: at most {MAX_BINDING_ITEMS} items")));
+                        }
+                        let items = list.iter().map(one).collect::<WsResult<Vec<_>>>()?;
+                        let mut seen = std::collections::BTreeSet::new();
+                        if items.iter().any(|i| !seen.insert(i["entity_id"].to_string())) {
+                            return Err(bad(format!("binding {name}: an item is listed twice")));
+                        }
+                        if !items.is_empty() {
+                            norm.insert(name, Value::Array(items));
+                        }
+                    }
+                    _ => {
+                        norm.insert(name, one(&target)?);
+                    }
+                }
             }
             payload.insert("bindings".into(), Value::Object(norm));
         }
@@ -423,6 +460,12 @@ fn validate_cell(p: &mut Planner, e: &mut EntityRow, changed: Option<&[String]>)
                 return Err(bad("manual_order: invalid record_id"));
             }
             check_order_key(key.as_str().unwrap_or(""))?;
+        }
+    }
+    // how many rows the table view shows (B7-3, §6 Q9): a display limit, the data keeps every row
+    if let Some(n) = e.payload.get("row_limit").filter(|v| !v.is_null()) {
+        if view_type != "table" || !n.as_u64().is_some_and(|n| (1..=MAX_ROW_LIMIT).contains(&n)) {
+            return Err(bad(format!("row_limit (1..{MAX_ROW_LIMIT}) belongs to a table view")));
         }
     }
     if view_type == "connector" {
@@ -866,9 +909,21 @@ fn container_primitive(p: &Planner, e: &mut EntityRow, before: Option<&EntityRow
         ("folder" | "surface" | "group", None) => {}
         (k, None) if is_control_kind(k) => {}
         ("root" | "data" | "surfaces", None) if p.env.internal => {}
-        (_, None) => return Err(bad("container kind must be folder, surface, group or a control (mindmap, composite)")),
+        (_, None) => return Err(bad(format!("container kind must be folder, surface, group or a control ({})", controls_contract().0.join(", ")))),
         (k, Some(b)) if b.payload.get("kind").and_then(Value::as_str) == Some(k) => {}
         _ => return Err(WsError::invalid_op("container kind cannot be changed")),
+    }
+    // who writes the shared configuration (UI 框架 PRD §4.6, Q15): the Workspace's settings (the root's `config`) need
+    // `manage` on `/`, a Surface's toolbar `structure` on that Surface; a load (package, clone, template) and a replay
+    // carry them as they are
+    if let Some(b) = before.filter(|_| !p.env.import && !p.env.replay) {
+        let toolbar = |m: &JsonMap| m.get("config").and_then(|c| c.get("toolbar")).cloned();
+        if kind == "root" && b.payload.get("config") != e.payload.get("config") {
+            p.require(ROOT_ID, Cap::Manage)?;
+        }
+        if kind == "surface" && toolbar(&b.payload) != toolbar(&e.payload) {
+            p.require(&e.entity_id, Cap::Structure)?;
+        }
     }
     let mode = match e.payload.get("layout") {
         // a control's layout is its algorithm, implied by the kind (R2); a composite's comes from its definition
@@ -892,7 +947,11 @@ fn container_primitive(p: &Planner, e: &mut EntityRow, before: Option<&EntityRow
     e.payload.insert("layout".into(), json!({ "mode": mode }));
     match e.payload.get("system") {
         None => {}
-        Some(Value::String(s)) if kind == "folder" && matches!(s.as_str(), "canvas_content" | "surface_content" | "shows") => {}
+        Some(Value::String(s)) if kind == "folder" && matches!(s.as_str(), "canvas_content" | "surface_content" | "shows") => {
+            if crate::plan::in_surfaces_tree(&p.ov, &e.entity_id)? {
+                return Err(bad("a canvas folder has no system role"));
+            }
+        }
         Some(_) => return Err(bad("system must be canvas_content, surface_content or shows on a folder")),
     }
     if let Some(sid) = e.payload.get("surface_id") {
@@ -924,8 +983,15 @@ fn container_primitive(p: &Planner, e: &mut EntityRow, before: Option<&EntityRow
         if let Some(on) = e.payload.get("on") {
             check_on_shape(on)?;
         }
+    } else if is_data_control(&kind) {
+        // a data control shows the tables it binds: named inputs checked as on a Cell
+        if let Some(k) = ["def_ref", "on"].into_iter().find(|k| e.payload.contains_key(*k)) {
+            return Err(bad(format!("{k} is not valid on a {kind}")));
+        }
+        let changed = before.is_none_or(|b| b.payload.get("bindings") != e.payload.get("bindings"));
+        normalize_bindings(p, &mut e.payload, p.env.import || changed)?;
     } else if let Some(k) = ["def_ref", "bindings", "on"].into_iter().find(|k| e.payload.contains_key(*k)) {
-        return Err(bad(format!("{k} is only valid on a composite")));
+        return Err(bad(format!("{k} is only valid on a composite or a data control")));
     }
     let block = kind == "group" || control;
     if e.payload.contains_key("slot") && !block {
@@ -965,8 +1031,9 @@ fn composite_refs(p: &Planner, e: &mut EntityRow, before: Option<&EntityRow>) ->
 
 /// Validator class: schema (title, icon, page / control config, `locked`).
 /// A Surface may carry `icon`, the stable id of a preset icon chosen by the client (the client owns the preset list;
-/// an unknown id shows its default), and `config`, its page settings (background, page size; ≤ 64 KiB, checked by
-/// the client like a Cell's). A control's `config` is its attributes: a mind map's are checked here, a composite's
+/// an unknown id shows its default), and `config`, its page settings (background, page size, toolbar; ≤ 64 KiB, checked
+/// by the client like a Cell's). The root's `config` is the Workspace's shared settings (toolbar, cover; ≤ 64 KiB, the
+/// client checks the keys but the cover's, `root_cover`). A control's `config` is its attributes: a mind map's are checked here, a composite's
 /// by its definition's `config_schema` in the clients (Q15).
 fn container_schema(e: &EntityRow) -> WsResult<()> {
     let kind = e.payload.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -983,7 +1050,7 @@ fn container_schema(e: &EntityRow) -> WsResult<()> {
         }
     }
     if let Some(c) = e.payload.get("config") {
-        let c = c.as_object().filter(|_| kind == "surface" || control).ok_or_else(|| bad("config must be an object on a surface or a control"))?;
+        let c = c.as_object().filter(|_| kind == "surface" || kind == "root" || control).ok_or_else(|| bad("config must be an object on a surface, the root (the Workspace's settings) or a control"))?;
         if canonical_len(&Value::Object(c.clone())) > MAX_CONFIG_BYTES {
             return Err(WsError::limit(format!("config is limited to {MAX_CONFIG_BYTES} bytes")));
         }
@@ -997,12 +1064,12 @@ fn container_schema(e: &EntityRow) -> WsResult<()> {
 /// The constants the core shares with the Desktop's control registry (one file, read by both).
 const CONTROLS_JSON: &str = include_str!("../../controls/core.json");
 
-fn controls_contract() -> &'static (Vec<String>, Vec<String>) {
-    static C: std::sync::OnceLock<(Vec<String>, Vec<String>)> = std::sync::OnceLock::new();
+fn controls_contract() -> &'static (Vec<String>, Vec<String>, Vec<String>) {
+    static C: std::sync::OnceLock<(Vec<String>, Vec<String>, Vec<String>)> = std::sync::OnceLock::new();
     C.get_or_init(|| {
         let v: Value = serde_json::from_str(CONTROLS_JSON).expect("controls/core.json is valid JSON");
         let list = |k: &str| v[k].as_array().expect("controls/core.json lists").iter().map(|s| s.as_str().unwrap().to_string()).collect();
-        (list("control_kinds"), list("text_views"))
+        (list("control_kinds"), list("text_views"), list("data_controls"))
     })
 }
 
@@ -1010,6 +1077,13 @@ fn controls_contract() -> &'static (Vec<String>, Vec<String>) {
 /// Blocks it holds with its named algorithm. `mindmap` is the first.
 pub fn is_control_kind(kind: &str) -> bool {
     controls_contract().0.iter().any(|k| k == kind)
+}
+
+/// Data controls (控件机制 TODO G2, Q19): the official to-do and calendar. They show the records of the tables they bind
+/// (`bindings`) as projected Blocks the clients compute and never store, hold no Blocks themselves and have a numeric
+/// size the user sets.
+pub fn is_data_control(kind: &str) -> bool {
+    controls_contract().2.iter().any(|k| k == kind)
 }
 
 /// Text views (R17): their size comes from the title, so their `w` / `h` may be `"auto"` inside a control.
@@ -1025,12 +1099,19 @@ pub fn is_block_container(e: &EntityRow) -> bool {
 /// The host kind of every composite control instance (扩展控件 P1, K4): which control it is, is its `def_ref`.
 pub const COMPOSITE: &str = "composite";
 
+/// The PDF Frame (打印 TODO §3.3, T3): a page shape with a header and a footer band that printing scales onto every
+/// page. Its only children are its two bands, groups slotted `header` and `footer` (placed by the frame); its size is
+/// numeric (the clients derive the height from the width and the shape, `controls/pdfframe.ts`).
+pub const PDF_FRAME: &str = "pdf-frame";
+const PDF_FRAME_BANDS: &[&str] = &["header", "footer"];
+
 /// The layout mode a control kind implies (stored in `layout`, never chosen by the writer). A composite's layout is
 /// its definition's (`composition.layout`).
 fn control_layout(kind: &str) -> &'static str {
     match kind {
         "mindmap" => "tree",
         COMPOSITE => "def",
+        k if is_data_control(k) => "data",
         _ => "free",
     }
 }
@@ -1066,6 +1147,9 @@ pub fn is_slot(s: &str) -> bool {
 
 /// The configuration of a control container (its `attr_def`, §6.2).
 pub fn check_control_config(kind: &str, c: &JsonMap) -> WsResult<()> {
+    if kind == PDF_FRAME {
+        return check_pdf_frame_config(c);
+    }
     if kind != "mindmap" {
         return Ok(());
     }
@@ -1082,6 +1166,27 @@ pub fn check_control_config(kind: &str, c: &JsonMap) -> WsResult<()> {
         if !ok {
             return Err(bad(format!(
                 "mindmap config.{k} is invalid (direction: right | left | both | down; edge: curve | elbow | straight; spacing: {{ sibling?, level? }} in [0, 2000]; branch_colors: up to 64 colors)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A PDF Frame's page shape and bands (`controls/pdfframe.ts` `pdfFrameConfig`): `page` A | Letter | 16:9 | 4:3 | custom
+/// (`custom_w` / `custom_h` in mm, (0, 10000]), `orientation`, and the band heights and side margin in the frame's units.
+fn check_pdf_frame_config(c: &JsonMap) -> WsResult<()> {
+    for (k, v) in c {
+        let n = finite(Some(v));
+        let ok = match k.as_str() {
+            "page" => matches!(v.as_str(), Some("A" | "Letter" | "16:9" | "4:3" | "custom")),
+            "orientation" => matches!(v.as_str(), Some("portrait" | "landscape")),
+            "custom_w" | "custom_h" => n.is_some_and(|n| n > 0.0 && n <= 10000.0),
+            "header" | "footer" | "margin" => n.is_some_and(|n| (0.0..=20000.0).contains(&n)),
+            _ => return Err(bad(format!("pdf-frame config: unknown key {k}"))),
+        };
+        if !ok {
+            return Err(bad(format!(
+                "pdf-frame config.{k} is invalid (page: A | Letter | 16:9 | 4:3 | custom; orientation: portrait | landscape; custom_w, custom_h: mm in (0, 10000]; header, footer, margin: [0, 20000])"
             )));
         }
     }
@@ -1131,10 +1236,17 @@ fn check_slot(p: &Planner, e: &EntityRow) -> WsResult<()> {
         }
         return Ok(());
     }
-    let Some(slot) = e.payload.get("slot") else { return Ok(()) };
+    // a PDF Frame's children are its bands: each names one, once
+    let band = p.ov.entity(&edge.parent_id)?.is_some_and(|parent| parent.type_id == TYPE_CONTAINER && container_kind_of(&parent) == PDF_FRAME);
+    let Some(slot) = e.payload.get("slot") else {
+        return if band { Err(bad("a band of a PDF Frame needs slot (header or footer)")) } else { Ok(()) };
+    };
     let slot = slot.as_str().filter(|s| is_slot(s)).ok_or_else(|| bad("slot must match ^[a-z0-9][a-z0-9_-]{0,31}$"))?;
     if !laid_out_by_control(&p.ov, &edge.parent_id)? {
         return Err(bad("slot is only valid on a Block inside a control"));
+    }
+    if band && !PDF_FRAME_BANDS.contains(&slot) {
+        return Err(bad(format!("slot {slot:?} is not a band of a PDF Frame (header, footer)")));
     }
     for sibling in p.ov.children(&edge.parent_id)? {
         if sibling.child_id == e.entity_id {
@@ -1167,7 +1279,7 @@ pub const ASSET_CONTENT_KEYS: &[&str] = &["image", "poster", "duration_ms", "pag
 /// Validator class: primitive (AssetRef shape, media type and size from the verified content); reference for the uploaded
 /// object and its poster (a picture of the content: a video frame, a PDF's first page, an album cover).
 fn validate_asset(p: &mut Planner, e: &mut EntityRow) -> WsResult<()> {
-    check_keys(&e.payload, &["object_id", "media_type", "size", "file_name", "image", "poster", "duration_ms", "page_count", "source"], "asset")?;
+    check_keys(&e.payload, &["object_id", "media_type", "size", "file_name", "image", "poster", "duration_ms", "page_count", "source", "data_version"], "asset")?;
     if let Some(s) = e.payload.get("source") {
         check_source(s)?;
     }
@@ -1211,6 +1323,41 @@ fn validate_asset(p: &mut Planner, e: &mut EntityRow) -> WsResult<()> {
     Ok(())
 }
 
+/// Pictures a Workspace's cover may be: what the asset route serves as themselves (an SVG it serves as bytes: never).
+pub const COVER_MEDIA_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp"];
+/// A cover is at most 8 MiB: the home page downloads each one whole.
+pub const COVER_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Validator class: primitive; reference for the uploaded picture. The Workspace's cover (UI 框架 PRD §9.2, Q37) is
+/// `config.cover` on the root, a setting like the others (`manage` writes it): `{ object_id, media_type, size }` of an
+/// uploaded PNG, JPEG, GIF, WebP, AVIF or BMP picture of at most 8 MiB, the media type and size from the verified
+/// content. Judged when it changes; a package may name one it did not bring (it reads back as no cover).
+fn root_cover(p: &mut Planner, e: &mut EntityRow, before: Option<&EntityRow>) -> WsResult<()> {
+    let cover = |m: &JsonMap| m.get("config").and_then(|c| c.get("cover")).cloned();
+    let Some(c) = cover(&e.payload) else { return Ok(()) };
+    if !p.env.import && before.is_some_and(|b| cover(&b.payload).as_ref() == Some(&c)) {
+        return Ok(());
+    }
+    let o = c.as_object().filter(|o| o.keys().all(|k| matches!(k.as_str(), "object_id" | "media_type" | "size"))).ok_or_else(|| bad("config.cover must be { object_id }"))?;
+    let object_id = o.get("object_id").and_then(Value::as_str).filter(|id| crate::canonical::is_obj_id(id)).ok_or_else(|| bad("config.cover.object_id must be a type:hex object id"))?.to_string();
+    let Some(info) = p.ov.asset(&object_id)? else {
+        if p.env.import && o.get("media_type").is_some_and(Value::is_string) && o.get("size").is_some_and(Value::is_u64) {
+            return Ok(());
+        }
+        return Err(WsError::new(Code::DependencyUnavailable, format!("cover {object_id} has not been uploaded")));
+    };
+    if !COVER_MEDIA_TYPES.contains(&info.media_type.as_str()) {
+        return Err(bad(format!("the cover must be a PNG, JPEG, GIF, WebP, AVIF or BMP picture, not {}", info.media_type)));
+    }
+    if info.size > COVER_MAX_BYTES {
+        return Err(WsError::limit(format!("the cover is limited to {COVER_MAX_BYTES} bytes")));
+    }
+    let value = json!({ "object_id": object_id, "media_type": info.media_type, "size": info.size });
+    p.ov.assets.insert(object_id, info);
+    e.payload.get_mut("config").and_then(Value::as_object_mut).expect("config is an object").insert("cover".into(), value);
+    Ok(())
+}
+
 // ---- resource directory (内核架构改进 D01, D25) ----
 
 const DIR_KEYS: &[&str] = &["members", "meta", "source"];
@@ -1218,8 +1365,8 @@ pub const MAX_DIR_MEMBERS: usize = 10_000;
 pub const MAX_DIR_META_BYTES: usize = 64 * 1024;
 
 /// A member name: a relative path of at most 255 bytes whose `/`-separated segments are non-empty and neither `.`
-/// nor `..` (no leading, trailing or doubled `/`, no NUL). A name with `/` encodes a file of a sub-folder of a flat
-/// member map (扩展控件 P1, Q23); a directory never nests through it.
+/// nor `..` (no leading, trailing or doubled `/`, no NUL). A name with `/` encodes a member of a sub-folder of the
+/// flat member map (扩展控件 P1, Q23); a `folder` member names a sub-folder of its own, empty or not (UI 框架 PRD Q25).
 pub fn check_member_name(name: &str) -> WsResult<()> {
     if name.is_empty() || name.len() > 255 || name.contains('\0') || name.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
         return Err(bad(format!("invalid directory member name {name:?}")));
@@ -1244,9 +1391,9 @@ fn dir_reaches(ctx: &dyn ReadCtx, from: &str, target: &str, depth: usize) -> WsR
     Ok(false)
 }
 
-/// Validator class: primitive (the member map's shape, names and limits); reference (file members name
-/// uploaded objects — media type and size come from the content; child directories are alive directories
-/// that do not contain this one).
+/// Validator class: primitive (the member map's shape, names and limits; a name is a file, a child directory or a
+/// folder, never also a folder of other names); reference (file members name uploaded objects — media type and size
+/// come from the content; child directories are alive directories that do not contain this one).
 pub fn validate_dir(p: &mut Planner, e: &mut EntityRow) -> WsResult<()> {
     check_keys(&e.payload, DIR_KEYS, "dir")?;
     if let Some(s) = e.payload.get("source") {
@@ -1304,7 +1451,23 @@ pub fn validate_dir(p: &mut Planner, e: &mut EntityRow) -> WsResult<()> {
                 }
                 out.insert(name.clone(), json!({ "kind": "dir", "entity_id": child }));
             }
-            _ => return Err(bad(format!("member {name}: kind must be file or dir"))),
+            Some("folder") => {
+                if o.len() != 1 {
+                    return Err(bad(format!("member {name}: unknown key")));
+                }
+                out.insert(name.clone(), json!({ "kind": "folder" }));
+            }
+            _ => return Err(bad(format!("member {name}: kind must be file, dir or folder"))),
+        }
+    }
+    for name in out.keys() {
+        let mut at = 0;
+        while let Some(i) = name[at..].find('/') {
+            let folder = &name[..at + i];
+            if out.get(folder).is_some_and(|m| m["kind"] != json!("folder")) {
+                return Err(bad(format!("member {folder} is not a folder: {name} cannot be inside it")));
+            }
+            at += i + 1;
         }
     }
     e.payload.insert("members".into(), Value::Object(out));
@@ -1339,9 +1502,11 @@ fn dir_refs(e: &EntityRow, out: &mut BTreeSet<RefEdge>) {
 }
 
 /// A DirObject (`cydir`) as a directory payload. `dirs` maps a child `cydir:` id to the entity holding it
-/// (children are imported before their parents). Inline `{ obj_type, body }` members are hashed to their id.
+/// (children are imported before their parents); an empty child DirObject not in `dirs` is a `folder` member.
+/// Inline `{ obj_type, body }` members are hashed to their id.
 pub fn dir_payload_from_dir_object(v: &Value, dirs: &BTreeMap<String, String>) -> WsResult<JsonMap> {
     let body = v.get("body").and_then(Value::as_object).ok_or_else(|| bad("DirObject needs a body"))?;
+    let (empty, _) = crate::canonical::dir_object(&[])?;
     let mut members = Map::new();
     for (name, item) in body {
         check_member_name(name)?;
@@ -1362,8 +1527,11 @@ pub fn dir_payload_from_dir_object(v: &Value, dirs: &BTreeMap<String, String>) -
             }
             members.insert(name.clone(), m);
         } else if id.starts_with("cydir:") {
-            let child = dirs.get(&id).ok_or_else(|| WsError::new(Code::DependencyUnavailable, format!("child directory {id} of {name} is not imported")))?;
-            members.insert(name.clone(), json!({ "kind": "dir", "entity_id": child }));
+            match dirs.get(&id) {
+                Some(child) => members.insert(name.clone(), json!({ "kind": "dir", "entity_id": child })),
+                None if id == empty => members.insert(name.clone(), json!({ "kind": "folder" })),
+                None => return Err(WsError::new(Code::DependencyUnavailable, format!("child directory {id} of {name} is not imported"))),
+            };
         } else {
             return Err(bad(format!("DirObject member {name} is neither a file nor a directory")));
         }
@@ -1446,7 +1614,7 @@ fn validate_annotation(p: &Planner, e: &mut EntityRow, before: Option<&EntityRow
 
 // ---- Wish (phase two §7.1) ----
 
-const WISH_KEYS: &[&str] = &["title", "prompt", "knowledge", "refinements", "analysis", "inputs", "executor", "output", "output_mode", "executor_config", "program", "last_run"];
+const WISH_KEYS: &[&str] = &["title", "prompt", "knowledge", "refinements", "analysis", "inputs", "executor", "output", "output_mode", "executor_config", "program", "last_run", "history"];
 pub const MAX_PROMPT_CHARS: usize = 20_000;
 
 /// Validator class: schema (selector and version shape); reference for the input target and its `table_view` cell.
@@ -1550,8 +1718,8 @@ fn validate_wish(p: &mut Planner, e: &mut EntityRow, changed: Option<&[String]>)
         return Err(bad("wish needs prompt"));
     }
     match e.payload.get("executor").and_then(Value::as_str) {
-        Some("mock" | "xllm" | "agent-work-session") => {}
-        _ => return Err(bad("executor must be mock, xllm or agent-work-session")),
+        Some("xllm" | "agent-work-session") => {}
+        _ => return Err(bad("executor must be xllm or agent-work-session")),
     }
     match e.payload.get("output_mode") {
         None => {
@@ -1606,8 +1774,9 @@ fn validate_wish(p: &mut Planner, e: &mut EntityRow, changed: Option<&[String]>)
     if let Some(a) = e.payload.get("analysis") {
         crate::wish::check_analysis(a)?;
     }
-    if e.payload.contains_key("analysis") && is_changed("analysis") {
-        // the basis is the core's statement of what the analysis was made from, never the writer's
+    if e.payload.contains_key("analysis") && is_changed("analysis") && !p.env.internal {
+        // the basis is the core's statement of what the analysis was made from, never the writer's; an undo or a
+        // rollback (internal) restores an analysis as it was, basis included
         crate::wish::with_basis(&mut e.payload);
     }
     if let Some(out) = e.payload.get("output").filter(|v| !v.is_null()) {
@@ -1645,6 +1814,26 @@ fn validate_wish(p: &mut Planner, e: &mut EntityRow, changed: Option<&[String]>)
     if e.payload.get("analysis").is_some_and(|c| canonical_len(c) > MAX_CONFIG_BYTES * 2) {
         return Err(WsError::limit("analysis is limited to 128 KiB"));
     }
+    if let Some(h) = e.payload.get("history") {
+        crate::wish::check_history(h)?;
+    }
+    // the run records are the service's (许愿格交互升级 §3.4): a run's own Commit, a rollback or an undo (internal), an
+    // import or a replay; nobody writes them by hand
+    if is_changed("history") && (changed.is_some() || e.payload.contains_key("history")) && !(p.env.origin == "program" || p.env.internal || p.env.replay) {
+        return Err(WsError::denied("a wish's history is written by its runs only"));
+    }
+    if is_changed("history") || importing {
+        let ids: Vec<String> = crate::wish::history_objects(&e.payload).into_iter().map(|(id, _)| id.to_string()).collect();
+        for id in ids {
+            match p.ov.asset(&id)? {
+                Some(info) => {
+                    p.ov.assets.insert(id, info);
+                }
+                None if importing => {}
+                None => return Err(WsError::new(Code::DependencyUnavailable, format!("history object {id} has not been uploaded"))),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1652,8 +1841,9 @@ fn validate_wish(p: &mut Planner, e: &mut EntityRow, changed: Option<&[String]>)
 
 /// The newest `component.json` / definition `manifest_version` this core reads (扩展控件 P0, Q19: older ones stay
 /// readable). 2 (P1) adds `kind: composite`, `composition` and non-empty `deps`; 3 (P2 / P3) `events`, the declarative
-/// `button`, composite `events`, HTML host API 3 and Workspace templates.
-pub const MANIFEST_VERSION: u64 = 3;
+/// `button`, composite `events`, HTML host API 3 and Workspace templates; 4 (控件机制 TODO G13, G17, G19, H2) composite
+/// `projections`, `media`, slot `visible`, events raised by a projection's role, `actions`, HTML host API 4.
+pub const MANIFEST_VERSION: u64 = 5;
 /// Definitions one definition may depend on (`deps`).
 pub const MAX_DEF_DEPS: usize = 32;
 /// Slots of a composite (`composition.slots`).
@@ -1709,13 +1899,99 @@ pub fn check_def_bindings(v: &Value) -> WsResult<()> {
         for (k, x) in d {
             let ok = match k.as_str() {
                 "accepts" => x.as_array().is_some_and(|l| l.iter().all(|t| t.as_str().is_some_and(is_data_type))),
-                "required" => x.is_boolean(),
+                "required" | "many" => x.is_boolean(),
+                // only tables of this business schema (控件 on_bind TODO §2.3)
+                "schema_id" => x.as_str().is_some_and(|t| !t.is_empty() && t.len() <= 128),
                 "title" => x.as_str().is_some_and(|t| t.chars().count() <= 256),
                 "description" => x.as_str().is_some_and(|t| t.chars().count() <= 4000),
                 _ => return Err(bad(format!("binding {name}: unknown key {k}"))),
             };
             if !ok {
                 return Err(bad(format!("binding {name}: bad {k}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// (host API 5, 控件 on_bind TODO §2.9) An HTML control decides its bindings in its script: `on_bind` / `on_init_control`
+/// are `"script"`, its `aiws.on('bind')` / `aiws.on('init_control')` run by the host without a page before placing.
+pub fn check_script_events(on_bind: Option<&Value>, on_init: Option<&Value>) -> WsResult<()> {
+    for (key, v) in [("on_bind", on_bind), ("on_init_control", on_init)] {
+        if v.is_some_and(|v| v != "script") {
+            return Err(bad(format!("{key}: an HTML control writes \"script\" (its behavior.js handles aiws.on('{}'))", if key == "on_bind" { "bind" } else { "init_control" })));
+        }
+    }
+    Ok(())
+}
+
+/// (manifest 5, 控件 on_bind TODO §2.6) A composite's declared steps: `on_bind` — `{ binding, pick: one | many | all,
+/// title?, allow_new? }`, `{ binding, from_parent }`, `{ binding, create: { standard } | { table: { name, title_field_id?,
+/// fields } } | { dir: { name } }, when?: missing | always }` — and `on_init_control` — `{ require: "children" }`,
+/// `{ then: { action } }` — against the bindings and actions it declares, 16 steps each at most.
+pub fn check_bind_steps(on_bind: Option<&Value>, on_init: Option<&Value>, bindings: &Map<String, Value>, actions: &[String]) -> WsResult<()> {
+    if let Some(v) = on_bind {
+        let steps = v.as_array().filter(|l| l.len() <= 16).ok_or_else(|| bad("on_bind: at most 16 steps"))?;
+        for (i, step) in steps.iter().enumerate() {
+            let at = format!("on_bind[{i}]");
+            let o = step.as_object().ok_or_else(|| bad(format!("{at}: an object")))?;
+            let name = o.get("binding").and_then(Value::as_str).ok_or_else(|| bad(format!("{at}: names a binding")))?;
+            let decl = bindings.get(name).ok_or_else(|| bad(format!("{at}: {name} is not a declared binding")))?;
+            let many = decl.get("many") == Some(&json!(true));
+            let kinds: Vec<&str> = ["pick", "from_parent", "create"].into_iter().filter(|k| o.contains_key(*k)).collect();
+            if kinds.len() != 1 {
+                return Err(bad(format!("{at}: one of pick, from_parent, create")));
+            }
+            let allowed: &[&str] = match kinds[0] {
+                "pick" => &["binding", "pick", "title", "allow_new"],
+                "from_parent" => &["binding", "from_parent"],
+                _ => &["binding", "create", "when"],
+            };
+            if let Some(k) = o.keys().find(|k| !allowed.contains(&k.as_str())) {
+                return Err(bad(format!("{at}: unknown key {k}")));
+            }
+            match kinds[0] {
+                "pick" => match o["pick"].as_str() {
+                    Some("one") => {}
+                    Some("many" | "all") if many => {}
+                    Some("many" | "all") => return Err(bad(format!("{at}: {name} takes one"))),
+                    _ => return Err(bad(format!("{at}: pick is one, many or all"))),
+                },
+                "from_parent" if !o["from_parent"].as_str().is_some_and(is_binding_name) => return Err(bad(format!("{at}: from_parent names a binding of the parent"))),
+                "from_parent" => {}
+                _ => {
+                    let c = o["create"].as_object().filter(|c| c.len() == 1).ok_or_else(|| bad(format!("{at}: create one of standard, table, dir")))?;
+                    let ok = match c.iter().next().map(|(k, v)| (k.as_str(), v)) {
+                        Some(("standard", v)) => v.as_str().is_some_and(|s| crate::standard::is_standard_schema(s)),
+                        Some(("table", v)) => v.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty() && n.chars().count() <= 256) && v.get("fields").is_some_and(Value::is_array)
+                            && v.as_object().is_some_and(|t| t.keys().all(|k| matches!(k.as_str(), "name" | "fields" | "title_field_id"))),
+                        Some(("dir", v)) => v.get("name").and_then(Value::as_str).is_some_and(|n| !n.is_empty() && n.chars().count() <= 256) && v.as_object().is_some_and(|t| t.len() == 1),
+                        _ => false,
+                    };
+                    if !ok {
+                        return Err(bad(format!("{at}: create one of {{ standard: <a standard schema> }}, {{ table: {{ name, fields, title_field_id? }} }}, {{ dir: {{ name }} }}")));
+                    }
+                    if o.get("when").is_some_and(|w| !matches!(w.as_str(), Some("missing" | "always"))) {
+                        return Err(bad(format!("{at}: when is missing or always")));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(v) = on_init {
+        let steps = v.as_array().filter(|l| l.len() <= 16).ok_or_else(|| bad("on_init_control: at most 16 steps"))?;
+        for (i, step) in steps.iter().enumerate() {
+            let at = format!("on_init_control[{i}]");
+            if step == &json!({ "require": "children" }) {
+                continue;
+            }
+            match step.get("then").and_then(|t| t.get("action")).and_then(Value::as_str) {
+                Some(a) if step.as_object().is_some_and(|o| o.len() == 1) && step["then"].as_object().is_some_and(|t| t.len() == 1) => {
+                    if !actions.iter().any(|x| x == a) {
+                        return Err(bad(format!("{at}: {a} is not a declared action")));
+                    }
+                }
+                _ => return Err(bad(format!("{at}: {{ require: \"children\" }} or {{ then: {{ action }} }}"))),
             }
         }
     }
@@ -1747,6 +2023,7 @@ fn is_sha256_digest(s: &str) -> bool {
 pub const BLOCK_DEF_KEYS: &[&str] = &[
     "def_id", "version", "kind", "title", "accepts", "allow_no_source", "default_size", "declarative", "html", "config_schema", "actions", "inspector", "description",
     "ident", "manifest_version", "source_dir", "bindings", "catalog", "agent", "provenance", "deps", "composition", "events",
+    "on_bind", "on_init_control", "trusted",
 ];
 
 /// A slot name of a composite (`composition.slots`): `[a-z][a-z0-9_]{0,31}`.
@@ -1774,8 +2051,43 @@ fn deps_reach(ctx: &dyn ReadCtx, from: &str, target: &str, path: &mut Vec<String
 /// Validator class: primitive (`deps` shape; only builds and imports write it) and reference (`source_dir` names a
 /// live resource directory; each `deps` entry a live definition, without closing a cycle — `REFERENCE_CYCLE`;
 /// both judged when written).
+/// The keys of an HTML definition that are code a viewer's browser runs (权限需求 R37).
+const HTML_CODE_KEYS: &[&str] = &["kind", "html", "on_bind", "on_init_control"];
+
 fn block_def_primitive(p: &Planner, e: &mut EntityRow, changed: Option<&[String]>) -> WsResult<()> {
     let is_changed = |k: &str| changed.is_none_or(|c| c.iter().any(|x| x == k));
+    // writing an HTML definition's code, or vouching for it, is a manager's (权限需求 R37, Q11); whoever does it marks
+    // the definition `trusted` — a viewer's host runs only trusted code by itself (view mode)
+    let html = e.payload.get("kind").and_then(Value::as_str) == Some("html");
+    let code = html && HTML_CODE_KEYS.iter().any(|k| is_changed(k));
+    let vouched = changed.is_some_and(|c| c.iter().any(|x| x == "trusted"));
+    if code && !vouched && p.env.origin == "program" {
+        // a run's result (origin `program`: written by the service when its stage ends, R32) writes its macro's page without `manage` — the code was
+        // fixed when the macro was coded, and the run is written as its macro identity — but it is trusted only when that
+        // identity may vouch for it (权限需求 Q32). A replay takes what history recorded: a created definition's stored
+        // payload; a changed one carries `trusted` beside its code when it was trusted.
+        let trusted = if p.env.replay {
+            changed.is_none() && e.payload.get("trusted").is_some_and(|t| t.get("by").is_some())
+        } else {
+            p.can(&e.entity_id, crate::access::Cap::Manage)?
+        };
+        if trusted {
+            e.payload.insert("trusted".into(), json!({ "by": p.env.principal, "rev": p.seq() }));
+            e.key_revs.insert("trusted".into(), p.seq());
+        } else {
+            e.payload.remove("trusted");
+        }
+    } else if code || vouched {
+        if !(p.env.import || p.env.internal || p.env.replay) {
+            p.require(&e.entity_id, crate::access::Cap::Manage)?;
+        }
+        if html {
+            e.payload.insert("trusted".into(), json!({ "by": p.env.principal, "rev": p.seq() }));
+            e.key_revs.insert("trusted".into(), p.seq());
+        } else {
+            e.payload.remove("trusted");
+        }
+    }
     if let Some(d) = e.payload.get("source_dir") {
         let o = d.as_object().filter(|o| o.len() == 1).ok_or_else(|| bad("source_dir must be { entity_id }"))?;
         let id = o.get("entity_id").and_then(Value::as_str).filter(|s| is_valid_id(s)).ok_or_else(|| bad("source_dir.entity_id must be an entity id"))?;
@@ -1862,6 +2174,11 @@ fn check_composition_shape(v: &Value) -> WsResult<()> {
 /// Validator class: schema (the payload's keys and shapes).
 fn block_def_schema(e: &mut EntityRow) -> WsResult<()> {
     check_keys(&e.payload, BLOCK_DEF_KEYS, "block_def")?;
+    if let Some(t) = e.payload.get("trusted") {
+        if !(t.is_boolean() || t.get("by").is_some_and(Value::is_string)) {
+            return Err(bad("trusted is written by the service (who vouched for the code, at which revision)"));
+        }
+    }
     let def_id = e.payload.get("def_id").and_then(Value::as_str).ok_or_else(|| bad("block_def needs def_id"))?;
     if !is_renderer_id(def_id) {
         return Err(bad("def_id must be a renderer id"));
@@ -1912,6 +2229,23 @@ fn block_def_schema(e: &mut EntityRow) -> WsResult<()> {
     }
     if kind != COMPOSITE && e.payload.contains_key("composition") {
         return Err(bad("composition is only valid on a composite definition"));
+    }
+    if e.payload.contains_key("on_bind") || e.payload.contains_key("on_init_control") {
+        if kind == "html" {
+            check_script_events(e.payload.get("on_bind"), e.payload.get("on_init_control"))?;
+            let api = e.payload.get("html").and_then(|h| h.get("api_version")).and_then(Value::as_u64).unwrap_or(HTML_API_VERSION);
+            if api < HTML_BIND_API {
+                return Err(bad(format!("on_bind / on_init_control \"script\" needs html api_version {HTML_BIND_API}")));
+            }
+        } else if kind != COMPOSITE {
+            return Err(bad("on_bind / on_init_control are a composite's declared steps or an HTML control's \"script\""));
+        }
+    }
+    if kind == COMPOSITE && (e.payload.contains_key("on_bind") || e.payload.contains_key("on_init_control")) {
+        let empty = Map::new();
+        let bindings = e.payload.get("bindings").and_then(Value::as_object).unwrap_or(&empty);
+        let actions: Vec<String> = e.payload.get("actions").and_then(Value::as_array).into_iter().flatten().filter_map(|a| a.get("id").and_then(Value::as_str)).map(str::to_string).collect();
+        check_bind_steps(e.payload.get("on_bind"), e.payload.get("on_init_control"), bindings, &actions)?;
     }
     opt_text(&e.payload, "title", 256)?;
     opt_text(&e.payload, "description", 4000)?;
@@ -1977,7 +2311,7 @@ pub fn check_derived(p: &Planner, v: &Value, content_rev: u64) -> WsResult<Value
     for k in o.keys() {
         if !matches!(
             k.as_str(),
-            "wish_id" | "run_id" | "executor" | "inputs" | "generated_rev" | "simulated" | "at" | "output_mode" | "group" | "stale" | "stale_at_import" | "kept_manual"
+            "wish_id" | "run_id" | "executor" | "inputs" | "generated_rev" | "at" | "output_mode" | "group" | "stale" | "stale_at_import" | "kept_manual"
                 | "config_digest" | "result_key" | "approach" | "program_digest" | "model_judgment" | "external_data" | "mode"
         ) {
             return Err(bad(format!("derived: unknown key {k}")));
@@ -2013,7 +2347,7 @@ pub fn check_derived(p: &Planner, v: &Value, content_rev: u64) -> WsResult<Value
     }
     out.insert("inputs".into(), Value::Array(norm));
     out.insert("generated_rev".into(), json!(content_rev));
-    for k in ["simulated", "at", "output_mode", "group", "model_judgment", "external_data"] {
+    for k in ["at", "output_mode", "group", "model_judgment", "external_data"] {
         if let Some(x) = o.get(k) {
             out.insert(k.into(), x.clone());
         }
@@ -2072,14 +2406,16 @@ fn check_build_record(p: &Planner, o: &Map<String, Value>, content_rev: u64) -> 
 
 // ---- Source (内核架构改进 D12, D24, D26): where a data entity's content comes from ----
 
-/// `source{ kind: url | workspace, url?, zone?, workspace_id?, entity_id?, mode: live | fixed, version?, query?,
-/// refresh?: { interval_s }, auth_mode: none | hosted, name? }`. An entity with a Source is read-only for Blocks
-/// and people: its content is written only by a refresh run (commit origin `source`). Credentials never
-/// belong in it (§6.2): `auth_mode: hosted` means the owner's Agent refreshes it.
+/// `source{ kind: url | workspace | zone | session, url?, zone?, workspace_id?, entity_id?, path?, mode: live | fixed,
+/// version?, query?, refresh?: { interval_s }, auth_mode: none | hosted, name?, def?, sync? }`. An entity with a Source is
+/// read-only for Blocks and people: its content is written only by a refresh run (commit origin `source`). Credentials
+/// never belong in it (§6.2): `auth_mode: hosted` means the owner's Agent refreshes it. `kind: zone` reads a file of the
+/// workspace owner's home (`path`, AI Native 余下任务 §7.2); `def` says what the data is (meaning, primary key,
+/// freshness, row limit); `sync` names the Agent's sync task that writes the file (§8.2, [`check_source_sync`]).
 pub fn check_source(v: &Value) -> WsResult<()> {
     let o = v.as_object().ok_or_else(|| bad("source must be an object"))?;
     for k in o.keys() {
-        if !matches!(k.as_str(), "kind" | "url" | "zone" | "workspace_id" | "entity_id" | "mode" | "version" | "query" | "refresh" | "auth_mode" | "name" | "feed") {
+        if !matches!(k.as_str(), "kind" | "url" | "zone" | "workspace_id" | "entity_id" | "path" | "mode" | "version" | "query" | "refresh" | "auth_mode" | "name" | "feed" | "def" | "sync") {
             return Err(bad(format!("source: unknown key {k}")));
         }
     }
@@ -2105,6 +2441,18 @@ pub fn check_source(v: &Value) -> WsResult<()> {
                 check_absolute_url(u.as_str().unwrap_or(""))?;
             }
         }
+        Some("zone") => {
+            if o.keys().any(|k| !matches!(k.as_str(), "kind" | "path" | "mode" | "refresh" | "name" | "def" | "sync")) {
+                return Err(bad("a zone source has kind, path, mode, refresh, name, def and sync only"));
+            }
+            let segs = zone_path_segments(o.get("path").and_then(Value::as_str).unwrap_or(""))?;
+            if let Some(sync) = o.get("sync") {
+                check_source_sync(sync, &segs)?;
+            }
+            if o.get("mode").is_some_and(|m| m != "live") {
+                return Err(bad("a zone source is live"));
+            }
+        }
         Some("session") => {
             // a session feed (第四期规划 §5.3, Q19): live only, refreshed by the session service, never fetched
             if !o.get("feed").and_then(Value::as_str).is_some_and(|f| SESSION_FEEDS.contains(&f)) {
@@ -2114,10 +2462,13 @@ pub fn check_source(v: &Value) -> WsResult<()> {
                 return Err(bad("a session source has kind, feed, mode and name only"));
             }
         }
-        _ => return Err(bad("source.kind must be url, workspace or session")),
+        _ => return Err(bad("source.kind must be url, workspace, zone or session")),
     }
     if o.get("kind").and_then(Value::as_str) != Some("session") && o.contains_key("feed") {
         return Err(bad("source.feed belongs to a session source"));
+    }
+    if o.get("kind").and_then(Value::as_str) != Some("zone") && o.contains_key("sync") {
+        return Err(bad("source.sync belongs to a zone source"));
     }
     match (o.get("mode").and_then(Value::as_str), o.get("version")) {
         (None | Some("live"), None) => {}
@@ -2135,8 +2486,8 @@ pub fn check_source(v: &Value) -> WsResult<()> {
     }
     if let Some(r) = o.get("refresh") {
         let secs = r.get("interval_s").and_then(Value::as_u64).ok_or_else(|| bad("source.refresh.interval_s must be a number of seconds"))?;
-        if secs < 60 {
-            return Err(bad("source.refresh.interval_s is at least 60"));
+        if secs < MIN_REFRESH_INTERVAL_S {
+            return Err(bad(format!("source.refresh.interval_s is at least {MIN_REFRESH_INTERVAL_S}")));
         }
         if r.as_object().is_some_and(|m| m.keys().any(|k| k != "interval_s")) {
             return Err(bad("source.refresh: only interval_s"));
@@ -2151,7 +2502,126 @@ pub fn check_source(v: &Value) -> WsResult<()> {
             return Err(bad("source.name must be a short string"));
         }
     }
+    if let Some(d) = o.get("def") {
+        check_source_def(d)?;
+    }
     Ok(())
+}
+
+/// The shortest refresh interval a Source may ask for (B5-2, a placeholder until the DV says otherwise).
+pub const MIN_REFRESH_INTERVAL_S: u64 = 900;
+/// The most rows `def.limit` may keep.
+pub const MAX_SOURCE_LIMIT: u64 = 100_000;
+
+/// `source.def { meaning, origin?, primary_key?, freshness?: { max_age_s }, limit? }` (B0-1): what the data means, where
+/// it comes from, the fields that identify a record, how old it may get, and how many rows of it the workspace keeps.
+pub fn check_source_def(v: &Value) -> WsResult<()> {
+    let o = v.as_object().ok_or_else(|| bad("source.def must be an object"))?;
+    if let Some(k) = o.keys().find(|k| !matches!(k.as_str(), "meaning" | "origin" | "primary_key" | "freshness" | "limit")) {
+        return Err(bad(format!("source.def: unknown key {k}")));
+    }
+    if !o.get("meaning").and_then(Value::as_str).is_some_and(|m| !m.trim().is_empty() && m.chars().count() <= 2000) {
+        return Err(bad("source.def.meaning (what the data is, at most 2000 chars) required"));
+    }
+    if o.get("origin").is_some_and(|x| !x.as_str().is_some_and(|m| m.chars().count() <= 2000)) {
+        return Err(bad("source.def.origin must be a string of at most 2000 chars"));
+    }
+    if let Some(k) = o.get("primary_key") {
+        let ok = k.as_array().is_some_and(|a| (1..=4).contains(&a.len()) && a.iter().all(|f| f.as_str().is_some_and(|f| !f.is_empty() && f.len() <= 128)));
+        let unique = k.as_array().is_some_and(|a| a.iter().filter_map(Value::as_str).collect::<BTreeSet<_>>().len() == a.len());
+        if !ok || !unique {
+            return Err(bad("source.def.primary_key must list 1 to 4 distinct field ids"));
+        }
+    }
+    if let Some(f) = o.get("freshness") {
+        let ok = f.as_object().is_some_and(|m| m.len() == 1) && f.get("max_age_s").and_then(Value::as_u64).is_some_and(|s| s >= 1);
+        if !ok {
+            return Err(bad("source.def.freshness must be { max_age_s } (seconds)"));
+        }
+    }
+    if o.get("limit").is_some_and(|l| !l.as_u64().is_some_and(|n| (1..=MAX_SOURCE_LIMIT).contains(&n))) {
+        return Err(bad(format!("source.def.limit must be 1..{MAX_SOURCE_LIMIT}")));
+    }
+    Ok(())
+}
+
+/// The segments of a zone source's path: `/home/<owner>/<rest…>`, each a plain name (no `.`, `..`, empty segment or
+/// separator). The owner is checked when the source is read: the workspace's owner then.
+pub fn zone_path_segments(path: &str) -> WsResult<Vec<&str>> {
+    let rest = path.strip_prefix('/').filter(|_| path.len() <= 1024).ok_or_else(|| bad("source.path must be an absolute Zone path /home/<owner>/…"))?;
+    let segs: Vec<&str> = rest.split('/').collect();
+    if segs.len() < 3 || segs[0] != "home" || segs.iter().any(|s| s.is_empty() || *s == "." || *s == ".." || s.contains(['\\', '\0']) || s.chars().any(char::is_control)) {
+        return Err(bad("source.path must be a file in the owner's home: /home/<owner>/…, without . or .. segments"));
+    }
+    Ok(segs)
+}
+
+/// `source.sync { agent_id, task_id }` (AI Native 余下任务 §8.2): the owner's Agent runs the sync task `task_id` and leaves
+/// its output in its AgentRoot, so the source reads exactly that file: `path` is
+/// `/home/<owner>/agents/<agent_id>/sync/<task_id>/out.json`. The service asks the Agent to run the task before it reads the
+/// file on a triggered refresh; that the Agent is the current owner's is checked then, with the owner.
+pub fn check_source_sync(sync: &Value, path: &[&str]) -> WsResult<()> {
+    let o = sync.as_object().ok_or_else(|| bad("source.sync must be { agent_id, task_id }"))?;
+    let id = |k: &str| o.get(k).and_then(Value::as_str).filter(|v| !v.is_empty() && v.len() <= 253);
+    let (Some(agent), Some(task)) = (id("agent_id"), id("task_id")) else { return Err(bad("source.sync must be { agent_id, task_id }")) };
+    if o.len() != 2 {
+        return Err(bad("source.sync has agent_id and task_id only"));
+    }
+    if path.len() != 7 || path[2] != "agents" || path[3] != agent || path[4] != "sync" || path[5] != task || path[6] != "out.json" {
+        return Err(bad(format!("a synced source reads its task's output: source.path must be /home/<owner>/agents/{agent}/sync/{task}/out.json")));
+    }
+    Ok(())
+}
+
+/// The definition of a sourced entity's data (`source.def`), when it has one.
+pub fn source_def(e: &EntityRow) -> Option<&Value> {
+    e.payload.get("source").and_then(|s| s.get("def")).filter(|d| d.is_object())
+}
+
+/// Types that can carry a Source.
+pub const SOURCE_TYPES: &[&str] = &[TYPE_TABLE, TYPE_RICHTEXT, TYPE_RECORD, TYPE_ASSET, TYPE_DIR];
+/// Types a refresh writes content into: they carry `data_version` and can be pending.
+pub const REFRESHED_TYPES: &[&str] = &[TYPE_TABLE, TYPE_RICHTEXT, TYPE_ASSET];
+
+/// A data source defined but not yet satisfied (B0-3): a fetched Source (not a session feed) whose refresh has not
+/// written a data version yet. It is no valid dependency: no rows to read, never shown as an empty table.
+pub fn data_pending(e: &EntityRow) -> bool {
+    REFRESHED_TYPES.contains(&e.type_id.as_str()) && has_source(e) && session_feed(e).is_none() && !e.payload.get("data_version").is_some_and(Value::is_object)
+}
+
+/// `data_version` (B0-2): the version a refresh wrote, only with a Source and only by the refresh (origin `source`;
+/// an import or clone carries it). Without a Source it goes with the Source.
+pub(crate) fn check_data_version(p: &Planner, e: &mut EntityRow, before: Option<&EntityRow>) -> WsResult<()> {
+    let Some(v) = e.payload.get("data_version") else { return Ok(()) };
+    let changed = before.is_none_or(|b| b.payload.get("data_version") != Some(v));
+    if !has_source(e) {
+        if changed {
+            return Err(bad("data_version belongs to an entity with a Source"));
+        }
+        e.payload.remove("data_version");
+        return Ok(());
+    }
+    if changed && !(p.env.origin == "source" || p.env.internal || p.env.import || p.env.replay) {
+        return Err(WsError::sub(Code::InvalidOperation, "SOURCE_READ_ONLY", format!("{}: data_version is written by the Source's refresh", e.entity_id)));
+    }
+    let o = v.as_object().ok_or_else(|| bad("data_version must be an object"))?;
+    if let Some(k) = o.keys().find(|k| !matches!(k.as_str(), "synced_at" | "business_time" | "produced_at" | "program" | "records" | "truncated" | "content_root")) {
+        return Err(bad(format!("data_version: unknown key {k}")));
+    }
+    if !o.get("synced_at").and_then(Value::as_str).is_some_and(|s| crate::value::parse_datetime_ms(s).is_some()) || canonical_len(v) > 4096 {
+        return Err(bad("data_version needs synced_at (a time) and stays under 4 KiB"));
+    }
+    Ok(())
+}
+
+/// Changing where an entity's data comes from — adding, changing (its `def` too) or removing a Source — is the
+/// workspace owner's (an Agent working for the owner included; B4-1, §6 Q7, Q13). A session feed is the session
+/// service's; imports, clones and internal paths carry what they have.
+pub fn require_source_owner(p: &Planner, entity_id: &str) -> WsResult<()> {
+    if p.access.is_owner() || p.env.internal || p.env.import || p.env.replay || matches!(p.env.origin.as_str(), "session" | "source") {
+        return Ok(());
+    }
+    Err(WsError::denied(format!("only the workspace owner sets the Source of {entity_id}")))
 }
 
 fn check_absolute_url(url: &str) -> WsResult<()> {
@@ -2235,7 +2705,7 @@ pub fn check_query_reference(v: &Value) -> WsResult<()> {
 
 /// Validator class: primitive (`title_field_id` names a live text field, `data_mode` fixed); schema for `description` and the `url_query` reference.
 fn validate_table_meta(p: &Planner, e: &mut EntityRow, before: Option<&EntityRow>) -> WsResult<()> {
-    check_keys(&e.payload, &["title_field_id", "description", "data_mode", "source_ref", "source"], "table")?;
+    check_keys(&e.payload, &["title_field_id", "description", "data_mode", "source_ref", "source", "data_version"], "table")?;
     opt_text(&e.payload, "description", 4000)?;
     if let Some(s) = e.payload.get("source") {
         check_source(s)?;
@@ -2289,7 +2759,13 @@ pub fn validate_primitive(p: &mut Planner, before: Option<&EntityRow>, e: &mut E
     }
     let has = |k: &str| changed.is_none_or(|c| c.iter().any(|x| x == k));
     match e.type_id.as_str() {
-        TYPE_CONTAINER => container_primitive(p, e, before),
+        TYPE_CONTAINER => {
+            container_primitive(p, e, before)?;
+            if e.payload.get("kind").and_then(Value::as_str) == Some("root") {
+                root_cover(p, e, before)?;
+            }
+            Ok(())
+        }
         TYPE_CELL => {
             // a line and a box are different geometries over the same placement: one object never turns into the other
             if let Some(b) = before {
@@ -2316,6 +2792,7 @@ pub fn validate_primitive(p: &mut Planner, before: Option<&EntityRow>, e: &mut E
                     }
                 }
             }
+            check_data_version(p, e, before)?;
             validate_asset(p, e)
         }
         TYPE_TABLE => {
@@ -2323,17 +2800,18 @@ pub fn validate_primitive(p: &mut Planner, before: Option<&EntityRow>, e: &mut E
             if before.is_some() && has("source_ref") {
                 p.require(&e.entity_id, Cap::Structure)?;
             }
+            check_data_version(p, e, before)?;
             validate_table_meta(p, e, before)
         }
         TYPE_RICHTEXT if before.is_some() => {
-            // a rich text's content is edited with richtext.* operations; its Source is a key
-            if changed.unwrap_or(&[]).iter().any(|k| k != "source") {
+            // a rich text's content is edited with richtext.* operations; its Source and data version are keys
+            if changed.unwrap_or(&[]).iter().any(|k| k != "source" && k != "data_version") {
                 return Err(WsError::invalid_op("rich text content is edited with richtext.* operations"));
             }
-            match e.payload.get("source") {
-                Some(s) => check_source(s),
-                None => Ok(()),
+            if let Some(s) = e.payload.get("source") {
+                check_source(s)?;
             }
+            check_data_version(p, e, before)
         }
         TYPE_DIR => {
             if before.is_some() && has("members") {
@@ -2353,6 +2831,7 @@ pub fn validate_primitive(p: &mut Planner, before: Option<&EntityRow>, e: &mut E
 pub fn validate_schema(p: &mut Planner, before: Option<&EntityRow>, e: &mut EntityRow, changed: Option<&[String]>) -> WsResult<()> {
     SCHEMA_RUNS.with(|c| c.set(c.get() + 1));
     match e.type_id.as_str() {
+        TYPE_TABLE => crate::standard::check_table(p, before, e, changed),
         TYPE_CONTAINER => container_schema(e),
         TYPE_RECORD => validate_record(p, e, changed),
         TYPE_CELL => validate_cell(p, e, changed),
@@ -2548,6 +3027,9 @@ pub fn init_entity(p: &mut Planner, row: &mut EntityRow, mut payload: JsonMap) -
                     deleted_seq: None,
                 });
             }
+            if recorded.iter().filter(|f| f["submitter"] == json!(true)).count() > 1 {
+                return Err(bad("a table has at most one submitter field"));
+            }
             if let Some(t) = title {
                 row.payload.insert("title_field_id".into(), t);
             }
@@ -2601,8 +3083,16 @@ fn ref_edge(src: &str, selector: &str, kind: &str, reference: &Value) -> RefEdge
 /// bodies and rich text references are maintained by their own planners.)
 pub fn entity_refs(e: &EntityRow) -> WsResult<BTreeSet<RefEdge>> {
     let mut out = BTreeSet::new();
+    // a wish's run logs may print what a reader of the wish cannot read: their own kind, read with `update` (D9)
+    let logs: BTreeSet<&str> = if e.type_id == TYPE_WISH {
+        let objects = crate::wish::history_objects(&e.payload);
+        let plain: BTreeSet<&str> = objects.iter().filter(|(_, log)| !log).map(|(id, _)| *id).chain(text_of(e.payload.get("program").and_then(|p| p.get("source")))).collect();
+        objects.iter().filter(|(id, log)| *log && !plain.contains(id)).map(|(id, _)| *id).collect()
+    } else {
+        BTreeSet::new()
+    };
     for object_id in asset_object_ids(&e.type_id, &e.payload) {
-        let mut edge = RefEdge::local(&e.entity_id, "", "asset", "");
+        let mut edge = RefEdge::local(&e.entity_id, "", if logs.contains(object_id) { "log" } else { "asset" }, "");
         edge.dst_object_id = object_id.to_string();
         out.insert(edge);
     }
@@ -2625,9 +3115,11 @@ pub fn entity_refs(e: &EntityRow) -> WsResult<BTreeSet<RefEdge>> {
             if let Some(d) = e.payload.get("def_ref") {
                 out.insert(ref_edge(&e.entity_id, "", "def", d));
             }
-            for (name, target) in e.payload.get("bindings").and_then(Value::as_object).into_iter().flatten() {
+            for (name, binding) in e.payload.get("bindings").and_then(Value::as_object).into_iter().flatten() {
                 let s = selector_string(&json!({ "kind": "binding", "name": name }));
-                out.insert(ref_edge(&e.entity_id, &s, "bind", target));
+                for target in binding_targets(binding) {
+                    out.insert(ref_edge(&e.entity_id, &s, "bind", target));
+                }
             }
             // endpoint bindings: listed in relations, never blocking deletion (the line freezes instead, §6)
             if is_connector(&e.type_id, &e.payload) {
@@ -2701,9 +3193,11 @@ pub fn entity_refs(e: &EntityRow) -> WsResult<BTreeSet<RefEdge>> {
             if let Some(d) = e.payload.get("def_ref") {
                 out.insert(ref_edge(&e.entity_id, "", "def", d));
             }
-            for (name, target) in e.payload.get("bindings").and_then(Value::as_object).into_iter().flatten() {
+            for (name, binding) in e.payload.get("bindings").and_then(Value::as_object).into_iter().flatten() {
                 let s = selector_string(&json!({ "kind": "binding", "name": name }));
-                out.insert(ref_edge(&e.entity_id, &s, "bind", target));
+                for target in binding_targets(binding) {
+                    out.insert(ref_edge(&e.entity_id, &s, "bind", target));
+                }
             }
         }
         _ => {}
@@ -2711,13 +3205,19 @@ pub fn entity_refs(e: &EntityRow) -> WsResult<BTreeSet<RefEdge>> {
     Ok(out)
 }
 
-/// The stored content objects an entity's payload names: an AssetRef's file and its poster, a Block snapshot, a wish program.
+fn text_of(v: Option<&Value>) -> Option<&str> {
+    v.and_then(Value::as_str)
+}
+
+/// The stored content objects an entity's payload names: an AssetRef's file and its poster, a Block snapshot, a wish program
+/// and the objects of its run records, the Workspace's cover (the root's settings).
 pub fn asset_object_ids<'a>(type_id: &str, payload: &'a JsonMap) -> Vec<&'a str> {
     let text = |v: Option<&'a Value>| v.and_then(Value::as_str);
     match type_id {
         TYPE_ASSET => [text(payload.get("object_id")), text(payload.get("poster"))].into_iter().flatten().collect(),
         TYPE_CELL => text(payload.get("config").and_then(|c| c.get("snapshot")).and_then(|s| s.get("object_id"))).into_iter().collect(),
-        TYPE_WISH => text(payload.get("program").and_then(|p| p.get("source"))).into_iter().collect(),
+        TYPE_WISH => text(payload.get("program").and_then(|p| p.get("source"))).into_iter().chain(crate::wish::history_objects(payload).into_iter().map(|(id, _)| id)).collect(),
+        TYPE_CONTAINER if text(payload.get("kind")) == Some("root") => text(payload.get("config").and_then(|c| c.get("cover")).and_then(|c| c.get("object_id"))).into_iter().collect(),
         _ => vec![],
     }
 }

@@ -8,7 +8,7 @@
 //! side; nothing is stored here.
 //!
 //! Only non-driver operations travel: reads and signed writes (`register`,
-//! `post_input`, `notebook_append`, `decide`). What a driver writes under
+//! `post_input`, `decide`). What a driver writes under
 //! its lease (`report_state`, `perception.append`, cursors, artifact
 //! versions) and the Agent-level locks depend on flock and stay with the
 //! processes that see the AgentRoot.
@@ -114,7 +114,7 @@ pub fn is_write(method: &str) -> bool {
             | "sessions.register"
             | "sessions.post_input"
             | "sessions.verify"
-            | "cognition.notebook_append"
+            | "sessions.delete"
             | "artifacts.decide"
             | "workspaces.create"
             | "workspaces.import"
@@ -135,11 +135,12 @@ pub fn is_write(method: &str) -> bool {
             | "goals.set_status"
             | "goals.reopen"
             | "goals.restart"
+            | "goals.set_check"
             | "notify.send"
             | "notify.cancel"
             | "notify.answer"
-            | "skills.install"
-            | "skills.remove"
+            | "skills.note_frozen"
+            | "skills.revise"
     )
 }
 
@@ -205,6 +206,10 @@ pub async fn serve_call(
             Err(e) => Err(e),
         },
         "sessions.verify" => agent.sessions().verify().await.and_then(out),
+        "sessions.delete" => match arg::<String>(params, "sid") {
+            Ok(sid) => agent.sessions().delete(&sid).await.map(|deleted| serde_json::json!({ "deleted": deleted })),
+            Err(e) => Err(e),
+        },
         "sessions.post_input" => {
             match (arg::<String>(params, "sid"), arg::<PostedInput>(params, "input")) {
                 (Ok(sid), Ok(mut input)) => {
@@ -238,13 +243,17 @@ pub async fn serve_call(
             Ok(sid) => agent.perception().last_seq(&sid).await.and_then(out),
             Err(e) => Err(e),
         },
-        "cognition.recall_hints" => match arg::<RecallQuery>(params, "query") {
-            Ok(q) => agent.cognition().recall_hints(&q).await.and_then(out),
-            Err(e) => Err(e),
+        // As the session's own identity (its configuration binds it).
+        "cognition.query" => match (
+            arg::<String>(params, "session"),
+            arg::<crate::memory::MemoryQuery>(params, "query"),
+        ) {
+            (Ok(sid), Ok(q)) => agent.cognition().query(&sid, &q).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
         },
-        "cognition.notebook_append" => match arg::<NotebookNote>(params, "note") {
-            Ok(n) => agent.cognition().notebook_append(&n, who).await.and_then(out),
-            Err(e) => Err(e),
+        "cognition.read" => match (arg::<String>(params, "session"), arg::<String>(params, "reference")) {
+            (Ok(sid), Ok(r)) => agent.cognition().read(&sid, &r).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
         },
         "artifacts.head" => match arg::<String>(params, "aid") {
             Ok(aid) => agent.artifacts().head(&aid).await.and_then(out),
@@ -370,20 +379,18 @@ pub async fn serve_call(
             Ok(kind) => agent.behaviors().skills(kind).await.and_then(out),
             Err(e) => Err(e),
         },
-        "skills.install" => match (
-            arg::<crate::skills::SkillPackage>(params, "package"),
-            arg::<Option<bool>>(params, "replace"),
-        ) {
-            (Ok(pkg), Ok(replace)) => agent
-                .behaviors()
-                .install_skills(&pkg, replace.unwrap_or(false), who)
-                .await
-                .and_then(out),
+        "skills.note_frozen" => match (arg::<Vec<String>>(params, "names"), arg::<String>(params, "session_id")) {
+            (Ok(names), Ok(sid)) => agent.behaviors().note_skills_frozen(&names, &sid).await.and_then(out),
             (Err(e), _) | (_, Err(e)) => Err(e),
         },
-        "skills.remove" => match (arg::<SkillKind>(params, "kind"), arg::<String>(params, "name")) {
-            (Ok(kind), Ok(name)) => agent.behaviors().remove_skill(kind, &name, who).await.and_then(out),
-            (Err(e), _) | (_, Err(e)) => Err(e),
+        "skills.revise" => match (
+            arg::<SkillKind>(params, "kind"),
+            arg::<String>(params, "name"),
+            arg::<String>(params, "text"),
+            arg::<String>(params, "reason"),
+        ) {
+            (Ok(kind), Ok(name), Ok(text), Ok(reason)) => agent.behaviors().revise_skill(kind, &name, &text, &reason, who).await.and_then(out),
+            (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => Err(e),
         },
         "goals.list" => agent.goals().list().await.and_then(out),
         "goals.get" => match arg::<String>(params, "goal_id") {
@@ -441,6 +448,28 @@ pub async fn serve_call(
         ) {
             (Ok(id), Ok(req), Ok(c)) => agent.goals().restart(&id, &req, &c).await.and_then(out),
             (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.set_check" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalCheckChange>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().set_check(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.check_script" => match (arg::<String>(params, "goal_id"), arg::<Option<u64>>(params, "version")) {
+            (Ok(id), Ok(v)) => agent.goals().check_script(&id, v).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "memory.status" => match agent.agent_root() {
+            Some(root) => {
+                let full = arg::<Option<bool>>(params, "full").ok().flatten().unwrap_or(false);
+                crate::host::maintenance::memory_status(root, full)
+                    .await
+                    .map_err(|e| OpenDanError::Other(format!("memory status: {e}")))
+                    .and_then(out)
+            }
+            None => Err(OpenDanError::InvalidArgument("memory.status needs the AgentRoot".into())),
         },
         "goals.state" => match arg::<String>(params, "goal_id") {
             Ok(id) => agent.goals().state(&id).await.and_then(out),
@@ -659,6 +688,10 @@ impl SessionRegistry for KrpcAgentStateClient {
     async fn post_input(&self, sid: &str, input: &PostedInput) -> Result<u64> {
         self.call("sessions.post_input", json!({ "sid": sid, "input": input })).await
     }
+    async fn delete(&self, sid: &str) -> Result<Vec<String>> {
+        let out: Value = self.call("sessions.delete", json!({ "sid": sid })).await?;
+        serde_json::from_value(out["deleted"].clone()).map_err(|e| OpenDanError::Other(format!("sessions.delete: {e}")))
+    }
 }
 
 #[async_trait]
@@ -684,11 +717,11 @@ impl Perception for KrpcAgentStateClient {
 
 #[async_trait]
 impl Cognition for KrpcAgentStateClient {
-    async fn recall_hints(&self, q: &RecallQuery) -> Result<Vec<Hint>> {
-        self.call("cognition.recall_hints", json!({ "query": q })).await
+    async fn query(&self, sid: &str, q: &crate::memory::MemoryQuery) -> Result<crate::memory::QueryResult> {
+        self.call("cognition.query", json!({ "session": sid, "query": q })).await
     }
-    async fn notebook_append(&self, note: &NotebookNote, _who: &str) -> Result<()> {
-        self.call("cognition.notebook_append", json!({ "note": note })).await
+    async fn read(&self, sid: &str, reference: &str) -> Result<crate::memory::MemoryRead> {
+        self.call("cognition.read", json!({ "session": sid, "reference": reference })).await
     }
 }
 
@@ -758,16 +791,11 @@ impl BehaviorCatalog for KrpcAgentStateClient {
     async fn skills_status(&self, runtime_id: Option<&str>) -> Result<serde_json::Value> {
         self.call("skills.status", json!({ "runtime_id": runtime_id })).await
     }
-    async fn install_skills(
-        &self,
-        pkg: &crate::skills::SkillPackage,
-        replace: bool,
-        _who: &str,
-    ) -> Result<crate::skills::InstallReport> {
-        self.call("skills.install", json!({ "package": pkg, "replace": replace })).await
+    async fn note_skills_frozen(&self, names: &[String], session_id: &str) -> Result<()> {
+        self.call("skills.note_frozen", json!({ "names": names, "session_id": session_id })).await
     }
-    async fn remove_skill(&self, kind: SkillKind, name: &str, _who: &str) -> Result<SkillMeta> {
-        self.call("skills.remove", json!({ "kind": kind, "name": name })).await
+    async fn revise_skill(&self, kind: SkillKind, name: &str, text: &str, reason: &str, _who: &str) -> Result<SkillMeta> {
+        self.call("skills.revise", json!({ "kind": kind, "name": name, "text": text, "reason": reason })).await
     }
 }
 
@@ -894,6 +922,16 @@ impl GoalStore for KrpcAgentStateClient {
             json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
         )
         .await
+    }
+    async fn set_check(&self, goal_id: &str, req: &GoalCheckChange, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call(
+            "goals.set_check",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn check_script(&self, goal_id: &str, version: Option<u64>) -> Result<Option<String>> {
+        self.call("goals.check_script", json!({ "goal_id": goal_id, "version": version })).await
     }
     async fn state(&self, goal_id: &str) -> Result<Option<GoalState>> {
         self.call("goals.state", json!({ "goal_id": goal_id })).await

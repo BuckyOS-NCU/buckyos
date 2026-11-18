@@ -29,8 +29,17 @@ pub fn list() -> Value {
 /// `control.describe { kind }`: the whole catalogue entry, with the self-description an Agent follows.
 pub fn describe(kind: &str) -> WsResult<Value> {
     let catalog = crate::wish::controls_catalog();
-    let control = catalog["controls"].as_array().into_iter().flatten().find(|c| c["kind"] == kind).cloned()
+    let mut control = catalog["controls"].as_array().into_iter().flatten().find(|c| c["kind"] == kind).cloned()
         .ok_or_else(|| WsError::not_found(format!("no control {kind:?} (control.list names them)")))?;
+    // an official data control's public contract (控件机制 TODO G13): component.json's shape, versioned
+    let contract = match kind {
+        "todo" => Some(include_str!("../../aiws/contracts/todo.json")),
+        "calendar" => Some(include_str!("../../aiws/contracts/calendar.json")),
+        _ => None,
+    };
+    if let Some(c) = contract.and_then(|c| serde_json::from_str::<Value>(c).ok()) {
+        control["contract"] = c;
+    }
     Ok(json!({ "ok": true, "control": control }))
 }
 
@@ -47,7 +56,8 @@ pub fn export(ws: &Workspace, caller: &Caller, p: &Value) -> WsResult<Value> {
     let id = p.get("entity_id").and_then(Value::as_str).ok_or_else(|| WsError::invalid_op("entity_id required"))?;
     let format = format_of(p)?;
     let outline = ws.outline(caller)?;
-    let entities = outline["entities"].as_array().cloned().unwrap_or_default();
+    // path nodes (what the caller cannot read, listed above what it can) are not part of the control as it reads it
+    let entities: Vec<Value> = outline["entities"].as_array().into_iter().flatten().filter(|e| e["path_only"] != json!(true)).cloned().collect();
     let container = entities.iter().find(|e| e["entity_id"] == id).ok_or_else(|| WsError::not_found(format!("entity {id} not found")))?;
     let kind = container["kind"].as_str().filter(|k| is_control_kind(k)).ok_or_else(|| WsError::invalid_op(format!("{id} is not a control")))?.to_string();
     // the outline lists children in sibling order after their parent

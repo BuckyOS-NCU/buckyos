@@ -11,22 +11,13 @@ IMAGE_NAME="${IMAGE_NAME:-}"
 VERSION_FILE="$SRC_DIR/VERSION"
 VERSION_TAG="${VERSION_TAG:-}"
 SUPPORTED_ARCHES=("amd64" "aarch64")
-# Core runtime + predefined Worker Image CLI tool set (see container
-# requirements §6.3). No compile toolchain — Crafter is deferred. Python apps
-# use uv with this system Python 3.12; Node.js comes from the official tarball
-# (NODE_VERSION in the Dockerfile), not Debian's EOL nodejs/npm. pandoc is a
-# tool package of the ExtTool volume (publish/exttool/install_pandoc.sh).
-# ffmpeg / poppler-utils / LibreOffice headless / fonts / locales are the
-# workflow media tool baseline (doc/workflow/media tool baseline.md); the
-# workflow host must carry the same set, the image alone does not satisfy it.
-# Only what is not an extension package's: the tools of ext-core come from the node's
-# tools volume (doc/app_service/paios容器需求.md §6.4 table B). The second group is the
-# planned ext-office (table C).
+# Only what is not an extension package's (doc/app_service/paios容器需求.md §6.3):
+# every command an Agent has beyond the core layer, LibreOffice headless and its
+# fonts included, comes from ext-core on the node's tools volume (§6.4 table B).
+# No compile toolchain — Crafter is deferred. bash and rsync are Linux-only and
+# not in ext-core.
 RUNTIME_PACKAGES=(
   "bash" "ca-certificates" "rsync"
-  "libreoffice-core-nogui" "libreoffice-writer-nogui" "libreoffice-impress-nogui" "libreoffice-calc-nogui"
-  "fonts-dejavu-core" "fonts-liberation" "fonts-noto-core" "fonts-noto-cjk"
-  "locales"
 )
 EXTRA_APT_PACKAGES=()
 SELECTED_ARCHES=()
@@ -563,6 +554,12 @@ config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", 
 PY
 }
 
+prepare_license_materials() {
+  local context_dir="$1"
+  local python_bin="$2"
+  "$python_bin" "$SRC_DIR/tools/prepare_licenses.py" --output "$context_dir/licenses/buckyos"
+}
+
 render_dockerfile() {
   local output_path="$1"
   local -a apt_packages=("${RUNTIME_PACKAGES[@]}")
@@ -587,6 +584,20 @@ ARG OPENDAN_SHA256
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# The virtual display the Agent's browser runs headed on (TigerVNC's Xvnc; Agent
+# Browser Protocol §6, container spec §6.3). Its package pulls in Mesa and LLVM
+# through libGL and Perl for the vncserver wrapper; Xvnc uses neither, so a
+# placeholder package stands in for them and apt's state stays consistent.
+RUN mkdir -p /tmp/xvnc-shim/DEBIAN && printf '%s\n' \
+      'Package: buckyos-xvnc-shim' 'Version: 1' 'Architecture: all' 'Multi-Arch: allowed' \
+      'Maintainer: BuckyOS' 'Provides: libglx-mesa0, libfile-readbackwards-perl (= 1.06), perl' \
+      'Description: lets Xvnc install without Mesa GLX or Perl, which it does not use' \
+      > /tmp/xvnc-shim/DEBIAN/control && \
+    dpkg-deb --build /tmp/xvnc-shim /tmp/buckyos-xvnc-shim.deb >/dev/null && \
+    apt-get update && apt-get install -y --no-install-recommends /tmp/buckyos-xvnc-shim.deb tigervnc-standalone-server && \
+    apt-get check && Xvnc -version 2>&1 | grep -q TigerVNC && \
+    rm -rf /tmp/xvnc-shim /tmp/buckyos-xvnc-shim.deb /var/lib/apt/lists/*
+
 # What the worker needs that is no extension tool (see container spec §6.4). The
 # GPU / LLVM stack that LibreOffice's dependencies drag in is never linked by the
 # headless tools, so it is dropped in the same layer.
@@ -603,9 +614,8 @@ EOF
        /usr/lib/*-linux-gnu/libGLX_mesa.so* \
     && rm -rf /usr/lib/*-linux-gnu/dri
 
-# UTF-8 locale for soffice (document -> PDF) and the other media tools; en_US.UTF-8
-# is generated so LibreOffice has a full locale besides C.UTF-8.
-RUN sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen en_US.UTF-8
+# C.UTF-8 is built into glibc: no locales package. ext-core's soffice launcher sets
+# it for itself where the environment has no UTF-8 locale.
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 COPY --from=core-deno /core/bin/deno /opt/buckyos/bin/opendan/deno
@@ -667,6 +677,7 @@ RUN mkdir -p \
 
 COPY --chmod=755 opendan /opt/buckyos/bin/opendan/
 COPY web /opt/buckyos/bin/opendan/web
+COPY licenses /opt/buckyos/licenses
 # One multi-call executable: agent_tool and xagent dispatch on argv[0].
 RUN printf '%s  %s\n' "${OPENDAN_SHA256}" /opt/buckyos/bin/opendan/opendan | sha256sum -c - && \
     ln -s opendan /opt/buckyos/bin/opendan/agent_tool && \
@@ -1463,6 +1474,7 @@ main() {
     platform="$(docker_platform_for_arch "$arch")"
     mkdir -p "$context_dir"
 
+    prepare_license_materials "$context_dir" "$python_bin"
     build_runtime_binaries "$arch" "$context_dir" "$cargo_target_dir" "$python_bin"
     cp -R "$buckyos_agent_package_dir" "$context_dir/buckyos-agent"
     cp -R "$buckyos_tool_check_dist_dir" "$context_dir/buckyos-tool-check-dist"

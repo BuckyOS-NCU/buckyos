@@ -1,30 +1,30 @@
 {
   "schema_version": 1,
-  "tool_version": "0.7.131",
-  "meta_root_id": "sha256:6c97f2b0a8669dc3724c4cac4d52d6f15dd9f298fcd656aef3f43f0a9b1e365f",
-  "source_fingerprint": "sha256:ac1e50729688122ec98af528227ab796050f01336c6cf812f560af12ab96bd04",
-  "app_doc_object_id": "appdoc:3e50b0b3c54000334aac68eeecb6ab7556f8f815d2c5384fa86c20208f81861b",
+  "tool_version": "0.7.173",
+  "meta_root_id": "sha256:97a183e3b4849836b87a98ef50ef13e84ed105d362ad8d92e08d39272aebd235",
+  "source_fingerprint": "sha256:ce2a1983567ed972662a31228cb197c69cdcf0e4986ea89a39e6fca80abbbf37",
+  "app_doc_object_id": "appdoc:3d0426b12614bbb9f58012483366ad0dd3f28e621ed93235bbc438cf3a5e3fbf",
   "pikg_file": "hello-skills-0.1.0.pikg",
   "generated_files": {
     "APPDOC.json": {
       "size": 711,
-      "digest": "sha256:9824a598e5fc1f1b1137d79314cda89c1ec0dda38b23c0f138eb8a71a9cf056c"
+      "digest": "sha256:8ae04eb8ce2211e9f30c2fe04f6a24da42b776de3f54e8aa36e97aa06b4d04cb"
     },
     "PACKAGE_META.json": {
       "size": 917,
-      "digest": "sha256:cdc303163c20a8052d71175c704d22e0eee00336a44a07768a55f4b66c266b2f"
+      "digest": "sha256:489e5b2b03c8bfb26292ae7b18c77dd3ac620aa60e80956af2c49f053de98eeb"
     },
     "agent_skills.tar.gz": {
-      "size": 531,
-      "digest": "sha256:f7a61e22c9a84b54bb18ff2abe2c38737070923ce2beaebecb10d82e420df2d3"
+      "size": 998,
+      "digest": "sha256:711f0e4574033e9241258d166a3a2aaa83d32fe73ff2478d4d58291a7f1039c9"
     }
   },
   "subpackages": {
     "agent_skills": {
       "source_kind": "path",
-      "size": 531,
-      "digest": "sha256:f7a61e22c9a84b54bb18ff2abe2c38737070923ce2beaebecb10d82e420df2d3",
-      "pkg_objid": "pkg:09aa22b7e786ae9619cafbf114695ae549cb612a40a3bd4688eea22d5b1b696a"
+      "size": 998,
+      "digest": "sha256:711f0e4574033e9241258d166a3a2aaa83d32fe73ff2478d4d58291a7f1039c9",
+      "pkg_objid": "pkg:7f0cd7625c93ade7e0a321bec0e1088b7c99e590338d624be222711ab63c3bd5"
     }
   }
 }

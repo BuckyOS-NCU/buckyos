@@ -1,5 +1,5 @@
-import type { AttachmentDirectory } from '../conversation/input/attachmentDraft'
-import { ObjectRouteError, retryingObjectRead, type ObjectAccess, type ObjectInfo } from '../conversation/history/objectAccess'
+import type { AttachmentDirectory } from '../../../components/conversation/input/attachmentDraft'
+import { ObjectRouteError, retryingObjectRead, type ObjectAccess, type ObjectInfo } from '../../../components/conversation/history/objectAccess'
 
 interface MockObject {
   name: string
@@ -237,6 +237,11 @@ export const mockObjectAccess: ObjectAccess = {
     const key = `${context.slice(context.lastIndexOf('/') + 1)}/${spec.name}`
     mockCollected.set(key, objId)
     return { bucketId: 'user/msg-center/mock/collected', key }
+  },
+  async prepareSave(objId, _context, innerPath) {
+    const id = resolveMockId(objId, innerPath)
+    if (!directories.has(id) && !specOf(id)) throw new Error('404 object unavailable')
+    return { objId: id, kind: directories.has(id) ? 'dir' : 'file' }
   },
 }
 

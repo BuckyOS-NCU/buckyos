@@ -26,6 +26,9 @@ links.ts                  the only definition of the addresses: `https://aiws-<i
 launch.ts                 going to a workspace's origin signed in (Control Panel `auth.prepare_app_launch { service_id: 'aiworkspace' }`)
 ui/controls/              Block-controls (the mind map): registry, folds, node measuring — see "Block-controls" below
 ui/extensions/            HTML / declarative hosts, and extension controls (dialog, instance form, home sources, define as control) — see "Extension controls"
+ui/print/                 导出可打印 PDF: the entry conditions, the dialog, generating (print.package → Workflow media.page) and saving, the
+                          workspace's print fonts — see "Printing" below
+print/renderer/           the print renderer the print package carries (aiws-print/ of the build) — see "Printing" below
 i18n.ts, useAiwsText.ts   the app's text in the Desktop's language — see "Language" below
 api/
   transport.ts            the only module that knows how to reach the service (zone path / dev override)
@@ -34,8 +37,11 @@ api/
                           OnlineWorkspaceSession (online direct mode): commit envelope, idempotency
                           keys, per-tab session_id, unknown-result resolution, change-stream
                           follower, EPOCH_MISMATCH / BASE_TOO_OLD stop
+  tableQuery.ts           a table view's rows without a replica: the view compiled by the core (WASM view_sql) and run
+                          with doc.query { sql } (URL tables: doc.source_query)
+  paths.ts                the one path syntax (/data/销售, ~<id>/…) over the tab's outline (the HTML host's resolve)
   sample.ts               "create sample": replays fixtures/project-workspace.commits.json
-  wasm.ts                 loader of the shared Rust core (order_key_between, rich text schema, canonical AST)
+  wasm.ts                 loader of the shared Rust core (order_key_between, rich text schema, canonical AST, view_sql)
   ids.ts, types.ts, testHooks.ts
 offline/                  the browser offline layer (design §6) — see "Offline" below
   protocol.ts             messages page ↔ Replica Worker, pending row / export shapes
@@ -77,18 +83,29 @@ state/userState.ts        user work state (mode, sub-mode, active Surface, viewp
                           IndexedDB + server
 state/recent.ts           the most recent workspace per service target and principal (app-level, localStorage)
 state/freshness.ts        subscribes to `doc.freshness`; the front end never derives freshness itself
+state/presence.ts         who is online (UI 框架 PRD K2): `usePresence()` registers this window (`presence.heartbeat`
+                          every 10 s, at once on a canvas switch, `presence.leave` when unused), self first; offline
+                          or refused, only this window's person; `presenceName`, `presenceGroupLabel` (所有者 / groups / 访客)
+state/worklog.ts          the work log (K3): `useWorkLog({ filter })` over `ws.work_log` (50 a page, `loadMore`), refreshed
+                          on Commits, this window's runs and every 15 s; `describeWorkLogEntry`, `workLogActor`, `workLogLocation`
 ui/
-  WorkspaceList.tsx       list / New (blank or template) / import / export / fork / delete
+  WorkspaceList.tsx       list / New (blank or template) / import / export / clone / delete
   WorkspaceView.tsx       store context + shell; registers the shipped Block definitions
   shell/                  WorkspaceShell (top-level views, active Surface, right panel, dialogs, layout preferences),
                           MainToolbar (icon, name, Surface switcher, data source, main menu, collaboration),
                           MainMenu (the function index), ViewToolbar (annotation, zoom and view navigation,
                           identity, share link), StatusSummary (the bottom-right status area: save / sync /
-                          connection, persistent alerts and notices; the 修改状态 panel), SidePanel, dialogs (New, export, import, help, Mock, leave check),
+                          connection, persistent alerts and notices; the 修改状态 panel), SidePanel, dialogs (New, export, import, help, leave check),
                           popover.tsx (popovers and keyboard menus), shellContext.ts, panels, annotations panel
-  sources/                data-source mode: DataTree (canvas content collapsed, filters), DataDetail (editors without a
-                          Block), RelationsPanel (doc.relations), PropertiesPanel (versions, restore), PermissionsPanel
-                          (presets, canvas permissions, subjects)
+  datamode/               the data mode (UI 框架 PRD §5; no tool-zone row above it): ObjectTree (its head holds 返回画布
+                          and the main menu; data sources by default, filters, search, the 宏 folder and the 工作区权限
+                          row last, the row menu of `data.*` actions, drag to move), tabs.ts (preview and
+                          fixed tabs in `ui:data-tabs`; `openDataEditor` opens an object's editor from anywhere),
+                          TabStrip / EditorHost (one mounted editor, scroll kept per tab), editors (each type's standard
+                          editor, a macro's task / code / runs pages), SideBar (属性 / 权限 / 修改记录), StatusInfo (the
+                          bar's object half), PhoneDataMode (one column: tree, editor, bottom panel), dialogs, ops
+  sources/                data-source helpers shared with the canvas: dataOps (type labels, new data), RelationsPanel
+                          (doc.relations), SourcePanel (publication, sources), FreshnessBadge, sourceLinks, presets
   canvas/                 CanvasView (sub-modes edit / view / path editing, selection, pointer tool,
                           one-shot placement, insert, clipboard, group, cross-Surface move, keyboard), ObjectToolbar,
                           InsertCatalog + catalog.ts (the one insert catalog), clipboard.ts, surfaceManage.tsx
@@ -129,14 +146,15 @@ ink/                      pen handwriting (notepads/aiworkspace-handwriting-todo
                           HtmlBlockHost.tsx + htmlRuntime.ts + bridge.ts (HTML extension Blocks: same-origin iframe,
                           `window.aiws` v2 API — named bindings, watch, typed writes in one batch —, snapshots,
                           local fallback)
-  wish/                   WishService (service runs `wish.xllm@1` / `wish.mock@1`: analyze, execute, feedback,
-                          re-run / repair the program, preview with choices, apply by plan digest, history),
-                          WishPanel + WishCandidate + WishPreviews, wishBlock, mockWishDef (the Mock executor as an
-                          HTML definition entity)
+  wish/                   WishService (service runs of `wish.xllm@1`: analyze, code (repair), run the macro,
+                          cancel, resume, roll back a run record), WishCard (the card: four tabs, the next-step
+                          button, the run button), WishRecords + records.ts (run records from `payload.history`),
+                          dialogs (request, task contract, macro, log, a version), WishInspector (the properties),
+                          ProgramView, wishBlock
   TableViewCell.tsx       virtualised table view (database grid: type icons, pills, tick boxes, "+ 新建" line, "+"
                           field column, arrow keys between cells), inline editing, filter / sort, conflicts; also the
                           source mode; fieldOps.ts (adding a field, shared with FieldManager)
-  tablePager.ts           keyset paging through doc.query, refresh from the change stream
+  tablePager.ts           paged rows of a table view (session.query: the replica's evaluator, or SQL compiled by the core), refresh from the change stream
   FieldManager.tsx        fields, options, migration pre-check
   annotations.tsx         cards next to a rich text, aligned with their anchors
   annotationInfo.ts       anchor states in words, labels, jump to an annotation
@@ -174,24 +192,22 @@ Desktop languages read English, like the rest of the Desktop.
 - **Where the language comes from.** The provider stores the choice before it re-renders (`src/i18n/provider.tsx`),
   so text produced outside React during that render is already in the new language. The Replica Worker has no
   page storage: every request carries the page's language (`WorkerRequest.locale`). HTML extensions get it as
-  `window.aiws.locale` and `<html lang>` (an extension shows English for a language it has no text for). The Mock
-  wish executor's script carries an English and a Chinese table, injected when its definition is created. The
+  `window.aiws.locale` and `<html lang>` (an extension shows English for a language it has no text for). The
   shared draw.io module (`@drawio/*`) stays language-free: it returns ids and codes, `ui/canvas/drawioText.ts`
   turns them into text. The offline start page of the service worker cannot read the Desktop's choice and says
   it in both languages, the browser's first.
 - **Text that becomes document data** — demo content, default names of new objects and canvases, edit and commit
-  labels, Mock wish results — is written in the language of the moment, like anything a user types.
-- **The backend speaks English** — its problem texts, the documents it writes (result group titles, the Mock
-  processing's output, commit messages), the data profile and the prompts it sends to models; it does not follow the
+  labels — is written in the language of the moment, like anything a user types. A wish's run records keep only
+  their material; `ui/wish/records.ts` writes them in the reader's language.
+- **The backend speaks English** — its problem texts, the documents it writes (result group titles, commit messages), the data profile and the prompts it sends to models; it does not follow the
   Desktop's language. `fixtures/project-workspace.commits.json` (byte-identical with the backend's fixture) is
   sample content and stays Chinese.
 - **Checks.** `deno test --allow-read --allow-env tests/datamodel/aiworkspace-i18n.test.ts [-- <path prefix>…]`
   (from `src/frame/desktop`): the two tables have the same keys and placeholders, no Chinese is left in string
-  literals or JSX text of this app or the draw.io module (a literal that must stay — Chinese words the Mock looks
-  for in user data — is marked `i18n-exempt: <reason>`), every key named in the source exists and every key is
+  literals or JSX text of this app or the draw.io module (a literal that must stay is marked `i18n-exempt: <reason>`), every key named in the source exists and every key is
   used. The e2e suite runs in zh-CN (`tests/aiworkspace/fixtures.ts` sets the stored language for every browser
   context) because its assertions match the Chinese UI; `i18n.spec.ts` runs the English UI — no Chinese on screen
-  through the list, a demo created in English, menus, panels, catalog, a Mock wish run, presentation and data
+  through the list, a demo created in English, menus, panels, catalog, a wish card, presentation and data
   sources — and switches the language live and back.
 
 ## Offline (design §6, first-phase document §7)
@@ -310,11 +326,12 @@ own origin, i.e. its own OPFS, service worker and localStorage.
 - **Blocks**: a front-end registry decides which Renderer shows which data; unknown renderers, unsupported versions,
   unreadable data and thrown renderers fall back inside the Block. Declarative and HTML definitions are document
   entities. HTML Blocks run same-origin (no sandbox, D16) through `window.aiws`.
-- **Wishes** (许愿格 v0.2) run on the service: analyze (task description, named inputs, output contract, checks) →
-  execute (the model writes a program, the service runs it under Deno; candidate with previews and checks) →
-  feedback rounds → apply exactly the previewed plan (one commit: results, Blocks, program, refinements,
-  dependency records; manual edits ask keep / replace / new). "只重跑程序" needs no model. The Mock executor stays an
-  HTML definition entity; its results are planned and applied by the service (`wish.mock@1`) and labelled "模拟".
+- **Wishes** (许愿格交互升级, `notepads/aiws-wish-card-interaction-todo.md`): everything happens on the card —
+  analyze (task contract; a missing input fails the run) → write the macro (saved alone; its trial run is only in
+  the record) → run the macro (results, Blocks, `last_run`). The service writes at the end of each stage, one commit
+  with a run record in `payload.history`; there is no candidate and no apply. A run record's “回滚” takes that stage
+  back (`proc.rollback`). The run button runs the macro only; the next-step button follows the tab. Inputs, input
+  links (light blue) and result links (light orange) are drawn by `ui/canvas/wishLinks/`, never saved.
 - **Freshness** comes from `doc.freshness` (core) and is shown identically on wish Blocks, result Blocks, the data
   tree and the detail panels.
 
@@ -330,9 +347,15 @@ own origin, i.e. its own OPFS, service worker and localStorage.
   opens the workspace and its Surface in a tab. A gone Surface falls back to the first readable one and says so.
 - **Chrome.** The canvas fills the window; the main toolbar (top left), the view toolbar (top right: add
   annotation, zoom ▾ with presets / fit, identity, share) and the vertical object toolbar float in screen space
-  (`camera.setInsets` keeps fitting and centring out from under them). There is no bottom-right navigation area:
-  the bottom-right corner of the work area is the status area (`StatusDock`: the save / sync summary, alerts and
-  notices stacked above it; expandable work logs are meant to live there too).
+  (`camera.setInsets` keeps fitting and centring out from under them). The object toolbar has fifteen fixed buttons
+  (select, pen | text, rich text, media, table, mind map, shape, connector, frame, wish, note, insert… | undo, redo);
+  select, table and shape carry a corner mark and open a second column beside the toolbar (select / pan; table,
+  calendar, to-do and the standard tables; the basic shapes merged with the shape library). Pinned extensions follow
+  "insert…". There is no bottom-right navigation area:
+  the bottom-right corner of the work area is the status area (`StatusDock`: the online count (K2) and the save / sync
+  summary, alerts and notices stacked above it; expanded, what needs attention, the connection and the recent work
+  log (K3, `ui/framework/WorkLog.tsx`)). Who is online is the collaboration zone's avatar stack and its members panel
+  (`ui/framework/members.tsx`); `FrameworkHost` registers every open window (on a phone too).
   The right panel shows one tab at a time (属性 / 引用与依赖 / 批注 / 协作 / 修改状态): layout width when the
   application container is ≥ 1100 px, a drawer below. Size classes: wide ≥ 1100, medium ≥ 760, narrow.
 - **One action per function.** Menus, toolbar buttons, the context menu and shortcuts call the same functions in
@@ -345,8 +368,14 @@ own origin, i.e. its own OPFS, service worker and localStorage.
   be lost is asked about (返回处理 / 导出后离开 / 仍然离开). Closing or reloading a tab with such edits makes the
   browser ask (`beforeunload`). In a Desktop window the identity menu logs out through the Desktop
   (`buckyos:request-logout`); in a tab it signs out itself (`src/auth/signOut.ts`, the same `/sso_logout` flow).
-- **Layout preferences** live in the user work state under `ui:` (`ui:object-toolbar`, `ui:presenter-toolbar`,
-  `ui:grid`, `ui:side`, `ui:pinned-defs`); "恢复默认布局" clears them, never the document.
+- **Layout preferences.** The tool zones' switches and whether the status bar is expanded are the person's across
+  Workspaces (`user.get_prefs` keys `zones`, `status.expanded`; `ui/framework/personal.ts`); the grid, the side drawer
+  and the pinned extensions stay in this Workspace's user state (`ui:grid`, `ui:side`, `ui:pinned-defs`). "恢复默认布局"
+  clears both, never the document.
+- **Toolbar configuration** (UI 框架 PRD §4.6, `ui/framework/config.ts`): built-in, the Workspace's settings
+  (`config.toolbar` on the root, `manage`), the canvas's `config.toolbar` (`structure`), the person's `zones`, merged by
+  the items' keys; "视图 ▸ 自定义工具栏…" (`ui/customize/`) edits a shared layer. App mode: every zone hidden and locked —
+  `structure` / `manage` keep a collapsed ⋯ top left (`ui/framework/AppModeEntry.tsx`), alerts stay.
 
 ## Standard object interaction (doc/workspace/标准对象的交互改进.md, S1–S3)
 
@@ -577,7 +606,7 @@ sent by reference (`assetUploader`, Q22).
 ## What is implemented
 
 - Registration as a built-in app; workspace list with create, sample, open, import (semantics must be
-  chosen), export (share / personal backup) with download, fork, delete.
+  chosen), export (share / personal backup) with download, clone (copy as a new workspace), delete.
 - Outline of all entities, flow page of cells and groups in `(order_key, entity_id)` order; create
   (group, rich text, table, record, image, extra table view), rename, delete with explicit subtree list,
   reorder and move without `expect` (auto-merge), order keys from the WASM `order_key_between`.
@@ -599,10 +628,9 @@ sent by reference (`assetUploader`, Q22).
   or re-edit), stop on `EPOCH_MISMATCH` / `BASE_TOO_OLD` / lost access with everything kept, export of
   unsaved inputs and of the pending queue as a JSON file, storage failures (quota, transaction error,
   dead Worker) shown as "未保存" with an export, "browser offline" told apart from "BuckyOS
-  unreachable", `lock_required` objects read-only without the backend, Mock runs / uploads / URL query
+  unreachable", `lock_required` objects read-only without the backend, wish runs / uploads / URL query
   tables saying that they need the backend.
 - Write locks: acquire, renew every 20 s, release, holder display, `LOCK_LOST`, policy toggle and break.
-- Mock run: candidate with `prepare` result and warnings, apply / cancel, everything labelled 模拟结果.
 
 ## What is not implemented (the UI says so or does not offer it)
 
@@ -639,7 +667,9 @@ sent by reference (`assetUploader`, Q22).
 - Record schemas cannot be edited. Annotations cannot be edited after creation (re-anchoring exists in the
   protocol, not in the UI), are always shared and of kind `note`. Annotation cards are drawn next to rich
   text only; table cells show a mark. Embedded (read-only, static) rich text shows no annotations.
-- No UI for grants (`ws.grant` / `ws.revoke`), checkpoints, `diag.*`; no partial undo (`mode: "partial"`):
+- The permission panel and share dialog still work in grants (subject × workspace or canvas → capabilities), mapped onto the
+  service's entries and logical groups by `api/legacyGrants.ts` (权限需求 §6 replaces these screens); no UI for checkpoints,
+  `diag.*`; no partial undo (`mode: "partial"`):
   an undo that conflicts is reported and does nothing.
 - Rich text: no UI to create a `link` mark or set an ordered list's start; no remote cursors; the caret is
   not restored after an undo. Drafts of refused updates live in `localStorage`, can be read and copied as
@@ -663,7 +693,7 @@ sent by reference (`assetUploader`, Q22).
 
 ## Handwriting (notepads/aiworkspace-handwriting-todo.md)
 
-- **Entry**: the object toolbar's pen and eraser (free canvas, edit mode, insert permission; `P` / `E`), which show the
+- **Entry**: the object toolbar's pen (free canvas, edit mode, insert permission; `P` / `E`), which shows the
   writing bar at the bottom: pen / eraser, six colours, three widths (2 / 4 / 8 canvas units), the pressure switch,
   the canvas touch lock, done (`Esc` drops a running stroke, else puts the pen down). The settings are the user's own
   (`ui:ink` in the user work state); a stroke stores the colour, width and pressure it was written with.
@@ -762,3 +792,43 @@ presentation/
   a show), `mobile.spec.ts` UI-M03 (the guide on a phone), `probe.spec.ts` P3-19 (`test-results/aiworkspace-probe-show.json`).
   The stage exposes `__aiwsTestHooks.stage` (camera, transitions with timings) under the dev override;
   `AIWS_SHOW_LEASE_MS` shortens the show lease of the e2e backend.
+
+## Printing (导出可打印 PDF, notepads/aiws-print-pdf-export-todo.md)
+
+A canvas is printed by exporting it as a PDF file, saved into the Zone (or downloaded); there is no printer dialog and no
+`window.print()`. The entry is the canvas menu's “导出可打印 PDF…” (`surface.export-pdf`, `ui/framework/builtin.ts`, also in
+the phone's menu; `export` on the canvas, online). A flow canvas goes straight to the dialog; a free canvas needs a
+presentation path through it (`ui/print/request.ts` `pathsThrough`; guide paths do not count), else a notice offers the
+path editor.
+
+- **Dialog** (`ui/print/PrintDialog.tsx`, mounted by `FrameworkHost` as `PrintHost`; full screen on a phone): the path
+  (several), the page size (`@print/page.ts`: A4, A5, A3, Letter, 16:9, 4:3, portrait / landscape; `defaultPaper`), a PDF
+  Frame (`ui/controls/pdfframe/api.tsx` `listPdfFrames`, those of another shape listed but not selectable, `frameFits`),
+  missing fonts, the page count (a free canvas: its playable steps, those on other canvases noted) and the steps that are
+  skipped. After printing it shows the PDF's page count and the service's issues (counted, unnamed).
+- **Generating** (`ui/print/generate.ts` `makePrintPdf`): `print.package` (the service builds the print package and hands
+  it to the caller), then the system definition `media.page` run as the caller (`buckyos.getWorkflowClient()`; with the
+  dev override, kRPC to this origin's `/kapi/workflow`): `paper` `<w>x<h>mm`, `margin_mm` 0, `wait_ready`
+  `window.__AIWS_PRINT_READY__ === true`. The place is chosen first (`useSaveToZone`), the PDF made in its `grant()` and
+  committed there by object id; “下载到本机” reads the PDF from NDM. Cancelling cancels the run; nothing is written on
+  failure. A node without Chromium fails the run with `tools_missing`: an administrator downloads it from the dialog.
+- **Fonts** (`ui/print/PrintFontsDialog.tsx`, “工作区 ▸ 打印字体…”, `manage`): root `config.fonts` maps `sans`, `serif`,
+  `mono` to a family of `@print/fonts.ts` (ext-core's defaults, or the font package `ext-fonts`). The dialog checks the
+  mapped families against the `ext-fonts` online items ready on the nodes (`ext_tools.status`, administrators only; others
+  read “cannot check”) and points to Settings › Extension tools; printing goes on with fallback fonts.
+- **Renderer** (`print/renderer/`, built by the `aiwsPrintRenderer()` plugin of `vite.config.ts` into `dist/aiws-print/`:
+  `index.html`, `print.css` and one classic script `print.js` with both WASM modules inlined, since the package is opened
+  over `file://`, where module scripts and fetches of files are refused). It reads `window.__AIWS_PRINT__` (`data.js` of the
+  package, `@print/package.ts`), builds a read-only Workspace from its rows in the WASM `Replica` (`PrintSession`: no SQL,
+  no writes, no runs) and renders the existing Blocks in the canvas mode `print` (`modePolicy`: nothing selects, edits,
+  writes or runs; `RenderHost` mounts everything at full detail). A free canvas prints one page per playable step of the
+  path (`resolveSteps`, `playable`, `fitStep`), as on stage. A flow canvas is rendered once at the content width, measured
+  (breaks between Blocks, paragraphs, lines and table rows; headings kept with what follows) and paginated by
+  `@print/paginate.ts`; a table prints all its rows (`PrintTable`), its header repeated on every page. A PDF Frame draws
+  the header and footer of every page (`PdfFrameDecoration`, `PageContextValue`), its instance is never printed. HTML
+  extension Blocks run with a read-only bridge and fall back to their snapshot. Pages are `contain: strict` (without it
+  Chromium shrinks the document when a Block reaches past a page). `window.__AIWS_PRINT_READY__` is set when the pages
+  are laid out (45 s at most); a package or canvas that cannot be read leaves it unset, so the run fails.
+- **Tests**: `tests/aiworkspace/print.spec.ts` (PR-01…07: the dialog and the flow, `print.package` and Workflow mocked),
+  `pdf-frame.spec.ts` (PF01, PF02); the pagination and page model in `../aiworkspace/print` (`deno test -A`); the renderer
+  was checked with `page-render` on packages of `cargo test -p aiworkspace-store --test print sample_packages -- --ignored`.

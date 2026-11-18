@@ -6,12 +6,13 @@ import type { z } from 'zod'
 import { useI18n } from '../../i18n/provider'
 import { useWindowDialog } from '../../desktop/windows/dialogs'
 import { useMessageHubStore } from './store'
-import { DialogFocus, hubButtonClass, hubInputClass, hubPrimaryButtonClass } from './SessionDialogs'
-import { groupSharedStateSchema, memberStateSchema, presentationSchema } from './sessionModel'
-import { confirmGroupAction } from './confirmDialog'
+import { DialogFocus, hubButtonClass, hubInputClass, hubPrimaryButtonClass } from '../../components/conversation/DialogFocus'
+import { groupSharedStateSchema, memberStateSchema, NATIVE_CONNECTION_LABEL, presentationSchema, sessionDescription } from './sessionModel'
+import { confirmGroupAction } from '../../components/conversation/confirmDialog'
 import { useNetworkDialogs } from '../../components/network/dialogs'
 import { friendlyDidName } from './api/projection'
-import { GROUP_MEMBER_KINDS, groupErrorText, groupSessionId, participating, sortSessionParticipants } from './groupModel'
+import { GROUP_MEMBER_KINDS, groupSessionId, participating, sortSessionParticipants } from './groupModel'
+import { groupErrorText } from '../../components/conversation/model/groupNotice'
 import type { Entity, GroupInfo, GroupSessionInfo, MessageHubContext, Session, SessionAccess } from './types'
 import { MemberAvatar } from './HubAvatar'
 import { useCurrentIdentity } from '../../sso/identity'
@@ -21,7 +22,8 @@ import { GroupExtensionPanels } from './extensions/GroupExtensionPanels'
 import { GroupDisplaySection, GroupHooksSection } from './extensions/GroupDisplaySection'
 import { mockPanelOrigins } from './extensions/model'
 
-export function SessionDetails({ session, entity, context, access, showActions, onShowActions, onClose, onManage, onWrite }: { session: Session; entity: Entity; context: MessageHubContext; access: SessionAccess; showActions: boolean; onShowActions: (value: boolean) => Promise<void>; onClose: () => void; onManage: () => void; onWrite: (enabled: boolean) => void }) {
+/** `embedded`: the content alone, inside another panel (the Agent panel's folded section) that has its own header and scrolling. */
+export function SessionDetails({ session, entity, context, access, showActions, onShowActions, onClose, onManage, onWrite, embedded = false }: { session: Session; entity: Entity; context: MessageHubContext; access: SessionAccess; showActions: boolean; onShowActions: (value: boolean) => Promise<void>; onClose: () => void; onManage: () => void; onWrite: (enabled: boolean) => void; embedded?: boolean }) {
   const { t, locale } = useI18n(), store = useMessageHubStore(), dialog = useWindowDialog()
   const nameOf = (did: string) => did === context.ownerDid ? t('messagehub.you') : store.findEntity(context, did)?.name ?? friendlyDidName(did, false)
   const enableWrite = async () => {
@@ -30,7 +32,7 @@ export function SessionDetails({ session, entity, context, access, showActions, 
     if (result) onWrite(true)
     if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus()
   }
-  const connection = session.binding.kind === 'tunnel' ? session.binding.connectionName : session.source ?? 'BuckyOS'
+  const connection = session.binding.kind === 'tunnel' ? session.binding.connectionName : session.binding.kind === 'native' ? NATIVE_CONNECTION_LABEL : session.source ?? '—'
   const rows = [
     [t('messagehub.sessionType'), t(`messagehub.type.${session.type}`)],
     [t('messagehub.targetEntity'), entity.id],
@@ -50,14 +52,14 @@ export function SessionDetails({ session, entity, context, access, showActions, 
   const members = Object.entries(session.members)
   const group = entity.type === 'group' && session.binding.kind === 'native' ? store.group(context, entity.id) : null
   const groupSession = group ? store.groupSession(context, entity.id, session.id) : null
+  const description = sessionDescription(session, store.preferences(context, session.id)) || groupSession?.description || ''
   const localMembers = <ul className="space-y-1.5">{members.map(([did, member]) => <li key={did} className="flex min-w-0 items-baseline gap-2" title={did}><span className="truncate">{did === context.ownerDid ? t('messagehub.you') : member.nickname || (did === entity.id ? entity.name : did)}</span>{did === context.ownerDid && member.nickname ? <span className="truncate text-xs text-[color:var(--cp-muted)]">{member.nickname}</span> : null}</li>)}</ul>
   const sharedEditors = <div className="space-y-5"><SharedEditor session={session} context={context} disabled={!access.canEditSharedState} groupSession={groupSession} /><MemberEditor session={session} context={context} disabled={!access.canEditOwnMemberState} /></div>
-  return <section className="flex h-full flex-col bg-[color:var(--cp-surface)]" data-testid="session-details">
-    <header className="flex shrink-0 items-center justify-between border-b border-[color:var(--cp-border)] py-1 pl-4 pr-1"><h2 className="text-sm font-semibold">{t('messagehub.sessionDetails')}</h2><button type="button" className="flex min-h-11 min-w-11 items-center justify-center" aria-label={t('messagehub.close')} title={t('messagehub.close')} onClick={onClose}><X size={18} /></button></header>
-    <div className="shell-scrollbar flex-1 space-y-6 overflow-y-auto p-4 text-sm">
+  const body = <>
       <div>
         <h3 className="break-words text-lg font-semibold leading-snug">{store.title(context, session)}</h3>
         <p className="mt-1 break-words text-[13px] text-[color:var(--cp-muted)]">{entity.name} · {t(`messagehub.type.${session.type}`)}</p>
+        {description && <p className="mt-2 whitespace-pre-wrap break-words text-[13px]" data-testid="session-description">{description}</p>}
         <div className="mt-2 flex flex-wrap gap-1.5 empty:hidden">
           {session.lifecycle === 'archived' && <DetailBadge>{t('messagehub.archived')}</DetailBadge>}
           {access.mode !== 'read_write' && <DetailBadge>{t('messagehub.readOnly')}</DetailBadge>}
@@ -92,7 +94,11 @@ export function SessionDetails({ session, entity, context, access, showActions, 
         <summary className="flex min-h-11 cursor-pointer items-center text-[13px] font-medium text-[color:var(--cp-muted)]">{t('messagehub.technicalInfo')}</summary>
         <dl className="space-y-2 pb-3 text-xs">{rows.map(([label, value]) => <div key={label}><dt className="text-[color:var(--cp-muted)]">{label}</dt><dd className="break-all">{value}</dd></div>)}</dl>
       </details>
-    </div>
+  </>
+  if (embedded) return <div className="space-y-6 text-sm" data-testid="session-details">{body}</div>
+  return <section className="flex h-full flex-col bg-[color:var(--cp-surface)]" data-testid="session-details">
+    <header className="flex shrink-0 items-center justify-between border-b border-[color:var(--cp-border)] py-1 pl-4 pr-1"><h2 className="text-sm font-semibold">{t('messagehub.sessionDetails')}</h2><button type="button" className="flex min-h-11 min-w-11 items-center justify-center" aria-label={t('messagehub.close')} title={t('messagehub.close')} onClick={onClose}><X size={18} /></button></header>
+    <div className="shell-scrollbar flex-1 space-y-6 overflow-y-auto p-4 text-sm">{body}</div>
   </section>
 }
 
@@ -240,7 +246,7 @@ function PresentationEditor({ session, context, disabled }: { session: Session; 
   const { t } = useI18n(), store = useMessageHubStore()
   const form = useForm<z.infer<typeof presentationSchema>>({ resolver: zodResolver(presentationSchema), values: store.preferences(context, session.id) })
   const action = useSaveAction()
-  return <form className="space-y-2" onSubmit={form.handleSubmit(values => action.save(() => store.updatePreferences(context, session.id, values)))}><fieldset disabled={disabled || action.pending} className="space-y-2 disabled:opacity-60"><label className="block">{t('messagehub.personalTitle')}<input className={hubInputClass} {...form.register('title')} /></label>{form.formState.errors.title && <p role="alert">{t('messagehub.titleLimit')}</p>}<label className="flex min-h-11 items-center gap-2"><input type="checkbox" {...form.register('pinned')} />{t('messagehub.pin')}</label><label className="flex min-h-11 items-center gap-2"><input type="checkbox" {...form.register('muted')} />{t('messagehub.mute')}</label><button type="submit" className={hubButtonClass}>{t(action.pending ? 'messagehub.saving' : 'messagehub.save')}</button></fieldset><SaveStatus status={action.status} /></form>
+  return <form className="space-y-2" onSubmit={form.handleSubmit(values => action.save(() => store.updatePreferences(context, session.id, values)))}><fieldset disabled={disabled || action.pending} className="space-y-2 disabled:opacity-60"><label className="block">{t('messagehub.personalTitle')}<input className={hubInputClass} {...form.register('title')} /></label>{form.formState.errors.title && <p role="alert">{t('messagehub.titleLimit')}</p>}<label className="block">{t('messagehub.personalDescription')}<textarea rows={2} className={hubInputClass} {...form.register('description')} /></label>{form.formState.errors.description && <p role="alert">{t('messagehub.fieldLimit')}</p>}<label className="flex min-h-11 items-center gap-2"><input type="checkbox" {...form.register('pinned')} />{t('messagehub.pin')}</label><label className="flex min-h-11 items-center gap-2"><input type="checkbox" {...form.register('muted')} />{t('messagehub.mute')}</label><button type="submit" className={hubButtonClass}>{t(action.pending ? 'messagehub.saving' : 'messagehub.save')}</button></fieldset><SaveStatus status={action.status} /></form>
 }
 function useSaveAction() {
   const [status, setStatus] = useState(''), [pending, setPending] = useState(false), busy = useRef(false)

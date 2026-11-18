@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Build the payloads of ext-core (doc/pikg/format.md §5.1, ExtTools TODO §3.10) into payload/<platform>/ and, with
+# Build the payloads of ext-core (doc/pikg/format.md section 5.1, ExtTools TODO section 3.10) into payload/<platform>/ and, with
 # --archive, dist/ext-core-<version>-<platform>.tar.gz plus dist/manifest.json.
+# Every build also writes the matching corresponding-source archive to dist/.
 #
 #   ./build.sh --platform linux-x86_64 --archive
 #   buckyos pikg doctor dapp_meta --catalog ..
 #   buckyos pikg build dapp_meta && buckyos pikg pack dapp_dist
 #   buckyos ext-tools import dapp_dist/ext-core-<version>.pikg     # into a Zone's Repo, digest unchanged
 #
-# Tools with an official archive are downloaded here, version and SHA256 pinned in the table below (§6.4 of
-# doc/app_service/paios容器需求.md: table B says which tool comes from where). The ones without go into a conda-forge
+# Tools with an official archive are downloaded here, version and SHA256 pinned in the table below (section 6.4 of
+# the paios container requirements: table B says which tool comes from where). The ones without go into a conda-forge
 # prefix locked by conda-lock.yml. A launcher in bin/ only ever points into store/ext-core, relative to itself, and never
-# falls back to the PATH.
+# falls back to the PATH. The browser is the exception: an online item, which the payload declares (ext-manifest.json
+# `online`) and a node downloads from Google into <tools>/online/chromium; its launcher points there.
 #
 # Needs: bash, curl, python3, tar (with xz), unzip, and micromamba (MICROMAMBA, or the one this script downloads).
 # darwin-* builds on a Mac: writing the install prefix into a Mach-O breaks its signature, and only macOS can sign it
-# again. linux-* and windows-* build anywhere.
+# again; LibreOffice comes out of its dmg with hdiutil.
+# linux-* builds anywhere. windows-* builds on Windows (msiexec /a unpacks LibreOffice's msi) or anywhere with msiextract
+# (msitools).
 set -euo pipefail
 
 PANDOC_VERSION=3.12.1
@@ -28,6 +32,12 @@ MINGIT_TAG=v2.56.0.windows.4
 MINGIT_VERSION=2.56.0.4
 BUSYBOX_VERSION=FRP-6354-g5f09fb446
 MICROMAMBA_VERSION=2.10.0-0
+LIBREOFFICE_VERSION=26.8.2
+NOTO_SANS_CJK_TAG=Sans2.004
+NOTO_SERIF_CJK_TAG=Serif2.003
+PLAYWRIGHT_VERSION=1.65.1
+CHROMIUM_VERSION=159.0.8154.6
+CHROMIUM_REVISION=1255
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 manifest="$here/ext-manifest.json"
@@ -35,6 +45,7 @@ python_bin="${PYTHON:-python3}"
 cache="${EXT_CORE_CACHE:-$here/.cache}"
 out="$here/payload"
 dist="$here/dist"
+source_out="${EXT_CORE_SOURCE_OUT:-$here/corresponding-source}"
 platforms=()
 archive=0
 
@@ -62,16 +73,42 @@ sha256_of_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
+# The addresses source-mirrors.json has for a SHA256, one per line: the same file as compliance.py's download() reads.
+mirrors_of() {
+  [ -f "$here/source-mirrors.json" ] || return 0
+  "$python_bin" -c 'import json, sys
+print("\n".join(json.load(open(sys.argv[1])).get(sys.argv[2], {}).get("urls", [])))' "$here/source-mirrors.json" "$1"
+}
+
+# Into the cache from one address, if the bytes are the ones sources.sha256 pins.
+fetch_from() {
+  local url="$1" file="$2" want="$3"
+  if ! curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 30 -o "$cache/$file.part" "$url"; then
+    echo "$file: download failed: $url" >&2
+  elif [ "$(sha256_of_file "$cache/$file.part")" != "$want" ]; then
+    echo "$file: sha256 differs from sources.sha256: $url" >&2
+  else
+    mv "$cache/$file.part" "$cache/$file"
+    return
+  fi
+  rm -f "$cache/$file.part"
+  return 1
+}
+
+# The file from its address or, failing that, from the mirrors of its SHA256.
 fetch() {
   local url="$1" file="${2:-${1##*/}}" want
   want="$(sha_of "$file")"
   [ -n "$want" ] || { echo "$file is not in sources.sha256" >&2; exit 1; }
-  if [ ! -f "$cache/$file" ] || [ "$(sha256_of_file "$cache/$file")" != "$want" ]; then
-    curl -fsSL --retry 3 --retry-delay 2 -o "$cache/$file.part" "$url"
-    mv "$cache/$file.part" "$cache/$file"
+  if [ -f "$cache/$file" ] && [ "$(sha256_of_file "$cache/$file")" = "$want" ]; then
+    echo "$cache/$file"
+    return
   fi
-  [ "$(sha256_of_file "$cache/$file")" = "$want" ] || { echo "$file: sha256 differs from sources.sha256" >&2; exit 1; }
-  echo "$cache/$file"
+  fetch_from "$url" "$file" "$want" && { echo "$cache/$file"; return; }
+  while IFS= read -r url; do
+    [ -n "$url" ] && fetch_from "$url" "$file" "$want" && { echo "$cache/$file"; return; }
+  done <<< "$(mirrors_of "$want")"
+  exit 1
 }
 
 conda_platform() {
@@ -81,6 +118,28 @@ conda_platform() {
     darwin-arm64) echo osx-arm64 ;;
     darwin-x86_64) echo osx-64 ;;
     windows-x86_64) echo win-64 ;;
+  esac
+}
+
+# Chrome for Testing's name of a platform: its download directory, and chrome-<name>/ inside the archive.
+cft_platform() {
+  case "$1" in
+    linux-x86_64) echo linux64 ;;
+    linux-aarch64) echo linux-arm64 ;;
+    darwin-arm64) echo mac-arm64 ;;
+    darwin-x86_64) echo mac-x64 ;;
+    windows-x86_64) echo win64 ;;
+  esac
+}
+
+# Chrome for Testing's own executable inside <tools>/online/chromium: what a downloaded browser has and the payload's
+# overlay has not. On Linux Playwright and bin/chromium run the script `chrome` beside it.
+chromium_binary() {
+  local dir="chromium-$CHROMIUM_REVISION/chrome-$(cft_platform "$1")"
+  case "$1" in
+    linux-*) echo "$dir/chrome-bin" ;;
+    darwin-*) echo "$dir/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" ;;
+    windows-*) echo "$dir/chrome.exe" ;;
   esac
 }
 
@@ -117,7 +176,33 @@ unix_launcher() {
   chmod 755 "$payload/bin/$command"
 }
 
+# Unix launcher of a file of an online item (ext-manifest.json `online`), which a node downloads into <tools>/online/<id>.
+# <tools> is the launcher's own package when that is unpacked as the tools directory, else the directory its staging or
+# version directory is in (the layout of buckyos-api's ext_tools_install.rs). `present` is a file the download brings and
+# the payload's overlay has not: without it the launcher says what is missing, as a command that is not there (127).
+unix_online_launcher() {
+  local payload="$1" command="$2" item="$3" present="$4" target="$5" what="$6"
+  {
+    echo '#!/bin/sh'
+    echo 'p="$0"'
+    echo 'while [ -h "$p" ]; do l="$(readlink "$p")"; case "$l" in /*) p="$l" ;; *) p="${p%/*}/$l" ;; esac; done'
+    echo 'here="$(cd "${p%/*}" && pwd -P)"'
+    echo 't="${here%/*}"'
+    echo "if [ ! -e \"\$t/online/$item/$present\" ]; then"
+    echo '  case "${t%/*}" in */staging) t="${t%/*/*}" ;; *) case "${t%/*/*}" in */versions) t="${t%/*/*/*}" ;; esac ;; esac'
+    echo 'fi'
+    echo "o=\"\$t/online/$item\""
+    echo "if [ ! -e \"\$o/$present\" ]; then"
+    echo "  echo '$command: $what is not downloaded on this node yet: the owner downloads it in Desktop Settings > Extension tools, or with: buckyos ext-tools download ext-core $item' >&2"
+    echo '  exit 127'
+    echo 'fi'
+    echo "exec \"\$o/$target\" \"\$@\""
+  } > "$payload/bin/$command"
+  chmod 755 "$payload/bin/$command"
+}
+
 # A prefix's data directories are compiled in at their build location, so a relocated tool is told where they are.
+# fonts.conf includes conf.d by a relative name, which fontconfig looks up in FONTCONFIG_PATH.
 unix_env_files() {
   local store="$1/store/ext-core" ghostscript
   mkdir -p "$store/env"
@@ -125,6 +210,7 @@ unix_env_files() {
 c="$s/conda"
 export MAGICK_CONFIGURE_PATH="$c/etc/ImageMagick-7:$(echo "$c"/share/ImageMagick-7):$(echo "$c"/lib/ImageMagick-*/config-Q16HDRI)"
 export FONTCONFIG_FILE="$c/etc/fonts/fonts.conf"
+export FONTCONFIG_PATH="$c/etc/fonts"
 SH
   cat > "$store/env/tesseract.sh" <<'SH'
 export TESSDATA_PREFIX="$s/conda/share/tessdata"
@@ -141,6 +227,16 @@ export CURL_CA_BUNDLE="$s/conda/ssl/cacert.pem"
 SH
   cat > "$store/env/fontconfig.sh" <<'SH'
 export FONTCONFIG_FILE="$s/conda/etc/fonts/fonts.conf"
+export FONTCONFIG_PATH="$s/conda/etc/fonts"
+SH
+  # LibreOffice's own libraries first (its copies of curl, ICU and libxml2 are not the prefix's), then the prefix for what
+  # the official build takes from the system. Fonts: the prefix configuration's, which are the prefix's, LibreOffice's
+  # share/fonts and the user's and the system's (XDG) font directories. Its text handling needs a UTF-8 locale; C.UTF-8 is in every glibc.
+  cat > "$store/env/soffice.sh" <<'SH'
+export LD_LIBRARY_PATH="$s/libreoffice/program:$s/conda/lib"
+export FONTCONFIG_FILE="$s/conda/etc/fonts/fonts.conf"
+export FONTCONFIG_PATH="$s/conda/etc/fonts"
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8|*[Uu][Tt][Ff]8) ;; *) export LC_ALL=C.UTF-8 ;; esac
 SH
 }
 
@@ -186,7 +282,7 @@ lib = top / "lib"
 if lib.is_dir():
     for path in list(lib.rglob("*.a")) + list(lib.rglob("*.la")) + list(lib.rglob("*.lib")) + list(lib.glob("openvino-*")):
         rm(path)
-    for pattern in ["libgtk-3*", "libgdk-3*", "libgailutil-3*", "libatk-*", "libatk-bridge-*", "libatspi*", "libepoxy*", "libopenvino_*frontend*", "libopenvino_*plugin*", "perl5"]:
+    for pattern in ["libgtk-3*", "libgdk-3*", "libgailutil-3*", "libepoxy*", "libopenvino_*frontend*", "libopenvino_*plugin*", "perl5"]:
         for path in lib.glob(pattern):
             rm(path)
 git_core = top / "libexec" / "git-core"
@@ -195,7 +291,7 @@ if git_core.is_dir():
     for path in git_core.iterdir():
         if path.is_symlink() and os.readlink(path) == "git":
             path.unlink()
-# OCR language data (§6.4 of doc/app_service/paios容器需求.md): the UI languages, their vertical variants, and the other
+# OCR language data (section 6.4 of the paios container requirements): the UI languages, their vertical variants, and the other
 # common ones; keep smoke/tesseract.sh and smoke/tesseract.ps1 in step.
 tesseract_langs = {"osd", "eng", "chi_sim", "chi_tra", "spa", "fra", "deu", "kor", "jpn", "rus",
                    "chi_sim_vert", "chi_tra_vert", "jpn_vert", "kor_vert",
@@ -290,26 +386,14 @@ if fonts.is_file():
 PY
 }
 
-licenses() {
-  local prefix="$1" store="$2"
-  mkdir -p "$store/LICENSES"
-  "$python_bin" - "$prefix/conda-meta" "$store/LICENSES/conda-forge.tsv" <<'PY'
-import json, sys
-from pathlib import Path
-rows = []
-for path in sorted(Path(sys.argv[1]).glob("*.json")):
-    meta = json.loads(path.read_text())
-    rows.append(f'{meta.get("name")}\t{meta.get("version")}\t{meta.get("license", "")}\t{meta.get("url", "")}')
-Path(sys.argv[2]).write_text("name\tversion\tlicense\tsource\n" + "\n".join(rows) + "\n")
-PY
-}
-
 install_conda() {
   local payload="$1" platform="$2" prefix="$payload/store/ext-core/conda" mm
   mm="$(find_micromamba)"
   MAMBA_ROOT_PREFIX="$cache/mamba" "$mm" create -y -q -p "$prefix" --platform "$(conda_platform "$platform")" -f "$here/conda-lock.yml"
   [ -d "$prefix/conda-meta" ] || { echo "[ext-core] micromamba made no prefix at $prefix" >&2; exit 1; }
-  licenses "$prefix" "$payload/store/ext-core"
+  "$python_bin" "$here/compliance.py" conda --prefix "$prefix" --payload "$payload" \
+    --platform "$platform" --source-dir "$source_out/$platform" \
+    --package-cache "$cache/mamba/pkgs" --download-cache "$cache/corresponding-source"
   prune_prefix "$prefix" "$platform"
   assert_loads "$prefix" "$platform"
 }
@@ -400,11 +484,284 @@ install_official() {
   rm -rf "$store/.tmp"
 }
 
+# LibreOffice, headless conversion only (the paios container requirements section 6.4 table B): writer, calc, impress, draw, math,
+# the import filters and its own fonts. No Python, Java classes, help, gallery, icon themes, extensions, dictionaries,
+# database drivers nor GUI media backends. Noto Sans / Serif CJK, regular and bold, go into its font directory on every
+# platform: the font set is part of a conversion's fingerprint.
+LIBREOFFICE_DEBS="libreoffice{v} libreoffice{v}-ure libobasis{v}-core libobasis{v}-writer libobasis{v}-calc libobasis{v}-impress libobasis{v}-draw libobasis{v}-math libobasis{v}-graphicfilter libobasis{v}-xsltfilter libobasis{v}-ooofonts libobasis{v}-en-us"
+
+# The font package ext-fonts (publish/exttool/ext-fonts) keeps in <tools>/store/ext-fonts/fonts.conf the directories of
+# its online items that a node may have downloaded; everything here that uses fontconfig takes it in, and a node without
+# the package has nothing at that name. fontconfig looks a relative <include> up in FONTCONFIG_PATH, this prefix's
+# etc/fonts, and the kernel resolves its `..` from where that directory really is: <tools> is eight levels up from a
+# version directory, seven from staging, five when the payload is unpacked as the tools directory. Only one of the three
+# has the file.
+ext_fonts_include() {
+  local store="$1"
+  cat > "$store/conda/etc/fonts/conf.d/64-ext-fonts.conf" <<'XML'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <include ignore_missing="yes">../../../../../../../../store/ext-fonts/fonts.conf</include>
+  <include ignore_missing="yes">../../../../../../../store/ext-fonts/fonts.conf</include>
+  <include ignore_missing="yes">../../../../../store/ext-fonts/fonts.conf</include>
+</fontconfig>
+XML
+}
+
+install_soffice() {
+  local payload="$1" platform="$2" store="$1/store/ext-core" lo="$1/store/ext-core/libreoffice" tmp="$1/store/ext-core/.tmp/libreoffice"
+  local base="https://download.documentfoundation.org/libreoffice/stable/$LIBREOFFICE_VERSION" file fonts found
+  rm -rf "$tmp" "$lo"
+  mkdir -p "$tmp"
+  case "$platform" in
+    linux-*)
+      case "$platform" in
+        linux-x86_64) file="$(fetch "$base/deb/x86_64/LibreOffice_${LIBREOFFICE_VERSION}_Linux_x86-64_deb.tar.gz")" ;;
+        linux-aarch64) file="$(fetch "$base/deb/aarch64/LibreOffice_${LIBREOFFICE_VERSION}_Linux_aarch64_deb.tar.gz")" ;;
+      esac
+      tar -xzf "$file" -C "$tmp"
+      "$python_bin" - "$tmp" "$tmp/root" "${LIBREOFFICE_VERSION%.*}" $LIBREOFFICE_DEBS <<'PY'
+import io, sys, tarfile
+from pathlib import Path
+src, root, series, names = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4:]
+def data_of(deb):
+    """The data.tar.* member of a .deb, which is an `ar` archive."""
+    with deb.open("rb") as handle:
+        assert handle.read(8) == b"!<arch>\n", deb
+        while True:
+            header = handle.read(60)
+            if len(header) < 60:
+                raise SystemExit(f"{deb}: no data.tar")
+            name, size = header[:16].decode().strip().rstrip("/"), int(header[48:58])
+            if name.startswith("data.tar"):
+                return handle.read(size)
+            handle.seek(size + size % 2, 1)
+for name in names:
+    name = name.replace("{v}", series)
+    debs = list(src.glob(f"*/DEBS/{name}_*.deb"))
+    if len(debs) != 1:
+        raise SystemExit(f"LibreOffice archive: expected one {name}_*.deb, found {len(debs)}")
+    with tarfile.open(fileobj=io.BytesIO(data_of(debs[0]))) as tar:
+        tar.extractall(root, filter="tar")
+PY
+      mv "$tmp/root/opt/libreoffice${LIBREOFFICE_VERSION%.*}" "$lo"
+      fonts="$lo/share/fonts/truetype"
+      # Text that names no language falls back to the Simplified Chinese faces, not to whichever face comes first.
+      # LibreOffice's font directory, Noto CJK included, is the prefix's too: Chromium has no other fonts.
+      cat > "$store/conda/etc/fonts/conf.d/64-ext-core-cjk.conf" <<'XML'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <dir prefix="relative">../../../../libreoffice/share/fonts/truetype</dir>
+  <alias><family>sans-serif</family><prefer><family>Noto Sans CJK SC</family></prefer></alias>
+  <alias><family>serif</family><prefer><family>Noto Serif CJK SC</family></prefer></alias>
+  <alias><family>monospace</family><prefer><family>Noto Sans CJK SC</family></prefer></alias>
+</fontconfig>
+XML
+      ext_fonts_include "$store"
+      ;;
+    darwin-*)
+      case "$platform" in
+        darwin-arm64) file="$(fetch "$base/mac/aarch64/LibreOffice_${LIBREOFFICE_VERSION}_MacOS_aarch64.dmg")" ;;
+        darwin-x86_64) file="$(fetch "$base/mac/x86_64/LibreOffice_${LIBREOFFICE_VERSION}_MacOS_x86-64.dmg")" ;;
+      esac
+      command -v hdiutil >/dev/null 2>&1 || { echo "[ext-core] $platform: LibreOffice's dmg needs hdiutil (build on a Mac)" >&2; exit 1; }
+      mkdir -p "$tmp/mnt" "$lo"
+      hdiutil attach -nobrowse -readonly -mountpoint "$tmp/mnt" "$file" >/dev/null
+      cp -R "$tmp/mnt/LibreOffice.app" "$lo/" || { hdiutil detach "$tmp/mnt" >/dev/null; exit 1; }
+      hdiutil detach "$tmp/mnt" >/dev/null
+      fonts="$lo/LibreOffice.app/Contents/Resources/fonts/truetype"
+      ;;
+    windows-*)
+      file="$(fetch "$base/win/x86_64/LibreOffice_${LIBREOFFICE_VERSION}_Win_x86-64.msi")"
+      mkdir -p "$tmp/msi"
+      case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+          MSYS2_ARG_CONV_EXCL='*' msiexec /a "$(cygpath -w "$file")" /qn "TARGETDIR=$(cygpath -w "$tmp/msi")" ;;
+        *)
+          command -v msiextract >/dev/null 2>&1 || { echo "[ext-core] $platform: LibreOffice's msi needs msiextract (msitools), or build on Windows" >&2; exit 1; }
+          msiextract -C "$tmp/msi" "$file" >/dev/null ;;
+      esac
+      found="$(find "$tmp/msi" -type f -name soffice.com | head -n 1)"
+      [ -n "$found" ] || { echo "[ext-core] $platform: no soffice.com in LibreOffice's msi" >&2; exit 1; }
+      mv "$(dirname "$(dirname "$found")")" "$lo"
+      # The msi puts LibreOffice's fonts into the Windows font folder; here they go where it loads private fonts from.
+      fonts="$lo/share/fonts/truetype"
+      mkdir -p "$fonts"
+      find "$tmp/msi" -type f \( -iname '*.ttf' -o -iname '*.otf' \) -exec cp {} "$fonts/" \;
+      ;;
+  esac
+  [ -d "$fonts" ] || { echo "[ext-core] $platform: LibreOffice has no font directory at $fonts" >&2; exit 1; }
+  prune_soffice "$lo" "$platform"
+  for file in NotoSansCJK-Regular.ttc NotoSansCJK-Bold.ttc; do
+    cp "$(fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/$NOTO_SANS_CJK_TAG/Sans/OTC/$file")" "$fonts/"
+  done
+  for file in NotoSerifCJK-Regular.ttc NotoSerifCJK-Bold.ttc; do
+    cp "$(fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/$NOTO_SERIF_CJK_TAG/Serif/OTC/$file")" "$fonts/"
+  done
+  mkdir -p "$store/LICENSES"
+  cp "$(fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/$NOTO_SANS_CJK_TAG/LICENSE" NotoCJK-LICENSE)" "$store/LICENSES/NotoCJK-LICENSE"
+  found="$(find "$lo" -maxdepth 4 -type f \( -name LICENSE -o -name license.txt \) | head -n 1)"
+  [ -n "$found" ] && cp "$found" "$store/LICENSES/LibreOffice-LICENSE"
+  rm -rf "$tmp"
+  rmdir "$store/.tmp" 2>/dev/null || true
+  assert_soffice_loads "$store" "$platform"
+}
+
+prune_soffice() {
+  "$python_bin" - "$1" "$2" <<'PY'
+import shutil, sys
+from pathlib import Path
+lo, platform = Path(sys.argv[1]), sys.argv[2]
+def rm(path):
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+if platform.startswith("darwin"):
+    contents = lo / "LibreOffice.app" / "Contents"
+    program, share = contents / "Frameworks", contents / "Resources"
+    patterns = {
+        contents: ["Frameworks/LibreOfficePython.framework", "Resources/python", "Resources/java", "Resources/help", "Resources/gallery",
+                   "Resources/extensions/*", "Resources/config/images_*.zip", "Resources/Scripts", "Resources/CREDITS.fodt",
+                   "Resources/firebird", "Frameworks/intl", "Frameworks/libpyuno*", "Frameworks/libpythonloader*", "Frameworks/libavmedia*",
+                   "Frameworks/libfirebird*", "Frameworks/libEngine12*", "Frameworks/libmysqlc*", "Frameworks/libpostgresql*",
+                   "Frameworks/libofficebean*", "Library/Spotlight", "Library/QuickLook"],
+    }
+elif platform.startswith("windows"):
+    patterns = {
+        lo: ["help", "readmes", "CREDITS.fodt", "LICENSE.html", "share/gallery", "share/extensions/*", "share/Scripts",
+             "share/config/images_*.zip", "program/classes", "program/wizards", "program/python-core-*", "program/python*.exe",
+             "program/python*.dll", "program/pyuno*", "program/pythonloader*", "program/*.py", "program/firebird*", "program/fbembed*",
+             "program/intl", "program/Engine12*", "program/mysqlc*", "program/postgresql-sdbc*", "program/libpq*", "program/avmedia*",
+             "program/officebean*", "program/updater*", "program/update_service*", "program/shlxthdl", "program/sbase.exe",
+             "program/minidump_upload*", "program/senddoc*", "program/gengal*"],
+    }
+else:
+    patterns = {
+        lo: ["help", "readmes", "CREDITS.fodt", "LICENSE.html", "share/gallery", "share/extensions", "share/Scripts",
+             "program/classes", "program/wizards", "program/*.py", "program/*.pyi", "program/libavmedia*", "program/liblibreofficekitgtk*",
+             "program/libofficebean*", "program/libmysqlclo*", "program/libldapbe2lo*", "program/gengal*", "program/minidump_upload",
+             "program/senddoc", "program/gdbtrace"],
+    }
+for base, globs in patterns.items():
+    for pattern in globs:
+        for path in list(base.glob(pattern)):
+            rm(path)
+PY
+}
+
+# The official Linux build takes cairo, cups, dbus, fontconfig, freetype, glib, NSS, X11, avahi and Kerberos from the
+# system: here they are the prefix's (conda-env.yml). Nothing it loads may be missing from the payload, save glibc.
+assert_soffice_loads() {
+  local store="$1" platform="$2" missing
+  case "$platform:$(uname -s)-$(uname -m)" in
+    linux-x86_64:Linux-x86_64|linux-aarch64:Linux-aarch64) ;;
+    *) return 0 ;;
+  esac
+  missing="$(for file in "$store"/libreoffice/program/*.bin "$store"/libreoffice/program/oosplash "$store"/libreoffice/program/*.so*; do
+    [ -f "$file" ] && LD_LIBRARY_PATH="$store/libreoffice/program:$store/conda/lib" ldd "$file" 2>/dev/null | grep 'not found' | sed "s|^|$(basename "$file"): |"
+  done | sort -u || true)"
+  if [ -n "$missing" ]; then
+    echo "[ext-core] LibreOffice loads what the payload does not have:" >&2
+    echo "$missing" >&2
+    exit 1
+  fi
+}
+
+# Chrome for Testing, the build playwright-core $PLAYWRIGHT_VERSION drives (revision $CHROMIUM_REVISION in its
+# browsers.json), is an online item (ext-manifest.json `online`): the payload does not carry it. A node downloads Google's
+# archive into <tools>/online/chromium, a Playwright browser directory (PLAYWRIGHT_BROWSERS_PATH), and lays the payload's
+# online/chromium over it. That overlay is Playwright's two marker files and, on Linux, the script that takes the place of
+# chrome-linux*/chrome, the archive's binary becoming chrome-bin beside it: Playwright runs that name itself, not a
+# launcher of bin/, and the official build takes its libraries and fonts from the system. The script gives it the prefix's
+# (conda-env.yml) of the package the node has in <tools>/store/ext-core. fonts.conf includes conf.d by a relative name,
+# which fontconfig looks up in FONTCONFIG_PATH: without it that is where the prefix was built, and conf.d is not read.
+# The full build only, no headless shell, so a test says channel: 'chromium'.
+install_chromium_overlay() {
+  local payload="$1" platform="$2" cft dir
+  cft="$(cft_platform "$platform")"
+  dir="$payload/online/chromium/chromium-$CHROMIUM_REVISION"
+  mkdir -p "$dir"
+  : > "$dir/INSTALLATION_COMPLETE"
+  : > "$dir/DEPENDENCIES_VALIDATED"
+  case "$platform" in
+    linux-*)
+      mkdir -p "$dir/chrome-$cft"
+      cat > "$dir/chrome-$cft/chrome" <<'SH'
+#!/bin/sh
+p="$0"
+while [ -h "$p" ]; do l="$(readlink "$p")"; case "$l" in /*) p="$l" ;; *) p="${p%/*}/$l" ;; esac; done
+here="$(cd "${p%/*}" && pwd -P)"
+c="$(cd "$here/../../../../store/ext-core/conda" 2>/dev/null && pwd -P)" || { echo 'chrome: the ext-core package this browser belongs to is not installed' >&2; exit 127; }
+export LD_LIBRARY_PATH="$c/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+[ -n "${FONTCONFIG_FILE:-}${FONTCONFIG_PATH:-}" ] || export FONTCONFIG_FILE="$c/etc/fonts/fonts.conf" FONTCONFIG_PATH="$c/etc/fonts"
+exec "$here/chrome-bin" "$@"
+SH
+      chmod 755 "$dir/chrome-$cft/chrome"
+      ;;
+  esac
+  check_chromium "$payload" "$platform"
+}
+
+# What a node has once it downloaded the browser, made from the same manifest entry (place_online.py) beside the payload's
+# store, looked at and thrown away. The archive is the one sources.sha256 pins, from the manifest's address. Where this
+# builder can run the loader: nothing the official Linux build takes from the system (X11, NSS, glib, cairo, pango, cups,
+# dbus, alsa, atk, at-spi, gbm) is missing from the prefix, save glibc, and the script starts the binary.
+check_chromium() {
+  local payload="$1" platform="$2" cft url file tools dir missing loaded
+  cft="$(cft_platform "$platform")"
+  url="$("$python_bin" -c 'import json, sys
+print(next(i for i in json.load(open(sys.argv[1]))["online"] if i["id"] == "chromium")["platforms"][sys.argv[2]]["url"])' "$manifest" "$platform")"
+  file="$(fetch "$url" "chrome-for-testing-$CHROMIUM_VERSION-$cft.zip")"
+  tools="$cache/online-check-$platform"
+  rm -rf "$tools"
+  mkdir -p "$tools"
+  "$python_bin" "$here/place_online.py" --payload "$payload" --tools "$tools" --platform "$platform" --archive "chromium=$file"
+  if [ ! -e "$tools/online/chromium/$(chromium_binary "$platform")" ]; then
+    echo "[ext-core] $platform: the manifest's chromium entry puts no browser at online/chromium/$(chromium_binary "$platform")" >&2
+    exit 1
+  fi
+  case "$platform:$(uname -s)-$(uname -m)" in
+    linux-x86_64:Linux-x86_64|linux-aarch64:Linux-aarch64)
+      dir="$tools/online/chromium/chromium-$CHROMIUM_REVISION/chrome-$cft"
+      missing="$(for loaded in "$dir"/chrome-bin "$dir"/chrome_crashpad_handler "$dir"/*.so*; do
+        [ -f "$loaded" ] && LD_LIBRARY_PATH="$payload/store/ext-core/conda/lib" ldd "$loaded" 2>/dev/null | grep 'not found' | sed "s|^|$(basename "$loaded"): |"
+      done | sort -u || true)"
+      if [ -n "$missing" ]; then
+        echo "[ext-core] Chromium loads what the payload does not have:" >&2
+        echo "$missing" >&2
+        exit 1
+      fi
+      ln -s "$(cd "$payload/store" && pwd)" "$tools/store"
+      if ! env -i "$dir/chrome" --version | grep -q -F "$CHROMIUM_VERSION"; then
+        echo "[ext-core] $platform: online/chromium's chrome does not start Chrome for Testing $CHROMIUM_VERSION" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  rm -rf "$tools"
+}
+
+# playwright-core of the version this Chromium belongs to, as a node_modules directory, and on top of the two our own
+# agent-browser and page-render (the modules of browser/, not their tests) with the versions they were packed with and
+# where the browser's own executable is inside <tools>/online/chromium.
+install_playwright() {
+  local store="$1/store/ext-core" platform="$2" file
+  file="$(fetch "https://registry.npmjs.org/playwright-core/-/playwright-core-$PLAYWRIGHT_VERSION.tgz")"
+  rm -rf "$store/playwright" "$store/browser"
+  mkdir -p "$store/playwright/node_modules/playwright-core" "$store/browser"
+  tar -xzf "$file" -C "$store/playwright/node_modules/playwright-core" --strip-components=1
+  cp "$here"/browser/*.mjs "$store/browser/"
+  printf '{"playwright": "%s", "chromium": "%s", "revision": "%s", "binary": "%s"}\n' "$PLAYWRIGHT_VERSION" "$CHROMIUM_VERSION" "$CHROMIUM_REVISION" "$(chromium_binary "$platform")" > "$store/browser/versions.json"
+}
+
 unix_launchers() {
-  local p="$1"
+  local p="$1" platform="$2"
   unix_env_files "$p"
-  for c in ffprobe xz tree unzip; do unix_launcher "$p" "$c" "\"\$s/conda/bin/$c\""; done
-  unix_launcher "$p" ffmpeg "\"\$s/conda/bin/ffmpeg\"" fontconfig.sh
+  for c in xz tree unzip; do unix_launcher "$p" "$c" "\"\$s/conda/bin/$c\""; done
+  for c in ffmpeg ffprobe; do unix_launcher "$p" "$c" "\"\$s/conda/bin/$c\"" fontconfig.sh; done
   for c in magick convert identify compare; do unix_launcher "$p" "$c" "\"\$s/conda/bin/magick\"$( [ "$c" = magick ] || echo " $c")" magick.sh; done
   for c in pdftotext pdftoppm pdfinfo; do unix_launcher "$p" "$c" "\"\$s/conda/bin/$c\"" fontconfig.sh; done
   unix_launcher "$p" tesseract "\"\$s/conda/bin/tesseract\"" tesseract.sh
@@ -418,14 +775,22 @@ unix_launchers() {
   unix_launcher "$p" npx "\"\$s/node/bin/node\" \"\$s/node/lib/node_modules/npm/bin/npx-cli.js\""
   unix_launcher "$p" deno "\"\$s/deno/deno\""
   unix_launcher "$p" jq "\"\$s/jq/jq\""
+  case "$platform" in
+    darwin-*) unix_launcher "$p" soffice "\"\$s/libreoffice/LibreOffice.app/Contents/MacOS/soffice\"" ;;
+    *) unix_launcher "$p" soffice "\"\$s/libreoffice/program/soffice\"" soffice.sh ;;
+  esac
+  local binary
+  binary="$(chromium_binary "$platform")"
+  unix_online_launcher "$p" chromium chromium "$binary" "${binary%-bin}" 'Chrome for Testing'
+  for c in agent-browser page-render; do unix_launcher "$p" "$c" "\"\$s/node/bin/node\" \"\$s/browser/$c.mjs\""; done
 }
 
 windows_launchers() {
   local p="$1" conda_env='set "C=%S%\\conda"\r\nset "PATH=%C%\\Library\\bin;%C%;%C%\\Library\\mingw-w64\\bin;%PATH%"\r\n'
-  local font_env="$conda_env"'set "FONTCONFIG_FILE=%C%\\Library\\etc\\fonts\\fonts.conf"\r\n'
-  for c in ffprobe xz curl; do windows_launcher "$p" "$c" "\"%C%\\Library\\bin\\$c.exe\"" "$conda_env"; done
-  windows_launcher "$p" ffmpeg "\"%C%\\Library\\bin\\ffmpeg.exe\"" "$font_env"
-  local magick_env="$conda_env"'set "MAGICK_CONFIGURE_PATH=%C%\\Library\\bin;%C%\\Library\\etc\\ImageMagick-7;%C%\\Library\\share\\ImageMagick-7"\r\nset "FONTCONFIG_FILE=%C%\\Library\\etc\\fonts\\fonts.conf"\r\n'
+  local font_env="$conda_env"'set "FONTCONFIG_FILE=%C%\\Library\\etc\\fonts\\fonts.conf"\r\nset "FONTCONFIG_PATH=%C%\\Library\\etc\\fonts"\r\n'
+  for c in xz curl; do windows_launcher "$p" "$c" "\"%C%\\Library\\bin\\$c.exe\"" "$conda_env"; done
+  for c in ffmpeg ffprobe; do windows_launcher "$p" "$c" "\"%C%\\Library\\bin\\$c.exe\"" "$font_env"; done
+  local magick_env="$font_env"'set "MAGICK_CONFIGURE_PATH=%C%\\Library\\bin;%C%\\Library\\etc\\ImageMagick-7;%C%\\Library\\share\\ImageMagick-7"\r\n'
   windows_launcher "$p" magick "\"%C%\\Library\\bin\\magick.exe\"" "$magick_env"
   for c in convert identify compare; do windows_launcher "$p" "$c" "\"%C%\\Library\\bin\\magick.exe\" $c" "$magick_env"; done
   for c in pdftotext pdftoppm pdfinfo; do windows_launcher "$p" "$c" "\"%C%\\Library\\bin\\$c.exe\"" "$font_env"; done
@@ -443,23 +808,38 @@ windows_launchers() {
   cp "$here/windows/tree.py" "$p/store/ext-core/tree/tree.py"
   windows_launcher "$p" tree '"%S%\python\python.exe" "%S%\tree\tree.py"'
   windows_launcher "$p" unzip '"%S%\busybox\busybox.exe" unzip'
+  windows_launcher "$p" soffice '"%S%\libreoffice\program\soffice.com"'
+  # The browser is an online item, found as unix_online_launcher finds it. chrome.exe is a GUI program and does not answer
+  # --version on a console: the launcher does.
+  local chrome_exe
+  chrome_exe="$(chromium_binary windows-x86_64 | sed 's|/|\\\\|g')"
+  windows_launcher "$p" chromium '"%B%"' 'set "P=%~dp0.."\r\nset "T=%P%"\r\nset "E=online\\chromium\\'"$chrome_exe"'"\r\nif not exist "%P%\\%E%" for %%I in ("%P%\\..") do if /i "%%~nxI"=="staging" set "T=%P%\\..\\.."\r\nif not exist "%P%\\%E%" if "%T%"=="%P%" for %%I in ("%P%\\..\\..") do if /i "%%~nxI"=="versions" set "T=%P%\\..\\..\\.."\r\nset "B=%T%\\%E%"\r\nif not exist "%B%" (\r\n  >&2 echo chromium: Chrome for Testing is not downloaded on this node yet: the owner downloads it in Desktop Settings, Extension tools, or with: buckyos ext-tools download ext-core chromium\r\n  exit /b 127\r\n)\r\nif "%~1"=="--version" (echo Google Chrome for Testing '"$CHROMIUM_VERSION"'& exit /b 0)\r\n'
+  for c in agent-browser page-render; do windows_launcher "$p" "$c" "\"%S%\\node\\node.exe\" \"%S%\\browser\\$c.mjs\""; done
 }
 
 for platform in "${platforms[@]}"; do
   payload="$out/$platform"
-  rm -rf "$payload"
+  rm -rf "$payload" "$source_out/$platform"
   mkdir -p "$payload/bin" "$payload/smoke" "$payload/store/ext-core"
   cp "$manifest" "$payload/ext-manifest.json"
   case "$platform" in
     windows-*) cp "$here"/smoke/*.ps1 "$payload/smoke/" ;;
     *) cp "$here"/smoke/*.sh "$payload/smoke/" ;;
   esac
+  cp "$here/smoke/soffice_docx.py" "$here/smoke/make_visio.py" "$here/smoke/visio-fdo57117.vsd" "$here/smoke/THIRD_PARTY.md" "$payload/smoke/"
   install_conda "$payload" "$platform"
   install_official "$payload" "$platform"
+  install_soffice "$payload" "$platform"
+  install_chromium_overlay "$payload" "$platform"
+  install_playwright "$payload" "$platform"
+  "$python_bin" "$here/official_sources.py" --payload "$payload" --source-root "$source_out/$platform" \
+    --platform "$platform" --cache "$cache/corresponding-source"
   case "$platform" in
     windows-*) windows_launchers "$payload" ;;
-    *) unix_launchers "$payload" ;;
+    *) unix_launchers "$payload" "$platform" ;;
   esac
+  "$python_bin" "$here/compliance.py" finalize --payload "$payload" --source-dir "$source_out/$platform" \
+    --platform "$platform" --version "$version" --dist "$dist"
   echo "[ext-core] $platform: $(du -sh "$payload" | cut -f1) in $payload"
   if [ "$archive" = 1 ]; then
     mkdir -p "$dist"

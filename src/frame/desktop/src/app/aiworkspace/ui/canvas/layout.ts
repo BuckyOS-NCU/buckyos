@@ -10,13 +10,14 @@
 import { isControlKind, isTextView } from '@controls/contract'
 import { num, type StoredPlacement } from '@controls/placement'
 import { branchColors } from '@controls/edges'
+import { bandOf, PDF_FRAME, type FrameBand } from '@controls/pdfframe'
 import { placeControl, type PlacedControl, type PlacedNode } from '@controls/solve'
 import type { Grow } from '@controls/tree'
 import type { EntityEnvelope, Placement } from '../../api/types'
 import type { OutlineModel } from '../../state/outline'
 import { blockRegistry } from '../blocks/registry'
 import { nodeMeasurer } from '../controls/measure'
-import { controlRegistry, isCanvasContainer } from '../controls/registry'
+import { controlRegistry, isBoxControl, isCanvasContainer } from '../controls/registry'
 import { isConnector, RECT_FORM, resolveConnectors, type LaidConnector, type TargetForm } from './connectors/layout'
 import { normalizeRotation, rotatedBounds } from './geometry'
 import { union, type Rect } from './render/camera'
@@ -63,6 +64,9 @@ export interface Laid { entity: EntityEnvelope; rect: Rect; rotation: number; bo
   node?: ControlNode
   /** A container kind this client does not know: drawn as a group (R12). */
   unknownKind?: string
+  /** A band of a PDF Frame (打印 TODO §3.3): a group the frame places, its header's or footer's Blocks inside. It is not
+   * pressed or picked itself (the frame is), but Blocks dropped on it join it like a group's. */
+  band?: FrameBand
   /** Where this Block's children are placed from, when not `rect`'s top-left (a control's origin). */
   origin?: { x: number; y: number } }
 
@@ -74,7 +78,8 @@ export function numericPlacement(p: Partial<StoredPlacement> | null | undefined,
 }
 
 /** The size a Block without a numeric one is laid out with inside a control: its definition's default. */
-function fallbackSize(e: { view_type?: string | null }): { w: number; h: number } {
+function fallbackSize(e: { view_type?: string | null; kind?: string | null }): { w: number; h: number } {
+  if (e.kind) return controlRegistry.get(e.kind)?.defaultSize ?? { w: 160, h: 90 }
   const def = e.view_type ? blockRegistry.get(e.view_type) : undefined
   return def?.defaultSize ?? { w: 160, h: 90 }
 }
@@ -83,7 +88,8 @@ function fallbackSize(e: { view_type?: string | null }): { w: number; h: number 
  * the connectors routed between them (`forms`: the outline and anchors each target declares; `folded`: the nodes
  * the reader folded in a control). */
 export function layoutSurface(outline: OutlineModel, surfaceId: string, forms: (id: string) => TargetForm = () => RECT_FORM,
-  folded: (containerId: string) => ReadonlySet<string> | undefined = () => undefined): Map<string, Laid> {
+  folded: (containerId: string) => ReadonlySet<string> | undefined = () => undefined,
+  projectionCount: (containerId: string, projection: string) => number | undefined = () => undefined): Map<string, Laid> {
   const out = new Map<string, Laid>()
   let paint = 0
   const add = (entity: EntityEnvelope, rect: Rect, rotation: number, depth: number, parentId: string, lockedAbove: boolean, extra: Partial<Laid> = {}): Laid => {
@@ -111,7 +117,8 @@ export function layoutSurface(outline: OutlineModel, surfaceId: string, forms: (
           color: colorOf(placed.controls.get(p.control)!, child.entity_id) }
         if (placed.controls.has(child.entity_id)) { control(child, placed, nodeDepth, parent, locked, { node }); continue }
         const rect = { x: p.x, y: p.y, w: p.w, h: p.h }
-        const laid = add(child, rect, 0, nodeDepth, parent, locked, { node })
+        const band = entity.kind === PDF_FRAME && parent === entity.entity_id ? bandOf(child) : null
+        const laid = add(child, rect, 0, nodeDepth, parent, locked, band ? { node, band } : { node })
         if (child.type_id === 'buckyos.container') walk(child.entity_id, { x: rect.x, y: rect.y }, nodeDepth + 1, laid.locked)
         else if (!p.collapsed) nodes(child.entity_id, nodeDepth + 1, laid.locked)
       }
@@ -126,7 +133,7 @@ export function layoutSurface(outline: OutlineModel, surfaceId: string, forms: (
       const def = isControlKind(entity.kind) ? controlRegistry.get(entity.kind) : undefined
       if (def) {
         // a control: solved from the outline (nested ones first), placed by its origin
-        const solved = def.layout.solve(outline, entity.entity_id, { measurer: nodeMeasurer, collapsed: folded, fallbackSize })
+        const solved = def.layout.solve(outline, entity.entity_id, { measurer: nodeMeasurer, collapsed: folded, fallbackSize, projectionCount })
         const at = { x: origin.x + (num(entity.placement?.x) ?? 0), y: entity.placement ? origin.y + (num(entity.placement.y) ?? 0) : autoY - solved.layout.bounds.y }
         control(entity, placeControl(solved, at), depth, parentId, lockedAbove)
         autoY = at.y + solved.layout.bounds.y + solved.layout.bounds.h + 24
@@ -173,6 +180,11 @@ export function relativeTo(laid: Map<string, Laid>, parentId: string, rect: Rect
 /** The placement of a laid-out Block at the world rect `rect` (its own by default) under `parentId`. A control keeps
  * its `"auto"` size and is placed by its origin; a Block inside a control keeps the size components it stores. */
 export function placementOf(laid: Map<string, Laid>, l: Laid, parentId = l.parentId, rect = l.rect, rotation = l.rotation): StoredPlacement {
+  // a data control is placed and sized like a Block (inside another control its x / y may still be laid out)
+  if (l.control && isBoxControl(l.control.kind)) {
+    const p = relativeTo(laid, parentId, rect, 0)
+    return l.node ? { x: l.entity.placement?.x ?? p.x, y: l.entity.placement?.y ?? p.y, w: p.w, h: p.h } : p
+  }
   if (l.control) {
     const { x: ox, y: oy } = originOf(laid, parentId)
     return { x: Math.round(l.control.origin.x + rect.x - l.rect.x - ox), y: Math.round(l.control.origin.y + rect.y - l.rect.y - oy), w: 'auto', h: 'auto' }
@@ -192,11 +204,11 @@ export function movedPlacement(laid: Map<string, Laid>, l: Laid, dx: number, dy:
 
 /** The group an object centred on `p` belongs in (draw.io 导入 TODO §2.2): the top-most group under it that is not
  * locked and not `excluded` (the moving objects themselves), else the Surface. A control and what it lays out are
- * never dropped into (R9: its Blocks come by copy and paste). */
+ * never dropped into (R9: its Blocks come by copy and paste), except a PDF Frame's bands (its header and footer). */
 export function groupAt(laid: Map<string, Laid>, p: { x: number; y: number }, surfaceId: string, excluded: ReadonlySet<string> = new Set()): string {
   let best: Laid | null = null
   for (const g of laid.values()) {
-    if (!g.isGroup || g.control || g.node || excluded.has(g.entity.entity_id) || g.locked) continue
+    if (!g.isGroup || g.control || (g.node && !g.band) || excluded.has(g.entity.entity_id) || g.locked) continue
     if (p.x < g.rect.x || p.x > g.rect.x + g.rect.w || p.y < g.rect.y || p.y > g.rect.y + g.rect.h) continue
     if (!best || g.paint > best.paint) best = g
   }

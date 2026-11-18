@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { selectDialog, selectGoto } from '../fixtures/selectDialog'
 
 function trackErrors(page: Page) {
   const errors: string[] = []
@@ -12,6 +13,7 @@ function trackErrors(page: Page) {
 async function openHomeStation(page: Page, search = '') {
   await page.goto(`/homestation${search}`)
   await expect(page.getByTestId('hs-card').first()).toBeVisible()
+  await expect(page.getByTestId('hs-info-panel')).toHaveCount(0)
 }
 
 const card = (page: Page, text: string) => page.getByTestId('hs-card').filter({ hasText: text })
@@ -191,6 +193,7 @@ test.describe('HomeStation prototype (architecture v0.6)', () => {
   test('A41 a failed publish is not shown as success and a retry creates one post', async ({ page }) => {
     const errors = trackErrors(page)
     await openHomeStation(page, '?scenario=publish-fail')
+    await page.getByTestId('hs-info-open').click()
     const text = 'Testing idempotent publishing from the quick panel'
     await page.getByTestId('hs-quick-text').fill(text)
     await page.getByTestId('hs-quick-submit').click()
@@ -290,6 +293,7 @@ test.describe('HomeStation prototype (architecture v0.6)', () => {
   test('A56 filtered items can be shown on request and a rule change keeps the scroll anchor', async ({ page }) => {
     const errors = trackErrors(page)
     await openHomeStation(page)
+    await page.getByTestId('hs-info-open').click()
     await expect(card(page, 'Daily AI Digest')).toHaveCount(0)
     const anchor = await scrollToCard(page, 'Show HN: A 200-line static site generator')
     await anchor.evaluate(element => element.scrollIntoView({ block: 'center' }))
@@ -395,7 +399,7 @@ test.describe('HomeStation on a phone', () => {
     await noOverflow()
     await page.getByRole('button', { name: 'Back' }).tap()
     await page.getByRole('button', { name: 'Back' }).tap()
-    await page.getByTestId('hs-fab').tap()
+    await page.getByTestId('hs-publish-open').tap()
     await page.getByTestId('hs-publish-text').fill('Posting from my phone')
     await expect(page.getByTestId('hs-publish-audience')).toBeVisible()
     await page.getByTestId('hs-publish-submit').tap()
@@ -407,14 +411,40 @@ test.describe('HomeStation on a phone', () => {
 
 test('a generic file publishes as a downloadable file with unchanged bytes', async ({ page }) => {
   await openHomeStation(page)
-  await page.getByTestId('hs-quick-generic-file').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('original attachment bytes') })
-  await page.getByTestId('hs-quick-text').fill('File attachment test')
-  await expect(page.getByTestId('hs-quick-submit')).toBeEnabled()
-  await page.getByTestId('hs-quick-submit').click()
+  await page.getByTestId('hs-publish-open').click()
+  await page.getByTestId('hs-publish-generic-file').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('original attachment bytes') })
+  await page.getByTestId('hs-publish-text').fill('File attachment test')
+  await expect(page.getByTestId('hs-publish-submit')).toBeEnabled()
+  await page.getByTestId('hs-publish-submit').click()
   await expect(page.getByTestId('hs-toast').filter({ hasText: 'Published to your feed' })).toBeVisible()
   await page.getByTestId('hs-nav-published').click()
-  const link = card(page, 'File attachment test').getByRole('link', { name: 'notes.txt', exact: true })
+  const link = card(page, 'File attachment test').getByRole('link', { name: 'Download notes.txt', exact: true })
   await expect(link).toBeVisible()
   const bytes = await link.evaluate(async element => (await fetch((element as HTMLAnchorElement).href)).text())
   expect(bytes).toBe('original attachment bytes')
+})
+
+test('a posted file is saved into my files at a place I pick in the Zone', async ({ page }) => {
+  await openHomeStation(page)
+  await page.getByTestId('hs-info-open').click()
+  await page.getByTestId('hs-quick-generic-file').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('saved attachment bytes') })
+  await page.getByTestId('hs-quick-text').fill('Save attachment test')
+  await page.getByTestId('hs-quick-submit').click()
+  await expect(page.getByTestId('hs-toast').filter({ hasText: 'Published to your feed' })).toBeVisible()
+  await page.getByTestId('hs-nav-published').click()
+  const save = card(page, 'Save attachment test').getByTestId('hs-attachment-save')
+  await save.click()
+  const dialog = selectDialog(page)
+  await expect(dialog).toHaveAttribute('data-mode', 'save')
+  await expect(dialog.getByTestId('select-name')).toHaveValue('notes.txt')
+  await selectGoto(dialog, '/home/Documents')
+  await dialog.getByTestId('select-confirm').click()
+  await expect(save).toHaveAttribute('data-state', 'saved')
+  await expect(save).toHaveAccessibleName('Saved to /home/Documents/notes.txt')
+  expect(await page.evaluate(async () => {
+    const data = '/src/app/filebrowser/mock/data.ts'
+    const content = '/src/app/filebrowser/mock/content.ts'
+    const entry = (await import(data)).mockEntryByPath('/home/Documents/notes.txt')
+    return entry ? (await (await import(content)).mockReadContent(entry)).text() : null
+  })).toBe('saved attachment bytes')
 })

@@ -50,12 +50,29 @@ fn the_workspace_host_serves_the_page_its_files_and_canonical_surface_links() {
         assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/html"), "{path}");
         assert_eq!(r.text().await.unwrap(), "<!doctype html><title>aiws page</title>", "{path}");
     }
-    // a Surface named without its id: the canonical address, the rest of the query kept
+    // a Surface nobody may read anonymously is not resolved by name here (权限需求 V2): the page resolves it once signed in
+    let r = get("/sales-2026/overview", html).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "<!doctype html><title>aiws page</title>");
+    srv.rpc("acl.set_anonymous", json!({ "enabled": true })).await;
+    srv.rpc("acl.set", json!({ "changes": [{ "subject": "@guest", "resource": "sf-overview", "allow": ["read"] }] })).await;
+    // one anyone may read: named without its id, the canonical address, the rest of the query kept
     let r = get("/sales-2026/overview", html).await;
     assert_eq!(r.status(), 307);
     assert_eq!(r.headers()["location"], "/sales-2026/overview?id=sf%2Doverview");
     let r = get("/sales-2026/sf-overview?block=b1", html).await;
     assert_eq!(r.headers()["location"], "/sales-2026/sf-overview?id=sf%2Doverview&block=b1");
+    // a canvas in a canvas folder (UI 框架 PRD Q5) is named the same way; the folder's grant covers it
+    srv.commit(json!([
+        { "op": "entity.create", "entity_id": "sf-archive", "type_id": "buckyos.container", "parent_id": "surfaces", "order_key": "b", "payload": { "kind": "folder", "title": "Archive" } },
+        { "op": "entity.create", "entity_id": "sf-old-content", "type_id": "buckyos.container", "parent_id": "canvas-content", "order_key": "b", "payload": { "kind": "folder", "system": "surface_content", "surface_id": "sf-old", "title": "Old plan" } },
+        { "op": "entity.create", "entity_id": "sf-old", "type_id": "buckyos.container", "parent_id": "sf-archive", "order_key": "a", "payload": { "kind": "surface", "layout": { "mode": "flow" }, "title": "Old plan", "content_folder_id": "sf-old-content" } },
+    ])).await;
+    assert_eq!(get("/sales-2026/old-plan", html).await.status(), 200, "not readable anonymously yet");
+    srv.rpc("acl.set", json!({ "changes": [{ "subject": "@guest", "resource": "/surfaces/Archive", "allow": ["read"] }] })).await;
+    let r = get("/sales-2026/old-plan", html).await;
+    assert_eq!(r.status(), 307);
+    assert_eq!(r.headers()["location"], "/sales-2026/old-plan?id=sf%2Dold");
     // a publication by name answers the publication, as JSON or as a page for a browser; with `id` it is the page
     let r = get("/sales-2026/orders", "application/json").await;
     assert_eq!(r.status(), 200);
@@ -75,7 +92,8 @@ fn the_workspace_host_serves_the_page_its_files_and_canonical_surface_links() {
     // a request that is not for a Workspace host is no page either
     assert_eq!(http.get(format!("{origin}/sales-2026")).header("x-forwarded-host", "zone.invalid").send().await.unwrap().status(), 404);
     // the entry page names the Workspace's page on its own origin
-    let created = srv.rpc("ws.create_entry", json!({ "capabilities": ["read"], "methods": { "guest": true } })).await;
+    srv.rpc("acl.set_group", json!({ "group_id": "visitors" })).await;
+    let created = srv.rpc("ws.create_entry", json!({ "group_id": "visitors", "methods": { "guest": true } })).await;
     let described = srv.rpc("entry.describe", json!({ "entry_id": created["entry"]["entry_id"] })).await;
     assert_eq!(described["resource"]["path"], json!(format!("https://{host}/sales-2026")));
     });

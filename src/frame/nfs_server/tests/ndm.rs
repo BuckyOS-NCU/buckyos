@@ -275,6 +275,35 @@ async fn import_finalize_requires_complete_owned_dependencies_and_is_retryable()
     assert_eq!(srv.rpc(&alice, endpoint, corrupt).await.0, StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn import_finalize_survives_concurrent_gc() {
+    let srv = start(3600).await;
+    let alice = user("alice");
+    let store = srv.state.share.store(&srv.state.config).await.unwrap().clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gc = tokio::spawn({
+        let (store, stop) = (store.clone(), stop.clone());
+        async move {
+            let mut evicted = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                evicted += store.maintenance_round(true).await.unwrap().gc.evicted_objects;
+                tokio::task::yield_now().await;
+            }
+            evicted
+        }
+    });
+    for i in 0..200 {
+        let data = format!("attachment {i}");
+        assert!(srv.write_chunk(&alice, data.as_bytes()).await.is_success());
+        let (id, body) = file_of(&format!("a{i}.txt"), data.as_bytes());
+        let manifest = json!({"objects": [{"obj_id": id.to_string(), "obj_data": body}], "roots": [id.to_string()]});
+        let (status, result) = srv.rpc(&alice, "/ndm/v1/import/finalize", manifest).await;
+        assert_eq!(status, StatusCode::OK, "import {i}: {result}");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(gc.await.unwrap(), 0);
+}
+
 #[tokio::test]
 async fn import_finalize_handles_chunk_lists_in_dependency_order() {
     let srv = start(3600).await;
@@ -522,9 +551,9 @@ async fn a_service_grants_a_principal_exactly_the_objects_it_names() {
         srv.http.post(format!("{}/kapi/nfs-server", srv.base)).json(&body).send()
     };
 
-    // Only `obj://ndm/manage` may do this: not the holder, not another frame service.
-    let frame = token("aicc", TokenPrincipalKind::System, "system:aicc");
-    for auth in [alice.clone().unwrap(), bob.clone().unwrap(), frame] {
+    // Only a service may do this (`obj://ndm/grant` or `obj://ndm/manage`): not the holder, not a user, not an App.
+    let app = token("alice", TokenPrincipalKind::App, "app:testapp@alice");
+    for auth in [alice.clone().unwrap(), bob.clone().unwrap(), app] {
         let refused: Value = grant(auth, bob_key).await.unwrap().json().await.unwrap();
         assert_eq!(refused["code"], "permission_denied", "{refused}");
     }
@@ -547,6 +576,13 @@ async fn a_service_grants_a_principal_exactly_the_objects_it_names() {
         srv.http.post(format!("{}/kapi/nfs-server", srv.base)).json(&body).send().await.unwrap().json().await.unwrap()
     };
     assert_eq!(bad["code"], "invalid_argument", "{bad}");
+
+    // A frame service (msg-center, HomeStation) has `obj://ndm/grant` alone: it grants, and manages nothing.
+    let frame = token("aicc", TokenPrincipalKind::System, "system:aicc");
+    let granted: Value = grant(frame.clone(), "app:testapp@bob").await.unwrap().json().await.unwrap();
+    assert_eq!(granted["result"]["granted"], 1, "{granted}");
+    assert_eq!(srv.proxy_call(&bob_app, "get_object", json!({"obj_id": file_id.to_string()})).await.0, StatusCode::OK);
+    assert_eq!(srv.proxy_call(&Some(frame), "remove_object", json!({"obj_id": file_id.to_string()})).await.0, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

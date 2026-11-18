@@ -1,55 +1,90 @@
-/* The vertical object toolbar (UI improvement §7): select / hand, the standard objects with the wish
- * (AI) entry, the workspace's pinned extensions, "all objects", and undo / redo at the bottom. Picking
- * an object on a free Surface starts a one-shot placement; on a flow page it appends. */
+/* The tool selection zone (UI 框架 PRD §4.3; UI improvement §7; 工具栏双排, 2026-11-12), from top to bottom: the
+ * pointer group — select (with pan), design / run (Q3), pen | the object group — text, rich text, media, table, mind
+ * map, shape, connector, frame, wish, sticky note, insert… | undo, redo. A flow page's pointer group is design / run
+ * alone. A button with a corner mark opens its second column beside it: select / pan; table, calendar, to-do and the
+ * standard tables; the basic shapes merged with the shape library. The others act at once: picking an object on a
+ * free Surface starts a one-shot placement, on a flow page it appends. Which objects the group holds comes from the
+ * toolbar configuration (built-in list, the canvas's `config.toolbar`). The workspace's extensions are reached through
+ * "insert…"; the ones the user pinned follow it. The eraser is in the pen's bar. */
 
-import { useRef, useSyncExternalStore, type ReactNode } from 'react'
-import { ChevronsDown, ChevronsUp, Eraser, Frame, Hand, Image, LetterText, Library, MousePointer2, PenLine, Plus, Puzzle, Redo2, Shapes, Sparkles, Spline, StickyNote, Table, Type, Undo2, Network, type LucideIcon } from 'lucide-react'
+import { useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { ChevronsDown, ChevronsUp, Hand, MousePointer2, PenLine, Plus, Redo2, Shapes, Table, Undo2, type LucideIcon } from 'lucide-react'
 import { useOutlineVersion, useStore, useUserState } from '../../state/hooks'
+import type { RunMode } from '../../state/runMode'
 import { useAiwsText } from '../../useAiwsText'
 import { blockRegistry } from '../blocks/registry'
 import { ShapePicker } from '../blocks/shapeBlock'
-import { PopoverPanel, usePopover } from '../shell/popover'
-import { entryId, extensionEntries, registryEntries, type CatalogEntry } from './catalog'
+import { usePopover } from '../shell/popover'
+import { useFilePicker } from '../shell/filePicker'
+import { ENTRY_ICONS, entryId, extensionEntries, registryEntries, type CatalogEntry } from './catalog'
 import { ShapeLibraryPanel } from './ShapeLibraryPanel'
 import { libraryShapeConfig } from './stencilLibrary'
+import { RunModeToggle } from './tools'
+import { TOOL_OBJECTS } from '../framework/config'
+/** The table group's second column: the views, then the standard tables (系统已知 schema_id). */
+const TABLE_GROUP = ['table', 'calendar', 'todo']
+const STANDARD_TABLES = ['table-todo', 'table-calendar']
 
-const ICONS: Record<string, LucideIcon> = { richtext: Type, 'shape-text': LetterText, note: StickyNote, shape: Shapes, connector: Spline, frame: Frame, mindmap: Network, table: Table, asset: Image, wish: Sparkles }
+const iconOf = (entry: CatalogEntry): LucideIcon => ENTRY_ICONS[entryId(entry)] ?? Plus
 
-/** The shape library (§2.4): a picked shape is placed like any object. */
-function LibraryTool({ entry, onPick }: { entry: CatalogEntry; onPick: (entry: CatalogEntry) => void }) {
-  const { t } = useAiwsText()
+/** The second column of a toolbar button: beside the toolbar, level with its button, kept inside the canvas area
+ * (moved up when it would run past the bottom, its height capped by the area's). */
+function SideColumn({ label, testId, className = '', children }: { label: string; testId: string; className?: string; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    const anchor = el?.parentElement
+    if (!el || !anchor) return
+    const place = () => {
+      const area = (el.closest('.aiws-canvas-main') ?? el.closest('.aiws-root') ?? document.documentElement).getBoundingClientRect()
+      const top = anchor.getBoundingClientRect().top
+      el.style.setProperty('--aiws-column-room', `${Math.max(120, area.height - 16)}px`)
+      el.style.top = `${Math.max(area.top + 8 - top, Math.min(0, area.bottom - 8 - (top + el.offsetHeight)))}px`
+    }
+    place()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(place)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+  return (
+    <div ref={ref} className={`aiws-popover aiws-popover-side aiws-tool-column ${className}`} role="dialog" aria-label={label} data-testid={testId} onPointerDown={(event) => event.stopPropagation()}>
+      {children}
+    </div>
+  )
+}
+
+function ColumnTool({ icon: Icon, label, title, pressed, testId, columnTestId, columnLabel, columnClass, onPress, children }: {
+  icon: LucideIcon
+  label: string
+  title: string
+  pressed: boolean
+  testId: string
+  columnTestId: string
+  columnLabel?: string
+  columnClass?: string
+  onPress?: () => void
+  children: (close: () => void) => ReactNode
+}) {
   const { open, toggle, close, bindAnchor, bindTrigger } = usePopover()
   return (
     <span ref={bindAnchor} className="aiws-anchor">
-      <button ref={bindTrigger} type="button" className="aiws-tool" aria-pressed={open} aria-label={t('aiworkspace.canvas.library.title')} title={t('aiworkspace.canvas.tool.libraryTip')} aria-haspopup="dialog" aria-expanded={open}
-        data-testid="aiws-tool-library" onClick={toggle}>
-        <Library size={20} />
+      <button ref={bindTrigger} type="button" className="aiws-tool has-column" aria-pressed={pressed} aria-label={label} title={title} aria-haspopup="dialog" aria-expanded={open}
+        data-testid={testId} onClick={() => { onPress?.(); toggle() }}>
+        <Icon size={20} />
       </button>
-      {open && (
-        <PopoverPanel label={t('aiworkspace.canvas.library.title')} testId="aiws-tool-library-panel" className="aiws-popover-side aiws-library-popover">
-          <ShapeLibraryPanel onPick={(shape) => { close(); const { size, config } = libraryShapeConfig(shape); onPick({ ...entry, key: `${entry.key}:library`, title: shape.title, size, config }) }} />
-        </PopoverPanel>
-      )}
+      {open && <SideColumn label={columnLabel ?? label} testId={columnTestId} className={columnClass}>{children(close)}</SideColumn>}
     </span>
   )
 }
 
-/** The shape tool: a grouped picker of the basic shapes (draw.io 导入 TODO §2.1), the pick is placed like any object. */
-function ShapeTool({ entry, pressed, title, onPick, extra }: { entry: CatalogEntry; pressed: boolean; title: string; onPick: (entry: CatalogEntry) => void; extra?: ReactNode }) {
-  const { t } = useAiwsText()
-  const { open, toggle, close, bindAnchor, bindTrigger } = usePopover()
+function ColumnItem({ icon: Icon, label, title, hint, pressed, testId, ai, onClick }: {
+  icon: LucideIcon; label: string; title?: string; hint?: string; pressed: boolean; testId: string; ai?: boolean; onClick: () => void
+}) {
   return (
-    <span ref={bindAnchor} className="aiws-anchor">
-      <button ref={bindTrigger} type="button" className="aiws-tool" aria-pressed={pressed || open} aria-label={entry.title} title={title} aria-haspopup="dialog" aria-expanded={open}
-        data-testid={`aiws-tool-insert-${entryId(entry)}`} onClick={toggle}>
-        <Shapes size={20} />
-      </button>
-      {open && (
-        <PopoverPanel label={t('aiworkspace.canvas.tool.pickShape')} testId="aiws-tool-shape-picker" className="aiws-popover-side">
-          <ShapePicker onPick={(kind) => { close(); onPick({ ...entry, config: { ...(entry.config ?? {}), shape: kind } }) }} extra={extra} />
-        </PopoverPanel>
-      )}
-    </span>
+    <button type="button" className={`aiws-column-item${ai ? ' is-ai' : ''}`} aria-pressed={pressed} title={title ?? label} data-testid={testId} onClick={onClick}>
+      <Icon size={18} aria-hidden="true" /><span>{label}</span>{hint && <kbd>{hint}</kbd>}
+    </button>
   )
 }
 
@@ -78,8 +113,12 @@ export function HistoryButtons({ size = 20 }: { size?: number }) {
  * whole strokes until another tool is picked (手写笔 TODO). */
 export type PointerTool = 'select' | 'hand' | 'connector' | 'pen' | 'eraser'
 
-export function ObjectToolbar({ isFree, tool, onTool, placingKey, insertReason, noteReason, onPick, onPickFile, onOpenCatalog, collapsed, onCollapsed }: {
+export function ObjectToolbar({ isFree, tool, onTool, placingKey, insertReason, noteReason, onPick, onPickFile, onOpenCatalog, collapsed, onCollapsed, runMode, objects: objectIds = TOOL_OBJECTS }: {
   isFree: boolean
+  /** The canvas's design / run switch (扩展控件 P2, Q27), in the pointer group (Q3). */
+  runMode?: RunMode
+  /** The object group, by `entryId` (`table` and `shape` open their second column). */
+  objects?: string[]
   tool: PointerTool
   onTool: (tool: PointerTool) => void
   /** The entry being placed (highlighted), if any. */
@@ -99,69 +138,128 @@ export function ObjectToolbar({ isFree, tool, onTool, placingKey, insertReason, 
   useOutlineVersion()
   useSyncExternalStore(blockRegistry.subscribe, blockRegistry.snapshot)
   const pinned = useUserState<string[]>('ui:pinned-defs') ?? []
-  const fileRef = useRef<HTMLInputElement>(null)
-  const fileEntry = useRef<CatalogEntry | null>(null)
-  // a flow page shows no connectors (连接线实现方案 §8.3)
-  const standard = registryEntries().filter((entry) => entry.catalog.standard && (isFree || entry.definition.type !== 'connector'))
-  const extensions = extensionEntries(store)
+  const pickFile = useFilePicker((message) => store.notify('error', message))
+  const barRef = useRef<HTMLDivElement>(null)
+  /** How many of the object group's last buttons give way to a low window. */
+  const [hidden, setHidden] = useState(0)
+  const [pointer, setPointer] = useState<'select' | 'hand'>('select')
+  if ((tool === 'select' || tool === 'hand') && tool !== pointer) setPointer(tool)
+  const canInsert = insertReason === null
+  const byId = new Map(registryEntries().map((entry) => [entryId(entry), entry]))
+  const offered = (id: string): CatalogEntry | undefined => {
+    const entry = byId.get(id)
+    if (!entry || (!isFree && entry.definition.type === 'connector')) return undefined
+    return canInsert || (noteReason === null && entry.definition.type === 'note') ? entry : undefined
+  }
+  const extensions = canInsert ? extensionEntries(store) : []
   const pinnedEntries = extensions.filter((entry) => pinned.includes(entry.defEntity?.entity_id ?? ''))
   const pick = (entry: CatalogEntry) => {
-    if (entry.catalog.needs === 'file') { fileEntry.current = entry; fileRef.current?.click(); return }
+    if (entry.catalog.needs === 'file') { void pickFile.file().then((file) => { if (file) onPickFile(entry, file) }); return }
     if (entry.catalog.needs !== 'none') { onOpenCatalog(entry.group === 'extension' ? 'extension' : 'all', entry.key); return }
     onPick(entry)
   }
-  const canInsert = insertReason === null
-  const offered = canInsert ? standard : noteReason === null ? standard.filter((entry) => entry.definition.type === 'note') : []
+  const tipOf = (entry: CatalogEntry) => entry.group === 'ai' ? t('aiworkspace.canvas.tool.wishTip', { name: entry.title })
+    : entry.definition.type === 'connector' ? t('aiworkspace.canvas.tool.connectorTip', { name: entry.title })
+    : isFree ? t('aiworkspace.canvas.tool.placeTip', { name: entry.title }) : t('aiworkspace.canvas.insertNamed', { name: entry.title })
+  const item = (entry: CatalogEntry, close: () => void) => (
+    <ColumnItem key={entry.key} icon={iconOf(entry)} label={entry.title} title={tipOf(entry)} pressed={placingKey === entry.key} testId={`aiws-tool-insert-${entryId(entry)}`} onClick={() => { close(); pick(entry) }} />
+  )
+  const objectTool = (id: string): ReactNode => {
+    const entry = offered(id)
+    if (id === 'table') {
+      const views = TABLE_GROUP.map(offered).filter((e): e is CatalogEntry => e !== undefined)
+      const standard = STANDARD_TABLES.map(offered).filter((e): e is CatalogEntry => e !== undefined)
+      if (views.length + standard.length === 0) return null
+      return (
+        <ColumnTool key="table" icon={Table} label={t('aiworkspace.canvas.tool.tables')} title={t('aiworkspace.canvas.tool.tablesTip')} testId="aiws-tool-table" columnTestId="aiws-tool-table-column"
+          pressed={[...views, ...standard].some((e) => e.key === placingKey)}>
+          {(close) => <>
+            {views.map((e) => item(e, close))}
+            {standard.length > 0 && <div className="aiws-column-title">{t('aiworkspace.canvas.tool.standardTables')}</div>}
+            {standard.map((e) => item(e, close))}
+          </>}
+        </ColumnTool>
+      )
+    }
+    if (!entry) return null
+    if (id === 'shape') {
+      return (
+        <ColumnTool key="shape" icon={Shapes} label={entry.title} title={isFree ? t('aiworkspace.canvas.tool.shapeTip', { name: entry.title }) : t('aiworkspace.canvas.insertNamed', { name: entry.title })}
+          testId={`aiws-tool-insert-${entryId(entry)}`} columnTestId="aiws-tool-shape-picker" columnLabel={t('aiworkspace.canvas.tool.pickShape')} columnClass="aiws-library-popover"
+          pressed={placingKey === entry.key || placingKey === `${entry.key}:library`}>
+          {(close) => (
+            <ShapeLibraryPanel
+              basic={<ShapePicker onPick={(kind) => { close(); onPick({ ...entry, config: { ...(entry.config ?? {}), shape: kind } }) }} />}
+              onPick={(shape) => { close(); const { size, config } = libraryShapeConfig(shape); onPick({ ...entry, key: `${entry.key}:library`, title: shape.title, size, config }) }} />
+          )}
+        </ColumnTool>
+      )
+    }
+    const Icon = iconOf(entry)
+    return (
+      <button key={entry.key} type="button" className={`aiws-tool${entry.group === 'ai' ? ' is-ai' : ''}`} aria-pressed={placingKey === entry.key} aria-label={entry.title} title={tipOf(entry)}
+        data-testid={`aiws-tool-insert-${entryId(entry)}`} onClick={() => pick(entry)}>
+        <Icon size={20} />
+      </button>
+    )
+  }
+  const objects = objectIds.map(objectTool).filter((node) => node !== null)
+  const pinnedTools = pinnedEntries.map((entry) => (
+    <button key={entry.key} type="button" className="aiws-tool" aria-label={entry.title} title={t('aiworkspace.canvas.tool.extensionTip', { name: entry.title })} data-testid={`aiws-tool-def-${entry.defEntity?.entity_id}`} onClick={() => onOpenCatalog('extension', entry.key)}>
+      <span className="aiws-tool-letter">{entry.title.slice(0, 1)}</span>
+    </button>
+  ))
+  // too low a window (UI 框架 PRD §4.3): the object group gives way from the bottom up — what goes is in "insert…" —
+  // while the pointer and history groups stay
+  const movable = objects.length + pinnedTools.length
+  const shown = Math.max(0, movable - hidden)
+  useLayoutEffect(() => {
+    const bar = barRef.current
+    const area = bar?.parentElement
+    if (!bar || !area || collapsed) return
+    const fit = () => {
+      const step = (bar.querySelector<HTMLElement>('.aiws-tool-group > .aiws-tool, .aiws-tool-group > .aiws-anchor')?.offsetHeight ?? 36) + 2
+      const room = area.clientHeight - (bar.offsetHeight - bar.clientHeight)
+      const next = Math.max(0, Math.min(movable, Math.ceil((bar.scrollHeight + hidden * step - room) / step)))
+      if (next !== hidden) setHidden(next)
+    }
+    fit()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(fit)
+    observer.observe(area)
+    return () => observer.disconnect()
+  }, [hidden, movable, collapsed])
+  const runToggle = runMode && !runMode.locked ? <RunModeToggle runMode={runMode} /> : null
+  const PointerIcon = pointer === 'hand' ? Hand : MousePointer2
   return (
-    <div className={`aiws-panel aiws-object-toolbar${collapsed ? ' is-collapsed' : ''}`} role="toolbar" aria-orientation="vertical" aria-label={t('aiworkspace.canvas.tool.objectTools')} data-testid="aiws-object-toolbar">
+    <div ref={barRef} className={`aiws-panel aiws-object-toolbar${collapsed ? ' is-collapsed' : ''}`} role="toolbar" aria-orientation="vertical" aria-label={t('aiworkspace.canvas.tool.objectTools')} data-testid="aiws-object-toolbar"
+      data-hidden={hidden > 0 ? hidden : undefined}>
       {!collapsed && (
         <>
+          {!isFree && runToggle && <div className="aiws-tool-group">{runToggle}</div>}
           {isFree && (
             <div className="aiws-tool-group">
-              <button type="button" className="aiws-tool" aria-pressed={tool === 'select' && !placingKey} aria-label={t('aiworkspace.canvas.tool.select')} title={t('aiworkspace.canvas.tool.selectTip')} data-testid="aiws-tool-select" onClick={() => onTool('select')}><MousePointer2 size={20} /></button>
-              <button type="button" className="aiws-tool" aria-pressed={tool === 'hand' && !placingKey} aria-label={t('aiworkspace.canvas.tool.hand')} title={t('aiworkspace.canvas.tool.handTip')} data-testid="aiws-tool-hand" onClick={() => onTool('hand')}><Hand size={20} /></button>
+              <ColumnTool icon={PointerIcon} label={t('aiworkspace.canvas.tool.pointer')} title={t('aiworkspace.canvas.tool.pointerTip')} testId="aiws-tool-pointer" columnTestId="aiws-tool-pointer-column"
+                pressed={(tool === 'select' || tool === 'hand') && !placingKey} onPress={() => { if (tool !== pointer || placingKey) onTool(pointer) }}>
+                {(close) => <>
+                  <ColumnItem icon={MousePointer2} label={t('aiworkspace.canvas.tool.select')} title={t('aiworkspace.canvas.tool.selectTip')} hint="V" pressed={tool === 'select' && !placingKey} testId="aiws-tool-select" onClick={() => { close(); onTool('select') }} />
+                  <ColumnItem icon={Hand} label={t('aiworkspace.canvas.tool.hand')} title={t('aiworkspace.canvas.tool.handTip')} hint="H" pressed={tool === 'hand' && !placingKey} testId="aiws-tool-hand" onClick={() => { close(); onTool('hand') }} />
+                </>}
+              </ColumnTool>
+              {runToggle}
               {canInsert && (
-                <>
-                  <button type="button" className="aiws-tool" aria-pressed={tool === 'pen'} aria-label={t('aiworkspace.canvas.ink.pen')} title={t('aiworkspace.canvas.tool.penTip')} data-testid="aiws-tool-pen" onClick={() => onTool(tool === 'pen' ? 'select' : 'pen')}><PenLine size={20} /></button>
-                  <button type="button" className="aiws-tool" aria-pressed={tool === 'eraser'} aria-label={t('aiworkspace.canvas.ink.eraser')} title={t('aiworkspace.canvas.tool.eraserTip')} data-testid="aiws-tool-eraser" onClick={() => onTool(tool === 'eraser' ? 'select' : 'eraser')}><Eraser size={20} /></button>
-                </>
+                <button type="button" className="aiws-tool" aria-pressed={tool === 'pen' || tool === 'eraser'} aria-label={t('aiworkspace.canvas.ink.pen')} title={t('aiworkspace.canvas.tool.penTip')} data-testid="aiws-tool-pen"
+                  onClick={() => onTool(tool === 'pen' || tool === 'eraser' ? 'select' : 'pen')}><PenLine size={20} /></button>
               )}
             </div>
           )}
-          {offered.length > 0 && (
+          {(objects.length > 0 || canInsert) && (
             <div className="aiws-tool-group">
-              {offered.map((entry) => {
-                const Icon = ICONS[entryId(entry)] ?? Plus
-                const ai = entry.group === 'ai'
-                if (entryId(entry) === 'shape') return [
-                  <ShapeTool key={entry.key} entry={entry} pressed={placingKey === entry.key} title={isFree ? t('aiworkspace.canvas.tool.shapeTip', { name: entry.title }) : t('aiworkspace.canvas.insertNamed', { name: entry.title })} onPick={onPick} />,
-                  ...(canInsert ? [<LibraryTool key="library" entry={entry} onPick={onPick} />] : []),
-                ]
-                return (
-                  <button key={entry.key} type="button" className={`aiws-tool${ai ? ' is-ai' : ''}`} aria-pressed={placingKey === entry.key} aria-label={entry.title}
-                    title={ai ? t('aiworkspace.canvas.tool.wishTip', { name: entry.title }) : entry.definition.type === 'connector' ? t('aiworkspace.canvas.tool.connectorTip', { name: entry.title }) : isFree ? t('aiworkspace.canvas.tool.placeTip', { name: entry.title }) : t('aiworkspace.canvas.insertNamed', { name: entry.title })}
-                    data-testid={`aiws-tool-insert-${entryId(entry)}`} onClick={() => pick(entry)}>
-                    <Icon size={20} />
-                  </button>
-                )
-              })}
+              {objects.slice(0, shown)}
+              {canInsert && <button type="button" className="aiws-tool" aria-label={t('aiworkspace.canvas.tool.insert')} title={t('aiworkspace.canvas.tool.insertTip')} data-testid="aiws-tool-catalog" onClick={() => onOpenCatalog('all')}><Plus size={20} /></button>}
+              {pinnedTools.slice(0, Math.max(0, shown - objects.length))}
             </div>
           )}
-          {canInsert && extensions.length > 0 && (
-            <div className="aiws-tool-group">
-              {pinnedEntries.map((entry) => (
-                <button key={entry.key} type="button" className="aiws-tool" aria-label={entry.title} title={t('aiworkspace.canvas.tool.extensionTip', { name: entry.title })} data-testid={`aiws-tool-def-${entry.defEntity?.entity_id}`} onClick={() => onOpenCatalog('extension', entry.key)}>
-                  <span className="aiws-tool-letter">{entry.title.slice(0, 1)}</span>
-                </button>
-              ))}
-              <button type="button" className="aiws-tool" aria-label={t('aiworkspace.canvas.tool.extensions')} title={t('aiworkspace.canvas.tool.extensionsTip', { count: extensions.length })} data-testid="aiws-tool-extensions" onClick={() => onOpenCatalog('extension')}><Puzzle size={20} /></button>
-            </div>
-          )}
-          {canInsert ? (
-            <div className="aiws-tool-group">
-              <button type="button" className="aiws-tool" aria-label={t('aiworkspace.canvas.tool.allObjects')} title={t('aiworkspace.canvas.tool.allObjectsTip')} data-testid="aiws-tool-catalog" onClick={() => onOpenCatalog('all')}><Plus size={20} /></button>
-            </div>
-          ) : null}
           <div className="aiws-tool-group aiws-tool-group-history">
             <HistoryButtons />
           </div>
@@ -170,12 +268,6 @@ export function ObjectToolbar({ isFree, tool, onTool, placingKey, insertReason, 
       <button type="button" className="aiws-tool aiws-tool-collapse" aria-label={t(collapsed ? 'aiworkspace.canvas.tool.expand' : 'aiworkspace.canvas.tool.collapse')} title={t(collapsed ? 'aiworkspace.canvas.tool.expand' : 'aiworkspace.canvas.tool.collapse')} data-testid="aiws-tool-collapse" onClick={() => onCollapsed(!collapsed)}>
         {collapsed ? <ChevronsDown size={16} /> : <ChevronsUp size={16} />}
       </button>
-      <input ref={fileRef} type="file" hidden aria-hidden="true" tabIndex={-1} data-testid="aiws-tool-file" onChange={(event) => {
-        const file = event.target.files?.[0]
-        const entry = fileEntry.current
-        event.target.value = ''
-        if (file && entry) onPickFile(entry, file)
-      }} />
       {!canInsert && insertReason && !collapsed && <span className="aiws-sr-only" data-testid="aiws-insert-unavailable">{insertReason}</span>}
     </div>
   )

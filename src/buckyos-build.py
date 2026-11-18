@@ -243,6 +243,13 @@ def _prepare_ext_tools(env: dict[str, str]) -> int:
     ).returncode
 
 
+def _prepare_license_materials() -> int:
+    return subprocess.run([
+        sys.executable,
+        str(Path(__file__).resolve().parent / "tools" / "prepare_licenses.py"),
+    ]).returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else list(argv)
     if any(arg in ("-h", "--help") for arg in args):
@@ -263,6 +270,9 @@ def main(argv: list[str] | None = None) -> int:
         return 127
 
     env = os.environ.copy()
+    result = _prepare_license_materials()
+    if result != 0:
+        return result
     if not standalone_daemon:
         result = _prepare_sdk_tool_distribution(env)
         if result != 0:

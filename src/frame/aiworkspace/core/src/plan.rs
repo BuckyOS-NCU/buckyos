@@ -19,6 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub max_ops: usize,
+    /// One assembled Commit (staged parts + the final request), and a compensating Commit.
+    pub max_commit_total_bytes: usize,
     pub max_set_values: usize,
     pub max_migrate_rows: usize,
     pub max_inverse_bytes: usize,
@@ -28,7 +30,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            max_ops: 10_000,
+            max_ops: 50_000,
+            max_commit_total_bytes: 32 * 1024 * 1024,
             max_set_values: 50_000,
             max_migrate_rows: 100_000,
             max_inverse_bytes: 64 * 1024 * 1024,
@@ -63,6 +66,9 @@ pub struct PlanEnv {
     /// CRDT peer used for backend-authored rich text operations.
     pub peer_id: u64,
     pub limits: Limits,
+    /// Who new entities are recorded as created by (R6, R16): the principal the writer was judged as; `None` = the
+    /// writer.
+    pub creator: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +90,9 @@ pub struct CommitRequest {
     pub message: Option<String>,
     #[serde(default)]
     pub preconditions: Vec<Value>,
+    /// Digests of the parts `doc.stage` holds for this key, in order; they come before `operations`.
+    #[serde(default)]
+    pub staged: Vec<String>,
     pub operations: Vec<Value>,
 }
 
@@ -244,6 +253,10 @@ pub struct Planner<'a> {
     pub warnings: Vec<Value>,
     /// Records inserted by an append-only principal (the only ones it may see back).
     pub read_denied: BTreeSet<String>,
+    /// Records of standard tables this Commit wrote, with the last operation that did (`standard::check_records`).
+    pub standard_records: BTreeMap<(String, String), usize>,
+    /// Siblings by parent, for naming: kept across a run of `entity.create`s, dropped by any other operation.
+    pub sibling_cache: BTreeMap<String, Vec<crate::naming::Sibling>>,
 }
 
 pub type OpResult = WsResult<(Value, Option<Vec<Value>>)>;
@@ -286,6 +299,8 @@ impl<'a> Planner<'a> {
             reports: vec![],
             warnings: vec![],
             read_denied: BTreeSet::new(),
+            standard_records: BTreeMap::new(),
+            sibling_cache: BTreeMap::new(),
         }
     }
 
@@ -434,19 +449,40 @@ impl<'a> Planner<'a> {
         e.content_rev = self.env.seq;
     }
 
-    /// Alive siblings under `parent` whose name equals `name` (excluding `except`).
-    pub fn name_taken(&self, parent: &str, name: &str, except: &str) -> WsResult<bool> {
-        for edge in self.ov.children(parent)? {
-            if edge.child_id == except {
-                continue;
-            }
-            if let Some(e) = self.ov.entity(&edge.child_id)? {
-                if e.alive() && e.scope == SCOPE_SHARED && e.name.as_deref() == Some(name) {
-                    return Ok(true);
-                }
-            }
+    /// The siblings under `parent` as naming sees them (cached while operations only create).
+    /// The siblings under `parent` the caller can read: names are unique among what one reader sees, so a sibling the
+    /// caller cannot read never answers `NAME_CONFLICT` nor pushes a name aside (权限需求 V4); a reader of both reaches
+    /// the second by `~<id>` (path shadowing).
+    pub fn siblings(&mut self, parent: &str) -> WsResult<Vec<crate::naming::Sibling>> {
+        if let Some(s) = self.sibling_cache.get(parent) {
+            return Ok(s.clone());
         }
-        Ok(false)
+        let mut s = crate::naming::siblings(&self.ov, parent)?;
+        let mut readable = Vec::with_capacity(s.len());
+        for sib in &s {
+            readable.push(match self.ov.entity(&sib.entity_id)? {
+                Some(e) => self.access.can_read(&self.ov, &e)?,
+                None => true,
+            });
+        }
+        let mut i = 0;
+        s.retain(|_| {
+            i += 1;
+            readable[i - 1]
+        });
+        self.sibling_cache.insert(parent.to_string(), s.clone());
+        Ok(s)
+    }
+
+    /// Is `name` used by a live sibling under `parent` that an entity of `scope` meets (excluding `except`)?
+    pub fn name_taken(&mut self, parent: &str, name: &str, except: &str, scope: &str) -> WsResult<bool> {
+        Ok(crate::naming::taken(&self.siblings(parent)?, name, scope, except))
+    }
+
+    /// A name for `e` under `parent` that follows it (`keep`: its current name, kept when still right and free).
+    pub fn follow_name(&mut self, parent: &str, e: &EntityRow, keep: Option<&str>) -> WsResult<String> {
+        let sibs = self.siblings(parent)?;
+        Ok(crate::naming::free_name(&sibs, &crate::naming::base_of(&e.type_id, &e.payload), &e.scope, &e.entity_id, keep))
     }
 
     /// A local reference target must exist, be alive, be readable by the caller
@@ -660,6 +696,56 @@ fn check_preconditions(p: &mut Planner, pre: &[Value]) -> WsResult<()> {
 /// recorded row delta, so a replica never needs this to match; `ws.get_info` reports it for diagnostics.
 pub const PLANNER_VERSION: u32 = 1;
 
+/// The entity types each operation acts on (its `entity_id` / `source_id`; the parent for `entity.create`): `"*"` any
+/// entity, empty for internal operations. `schemas/operations.json` mirrors it (`types`); `meta.ops` filters it.
+pub const OPERATION_TYPES: &[(&str, &[&str])] = &[
+    ("entity.create", &["buckyos.container", "buckyos.cell", "buckyos.table-source"]),
+    ("entity.delete", &["*"]),
+    ("entity.restore", &["*"]),
+    ("entity.rename", &["*"]),
+    ("entity.set_keys", &["*"]),
+    ("entity.unset_keys", &["*"]),
+    ("entity.set_props", &["buckyos.cell", "buckyos.container"]),
+    ("entity.set_write_policy", &["*"]),
+    ("entity.set_derived", &["*"]),
+    ("tree.move", &["*"]),
+    ("tree.place", &["*"]),
+    ("tree.clone", &["buckyos.cell", "buckyos.container"]),
+    ("entity.clone", &["buckyos.table-source", "buckyos.richtext", "buckyos.record", "buckyos.asset-ref", "buckyos.annotation", "buckyos.wish", "buckyos.block-def", "buckyos.dir"]),
+    ("data.pin", &["buckyos.table-source", "buckyos.richtext", "buckyos.record", "buckyos.asset-ref", "buckyos.annotation", "buckyos.wish", "buckyos.block-def", "buckyos.dir"]),
+    ("dir.set_member", &["buckyos.dir"]),
+    ("dir.remove_member", &["buckyos.dir"]),
+    ("dir.replace", &["buckyos.dir"]),
+    ("table.insert_records", &["buckyos.table-source"]),
+    ("table.delete_records", &["buckyos.table-source"]),
+    ("table.set_values", &["buckyos.table-source"]),
+    ("table.unset_values", &["buckyos.table-source"]),
+    ("table.set_body", &["buckyos.table-source"]),
+    ("table.add_field", &["buckyos.table-source"]),
+    ("table.update_field", &["buckyos.table-source"]),
+    ("table.delete_field", &["buckyos.table-source"]),
+    ("table.add_option", &["buckyos.table-source"]),
+    ("table.update_option", &["buckyos.table-source"]),
+    ("table.delete_option", &["buckyos.table-source"]),
+    ("table.migrate_field", &["buckyos.table-source"]),
+    ("richtext.apply_update", &["buckyos.richtext"]),
+    ("richtext.insert_blocks", &["buckyos.richtext"]),
+    ("richtext.replace_block", &["buckyos.richtext"]),
+    ("richtext.delete_blocks", &["buckyos.richtext"]),
+    ("richtext.move_block", &["buckyos.richtext"]),
+    ("table.restore_records", &["buckyos.table-source"]),
+    ("table.restore_field", &["buckyos.table-source"]),
+    ("table.restore_migration", &["buckyos.table-source"]),
+    ("data.restore_owns", &[]),
+    ("entity.purge", &[]),
+    ("system.ensure", &[]),
+];
+
+/// The operations an entity of `type_id` accepts (`meta.ops`).
+pub fn operations_for(type_id: &str) -> Vec<&'static str> {
+    OPERATION_TYPES.iter().filter(|(_, t)| t.iter().any(|x| *x == "*" || *x == type_id)).map(|(o, _)| *o).collect()
+}
+
 /// The operation catalogue: `(name, class, undo, capability)` — part of the
 /// protocol (design doc §2.5.3). `schemas/operations.json` mirrors it.
 pub const OPERATIONS: &[(&str, &str, &str, &str)] = &[
@@ -782,20 +868,36 @@ fn entity_purge(p: &mut Planner, op: &Value) -> OpResult {
 
 /// Own data (内核架构改进 D05): a Block created in this Commit together with the data it shows, under the
 /// canvas content folder, owns that data — unless the Block declares `data_ownership: "shared"`. The
-/// `owns` edge is added beside `bind`; data of the data tree (inserted in data mode) is never owned.
+/// `owns` edge is added beside `bind`; data of the data tree (inserted in data mode) is never owned. A control owns
+/// the data of its `bindings` created with it the same way: a data control (to-do, calendar), a composite, an extension
+/// Cell (控件 on_bind TODO §2.1: what its on_bind creates).
 fn add_owns_edges(p: &mut Planner) -> WsResult<()> {
     let seq = p.seq();
-    let created: Vec<EntityRow> = p.ov.entities.values().filter(|e| e.created_seq == seq && e.alive() && e.type_id == TYPE_CELL).cloned().collect();
-    for cell in created {
-        if cell.payload.get("data_ownership").and_then(Value::as_str) == Some("shared") {
+    let created: Vec<EntityRow> = p
+        .ov
+        .entities
+        .values()
+        .filter(|e| e.created_seq == seq && e.alive())
+        .filter(|e| e.type_id == TYPE_CELL || (e.type_id == TYPE_CONTAINER && (crate::types::is_data_control(container_kind(e)) || container_kind(e) == crate::types::COMPOSITE)))
+        .cloned()
+        .collect();
+    for block in created {
+        if block.payload.get("data_ownership").and_then(Value::as_str) == Some("shared") {
             continue;
         }
-        let Some(target) = cell.payload.get("source_ref").filter(|r| crate::value::reference_is_local(r)).and_then(crate::value::reference_entity_id).map(str::to_string) else { continue };
-        let Some(data) = p.ov.entity(&target)? else { continue };
-        if data.created_seq != seq || !data.alive() || !under_canvas_content(&p.ov, &target)? {
-            continue;
+        let bound = block.payload.get("bindings").and_then(Value::as_object).into_iter().flat_map(|b| b.values()).flat_map(crate::types::binding_targets);
+        let targets: Vec<&Value> = match block.type_id.as_str() {
+            TYPE_CELL => block.payload.get("source_ref").into_iter().chain(bound).collect(),
+            _ => bound.collect(),
+        };
+        for r in targets {
+            let Some(target) = Some(r).filter(|r| crate::value::reference_is_local(r)).and_then(crate::value::reference_entity_id).map(str::to_string) else { continue };
+            let Some(data) = p.ov.entity(&target)? else { continue };
+            if data.created_seq != seq || !data.alive() || !under_canvas_content(&p.ov, &target)? {
+                continue;
+            }
+            p.ov.add_ref(RefEdge::local(&block.entity_id, "", "owns", &target));
         }
-        p.ov.add_ref(RefEdge::local(&cell.entity_id, "", "owns", &target));
     }
     Ok(())
 }
@@ -1005,7 +1107,7 @@ fn entity_clone(p: &mut Planner, op: &Value) -> OpResult {
             Value::Object(payload)
         }
         TYPE_WISH => {
-            for k in ["last_run", "analysis", "program"] {
+            for k in ["last_run", "analysis", "program", "history"] {
                 payload.remove(k);
             }
             Value::Object(payload)
@@ -1132,7 +1234,10 @@ fn tree_clone(p: &mut Planner, op: &Value) -> OpResult {
         }
         if let Some(b) = payload.get_mut("bindings").and_then(Value::as_object_mut) {
             for v in b.values_mut() {
-                remap(v, &ids);
+                match v {
+                    Value::Array(list) => list.iter_mut().for_each(|item| remap(item, &ids)),
+                    _ => remap(v, &ids),
+                }
             }
         }
         let mut create = json!({ "op": "entity.create", "entity_id": ids[&r.entity_id], "type_id": r.type_id, "schema_version": r.schema_version });
@@ -1154,8 +1259,10 @@ fn tree_clone(p: &mut Planner, op: &Value) -> OpResult {
                 }
                 None => {}
             }
-            if let Some(n) = r.name.as_deref().filter(|n| r.scope == SCOPE_SHARED && !p.name_taken(parent_id, n, "").unwrap_or(true)) {
-                create["name"] = json!(n);
+            if let Some(n) = r.name.as_deref() {
+                if !p.name_taken(parent_id, n, "", &r.scope)? && !crate::naming::entity_follows(r) {
+                    create["name"] = json!(n);
+                }
             }
         } else {
             create["parent_id"] = json!(ids.get(&edge.parent_id).ok_or_else(|| WsError::invalid_op("subtree parent missing"))?);
@@ -1203,6 +1310,9 @@ pub fn plan_commit<'a>(
         p.op_index = i;
         p.touched = vec![];
         let name = op.get("op").and_then(Value::as_str).unwrap_or("");
+        if name != "entity.create" {
+            p.sibling_cache.clear();
+        }
         let result = if is_internal_op(name) && !env.internal {
             Err(WsError::invalid_op(format!("{name} is an internal operation")))
         } else {
@@ -1237,6 +1347,9 @@ pub fn plan_commit<'a>(
     }
     if !p.conflicts.is_empty() {
         return Err(CommitFailure::Conflict(p.conflicts));
+    }
+    if env.schema_checks {
+        crate::standard::check_records(&p).map_err(|(e, i)| reject(e, Some(i)))?;
     }
     add_owns_edges(&mut p).map_err(|e| reject(e, None))?;
     if env.import {
@@ -1303,12 +1416,13 @@ fn container_kind(e: &EntityRow) -> &str {
 /// * `data` / `folder`: folders and data entities (annotations of any scope); the data tree.
 /// * the `shows` system folder: presentation paths and Viewports, nothing else (third phase §6.2);
 ///   they are never placed anywhere else.
-/// * `surfaces`: Surfaces only.
+/// * `surfaces` and the folders under it (canvas folders, UI 框架 PRD §4.1.1, Q5): Surfaces and canvas folders only;
+///   `in_surfaces` says a `folder` parent is one of them.
 /// * `surface` / `group`: Cells, UI groups and controls only; the BlockTree holds no data.
 /// * a control (`mindmap`, 脑图方案 R2/R3/R24): Cells, groups and other controls; inside a control a Cell may hold
 ///   Cells and containers too (a node's children). `in_control` says the parent is a Cell laid out by a control.
 /// * a TableSource holds the rich text bodies of its records.
-pub fn child_allowed(parent: &EntityRow, in_control: bool, child_type: &str, child_kind: Option<&str>, child_scope: &str) -> bool {
+pub fn child_allowed(parent: &EntityRow, in_control: bool, in_surfaces: bool, child_type: &str, child_kind: Option<&str>, child_scope: &str) -> bool {
     if parent.entity_id == SHOWS_ID {
         return is_show_type(child_type) && child_scope == SCOPE_SHARED;
     }
@@ -1326,15 +1440,21 @@ pub fn child_allowed(parent: &EntityRow, in_control: bool, child_type: &str, chi
         TYPE_CELL => child_scope == SCOPE_SHARED,
         _ => false,
     };
+    let canvas_entry = child_type == TYPE_CONTAINER && matches!(child_kind, Some("surface" | "folder")) && child_scope == SCOPE_SHARED;
     match parent.type_id.as_str() {
         TYPE_CONTAINER => match container_kind(parent) {
+            "folder" if in_surfaces => canvas_entry,
             "data" | "folder" => match child_type {
                 TYPE_CONTAINER => child_kind == Some("folder"),
                 TYPE_ANNOTATION => true,
                 t => is_data_type(t) && child_scope == SCOPE_SHARED,
             },
-            "surfaces" => child_type == TYPE_CONTAINER && child_kind == Some("surface"),
+            "surfaces" => canvas_entry,
             "surface" | "group" => block(child_type),
+            // a data control's content is projected from its tables, never stored (控件机制 TODO Q19)
+            k if crate::types::is_data_control(k) => false,
+            // a PDF Frame holds its two bands, groups (打印 TODO §3.3)
+            crate::types::PDF_FRAME => child_type == TYPE_CONTAINER && child_kind == Some("group"),
             k if crate::types::is_control_kind(k) => block(child_type),
             _ => false,
         },
@@ -1344,10 +1464,52 @@ pub fn child_allowed(parent: &EntityRow, in_control: bool, child_type: &str, chi
     }
 }
 
-/// `child_allowed` for a parent in the current state: whether a Cell parent sits inside a control is read from the tree.
+/// `child_allowed` for a parent in the current state: whether a Cell parent sits inside a control, and whether a folder
+/// parent is a canvas folder, are read from the tree.
 fn child_allowed_here(p: &Planner, parent: &EntityRow, child_type: &str, child_kind: Option<&str>, child_scope: &str) -> WsResult<bool> {
     let in_control = parent.type_id == TYPE_CELL && crate::types::in_tree_control(&p.ov, &parent.entity_id)?;
-    Ok(child_allowed(parent, in_control, child_type, child_kind, child_scope))
+    let in_surfaces = parent.type_id == TYPE_CONTAINER && container_kind(parent) == "folder" && in_surfaces_tree(&p.ov, &parent.entity_id)?;
+    Ok(child_allowed(parent, in_control, in_surfaces, child_type, child_kind, child_scope))
+}
+
+/// Is `id` under `surfaces` (a canvas folder, a Surface or anything drawn on one)? `surfaces` itself is not.
+pub fn in_surfaces_tree(ctx: &dyn ReadCtx, id: &str) -> WsResult<bool> {
+    let mut cur = id.to_string();
+    for _ in 0..4096 {
+        match ctx.edge(&cur)? {
+            Some(e) if e.parent_id == SURFACES_ID => return Ok(true),
+            Some(e) => cur = e.parent_id,
+            None => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+/// Every live Surface under `surfaces`, through the canvas folders, in tree order (depth first). Folders are walked
+/// whoever may read them: what a caller may see is judged on each Surface.
+pub fn canvas_surfaces(ctx: &dyn ReadCtx) -> WsResult<Vec<EntityRow>> {
+    fn walk(ctx: &dyn ReadCtx, parent: &str, depth: usize, out: &mut Vec<EntityRow>) -> WsResult<()> {
+        if depth > 64 {
+            return Ok(());
+        }
+        for edge in ctx.children(parent)? {
+            let Some(e) = ctx.entity(&edge.child_id)?.filter(|e| e.alive() && e.type_id == TYPE_CONTAINER) else { continue };
+            match container_kind(&e) {
+                "surface" => out.push(e),
+                "folder" => walk(ctx, &e.entity_id, depth + 1, out)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(ctx, SURFACES_ID, 0, &mut out)?;
+    Ok(out)
+}
+
+/// A canvas folder: a `folder` under `surfaces` (UI 框架 PRD §4.1.1, Q5).
+pub fn is_canvas_folder(ctx: &dyn ReadCtx, e: &EntityRow) -> WsResult<bool> {
+    Ok(e.type_id == TYPE_CONTAINER && container_kind(e) == "folder" && in_surfaces_tree(ctx, &e.entity_id)?)
 }
 
 /// What a placement is judged against besides its own shape (脑图方案 §5.1–§5.2): where it sits and what it is.
@@ -1374,7 +1536,9 @@ impl<'a> PlaceRules<'a> {
             _ => false,
         };
         let laid_out = !fixed && host.as_ref().is_some_and(|c| crate::types::is_control_kind(container_kind(c)));
-        let control = type_id == TYPE_CONTAINER && payload.get("kind").and_then(Value::as_str).is_some_and(crate::types::is_control_kind);
+        // a data control and a PDF Frame have the size their user gives them (nothing of theirs to wrap)
+        let control = type_id == TYPE_CONTAINER
+            && payload.get("kind").and_then(Value::as_str).is_some_and(|k| crate::types::is_control_kind(k) && !crate::types::is_data_control(k) && k != crate::types::PDF_FRAME);
         let text = type_id == TYPE_CELL && payload.get("view").and_then(|v| v.get("type")).and_then(Value::as_str).is_some_and(crate::types::is_text_view);
         Ok(PlaceRules { connector, internal: p.env.internal, laid_out, auto_size: control || (laid_out && text) })
     }
@@ -1488,7 +1652,11 @@ fn connector_placement(op: &Value, rules: PlaceRules) -> WsResult<Option<Value>>
 }
 
 fn entity_create(p: &mut Planner, op: &Value) -> OpResult {
-    only_keys(op, &["entity_id", "type_id", "schema_version", "schema_id", "name", "parent_id", "order_key", "placement", "payload", "scope"])?;
+    if p.env.replay {
+        only_keys(op, &["entity_id", "type_id", "schema_version", "schema_id", "name", "parent_id", "order_key", "placement", "payload", "scope", "created_by"])?;
+    } else {
+        only_keys(op, &["entity_id", "type_id", "schema_version", "schema_id", "name", "parent_id", "order_key", "placement", "payload", "scope"])?;
+    }
     let id = get_str(op, "entity_id")?;
     check_id("entity_id", id)?;
     let type_id = get_str(op, "type_id")?;
@@ -1547,13 +1715,13 @@ fn entity_create(p: &mut Planner, op: &Value) -> OpResult {
         None | Some(Value::Null) => None,
         Some(Value::String(n)) => {
             check_name(n)?;
-            if scope == SCOPE_SHARED && p.name_taken(parent_id, n, id)? {
-                return Err(WsError::sub(Code::InvalidOperation, "NAME_CONFLICT", format!("name {n:?} already used under {parent_id}")));
-            }
             Some(n.clone())
         }
         Some(_) => return Err(WsError::invalid_op("name must be a string")),
     };
+    if crate::types::SOURCE_TYPES.contains(&type_id) && payload.get("source").is_some_and(|s| !s.is_null()) {
+        crate::types::require_source_owner(p, id)?;
+    }
     let placement = connector_placement(op, PlaceRules::new(p, parent_id, type_id, &payload)?)?;
     let seq = p.seq();
     let mut row = EntityRow {
@@ -1567,11 +1735,17 @@ fn entity_create(p: &mut Planner, op: &Value) -> OpResult {
         payload: Map::new(),
         key_revs: BTreeMap::new(),
         derived: None,
+        created_by: None,
         created_seq: seq,
         meta_rev: seq,
         content_rev: seq,
         life_rev: seq,
         deleted_seq: None,
+    };
+    // the creator (R6): who the writer was judged as; history carries it when that is not the writer itself
+    row.created_by = match (p.env.replay, op.get("created_by").and_then(Value::as_str)) {
+        (true, Some(c)) => Some(c.to_string()),
+        _ => Some(p.env.creator.clone().unwrap_or_else(|| p.env.principal.clone())),
     };
     // the edge exists before type initialization so adapters can see the tree position
     p.ov.put_edge(TreeEdge { child_id: id.to_string(), parent_id: parent_id.to_string(), order_key: order_key.to_string(), placement, struct_rev: seq });
@@ -1583,8 +1757,30 @@ fn entity_create(p: &mut Planner, op: &Value) -> OpResult {
     } else {
         row.payload = payload; // unknown extension: kept verbatim (V20)
     }
+    if row.created_by.as_deref() != Some(p.env.principal.as_str()) {
+        norm["created_by"] = json!(row.created_by);
+    }
     for k in row.payload.keys() {
         row.key_revs.insert(k.clone(), seq);
+    }
+    // a name nobody gave follows the entity (R19): its title's name, or a counter name; history records it. A given
+    // name that is just that (the title's name) moves aside like one (`-2`); another one taken is a conflict. An
+    // import keeps the package's entities as they are (its content root is verified); names are given after it.
+    if let Some(n) = row.name.clone() {
+        if p.name_taken(parent_id, &n, id, &row.scope)? {
+            if p.env.import || !crate::naming::entity_follows(&row) {
+                return Err(WsError::sub(Code::InvalidOperation, "NAME_CONFLICT", format!("name {n:?} already used under {parent_id}")));
+            }
+            row.name = None;
+        }
+    }
+    if row.name.is_none() && !p.env.import {
+        let n = p.follow_name(parent_id, &row, None)?;
+        norm["name"] = json!(n);
+        row.name = Some(n);
+    }
+    if let Some(sibs) = p.sibling_cache.get_mut(parent_id) {
+        sibs.push(crate::naming::Sibling { entity_id: id.to_string(), name: row.name.clone(), scope: row.scope.clone(), alive: true });
     }
     let refs = crate::types::entity_refs(&row)?;
     p.ov.set_refs(&BTreeSet::new(), &refs);
@@ -1632,6 +1828,11 @@ fn entity_delete(p: &mut Planner, op: &Value) -> OpResult {
     }
     let mut descendants = Vec::new();
     alive_descendants(p, id, &mut descendants)?;
+    // a canvas folder goes only when empty: its canvases are moved or deleted (with their content folders) first
+    if !descendants.is_empty() && !p.env.internal && is_canvas_folder(&p.ov, &e)? {
+        let ids: Vec<&str> = descendants.iter().map(|d| d.entity_id.as_str()).collect();
+        return Err(WsError::sub(Code::InvalidOperation, "FOLDER_NOT_EMPTY", "only an empty canvas folder can be deleted").with_data(json!({ "children": ids })));
+    }
     let listed: BTreeSet<String> = match op.get("subtree") {
         None => BTreeSet::new(),
         Some(Value::String(s)) if s == "reject_if_children" => BTreeSet::new(),
@@ -1745,12 +1946,20 @@ fn entity_restore(p: &mut Planner, op: &Value) -> OpResult {
     if !by_comment {
         p.need_lock(&parent);
     }
-    if let Some(n) = &e.name {
-        if e.scope == SCOPE_SHARED && p.name_taken(&edge.parent_id, n, id)? {
-            return Err(WsError::sub(Code::InvalidOperation, "NAME_CONFLICT", format!("name {n:?} is taken again")));
-        }
-    }
     let seq = p.seq();
+    // a following name moves aside (`-2`) when its place was taken meanwhile; a chosen one is a conflict
+    let taken = match e.name.clone() {
+        Some(n) => p.name_taken(&edge.parent_id, &n, id, &e.scope)?,
+        None => true,
+    };
+    if taken {
+        if e.name.is_some() && !crate::naming::entity_follows(&e) {
+            return Err(WsError::sub(Code::InvalidOperation, "NAME_CONFLICT", format!("name {:?} is taken again", e.name.as_deref().unwrap_or(""))));
+        }
+        e.name = Some(p.follow_name(&edge.parent_id, &e, None)?);
+        e.meta_rev = seq;
+        p.sibling_cache.remove(&edge.parent_id);
+    }
     e.deleted_seq = None;
     e.life_rev = seq;
     p.ov.put_entity(e);
@@ -1773,12 +1982,17 @@ fn entity_rename(p: &mut Planner, op: &Value) -> OpResult {
     if !p.check_rev(op.get("expect"), e.meta_rev, None, id, None, || Some(json!(old)))? {
         return Ok((op.clone(), None));
     }
+    let parent = p.ov.edge(id)?.map(|edge| edge.parent_id);
     let name = match op.get("name") {
-        Some(Value::Null) => None,
+        // `null` gives the name back to the rule (R19): it follows the title, or a counter
+        Some(Value::Null) => match &parent {
+            Some(parent) => Some(p.follow_name(parent, &e, None)?),
+            None => None,
+        },
         Some(Value::String(n)) => {
             check_name(n)?;
-            if let Some(edge) = p.ov.edge(id)? {
-                if e.scope == SCOPE_SHARED && p.name_taken(&edge.parent_id, n, id)? {
+            if let Some(parent) = &parent {
+                if p.name_taken(parent, n, id, &e.scope)? {
                     return Err(WsError::sub(Code::InvalidOperation, "NAME_CONFLICT", format!("name {n:?} already used")));
                 }
             }
@@ -1787,6 +2001,9 @@ fn entity_rename(p: &mut Planner, op: &Value) -> OpResult {
         _ => return Err(WsError::invalid_op("name must be a string or null").at("/name")),
     };
     let seq = p.seq();
+    if let Some(parent) = &parent {
+        p.sibling_cache.remove(parent);
+    }
     e.name = name;
     e.meta_rev = seq;
     p.ov.put_entity(e);
@@ -1826,8 +2043,11 @@ fn entity_set_keys(p: &mut Planner, op: &Value, unset: bool) -> OpResult {
         return Err(WsError::new(code, format!("content of {id} cannot be edited ({d})")));
     }
     require_session_writer(p, &e)?;
-    if e.type_id == TYPE_RICHTEXT && get_array(op, "keys")?.iter().any(|k| k.get("key").and_then(Value::as_str) != Some("source")) {
+    if e.type_id == TYPE_RICHTEXT && get_array(op, "keys")?.iter().any(|k| !matches!(k.get("key").and_then(Value::as_str), Some("source" | "data_version"))) {
         return Err(WsError::invalid_op("rich text content is edited with richtext.* operations"));
+    }
+    if crate::types::SOURCE_TYPES.contains(&e.type_id.as_str()) && get_array(op, "keys")?.iter().any(|k| k.get("key").and_then(Value::as_str) == Some("source")) {
+        crate::types::require_source_owner(p, id)?;
     }
     // a sourced entity keeps its content for its refresh; its Source and presentation keys stay editable
     if crate::types::has_source(&e) && get_array(op, "keys")?.iter().any(|k| k.get("key").and_then(Value::as_str).is_some_and(|k| !crate::types::SOURCE_FREE_KEYS.contains(&k))) {
@@ -1901,12 +2121,32 @@ fn entity_set_keys(p: &mut Planner, op: &Value, unset: bool) -> OpResult {
     for k in &changed {
         p.touch(id, sel(json!({ "kind": "doc_key", "key": k })), class);
     }
+    // a name that follows the title follows it here, in the same Commit (R19); undoing the title brings it back
+    let (old_base, new_base) = (crate::naming::base_of(&before.type_id, &before.payload), crate::naming::base_of(&e.type_id, &e.payload));
+    if old_base != new_base && !is_system_id(id) && crate::naming::follows(before.name.as_deref(), &old_base) {
+        if let Some(parent) = p.ov.edge(id)?.map(|edge| edge.parent_id) {
+            let n = p.follow_name(&parent, &e, None)?;
+            p.sibling_cache.remove(&parent);
+            if e.name.as_deref() != Some(n.as_str()) {
+                e.name = Some(n);
+                e.meta_rev = seq;
+                p.touch(id, None, "renamed");
+            }
+        }
+    }
     // the stored payload may have been normalized: history records what was stored
     let mut norm = op.clone();
     if !unset {
         for item in norm["keys"].as_array_mut().unwrap() {
             if let Some(v) = item["key"].as_str().and_then(|k| e.payload.get(k)) {
                 item["value"] = v.clone();
+            }
+        }
+        // a run's page trusted as it was written (权限需求 Q32): history carries the vouch, so a replay need not judge
+        // who wrote it
+        if e.type_id == TYPE_BLOCK_DEF && p.env.origin == "program" && !changed.iter().any(|k| k == "trusted") {
+            if let Some(t) = e.payload.get("trusted").filter(|t| before.payload.get("trusted") != Some(*t)) {
+                norm["keys"].as_array_mut().unwrap().push(json!({ "key": "trusted", "value": t, "expect": { "rev": before.key_rev("trusted") } }));
             }
         }
     }
@@ -2108,6 +2348,14 @@ fn tree_move(p: &mut Planner, op: &Value) -> OpResult {
     if !child_allowed_here(p, &new_parent, &e.type_id, kind, &e.scope)? {
         return Err(WsError::sub(Code::InvalidOperation, "CHILD_NOT_ALLOWED", format!("{} cannot be a child of {new_parent_id}", e.type_id)));
     }
+    // a folder keeps to its tree: a canvas folder holds canvases, a data folder data (UI 框架 PRD §4.1.1, Q5)
+    if e.type_id == TYPE_CONTAINER && kind == Some("folder") {
+        let canvas = |pid: &str| -> WsResult<bool> { Ok(pid == SURFACES_ID || in_surfaces_tree(&p.ov, pid)?) };
+        let from = p.ov.edge(id)?.map(|edge| edge.parent_id).unwrap_or_default();
+        if canvas(&from)? != canvas(new_parent_id)? {
+            return Err(WsError::sub(Code::InvalidOperation, "CHILD_NOT_ALLOWED", format!("folder {id} cannot move between the data tree and the canvases")));
+        }
+    }
     // a node keeps its children only where a tree control lays Blocks out (R3): elsewhere a Cell is a leaf again
     if e.type_id == TYPE_CELL && !crate::types::in_tree_control(&p.ov, new_parent_id)? {
         let mut kids = Vec::new();
@@ -2139,9 +2387,18 @@ fn tree_move(p: &mut Planner, op: &Value) -> OpResult {
     if !p.check_rev_opt(op.get("expect"), edge.struct_rev, None, id, None, || None)? {
         return Ok((op.clone(), None));
     }
-    if let Some(n) = &e.name {
-        if new_parent_id != edge.parent_id && e.scope == SCOPE_SHARED && p.name_taken(new_parent_id, n, id)? {
-            return Err(WsError::sub(Code::InvalidOperation, "NAME_CONFLICT", format!("name {n:?} already used under {new_parent_id}")));
+    // a following name moves aside in its new place (`text-3` → `text-7`); a chosen one that is taken there is a conflict
+    let mut renamed = None;
+    if new_parent_id != edge.parent_id {
+        let clash = match e.name.clone() {
+            Some(n) => p.name_taken(new_parent_id, &n, id, &e.scope)?,
+            None => true,
+        };
+        if clash {
+            if e.name.is_some() && !crate::naming::entity_follows(&e) {
+                return Err(WsError::sub(Code::InvalidOperation, "NAME_CONFLICT", format!("name {:?} already used under {new_parent_id}", e.name.as_deref().unwrap_or(""))));
+            }
+            renamed = Some(p.follow_name(new_parent_id, &e, None)?);
         }
     }
     if !from_by_comment {
@@ -2162,6 +2419,12 @@ fn tree_move(p: &mut Planner, op: &Value) -> OpResult {
     edge.struct_rev = seq;
     p.ov.put_edge(edge);
     let mut e = e;
+    if let Some(n) = renamed {
+        e.name = Some(n);
+        e.meta_rev = seq;
+        p.ov.put_entity(e.clone());
+        p.touch(id, None, "renamed");
+    }
     if let Some(slot) = op.get("slot") {
         if !slot.is_null() && !slot.as_str().is_some_and(crate::types::is_slot) {
             return Err(WsError::invalid_schema("slot must match ^[a-z0-9][a-z0-9_-]{0,31}$ or be null").at("/slot"));

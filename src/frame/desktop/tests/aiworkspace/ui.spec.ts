@@ -4,8 +4,10 @@
  * commit counts are asserted through kRPC and the dev-override hooks, not only through the DOM. */
 
 import type { Page } from '@playwright/test'
-import { asUser, closeWorkspace, expect, fitAll, hooks, mainMenu, openCanvas, openWorkspacePage, test, workspaceOrigin, workspacePage, type Api } from './fixtures'
+import { asUser, closePermissions, closeWorkspace, expect, hooks, mainMenu, openCanvas, openPermissions, openWorkspacePage, setCanvasMode, showAllWorkspaces, test, wishCard, workspaceOrigin, workspacePage, type Api } from './fixtures'
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- RPC results
+type Json = any
 const ALICE = 'tok-alice'
 const BOB = 'tok-bob'
 
@@ -92,15 +94,18 @@ test('UI-P02 three floating toolbars and the bottom-right status area, no naviga
     const status = boxes[3]
     expect(area.x + area.width - (status.x + status.width)).toBeLessThan(20)
     expect(area.y + area.height - (status.y + status.height)).toBeLessThan(20)
-    // the right panel: layout width when wide, a drawer otherwise; it always closes
-    await page.getByTestId('aiws-collab').click()
+    // the side drawer (here the comments, from 评论 → 评论对象): layout width when wide, a drawer otherwise; it always closes
+    await page.getByTestId('aiws-annotate-start').click()
+    await page.getByTestId('aiws-annotate-object').click()
     await expect(page.getByTestId('aiws-side-panel')).toBeVisible()
     await expect(page.getByTestId('aiws-side-panel')).toHaveClass(width === 0 || width >= 1100 ? /aiws-side(?! is-drawer)/ : /is-drawer/)
+    await page.keyboard.press('Escape')
     await page.getByTestId('aiws-side-close').click()
     await expect(page.getByTestId('aiws-side-panel')).toHaveCount(0)
   }
-  // a click on a Block selects that Block: the effective viewport and the hit coordinates agree
-  await fitAll(page)
+  // a click on a Block selects that Block: the effective viewport and the hit coordinates agree (in this narrow window
+  // the zoom control is in the collaboration zone's "more", so fit through the main menu)
+  await mainMenu(page, 'aiws-menu-view', 'aiws-menu-fit-all')
   const target = await page.getByTestId('aiws-canvas-block-blk-kpi').boundingBox()
   await page.mouse.click(target!.x + target!.width / 2, target!.y + target!.height / 2)
   await expect(page.getByTestId('aiws-selection-blk-kpi')).toBeVisible()
@@ -108,7 +113,7 @@ test('UI-P02 three floating toolbars and the bottom-right status area, no naviga
 
 test('UI-P03 rename in place: Enter one commit, Esc none, a concurrent rename keeps my input; the preset icon is shared', async ({ page, api, browser }) => {
   const ws = await blankCanvas(api, `p03 ${Date.now()}`)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', capabilities: ['read'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', allow: ['read'] }] })
   await openCanvas(page, ALICE, ws.workspace_id)
   const head = await api.headSeq(ALICE, ws.workspace_id)
   // Esc: nothing is written, the blur that follows saves nothing
@@ -176,11 +181,10 @@ test('UI-P04 New: a canvas with its content folder in one commit; a template cre
   expect(created.layout.mode).toBe('flow')
   expect(created.icon).toBe('kanban')
   expect(outline.find((e: { entity_id: string }) => e.entity_id === created.content_folder_id)?.parent_id).toBe('canvas-content')
-  // a template: always a new workspace, opened at once; the simulated content is labelled
-  await mainMenu(page, 'aiws-menu-new')
+  // a template: always a new workspace, opened at once
+  await mainMenu(page, 'aiws-menu-workspace', 'aiws-menu-new')
   await page.getByTestId('aiws-new-tab-template').click()
   await page.getByTestId('aiws-template-film').click()
-  await expect(page.getByTestId('aiws-template-film')).toContainText('含模拟内容')
   await page.getByLabel('工作区标题', { exact: true }).fill(`p04 模板 ${Date.now()}`)
   await page.getByTestId('aiws-create-template').click()
   await expect(page.getByTestId('aiws-workspace')).not.toHaveAttribute('data-workspace-id', ws.workspace_id, { timeout: 60_000 })
@@ -232,7 +236,7 @@ test('UI-P05 insertion: one-shot placement (Esc writes nothing), the main menu, 
   // existing data: a view of the same table, no new data entity
   const tables = async () => (await api.outline(ALICE, ws.workspace_id)).filter((e: { type_id: string }) => e.type_id === 'buckyos.table-source').length
   expect(await tables()).toBe(1)
-  await mainMenu(page, 'aiws-menu-add-data')
+  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-add-data')
   await expect(page.getByTestId('aiws-catalog-existing')).toContainText('与原视图共享数据')
   await page.getByTestId('aiws-picker-data').selectOption('tbl')
   await page.getByTestId('aiws-picker-confirm').click()
@@ -269,12 +273,12 @@ test('UI-P06 hand tool and space pan, zoom from the presenter toolbar and the ma
   await page.getByTestId('aiws-zoom-150').click()
   await expect(page.getByTestId('aiws-zoom')).toHaveText('150%')
   await page.keyboard.press('Escape')
-  await mainMenu(page, 'aiws-menu-zoom', 'aiws-menu-zoom-50')
+  await mainMenu(page, 'aiws-menu-view', 'aiws-menu-zoom', 'aiws-menu-zoom-50')
   await expect(page.getByTestId('aiws-zoom')).toHaveText('50%')
   // the presenter toolbar can be hidden; the main menu keeps view navigation reachable
-  await mainMenu(page, 'aiws-menu-view', 'aiws-menu-pref-view-toolbar')
+  await mainMenu(page, 'aiws-menu-view', 'aiws-menu-zones', 'aiws-menu-pref-view-toolbar')
   await expect(page.getByTestId('aiws-view-toolbar')).toHaveCount(0)
-  await mainMenu(page, 'aiws-menu-zoom', 'aiws-menu-fit-all')
+  await mainMenu(page, 'aiws-menu-view', 'aiws-menu-fit-all')
   await expect(page.getByTestId('aiws-canvas')).not.toHaveAttribute('data-zoom', '0.50')
   await mainMenu(page, 'aiws-menu-view', 'aiws-menu-reset-layout')
   await expect(page.getByTestId('aiws-view-toolbar')).toBeVisible()
@@ -288,7 +292,8 @@ test('UI-P07 object clipboard: copy a group (new ids, shared data), cut across S
   await openCanvas(page, ALICE, ws.workspace_id)
   // group the KPI card and the wish, then copy and paste the group: one commit, new identities, same sources
   await page.getByTestId('aiws-canvas-block-blk-kpi').click()
-  await page.getByTestId('aiws-canvas-block-blk-wish').click({ modifiers: ['Shift'] })
+  // (the wish by its title: its request field takes a click itself)
+  await wishCard(page, 'wish-analysis').getByTestId('aiws-wish-title').click({ modifiers: ['Shift'] })
   await page.keyboard.press('Control+g')
   await expect.poll(async () => (await api.outline(ALICE, ws.workspace_id)).find((e: { entity_id: string }) => e.entity_id === 'blk-kpi')?.parent_id).not.toBe('sf-analysis')
   const groupId = (await api.outline(ALICE, ws.workspace_id)).find((e: { entity_id: string }) => e.entity_id === 'blk-kpi')?.parent_id as string
@@ -347,7 +352,7 @@ test('UI-P08 view mode hides creation, the data-source view keeps the session; p
   await openCanvas(page, ALICE, ws.workspace_id)
   const session = await page.getByTestId('aiws-workspace').getAttribute('data-session-id')
   await expect(page.getByTestId('aiws-tool-insert-richtext')).toBeVisible()
-  await mainMenu(page, 'aiws-menu-canvas-mode', 'aiws-mode-view')
+  await mainMenu(page, 'aiws-menu-surface', 'aiws-menu-canvas-mode', 'aiws-mode-view')
   await expect(page.getByTestId('aiws-mode-note')).toHaveText('查看')
   await expect(page.getByTestId('aiws-tool-insert-richtext')).toHaveCount(0)
   await expect(page.getByTestId('aiws-undo')).toBeVisible()
@@ -358,9 +363,10 @@ test('UI-P08 view mode hides creation, the data-source view keeps the session; p
   // annotations stay available in view mode
   await expect(page.getByTestId('aiws-annotate-start')).toBeEnabled()
   // path editing (第三期规划 §7.1); without a presentation path there is nothing to show yet, and the menu says why
-  await mainMenu(page, 'aiws-menu-canvas-mode', 'aiws-mode-presentation_edit')
+  await mainMenu(page, 'aiws-menu-surface', 'aiws-menu-canvas-mode', 'aiws-mode-presentation_edit')
   await expect(page.getByTestId('aiws-path-editor').or(page.getByTestId('aiws-presentation-placeholder'))).toBeVisible()
   await page.getByTestId('aiws-main-menu').click()
+  await page.getByTestId('aiws-menu-collab').click()
   await expect(page.getByTestId('aiws-top-play')).toBeDisabled()
   await expect(page.getByTestId('aiws-top-play')).toContainText('还没有演讲路径')
   await page.keyboard.press('Escape')
@@ -368,12 +374,12 @@ test('UI-P08 view mode hides creation, the data-source view keeps the session; p
   await closeWorkspace(page)
   await page.locator(`[data-testid="aiws-workspace-card"][data-workspace-id="${ws.workspace_id}"]`).getByTestId('aiws-open').click()
   await expect(page.getByTestId('aiws-canvas')).toHaveAttribute('data-mode', 'presentation_edit', { timeout: 30_000 })
-  await mainMenu(page, 'aiws-menu-canvas-mode', 'aiws-mode-view')
+  await mainMenu(page, 'aiws-menu-surface', 'aiws-menu-canvas-mode', 'aiws-mode-view')
   // data source and back: same session, the toolbar says where it leads
   const reopened = await page.getByTestId('aiws-workspace').getAttribute('data-session-id')
   await page.getByTestId('aiws-top-sources').click()
   await expect(page.getByTestId('aiws-sources')).toBeVisible()
-  await expect(page.getByTestId('aiws-top-canvas')).toHaveText('返回画布')
+  await expect(page.getByTestId('aiws-top-canvas')).toHaveAttribute('aria-label', '返回画布')
   await page.getByTestId('aiws-top-canvas').click()
   await expect(page.getByTestId('aiws-canvas')).toBeVisible()
   expect(await page.getByTestId('aiws-workspace').getAttribute('data-session-id')).toBe(reopened)
@@ -382,11 +388,13 @@ test('UI-P08 view mode hides creation, the data-source view keeps the session; p
 
 test('UI-P10/P11 collaboration opens the permissions; the share link points at the Surface, carries no token and grants nothing', async ({ page, api, browser }) => {
   const ws = await api.demo(ALICE, 'quarterly', `p10 ${Date.now()}`)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', capabilities: ['read'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', allow: ['read'] }] })
   await openCanvas(page, ALICE, ws.workspace_id)
-  await page.getByTestId('aiws-collab').click()
-  await expect(page.getByTestId('aiws-side-panel').getByTestId('aiws-permissions')).toContainText('全部授权')
-  await expect(page.locator('[data-testid="aiws-grant"][data-subject="bob"]')).toBeVisible()
+  await openPermissions(page)
+  await expect(page.getByTestId('aiws-detail-permissions').getByTestId('aiws-permissions')).toHaveAttribute('data-complete', 'true')
+  await page.getByTestId('aiws-perm-tab-rules').click()
+  await expect(page.locator('[data-testid="aiws-perm-rule"][data-subject="bob"]')).toBeVisible()
+  await closePermissions(page)
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
   await page.evaluate(() => navigator.clipboard.writeText('before share'))
   await page.getByTestId('aiws-share').click()
@@ -413,13 +421,16 @@ test('UI-P10/P11 collaboration opens the permissions; the share link points at t
   await bob.goto(link)
   await expect(bob.getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', ws.workspace_id, { timeout: 30_000 })
   await expect(bob.getByTestId('aiws-canvas')).toHaveAttribute('data-surface-id', 'sf-analysis')
-  await bob.getByTestId('aiws-collab').click()
-  await expect(bob.getByTestId('aiws-permissions')).toContainText('只显示对我生效的授权')
-  await expect(bob.getByTestId('aiws-grant-form')).toHaveCount(0)
+  await openPermissions(bob)
+  await expect(bob.getByTestId('aiws-permissions').getByTestId('aiws-perm-mine')).toBeVisible()
+  await expect(bob.getByTestId('aiws-perm-rule-add')).toHaveCount(0)
+  await closePermissions(bob)
   await expect(bob.getByTestId('aiws-tool-insert-note')).toHaveCount(0)
   await expect(bob.getByTestId('aiws-presence-unavailable')).toHaveCount(0)
   await bob.getByTestId('aiws-principal').click()
-  await expect(bob.getByTestId('aiws-presence-unavailable')).toContainText('授权名单不等于在线成员')
+  // the online members (K2): bob first; alice has the Workspace open too
+  await expect(bob.getByTestId('aiws-member-me')).toHaveAttribute('data-principal', 'bob')
+  await expect(bob.locator('[data-testid="aiws-member-row"][data-principal="alice"]')).toBeVisible({ timeout: 25_000 })
   await expect(bob.getByTestId('aiws-logout')).toBeDisabled()
   await context.close()
 })
@@ -434,12 +445,14 @@ test('UI-P16 one-click public link: a guest opens it without signing in, reads a
   await expect(page.getByTestId('aiws-share-panel')).toContainText('无需登录')
   const link = await page.getByTestId('aiws-share-link').inputValue()
   expect(link).not.toMatch(/tok-|gt_/)
-  // what the click wrote: a `public` grant with read + comment, nothing more; the link itself is unchanged
-  const grants = await api.rpc(ALICE, 'ws.list_grants', { workspace_id: ws.workspace_id })
-  expect(grants.grants.find((g: { subject: string }) => g.subject === 'public')?.capabilities).toEqual(['read', 'comment'])
+  // what the click wrote: anonymous access on and `@guest` with read + comment, nothing more; the link itself is unchanged
+  const all = await api.rpc(ALICE, 'acl.query', { workspace_id: ws.workspace_id, by: 'all' })
+  expect(all.anonymous).toBe(true)
+  expect(all.entries.find((e: { subject: string }) => e.subject === '@guest')?.allow).toEqual(['read', 'comment'])
   await page.keyboard.press('Escape')
-  await page.getByTestId('aiws-collab').click()
-  await expect(page.locator('[data-testid="aiws-grant"][data-subject="public"]')).toContainText('无需登录')
+  await openPermissions(page)
+  await expect(page.getByTestId('aiws-perm-anonymous')).toHaveAttribute('data-on', 'true')
+  await closePermissions(page)
 
   // a guest: no account, no test token, only the link (the dev override's guest mode stands in for "not signed in")
   const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } })
@@ -455,7 +468,12 @@ test('UI-P16 one-click public link: a guest opens it without signing in, reads a
   const token = await guest.evaluate(() => window.localStorage.getItem('aiworkspace.guest'))
   expect(token).toMatch(/^gt_[A-Za-z0-9_-]{43}$/)
   expect(principal).not.toContain(token!.slice(3, 13))
-  // read and comment, nothing else: of the insert tools only the note (a note is an annotation), no new workspace, no way to manage the link
+  // a guest who may not update starts in view mode (控件机制 TODO Q27 修订, 11-12); in edit mode it reads and comments,
+  // nothing else: of the insert tools only the note (a note is an annotation), no new workspace, no way to manage the link
+  await expect(guest.getByTestId('aiws-mode-note')).toBeVisible()
+  await expect(guest.getByTestId('aiws-tool-insert-note')).toHaveCount(0)
+  await setCanvasMode(guest, 'edit')
+  await expect(guest.getByTestId('aiws-mode-note')).toHaveCount(0)
   await expect(guest.getByTestId('aiws-tool-insert-note')).toBeVisible()
   await expect(guest.getByTestId('aiws-tool-insert-richtext')).toHaveCount(0)
   await expect(guest.getByTestId('aiws-tool-catalog')).toHaveCount(0)
@@ -476,9 +494,9 @@ test('UI-P16 one-click public link: a guest opens it without signing in, reads a
   await expect(guest.getByTestId('aiws-identity-name')).toHaveText('路人甲')
   await expect(guest.getByTestId('aiws-login')).toBeVisible()
   await guest.keyboard.press('Escape')
-  await guest.getByTestId('aiws-canvas-block-blk-wish').click()
+  await wishCard(guest, 'wish-analysis').getByTestId('aiws-wish-title').click()
   await guest.getByTestId('aiws-near-annotate').click()
-  await guest.getByLabel('批注内容').fill('访客的批注')
+  await guest.getByLabel('评论内容').fill('访客的批注')
   await guest.getByTestId('aiws-annotation-save').click()
   await expect(guest.getByTestId('aiws-annotation').filter({ hasText: '访客的批注' }).getByTestId('aiws-annotation-author')).toHaveText('路人甲')
   const notes = (await api.outline(ALICE, ws.workspace_id)).filter((e: { type_id: string }) => e.type_id === 'buckyos.annotation')
@@ -521,7 +539,7 @@ test('UI-P16 one-click public link: a guest opens it without signing in, reads a
   await expect(guest.getByTestId('aiws-near-more')).toBeVisible()
   await guest.keyboard.press('Delete')
   expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head)
-  expect((await cells(api, ws.workspace_id, 'sf-analysis')).find((c: { entity_id: string }) => c.entity_id === 'blk-wish').placement.x).toBe(980)
+  expect((await cells(api, ws.workspace_id, 'sf-analysis')).find((c: { entity_id: string }) => c.entity_id === 'blk-wish').placement.x).toBe(1040)
   // and the guest removes its note: the Block and the note go together
   await guest.getByTestId(`aiws-canvas-block-${placed.entity_id}`).click()
   await guest.keyboard.press('Delete')
@@ -544,32 +562,32 @@ test('UI-P16 one-click public link: a guest opens it without signing in, reads a
   await context.close()
 })
 
-test('UI-P12 the AI entry creates a wish where it is placed and opens its task; with a wish selected it opens that one', async ({ page, api }) => {
+test('UI-P12 the wish tool places a new wish where it is clicked: its card takes the request at once, and nothing runs by itself', async ({ page, api }) => {
   const ws = await api.demo(ALICE, 'quarterly', `p12 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
-  // a selected wish: the AI entry opens its existing task flow, nothing is created
-  const head = await api.headSeq(ALICE, ws.workspace_id)
-  await page.getByTestId('aiws-canvas-block-blk-wish').click()
-  await page.getByTestId('aiws-tool-insert-wish').click()
-  // on a free canvas the task opens in the right panel (标准对象的交互改进 R6)
-  const wishPanel = page.locator('[data-testid="aiws-side-panel"][data-tab="wish"]')
-  await expect(wishPanel.getByTestId('aiws-wish-prompt')).toHaveValue(/经营分析/)
-  expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head)
-  await page.getByTestId('aiws-side-close').click()
-  await page.keyboard.press('Escape')
   await page.getByTestId('aiws-canvas').click({ position: { x: 600, y: 750 } })
-  // nothing selected: place a new wish; its panel opens for the task, nothing runs by itself
   await page.getByTestId('aiws-tool-insert-wish').click()
   const at = await screenOf(page, { x: 40, y: 700 })
   await page.mouse.move(at.x, at.y)
   await page.mouse.click(at.x, at.y)
   await expect.poll(async () => (await api.outline(ALICE, ws.workspace_id)).filter((e: { type_id: string }) => e.type_id === 'buckyos.wish').length).toBe(2)
   const created = (await api.outline(ALICE, ws.workspace_id)).find((e: { type_id: string; entity_id: string }) => e.type_id === 'buckyos.wish' && e.entity_id !== 'wish-analysis')
+  expect((await api.read(ALICE, ws.workspace_id, created.entity_id)).content.payload.executor).toBe('xllm')
   const block = (await cells(api, ws.workspace_id, 'sf-analysis')).find((c: { source_id: string }) => c.source_id === created.entity_id)
   await expect(page.getByTestId(`aiws-canvas-block-${block.entity_id}`)).toBeVisible()
-  await expect(wishPanel.getByTestId(`aiws-wish-${created.entity_id}`)).toBeVisible()
-  await expect(wishPanel.getByTestId('aiws-wish-prompt')).toBeVisible()
-  expect((await api.read(ALICE, ws.workspace_id, created.entity_id)).content.payload.last_run ?? null).toBeNull()
+  // the card, not a panel: the request is typed into it at once
+  const card = wishCard(page, created.entity_id)
+  await expect(card.getByTestId('aiws-wish-prompt')).toBeFocused()
+  await page.keyboard.type('按区域汇总销售额')
+  await card.getByTestId('aiws-wish-title').click()
+  await expect.poll(async () => (await api.read(ALICE, ws.workspace_id, created.entity_id)).content.payload.prompt).toBe('按区域汇总销售额')
+  await expect(page.getByTestId('aiws-side-panel')).toHaveCount(0)
+  // nothing ran: the next step is the analysis
+  await expect(card.getByTestId('aiws-wish-next')).toHaveAttribute('data-action', 'analyze')
+  await expect(card.getByTestId('aiws-wish-run')).toHaveCount(0)
+  const payload = (await api.read(ALICE, ws.workspace_id, created.entity_id)).content.payload
+  expect(payload.last_run ?? null).toBeNull()
+  expect(payload.history ?? null).toBeNull()
 })
 
 test('UI-P13 keyboard: menus by arrows and Esc with focus back on the trigger; V/H only with the canvas focused; help lists the shortcuts', async ({ page, api }) => {
@@ -578,9 +596,9 @@ test('UI-P13 keyboard: menus by arrows and Esc with focus back on the trigger; V
   await page.getByTestId('aiws-main-menu').focus()
   await page.keyboard.press('Enter')
   await expect(page.getByTestId('aiws-main-menu-list')).toBeVisible()
-  await expect(page.getByTestId('aiws-menu-new-canvas')).toBeFocused()
+  await expect(page.getByTestId('aiws-menu-workspace')).toBeFocused()
   await page.keyboard.press('ArrowDown')
-  await expect(page.getByTestId('aiws-menu-new')).toBeFocused()
+  await expect(page.getByTestId('aiws-menu-surface')).toBeFocused()
   await page.keyboard.press('Escape')
   await expect(page.getByTestId('aiws-main-menu-list')).toHaveCount(0)
   await expect(page.getByTestId('aiws-main-menu')).toBeFocused()
@@ -627,6 +645,8 @@ test('UI-P15 a workspace in a browser tab of its own: the address names what is 
   await page.goto('/workspace')
   await expect(page.getByTestId('aiws-tab').getByTestId('aiws-list')).toBeVisible({ timeout: 30_000 })
   await expect(page).toHaveTitle('AI 工作区 · alice')
+  // (the account has opened other workspaces before: the home may start on "Recent", §9.1)
+  await showAllWorkspaces(page)
   // opening goes to the workspace's own origin (T4-8); its address names the workspace
   await card(a.workspace_id).getByTestId('aiws-open').click()
   await expect(page.getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', a.workspace_id, { timeout: 30_000 })
@@ -644,6 +664,12 @@ test('UI-P15 a workspace in a browser tab of its own: the address names what is 
   await expect(page.getByTestId('aiws-list')).toBeVisible()
   await expect.poll(() => pathOf(page)).toBe('/workspace')
   await expect(page).toHaveTitle('AI 工作区 · alice')
+  // the list keeps the category picked (UI framework PRD §9.3, §12); "Recent" has the first one, not the second
+  await expect(page.getByTestId('aiws-home-tab-all')).toHaveAttribute('aria-selected', 'true')
+  await page.getByTestId('aiws-home-tab-recent').click()
+  await expect(page.getByTestId('aiws-home-grid-recent').locator(':scope > *').first()).toHaveAttribute('data-workspace-id', a.workspace_id)
+  await expect(card(b.workspace_id)).toHaveCount(0)
+  await showAllWorkspaces(page)
   await card(b.workspace_id).getByTestId('aiws-open').click()
   await expect(page.getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', b.workspace_id, { timeout: 30_000 })
   await expect.poll(() => new URL(page.url()).origin).toBe(workspaceOrigin(b.workspace_id))
@@ -655,9 +681,10 @@ test('UI-P15 a workspace in a browser tab of its own: the address names what is 
   await page.goForward()
   await page.goForward()
   await expect(page.getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', b.workspace_id, { timeout: 30_000 })
-  // switching from the main menu's New dialog / fork lands in the address too: here, the menu's "open workspace" + list
-  await mainMenu(page, 'aiws-menu-open-workspace')
+  // switching from the main menu's New dialog / clone lands in the address too: here, the menu's "open workspace" + list
+  await mainMenu(page, 'aiws-menu-workspace', 'aiws-menu-open-workspace')
   await expect(page.getByTestId('aiws-list')).toBeVisible()
+  await showAllWorkspaces(page)
   await card(a.workspace_id).getByTestId('aiws-open').click()
   await expect.poll(() => new URL(page.url()).origin).toBe(workspaceOrigin(a.workspace_id))
   // a reload reopens what the address names, without the list in between
@@ -666,7 +693,7 @@ test('UI-P15 a workspace in a browser tab of its own: the address names what is 
   await expect(page.getByTestId('aiws-list')).toHaveCount(0)
   await expect(page.getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', a.workspace_id, { timeout: 30_000 })
   // back to the Desktop from the main menu
-  await mainMenu(page, 'aiws-menu-home')
+  await mainMenu(page, 'aiws-menu-workspace', 'aiws-menu-home')
   await expect.poll(() => pathOf(page)).toBe('/')
   await expect(page.getByTestId('desktop-app-aiworkspace')).toBeVisible({ timeout: 30_000 })
   await expect(page).toHaveTitle('alice')
@@ -678,7 +705,7 @@ test('UI-P15 a workspace in a browser tab of its own: the address names what is 
   await expect(page.getByTestId('aiws-canvas')).toHaveAttribute('data-surface-id', 'sf-detail')
   await expect(page.getByTestId('aiws-menu-home')).toHaveCount(0)
   const opened = context.waitForEvent('page')
-  await mainMenu(page, 'aiws-menu-new-tab')
+  await mainMenu(page, 'aiws-menu-workspace', 'aiws-menu-new-tab')
   const tab = await opened
   await expect(tab.getByTestId('aiws-tab').getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', b.workspace_id, { timeout: 30_000 })
   await expect(tab.getByTestId('aiws-canvas')).toHaveAttribute('data-surface-id', 'sf-detail')
@@ -727,6 +754,8 @@ test('P0 stacking (connector plan §9.3): painting and hit testing follow the Bl
   const head = await api.headSeq(ALICE, ws.workspace_id)
   const aOnly = await screenOf(page, { x: 240, y: 300 })
   await page.mouse.click(aOnly.x, aOnly.y, { button: 'right' })
+  // more than twelve items: "arrange" is a submenu (UI 框架 PRD §10.3)
+  await page.getByTestId('aiws-menu-group-arrange').click()
   await page.getByTestId('aiws-menu-front').click()
   await expect.poll(async () => api.headSeq(ALICE, ws.workspace_id)).toBe(head + 1)
   await expect.poll(() => paintedAt(ab)).toBe('shp-a')
@@ -734,7 +763,85 @@ test('P0 stacking (connector plan §9.3): painting and hit testing follow the Bl
   expect(await frameOrder()).toEqual(before)
   // and send it back
   await page.mouse.click(aOnly.x, aOnly.y, { button: 'right' })
+  await page.getByTestId('aiws-menu-group-arrange').click()
   await page.getByTestId('aiws-menu-back').click()
   await expect.poll(() => paintedAt(ab)).toBe('shp-b')
   expect(await selectedBy(ab)).toBe('shp-b')
+})
+
+test('UI-P17 the object toolbar in two columns: sixteen buttons without scrolling (design / run joined the pointer group, UI framework PRD Q3); select / pan, the table group with the standard tables, the shape group with the library open beside it', async ({ page, api }) => {
+  const ws = await blankCanvas(api, `p17 ${Date.now()}`)
+  await openCanvas(page, ALICE, ws.workspace_id)
+  const bar = page.getByTestId('aiws-object-toolbar')
+  // the sixteen buttons, top to bottom (the collapse handle is not one of them)
+  const ids = await bar.locator(':scope > .aiws-tool-group button.aiws-tool').evaluateAll((els) => els.map((el) => el.getAttribute('data-testid')))
+  expect(ids).toEqual(['aiws-tool-pointer', 'aiws-run-toggle', 'aiws-tool-pen', 'aiws-tool-insert-shape-text', 'aiws-tool-insert-richtext', 'aiws-tool-insert-asset', 'aiws-tool-table', 'aiws-tool-insert-mindmap',
+    'aiws-tool-insert-shape', 'aiws-tool-insert-connector', 'aiws-tool-insert-frame', 'aiws-tool-insert-wish', 'aiws-tool-insert-note', 'aiws-tool-catalog', 'aiws-undo', 'aiws-redo'])
+  // no scroll bar at this window height, nor at a lower one
+  for (const height of [1000, 760]) {
+    await page.setViewportSize({ width: 1600, height })
+    await expect.poll(() => bar.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeLessThanOrEqual(0)
+  }
+  const canvas = page.getByTestId('aiws-canvas')
+
+  // select / pan: the button opens its column; it shows and goes back to the last one used
+  await page.getByTestId('aiws-tool-pointer').click()
+  const pointerColumn = page.getByTestId('aiws-tool-pointer-column')
+  await expect(pointerColumn).toBeVisible()
+  const barBox = (await bar.boundingBox())!
+  expect((await pointerColumn.boundingBox())!.x).toBeGreaterThan(barBox.x + barBox.width)
+  await pointerColumn.getByTestId('aiws-tool-hand').click()
+  await expect(pointerColumn).toHaveCount(0)
+  await expect(canvas).toHaveAttribute('data-tool', 'hand')
+  await page.getByTestId('aiws-tool-pen').click()
+  await expect(canvas).toHaveAttribute('data-tool', 'pen')
+  await page.getByTestId('aiws-tool-pointer').click()
+  await expect(canvas).toHaveAttribute('data-tool', 'hand')
+  await expect(pointerColumn.getByTestId('aiws-tool-hand')).toHaveAttribute('aria-pressed', 'true')
+  await pointerColumn.getByTestId('aiws-tool-select').click()
+  await expect(canvas).toHaveAttribute('data-tool', 'select')
+
+  // the table group: views, then the standard tables (the schemas the system knows)
+  await page.getByTestId('aiws-tool-table').click()
+  const tableColumn = page.getByTestId('aiws-tool-table-column')
+  expect(await tableColumn.locator('button').evaluateAll((els) => els.map((el) => el.getAttribute('data-testid')))).toEqual(
+    ['aiws-tool-insert-table', 'aiws-tool-insert-calendar', 'aiws-tool-insert-todo', 'aiws-tool-insert-table-todo', 'aiws-tool-insert-table-calendar'])
+  await page.screenshot({ path: 'test-results/aiworkspace/p17-table-column.png' })
+  // a to-do table: a new standard table shown as a table view; the view keeps no `standard`
+  await tableColumn.getByTestId('aiws-tool-insert-table-todo').click()
+  await page.mouse.click(700, 300)
+  const tables = async () => (await api.outline(ALICE, ws.workspace_id)).filter((e: Json) => e.type_id === 'buckyos.table-source' && e.schema_id === 'buckyos.todo@1')
+  await expect.poll(async () => (await tables()).length).toBe(1)
+  const [todo] = await tables()
+  await expect.poll(async () => (await cells(api, ws.workspace_id, 'sf-p')).length).toBe(1)
+  const [view] = await cells(api, ws.workspace_id, 'sf-p')
+  expect(view.view_type).toBe('table')
+  expect(view.source_id).toBe(todo.entity_id)
+  expect((await api.read(ALICE, ws.workspace_id, view.entity_id)).content.payload.config?.standard).toBeUndefined()
+  // again: the workspace has one, so it asks — that one in a new view, or a new table
+  await page.keyboard.press('Escape')
+  await page.getByTestId('aiws-tool-table').click()
+  await tableColumn.getByTestId('aiws-tool-insert-table-todo').click()
+  await page.mouse.click(700, 700)
+  const chooser = page.getByTestId('aiws-source-chooser')
+  await expect(chooser.locator('[data-testid^="aiws-source-"]')).toHaveCount(2)
+  await chooser.getByTestId(`aiws-source-${todo.entity_id}`).click()
+  await expect.poll(async () => (await cells(api, ws.workspace_id, 'sf-p')).map((c: Json) => c.source_id)).toEqual([todo.entity_id, todo.entity_id])
+  expect(await tables()).toHaveLength(1)
+
+  // the shape group: the basic shapes first, the libraries in the same column; kept inside the canvas area
+  await page.keyboard.press('Escape')
+  await page.getByTestId('aiws-tool-insert-shape').click()
+  const shapeColumn = page.getByTestId('aiws-tool-shape-picker')
+  await expect(shapeColumn.getByTestId('aiws-shape-kind-diamond')).toBeVisible()
+  await expect(shapeColumn.getByTestId('aiws-library-select')).toHaveValue('')
+  await shapeColumn.getByTestId('aiws-library-select').selectOption('flowchart')
+  await expect(shapeColumn.getByTestId('aiws-library-shape-mxgraph.flowchart.decision')).toBeVisible()
+  const area = (await canvas.boundingBox())!
+  const column = (await shapeColumn.boundingBox())!
+  expect(column.y + column.height).toBeLessThanOrEqual(area.y + area.height)
+  await page.screenshot({ path: 'test-results/aiworkspace/p17-shape-column.png' })
+  await shapeColumn.getByTestId('aiws-library-shape-mxgraph.flowchart.decision').click()
+  await page.mouse.click(1100, 300)
+  await expect.poll(async () => (await cells(api, ws.workspace_id, 'sf-p')).filter((c: Json) => c.view_type === 'shape').length).toBe(1)
 })

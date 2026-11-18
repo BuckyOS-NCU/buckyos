@@ -126,7 +126,7 @@ impl Actor {
     /// The Access the actor reads the run Workspace with in session methods (the grants say the same for direct reads).
     pub fn access(&self) -> Access {
         let caps = if self.role.reviews() { CapSet::ALL } else { CapSet(Cap::Read as u16) };
-        Access { principal: self.principal.clone(), ws_caps: caps, scoped: BTreeMap::new() }
+        Access::uniform(&self.principal, caps)
     }
 }
 
@@ -136,7 +136,7 @@ pub fn normalize_policy(v: Option<&Value>) -> WsResult<Value> {
     let v = v.filter(|v| !v.is_null()).unwrap_or(&empty);
     let o = v.as_object().ok_or_else(|| WsError::invalid_op("policy must be an object"))?;
     for k in o.keys() {
-        if !matches!(k.as_str(), "guest_interact" | "voice" | "expected_audience" | "media_limit_mib" | "show_names") {
+        if !matches!(k.as_str(), "guest_interact" | "voice" | "expected_audience" | "media_limit_mib" | "show_names" | "speak" | "speak_mode") {
             return Err(WsError::invalid_op(format!("unknown policy key {k}")));
         }
     }
@@ -154,7 +154,41 @@ pub fn normalize_policy(v: Option<&Value>) -> WsResult<Value> {
         }
     };
     Ok(json!({ "guest_interact": flag("guest_interact", false)?, "voice": flag("voice", true)?, "show_names": flag("show_names", true)?,
-               "expected_audience": count("expected_audience", 50, 10_000)?, "media_limit_mib": count("media_limit_mib", 2048, 2048)? }))
+               "expected_audience": count("expected_audience", 50, 10_000)?, "media_limit_mib": count("media_limit_mib", 2048, 2048)?,
+               "speak": speak_policy(o.get("speak"))?, "speak_mode": speak_mode_policy(o.get("speak_mode"))? }))
+}
+
+/// `policy.speak` (多人发言 §4.7, Q4): `granted` (only those a manager allowed) or `all` (everyone unless a manager said
+/// otherwise for them). The “小班课” preset of the start panel is `all` with `speak_mode=auto` (§2 裁决 5).
+fn speak_policy(v: Option<&Value>) -> WsResult<&'static str> {
+    match v {
+        None | Some(Value::Null) => Ok("granted"),
+        Some(v) if v == "granted" => Ok("granted"),
+        Some(v) if v == "all" => Ok("all"),
+        Some(_) => Err(WsError::invalid_op("policy.speak must be granted or all")),
+    }
+}
+
+/// `policy.speak_mode` (Q3): the mode someone starts in once they may speak.
+fn speak_mode_policy(v: Option<&Value>) -> WsResult<&'static str> {
+    match v {
+        None | Some(Value::Null) => Ok("manual"),
+        Some(v) if v == "manual" => Ok("manual"),
+        Some(v) if v == "auto" => Ok("auto"),
+        Some(_) => Err(WsError::invalid_op("policy.speak_mode must be auto or manual")),
+    }
+}
+
+/// Whether `p` speaks in `s` (多人发言 §4.2): the presenter always; otherwise a manager's own setting for the person, and
+/// without one the room's `policy.speak` — `all` covers guests only while guests may interact (Q5).
+pub fn participant_speaks(s: &SessionRow, p: &ParticipantRow) -> bool {
+    if p.principal == s.presenter {
+        return true;
+    }
+    match p.speak {
+        Some(v) => v,
+        None => s.speak_all() && (p.level != "guest" || s.guest_interact()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -332,9 +366,14 @@ impl Workspace {
     /// The playable steps of the session's path as the run Workspace has them now: `{ id, kind, target_id, surface_id, title, transition }`.
     pub fn session_steps(&self) -> WsResult<Vec<Value>> {
         let path_id = meta_get(&self.doc, "session_path")?.unwrap_or_default();
+        self.path_steps(&path_id)
+    }
+
+    /// The playable steps of a presentation path (enabled steps with live targets), each with the Surface it is on.
+    pub fn path_steps(&self, path_id: &str) -> WsResult<Vec<Value>> {
         let now = self.now();
         let ctx = self.ctx(&now);
-        let Some(path) = ctx.entity(&path_id)?.filter(|e| e.alive()) else { return Ok(Vec::new()) };
+        let Some(path) = ctx.entity(path_id)?.filter(|e| e.alive()) else { return Ok(Vec::new()) };
         let mut out = Vec::new();
         for step in path.payload.get("steps").and_then(Value::as_array).into_iter().flatten() {
             if step.get("enabled") == Some(&json!(false)) {
@@ -402,33 +441,39 @@ fn transition(from: Option<&Value>, to: &Value) -> &'static str {
 // the run Workspace
 // ---------------------------------------------------------------------------
 
+/// The rows `sql` selects, as `replica::load_rows` reads them: an object per row by column name, BLOBs as base64.
+pub(crate) fn query_rows(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> WsResult<Vec<Value>> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut st = conn.prepare(sql).map_err(db_err)?;
+    let names: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+    let rows = st
+        .query_map(params, |r| {
+            let mut m = Map::new();
+            for (i, n) in names.iter().enumerate() {
+                let v = match r.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => Value::Null,
+                    rusqlite::types::ValueRef::Integer(x) => json!(x),
+                    rusqlite::types::ValueRef::Real(x) => json!(x),
+                    rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+                    rusqlite::types::ValueRef::Blob(b) => json!(b64.encode(b)),
+                };
+                m.insert(n.clone(), v);
+            }
+            Ok(Value::Object(m))
+        })
+        .map_err(db_err)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
 /// Every row of the document tables, as `replica::load_rows` reads them (rich texts folded into their snapshot): the
 /// baseline a replay starts from (§7.1, TODO I12).
 pub fn dump_doc_rows(ws: &Workspace) -> WsResult<Value> {
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut out = Map::new();
     for table in ["entities", "tree_edges", "refs", "table_fields", "table_records", "richtext_states", "assets"] {
-        let mut st = ws.doc.prepare(&format!("SELECT * FROM {table}")).map_err(db_err)?;
-        let names: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
-        let rows: Vec<Value> = st
-            .query_map([], |r| {
-                let mut m = Map::new();
-                for (i, n) in names.iter().enumerate() {
-                    let v = match r.get_ref(i)? {
-                        rusqlite::types::ValueRef::Null => Value::Null,
-                        rusqlite::types::ValueRef::Integer(x) => json!(x),
-                        rusqlite::types::ValueRef::Real(x) => json!(x),
-                        rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
-                        rusqlite::types::ValueRef::Blob(b) => json!(b64.encode(b)),
-                    };
-                    m.insert(n.clone(), v);
-                }
-                Ok(Value::Object(m))
-            })
-            .map_err(db_err)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(db_err)?;
-        out.insert(table.to_string(), Value::Array(rows));
+        out.insert(table.to_string(), Value::Array(query_rows(&ws.doc, &format!("SELECT * FROM {table}"), [])?));
     }
     // a rich text with pending updates: its snapshot as the replica would need it
     let now = ws.now();
@@ -483,7 +528,7 @@ impl Service {
             ] {
                 meta_set(&doc, k, &v)?;
             }
-            for k in ["forked_from", "show_source", "show_id", "show_expires_at"] {
+            for k in ["cloned_from", "show_source", "show_id", "show_expires_at"] {
                 doc.execute("DELETE FROM workspace_meta WHERE key = ?1", [k]).map_err(db_err)?;
             }
             // the session starts from the content, not from how it was written (§3.1)
@@ -529,13 +574,16 @@ impl Service {
             let local = Connection::open(tmp.join("local.sqlite")).map_err(db_err)?;
             local
                 .execute_batch(
-                    "DELETE FROM grants; DELETE FROM share_entries; DELETE FROM publications; DELETE FROM referrers; DELETE FROM locks; \
-                     DELETE FROM lock_events; DELETE FROM staged_assets; DELETE FROM user_state; DELETE FROM runs; DELETE FROM local_meta;",
+                    "DELETE FROM acl_entries; DELETE FROM acl_groups; DELETE FROM acl_members; DELETE FROM acl_macro_bindings; DELETE FROM acl_audit; \
+                     DELETE FROM share_entries; DELETE FROM publications; DELETE FROM publication_versions; DELETE FROM referrers; DELETE FROM locks; \
+                     DELETE FROM lock_events; DELETE FROM staged_assets; DELETE FROM staged_commits; DELETE FROM user_state; DELETE FROM runs; DELETE FROM local_meta;",
                 )
                 .map_err(db_err)?;
-            local.execute("INSERT INTO grants (subject, scope_entity_id, capabilities) VALUES (?1, '', ?2)", params![owner, CapSet::ALL.0]).map_err(db_err)?;
+            // the owner holds everything as the owner (权限需求 §4.2); the presenter gets an entry of its own
             if presenter != owner {
-                local.execute("INSERT INTO grants (subject, scope_entity_id, capabilities) VALUES (?1, '', ?2)", params![presenter, PRESENTER_CAPS]).map_err(db_err)?;
+                local
+                    .execute("INSERT INTO acl_entries (subject, scope_entity_id, allow, deny, updated_by, updated_at) VALUES (?1, '', ?2, 0, ?3, '')", params![presenter, PRESENTER_CAPS, owner])
+                    .map_err(db_err)?;
             }
             local.execute("INSERT INTO local_meta (key, value) VALUES ('owner', ?1)", [owner]).map_err(db_err)?;
             Ok(point)
@@ -556,16 +604,24 @@ impl Service {
         self.sessions.by_run_workspace(ws_id)
     }
 
-    /// `session.create { workspace_id, path_id, title?, presenter?, policy? }` (§3.1, §3.2): the caller becomes the owner;
-    /// it needs workspace-level `read` and `update` on the source (授课只要求创建本场及 Presenter 所需权限, not the Host).
+    /// `session.create { workspace_id, path_id, title?, presenter?, policy?, readers_of? }` (§3.1, §3.2): the caller becomes
+    /// the owner; it needs workspace-level `read` and `update` on the source (授课只要求创建本场及 Presenter 所需权限, not
+    /// the Host). `readers_of` (UI 框架 PRD Q19): the entity of the source whose readers may come in without a link — a
+    /// path or an entity id the caller may read; by default the Surface of the path's first step (the Workspace when no
+    /// step is on one). It is kept by id (`policy.readers_of`): renaming or moving it changes nothing.
     pub fn session_create(&self, caller: &Caller, p: &Value) -> WsResult<Value> {
         if caller.is_restricted() || caller.is_guest() {
             return Err(WsError::refused(Code::PermissionDenied, aiworkspace_core::Deny::SessionKindNotAllowed, "this kind of account cannot create a session"));
         }
         let source_id = s(p, "workspace_id")?.to_string();
         let path_id = s(p, "path_id")?.to_string();
-        let policy = normalize_policy(p.get("policy"))?;
+        let mut policy = normalize_policy(p.get("policy"))?;
         let presenter = p.get("presenter").and_then(Value::as_str).filter(|v| !v.is_empty()).unwrap_or(&caller.principal).to_string();
+        // the presenter is a person of this Zone (权限需求 R27): never a guest, a link, a group or a made-up name (the
+        // service checks the Zone's users before this)
+        if presenter.starts_with("guest:") || presenter.starts_with("link:") || presenter.starts_with('@') || presenter.chars().any(char::is_whitespace) || presenter.len() > 256 {
+            return Err(WsError::invalid_op("presenter must be an account of this Zone"));
+        }
         let title = {
             let handle = self.workspace(&source_id)?;
             let ws = handle.lock().unwrap();
@@ -577,6 +633,15 @@ impl Service {
             if read["type_id"] != json!(TYPE_SHOW_PATH) {
                 return Err(WsError::invalid_op(format!("{path_id} is not a presentation path")));
             }
+            let object = match p.get("readers_of") {
+                None | Some(Value::Null) => {
+                    let steps = ws.path_steps(&path_id)?;
+                    steps.iter().find_map(|st| st["surface_id"].as_str().map(str::to_string)).unwrap_or_else(|| ROOT_ID.to_string())
+                }
+                Some(Value::String(r)) => ws.permission_object(&access, r)?,
+                Some(_) => return Err(WsError::invalid_op("readers_of must be a path or an entity id")),
+            };
+            policy["readers_of"] = json!(object);
             p.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string).or_else(|| read["content"]["payload"]["title"].as_str().map(str::to_string)).unwrap_or_else(|| ws.title())
         };
         if title.chars().count() > 256 {
@@ -584,7 +649,7 @@ impl Service {
         }
         let session_id = random_id("se_");
         let (run_id, point) = self.clone_for_session(&source_id, &session_id, &caller.principal, &presenter, &path_id)?;
-        let owner = Caller::user(&caller.principal);
+        let owner = Caller::internal(&caller.principal);
         let baseline = {
             let handle = self.workspace(&run_id)?;
             let mut ws = handle.lock().unwrap();
@@ -622,11 +687,14 @@ impl Service {
         };
         self.sessions.insert(&row)?;
         log::info!("session {session_id} created on {} by {} (run workspace {})", row.source_workspace_id, caller.principal, row.workspace_id);
-        Ok(json!({ "ok": true, "session": session_json(&row, Some(Role::Presenter)) }))
+        let mut v = session_json(&row, Some(Role::Presenter));
+        v["readers_of"] = self.readers_of_json(&row);
+        Ok(json!({ "ok": true, "session": v }))
     }
 
-    /// Who `caller` is in `s`: the presenter, the owner, a joined participant, or — through a link — a display or a
-    /// prompter. `None`: nobody (a link is needed to join).
+    /// Who `caller` is in `s`: the presenter, the owner, a joined participant, a reader of the session's permission object
+    /// while the room is open (as audience, [`Service::may_open_unlinked`]), or — through a link — a display or a prompter.
+    /// `None`: nobody (a link is needed to join).
     pub fn session_actor(&self, s: &SessionRow, caller: &Caller, via: Option<&InviteRow>) -> WsResult<Option<Actor>> {
         let class = |c: &Caller| match c.class {
             crate::CallerClass::Account { .. } => "account",
@@ -634,7 +702,7 @@ impl Service {
             crate::CallerClass::Guest => "guest",
             crate::CallerClass::Service => "service",
         };
-        if let Some(i) = via.filter(|i| i.session_id == s.session_id && i.revoked_ms.is_none()) {
+        if let Some(i) = via.filter(|i| i.session_id == s.session_id && i.usable((self.clock)())) {
             match i.kind.as_str() {
                 "pt" => return Ok(Some(Actor { principal: s.presenter.clone(), role: Role::Prompter, class: "account".into(), level: "verified", name: s.presenter.clone() })),
                 "dt" => return Ok(Some(Actor { principal: display_principal(&i.invite_id), role: Role::Display, class: "display".into(), level: "guest", name: i.label.clone().unwrap_or_else(|| "Display".into()) })),
@@ -650,6 +718,10 @@ impl Service {
         if let Some(p) = self.sessions.participant(&s.session_id, &caller.principal)? {
             let level = if p.level == "guest" { "guest" } else { "verified" };
             return Ok(Some(Actor { principal: caller.principal.clone(), role: Role::Participant, class: p.class, level, name: p.name }));
+        }
+        // a reader of the permission object comes in as audience without a link (UI 框架 PRD §9.1, K7, Q19)
+        if self.may_open_unlinked(s, caller)? {
+            return Ok(Some(Actor { principal: caller.principal.clone(), role: Role::Participant, class: class(caller).into(), level: "verified", name: caller.principal.clone() }));
         }
         Ok(None)
     }
@@ -667,6 +739,7 @@ impl Service {
         v["principal"] = json!(actor.principal);
         v["level"] = json!(actor.level);
         v["owner_actions"] = json!(actor.is_owner(s));
+        v["my_speak"] = json!(self.actor_speaks(s, actor)?);
         if s.alive() {
             let handle = self.workspace(&s.workspace_id)?;
             let ws = handle.lock().unwrap();
@@ -679,12 +752,41 @@ impl Service {
             }
         }
         if actor.role.reviews() {
+            // who may come in without a link (Q19)
+            v["readers_of"] = self.readers_of_json(s);
             // who came in, and whether they are here (§5.4: the presenter's own view of the room)
-            v["participants"] = json!(self.sessions.participants(&s.session_id)?.iter().map(|p| json!({
+            v["participants"] = json!(self.participants_of(s)?.iter().map(|p| json!({
                 "principal": p.principal, "name": p.name, "class": p.class, "level": p.level, "role": p.role, "online": p.online,
-                "joined_at": format_utc_ms(p.joined_ms), "last_seen": format_utc_ms(p.last_seen_ms) })).collect::<Vec<_>>());
+                "joined_at": format_utc_ms(p.joined_ms), "last_seen": format_utc_ms(p.last_seen_ms),
+                "speak": p.speaks, "speak_set": p.speak, "request": p.speak_req_ms.is_some() && !p.speaks })).collect::<Vec<_>>());
         }
         Ok(v)
+    }
+
+    /// The participants with whether each speaks now (the feeds and the presenter's view of the room).
+    pub fn participants_of(&self, s: &SessionRow) -> WsResult<Vec<ParticipantRow>> {
+        let mut rows = self.sessions.participants(&s.session_id)?;
+        for p in rows.iter_mut() {
+            p.speaks = participant_speaks(s, p);
+        }
+        Ok(rows)
+    }
+
+    /// Whether `actor` may speak (多人发言 §4.2): the presenter and the prompter (the presenter's remote) always, a display
+    /// never, anyone else as their participant row says.
+    pub fn actor_speaks(&self, s: &SessionRow, actor: &Actor) -> WsResult<bool> {
+        Ok(match actor.role {
+            Role::Presenter | Role::Prompter => true,
+            Role::Display => false,
+            Role::Owner | Role::Participant => self.sessions.participant(&s.session_id, &actor.principal)?.is_some_and(|p| participant_speaks(s, &p)),
+        })
+    }
+
+    /// Everyone who may speak in `s` now: the voice service keeps only their senders.
+    pub fn speakers(&self, s: &SessionRow) -> WsResult<BTreeSet<String>> {
+        let mut out: BTreeSet<String> = self.participants_of(s)?.into_iter().filter(|p| p.speaks).map(|p| p.principal).collect();
+        out.insert(s.presenter.clone());
+        Ok(out)
     }
 
     /// `session.list { workspace_id }` (§8: 作品中的历次演示入口): the sessions of a source Workspace its readers may see.
@@ -742,7 +844,7 @@ impl Service {
             return Err(WsError::sub(Code::InvalidOperation, "SESSION_STATE", format!("a {} session cannot start again; create another session", s.state)));
         }
         let now = (self.clock)();
-        let participants = self.sessions.participants(&s.session_id)?;
+        let participants = self.participants_of(s)?;
         let stage = self.with_run(s, |ws| {
             meta_set(&ws.doc, "session_t0", &now.to_string())?;
             let steps = ws.session_steps()?;
@@ -751,7 +853,7 @@ impl Service {
                                 "title": first.as_ref().map(|f| f["title"].clone()), "surface_id": first.as_ref().map(|f| f["surface_id"].clone()),
                                 "black": false, "free": false, "transition": "fade", "nonce": 1, "media": {}, "rect": Value::Null, "updated_ms": now });
             ws.set_stage(&stage, NewEvent { actor: &actor.principal, scope: "public", track: "public", kind: "session.start", command_id: None, data: json!({ "stage": stage }), t_rel_ms: Some(0) })?;
-            let owner = Caller::user(&s.owner);
+            let owner = Caller::internal(&s.owner);
             ws.refresh_feeds(&owner, &actor.principal, &format!("start/{}", s.session_id), &FeedSel::all(), &participants)?;
             Ok(stage)
         })?;
@@ -771,7 +873,7 @@ impl Service {
         }
         let now = (self.clock)();
         self.with_run(s, |ws| {
-            let owner = Caller::user(&s.owner);
+            let owner = Caller::internal(&s.owner);
             // open tasks close with the session: nothing more is accepted
             let open: Vec<String> = ws.session_entities(TYPE_TASK)?.into_iter().filter(|t| t.payload.get("state") == Some(&json!("open"))).map(|t| t.entity_id).collect();
             if !open.is_empty() {
@@ -801,7 +903,7 @@ impl Service {
         Ok(json!({ "ok": true, "state": s.state, "expires_at": format_utc_ms(now + retention_ms) }))
     }
 
-    /// `session.save` (§8, Q12): the owner (or a manager of the source) keeps the session: an archive manifest naming
+    /// `session.save` (§8, Q12): the owner keeps the session: an archive manifest naming
     /// the baseline, the final snapshot, the event range, the voice segments and what is missing, and a `session`
     /// retention set pinning every object they need — no 30-day history rule applies to it.
     pub fn session_save(&self, s: &mut SessionRow, actor: &Actor) -> WsResult<Value> {
@@ -904,11 +1006,21 @@ impl Service {
         Ok(())
     }
 
-    /// `session.set_access { access?, posts? }` (§3.2, §8): closing the room to new audience and closing comments are
-    /// separate switches.
-    pub fn session_set_access(&self, s: &mut SessionRow, actor: &Actor, p: &Value) -> WsResult<Value> {
+    /// `session.set_access { access?, posts?, guest_interact?, readers_of?, speak?, speak_mode? }` (§3.2, §8): closing the room
+    /// to new audience and closing comments are separate switches; `readers_of` (the owner or the presenter, Q19) chooses
+    /// another permission object — a path or an entity id of the source Workspace the caller may read there. `speak` and
+    /// `speak_mode` (多人发言 §4.7) are the room's speaking settings: whoever's speaking changes with them — those without a
+    /// setting of their own — gets a `voice.allow`.
+    pub fn session_set_access(&self, s: &mut SessionRow, actor: &Actor, caller: &Caller, p: &Value) -> WsResult<Value> {
         if !actor.is_owner(s) && !actor.role.presents() {
             return Err(WsError::denied("the owner or the presenter sets the room's access"));
+        }
+        let before = s.clone();
+        if let Some(v) = p.get("speak") {
+            s.policy["speak"] = json!(speak_policy(Some(v))?);
+        }
+        if let Some(v) = p.get("speak_mode") {
+            s.policy["speak_mode"] = json!(speak_mode_policy(Some(v))?);
         }
         if let Some(a) = p.get("access").and_then(Value::as_str) {
             if !matches!(a, "open" | "closed") {
@@ -928,8 +1040,108 @@ impl Service {
             }
             s.policy["guest_interact"] = json!(v.as_bool().ok_or_else(|| WsError::invalid_op("guest_interact must be a boolean"))?);
         }
+        if let Some(v) = p.get("readers_of") {
+            if !actor.is_owner(s) && actor.role != Role::Presenter {
+                return Err(WsError::denied("the owner or the presenter chooses who may come in without a link"));
+            }
+            let r = v.as_str().ok_or_else(|| WsError::invalid_op("readers_of must be a path or an entity id"))?;
+            let object = {
+                let handle = self.workspace(&s.source_workspace_id)?;
+                let ws = handle.lock().unwrap();
+                let access = ws.require_ws_any(caller)?;
+                ws.permission_object(&access, r)?
+            };
+            s.policy["readers_of"] = json!(object);
+        }
         self.sessions.update(s)?;
-        Ok(json!({ "ok": true, "access": s.access, "posts": s.posts, "policy": s.policy }))
+        if before.speak_all() != s.speak_all() || before.guest_interact() != s.guest_interact() {
+            let changed: Vec<ParticipantRow> = self.participants_of(s)?.into_iter().filter(|p| p.speaks != participant_speaks(&before, p)).collect();
+            if !changed.is_empty() && s.alive() {
+                self.with_run(s, |ws| {
+                    if ws.session_closed() {
+                        return Ok(());
+                    }
+                    for p in &changed {
+                        voice_allow(ws, s, &p.principal, &p.name, p.speaks, &actor.principal, "room")?;
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(json!({ "ok": true, "access": s.access, "posts": s.posts, "policy": s.policy, "readers_of": self.readers_of_json(s) }))
+    }
+
+    /// `session.voice { op, … }` (多人发言 §4.7). The managers' — the owner, the presenter, the prompter: `allow { principal,
+    /// allow }` sets whether one person speaks (their own setting wins over the room's, §4.2), `mute_all {}` puts everyone
+    /// but the presenter into mute mode without taking their right away (Q7). One's own: `mode { mode: auto | manual |
+    /// mute }` says which mode one is in (the service records it, it does not enforce it), `request { on? }` asks to speak
+    /// or takes the request back (Q6). Each leaves its `voice.*` event on the time line (§4.6).
+    pub fn session_voice(&self, s: &SessionRow, actor: &Actor, p: &Value) -> WsResult<Value> {
+        let manager = actor.is_owner(s) || actor.role.presents();
+        let now = (self.clock)();
+        let open = |ws: &Workspace| if ws.session_closed() { Err(ended()) } else { Ok(()) };
+        match p.get("op").and_then(Value::as_str).unwrap_or("") {
+            "allow" => {
+                if !manager {
+                    return Err(WsError::denied("the owner or the presenter decides who speaks"));
+                }
+                let who = s_str(p, "principal")?;
+                let allow = p.get("allow").and_then(Value::as_bool).ok_or_else(|| WsError::invalid_op("allow must be a boolean"))?;
+                if who == s.presenter {
+                    return Err(WsError::invalid_op("the presenter always speaks"));
+                }
+                let row = self.sessions.participant(&s.session_id, who)?.ok_or_else(|| WsError::not_found(format!("{who} has not joined this session")))?;
+                self.with_run(s, |ws| open(ws))?;
+                self.sessions.set_speak(&s.session_id, who, Some(allow), &actor.principal, now)?;
+                self.with_run(s, |ws| voice_allow(ws, s, who, &row.name, allow, &actor.principal, "manager"))?;
+                Ok(json!({ "ok": true, "principal": who, "speak": allow }))
+            }
+            "mode" => {
+                let mode = p.get("mode").and_then(Value::as_str).filter(|m| matches!(*m, "auto" | "manual" | "mute")).ok_or_else(|| WsError::invalid_op("mode must be auto, manual or mute"))?;
+                if actor.role == Role::Display {
+                    return Err(WsError::denied("a display does not speak"));
+                }
+                if mode != "mute" && !self.actor_speaks(s, actor)? {
+                    return Err(WsError::sub(Code::PermissionDenied, "VOICE_NOT_ALLOWED", "you may not speak in this session"));
+                }
+                self.with_run(s, |ws| {
+                    open(ws)?;
+                    ws.append_event(NewEvent { actor: &actor.principal, scope: "presenter", track: "voice", kind: "voice.mode", command_id: None,
+                                               data: json!({ "principal": actor.principal, "mode": mode }), t_rel_ms: None })?;
+                    Ok(json!({ "ok": true, "mode": mode }))
+                })
+            }
+            "request" => {
+                let on = p.get("on").and_then(Value::as_bool).unwrap_or(true);
+                if !matches!(actor.role, Role::Participant | Role::Owner) {
+                    return Err(WsError::invalid_op("the presenter always speaks"));
+                }
+                self.may_interact(s, actor)?;
+                if on && self.actor_speaks(s, actor)? {
+                    return Ok(json!({ "ok": true, "request": false, "speak": true }));
+                }
+                self.with_run(s, |ws| open(ws))?;
+                self.sessions.set_speak_request(&s.session_id, &actor.principal, on.then_some(now))?;
+                let scope = format!("{PARTICIPANT_PREFIX}{}", actor.principal);
+                self.with_run(s, |ws| {
+                    ws.append_event(NewEvent { actor: &actor.principal, scope: &scope, track: "voice", kind: "voice.request", command_id: None,
+                                               data: json!({ "principal": actor.principal, "name": actor.name, "on": on }), t_rel_ms: None })?;
+                    Ok(json!({ "ok": true, "request": on }))
+                })
+            }
+            "mute_all" => {
+                if !manager {
+                    return Err(WsError::denied("the owner or the presenter mutes the room"));
+                }
+                self.with_run(s, |ws| {
+                    open(ws)?;
+                    ws.append_event(NewEvent { actor: &actor.principal, scope: "public", track: "voice", kind: "voice.mute_all", command_id: None,
+                                               data: json!({ "by": actor.principal }), t_rel_ms: None })?;
+                    Ok(json!({ "ok": true }))
+                })
+            }
+            _ => Err(WsError::invalid_op("op must be allow, mode, request or mute_all")),
+        }
     }
 
     // ---- invites (Q14) ----
@@ -947,7 +1159,19 @@ impl Service {
             Some(Value::Object(o)) if Value::Object(o.clone()).to_string().len() <= 4096 => Value::Object(o.clone()),
             Some(_) => return Err(WsError::invalid_op("config must be a small object")),
         };
+        if config.get("speak").is_some_and(|v| !v.is_boolean()) {
+            return Err(WsError::invalid_op("config.speak must be a boolean"));
+        }
         let label = p.get("label").and_then(Value::as_str).map(|l| l.chars().take(128).collect::<String>());
+        // a link may stop working by itself (权限需求 R27): `expires_at` in unix seconds
+        let mut config = config;
+        match p.get("expires_at") {
+            None | Some(Value::Null) => {}
+            Some(v) => {
+                let e = v.as_i64().filter(|e| *e * 1000 > (self.clock)()).ok_or_else(|| WsError::invalid_op("expires_at must be unix seconds in the future"))?;
+                config["expires_at"] = json!(e);
+            }
+        }
         let row = InviteRow {
             invite_id: random_id("iv_"),
             session_id: s.session_id.clone(),
@@ -962,12 +1186,7 @@ impl Service {
         self.sessions.add_invite(&row)?;
         if kind == "dt" || kind == "pt" {
             // a display or a prompter reads the public projection of the run Workspace under the link's own subject
-            self.with_run(s, |ws| {
-                ws.local
-                    .execute("INSERT OR REPLACE INTO grants (subject, scope_entity_id, capabilities, via_entry) VALUES (?1, '', ?2, ?3)", params![display_principal(&row.invite_id), Cap::Read as u16, row.invite_id])
-                    .map_err(db_err)?;
-                Ok(())
-            })?;
+            self.with_run(s, |ws| invite_member(ws, &s.owner, &row.invite_id, &display_principal(&row.invite_id)))?;
         }
         Ok(json!({ "ok": true, "invite": row.to_json() }))
     }
@@ -987,11 +1206,12 @@ impl Service {
             return Err(WsError::denied("the owner or the presenter revokes links"));
         }
         let revoked = self.sessions.revoke_invite(&s.session_id, invite_id, (self.clock)())?;
+        if revoked {
+            // those who joined through it leave the session too (权限需求 R27, Q17)
+            self.sessions.remove_participants_via(&s.session_id, invite_id)?;
+        }
         if revoked && s.alive() {
-            self.with_run(s, |ws| {
-                ws.local.execute("DELETE FROM grants WHERE via_entry = ?1", [invite_id]).map_err(db_err)?;
-                Ok(())
-            })?;
+            self.with_run(s, |ws| drop_invite_group(ws, &s.owner, invite_id))?;
         }
         Ok(json!({ "ok": true, "revoked": revoked }))
     }
@@ -1010,13 +1230,17 @@ impl Service {
                 return Ok((actor, json!({}), false));
             }
             let name = name.map(clean_name).filter(|n| !n.is_empty()).unwrap_or(actor.name.clone());
-            let row = ParticipantRow { principal: actor.principal.clone(), class: actor.class.clone(), level: actor.level.into(), name: name.clone(),
-                                       role: actor.role.as_str().into(), via_invite: None, joined_ms: now, last_seen_ms: now, online: true };
+            // a reader of the permission object coming in for the first time reads the run Workspace through their group
+            if actor.role == Role::Participant && self.sessions.participant(&s.session_id, &actor.principal)?.is_none() {
+                self.with_run(s, |ws| invite_member(ws, &s.owner, crate::home::SOURCE_READERS_GROUP, &actor.principal))?;
+            }
+            let row = ParticipantRow::joined(&actor.principal, &actor.class, actor.level, &name, actor.role.as_str(), None, now);
             let first = self.sessions.upsert_participant(&s.session_id, &row)?;
-            let my = self.with_run(s, |ws| ws.ensure_my_feeds(&Caller::user(&s.owner), &actor.principal))?;
+            self.speak_by_link(s, invite, &actor.principal, &name, now)?;
+            let my = self.with_run(s, |ws| ws.ensure_my_feeds(&Caller::internal(&s.owner), &actor.principal))?;
             return Ok((Actor { name, ..actor }, my, first));
         }
-        let Some(inv) = invite.filter(|i| i.kind == "at" && i.session_id == s.session_id && i.revoked_ms.is_none()) else {
+        let Some(inv) = invite.filter(|i| i.kind == "at" && i.session_id == s.session_id && i.usable((self.clock)())) else {
             return Err(WsError::sub(Code::NotFound, "SESSION_NOT_FOUND", "session not found, or you were not invited"));
         };
         if s.access != "open" {
@@ -1032,19 +1256,35 @@ impl Service {
             crate::CallerClass::Service => ("service", "verified"),
         };
         let name = name.map(clean_name).filter(|n| !n.is_empty()).unwrap_or_else(|| caller.principal.clone());
-        self.with_run(s, |ws| {
-            ws.local
-                .execute("INSERT OR IGNORE INTO grants (subject, scope_entity_id, capabilities, via_entry) VALUES (?1, '', ?2, ?3)", params![caller.principal, Cap::Read as u16, inv.invite_id])
-                .map_err(db_err)?;
-            Ok(())
-        })?;
-        let row = ParticipantRow { principal: caller.principal.clone(), class: class.into(), level: level.into(), name: name.clone(), role: "audience".into(),
-                                   via_invite: Some(inv.invite_id.clone()), joined_ms: now, last_seen_ms: now, online: true };
+        self.with_run(s, |ws| invite_member(ws, &s.owner, &inv.invite_id, &caller.principal))?;
+        let row = ParticipantRow::joined(&caller.principal, class, level, &name, "audience", Some(inv.invite_id.clone()), now);
         let first = self.sessions.upsert_participant(&s.session_id, &row)?;
-        let my = self.with_run(s, |ws| ws.ensure_my_feeds(&Caller::user(&s.owner), &caller.principal))?;
+        self.speak_by_link(s, Some(inv), &caller.principal, &name, now)?;
+        let my = self.with_run(s, |ws| ws.ensure_my_feeds(&Caller::internal(&s.owner), &caller.principal))?;
         let actor = Actor { principal: caller.principal.clone(), role: Role::Participant, class: class.into(), level, name };
         Ok((actor, my, first))
     }
+}
+
+impl Service {
+    /// An audience link with `config.speak` (Q10: guests of honour, assistants) lets whoever joins through it speak —
+    /// unless a manager already decided otherwise for them.
+    fn speak_by_link(&self, s: &SessionRow, invite: Option<&InviteRow>, principal: &str, name: &str, now: i64) -> WsResult<()> {
+        let Some(inv) = invite.filter(|i| i.kind == "at" && i.session_id == s.session_id && i.config["speak"] == json!(true)) else { return Ok(()) };
+        if self.sessions.set_speak_if_unset(&s.session_id, principal, true, &inv.created_by, now)? {
+            self.with_run(s, |ws| if ws.session_closed() { Ok(()) } else { voice_allow(ws, s, principal, name, true, &inv.created_by, "link") })?;
+        }
+        Ok(())
+    }
+}
+
+/// `voice.allow` (多人发言 §4.6): whether `principal` speaks now, for them and the managers; `speak_mode` is the mode they
+/// start in when this is their first time (S3a); `via`: `manager | room | link`.
+fn voice_allow(ws: &Workspace, s: &SessionRow, principal: &str, name: &str, allow: bool, by: &str, via: &str) -> WsResult<()> {
+    let scope = format!("{PARTICIPANT_PREFIX}{principal}");
+    ws.append_event(NewEvent { actor: by, scope: &scope, track: "voice", kind: "voice.allow", command_id: None,
+                               data: json!({ "principal": principal, "name": name, "allow": allow, "by": by, "via": via, "speak_mode": s.speak_mode() }), t_rel_ms: None })?;
+    Ok(())
 }
 
 /// An order key under the `session` folder: lower-case letters and digits, never ending in `0`.
@@ -1066,6 +1306,31 @@ pub fn display_principal(invite_id: &str) -> String {
     format!("link:{invite_id}")
 }
 
+/// Each link of a session is a logical group of its run Workspace (权限需求 R27): it reads the Workspace, its display
+/// or prompter and those who joined through it are its members, and revoking the link takes the group away.
+fn invite_member(ws: &Workspace, owner: &str, invite_id: &str, member: &str) -> WsResult<()> {
+    let now = ws.now();
+    ws.acl_txn(&Caller::internal(owner), |tx| {
+        tx.execute("INSERT OR IGNORE INTO acl_groups (group_id, title, description, created_by, created_at) VALUES (?1, ?1, 'session link', ?2, ?3)", params![invite_id, owner, now])
+            .map_err(db_err)?;
+        tx.execute("INSERT OR IGNORE INTO acl_entries (subject, scope_entity_id, allow, deny, updated_by, updated_at) VALUES (?1, '', ?2, 0, ?3, ?4)", params![format!("@{invite_id}"), Cap::Read as u16, owner, now])
+            .map_err(db_err)?;
+        tx.execute("INSERT OR IGNORE INTO acl_members (group_id, member, via_entry, added_by, added_at) VALUES (?1, ?2, ?1, ?3, ?4)", params![invite_id, member, owner, now]).map_err(db_err)?;
+        Ok(((), vec![crate::acl::AuditItem { action: "session.link_member", target: json!({ "group_id": invite_id }), before: None, after: Some(json!({ "member": member })) }]))
+    })?;
+    Ok(())
+}
+
+fn drop_invite_group(ws: &Workspace, owner: &str, invite_id: &str) -> WsResult<()> {
+    ws.acl_txn(&Caller::internal(owner), |tx| {
+        tx.execute("DELETE FROM acl_members WHERE group_id = ?1", [invite_id]).map_err(db_err)?;
+        tx.execute("DELETE FROM acl_entries WHERE subject = ?1", [format!("@{invite_id}")]).map_err(db_err)?;
+        tx.execute("DELETE FROM acl_groups WHERE group_id = ?1", [invite_id]).map_err(db_err)?;
+        Ok(((), vec![crate::acl::AuditItem { action: "session.revoke_link", target: json!({ "group_id": invite_id }), before: None, after: None }]))
+    })?;
+    Ok(())
+}
+
 fn clean_name(n: &str) -> String {
     n.trim().chars().filter(|c| !c.is_control()).take(64).collect()
 }
@@ -1075,7 +1340,7 @@ pub fn session_json(s: &SessionRow, role: Option<Role>) -> Value {
     let mut v = json!({ "session_id": s.session_id, "title": s.title, "state": s.state, "access": s.access, "posts": s.posts,
                         "workspace_id": s.workspace_id, "source_workspace_id": s.source_workspace_id, "path_id": s.path_id,
                         "owner": s.owner, "presenter": s.presenter, "guest_interact": s.guest_interact(), "voice": s.policy["voice"],
-                        "show_names": s.policy["show_names"],
+                        "show_names": s.policy["show_names"], "speak": if s.speak_all() { "all" } else { "granted" }, "speak_mode": s.speak_mode(),
                         "created_at": format_utc_ms(s.created_ms), "started_at": s.started_ms.map(format_utc_ms), "ended_at": s.ended_ms.map(format_utc_ms),
                         "saved_at": s.saved_ms.map(format_utc_ms), "expires_at": s.expires_ms.map(format_utc_ms), "controller": s.controller });
     if role.is_some_and(|r| r.reviews()) {
@@ -1296,7 +1561,7 @@ impl Workspace {
                     .filter(|p| p.role != "display")
                     .map(|p| {
                         let mut values = json!({ "name": p.name, "principal": p.principal, "role": p.role, "level": p.level, "online": p.online,
-                                                 "last_seen": format_utc_ms(p.last_seen_ms), "joined_at": format_utc_ms(p.joined_ms) });
+                                                 "last_seen": format_utc_ms(p.last_seen_ms), "joined_at": format_utc_ms(p.joined_ms), "speak": p.speaks });
                         if public {
                             // the public projection: display name and presence only
                             for k in ["principal", "level", "last_seen"] {
@@ -1373,7 +1638,7 @@ impl Workspace {
                 _ => Vec::new(),
             };
             let fetched = Fetched::Table { fields: feeds::fields(&feed), records };
-            ops.extend(self.source_ops(owner, &entity_id, &fetched)?);
+            ops.extend(self.source_ops(owner, &entity_id, &fetched)?.0);
         }
         Ok(ops)
     }
@@ -1507,7 +1772,7 @@ impl Service {
                 _ => {}
             }
         }
-        let owner = Caller::user(&s.owner);
+        let owner = Caller::internal(&s.owner);
         self.with_run(s, |ws| {
             let mut ops = Vec::new();
             let mut overrides = BTreeMap::new();
@@ -1630,7 +1895,7 @@ impl Service {
         self.live(s)?;
         self.may_interact(s, actor)?;
         let task_id = s_str(p, "task_id")?.to_string();
-        let owner = Caller::user(&s.owner);
+        let owner = Caller::internal(&s.owner);
         let now = format_utc_ms((self.clock)());
         self.with_run(s, |ws| {
             let t = ws.entity_row(&task_id).ok().filter(|e| e.type_id == TYPE_TASK).ok_or_else(|| WsError::not_found(format!("task {task_id} not found")))?;
@@ -1680,7 +1945,7 @@ impl Service {
         if content.to_string().len() > 64 * 1024 {
             return Err(WsError::limit("an answer is limited to 64 KiB"));
         }
-        let owner = Caller::user(&s.owner);
+        let owner = Caller::internal(&s.owner);
         let now = format_utc_ms((self.clock)());
         self.with_run(s, |ws| {
             let t = ws.entity_row(&task_id).ok().filter(|e| e.type_id == TYPE_TASK).ok_or_else(|| WsError::not_found(format!("task {task_id} not found")))?;
@@ -1743,7 +2008,7 @@ impl Service {
         }
         let rid = s_str(p, "response_id")?.to_string();
         let review = p.get("review").filter(|v| v.is_object()).cloned().ok_or_else(|| WsError::invalid_op("review must be an object"))?;
-        let owner = Caller::user(&s.owner);
+        let owner = Caller::internal(&s.owner);
         let now = format_utc_ms((self.clock)());
         self.with_run(s, |ws| {
             let r = ws.entity_row(&rid).ok().filter(|e| e.type_id == TYPE_RESPONSE).ok_or_else(|| WsError::not_found(format!("response {rid} not found")))?;
@@ -1773,7 +2038,7 @@ impl Service {
         let task_id = s_str(p, "task_id")?.to_string();
         let command = p.get("command_id").and_then(Value::as_str).filter(|c| !c.is_empty() && c.len() <= 96).ok_or_else(|| WsError::invalid_op("command_id required"))?;
         let content = p.get("content").cloned().unwrap_or(Value::Null);
-        let owner = Caller::user(&s.owner);
+        let owner = Caller::internal(&s.owner);
         let now = format_utc_ms((self.clock)());
         self.with_run(s, |ws| {
             ws.entity_row(&task_id).ok().filter(|e| e.type_id == TYPE_TASK).ok_or_else(|| WsError::not_found(format!("task {task_id} not found")))?;
@@ -1818,8 +2083,8 @@ impl Service {
             return Err(WsError::limit("a command is limited to 8 KiB"));
         }
         let now = (self.clock)();
-        let participants = self.sessions.participants(&s.session_id)?;
-        let owner = Caller::user(&s.owner);
+        let participants = self.participants_of(s)?;
+        let owner = Caller::internal(&s.owner);
         self.with_run(s, |ws| {
             if let Some(prior) = ws.event_by_command(&actor.principal, id)? {
                 return Ok(json!({ "ok": true, "duplicate": true, "event": prior, "stage": ws.stage() }));

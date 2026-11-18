@@ -245,6 +245,10 @@ pub struct OpenTurn {
     /// A message (not only events) is among them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_msg: bool,
+    /// Keys of the messages among them (a message's ObjId): what a
+    /// retraction names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub msg_keys: Vec<String>,
     pub at_ms: u64,
 }
 
@@ -633,8 +637,17 @@ pub struct SessionState {
     pub process_stack: Vec<ProcessFrame>,
     #[serde(default)]
     pub bootstrap_done: bool,
+    /// What the conversation is about, as other sessions see it: derived
+    /// from [`Self::memory`] (its title and the tags still held).
     #[serde(default)]
     pub topic: Topic,
+    /// The session's Memory observation (recall wiring TODO §3.3): the
+    /// topic with every tag's score and when it was last mentioned, the
+    /// snapshot, pending refs, read set and what this topic phase showed.
+    /// A batch's receipt carries it as it is after that batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Value>")]
+    pub memory: Option<crate::memory::ObservationState>,
     #[serde(default)]
     pub live_run: Option<LiveRun>,
     #[serde(default)]
@@ -749,9 +762,42 @@ pub struct SessionState {
     pub updated_at_ms: u64,
 }
 
+/// Why a session is paused: who resumes it follows from it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseSource {
+    /// Someone asked (`control(pause)`).
+    #[default]
+    User,
+    /// Its parent session was paused; resumed with it.
+    Parent,
+    /// The host restarted while it was working; resumed by hand, with the
+    /// sub sessions the same restart interrupted.
+    Interrupted,
+    /// Its Goal was put to sleep; resumed when the Goal wakes.
+    Goal,
+    /// Its Goal's period budget (or the agent's background total) ran out;
+    /// resumed when the period resets.
+    Budget,
+}
+
+impl PauseSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PauseSource::User => "user",
+            PauseSource::Parent => "parent",
+            PauseSource::Interrupted => "interrupted",
+            PauseSource::Goal => "goal",
+            PauseSource::Budget => "budget",
+        }
+    }
+}
+
 /// [`SessionState::paused`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Paused {
+    #[serde(default)]
+    pub source: PauseSource,
     pub at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -851,6 +897,7 @@ impl SessionState {
             process_stack: Vec::new(),
             bootstrap_done: false,
             topic: Topic::default(),
+            memory: None,
             live_run: None,
             last_run: None,
             worklog,

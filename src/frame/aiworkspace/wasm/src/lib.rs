@@ -23,6 +23,40 @@ fn parse(text: &str) -> Result<Value, JsError> {
     canonical::parse_strict(text).map_err(fail)
 }
 
+/// A table view compiled to SQL over the logical table named `table` (a path or an alias, quoted here) — core
+/// `sqlview::compile_view`, the one compiler the service uses too (核心 API 调整 §3.5). For sessions without a replica,
+/// which read a view with `doc.query { sql }`. `fields_json`: the table's live fields as `doc.read` gives them;
+/// `view_json`: `{ filter?, sorts?, fields?, group?, manual_order? }`; `projection`: `records` (`_record`, the native
+/// rows) or `display` (`_id` and the display columns). → `{ sql, count_sql, group_sql?, diagnostics }`.
+#[wasm_bindgen]
+pub fn view_sql(table: &str, fields_json: &str, view_json: &str, projection: &str) -> Result<String, JsError> {
+    use aiworkspace_core::model::FieldRow;
+    use aiworkspace_core::sqlview::{compile_view, ident, Projection, ViewDef};
+    let fields = parse(fields_json)?;
+    let rows: Vec<FieldRow> = fields
+        .as_array()
+        .ok_or_else(|| fail(WsError::invalid_op("fields must be an array")))?
+        .iter()
+        .map(|f| {
+            let mut d = f.clone();
+            if let Some(o) = d.as_object_mut() {
+                for k in ["order_key", "def_rev", "type_rev", "values_rev"] {
+                    o.remove(k);
+                }
+            }
+            let def = FieldDef::from_value(&d).map_err(fail)?;
+            Ok(FieldRow { source_id: String::new(), field_id: def.field_id.clone(), def, order_key: String::new(), def_rev: 0, type_rev: 0, values_rev: 0, deleted_seq: None })
+        })
+        .collect::<Result<_, JsError>>()?;
+    let projection = match projection {
+        "records" => Projection::Records,
+        "display" => Projection::Display,
+        other => return Err(fail(WsError::invalid_op(format!("projection must be records or display, not {other}")))),
+    };
+    let v = compile_view(&ident(table), &rows, &ViewDef::of_params(&parse(view_json)?), projection).map_err(fail)?;
+    Ok(json!({ "sql": v.sql, "count_sql": v.count_sql, "group_sql": v.group_sql, "diagnostics": v.diagnostics }).to_string())
+}
+
 #[wasm_bindgen]
 pub fn core_version() -> String {
     format!("{} (loro {})", env!("CARGO_PKG_VERSION"), richtext::engine_version())
@@ -153,6 +187,15 @@ pub fn wish_config_digest(payload_json: &str) -> Result<String, JsError> {
 }
 
 /// Whether a wish payload must be analysed before it can execute (§4.1).
+/// The main state and next action of a wish (PRD §5.8, 许愿格交互升级 §2.6): `freshness_json` is its freshness, `runs_json`
+/// what the page knows of its runs (`{ active?: { stage, state }, last_failed?: { stage, error } }`).
+#[wasm_bindgen]
+pub fn wish_main_status(freshness_json: &str, runs_json: &str) -> Result<String, JsError> {
+    let f: serde_json::Value = serde_json::from_str(freshness_json).map_err(|e| JsError::new(&e.to_string()))?;
+    let r: serde_json::Value = serde_json::from_str(runs_json).map_err(|e| JsError::new(&e.to_string()))?;
+    Ok(aiworkspace_core::freshness::main_status(&f, &r).to_string())
+}
+
 #[wasm_bindgen]
 pub fn wish_needs_analysis(payload_json: &str) -> Result<bool, JsError> {
     let p = parse(payload_json)?;
@@ -214,6 +257,11 @@ impl Replica {
 
     pub fn discard(&mut self, key: &str) -> bool {
         self.inner.discard(key).is_some()
+    }
+
+    /// An asset the service staged after the replica was made (an upload from this window): local plans know it.
+    pub fn note_asset(&mut self, object_id: &str, media_type: &str, size: f64) {
+        self.inner.note_asset(aiworkspace_core::model::AssetInfo { object_id: object_id.to_string(), media_type: media_type.to_string(), size: size as u64 })
     }
 
     /// The history was replaced: live submissions become conflicts to resend (D07).
@@ -331,6 +379,10 @@ impl Replica {
         if let Some(s) = p.get("sorts").and_then(Value::as_array) {
             spec.sorts = s.clone();
         }
+        if let Some(g) = p.get("group").and_then(Value::as_str) {
+            spec.group = Some(g.to_string());
+        }
+        aiworkspace_core::filter::group_params(&p, &mut spec).map_err(fail)?;
         let source_id = source_id.ok_or_else(|| fail(WsError::invalid_op("source_id or view_id required")))?;
         let source = m.entity(&source_id).map_err(fail)?.filter(|e| e.alive()).ok_or_else(|| fail(WsError::not_found("table not found")))?;
         if aiworkspace_core::types::is_url_table(&source) {

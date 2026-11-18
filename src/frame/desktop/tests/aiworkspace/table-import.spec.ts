@@ -1,13 +1,13 @@
 /* Table data import (notepads/done/aiworkspace-table-import-todo.md §11, TI-01 – TI-12): pasted spreadsheet HTML and TSV,
  * CSV / xlsx / SQLite files through the drop, the insert catalog and the main menu, the wizard's header switch, types,
- * currencies and invalid values, flow pages and undo, more than 20 000 rows, and aiws's own "copy as table".
+ * currencies and invalid values, flow pages and undo, more than 20 000 rows in one Commit, and aiws's own "copy as table".
  * The fixtures are those of the shared importer (src/frame/aiworkspace/fixtures/table). Screenshots go to
  * test-results/aiworkspace-table/. */
 
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { Page } from '@playwright/test'
-import { mainMenu, openCanvas, test, expect, type Api } from './fixtures'
+import { chooseFromDevice, chooseFromZone, mainMenu, openCanvas, test, expect, type Api } from './fixtures'
 
 const ALICE = 'tok-alice'
 const SHOTS = 'test-results/aiworkspace-table'
@@ -32,7 +32,7 @@ async function rows(api: Api, ws: Ws, sourceId: string, extra: Json = {}): Promi
   const out: Json[] = []
   let cursor: string | undefined
   for (;;) {
-    const page = await api.rpc(ALICE, 'doc.query', { workspace_id: ws.workspace_id, source_id: sourceId, limit: 1000, ...extra, ...(cursor ? { cursor } : {}) })
+    const page = await api.table(ALICE, ws.workspace_id, { source_id: sourceId, limit: 1000, ...extra, ...(cursor ? { cursor } : {}) })
     out.push(...page.rows)
     if (!page.next_cursor || page.rows.length === 0) return out
     cursor = page.next_cursor
@@ -64,10 +64,10 @@ async function drop(page: Page, name: string, bytes: Buffer, at: { x: number; y:
   await target.dispatchEvent('drop', { dataTransfer: dt, clientX: at.x, clientY: at.y })
 }
 
-async function chooseFile(page: Page, open: () => Promise<void>, name: string, buffer: Buffer, mimeType = 'text/csv') {
-  const chooser = page.waitForEvent('filechooser')
-  await open()
-  await (await chooser).setFiles({ name, mimeType, buffer })
+/** A file from the Zone (the main case), or from this device. */
+async function chooseFile(page: Page, open: () => Promise<void>, name: string, buffer: Buffer, mimeType = 'text/csv', from: 'zone' | 'device' = 'zone') {
+  if (from === 'zone') await chooseFromZone(page, open, { name, mimeType, buffer })
+  else await chooseFromDevice(page, open, { name, mimeType, buffer })
 }
 
 const fixture = (path: string) => readFileSync(`${FIXTURES}/${path}`)
@@ -156,6 +156,7 @@ test('TI-04 a flow page: the table Block goes after the selected Block; one undo
     { op: 'entity.create', entity_id: 'c1', type_id: 'buckyos.cell', parent_id: 'sf-t', order_key: 'a', payload: { view: { type: 'richtext' }, source_ref: { entity_id: 't1' } } },
     { op: 'entity.create', entity_id: 'c2', type_id: 'buckyos.cell', parent_id: 'sf-t', order_key: 'b', payload: { view: { type: 'richtext' }, source_ref: { entity_id: 't2' } } }])
   await openCanvas(page, ALICE, ws.workspace_id)
+  await page.getByTestId('aiws-cell-frame-c1').hover()
   await page.getByTestId('aiws-flow-handle-c1').click()
   await paste(page, { text: 'name\tqty\na\t1\nb\t2\n' })
   await wizard(page).getByTestId('aiws-table-start').click()
@@ -212,7 +213,7 @@ test('TI-06 the insert catalog\'s table entry → from a file: a GB 18030 CSV wi
 test('TI-07 the main menu\'s "import table data", keeping the original file: the table and the file in the canvas\'s data', async ({ page, api }) => {
   const ws = await canvasWorkspace(api, `ti-07 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
-  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-table'), 'thousands.csv', fixture('csv/thousands.csv'))
+  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-file', 'aiws-menu-import-table'), 'thousands.csv', fixture('csv/thousands.csv'))
   const dialog = wizard(page)
   await dialog.getByTestId('aiws-table-advanced').click()
   await expect(dialog.getByTestId('aiws-table-keep')).not.toBeChecked()
@@ -226,7 +227,7 @@ test('TI-07 the main menu\'s "import table data", keeping the original file: the
 test('TI-08 money: codes, names and symbols; the default currency for bare amounts; order and filter within a currency', async ({ page, api }) => {
   const ws = await canvasWorkspace(api, `ti-08 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
-  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-table'), 'prices.csv', fixture('csv/currency-mixed.csv'))
+  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-file', 'aiws-menu-import-table'), 'prices.csv', fixture('csv/currency-mixed.csv'))
   const dialog = wizard(page)
   await expect(dialog.getByTestId('aiws-table-type-1')).toHaveValue('currency')
   await expect(dialog.getByTestId('aiws-table-yen-1')).toHaveValue('CNY')
@@ -252,7 +253,7 @@ test('TI-09 an xlsx workbook: the first sheet by default, one table per sheet on
   test.setTimeout(120_000)
   const ws = await canvasWorkspace(api, `ti-09 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
-  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-table'), 'workbook.xlsx', fixture('xlsx/workbook.xlsx'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-file', 'aiws-menu-import-table'), 'workbook.xlsx', fixture('xlsx/workbook.xlsx'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
   const dialog = wizard(page)
   await expect(dialog.getByTestId('aiws-table-title')).toHaveValue('Sales')
   await expect.poll(() => Promise.all([0, 1, 2, 3, 4].map((i) => dialog.getByTestId(`aiws-table-type-${i}`).inputValue()))).toEqual(['date', 'currency', 'number', 'decimal', 'decimal'])
@@ -284,7 +285,7 @@ test('TI-10 a SQLite file: its tables listed and chosen, BLOB columns left out, 
   test.setTimeout(120_000)
   const ws = await canvasWorkspace(api, `ti-10 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
-  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-table'), 'shop.sqlite', fixture('sqlite/shop.sqlite'), 'application/vnd.sqlite3')
+  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-file', 'aiws-menu-import-table'), 'shop.sqlite', fixture('sqlite/shop.sqlite'), 'application/vnd.sqlite3')
   const dialog = wizard(page)
   await expect(dialog.getByRole('tab')).toHaveCount(3)
   await dialog.getByTestId('aiws-table-advanced').click()
@@ -302,26 +303,35 @@ test('TI-10 a SQLite file: its tables listed and chosen, BLOB columns left out, 
   expect((await rows(api, ws, tables[1].entity_id))[0].values.c6).toBe('9007199254740993')
 })
 
-test('TI-11 more than 20 000 rows: two commits with progress; cancelled during the first, the import says how far it got', async ({ page, api }) => {
+test('TI-11 more than 20 000 rows: one Commit; one undo removes the table with every row, one redo brings it back', async ({ page, api }) => {
   test.setTimeout(240_000)
   const ws = await canvasWorkspace(api, `ti-11 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
+  const head = await api.headSeq(ALICE, ws.workspace_id)
   const csv = Buffer.from(['n,label', ...Array.from({ length: 20_001 }, (_, i) => `${i},row ${i}`)].join('\n'))
-  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-table'), 'big.csv', csv)
+  await chooseFile(page, () => mainMenu(page, 'aiws-menu-insert', 'aiws-menu-import-file', 'aiws-menu-import-table'), 'big.csv', csv, 'text/csv', 'device')
   const dialog = wizard(page)
   await expect(dialog.getByTestId('aiws-table-start')).toHaveText('导入 20001 行')
   await dialog.getByTestId('aiws-table-start').click()
-  await expect(dialog.getByTestId('aiws-table-progress')).toContainText('正在导入', { timeout: 60_000 })
+  await expect(dialog.getByTestId('aiws-table-progress')).toContainText('正在写入 20001 行', { timeout: 60_000 })
+  // nothing to cancel once the Commit is on its way: it is written whole, or not at all
+  await expect(dialog.getByTestId('aiws-table-cancel')).toBeDisabled()
   await page.screenshot({ path: `${SHOTS}/ti11-progress.png` })
-  await dialog.getByTestId('aiws-table-cancel').click()
-  const report = page.getByTestId('aiws-import-report')
-  await expect(report.getByTestId('aiws-import-error')).toContainText('已取消，导入了 20001 行中的 20000 行', { timeout: 120_000 })
-  await report.getByTestId('aiws-import-report-close').click()
+  await expect(dialog).toHaveCount(0, { timeout: 120_000 })
+  expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head + 1)
   const [source] = await tablesIn(api, ws)
-  expect((await api.rpc(ALICE, 'doc.query', { workspace_id: ws.workspace_id, source_id: source.entity_id, limit: 1 })).total).toBe(20_000)
+  expect((await api.table(ALICE, ws.workspace_id, { source_id: source.entity_id, limit: 1 })).total).toBe(20_001)
   // rows keep the file's order (record ids sort in row order)
-  const first = await api.rpc(ALICE, 'doc.query', { workspace_id: ws.workspace_id, source_id: source.entity_id, limit: 3 })
+  const first = await api.table(ALICE, ws.workspace_id, { source_id: source.entity_id, limit: 3 })
   expect(first.rows.map((r: Json) => r.values.c1)).toEqual([0, 1, 2])
+  const report = page.getByTestId('aiws-import-report')
+  if (await report.isVisible()) await report.getByTestId('aiws-import-report-close').click()
+  await page.getByTestId('aiws-undo').click()
+  await expect.poll(async () => (await tablesIn(api, ws)).length, { timeout: 60_000 }).toBe(0)
+  await page.getByTestId('aiws-redo').click()
+  await expect.poll(async () => (await tablesIn(api, ws)).length, { timeout: 60_000 }).toBe(1)
+  expect((await api.table(ALICE, ws.workspace_id, { source_id: source.entity_id, limit: 1 })).total).toBe(20_001)
+  expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head + 3)
 })
 
 test('TI-12 "copy as table" in a table view, pasted on another canvas: the wizard prefilled with the types and options', async ({ page, api }) => {

@@ -31,6 +31,7 @@ import {
   AGENT_SETUP_PAGES,
   applyTemplateToDraft,
   buildAgentCreateRequest,
+  chosenExtraRuntimes,
   classifyAgentError,
   draftDisplayName,
   isTelegramBotToken,
@@ -337,10 +338,10 @@ function WizardBody({
         <Alert
           severity="info"
           data-testid="agent-setup-slot-occupied"
-          action={<Button size="small" variant="text" onClick={() => { void openUsersAgents({ entityId: slot.agent_id }); closeWindow() }}>{t('agentSetup.slot.manage')}</Button>}
         >
           <p className="font-semibold">{t('agentSetup.slot.title')}</p>
           <p>{t('agentSetup.slot.occupied', undefined, { agent: slot.agent_id })}</p>
+          <Button size="small" variant="text" sx={{ mt: 1, whiteSpace: 'nowrap' }} onClick={() => { void openUsersAgents({ entityId: slot.agent_id }); closeWindow() }}>{t('agentSetup.slot.manage')}</Button>
         </Alert>
       </WizardFrame>
     )
@@ -481,6 +482,7 @@ function WizardBody({
             avatarFallback={templateIcon}
             host={host}
             onHost={runsOnHost(effectiveDraft, host, directory)}
+            extraRuntimes={chosenExtraRuntimes(effectiveDraft, directory)}
           />
         </>
       )

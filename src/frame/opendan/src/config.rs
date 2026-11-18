@@ -28,13 +28,6 @@ pub struct UiRule {
     pub idle_unload_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModuleSwitch {
-    #[serde(default)]
-    pub enabled: bool,
-}
-
 /// `[loader.goals]`: the agent's Goals are hosted (their Goal Sessions,
 /// scheduled run opportunities). On by default: without a Goal it costs
 /// nothing.
@@ -48,6 +41,53 @@ pub struct GoalsSwitch {
 impl Default for GoalsSwitch {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// `[loader.browser]`: the agent's browser (`crate::browser`). On by
+/// default: it is started on demand, and a node without `chromium` only
+/// reports it unavailable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserSection {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Nobody watching and no lease for this long: the browser is stopped.
+    #[serde(default = "default_browser_idle")]
+    pub idle_stop_secs: u64,
+    /// Limit of the tabs of all groups together.
+    #[serde(default = "default_max_tabs")]
+    pub max_tabs: usize,
+    /// How the browser is shown: `virtual` (headed on a virtual display,
+    /// Linux), `headless`, or `auto` (the platform's).
+    #[serde(default)]
+    pub display: crate::browser::display::DisplayMode,
+    /// Device pixels per CSS pixel of the virtual display.
+    #[serde(default = "default_device_scale_factor")]
+    pub device_scale_factor: f64,
+}
+
+fn default_device_scale_factor() -> f64 {
+    2.0
+}
+
+fn default_browser_idle() -> u64 {
+    600
+}
+
+fn default_max_tabs() -> usize {
+    12
+}
+
+impl Default for BrowserSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_stop_secs: default_browser_idle(),
+            max_tabs: default_max_tabs(),
+            display: Default::default(),
+            device_scale_factor: default_device_scale_factor(),
+        }
     }
 }
 
@@ -68,9 +108,9 @@ pub struct LoaderSection {
     #[serde(default)]
     pub placeholder_delay_ms: Option<u64>,
     #[serde(default)]
-    pub self_check: ModuleSwitch,
-    #[serde(default)]
     pub goals: GoalsSwitch,
+    #[serde(default)]
+    pub browser: BrowserSection,
 }
 
 fn yes() -> bool {
@@ -89,8 +129,8 @@ impl Default for LoaderSection {
             idle_unload_secs: default_idle(),
             ui: Vec::new(),
             placeholder_delay_ms: None,
-            self_check: ModuleSwitch::default(),
             goals: GoalsSwitch::default(),
+            browser: BrowserSection::default(),
         }
     }
 }
@@ -173,7 +213,7 @@ impl AgentConfig {
                 );
             }
             if template.input != InputChannel::Queue {
-                bail!("{at}: session class `{}` has no input queue", rule.session_class);
+                bail!("{at}: session class `{}` takes no user messages (input = \"queue\")", rule.session_class);
             }
         }
         if self.loader.goals.enabled {
@@ -206,8 +246,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = AgentConfig::load(dir.path()).unwrap();
         assert!(cfg.loader.ui.is_empty() && cfg.loader.agent_state_service);
-        assert!(!cfg.loader.self_check.enabled);
         assert!(cfg.loader.goals.enabled);
+        let browser = &cfg.loader.browser;
+        assert_eq!((browser.enabled, browser.idle_stop_secs, browser.max_tabs), (true, 600, 12));
+    }
+
+    #[test]
+    fn the_browser_section_is_parsed() {
+        let cfg = load("[loader.browser]\nenabled = false\nidle_stop_secs = 30\n").unwrap();
+        let browser = &cfg.loader.browser;
+        assert_eq!((browser.enabled, browser.idle_stop_secs, browser.max_tabs), (false, 30, 12));
+        assert_eq!(load("[loader.browser]\nmax_tabs = 3\n").unwrap().loader.browser.max_tabs, 3);
+        assert!(format!("{:#}", load("[loader.browser]\nmax_tab = 3\n").unwrap_err()).contains("unknown field"));
     }
 
     #[test]
@@ -240,14 +290,13 @@ max_total_tokens = 1000
         assert!(load("[session.goal.budget]\nnope = 1\n").is_err());
         std::fs::write(
             dir.path().join("agent.toml"),
-            "[session.goal.maintenance]\nenabled = true\ndecision = \"off\"\nbehavior = \"memory_maintenance\"\n",
+            "[session.goal.maintenance]\nenabled = true\nbehavior = \"memory_maintenance\"\n",
         )
         .unwrap();
         let d = libopendan::goal::defaults(Some(dir.path()), "goal");
         assert!(d.maintenance.enabled);
-        assert_eq!(d.maintenance.decision, "off");
         assert_eq!(d.maintenance.behavior.as_deref(), Some("memory_maintenance"));
-        assert!(load("[session.goal.maintenance]\ndecision = \"maybe\"\n").is_err());
+        assert!(load("[session.goal.maintenance]\ndecision = \"off\"\n").is_err(), "the decision pre-check is gone");
         assert!(load("[session.goal.maintenance]\nnope = 1\n").is_err());
     }
 
@@ -276,9 +325,6 @@ idle_unload_secs = 60
 on = "msg.group"
 session_class = "group"
 sid_strategy = "per_group"
-
-[loader.self_check]
-enabled = false
 
 [session.ui]
 default_behavior = "chat_route"

@@ -3,11 +3,10 @@
 
 import { z } from 'zod'
 import type { BlockDefPayload, ControlBinding, EntityEnvelope, Json } from '../../api/types'
-import { MOCK_WISH_DEF_ID } from '../wish/mockWishDef'
 
-/** The Workspace's control definitions (the Mock wish executor's is not a control). */
+/** The Workspace's control definitions. */
 export function controlDefinitions(entities: EntityEnvelope[]): EntityEnvelope[] {
-  return entities.filter((e) => !e.deleted && e.type_id === 'buckyos.block-def' && e.entity_id !== MOCK_WISH_DEF_ID)
+  return entities.filter((e) => !e.deleted && e.type_id === 'buckyos.block-def')
 }
 
 export interface PropSchema { type?: string | string[]; enum?: Json[]; default?: Json; title?: string; description?: string; minimum?: number; maximum?: number; minLength?: number; maxLength?: number }
@@ -30,14 +29,9 @@ export function configProblems(def: BlockDefPayload | undefined, config: Record<
   }
 }
 
-/** Required bindings left unbound. */
-export function missingBindings(def: BlockDefPayload | undefined, bindings: Record<string, string>): string[] {
-  return Object.entries(def?.bindings ?? {}).filter(([name, b]) => b.required && !bindings[name]).map(([name]) => name)
-}
-
 
 /** The newest `manifest_version` this host reads (扩展控件 P2/P3); a package above it is listed, never imported (Q33). */
-export const HOST_MANIFEST_VERSION = 3
+export const HOST_MANIFEST_VERSION = 5
 
 /** What a newer version of a control changes in the contract its instances rely on (`ext.upgrade`, Q30): the inputs of
  * the migration form. `next` is the new `component.json` (and `composition.json` for a composite). */

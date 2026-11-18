@@ -32,17 +32,16 @@ pub use activity::{
 };
 pub use artifacts::{nearest_valid_base, DecideResult};
 pub use behaviors::{
-    check_cmd_skill_names, freeze_behavior, freeze_config, parse_behavior, BehaviorCatalog,
-    FsBehaviorCatalog, MemBehaviorCatalog, CMD_SKILLS_DIR, ROLE_SUPPLEMENT_FILE,
+    check_cmd_skill_names, check_named_skills, freeze_behavior, freeze_config, parse_behavior, BehaviorCatalog,
+    FsBehaviorCatalog, MemBehaviorCatalog, CMD_SKILLS_DIR, ROLE_SUPPLEMENT_FILE, frozen_changes, refrozen,
 };
-pub use cognition::{Hint, NotebookNote, RecallQuery};
 pub use connect::{
     connect, register_in_process, unregister_in_process, ConnectOptions, ForwardingStateClient,
     StateLocator, WithBehaviors, WithNotify, ENV_AGENT_ROOT, ENV_AGENT_STATE_URL,
 };
 pub use fs_client::{AgentLayout, FsAgentStateClient};
 pub use goals::{
-    ActivationQuery, CallerKind, GoalCaller, GoalCreate, GoalReopen, GoalRestart, GoalRevise,
+    ActivationQuery, CallerKind, GoalCaller, GoalCheckChange, GoalCreate, GoalReopen, GoalRestart, GoalRevise,
     GoalStatusChange, GoalStore,
 };
 pub use krpc::{KrpcAgentStateClient, KrpcTransport, StateTransport};
@@ -84,6 +83,19 @@ pub trait SessionRegistry: Send + Sync {
     async fn update_location(&self, lease: &Lease, sid: &str, location: &Path) -> Result<()>;
     /// Mark entries whose location vanished as unreachable (never deletes).
     async fn verify(&self) -> Result<Vec<String>>;
+    /// Host only: mark the unfinished sessions frozen to `runtime_id` with
+    /// why it cannot be used now (`None`: it can again, the marks go).
+    /// Returns the sessions that were not marked before.
+    async fn mark_runtime(&self, _runtime_id: &str, _reason: Option<&str>) -> Result<Vec<RegistryEntry>> {
+        Ok(Vec::new())
+    }
+    /// Delete a finished Work session with everything below it
+    /// (all finished too): their directories and registry entries. Returns
+    /// the deleted session ids. What they left in the perception stream
+    /// stays (Memory cites it).
+    async fn delete(&self, _sid: &str) -> Result<Vec<String>> {
+        Err(crate::error::OpenDanError::InvalidArgument("this registry deletes no sessions".into()))
+    }
     /// Post an input to a session's kmsg queue (+ wake event).
     /// Append a record to the session's input bus. Refused with
     /// `input_full` while the bus holds [`MAX_PENDING_INPUTS`] records that
@@ -109,13 +121,15 @@ pub trait Perception: Send + Sync {
     async fn last_seq(&self, sid: &str) -> Result<u64>;
 }
 
-/// Cognition facade (§6.4) over `agent_tool` memory / notebook.
+/// Cognition facade (§6.3, §6.4) over the Memory component.
 #[async_trait]
 pub trait Cognition: Send + Sync {
-    /// Read-only; any session may call it.
-    async fn recall_hints(&self, q: &RecallQuery) -> Result<Vec<Hint>>;
-    /// Explicit declaration from an ordinary session ("remember this").
-    async fn notebook_append(&self, note: &NotebookNote, who: &str) -> Result<()>;
+    /// Active Memory query of session `sid`, as its host-bound identity
+    /// (its grants decide what is visible). Read-only.
+    async fn query(&self, sid: &str, q: &crate::memory::MemoryQuery) -> Result<crate::memory::QueryResult>;
+    /// A reference in full (a cognition with its provenance, or a
+    /// perception), as session `sid`. Read-only.
+    async fn read(&self, sid: &str, reference: &str) -> Result<crate::memory::MemoryRead>;
 }
 
 /// Artifact list (§6.5): registration and pointers only.

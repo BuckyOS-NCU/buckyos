@@ -40,7 +40,7 @@ fn generated_results_get_versions_that_can_be_restored() {
     let h = env.svc.workspace(&id).unwrap();
     let mut ws = h.lock().unwrap();
     let members = ws.read(&alice(), "tasks", None).unwrap()["content"]["members_rev"].clone();
-    let derived = |run: &str| json!({ "wish_id": "tasks", "run_id": run, "executor": "mock", "simulated": true,
+    let derived = |run: &str| json!({ "wish_id": "tasks", "run_id": run, "executor": "xllm",
         "inputs": [{ "entity_id": "tasks", "selector": { "kind": "table_members" }, "version": { "mode": "follow", "rev": members } }] });
     // run 1: a record result with its record
     let r1 = ok(&mut ws, &alice(), json!([
@@ -110,15 +110,15 @@ fn grants_as_seen_by_non_managers_and_canvas_permissions() {
     // a canvas permission is two rows: the Surface and its content folder (phase two §6.3)
     ws.grant(&alice(), "bob", Some("surface-main"), &["structure".into(), "update".into()]).unwrap();
     ws.grant(&alice(), "bob", Some("surface-main-content"), &["structure".into(), "update".into(), "append".into()]).unwrap();
-    let all = ws.list_grants(&alice()).unwrap();
-    assert_eq!(all["complete"], true);
-    assert_eq!(all["grants"].as_array().unwrap().len(), 5);
-    // bob sees only his own rows, not carol's
-    let mine = ws.list_grants(&bob()).unwrap();
-    assert_eq!(mine["complete"], false);
-    let subjects: Vec<&str> = mine["grants"].as_array().unwrap().iter().map(|g| g["subject"].as_str().unwrap()).collect();
-    assert!(subjects.iter().all(|s| *s == "bob"), "{subjects:?}");
-    assert_eq!(subjects.len(), 3);
+    let all = ws.acl_query(&alice(), &json!({ "by": "entity", "resource": "/" }), None).unwrap();
+    let subjects: Vec<&str> = all["subjects"].as_array().unwrap().iter().map(|g| g["subject"].as_str().unwrap()).collect();
+    assert_eq!(subjects, ["@owner", "bob", "carol"]);
+    // bob sees only his own entries, not carol's
+    let mine = ws.acl_query(&bob(), &json!({ "by": "subject" }), None).unwrap();
+    assert_eq!(mine["subject"], "bob");
+    assert_eq!(mine["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(ws.acl_query(&bob(), &json!({ "by": "subject", "subject": "carol" }), None).unwrap_err().code.as_str(), "PERMISSION_DENIED");
+    assert_eq!(ws.acl_query(&bob(), &json!({ "by": "entity", "resource": "/" }), None).unwrap_err().code.as_str(), "PERMISSION_DENIED");
     // bob can place a Block on the Surface and create data in its content folder, but not touch first-level data
     let life = ws.read(&bob(), "cell-info", None).unwrap()["life_rev"].clone();
     let _ = life;
@@ -132,22 +132,17 @@ fn grants_as_seen_by_non_managers_and_canvas_permissions() {
 }
 
 #[test]
-fn mock_program_writes_data_and_block_into_the_two_trees() {
+fn a_run_request_is_idempotent_by_its_key() {
     let env = env();
     let id = project(&env);
     let h = env.svc.workspace(&id).unwrap();
     let mut ws = h.lock().unwrap();
-    let run = ws.proc_start(&alice(), "mock.task-summary@1", &json!({ "today": "2026-10-13" }), "run-p2").unwrap();
-    assert_eq!(run["state"], "waiting_confirmation", "{run}");
+    let params = json!({ "stage": "run", "request": { "today": "2026-10-13" } });
+    let (run, replayed) = ws.wish_run_create(&alice(), "wish.xllm@1", &params, "run-p2", &Value::Null).unwrap();
+    assert!(!replayed);
     // the same key replays the same request only; another request under it is refused (13.2)
-    assert_eq!(ws.proc_start(&alice(), "mock.task-summary@1", &json!({ "today": "2026-10-13" }), "run-p2").unwrap()["replayed"], true);
-    assert_eq!(ws.proc_start(&alice(), "mock.task-summary@1", &json!({ "today": "2026-10-14" }), "run-p2").unwrap_err().code, aiworkspace_core::Code::IdempotencyMismatch);
-    let applied = ws.proc_apply(&alice(), run["run_id"].as_str().unwrap(), None).unwrap();
-    assert_eq!(applied["state"], "succeeded", "{applied}");
-    let outline = ws.outline(&alice()).unwrap();
-    let parent = |eid: &str| outline["entities"].as_array().unwrap().iter().find(|e| e["entity_id"] == eid).map(|e| e["parent_id"].as_str().unwrap().to_string());
-    assert_eq!(parent("summary").as_deref(), Some("data"));
-    assert_eq!(parent("cell-summary").as_deref(), Some("surface-main"));
+    assert_eq!(ws.wish_run_create(&alice(), "wish.xllm@1", &params, "run-p2", &Value::Null).unwrap(), (run, true));
+    let other = json!({ "stage": "run", "request": { "today": "2026-10-14" } });
+    assert_eq!(ws.wish_run_create(&alice(), "wish.xllm@1", &other, "run-p2", &Value::Null).unwrap_err().code, aiworkspace_core::Code::IdempotencyMismatch);
     let _ = CommitOpts::default();
-    let _: Value = Value::Null;
 }

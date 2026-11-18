@@ -1,16 +1,16 @@
 /* The English UI (the Desktop's default language): AI Workspace shows no Chinese — the list, the workspace chrome,
- * menus, panels, dialogs, the insert catalog, data sources, presentation editing, and the demo content and Mock wish
- * output it creates in English. The rest of the suite runs in zh-CN (fixtures.ts); the source-level guard is
+ * menus, panels, dialogs, the insert catalog, data sources, presentation editing, the demo content it creates and the
+ * wish card in English. The rest of the suite runs in zh-CN (fixtures.ts); the source-level guard is
  * tests/datamodel/aiworkspace-i18n.test.ts. */
 
 import type { Page } from '@playwright/test'
-import { backToList, expect, LOCALE_STORAGE_KEY, openApp, openSide, openStatus, setCanvasMode, test } from './fixtures'
+import { backToList, closePermissions, expect, LOCALE_STORAGE_KEY, openApp, openPermissions, openSide, openStatus, setCanvasMode, test, wishThreeSteps } from './fixtures'
 
 const ALICE = 'tok-alice'
 const CJK = /[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]/
 
 /** Content shown as is: workspace titles on the list (other specs name theirs in Chinese). */
-const USER_CONTENT = 'script, style, .aiws-card-title'
+const USER_CONTENT = 'script, style, .aiws-user-text'
 
 /** Chinese text anywhere on the page: text nodes, accessible names, titles, placeholders, same-origin frames. */
 async function chineseOnPage(page: Page): Promise<string[]> {
@@ -61,7 +61,7 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript((key) => window.localStorage.setItem(key, 'en'), LOCALE_STORAGE_KEY)
 })
 
-test('i18n: in English, the list, a demo created from a template, its chrome, panels and wish output show no Chinese', async ({ page }) => {
+test('i18n: in English, the list, a demo created from a template, its chrome, panels and wish output show no Chinese', async ({ page, api }) => {
   test.setTimeout(240_000)
   await openApp(page, ALICE)
   await expectEnglish(page, 'workspace list')
@@ -80,19 +80,22 @@ test('i18n: in English, the list, a demo created from a template, its chrome, pa
   // the main menu and its submenus
   await page.getByTestId('aiws-main-menu').click()
   await expectEnglish(page, 'main menu')
-  for (const submenu of ['aiws-menu-view', 'aiws-menu-canvas-mode', 'aiws-menu-dev']) {
-    await page.getByTestId(submenu).click()
-    await expectEnglish(page, `main menu → ${submenu}`)
+  for (const path of [['aiws-menu-workspace', 'aiws-menu-offline'], ['aiws-menu-surface', 'aiws-menu-canvas-mode'], ['aiws-menu-insert', 'aiws-menu-import-file'], ['aiws-menu-edit'], ['aiws-menu-view', 'aiws-menu-panels'], ['aiws-menu-collab'], ['aiws-menu-help']]) {
+    for (const submenu of path) await page.getByTestId(submenu).click()
+    await expectEnglish(page, `main menu → ${path.join(' → ')}`)
   }
   await page.keyboard.press('Escape')
   await page.keyboard.press('Escape')
 
-  // the side panel tabs and the status area
-  for (const tab of ['inspector', 'relations', 'annotations', 'collab', 'edits'] as const) {
+  // the side drawer's tabs, members and permissions, and the status panel
+  for (const tab of ['inspector', 'relations', 'annotations'] as const) {
     await openSide(page, tab)
     await expectEnglish(page, `side panel: ${tab}`)
   }
   await page.getByTestId('aiws-side-close').click()
+  await openPermissions(page)
+  await expectEnglish(page, 'members and permissions')
+  await closePermissions(page)
   await openStatus(page)
   await expectEnglish(page, 'status area')
   await page.getByTestId('aiws-status').click()
@@ -107,16 +110,14 @@ test('i18n: in English, the list, a demo created from a template, its chrome, pa
   }
   await page.keyboard.press('Escape')
 
-  // the Mock wish: analysis, candidate and applied results are English too
-  await page.getByTestId('aiws-canvas-block-blk-wish').dblclick()
-  await page.getByTestId('aiws-wish-analyze').click()
-  await expect(page.getByTestId('aiws-wish-analysis')).toBeVisible()
-  await page.getByTestId('aiws-wish-execute').click()
-  await expect(page.getByTestId('aiws-wish-candidate')).toHaveAttribute('data-ready', 'true', { timeout: 30_000 })
-  await expectEnglish(page, 'wish candidate')
-  await page.getByTestId('aiws-wish-apply').click()
-  await expect(page.getByTestId('aiws-wish-message')).toBeVisible()
-  await expectEnglish(page, 'wish applied')
+  // the wish card (the scripted model answers an English request in English): its tabs, records and buttons through the
+  // three stages, each written as it ends
+  const workspaceId = (await page.getByTestId('aiws-workspace').getAttribute('data-workspace-id'))!
+  await wishThreeSteps(page, api, ALICE, workspaceId, 'wish-analysis')
+  await expect(page.getByTestId('aiws-wish-card-wish-analysis')).toHaveAttribute('data-tab', 'results')
+  await expectEnglish(page, 'wish card after its run')
+  await page.getByTestId('aiws-wish-card-wish-analysis').getByTestId('aiws-wish-tab-analysis').click()
+  await expectEnglish(page, 'wish records')
 
   // presentation path editing and view mode
   await setCanvasMode(page, 'presentation_edit')
@@ -148,8 +149,11 @@ test('i18n: the film demo in English; a live language switch re-renders the open
   await expect(page.getByRole('toolbar', { name: 'Main toolbar' })).toBeVisible()
   await expectEnglish(page, 'after switching back to English without a reload')
 
-  // a stored choice survives a reload (init scripts run in order: this one after the spec's English)
-  await page.addInitScript((key) => window.localStorage.setItem(key, 'zh-CN'), LOCALE_STORAGE_KEY)
+  // the choice is the account's (AccountAppearanceSync): made in Settings, it comes back after a reload whatever this page
+  // stored (the spec's English init script runs again)
+  await switchLanguage(page, 'zh-CN')
+  // saved to the account before the page goes (nothing left pending, AppearanceSync)
+  await expect.poll(() => page.evaluate(() => window.localStorage.getItem('buckyos.desktop.appearance-pending.v1'))).toBeNull()
   await page.reload()
   await page.getByTestId('desktop-app-aiworkspace').click()
   await backToList(page)

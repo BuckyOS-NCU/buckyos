@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { pickLocal, pickZone, putZoneFile, selectDialog } from '../fixtures/selectDialog'
 
 /** A landscape picture drawn in the page, as a file the picker can take. */
 async function landscapePicture(page: Page, name = 'sunset.jpg') {
@@ -94,7 +95,11 @@ test.describe('settings', () => {
     await expect(page.getByTestId('desktop-background')).not.toHaveAttribute('data-wallpaper-mode')
     await expect(page.locator('main[data-wallpaper]')).toHaveCount(0)
 
-    await win.getByTestId('settings-wallpaper-file').setInputFiles(await landscapePicture(page))
+    // From the Zone, the user's main file system: the picker shows pictures as a grid.
+    await putZoneFile(page, '/home/Pictures/sunset.jpg', (await landscapePicture(page)).buffer, 'image/jpeg')
+    await win.getByTestId('settings-wallpaper-choose').click()
+    await pickZone(selectDialog(page), '/home/Pictures/sunset.jpg')
+    await expect(selectDialog(page)).toHaveCount(0)
     await expect(section.getByTestId('settings-wallpaper-status')).toContainText('sunset.jpg · 1200 × 800')
     await expect(page.getByTestId('desktop-background')).toHaveAttribute('data-wallpaper-mode', 'fill')
     await expect(wallpaperLayer(page)).toHaveCSS('background-image', /^url\("blob:/)
@@ -144,7 +149,9 @@ test.describe('settings', () => {
     const win = await openSettings(page, 'Appearance')
     await win.getByTestId('settings-theme').selectOption('dark')
     await win.getByTestId('settings-icon-size').selectOption('large')
-    await win.getByTestId('settings-wallpaper-file').setInputFiles(await landscapePicture(page))
+    // From this device, through the picker's "This device".
+    await win.getByTestId('settings-wallpaper-choose').click()
+    await pickLocal(page, await landscapePicture(page))
     await win.getByTestId('settings-wallpaper-fit-fit').click()
     await expect.poll(() => accountAppearance(page)).toMatchObject({ theme: 'dark', iconSize: 'large', wallpaper: { fit: 'fit', image: { name: 'sunset.jpg' } } })
 
@@ -171,11 +178,11 @@ test.describe('settings', () => {
 
   test('appearance: a file that is not a picture is refused and the background is kept', async ({ page }) => {
     const win = await openSettings(page, 'Appearance')
-    await win.getByTestId('settings-wallpaper-file').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hello') })
-    await expect(win.getByTestId('settings-wallpaper').getByRole('alert')).toContainText('Choose a picture file')
-    await expect(page.getByTestId('desktop-background')).not.toHaveAttribute('data-wallpaper-mode')
-
-    await win.getByTestId('settings-wallpaper-file').setInputFiles({ name: 'broken.png', mimeType: 'image/png', buffer: Buffer.from('not a png') })
+    // The picker only takes pictures: a text file is refused there and the picker stays open.
+    await win.getByTestId('settings-wallpaper-choose').click()
+    await pickLocal(page, { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hello') })
+    await expect(selectDialog(page).getByTestId('select-notice')).toContainText('notes.txt')
+    await pickLocal(page, { name: 'broken.png', mimeType: 'image/png', buffer: Buffer.from('not a png') })
     await expect(win.getByTestId('settings-wallpaper').getByRole('alert')).toContainText('could not be read')
     await expect(page.getByTestId('desktop-background')).not.toHaveAttribute('data-wallpaper-mode')
   })
@@ -198,7 +205,117 @@ test.describe('settings', () => {
     await expect(storage.getByTestId('settings-storage-bucket-user/notes.alice.bns.did/alice/index')).toBeVisible()
   })
 
-  test('cluster: devices with their hardware, Linux device creation, certificates', async ({ page }) => {
+  test('storage: an admin runs the content store cleanup by hand', async ({ page }) => {
+    const win = await openSettings(page, 'Storage')
+    const gc = win.getByTestId('settings-storage-gc')
+    // What the background GC did lately, so that it can be seen running.
+    await expect(gc).toContainText(/last run 1\d seconds ago/)
+    const records = gc.getByTestId('settings-storage-gc-record')
+    await expect(records).toHaveCount(2)
+    await expect(records.first()).toContainText('Background')
+    await expect(records.first()).toContainText('Freed 12 MB (23 items)')
+    await expect(records.nth(1)).toContainText('2 expired holds released')
+
+    await gc.getByTestId('settings-storage-gc-run').click()
+    await expect(records).toHaveCount(3)
+    await expect(records.first()).toContainText('Manual')
+    await expect(records.first()).toContainText('Freed 184 MB (89 items)')
+    await gc.getByTestId('settings-storage-gc-run').click()
+    await expect(records.first()).toContainText('Nothing to clean up')
+    await expect(records).toHaveCount(3)
+  })
+
+  test('agent runtimes: node policy, device issue and assignment, one Agent per device, revoke', async ({ page }) => {
+    const win = await openSettings(page, 'Agent Runtimes')
+    const runtimes = win.getByTestId('settings-agent-runtimes')
+    const host = runtimes.getByTestId('settings-runtime-host')
+    await expect(host).toContainText('Alice’s computer')
+    await expect(host).toContainText('Open')
+    await expect(host).toContainText('/home/alice · Read and write · ComputerUse: Screenshots and input · Standard environment')
+    await expect(host).toContainText('Runs as the OS account chosen when the node was activated')
+
+    // A second Agent of the same owner, to contend for the device.
+    await page.evaluate(() => {
+      const key = 'buckyos.mock.control-panel.v1'
+      const state = JSON.parse(window.localStorage.getItem(key) ?? '{}')
+      const coder = JSON.parse(JSON.stringify(state.agents[0]))
+      Object.assign(coder, { agent_id: 'coder.alice', agent_did: 'did:bns:coder.alice', name: 'coder', profile: { display_name: 'Coder' }, idempotency_key: 'seed-coder' })
+      Object.assign(coder.install, { agent_id: 'coder.alice', agent_did: 'did:bns:coder.alice' })
+      state.agents.push(coder)
+      window.localStorage.setItem(key, JSON.stringify(state))
+    })
+
+    await host.getByRole('button', { name: 'Edit', exact: true }).click()
+    const edit = page.getByTestId('settings-runtime-edit')
+    await expect(edit).toContainText('It cannot be changed here')
+    await edit.getByLabel('Allowed working directories').fill('/home/alice\n/srv/data')
+    await edit.getByLabel('Declared environment').click()
+    await page.getByRole('option', { name: 'Extended environment' }).click()
+    await edit.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(host).toContainText('/home/alice, /srv/data · Read and write · ComputerUse: Screenshots and input · Extended environment')
+
+    await runtimes.getByTestId('settings-add-device').click()
+    const addDevice = page.getByRole('dialog', { name: 'Add device' })
+    await expect(addDevice.getByRole('button', { name: 'Generate URL' })).toBeDisabled()
+    await expect(addDevice).toContainText('Shell commands retain the current OS user')
+    await addDevice.getByLabel('Device name').fill('Agent laptop')
+    await addDevice.getByLabel('Allowed working directories').fill('/home/alice/work')
+    await addDevice.getByLabel('Permissions').click()
+    await page.getByRole('option', { name: 'Read files only' }).click()
+    await addDevice.getByLabel('Assign to Agent (optional)').click()
+    await page.getByRole('option', { name: 'BuckyOS Assistant' }).click()
+    await addDevice.getByRole('button', { name: 'Generate URL' }).click()
+    const issued = page.getByRole('dialog', { name: 'Start your device' })
+    await expect(issued.getByLabel('Startup command')).toHaveValue(/start-buckyos-agent-daemon.sh/)
+    await issued.getByRole('button', { name: 'Close', exact: true }).click()
+
+    const devices = runtimes.getByTestId('settings-runtime-devices')
+    const device = devices.locator('[data-testid^="settings-runtime-exec-"]')
+    await expect(device).toContainText('Agent laptop')
+    await expect(device).toContainText('/home/alice/work · Read only · ComputerUse: Disabled · Standard environment')
+    await expect(device.getByTestId('settings-runtime-assignment-assistant.alice')).toContainText('On')
+    const stored = await page.evaluate(() => JSON.parse(window.localStorage.getItem('buckyos.mock.control-panel.v1') ?? '{}'))
+    expect(stored.executor_devices[0].profiles.default).toEqual({ workdir_roots: ['/home/alice/work'], ops: ['open_stream', 'describe', 'read', 'stat', 'query', 'cancel'], baseline: 'standard' })
+    const runtimeId = `exec-${stored.executor_devices[0].executor_id}`
+    expect(stored.agents[0].settings.runtimes[runtimeId]).toEqual({ enabled: true, target: { kind: 'executor', executor_id: stored.executor_devices[0].executor_id } })
+
+    // The device is in use by the first Agent: the server refuses, the owner switches it over.
+    await device.getByRole('button', { name: 'Assign to Agent', exact: true }).click()
+    const assign = page.getByTestId('settings-runtime-assign')
+    await assign.getByLabel('Agent', { exact: true }).click()
+    await page.getByRole('option', { name: 'Coder' }).click()
+    await assign.getByTestId('settings-runtime-assign-ok').click()
+    await expect(assign).toContainText('This device is in use by BuckyOS Assistant')
+    await assign.getByTestId('settings-runtime-assign-switch').click()
+    await expect(assign).toHaveCount(0)
+    await expect(device.getByTestId('settings-runtime-assignment-assistant.alice')).toContainText('Off')
+    await expect(device.getByTestId('settings-runtime-assignment-coder.alice')).toContainText('On')
+
+    await device.getByRole('button', { name: 'Unassign from BuckyOS Assistant' }).click()
+    await page.getByTestId('settings-runtime-unassign-ok').click()
+    await expect(device.getByTestId('settings-runtime-assignment-assistant.alice')).toHaveCount(0)
+
+    await device.getByRole('button', { name: 'Revoke', exact: true }).click()
+    const remove = page.getByTestId('settings-runtime-remove')
+    await expect(remove).toContainText('It will be taken away from these Agents')
+    await expect(remove).toContainText('Coder · using it now')
+    await remove.getByTestId('settings-runtime-remove-ok').click()
+    await expect(device).toContainText('Access revoked')
+    await expect(device).toContainText('no Agent')
+    await expect(device.getByRole('button', { name: 'Assign to Agent', exact: true })).toHaveCount(0)
+    await device.getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.getByTestId('settings-runtime-remove')).toContainText('No Agent is assigned to it')
+    await page.getByTestId('settings-runtime-remove-ok').click()
+    await expect(devices).toContainText('No device has been added yet')
+
+    await host.getByRole('button', { name: 'Edit', exact: true }).click()
+    await edit.getByRole('switch').click()
+    await edit.getByRole('button', { name: 'Save', exact: true }).click()
+    await expect(host).toContainText('Closed')
+    await expect(host.getByRole('button', { name: 'Assign to Agent', exact: true })).toHaveCount(0)
+  })
+
+  test('cluster: devices with their hardware, certificates', async ({ page }) => {
     const win = await openSettings(page, 'Cluster Manager')
     const devices = win.getByTestId('settings-cluster-devices')
     await expect(devices.getByTestId('settings-device-ood1')).toContainText('This node')
@@ -211,26 +328,7 @@ test.describe('settings', () => {
     await expect(detail).toContainText('Ubuntu 24.04.1 LTS')
     await expect(detail).toContainText('32 GB')
 
-    await devices.getByTestId('settings-add-device').click()
-    const addDevice = page.getByRole('dialog', { name: 'Add device' })
-    await expect(addDevice.getByLabel('Device name')).toBeVisible()
-    await expect(addDevice.getByLabel('Allowed Agent')).toBeVisible()
-    await expect(addDevice.getByRole('button', { name: 'Generate URL' })).toBeDisabled()
-    await expect(addDevice).toContainText('Shell commands retain the current OS user')
-    await addDevice.getByLabel('Device name').fill('Agent laptop')
-    await addDevice.getByLabel('Allowed Agent').click()
-    await page.getByRole('option').first().click()
-    await addDevice.getByLabel('Allowed working directories').fill('/home/alice/work')
-    await addDevice.getByRole('button', { name: 'Generate URL' }).click()
-    const issued = page.getByRole('dialog', { name: 'Start your device' })
-    await expect(issued.getByLabel('Startup command')).toHaveValue(/start-buckyos-agent-daemon.sh/)
-    await issued.getByRole('button', { name: 'Close', exact: true }).click()
-    await expect(devices).toContainText('Agent laptop')
-    await expect(devices).toContainText('UI unsupported')
-    await devices.getByRole('button', { name: 'Revoke', exact: true }).click()
-    await expect(devices).toContainText('Access revoked')
-    await devices.getByRole('button', { name: 'Delete', exact: true }).click()
-    await expect(devices).not.toContainText('Agent laptop')
+    await expect(devices.getByTestId('settings-add-device')).toHaveCount(0)
 
     await expect(win.getByTestId('settings-cluster-certificates')).toContainText('*.alice.web3.buckyos.ai')
     await expect(win.getByTestId('settings-cluster-certificates')).toContainText('ACME')
@@ -278,7 +376,9 @@ test.describe('settings on a phone', () => {
     await page.getByRole('button', { name: 'Appearance' }).first().click()
 
     await expect(page.getByTestId('settings-wallpaper-preview-phone').locator('xpath=..')).toContainText('Phone · this screen')
-    await page.getByTestId('settings-wallpaper-file').setInputFiles(await landscapePicture(page))
+    await putZoneFile(page, '/home/Pictures/sunset.jpg', (await landscapePicture(page)).buffer, 'image/jpeg')
+    await page.getByTestId('settings-wallpaper-choose').tap()
+    await pickZone(selectDialog(page), '/home/Pictures/sunset.jpg', true)
     await expect(page.getByTestId('settings-wallpaper-status')).toContainText('1200 × 800')
     await page.getByTestId('settings-wallpaper-fit-panorama').click()
     await page.getByRole('button', { name: 'Minimize' }).tap()

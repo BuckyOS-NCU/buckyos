@@ -23,6 +23,7 @@ export const replica_list_annotations: (a: number, b: number, c: number, d: numb
 export const replica_mark: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const replica_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
 export const replica_next_to_send: (a: number, b: number) => void;
+export const replica_note_asset: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const replica_outline: (a: number, b: number) => void;
 export const replica_pending: (a: number, b: number) => void;
 export const replica_pending_richtext_updates: (a: number, b: number, c: number, d: number) => void;
@@ -40,7 +41,9 @@ export const richtext_diff: (a: number, b: number, c: number, d: number, e: numb
 export const richtext_schema: (a: number) => void;
 export const richtext_to_markdown: (a: number, b: number, c: number) => void;
 export const verify_object: (a: number, b: number, c: number, d: number, e: number) => void;
+export const view_sql: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
 export const wish_config_digest: (a: number, b: number, c: number) => void;
+export const wish_main_status: (a: number, b: number, c: number, d: number, e: number) => void;
 export const wish_needs_analysis: (a: number, b: number, c: number) => void;
 export const __wbindgen_export: (a: number) => void;
 export const __wbindgen_export2: () => number;

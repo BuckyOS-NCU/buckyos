@@ -2,13 +2,15 @@
 //!
 //! A data entity with a `source` attribute is read-only for Blocks and people: its content is written only by
 //! a *refresh* — a run (`source.refresh@1`) whose candidate is validated and then committed with origin `source`,
-//! one Source at a time (each refresh is its own atomic Commit). Publishing an entity grants the `public`
-//! subject read on it and registers a name; the link is the URL projection of the reference object (D21), and
-//! another Workspace inserts it as a `source{kind: workspace}`. Referrers register themselves (a weak record:
-//! it never blocks an unpublish; the consumer then reads `unavailable`).
+//! one Source at a time (each refresh is its own atomic Commit). Publishing an entity (an inner-path publication,
+//! 权限需求 R26) gives the publication's own subject (`@pub:<entity_id>`) `read` on it and registers a name; readers
+//! come through the publication routes only, never into the Workspace. The link is the URL projection of the
+//! reference object (D21), and another Workspace inserts it as a `source{kind: workspace}`. Referrers register
+//! themselves (a weak record: it never blocks an unpublish; the consumer then reads `unavailable`).
 
 use crate::docdb::db_err;
-use crate::workspace::{random_id, Caller, CommitOpts, Workspace, PUBLIC_SUBJECT};
+use crate::acl::{AuditItem, PUB_PREFIX};
+use crate::workspace::{random_id, Caller, CommitOpts, Workspace};
 use aiworkspace_core::access::Cap;
 use aiworkspace_core::canonical::{canonical_json, sha256_hex};
 use aiworkspace_core::id::check_idempotency_key;
@@ -27,6 +29,8 @@ pub const PUB_FORMAT: &str = "buckyos.ai-workspace/pub/1.0";
 /// Types that can carry a Source and be published.
 pub const SOURCED_TYPES: &[&str] = &[TYPE_TABLE, TYPE_RICHTEXT, TYPE_RECORD, TYPE_ASSET, TYPE_DIR];
 const RECORDS_PER_OP: usize = 1000;
+/// Referrer records one publication keeps (V3).
+const MAX_REFERRERS: i64 = 256;
 
 /// What a fetch produced for one entity.
 #[derive(Debug, Clone)]
@@ -46,18 +50,19 @@ pub fn pub_name(s: &str) -> String {
     ascii.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-").chars().take(64).collect()
 }
 
-fn public_reader() -> Caller {
-    Caller::service(PUBLIC_SUBJECT)
+/// The subject of the publication of `entity_id`.
+pub fn publication_subject(entity_id: &str) -> String {
+    format!("{PUB_PREFIX}{entity_id}")
 }
 
 impl Workspace {
     // ---- publishing (D26, T4-4)
 
-    /// `ws.publish { entity_id, name? }` (`manage`): the `public` subject may read the entity; the name (default:
-    /// the entity's own, slugified) becomes the last segment of the link. Publishing again under another name
-    /// keeps the old name as an alias, so old links keep resolving.
+    /// `ws.publish { entity_id, name? }` (`manage` on the entity): the publication's subject may read the entity; the
+    /// name (default: the entity's own, slugified) becomes the last segment of the link. Publishing again under another
+    /// name keeps the old name as an alias, so old links keep resolving. It does not open the Workspace to anyone.
     pub fn publish_entity(&mut self, caller: &Caller, entity_id: &str, name: Option<&str>) -> WsResult<Value> {
-        self.require_ws(caller, Cap::Manage)?;
+        self.require_on(caller, Some(entity_id), Cap::Manage)?;
         let now = self.now();
         let e = {
             let ctx = self.ctx(&now);
@@ -78,28 +83,61 @@ impl Workspace {
         if taken.as_deref().is_some_and(|t| t != entity_id) {
             return Err(WsError::sub(Code::InvalidOperation, "NAME_CONFLICT", format!("{name} already names another publication")));
         }
-        self.grant_with(caller, PUBLIC_SUBJECT, Some(entity_id), &["read".to_string()], None, None)?;
-        self.local.execute("UPDATE publications SET current = 0 WHERE entity_id = ?1", [entity_id]).map_err(db_err)?;
-        self.local
-            .execute("INSERT OR REPLACE INTO publications (name, entity_id, created_at, created_by, current) VALUES (?1, ?2, ?3, ?4, 1)", params![name, entity_id, now, caller.principal])
+        let subject = publication_subject(entity_id);
+        self.acl_txn(caller, |tx| {
+            tx.execute(
+                "INSERT OR REPLACE INTO acl_entries (subject, scope_entity_id, allow, deny, updated_by, updated_at) VALUES (?1, ?2, ?3, \
+                 COALESCE((SELECT deny FROM acl_entries WHERE subject = ?1 AND scope_entity_id = ?2), 0), ?4, ?5)",
+                params![subject, entity_id, Cap::Read as u16, caller.principal, now],
+            )
             .map_err(db_err)?;
+            tx.execute("UPDATE publications SET current = 0 WHERE entity_id = ?1", [entity_id]).map_err(db_err)?;
+            tx.execute("INSERT OR REPLACE INTO publications (name, entity_id, created_at, created_by, current) VALUES (?1, ?2, ?3, ?4, 1)", params![name, entity_id, now, caller.principal])
+                .map_err(db_err)?;
+            Ok(((), vec![AuditItem { action: "publish", target: json!({ "entity_id": entity_id, "subject": subject }), before: None, after: Some(json!({ "name": name })) }]))
+        })?;
         Ok(self.publication_json(&name, entity_id, &now, &caller.principal)?)
     }
 
-    /// `ws.unpublish { entity_id }` (`manage`): every name of the entity goes, and so does the public grant;
-    /// referrers keep their records and read `unavailable` from now on.
+    /// `ws.unpublish { entity_id }` (`manage` on the entity): every name of the entity goes, and so does the
+    /// publication's entry; referrers keep their records and read `unavailable` from now on.
     pub fn unpublish(&mut self, caller: &Caller, entity_id: &str) -> WsResult<Value> {
-        self.require_ws(caller, Cap::Manage)?;
-        let n = self.local.execute("DELETE FROM publications WHERE entity_id = ?1", [entity_id]).map_err(db_err)?;
-        self.local.execute("DELETE FROM grants WHERE subject = ?1 AND scope_entity_id = ?2", params![PUBLIC_SUBJECT, entity_id]).map_err(db_err)?;
+        let names: Vec<String> = {
+            let mut st = self.local.prepare("SELECT name FROM publications WHERE entity_id = ?1").map_err(db_err)?;
+            let rows = st.query_map([entity_id], |r| r.get(0)).map_err(db_err)?.collect::<rusqlite::Result<_>>().map_err(db_err)?;
+            rows
+        };
+        if names.is_empty() {
+            self.require_ws_any(caller)?;
+            return Ok(json!({ "ok": true, "entity_id": entity_id, "removed": 0 }));
+        }
+        // a deleted entity's publication can still be taken down by a Workspace manager
+        let now = self.now();
+        let live = self.ctx(&now).entity(entity_id)?.is_some_and(|e| e.alive());
+        self.require_on(caller, live.then_some(entity_id), Cap::Manage)?;
+        let subject = publication_subject(entity_id);
+        let (n, _) = self.acl_txn(caller, |tx| {
+            let n = tx.execute("DELETE FROM publications WHERE entity_id = ?1", [entity_id]).map_err(db_err)?;
+            tx.execute("DELETE FROM acl_entries WHERE subject = ?1", [&subject]).map_err(db_err)?;
+            tx.execute("DELETE FROM publication_versions WHERE entity_id = ?1", [entity_id]).map_err(db_err)?;
+            tx.execute("DELETE FROM publication_reads WHERE entity_id = ?1", [entity_id]).map_err(db_err)?;
+            Ok((n, vec![AuditItem { action: "unpublish", target: json!({ "entity_id": entity_id, "subject": subject }), before: Some(json!({ "names": names })), after: None }]))
+        })?;
         Ok(json!({ "ok": true, "entity_id": entity_id, "removed": n }))
     }
 
     fn publication_json(&self, name: &str, entity_id: &str, at: &str, by: &str) -> WsResult<Value> {
         let referrers: i64 = self.local.query_row("SELECT COUNT(*) FROM referrers WHERE entity_id = ?1", [entity_id], |r| r.get(0)).map_err(db_err)?;
-        Ok(json!({ "ok": true, "entity_id": entity_id, "name": name, "path": format!("/{}/{}", self.workspace_slug(), name),
+        let (reads, last): (i64, Option<String>) = self
+            .local
+            .query_row("SELECT reads, last_read_at FROM publication_reads WHERE entity_id = ?1", [entity_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or((0, None));
+        Ok(json!({ "ok": true, "entity_id": entity_id, "name": name, "path": format!("/{}/{}", self.workspace_slug(), name), "kind": "inner_path",
+                   "subject": publication_subject(entity_id),
                    "reference": { "workspace_id": self.workspace_id, "entity_id": entity_id, "mode": "live" },
-                   "published_at": at, "published_by": by, "referrers": referrers }))
+                   "published_at": at, "published_by": by, "referrers": referrers, "reads": reads, "last_read_at": last }))
     }
 
     /// The workspace's own segment of a link (D21): its title, slugified; the id is in the host. Empty, or one of
@@ -140,12 +178,20 @@ impl Workspace {
         self.local.query_row("SELECT name, entity_id FROM publications WHERE entity_id = ?1 AND current = 1", [name_or_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(db_err)
     }
 
-    /// The published content of a name (no session: the `public` subject reads it). `fixed` also names the
+    /// The published content of a name (no session: the publication's own subject reads it). `fixed` also names the
     /// entity's content object (D03 `{ content_root }`), the version a consumer can pin.
     pub fn public_content(&self, name_or_id: &str, fixed: bool, with_bytes: bool) -> WsResult<Value> {
         let (name, entity_id) = self.publication(name_or_id)?.ok_or_else(|| WsError::not_found("no such publication"))?;
-        let reader = public_reader();
-        let access = self.require_ws_any(&reader)?;
+        let reader = Caller::publication_reader(&entity_id);
+        let access = self.require_ws_any(&reader).map_err(|_| WsError::not_found("no such publication"))?;
+        // an inner-path publication's reads are counted here (权限需求 R26): what MyContent will be told
+        self.local
+            .execute(
+                "INSERT INTO publication_reads (entity_id, reads, last_read_at) VALUES (?1, 1, ?2) \
+                 ON CONFLICT (entity_id) DO UPDATE SET reads = reads + 1, last_read_at = excluded.last_read_at",
+                params![entity_id, self.now()],
+            )
+            .map_err(db_err)?;
         let now = self.now();
         let ctx = self.ctx(&now);
         let e = readable_entity(&ctx, &access, &entity_id)?;
@@ -190,15 +236,28 @@ impl Workspace {
             let mut members = std::collections::BTreeMap::new();
             self.objects.entity_members(&root, &e.type_id, &mut members)?;
             self.objects.retain(&self.bucket(crate::objects::EXPORTS)?, &format!("{}/fixed/{root}", self.workspace_id), &members)?;
+            // the versions this publication handed out are the only fixed versions it serves (S1)
+            self.local.execute("INSERT OR IGNORE INTO publication_versions (content_root, entity_id, created_at) VALUES (?1, ?2, ?3)", params![root, entity_id, self.now()]).map_err(db_err)?;
             v["content_root"] = json!(root);
             v["reference"] = json!({ "workspace_id": self.workspace_id, "entity_id": entity_id, "mode": "fixed", "version": { "content_root": root } });
         }
         Ok(v)
     }
 
-    /// The content a consumer pinned (`version.content_root`), read back from the named store: valid as long as
-    /// it is there (its `exports` binding keeps it seven days after the last fixed read).
-    pub fn public_fixed_content(&self, content_root: &str) -> WsResult<Value> {
+    /// The content a consumer pinned (`version.content_root`) of the publication `name_or_id`, read back from the named
+    /// store: only a version this publication handed out while it is published (S1, R26), and valid as long as it is
+    /// there (its `exports` binding keeps it seven days after the last fixed read). Anything else is not found.
+    pub fn public_fixed_content(&self, name_or_id: &str, content_root: &str) -> WsResult<Value> {
+        let (_, entity_id) = self.publication(name_or_id)?.ok_or_else(|| WsError::not_found("no such publication"))?;
+        let ours: bool = self
+            .local
+            .query_row("SELECT 1 FROM publication_versions WHERE content_root = ?1 AND entity_id = ?2", params![content_root, entity_id], |_| Ok(true))
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(false);
+        if !ours || self.require_ws_any(&Caller::publication_reader(&entity_id)).is_err() {
+            return Err(WsError::not_found("no such publication version"));
+        }
         if !self.objects.has_object(content_root) {
             return Err(WsError::new(Code::VersionNotRetained, "that fixed version is no longer retained"));
         }
@@ -217,8 +276,20 @@ impl Workspace {
     // ---- referrers (D26, T4-6)
 
     /// A consumer registered that it reads `entity_id` (same service: at insert; other Zones: over HTTP). Weak.
+    /// Unauthenticated over HTTP (V3): a record is small, names a Workspace id, and a publication keeps at most
+    /// `MAX_REFERRERS` of them (the oldest go) — a weak, bounded hint, never a grant.
     pub fn register_referrer(&self, entity_id: &str, referrer: &Value) -> WsResult<()> {
+        let text = referrer.to_string();
+        if text.len() > 2048 || !referrer["workspace_id"].as_str().is_some_and(aiworkspace_core::id::is_workspace_id) {
+            return Err(WsError::invalid_op("a referrer names its workspace_id (ws_…) in under 2 KiB"));
+        }
         let key = sha256_hex(canonical_json(referrer)?.as_bytes())[..32].to_string();
+        self.local
+            .execute(
+                "DELETE FROM referrers WHERE entity_id = ?1 AND referrer_key IN (SELECT referrer_key FROM referrers WHERE entity_id = ?1 ORDER BY registered_at DESC LIMIT -1 OFFSET ?2)",
+                params![entity_id, MAX_REFERRERS - 1],
+            )
+            .map_err(db_err)?;
         self.local
             .execute("INSERT OR REPLACE INTO referrers (entity_id, referrer_key, referrer_json, registered_at) VALUES (?1, ?2, ?3, ?4)", params![entity_id, key, referrer.to_string(), self.now()])
             .map_err(db_err)?;
@@ -255,17 +326,18 @@ impl Workspace {
         Ok((e, s))
     }
 
-    /// `proc.start { program: source.refresh@1, params: { entity_id } }`: a refresh run, `update` on the entity.
+    /// `proc.start { program: source.refresh@1, params: { entity_id } }`: a refresh run, `run` (or an editing right) on
+    /// the entity — triggering a sync is not the owner's alone (B4-1, §6 Q13).
     pub fn source_refresh_start(&mut self, caller: &Caller, entity_id: &str, idem_key: &str) -> WsResult<Value> {
         check_idempotency_key(idem_key)?;
         let access = self.require_ws_any(caller)?;
-        let (_, source) = self.source_of(entity_id)?;
+        let (e, source) = self.source_of(entity_id)?;
         if source["kind"] == json!("session") {
             return Err(WsError::invalid_op("a session feed is written by its session, not fetched"));
         }
         let now = self.now();
-        if !access.can(&self.ctx(&now), entity_id, Cap::Update)? {
-            return Err(WsError::denied("refreshing a Source needs update on its entity"));
+        if !access.entity_caps(&self.ctx(&now), &e)?.may_run() {
+            return Err(WsError::denied("refreshing a Source needs run on its entity"));
         }
         let params = json!({ "entity_id": entity_id, "source": source });
         let existing: Option<String> = self.local.query_row("SELECT run_id FROM runs WHERE principal = ?1 AND idem_key = ?2", params![caller.principal, idem_key], |r| r.get(0)).optional().map_err(db_err)?;
@@ -291,22 +363,119 @@ impl Workspace {
         self.run_json(run_id)
     }
 
+    /// `proc.get` of a refresh run: one's own, or any with `run` on the Workspace.
+    pub fn source_run_get(&self, caller: &Caller, run_id: &str) -> WsResult<Value> {
+        let mut run = self.visible_source_run(caller, run_id)?;
+        run["ok"] = json!(true);
+        Ok(run)
+    }
+
+    /// `proc.cancel` of a refresh run. A refresh that already committed says so truthfully.
+    pub fn source_run_cancel(&mut self, caller: &Caller, run_id: &str) -> WsResult<Value> {
+        let run = self.visible_source_run(caller, run_id)?;
+        if run["state"] == json!("succeeded") {
+            return Ok(json!({ "ok": true, "state": "succeeded", "already_applied": true, "commit_id": run["result"]["commit_id"] }));
+        }
+        self.set_run(run_id, "cancelled", None)?;
+        Ok(json!({ "ok": true, "state": "cancelled", "already_applied": false }))
+    }
+
+    /// A refresh run is seen by whoever may read its entity (B4-1).
+    fn visible_source_run(&self, caller: &Caller, run_id: &str) -> WsResult<Value> {
+        let access = self.require_ws_any(caller)?;
+        let run = self.run_json(run_id)?;
+        let now = self.now();
+        let readable = match self.ctx(&now).entity(run["params"]["entity_id"].as_str().unwrap_or(""))? {
+            Some(e) => access.can_read(&self.ctx(&now), &e)?,
+            None => false,
+        };
+        if run["program"] != json!(SOURCE_PROGRAM) || (run["principal"] != json!(caller.principal) && !readable) {
+            return Err(WsError::not_found("run not found"));
+        }
+        Ok(run)
+    }
+
+    /// The last refresh attempt of a sourced entity (`meta.data.attempt`, B0-2): `{ at, status: running | succeeded |
+    /// failed, error?, run_id }`. Local state of this deployment: it never travels with an export.
+    pub fn source_attempt(&self, entity_id: &str) -> WsResult<Option<Value>> {
+        let row: Option<(String, String, Option<String>, String)> = self
+            .local
+            .query_row(
+                "SELECT run_id, state, result_json, updated_at FROM runs WHERE program = ?1 AND json_extract(params_json, '$.entity_id') = ?2 ORDER BY created_at DESC, updated_at DESC LIMIT 1",
+                params![SOURCE_PROGRAM, entity_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(row.map(|(run_id, state, result, at)| {
+            let result: Value = result.and_then(|r| serde_json::from_str(&r).ok()).unwrap_or(Value::Null);
+            let status = match state.as_str() {
+                "succeeded" => "succeeded",
+                "failed" | "cancelled" => "failed",
+                _ => "running",
+            };
+            let mut v = json!({ "at": at, "status": status, "run_id": run_id });
+            match state.as_str() {
+                "cancelled" => v["error"] = json!({ "code": "RUN_CANCELLED", "detail": "the refresh was cancelled" }),
+                "failed" => v["error"] = result.get("error").cloned().or_else(|| result.get("errors").and_then(|e| e.get(0)).cloned()).unwrap_or(Value::Null),
+                _ => {}
+            }
+            if let Some(c) = result.get("schema_changes").filter(|c| c.as_array().is_some_and(|a| !a.is_empty())) {
+                v["schema_changes"] = c.clone();
+            }
+            v
+        }))
+    }
+
+    fn run_json(&self, run_id: &str) -> WsResult<Value> {
+        self.local
+            .query_row(
+                "SELECT run_id, program, principal, state, params_json, inputs_json, candidate_json, warnings_json, result_json, created_at, updated_at \
+                 FROM runs WHERE run_id = ?1",
+                [run_id],
+                |r| {
+                    let parse = |s: Option<String>| s.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+                    Ok(json!({ "run_id": r.get::<_, String>(0)?, "program": r.get::<_, String>(1)?, "principal": r.get::<_, String>(2)?,
+                               "state": r.get::<_, String>(3)?, "params": parse(r.get(4)?), "inputs": parse(r.get(5)?),
+                               "candidate": parse(r.get(6)?), "warnings": parse(r.get(7)?), "result": parse(r.get(8)?),
+                               "created_at": r.get::<_, String>(9)?, "updated_at": r.get::<_, String>(10)? }))
+                },
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or_else(|| WsError::not_found("run not found"))
+    }
+
+    fn set_run(&self, run_id: &str, state: &str, result: Option<&Value>) -> WsResult<()> {
+        self.local
+            .execute(
+                "UPDATE runs SET state = ?2, result_json = COALESCE(?3, result_json), updated_at = ?4 WHERE run_id = ?1",
+                params![run_id, state, result.map(Value::to_string), self.now()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     pub fn source_run_set(&self, run_id: &str, state: &str, result: Option<&Value>) -> WsResult<()> {
         self.set_run(run_id, state, result)
     }
 
     /// The fetched content becomes the entity's content in one Commit of origin `source` (D12): the diff
-    /// against the current content, written as the run's principal; on any failure nothing changes and the
-    /// run says why (§11.2: a failed refresh keeps the last valid version).
-    pub fn source_apply(&mut self, run_id: &str, fetched: &Fetched, bytes: u64, content_root: Option<&str>) -> WsResult<Value> {
+    /// against the current content and the new `data_version` (B0-2), written as the run's principal; on any failure
+    /// nothing changes and the run says why (§11.2: a failed refresh keeps the last valid version). `version` is what
+    /// the fetch knows of the data (`business_time`, `produced_at`, `program`, `truncated`); the same content and the
+    /// same version but for the time it was synced is no new version: nothing is written.
+    pub fn source_apply(&mut self, run_id: &str, fetched: &Fetched, bytes: u64, content_root: Option<&str>, version: &Value) -> WsResult<Value> {
         let run = self.run_json(run_id)?;
         if run["state"] != json!("queued") && run["state"] != json!("running") {
             return Err(WsError::invalid_op(format!("run is {}", run["state"].as_str().unwrap_or("?"))));
         }
         let principal = run["principal"].as_str().unwrap_or("").to_string();
         let entity_id = run["params"]["entity_id"].as_str().unwrap_or("").to_string();
-        let caller = Caller::user(&principal);
-        let ops = match self.source_ops(&caller, &entity_id, fetched) {
+        // the service writes a refresh in its own declared name for the owner (权限需求 R14, I3/I4): the trigger's
+        // `update` on the entity was judged when the refresh started; the Commit is recorded as the trigger
+        let caller = Caller::internal(&self.owner()?.unwrap_or_default());
+        let (mut ops, schema_changes) = match self.source_ops(&caller, &entity_id, fetched) {
             Ok(ops) => ops,
             Err(e) => {
                 self.set_run(run_id, "failed", Some(&json!({ "error": e.to_json() })))?;
@@ -314,12 +483,40 @@ impl Workspace {
             }
         };
         let now = self.now();
-        if ops.is_empty() {
+        let current = {
+            let ctx = self.ctx(&now);
+            ctx.entity(&entity_id)?.ok_or_else(|| WsError::not_found(format!("entity {entity_id} not found")))?
+        };
+        let mut data_version = Map::new();
+        for k in ["business_time", "produced_at", "program", "truncated"] {
+            if let Some(v) = version.get(k).filter(|v| !v.is_null()) {
+                data_version.insert(k.into(), v.clone());
+            }
+        }
+        if let Fetched::Table { records, .. } = fetched {
+            data_version.insert("records".into(), json!(records.len()));
+            data_version.entry("truncated").or_insert(json!(false));
+        }
+        if let Some(r) = content_root {
+            data_version.insert("content_root".into(), json!(r));
+        }
+        // when the program produced it is no new version: the same data, business time and program write nothing
+        let same_version = current.payload.get("data_version").and_then(Value::as_object).is_some_and(|old| {
+            let (mut old, mut new) = (old.clone(), data_version.clone());
+            for k in ["synced_at", "produced_at"] {
+                old.remove(k);
+                new.remove(k);
+            }
+            old == new
+        });
+        if ops.is_empty() && same_version {
             let result = json!({ "status": "unchanged", "bytes": bytes, "content_root": content_root, "at": now });
             self.set_run(run_id, "succeeded", Some(&result))?;
             local_set(&self.local, &format!("source_refreshed:{entity_id}"), &now)?;
             return self.run_json(run_id);
         }
+        data_version.insert("synced_at".into(), json!(now));
+        ops.push(json!({ "op": "entity.set_keys", "entity_id": entity_id, "keys": [{ "key": "data_version", "value": data_version, "expect": { "rev": current.key_rev("data_version") } }] }));
         let req = json!({ "protocol_version": PROTOCOL_VERSION, "workspace_id": self.workspace_id, "epoch": self.epoch, "idempotency_key": format!("source/{run_id}"),
                           "origin": "program", "run_id": run_id, "message": format!("refresh from source ({} bytes)", bytes), "operations": ops });
         let opts = CommitOpts { as_source: true, as_principal: Some(principal), ..CommitOpts::default() };
@@ -327,6 +524,10 @@ impl Workspace {
         result["bytes"] = json!(bytes);
         if let Some(r) = content_root {
             result["content_root"] = json!(r);
+        }
+        // fields the refresh deleted or retyped (B3-4): published, and every wish that reads them goes back to coding
+        if !schema_changes.is_empty() {
+            result["schema_changes"] = json!(schema_changes);
         }
         let accepted = result["status"] == json!("accepted");
         self.set_run(run_id, if accepted { "succeeded" } else { "failed" }, Some(&result))?;
@@ -340,16 +541,21 @@ impl Workspace {
         self.set_run(run_id, "failed", Some(&json!({ "error": error.to_json() })))
     }
 
-    /// Operations that turn the current content into `fetched`.
-    pub(crate) fn source_ops(&mut self, caller: &Caller, entity_id: &str, fetched: &Fetched) -> WsResult<Vec<Value>> {
+    /// Operations that turn the current content into `fetched`, and the fields they delete or retype.
+    pub(crate) fn source_ops(&mut self, caller: &Caller, entity_id: &str, fetched: &Fetched) -> WsResult<(Vec<Value>, Vec<Value>)> {
         let now = self.now();
-        let (e, fields, records, ast) = {
+        let (e, fields, records, ast, mut last_number) = {
             let ctx = self.ctx(&now);
             let e = ctx.entity(entity_id)?.filter(|e| e.alive()).ok_or_else(|| WsError::not_found(format!("entity {entity_id} not found")))?;
             let fields: Vec<FieldRow> = if e.type_id == TYPE_TABLE { ctx.fields(entity_id)?.into_iter().filter(|f| f.alive()).collect() } else { Vec::new() };
             let mut records: BTreeMap<String, RecordRow> = BTreeMap::new();
+            let mut last_number = 0u64;
             if e.type_id == TYPE_TABLE {
                 ctx.scan_records(entity_id, &mut |r| {
+                    // an auto-increment id is never given twice, a deleted record's included
+                    if let Ok(n) = r.record_id.parse::<u64>() {
+                        last_number = last_number.max(n);
+                    }
                     if r.alive() {
                         records.insert(r.record_id.clone(), r.clone());
                     }
@@ -357,9 +563,10 @@ impl Workspace {
                 })?;
             }
             let ast = if e.type_id == TYPE_RICHTEXT { ctx.richtext(entity_id)? } else { None };
-            (e, fields, records, ast)
+            (e, fields, records, ast, last_number)
         };
         let mut ops = Vec::new();
+        let mut schema_changes = Vec::new();
         match (e.type_id.as_str(), fetched) {
             (TYPE_TABLE, Fetched::Table { fields: new_fields, records: new_records }) => {
                 let current: BTreeMap<String, &FieldRow> = fields.iter().map(|f| (f.field_id.clone(), f)).collect();
@@ -371,7 +578,13 @@ impl Workspace {
                 for (id, f) in &current {
                     match wanted.get(id) {
                         Some(def) if def.ty == f.def.ty => {}
-                        _ => ops.push(json!({ "op": "table.delete_field", "source_id": entity_id, "field_id": id, "expect": { "rev": f.def_rev } })),
+                        other => {
+                            schema_changes.push(match other {
+                                Some(def) => json!({ "field_id": id, "change": "type_changed", "from": f.def.ty.as_str(), "to": def.ty.as_str() }),
+                                None => json!({ "field_id": id, "change": "deleted", "from": f.def.ty.as_str() }),
+                            });
+                            ops.push(json!({ "op": "table.delete_field", "source_id": entity_id, "field_id": id, "expect": { "rev": f.def_rev } }));
+                        }
                     }
                 }
                 for (id, def) in &wanted {
@@ -381,10 +594,31 @@ impl Workspace {
                 }
                 let mut seen = std::collections::BTreeSet::new();
                 let (mut inserts, mut sets, mut unsets) = (Vec::new(), Vec::new(), Vec::new());
+                // rows without a key keep the id of a current record with the same values, else take the next number
+                let content = |vals: &mut dyn Iterator<Item = (&String, &Value)>| -> String {
+                    let sorted: BTreeMap<&String, &Value> = vals.filter(|(k, v)| wanted.contains_key(*k) && !v.is_null()).collect();
+                    serde_json::to_string(&sorted).unwrap_or_default()
+                };
+                let mut same_values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                if new_records.iter().any(|r| r["record_id"].as_str().is_none()) {
+                    for (id, r) in records.iter().rev() {
+                        same_values.entry(content(&mut r.values.iter())).or_default().push(id.clone());
+                    }
+                }
                 for r in new_records {
-                    let rid = r["record_id"].as_str().ok_or_else(|| WsError::invalid_schema("record_id required"))?.to_string();
                     let values = r["values"].as_object().cloned().unwrap_or_default();
-                    let values: Map<String, Value> = values.into_iter().filter(|(k, _)| wanted.contains_key(k)).collect();
+                    // a parsed 1.0 is the stored 1: compared as stored, or every refresh rewrites the row
+                    let values: Map<String, Value> = values.into_iter().filter(|(k, _)| wanted.contains_key(k)).map(|(k, v)| (k, stored_number(v))).collect();
+                    let rid = match r["record_id"].as_str() {
+                        Some(id) => id.to_string(),
+                        None => match same_values.get_mut(&content(&mut values.iter())).and_then(Vec::pop) {
+                            Some(id) => id,
+                            None => {
+                                last_number += 1;
+                                last_number.to_string()
+                            }
+                        },
+                    };
                     seen.insert(rid.clone());
                     match records.get(&rid) {
                         None => inserts.push(json!({ "record_id": rid, "values": values })),
@@ -465,7 +699,7 @@ impl Workspace {
             }
             (t, _) => return Err(WsError::invalid_op(format!("fetched content does not fit a {t}"))),
         }
-        Ok(ops)
+        Ok((ops, schema_changes))
     }
 
     /// Sourced entities whose `refresh.interval_s` elapsed since their last successful refresh (the timer's list).
@@ -508,12 +742,17 @@ impl Workspace {
 
 impl Workspace {
     /// The Surface a link names (D21 `/<workspace_name>/<surface_name>`): by name, else by title.
+    /// Only a Surface anyone may read is named here (the page route has no session; 权限需求 V2): anything else is left to
+    /// the page, which resolves it once signed in.
     pub fn surface_by_name(&self, name: &str) -> WsResult<Option<String>> {
+        let anyone = self.access(&Caller::anonymous())?;
         let now = self.now();
         let ctx = self.ctx(&now);
         let wanted = pub_name(name);
-        for edge in ctx.children(SURFACES_ID)? {
-            let Some(e) = ctx.entity(&edge.child_id)?.filter(|e| e.alive()) else { continue };
+        for e in aiworkspace_core::plan::canvas_surfaces(&ctx)? {
+            if !anyone.can_read(&ctx, &e)? {
+                continue;
+            }
             let title = e.payload.get("title").and_then(Value::as_str).unwrap_or("");
             if e.name.as_deref() == Some(name) || e.entity_id == name || pub_name(title) == wanted || pub_name(e.name.as_deref().unwrap_or("")) == wanted {
                 return Ok(Some(e.entity_id));
@@ -533,6 +772,14 @@ fn local_set(conn: &rusqlite::Connection, key: &str, value: &str) -> WsResult<()
 }
 
 /// `source_refreshed:<id>` is a `format_utc_ms` timestamp.
+/// A whole number parsed as a float is the integer the store keeps.
+fn stored_number(v: Value) -> Value {
+    match v.as_f64() {
+        Some(f) if v.is_f64() && f.fract() == 0.0 && f.abs() < 9.0e15 => json!(f as i64),
+        _ => v,
+    }
+}
+
 pub fn refreshed_at(ws: &Workspace, entity_id: &str) -> WsResult<Option<String>> {
     local_get(&ws.local, &format!("source_refreshed:{entity_id}"))
 }

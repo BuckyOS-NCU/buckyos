@@ -24,12 +24,12 @@ async function showWorkspace(api: Api, title: string, grants: { subject: string;
     const result = await api.commit(ALICE, ws, commit.operations, `presentation/${index + 1}`)
     expect(result.status, JSON.stringify(result)).toBe('accepted')
   }
-  for (const g of grants) expect((await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, ...g })).ok).toBe(true)
+  for (const g of grants) expect((await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: g.subject, allow: g.capabilities }] })).ok).toBe(true)
   return ws
 }
 
 async function startShow(page: Page, stepTitle?: string) {
-  await mainMenu(page, 'aiws-top-play')
+  await mainMenu(page, 'aiws-menu-collab', 'aiws-top-play')
   await expect(page.getByTestId('aiws-start-show')).toBeVisible()
   if (stepTitle) await page.getByTestId('aiws-start-step').selectOption({ label: stepTitle })
   await page.getByTestId('aiws-start-show-go').click()
@@ -146,9 +146,10 @@ test('P3-01b the editor builds a path from the UI: new path, Frames, the current
   await openCanvas(page, ALICE, ws.workspace_id)
   await setCanvasMode(page, 'presentation_edit')
   await page.getByTestId('aiws-path-new').click()
+  // the existing path stays selected until the new one is created and chosen
+  await expect(page.getByTestId('aiws-path-select')).not.toHaveValue('path-intro')
   await expect(page.getByTestId('aiws-path-select')).toHaveValue(/.+/)
   const pathId = await page.getByTestId('aiws-path-select').inputValue()
-  expect(pathId).not.toBe('path-intro')
   await page.getByTestId('aiws-path-add-frame').selectOption('frame2')
   await page.getByTestId('aiws-path-add-frame').selectOption('frame1')
   await page.getByTestId('aiws-path-add-view').click()
@@ -226,7 +227,7 @@ test('P3-04 Viewport to Viewport: far apart it zooms out first, close by it does
       { id: 'a', target: { kind: 'viewport', entity_id: 'viewport1' } }, { id: 'b', target: { kind: 'viewport', entity_id: 'v-near' } }, { id: 'c', target: { kind: 'viewport', entity_id: 'v-far' } }] } },
   ])
   await openCanvas(page, ALICE, ws.workspace_id)
-  await mainMenu(page, 'aiws-top-play')
+  await mainMenu(page, 'aiws-menu-collab', 'aiws-top-play')
   await page.getByTestId('aiws-start-path').selectOption({ label: '飞行' })
   await page.getByTestId('aiws-start-show-go').click()
   await onStep(page, 'a')
@@ -334,7 +335,7 @@ test('P3-08 deleted targets become dangling steps: listed, skipped by the show, 
   await expect(page.getByTestId('aiws-path-step-s4')).toHaveAttribute('data-problem', 'missing')
   await expect(page.getByTestId('aiws-path-step-s5')).toHaveAttribute('data-problem', 'missing')
   await expect(page.getByTestId('aiws-path-editor')).toContainText('2 个失效项')
-  await mainMenu(page, 'aiws-top-play')
+  await mainMenu(page, 'aiws-menu-collab', 'aiws-top-play')
   await expect(page.getByTestId('aiws-start-summary')).toContainText('3 步')
   await page.getByTestId('aiws-start-show-go').click()
   await expect(page.getByTestId('aiws-show')).toHaveAttribute('data-count', '3')
@@ -392,7 +393,7 @@ test('P3-10 a share export leaves the speaker notes out; captions and paths trav
   await api.rpc(ALICE, 'ws.set_user_state', { workspace_id: ws.workspace_id, entries: { 'guide:path-guide': { index: 2, done: false } } })
   // the dialog: a share package defaults to no notes, a personal backup to notes
   await openCanvas(page, ALICE, ws.workspace_id)
-  await mainMenu(page, 'aiws-menu-export-menu', 'aiws-menu-export')
+  await mainMenu(page, 'aiws-menu-workspace', 'aiws-menu-export')
   await expect(page.getByTestId('aiws-export-notes')).not.toBeChecked()
   await page.getByTestId('aiws-export-dialog').getByLabel('导出方式').selectOption('personal_backup')
   await expect(page.getByTestId('aiws-export-notes')).toBeChecked()
@@ -416,7 +417,8 @@ test('P3-11 the guide: the rest is dimmed and inert, it ends where it is, resume
   const ws = await showWorkspace(api, `p3-11 ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
   await expect(page.getByTestId('aiws-notice').filter({ hasText: '使用引导「首次使用」' })).toBeVisible()
-  await page.getByTestId('aiws-guide-start').click()
+  await page.getByTestId('aiws-collab-play').click()
+  await page.getByTestId('aiws-play-guide-path-guide').click()
   await expect(page.getByTestId('aiws-guide')).toHaveAttribute('data-step', 'g1')
   await expect(page.getByTestId('aiws-guide-caption')).toHaveText('欢迎：这是演示的第一页。')
   // everything but the step is dimmed; the step (a 16:9 Frame) is fitted into the canvas
@@ -446,7 +448,8 @@ test('P3-11 the guide: the rest is dimmed and inert, it ends where it is, resume
   await expect(page.getByTestId('aiws-guide')).toHaveCount(0)
   await expect.poll(async () => (await api.rpc(ALICE, 'ws.get_user_state', { workspace_id: ws.workspace_id })).entries['guide:path-guide']?.index).toBe(1)
   // it resumes where it ended
-  await page.getByTestId('aiws-guide-start').click()
+  await page.getByTestId('aiws-collab-play').click()
+  await page.getByTestId('aiws-play-guide-path-guide').click()
   await expect(page.getByTestId('aiws-guide')).toHaveAttribute('data-step', 'g2')
   await page.getByTestId('aiws-guide-next').click()
   await expect(page.getByTestId('aiws-guide-count')).toHaveText('3 / 3')
@@ -483,7 +486,8 @@ test('P3-12 the show lock: other writes are refused and name the presenter; a cr
   // the stage crashes (the tab goes away without ending the show): the lease runs out, the clone goes
   await page.close()
   await expect.poll(async () => (await api.rpc(BOB, 'ws.get_info', { workspace_id: ws.workspace_id })).show_lock, { timeout: 20_000 }).toBeNull()
-  if (show.start.clone_workspace_id) expect((await api.rpc(ALICE, 'ws.get_info', { workspace_id: show.start.clone_workspace_id })).error?.code).toBe('NOT_FOUND')
+  // the lock reads as gone once its time is up; the sweeper deletes the clone on its next tick
+  if (show.start.clone_workspace_id) await expect.poll(async () => (await api.rpc(ALICE, 'ws.get_info', { workspace_id: show.start.clone_workspace_id })).error?.code, { timeout: 15_000 }).toBe('NOT_FOUND')
   await expect(bobPage.getByTestId('aiws-show-locked')).toHaveCount(0, { timeout: 40_000 })
   // bob presents; alice (the owner) ends it from her window's alert
   const bobShow = await api.rpc(BOB, 'show.start', { workspace_id: ws.workspace_id, path_id: 'path-intro', live: false })
@@ -662,7 +666,7 @@ test('P3 dark theme: the path editor, the start dialog, the stage controls, the 
   await page.getByTestId('aiws-path-step-s1').click()
   await expect(page.getByTestId('aiws-step-props')).toBeVisible()
   await shot(page, 'dark-editor')
-  await mainMenu(page, 'aiws-top-play')
+  await mainMenu(page, 'aiws-menu-collab', 'aiws-top-play')
   await expect(page.getByTestId('aiws-start-show')).toBeVisible()
   await shot(page, 'dark-start')
   await page.getByTestId('aiws-start-show-go').click()
@@ -684,7 +688,8 @@ test('P3 dark theme: the path editor, the start dialog, the stage controls, the 
   await phone.close()
   await page.getByTestId('aiws-show-exit').click()
   await setCanvasMode(page, 'view')
-  await page.getByTestId('aiws-guide-start').click()
+  await page.getByTestId('aiws-collab-play').click()
+  await page.getByTestId('aiws-play-guide-path-guide').click()
   await expect(page.getByTestId('aiws-guide')).toBeVisible()
   await shot(page, 'dark-guide')
 })

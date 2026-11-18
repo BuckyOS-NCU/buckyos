@@ -5,7 +5,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import FocusTrap from '@mui/material/Unstable_TrapFocus'
-import { ArrowDownToLine, Check, Database, FileUp, FlaskConical, FolderUp, Frame, Grid2X2, Image, Info, Layers3, LetterText, MousePointer2, Plus, Puzzle, Search, Shapes, Sparkles, Spline, StickyNote, Table, Type, X, Network, type LucideIcon } from 'lucide-react'
+import { ArrowDownToLine, Check, Database, FileUp, FlaskConical, FolderUp, Grid2X2, Info, Layers3, MousePointer2, Plus, Puzzle, Search, Shapes, Sparkles, Type, X, type LucideIcon } from 'lucide-react'
 import type { BlockDefPayload, EntityEnvelope, Json } from '../../api/types'
 import type { ReadOk } from '../../api/session'
 import { useLoad, useOutlineVersion, useStore, useUserState } from '../../state/hooks'
@@ -16,15 +16,15 @@ import { useOverlayMounted } from '../shell/popover'
 import { ShapePicker } from '../blocks/shapeBlock'
 import { svgShapeFromDocument } from '@drawio/svg'
 import type { ShapeKind } from '@drawio/shapes'
-import { allEntries, dataFor, entryId, entrySize, type CatalogEntry, type InsertRequest } from './catalog'
+import { allEntries, dataFor, ENTRY_ICONS, entryId, entrySize, type CatalogEntry, type InsertRequest } from './catalog'
 import { InstanceForm } from '../extensions/InstanceForm'
-import { configProblems, missingBindings } from '../extensions/controls'
+import { configProblems } from '../extensions/controls'
 import { useShell } from '../shell/shellContext'
+import { useFilePicker } from '../shell/filePicker'
 
 export type CatalogTab = 'all' | CatalogGroup | 'existing'
 const TABS: CatalogTab[] = ['all', 'text', 'data', 'layout', 'ai', 'sample', 'extension', 'existing']
 const TAB_ICONS: Record<CatalogTab, LucideIcon> = { all: Grid2X2, text: Type, data: Database, layout: Shapes, ai: Sparkles, sample: FlaskConical, extension: Puzzle, existing: Layers3 }
-const ENTRY_ICONS: Record<string, LucideIcon> = { richtext: Type, 'shape-text': LetterText, note: StickyNote, shape: Shapes, connector: Spline, frame: Frame, mindmap: Network, table: Table, asset: Image, wish: Sparkles }
 
 function EntryIcon({ entry }: { entry: CatalogEntry }) {
   const Icon = ENTRY_ICONS[entryId(entry)] ?? TAB_ICONS[entry.group]
@@ -60,8 +60,11 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
     && (!q || entry.title.toLowerCase().includes(q) || entry.catalog.description.toLowerCase().includes(q) || entry.definition.type.toLowerCase().includes(q)))
   const chosen = shown.find((entry) => entry.key === chosenKey) ?? shown[0]
   const dialogRef = useRef<HTMLDivElement>(null)
-  const filesRef = useRef<HTMLInputElement>(null)
-  const folderRef = useRef<HTMLInputElement>(null)
+  const pickFile = useFilePicker((message) => store.notify('error', message))
+  // the system file picker is drawn outside this dialog (over the window, or framed over the page): the focus trap
+  // lets it have the focus while it is open
+  const [picking, setPicking] = useState(0)
+  const whilePicking = useCallback(<T,>(pending: Promise<T>): Promise<T> => { setPicking((n) => n + 1); return pending.finally(() => setPicking((n) => n - 1)) }, [])
   const importController = useRef<AbortController | null>(null)
   const [importing, setImporting] = useState(false)
   useEffect(() => () => importController.current?.abort(), [])
@@ -75,7 +78,7 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
   }
   return (
     <div className="aiws-modal-backdrop aiws-catalog-backdrop" onPointerDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <FocusTrap open>
+      <FocusTrap open disableEnforceFocus={picking > 0}>
         <div ref={dialogRef} tabIndex={-1} className="aiws-dialog aiws-catalog" role="dialog" aria-modal="true" aria-label={t('aiworkspace.canvas.catalog.title')} data-testid="aiws-catalog"
           onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); onClose() } }}>
           <div className="aiws-catalog-head">
@@ -94,12 +97,8 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
             {(onImport || onImportAssets) && <div className="aiws-catalog-imports" aria-busy={importing}>
               {onImport && <button type="button" data-testid="aiws-catalog-import-drawio" disabled={importing} onClick={onImport}><ArrowDownToLine size={16} aria-hidden="true" />{t('aiworkspace.canvas.catalog.importDrawio')}</button>}
               {onImportAssets && <>
-                <button type="button" disabled={importing} onClick={() => filesRef.current?.click()}><FileUp size={16} aria-hidden="true" />{t('aiworkspace.data.tree.importFiles')}</button>
-                <input ref={filesRef} type="file" hidden multiple disabled={importing} data-testid="aiws-catalog-import-files" onChange={(event) => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void importAssets(files, false) }} />
-                {'webkitdirectory' in document.createElement('input') && <>
-                  <button type="button" disabled={importing} onClick={() => folderRef.current?.click()}><FolderUp size={16} aria-hidden="true" />{t('aiworkspace.data.tree.importFolder')}</button>
-                  <input ref={folderRef} type="file" hidden multiple disabled={importing} {...{ webkitdirectory: '' }} data-testid="aiws-catalog-import-folder" onChange={(event) => { const files = Array.from(event.target.files ?? []); event.target.value = ''; if (files.length) void importAssets(files, true) }} />
-                </>}
+                <button type="button" disabled={importing} data-testid="aiws-catalog-pick-files" onClick={() => { void whilePicking(pickFile.files({ multiple: true })).then((files) => { if (files?.length) void importAssets(files, false) }) }}><FileUp size={16} aria-hidden="true" />{t('aiworkspace.data.tree.importFiles')}</button>
+                <button type="button" disabled={importing} data-testid="aiws-catalog-pick-folder" onClick={() => { void whilePicking(pickFile.files({ folder: true })).then((files) => { if (files?.length) void importAssets(files, true) }) }}><FolderUp size={16} aria-hidden="true" />{t('aiworkspace.data.tree.importFolder')}</button>
                 {importing && <button type="button" onClick={() => importController.current?.abort()}>{t('aiworkspace.common.cancel')}</button>}
               </>}
             </div>}
@@ -132,7 +131,7 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
                     ))}
                   </ul>
                 </div>
-                {chosen ? <EntryDetail key={chosen.key} entry={chosen} canPlace={canPlace} onInsert={onInsert} onImportTable={onImportTable} /> : <div className="aiws-catalog-detail aiws-catalog-empty"><MousePointer2 size={28} aria-hidden="true" /><span>{t('aiworkspace.canvas.catalog.chooseEntry')}</span></div>}
+                {chosen ? <EntryDetail key={chosen.key} entry={chosen} canPlace={canPlace} onInsert={onInsert} onImportTable={onImportTable} whilePicking={whilePicking} /> : <div className="aiws-catalog-detail aiws-catalog-empty"><MousePointer2 size={28} aria-hidden="true" /><span>{t('aiworkspace.canvas.catalog.chooseEntry')}</span></div>}
               </>
             )}
           </div>
@@ -143,7 +142,7 @@ export function InsertCatalog({ initialTab = 'all', initialKey, canPlace, onClos
   )
 }
 
-function EntryDetail({ entry, canPlace, onInsert, onImportTable }: { entry: CatalogEntry; canPlace: boolean; onInsert: (request: InsertRequest, how: 'center' | 'place') => void; onImportTable?: () => void }) {
+function EntryDetail({ entry, canPlace, onInsert, onImportTable, whilePicking }: { entry: CatalogEntry; canPlace: boolean; onInsert: (request: InsertRequest, how: 'center' | 'place') => void; onImportTable?: () => void; whilePicking: <T>(pending: Promise<T>) => Promise<T> }) {
   const store = useStore()
   const { t, list } = useAiwsText()
   const [title, setTitle] = useState('')
@@ -152,6 +151,7 @@ function EntryDetail({ entry, canPlace, onInsert, onImportTable }: { entry: Cata
   const [kind, setKind] = useState<ShapeKind>('rect')
   const [choices, setChoices] = useState<Record<string, string>>({})
   const [svgText, setSvgText] = useState('')
+  const pickFile = useFilePicker((message) => store.notify('error', message))
   const svg = entryId(entry) === 'shape-svg' && svgText.trim() ? svgShapeFromDocument(svgText) : null
   const pinned = useUserState<string[]>('ui:pinned-defs') ?? []
   const defId = entry.defEntity?.entity_id ?? ''
@@ -161,7 +161,6 @@ function EntryDetail({ entry, canPlace, onInsert, onImportTable }: { entry: Cata
   const [instanceConfig, setInstanceConfig] = useState<Record<string, Json>>({})
   const [instanceBindings, setInstanceBindings] = useState<Record<string, string>>({})
   const configIssues = entry.defEntity ? configProblems(def, instanceConfig) : []
-  const unbound = entry.defEntity ? missingBindings(def, instanceBindings) : []
   const accepts = entry.defEntity ? (def?.accepts ?? entry.definition.accepts) : entry.definition.accepts
   // a composite shows no data of its own: its Blocks do (扩展控件 P1)
   const needsData = entry.catalog.needs === 'data' || (entry.defEntity !== undefined && def !== undefined && def.kind !== 'composite' && def.allow_no_source !== true)
@@ -169,7 +168,7 @@ function EntryDetail({ entry, canPlace, onInsert, onImportTable }: { entry: Cata
   const data = needsData || optionalData ? dataFor(store, accepts) : []
   const needsFile = entry.catalog.needs === 'file'
   const ready = (!needsData || sourceId !== '') && (!needsFile || file !== null) && (!entry.defEntity || def !== undefined) && (entryId(entry) !== 'shape-svg' || (svg !== null && svg.svg.body.length <= 48 * 1024))
-    && configIssues.length === 0 && unbound.length === 0
+    && configIssues.length === 0
   const svgSize = svg ? (() => { const k = Math.min(1, 320 / Math.max(svg.w, svg.h, 1)); return { w: Math.max(24, Math.round(svg.w * k)), h: Math.max(24, Math.round(svg.h * k)) } })() : null
   const request = (): InsertRequest => svg && svgSize ? ({ entry: { ...entry, size: svgSize }, title: title.trim() || undefined, config: { shape: 'svg', svg: svg.svg as unknown as Json, fill: svg.fill, stroke: svg.stroke ?? 'none', stroke_width: 1 } }) : ({
     entry, title: title.trim() || undefined, sourceId: sourceId || undefined, file: file ?? undefined,
@@ -177,7 +176,7 @@ function EntryDetail({ entry, canPlace, onInsert, onImportTable }: { entry: Cata
     bindings: entry.defEntity && Object.keys(instanceBindings).length > 0 ? instanceBindings : undefined,
   })
   const missing = needsData && sourceId === '' ? t('aiworkspace.canvas.catalog.missingData') : needsFile && !file ? t('aiworkspace.canvas.catalog.missingFile')
-    : unbound.length > 0 ? t('aiworkspace.ext.form.missingBindings', { names: list(unbound) }) : configIssues.length > 0 ? t('aiworkspace.ext.form.invalidConfig', { issues: list(configIssues) }) : null
+    : configIssues.length > 0 ? t('aiworkspace.ext.form.invalidConfig', { issues: list(configIssues) }) : null
   return (
     <div className="aiws-catalog-detail" data-testid="aiws-catalog-detail" data-entry={entry.key}>
       <div className="aiws-catalog-detail-content">
@@ -193,7 +192,7 @@ function EntryDetail({ entry, canPlace, onInsert, onImportTable }: { entry: Cata
         {entryId(entry) === 'shape-svg' && (
           <>
             <label className="aiws-field">{t('aiworkspace.canvas.catalog.svgCode')}<textarea rows={5} value={svgText} placeholder="<svg …>…</svg>" data-testid="aiws-catalog-svg-text" onChange={(e) => setSvgText(e.target.value)} /></label>
-            <label className="aiws-field">{t('aiworkspace.canvas.catalog.svgFile')}<input type="file" accept=".svg,image/svg+xml" data-testid="aiws-catalog-svg-file" onChange={(e) => { const f = e.target.files?.[0]; if (f) void f.text().then(setSvgText) }} /></label>
+            <button type="button" className="aiws-link" data-testid="aiws-catalog-svg-file" onClick={() => { void whilePicking(pickFile.file('.svg,image/svg+xml')).then((f) => { if (f) void f.text().then(setSvgText) }) }}>{t('aiworkspace.canvas.catalog.svgFile')}</button>
             {svgText.trim() && !svg && <div className="aiws-warning">{t('aiworkspace.canvas.catalog.svgInvalid')}</div>}
             {svg && svg.svg.body.length > 48 * 1024 && <div className="aiws-warning">{t('aiworkspace.canvas.catalog.svgTooLarge')}</div>}
           </>
@@ -219,7 +218,12 @@ function EntryDetail({ entry, canPlace, onInsert, onImportTable }: { entry: Cata
         )}
         {entry.defEntity && def && <InstanceForm def={def} config={instanceConfig} bindings={instanceBindings} onConfig={setInstanceConfig} onBindings={setInstanceBindings} />}
         {needsFile && (
-          <label className="aiws-field">{t('aiworkspace.canvas.catalog.file')}<input type="file" aria-label={t('aiworkspace.canvas.catalog.chooseFile')} data-testid="aiws-catalog-file" onChange={(event) => setFile(event.target.files?.[0] ?? null)} /></label>
+          <div className="aiws-field" role="group" aria-label={t('aiworkspace.canvas.catalog.file')}>{t('aiworkspace.canvas.catalog.file')}
+            <span className="aiws-file-choice">
+              <button type="button" data-testid="aiws-catalog-file" onClick={() => { void whilePicking(pickFile.file()).then((f) => { if (f) setFile(f) }) }}>{t('aiworkspace.canvas.catalog.chooseFile')}</button>
+              <span className="aiws-muted" data-testid="aiws-catalog-file-name">{file?.name ?? t('aiworkspace.canvas.catalog.noFile')}</span>
+            </span>
+          </div>
         )}
         {missing && <div className="aiws-muted" data-testid="aiws-catalog-missing">{missing}</div>}
       </div>

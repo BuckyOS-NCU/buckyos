@@ -52,6 +52,44 @@ impl Env {
     }
 }
 
+/// The old grant shape on the permission model (权限需求 §4): a principal gets an entry of its own; `public` turns
+/// anonymous access on and allows `@guest`; `*`, `group:<id>` and `contact:…` become members of a logical group
+/// that holds the entry.
+pub trait Grants {
+    fn grant(&mut self, by: &Caller, subject: &str, scope: Option<&str>, caps: &[String]) -> aiworkspace_core::WsResult<Value>;
+    fn revoke(&mut self, by: &Caller, subject: &str, scope: Option<&str>) -> aiworkspace_core::WsResult<Value>;
+}
+
+fn grant_subject(ws: &mut Workspace, by: &Caller, subject: &str) -> aiworkspace_core::WsResult<String> {
+    if subject == "public" {
+        ws.acl_set_anonymous(by, true)?;
+        return Ok("@guest".into());
+    }
+    if subject == "*" || subject.starts_with("group:") || subject.starts_with("contact:") {
+        let id: String = format!("g-{}", subject.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect::<String>());
+        let id: String = id.chars().take(64).collect();
+        ws.acl_set_group(by, &id, None, None)?;
+        ws.acl_members(by, &id, &[subject.to_string()], &[])?;
+        return Ok(format!("@{id}"));
+    }
+    Ok(subject.to_string())
+}
+
+impl Grants for Workspace {
+    fn grant(&mut self, by: &Caller, subject: &str, scope: Option<&str>, caps: &[String]) -> aiworkspace_core::WsResult<Value> {
+        let subject = grant_subject(self, by, subject)?;
+        self.acl_set(by, &json!([{ "subject": subject, "resource": scope.unwrap_or("/"), "allow": caps }]))
+    }
+    fn revoke(&mut self, by: &Caller, subject: &str, scope: Option<&str>) -> aiworkspace_core::WsResult<Value> {
+        let subject = grant_subject(self, by, subject)?;
+        self.acl_set(by, &json!([{ "subject": subject, "resource": scope.unwrap_or("/"), "allow": [], "deny": [] }]))
+    }
+}
+
+pub fn caps(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
 pub fn alice() -> Caller {
     Caller::user("alice")
 }
@@ -124,4 +162,25 @@ pub fn fetched(objects: &ObjectStore, r: &Value) -> tempfile::TempPath {
     let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     objects.read_to_file(r["download"]["obj_id"].as_str().unwrap(), &path).unwrap();
     path
+}
+
+/// `doc.query { sql }`.
+pub fn sql(ws: &Workspace, who: &Caller, sql: &str) -> Result<Value, aiworkspace_core::WsError> {
+    ws.query(who, &json!({ "sql": sql }))
+}
+
+/// The meta of an entity (`doc.read { as: "meta" }`).
+pub fn meta(ws: &Workspace, who: &Caller, id: &str) -> Value {
+    ws.read_as(who, &json!({ "entity_id": id, "as": "meta" })).unwrap()
+}
+
+/// The record ids a table view Block shows, in its order, through its compiled SQL (`meta.shows.view_sql`);
+/// a view that no longer compiles gives its `view_error`.
+pub fn view_ids(ws: &Workspace, who: &Caller, cell: &str) -> Result<Vec<String>, Value> {
+    let m = meta(ws, who, cell);
+    if let Some(e) = m["shows"].get("view_error") {
+        return Err(e.clone());
+    }
+    let q = ws.query(who, &json!({ "sql": m["shows"]["view_sql"] })).unwrap();
+    Ok(q["rows"].as_array().unwrap().iter().map(|r| r[0].as_str().unwrap().to_string()).collect())
 }

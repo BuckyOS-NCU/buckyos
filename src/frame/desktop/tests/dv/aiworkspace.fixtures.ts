@@ -1,9 +1,15 @@
+import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { expect, test as base, type BrowserContext, type Page, type TestInfo } from '@playwright/test'
-import { unwrap } from '../../src/app/aiworkspace/api/client'
+import { ServiceFailure, unwrap } from '../../src/app/aiworkspace/api/client'
+import { queryBySql } from '../../src/app/aiworkspace/api/tableQuery'
+import type { QueryPage, QueryParams, SqlResult } from '../../src/app/aiworkspace/api/types'
+import { core } from '../aiworkspace/fixtures'
 import { PROTOCOL_VERSION, type CommitResult, type Operation, type Result, type RichTextContent, type WorkspaceInfo, type WorkspaceSummary } from '../../src/app/aiworkspace/api/types'
-import { expectAllCommitted } from '../aiworkspace/fixtures'
+import { chooseFromDevice, expectAllCommitted, openedPicker, zoneGoto, type PickedFile } from '../aiworkspace/fixtures'
+import { selectRow } from '../e2e/fixtures/selectDialog'
 
 type Params = Record<string, unknown>
 type Workspace = Pick<WorkspaceInfo, 'workspace_id' | 'epoch'>
@@ -15,9 +21,23 @@ export class ZoneClient {
   readonly prefix = `dv-aiws-${randomUUID()}`
   private seq = 0
 
-  constructor(readonly page: Page, private readonly token: string) {}
+  private renewed: string | null = null
 
-  async service<T>(service: string, method: string, params: Params, token: string | null = this.token): Promise<T> {
+  /** `renew`: a fresh session of the same user (a password login), for a test that outlives its login token. */
+  constructor(readonly page: Page, readonly token: string, private readonly renew: (() => Promise<string>) | null = null) {}
+
+  /** The session this user has now: the newest of the login token, the browser's (refreshed) session cookies and a
+   * renewed login. */
+  async session(): Promise<string> {
+    const exp = (jwt: string) => { try { return (JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8')) as { exp?: number }).exp ?? 0 } catch { return 0 } }
+    const cookies = (await this.page.context().cookies()).filter((c) => c.name === 'buckyos_session_token').map((c) => c.value)
+    const best = [this.token, ...cookies, ...(this.renewed ? [this.renewed] : [])].reduce((a, t) => (exp(t) > exp(a) ? t : a))
+    if (this.renew && exp(best) * 1000 < Date.now() + 60_000) this.renewed = await this.renew()
+    return this.renewed && exp(this.renewed) >= exp(best) ? this.renewed : best
+  }
+
+  async service<T>(service: string, method: string, params: Params, explicit?: string | null): Promise<T> {
+    const token = explicit === undefined ? await this.session() : explicit
     const reply = await this.page.evaluate(async (input) => {
       const response = await fetch(`/kapi/${input.service}`, {
         method: 'POST',
@@ -38,6 +58,17 @@ export class ZoneClient {
 
   async ok<T>(method: string, params: Params): Promise<T> {
     return unwrap(await this.call<Result<T>>(method, params))
+  }
+
+  /** The rows of a table or table view as a session without a replica reads them (the view compiled to SQL). */
+  table(ws: Workspace, params: QueryParams): Promise<QueryPage> {
+    return queryBySql({
+      read: async (ids) => (await this.ok<{ results: Record<string, unknown>[] }>('doc.read', { workspace_id: ws.workspace_id, targets: ids.map((entity_id) => ({ entity_id })) })).results,
+      sql: (p) => this.ok<SqlResult>('doc.query', { workspace_id: ws.workspace_id, ...p }),
+      sourceQuery: (p) => this.ok<QueryPage>('doc.source_query', { workspace_id: ws.workspace_id, ...p }),
+      viewSql: (table, fields, view, projection) => core().view_sql(table, fields, view, projection),
+      fail: (e) => new ServiceFailure(e),
+    }, params)
   }
 
   info(ws: Workspace) { return this.ok<WorkspaceInfo>('ws.get_info', { workspace_id: ws.workspace_id }) }
@@ -85,7 +116,13 @@ async function login(page: Page, userId: string, value: string): Promise<Actor> 
   const claims = JSON.parse(Buffer.from(cookie.value.split('.')[1], 'base64url').toString('utf8')) as { sub: string }
   expect(claims.sub).toBe(userId)
   expect(await page.evaluate(() => localStorage.getItem('aiworkspace.dev'))).toBeNull()
-  const client = new ZoneClient(page, cookie.value)
+  const client = new ZoneClient(page, cookie.value, async () => {
+    const nonce = Date.now()
+    const renewed = await client.service<{ session_token: string }>('verify-hub', 'login_by_password', {
+      type: 'password', username: userId, password: hashPassword(userId, value, nonce), target: { kind: 'system', service_id: 'control-panel' }, login_nonce: nonce,
+    }, null)
+    return renewed.session_token
+  })
   await client.list()
   return { page, client, userId }
 }
@@ -95,6 +132,8 @@ function observe(page: Page, errors: string[]) {
   page.on('console', (message) => {
     if (message.type() !== 'error') return
     if (message.location().url.endsWith('/sso_refresh') && message.text().includes('401')) return
+    // the picker's save mode stats the name it was given: not found means the name is free
+    if (message.location().url.endsWith('/nfs/v1/stat') && message.text().includes('404')) return
     errors.push(message.text())
   })
 }
@@ -128,6 +167,8 @@ export async function createTemplate(actor: Actor, template: 'sample' | 'quarter
     await page.getByTestId('window-aiworkspace').getByRole('button', { name: 'Maximize', exact: true }).click()
   } else await page.goto('/workspace')
   await expect(page.getByTestId('aiws-transport')).toHaveText('Zone 服务', { timeout: 30_000 })
+  // the home starts on "Recent" when there is any; "New from template" is on the first card of "All workspaces"
+  await page.getByTestId('aiws-home-tab-all').click()
   await page.getByTestId('aiws-new-template').click()
   await page.getByTestId(`aiws-template-${template}`).click()
   await page.getByLabel('工作区标题', { exact: true }).fill(actor.client.prefix)
@@ -221,4 +262,55 @@ export const test = base.extend<{ owner: Actor; peer: Actor }>({
   },
 })
 
-export { expect, expectAllCommitted, screenshot }
+/** Writes a file below the actor's home folder over NFSP (the Zone's file service, with the actor's session): what
+ * the system file picker then chooses from the Zone. `dir` is relative to the home folder. */
+export async function putHomeFile(actor: Actor, dir: string, file: PickedFile) {
+  let seq = 0
+  const call = async (method: string, body: Params) => {
+    const parsed = await (await actor.page.request.post(`/nfs/v1/${method}`, { headers: { Authorization: `Bearer ${actor.client.token}` }, data: body })).json()
+    if (!parsed.ok) throw new Error(`${method}: ${JSON.stringify(parsed.error)}`)
+    return parsed.result
+  }
+  const session = (await call('hello', { args: {} })).session
+  let path = `/home/${actor.userId}`
+  for (const segment of dir.split('/').filter(Boolean)) {
+    path = `${path}/${segment}`
+    await call('mkdir', { session, seq: ++seq, args: {}, at: { realm: 'dfs', path } }).catch(() => undefined)
+  }
+  const parent = await call('stat', { session, args: {}, at: { realm: 'dfs', path } })
+  const open = await call('open_write', { session, seq: ++seq, args: { parent_ref: parent.ref, name: file.name, size: file.buffer.length } })
+  await actor.page.request.fetch(`/nfs/v1/uploads/${open.fb_handle}`, { method: 'PATCH', headers: { Authorization: `Bearer ${actor.client.token}`, 'Upload-Offset': '0', 'Tus-Resumable': '1.0.0', 'Content-Type': 'application/offset+octet-stream' }, data: file.buffer })
+  await call('commit_file', { session, seq: ++seq, args: { name: file.name, fb_handle: open.fb_handle, lease_id: open.lease.lease_id, overwrite: true }, at: { ref: parent.ref } })
+}
+
+/** Chooses a file from the Zone in the system file picker `open` brings up (path A in the Desktop window, path C framed
+ * over a Workspace's own page): it is written into the home folder first. */
+export async function chooseFromHome(actor: Actor, open: () => Promise<unknown>, dir: string, file: PickedFile) {
+  await putHomeFile(actor, dir, file)
+  await open()
+  const { dialog } = await openedPicker(actor.page)
+  await zoneGoto(dialog, dir.split('/').filter(Boolean))
+  await selectRow(dialog, file.name).click()
+  await dialog.getByTestId('select-confirm').click()
+}
+
+export { chooseFromDevice, expect, expectAllCommitted, screenshot }
+
+/** The buckyos CLI of the websdk checkout next to this repository, as the signed-in owner. */
+export function cli(token: string, baseURL: string, cwd: string, ...args: string[]): Record<string, unknown> {
+  const launcher = resolve(process.env.BUCKYOS_WEBSDK_DIR ?? '../../../../buckyos-websdk', 'cli/launcher.mjs')
+  // the Zone comes from the environment: local commands (pikg) refuse an explicit --endpoint
+  let out: string
+  try {
+    out = execFileSync(process.execPath, [launcher, '--non-interactive', '--yes', '--output', 'json', '--timeout', '5m', ...args], {
+      cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, BUCKYOS_TOOL_ENDPOINT: baseURL, BUCKYOS_APPCLIENT_SESSION_TOKEN: token, NODE_TLS_REJECT_UNAUTHORIZED: '0', HOME: cwd },
+    })
+  } catch (error) {
+    const failed = error as { stdout?: string; stderr?: string }
+    throw new Error(`buckyos ${args.slice(0, 2).join(' ')} failed: ${failed.stdout ?? ''} ${failed.stderr?.slice(-2000) ?? ''}`)
+  }
+  const envelope = JSON.parse(out) as { ok: boolean; data: Record<string, unknown>; error?: unknown }
+  expect(envelope.ok, out).toBe(true)
+  return envelope.data
+}

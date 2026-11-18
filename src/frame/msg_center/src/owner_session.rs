@@ -583,6 +583,9 @@ pub struct CallerIdentity {
     pub user_did: Option<DID>,
     /// RBAC app subject of the token (`system:<service>` / `app:<app>`).
     pub authorization_key: String,
+    /// The token's canonical target (`system:<service>` / `app:<app>@<owner>`):
+    /// nfs-server keeps a user's object holdings per this key.
+    pub app_key: String,
     /// A user token for a DID without an account record in this Zone: it
     /// only acts in group sessions.
     pub external: bool,
@@ -738,6 +741,7 @@ impl MessageCenter {
         Ok(Some(CallerIdentity {
             user_id,
             authorization_key: claims.target.authorization_key(),
+            app_key: claims.target.canonical_key(),
             principal_kind: claims.principal_kind,
             user_did,
             external,
@@ -1255,6 +1259,41 @@ impl MessageCenter {
             SessionLifecycle::Active => None,
         };
         state.updated_at_ms = now_ms;
+        self.msg_box_db.upsert_owner_session(&state).await?;
+        Ok(state)
+    }
+
+    /// Clear the history for this owner only: the visibility watermark moves
+    /// to the newest record the session holds now (never backwards), while
+    /// registration, lifecycle, title and the owner's UI state stay. Unlike a
+    /// delete the watermark is not raised to the current time, so a message
+    /// that arrives next is visible whatever the sender's clock says. A
+    /// registered session stays listed while empty; one known only from its
+    /// records is listed again with its next message.
+    pub(crate) async fn clear_session_internal(
+        &self,
+        owner: DID,
+        session_id: String,
+    ) -> std::result::Result<OwnerSessionState, RPCErrors> {
+        let session_id = normalize_session_id(&session_id)?;
+        let mut state = self.load_or_default_state(&owner, &session_id).await?;
+        if let Some(newest) = self
+            .msg_box_db
+            .session_max_record_key(&owner, &session_id)
+            .await?
+        {
+            let current = state.delete_watermark_sort_key.map(|sort_key| {
+                (
+                    sort_key,
+                    state.delete_watermark_record_id.clone().unwrap_or_default(),
+                )
+            });
+            if current.as_ref().is_none_or(|current| &newest > current) {
+                state.delete_watermark_sort_key = Some(newest.0);
+                state.delete_watermark_record_id = Some(newest.1);
+            }
+        }
+        state.updated_at_ms = Self::now_ms();
         self.msg_box_db.upsert_owner_session(&state).await?;
         Ok(state)
     }

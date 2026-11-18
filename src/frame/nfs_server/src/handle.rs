@@ -69,6 +69,27 @@ impl HandleCodec {
         format!("nh_{}.{}", B64.encode(&payload), B64.encode(mac))
     }
 
+    /// Seals an opaque payload as `<prefix><b64(payload)>.<b64(mac16)>`.
+    pub fn seal(&self, prefix: &str, payload: &[u8]) -> String {
+        let mut tagged = prefix.as_bytes().to_vec();
+        tagged.extend_from_slice(payload);
+        format!("{}{}.{}", prefix, B64.encode(payload), B64.encode(hmac16(&self.key, &tagged)))
+    }
+
+    /// Authenticates a sealed payload; tampered or foreign ones are STALE.
+    pub fn open(&self, prefix: &str, sealed: &str) -> NfsResult<Vec<u8>> {
+        let rest = sealed.strip_prefix(prefix).ok_or_else(|| invalid(format!("not a {prefix} handle")))?;
+        let (p64, m64) = rest.split_once('.').ok_or_else(|| stale("malformed handle"))?;
+        let payload = B64.decode(p64).map_err(|_| stale("malformed handle"))?;
+        let mac = B64.decode(m64).map_err(|_| stale("malformed handle"))?;
+        let mut tagged = prefix.as_bytes().to_vec();
+        tagged.extend_from_slice(&payload);
+        if mac.len() != 16 || !constant_time_eq(&mac, &hmac16(&self.key, &tagged)) {
+            return Err(stale("handle signature mismatch"));
+        }
+        Ok(payload)
+    }
+
     /// Decodes and authenticates a `nh_*` node_id. Tampered or foreign handles
     /// return STALE (the client must re-resolve from a trusted locator).
     pub fn decode(&self, node_id: &str) -> NfsResult<NativeHandle> {
@@ -87,6 +108,21 @@ impl HandleCodec {
         let h: NativeHandle =
             serde_json::from_slice(&payload).map_err(|_| stale("malformed handle payload"))?;
         Ok(h)
+    }
+}
+
+impl HandleCodec {
+    pub fn sign_read(&self, node_id: &str, exp: u64) -> String {
+        let mac = hmac16(&self.key, format!("hx\0{}\0{}", node_id, exp).as_bytes());
+        format!("{}.{}", exp, B64.encode(mac))
+    }
+
+    pub fn verify_read(&self, node_id: &str, hx: &str) -> Option<u64> {
+        let (exp, mac) = hx.split_once('.')?;
+        let exp: u64 = exp.parse().ok()?;
+        let mac = B64.decode(mac).ok()?;
+        let expect = hmac16(&self.key, format!("hx\0{}\0{}", node_id, exp).as_bytes());
+        (mac.len() == 16 && constant_time_eq(&mac, &expect)).then_some(exp)
     }
 }
 
@@ -183,6 +219,17 @@ mod tests {
         let c2 = HandleCodec::new(vec![9u8; 32]);
         let s = c.encode(&h);
         assert!(c2.decode(&s).is_err());
+    }
+
+    #[test]
+    fn read_capability() {
+        let c = codec();
+        let hx = c.sign_read("nh_a.b", 100);
+        assert_eq!(c.verify_read("nh_a.b", &hx), Some(100));
+        assert_eq!(c.verify_read("nh_a.c", &hx), None);
+        assert_eq!(c.verify_read("nh_a.b", &hx.replacen("100", "200", 1)), None);
+        assert_eq!(c.verify_read("nh_a.b", "100"), None);
+        assert_eq!(HandleCodec::new(vec![9u8; 32]).verify_read("nh_a.b", &hx), None);
     }
 
     #[test]

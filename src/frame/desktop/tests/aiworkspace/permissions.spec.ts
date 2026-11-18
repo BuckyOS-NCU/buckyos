@@ -1,37 +1,58 @@
-/* Phase two §13.1 UI14: preset groups, workspace and canvas permissions through the UI, union
- * semantics, and no leaks of names, referrers or dependency details to a restricted principal. */
+/* Phase two §13.1 UI14, in the permission editor of UI 框架 PRD §8.3: rules by path — the workspace, and a canvas with
+ * the data folder it holds — union semantics, and no leaks of names, referrers or dependency details to a restricted
+ * principal. */
 
+import type { Page } from '@playwright/test'
 import { expect, openWorkspace, test } from './fixtures'
 
 const ALICE = 'tok-alice'
 const BOB = 'tok-bob'
 
-test('UI14 presets, canvas permissions and what a restricted principal can see', async ({ page, api }) => {
-  const ws = await api.demo(ALICE, 'quarterly', `perm ${Date.now()}`)
-  await openWorkspace(page, ALICE, ws.workspace_id)
+/** The data mode with the permission editor (§8). */
+async function openEditor(page: Page, token: string, workspaceId: string) {
+  await openWorkspace(page, token, workspaceId)
   await page.getByTestId('aiws-top-sources').click()
-  await page.getByTestId('aiws-left-permissions').click()
+  await page.getByTestId('aiws-dm-perm-node').click()
   await expect(page.getByTestId('aiws-permissions')).toBeVisible()
-  await expect(page.locator('[data-testid="aiws-grant"][data-subject="alice"]').getByTestId('aiws-grant-preset')).toHaveText('管理者')
-  // bob becomes a reader of the workspace, and an editor of the detail canvas only (two grants: Surface + content folder)
-  await page.getByTestId('aiws-grant-subject').fill('bob')
-  await page.getByTestId('aiws-grant-preset-select').selectOption('reader')
-  await page.getByTestId('aiws-grant-submit').click()
-  await expect(page.getByTestId('aiws-permissions-message')).toContainText('已授予 bob')
-  await page.getByTestId('aiws-grant-subject').fill('bob')
-  await page.getByTestId('aiws-grant-preset-select').selectOption('editor')
-  await page.getByTestId('aiws-grant-scope').selectOption('sf-detail')
-  await page.getByTestId('aiws-grant-submit').click()
-  await expect(page.getByTestId('aiws-permissions-message')).toContainText('（画布）')
-  await expect(page.locator('[data-testid="aiws-grant"][data-subject="bob"][data-scope=""]').getByTestId('aiws-grant-preset')).toHaveText('阅读者')
-  await expect(page.locator('[data-testid="aiws-grant"][data-subject="bob"][data-scope="sf-detail"]').getByTestId('aiws-grant-preset')).toHaveText('编辑者')
-  const grants = await api.rpc(ALICE, 'ws.list_grants', { workspace_id: ws.workspace_id })
-  const bobs = grants.grants.filter((g: { subject: string }) => g.subject === 'bob').map((g: { scope_entity_id: string | null }) => g.scope_entity_id).sort()
+}
+
+/** A rule added in the rule list: who, the path, a preset. */
+async function addRule(page: Page, subject: string, path: string, preset: string) {
+  await page.getByTestId('aiws-perm-rule-add').click()
+  const rule = page.getByTestId('aiws-perm-rule-editor')
+  await rule.getByTestId('aiws-perm-subject').selectOption(subject)
+  await rule.getByTestId('aiws-perm-path').fill(path)
+  await expect(rule.getByTestId('aiws-perm-path-check')).toHaveAttribute('data-state', 'ok')
+  await rule.getByTestId(`aiws-perm-preset-${preset}`).click()
+  await rule.getByTestId('aiws-perm-rule-save').click()
+  await expect(rule).toHaveCount(0)
+}
+
+test('UI14 workspace and canvas rules by path, and what a restricted principal can see', async ({ page, api }) => {
+  const ws = await api.demo(ALICE, 'quarterly', `perm ${Date.now()}`)
+  await openEditor(page, ALICE, ws.workspace_id)
+  const editor = page.getByTestId('aiws-permissions')
+  // the owner holds everything without a rule
+  await expect(editor.locator('[data-testid="aiws-perm-group"][data-subject="@owner"]')).toContainText('全部能力')
+  await editor.getByTestId('aiws-perm-tab-rules').click()
+  // bob becomes a reader of the workspace, and an editor of the detail canvas only (two entries: the Surface and the
+  // data folder it holds)
+  await addRule(page, 'bob', '/', 'reader')
+  await addRule(page, 'bob', '/surfaces/数据明细', 'editor')
+  const row = (path: string) => editor.locator(`[data-testid="aiws-perm-rule"][data-subject="bob"][data-resource="${path}"]`)
+  await expect(row('/').getByTestId('aiws-perm-rule-allow').locator('[data-cap]')).toHaveCount(1)
+  await expect(row('/surfaces/数据明细').getByTestId('aiws-perm-rule-allow').locator('[data-cap]')).toHaveCount(6)
+  const content = editor.locator('[data-testid="aiws-perm-rule"][data-subject="bob"][data-entity-id="sf-detail-content"]')
+  await expect(content.getByTestId('aiws-perm-rule-allow').locator('[data-cap]')).toHaveCount(6)
+  // the entries behind the editor (acl.query by: all): the workspace, the canvas and its content folder
+  type Entry = { subject: string; resource: { entity_id: string | null } }
+  const entries = async (token: string) => api.rpc(token, 'acl.query', { workspace_id: ws.workspace_id, by: 'all' }) as Promise<{ entries: Entry[]; complete: boolean }>
+  const bobs = (await entries(ALICE)).entries.filter((e) => e.subject === 'bob').map((e) => e.resource.entity_id).sort()
   expect(bobs).toEqual([null, 'sf-detail', 'sf-detail-content'].sort())
   // bob: edits on the detail canvas are accepted (union), first-level data edits are refused
-  const bobGrants = await api.rpc(BOB, 'ws.list_grants', { workspace_id: ws.workspace_id })
+  const bobGrants = await entries(BOB)
   expect(bobGrants.complete).toBe(false)
-  expect(bobGrants.grants.every((g: { subject: string }) => g.subject === 'bob')).toBe(true)
+  expect(bobGrants.entries.every((e) => e.subject === 'bob')).toBe(true)
   expect(JSON.stringify(bobGrants)).not.toContain('"alice"')
   const place = await api.commit(BOB, ws, [{ op: 'tree.place', entity_id: 'blk-chart-2', placement: { x: 1, y: 2, w: 420, h: 300 } }])
   expect(place.status).toBe('accepted')
@@ -43,15 +64,17 @@ test('UI14 presets, canvas permissions and what a restricted principal can see',
   expect(edit.code).toBe('PERMISSION_DENIED')
   const moveMain = await api.commit(BOB, ws, [{ op: 'tree.place', entity_id: 'blk-kpi', placement: { x: 1, y: 2, w: 420, h: 130 } }])
   expect(moveMain.status).toBe('rejected')
-  // revoking the canvas permission removes both rows; the workspace grant still makes bob a reader
-  await page.locator('[data-testid="aiws-grant"][data-subject="bob"][data-scope="sf-detail"]').getByTestId('aiws-revoke').click()
-  await expect(page.locator('[data-testid="aiws-grant"][data-subject="bob"][data-scope="sf-detail"]')).toHaveCount(0)
-  const after = await api.rpc(ALICE, 'ws.list_grants', { workspace_id: ws.workspace_id })
-  expect(after.grants.filter((g: { subject: string }) => g.subject === 'bob')).toHaveLength(1)
+  // deleting the canvas rule deletes its data folder's too; the workspace rule still makes bob a reader
+  await row('/surfaces/数据明细').getByTestId('aiws-perm-rule-edit').click()
+  await expect(page.getByTestId('aiws-perm-rule-pair')).toBeChecked()
+  await page.getByTestId('aiws-perm-rule-delete').click()
+  await expect(row('/surfaces/数据明细')).toHaveCount(0)
+  await expect(content).toHaveCount(0)
+  expect((await entries(ALICE)).entries.filter((e) => e.subject === 'bob')).toHaveLength(1)
   expect((await api.rpc(BOB, 'doc.read', { workspace_id: ws.workspace_id, entity_id: 'sales' })).ok).toBe(true)
   // a principal reading only a subtree learns nothing about referrers or dependencies elsewhere
-  await api.rpc(ALICE, 'ws.revoke', { workspace_id: ws.workspace_id, subject: 'bob' })
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', scope_entity_id: 'sf-detail-content', capabilities: ['read'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob' }] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', resource: 'sf-detail-content', allow: ['read'] }] })
   const relations = await api.rpc(BOB, 'doc.relations', { workspace_id: ws.workspace_id, entity_id: 'bob-note' })
   expect(relations.ok).toBe(true)
   expect(relations.hidden_incoming).toBe(false)
@@ -61,35 +84,4 @@ test('UI14 presets, canvas permissions and what a restricted principal can see',
   const fresh = await api.rpc(BOB, 'doc.freshness', { workspace_id: ws.workspace_id, entity_ids: ['sales'] })
   expect(fresh.items[0].status).toBe('unknown')
   expect(JSON.stringify(fresh)).not.toContain('原始销售数据')
-})
-
-test('AI Center Quota §3.3: a manager chooses whose AI resources wish blocks use; a reader only sees it', async ({ page, browser, api }) => {
-  const ws = await api.demo(ALICE, 'quarterly', `aicc ${Date.now()}`)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', capabilities: ['read'] })
-  await openWorkspace(page, ALICE, ws.workspace_id)
-  await page.getByTestId('aiws-top-sources').click()
-  await page.getByTestId('aiws-left-permissions').click()
-  const mode = page.getByTestId('aiws-wish-aicc-mode')
-  await expect(mode).toHaveValue('workspace_owner')
-  await mode.selectOption('current_user')
-  await expect.poll(async () => (await api.rpc(ALICE, 'ws.get_info', { workspace_id: ws.workspace_id })).wish_aicc_mode).toBe('current_user')
-
-  const bobPage = await (await browser.newContext()).newPage()
-  await openWorkspace(bobPage, BOB, ws.workspace_id)
-  await bobPage.getByTestId('aiws-top-sources').click()
-  await bobPage.getByTestId('aiws-left-permissions').click()
-  await expect(bobPage.getByTestId('aiws-wish-aicc-mode')).toHaveValue('current_user')
-  await expect(bobPage.getByTestId('aiws-wish-aicc-mode')).toBeDisabled()
-  const refused = await api.rpc(BOB, 'ws.set_wish_aicc', { workspace_id: ws.workspace_id, mode: 'workspace_owner' })
-  expect(refused.ok).toBe(false)
-  expect(refused.error.code).toBe('PERMISSION_DENIED')
-  // hosted execution (内核架构改进 D22, T3-7): the owner names the Agent and the wishes; a reader cannot change it
-  await page.getByTestId('aiws-hosted-enabled').check()
-  await page.getByTestId('aiws-hosted-agent').fill('jarvis.test.buckyos.io')
-  await page.getByTestId('aiws-hosted-wish-wish-analysis').check()
-  await page.getByTestId('aiws-hosted-save').click()
-  await expect.poll(async () => (await api.rpc(ALICE, 'ws.get_info', { workspace_id: ws.workspace_id })).hosted_exec).toMatchObject({ enabled: true, agent_id: 'jarvis.test.buckyos.io', allowed_wishes: ['wish-analysis'] })
-  await expect(bobPage.getByTestId('aiws-hosted-save')).toBeDisabled()
-  const hostedRefused = await api.rpc(BOB, 'ws.set_hosted_exec', { workspace_id: ws.workspace_id, config: { enabled: false } })
-  expect(hostedRefused.error.code).toBe('PERMISSION_DENIED')
 })

@@ -3,12 +3,12 @@
  * workspace's readable `buckyos.block-def` entities. The menus, the object toolbar, the context menu and the
  * catalog dialog all read this one list. */
 
+import { CalendarDays, CalendarRange, Frame, Image, LetterText, ListChecks, ListTodo, Network, PanelTopBottomDashed, Shapes, Sparkles, Spline, StickyNote, Table, Type, type LucideIcon } from 'lucide-react'
 import type { EntityEnvelope, Json } from '../../api/types'
 import { aiwsText } from '../../i18n'
 import type { WorkspaceStore } from '../../state/store'
 import { blockRegistry, type BlockDefinition, type CatalogGroup, type CatalogInfo, type CatalogVariant } from '../blocks/registry'
 import { controlRegistry, type ContainerDefinition } from '../controls/registry'
-import { MOCK_WISH_DEF_ID } from '../wish/mockWishDef'
 import type { MediaFacts } from '../media/poster'
 
 export interface CatalogEntry {
@@ -27,7 +27,7 @@ export interface CatalogEntry {
   defEntity?: EntityEnvelope
 }
 
-export const STANDARD_ORDER = ['richtext', 'shape:text', 'note', 'shape', 'connector', 'frame', 'mindmap', 'table', 'asset', 'wish']
+export const STANDARD_ORDER = ['richtext', 'shape:text', 'note', 'shape', 'connector', 'frame', 'mindmap', 'todo', 'calendar', 'table', 'asset', 'wish', 'label', 'pdf-frame']
 
 /** A control as an insertable entry: its definition creates the container and the first Block (selected and edited). */
 const controlEntries = new Map<string, BlockDefinition>()
@@ -36,8 +36,9 @@ function controlEntry(def: ContainerDefinition): BlockDefinition {
   if (!entry) {
     entry = {
       type: def.kind, version: def.version, get title() { return def.title }, accepts: [], allowNoSource: true, pureUi: true,
-      defaultSize: { w: 120, h: 44 }, cost: { editor: false, html: false }, Static: () => null, create: def.create,
-      catalog: { group: 'layout', get description() { return def.agent.summary }, needs: 'none', editAfterInsert: true, standard: true },
+      defaultSize: def.defaultSize ?? { w: 120, h: 44 }, cost: { editor: false, html: false }, Static: () => null, create: def.create,
+      // a data control (to-do, calendar) is selected after insertion, not edited: it is used right away
+      catalog: { group: def.catalogGroup ?? (def.sizing === 'box' ? 'data' : 'layout'), get description() { return def.agent.summary }, needs: 'none', editAfterInsert: def.sizing !== 'box', standard: true },
     }
     controlEntries.set(def.kind, entry)
   }
@@ -56,6 +57,12 @@ function compositeEntry(): BlockDefinition | undefined {
 
 /** An entry's id in test ids and menu ids: the type, or `type-variant`. */
 export const entryId = (entry: CatalogEntry) => (entry.variant ? `${entry.definition.type}-${entry.variant}` : entry.definition.type)
+
+/** The icons of the standard entries (object toolbar, insert catalog), by `entryId`. */
+export const ENTRY_ICONS: Record<string, LucideIcon> = {
+  richtext: LetterText, 'shape-text': Type, note: StickyNote, shape: Shapes, connector: Spline, frame: Frame, mindmap: Network, table: Table, asset: Image, wish: Sparkles,
+  todo: ListTodo, calendar: CalendarDays, 'table-todo': ListChecks, 'table-calendar': CalendarRange, 'pdf-frame': PanelTopBottomDashed,
+}
 /** The size an insertion of the entry takes. */
 export const entrySize = (entry: CatalogEntry) => entry.size ?? entry.definition.defaultSize
 
@@ -79,7 +86,7 @@ export function registryEntries(): CatalogEntry[] {
     // composite instances are inserted from their definitions (the extension entries), never as a bare host
     if (def.kind === 'composite') continue
     const definition = controlEntry(def)
-    out.push({ key: `control:${def.kind}`, definition, catalog: definition.catalog!, title: definition.title, group: 'layout' })
+    out.push({ key: `control:${def.kind}`, definition, catalog: definition.catalog!, title: definition.title, group: definition.catalog!.group })
   }
   const rank = (entry: CatalogEntry) => { const i = STANDARD_ORDER.indexOf(entry.variant ? `${entry.definition.type}:${entry.variant}` : entry.definition.type); return i < 0 ? 100 : i }
   const { compare } = aiwsText()
@@ -90,8 +97,7 @@ export function registryEntries(): CatalogEntry[] {
 export function extensionEntries(store: WorkspaceStore): CatalogEntry[] {
   const out: CatalogEntry[] = []
   for (const entity of store.outline.all()) {
-    // the Mock wish executor's definition drives wishes; it is not a view to place on a canvas
-    if (entity.deleted || entity.type_id !== 'buckyos.block-def' || entity.entity_id === MOCK_WISH_DEF_ID) continue
+    if (entity.deleted || entity.type_id !== 'buckyos.block-def') continue
     const host = entity.def_kind === 'composite' ? compositeEntry() : entity.def_kind ? blockRegistry.get(entity.def_kind) : undefined
     if (!host?.catalog || !host.create) continue
     out.push({ key: `def:${entity.entity_id}`, definition: host, catalog: host.catalog, title: entity.title ?? entity.name ?? entity.entity_id, group: 'extension', defEntity: entity })

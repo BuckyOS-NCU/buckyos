@@ -148,14 +148,14 @@ impl Workspace {
             }
         };
         let m = materialize_with(&ctx, &mut sink, &visible, &mut cached, !notes)?;
-        let forked: Option<Value> = crate::docdb::meta_get(&self.doc, "forked_from")?.and_then(|s| serde_json::from_str(&s).ok());
-        let snap = snapshot_root(&self.workspace_id, self.head_seq, &self.head_commit_id, &m.content_root, forked.as_ref());
+        let cloned: Option<Value> = crate::docdb::meta_get(&self.doc, "cloned_from")?.and_then(|s| serde_json::from_str(&s).ok());
+        let snap = snapshot_root(&self.workspace_id, self.head_seq, &self.head_commit_id, &m.content_root, cloned.as_ref());
         let (snapshot_id, text) = named_object(OBJ_TYPE_JSON, &snap)?;
         self.objects.put_verified(&snapshot_id, &text)?;
         // every snapshot is retained (D06) by its retention set until `ws.release_retention` / `ws.delete_checkpoint`
         let mut members = BTreeMap::new();
         self.objects.add_member(&snapshot_id, &mut members)?;
-        if let Some(source) = forked.as_ref().and_then(|f| f["snapshot"].as_str()) {
+        if let Some(source) = cloned.as_ref().and_then(|f| f["snapshot"].as_str()) {
             self.objects.add_member(source, &mut members)?;
         }
         self.objects.content_members(&m.content_root, &mut members)?;
@@ -271,7 +271,9 @@ impl Workspace {
             .map(|a| json!({ "id": a, "reason": if self_contained { "unavailable" } else { "external" } }))
             .collect();
         missing.extend(cp.unresolved.iter().filter(|u| u.get("to").is_some()).map(|u| json!({ "ref": u["to"], "reason": "external" })));
-        let manifest = json!({
+        // a manager's package carries the permission design (权限需求 R12): a new import starts with it; members never travel
+        let design = if access.ws_caps.has(Cap::Manage) { Some(self.permission_design(&|id| cp.objects.contains_key(id))?.0) } else { None };
+        let mut manifest = json!({
             "format": PACKAGE_FORMAT, "format_version": FORMAT_VERSION, "export_mode": mode,
             // only true when everything in the declared scope really is inside the package
             "self_contained": self_contained && missing.is_empty() && external.is_empty(),
@@ -283,6 +285,9 @@ impl Workspace {
             "collab": collab, "personal_entities": personal_count, "notes_included": notes,
             "exported_at": now, "exported_by": caller.principal,
         });
+        if let Some(d) = design {
+            manifest["permission_design"] = d;
+        }
         zip.start_file("manifest.json", opts).map_err(zerr)?;
         zip.write_all(serde_json::to_string_pretty(&manifest).unwrap().as_bytes()).map_err(io)?;
         zip.finish().map_err(zerr)?.sync_all().map_err(io)?;
@@ -314,7 +319,11 @@ impl Workspace {
     /// byte. `binding` names where the uploader bound it (`bucket.get` proves it); without one the server binds the
     /// object itself (the caller's right to read it was checked at the NDM gateway).
     pub fn stage_object(&mut self, caller: &Caller, object_id: &str, max_bytes: u64) -> WsResult<Value> {
-        const MAX_MEDIA_BYTES: u64 = 2 << 30;
+        self.stage_upload(caller, object_id, max_bytes, max_bytes)
+    }
+
+    /// [`Self::stage_object`] of a user upload: audio and video may be up to `max_media_bytes`.
+    pub fn stage_upload(&mut self, caller: &Caller, object_id: &str, max_bytes: u64, max_media_bytes: u64) -> WsResult<Value> {
         require_update(&self.require_ws_any(caller)?)?;
         if !object_id.starts_with("cyfile:") {
             return Err(WsError::invalid_op("an asset must be a FileObject; import folders as workspace containers"));
@@ -324,13 +333,20 @@ impl Workspace {
         }
         let size = self.objects.file_size(object_id)?;
         let media_type = sniff_prefix(&self.objects.file_head(object_id, 512)?);
-        // audio and video play by Range from the stream route (第四期规划 §7.3.2, §7.3.5): up to 2 GiB
-        let max_bytes = if media_type.starts_with("audio/") || media_type.starts_with("video/") { max_bytes.max(MAX_MEDIA_BYTES) } else { max_bytes };
+        // audio and video play by Range from the stream route (第四期规划 §7.3.2, §7.3.5; 控件机制 TODO Q16): their own limit
+        let max_bytes = if media_type.starts_with("audio/") || media_type.starts_with("video/") { max_media_bytes } else { max_bytes };
         if size > max_bytes {
             return Err(WsError::limit(format!("workspace assets are limited to {max_bytes} bytes")));
         }
         self.check_quota(size, false)?;
-        self.stage_bound(caller, object_id, media_type, size)
+        let mut staged = self.stage_bound(caller, object_id, media_type, size)?;
+        // a picture's size, so a generated one can be checked and laid out without reading it
+        if media_type.starts_with("image/") {
+            if let (_, Some((w, h))) = crate::wish::results::sniff_file(&self.objects.file_head(object_id, 64 * 1024)?) {
+                staged["image"] = json!({ "width": w, "height": h });
+            }
+        }
+        Ok(staged)
     }
 
     /// Bind a stored FileObject under `<ws>/<object_id>` in the owner's `assets` bucket and list it as staged.
@@ -595,7 +611,7 @@ pub struct LoadSpec<'a> {
     /// Original CRDT snapshots (personal backup only): `entity_id → (lineage_id, bytes)`.
     pub collab: BTreeMap<String, (String, Vec<u8>)>,
     pub personal: Vec<Value>,
-    pub forked_from: Option<Value>,
+    pub cloned_from: Option<Value>,
 }
 
 /// Build a complete Workspace folder at `dir` from a content root: one
@@ -631,7 +647,7 @@ pub fn load_workspace(
         }
         let req = json!({ "protocol_version": PROTOCOL_VERSION, "workspace_id": ws.workspace_id, "epoch": ws.epoch,
                           "idempotency_key": key, "origin": "import", "operations": ops });
-        let r = ws.commit(&req, caller, &CommitOpts { internal: true, import: true, undoes: None, as_principal: None, maintenance: false, as_source: false, as_build: false, as_session: false });
+        let r = ws.commit(&req, caller, &CommitOpts { internal: true, import: true, undoes: None, as_principal: None, maintenance: false, as_source: false, as_build: false, as_session: false, authorize_as: None, attribution: None, commit_id: None });
         if r["status"] != json!("accepted") {
             return Err(WsError::invalid_schema("package content was rejected").with_data(r));
         }
@@ -650,14 +666,18 @@ pub fn load_workspace(
                          "order_key": p["order_key"], "payload": p["payload"], "scope": "personal" }))
         .collect();
     commit(&mut ws, "import-personal", personal)?;
-    if let Some(f) = &spec.forked_from {
-        meta_set(&ws.doc, "forked_from", &f.to_string())?;
+    // a package of an older build may hold entities without a name: they get the names the rule gives
+    crate::workspace::backfill_names(&ws.doc)?;
+    if let Some(f) = &spec.cloned_from {
+        meta_set(&ws.doc, "cloned_from", &f.to_string())?;
     }
     Ok(ws)
 }
 
+/// Staging bytes reserves room for a later Commit, which is judged where it writes: any writer may stage — one with
+/// update or structure rights on a single canvas included (权限需求 R22, E1, E2).
 fn require_update(access: &Access) -> WsResult<()> {
-    if !access.ws_caps.has(Cap::Update) && !access.ws_caps.has(Cap::Structure) {
+    if !access.anywhere(Cap::Update) && !access.anywhere(Cap::Structure) && !access.anywhere(Cap::Append) {
         return Err(WsError::denied("update or structure capability required"));
     }
     Ok(())

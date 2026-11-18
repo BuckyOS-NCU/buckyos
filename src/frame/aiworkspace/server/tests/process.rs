@@ -153,8 +153,9 @@ async fn v23_service_api_end_to_end() {
     let info = s.rpc("tok-alice", "ws.get_info", w.clone()).await;
     assert_eq!((info["head_seq"].as_u64(), info["title"].as_str()), (Some(6), Some("项目工作区")));
     assert_eq!(s.rpc("tok-alice", "doc.outline", w.clone()).await["entities"].as_array().unwrap().len(), 18);
-    let open = s.rpc("tok-alice", "doc.query", json!({ "workspace_id": id, "view_id": "cell-open-tasks" })).await;
-    assert_eq!(open["total"], 4);
+    let view = s.rpc("tok-alice", "doc.read", json!({ "workspace_id": id, "entity_id": "cell-open-tasks", "as": "meta" })).await;
+    let open = s.rpc("tok-alice", "doc.query", json!({ "workspace_id": id, "sql": view["shows"]["view_count_sql"] })).await;
+    assert_eq!(open["rows"][0][0], 4, "{view}");
     let batch = s.rpc("tok-alice", "doc.read", json!({ "workspace_id": id, "targets": [{ "entity_id": "notes" }, { "entity_id": "ghost" }] })).await;
     assert_eq!((batch["results"][0]["type_id"].as_str(), batch["results"][1]["error"]["code"].as_str()), (Some("buckyos.richtext"), Some("NOT_FOUND")));
     let bob_view = s.rpc("tok-bob", "ws.get_info", w.clone()).await;
@@ -183,25 +184,28 @@ async fn v23_service_api_end_to_end() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     let c = s.rpc("tok-alice", "doc.commit", mixed_batch(&id, &epoch)).await;
     assert_eq!(c["status"], "accepted", "{c}");
-    let woke = tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("wake-up").unwrap();
-    assert_eq!(woke, json!({ "ok": true, "epoch": epoch, "head_seq": 7, "timed_out": false, "show_lock": null }));
+    let mut woke = tokio::time::timeout(Duration::from_secs(5), waiter).await.expect("wake-up").unwrap();
+    assert!(woke["server_ms"].as_i64().is_some_and(|t| t > 1_700_000_000_000), "{woke}");
+    woke.as_object_mut().unwrap().remove("server_ms");
+    assert_eq!(woke, json!({ "ok": true, "epoch": epoch, "head_seq": 7, "acl_rev": 0, "timed_out": false, "show_lock": null }));
     let quiet = s.rpc("tok-alice", "doc.wait_changes", json!({ "workspace_id": id, "epoch": epoch, "after_seq": 7, "timeout_ms": 100 })).await;
     assert_eq!(quiet["timed_out"], true);
     let changes = s.rpc("tok-alice", "doc.get_changes", json!({ "workspace_id": id, "epoch": epoch, "after_seq": 6 })).await;
     assert_eq!(changes["changes"][0]["ops"].as_array().unwrap().len(), 3);
-    // Mock run, URL table and undo through the API
-    let run = s.rpc("tok-alice", "proc.start", json!({ "workspace_id": id, "program": "mock.task-summary@1", "idempotency_key": "run-1", "params": { "today": "2026-10-13" } })).await;
-    assert_eq!(run["state"], "waiting_confirmation", "{run}");
-    let applied = s.rpc("tok-alice", "proc.apply", json!({ "workspace_id": id, "run_id": run["run_id"], "session_id": "s1" })).await;
-    assert_eq!(applied["state"], "succeeded", "{applied}");
-    let undone = s.rpc("tok-alice", "doc.undo", json!({ "workspace_id": id, "epoch": epoch, "commit_id": applied["result"]["commit_id"], "idempotency_key": "undo-run" })).await;
+    // an unknown program is no run; a URL table and undo through the API
+    let unknown = s.raw(Some("tok-alice"), "proc.start", json!({ "workspace_id": id, "program": "mock.task-summary@1", "idempotency_key": "run-1", "params": {} })).await;
+    assert!(format!("{unknown:?}").contains("MISSING_EXTENSION"), "{unknown:?}");
+    let applied = s.rpc("tok-alice", "doc.commit", commit_req(&id, &epoch, "summary", json!([{ "op": "entity.create", "entity_id": "summary", "type_id": "buckyos.richtext",
+        "parent_id": "data", "order_key": "y", "name": "Task summary", "payload": { "content": { "type": "doc", "content": [{ "type": "paragraph", "attrs": { "block_id": "p1" } }] } } }]))).await;
+    assert_eq!(applied["status"], "accepted", "{applied}");
+    let undone = s.rpc("tok-alice", "doc.undo", json!({ "workspace_id": id, "epoch": epoch, "commit_id": applied["commit_id"], "idempotency_key": "undo-run" })).await;
     assert_eq!(undone["status"], "accepted", "{undone}");
     let r = s.rpc("tok-alice", "doc.commit", commit_req(&id, &epoch, "url", json!([{ "op": "entity.create", "entity_id": "events", "type_id": "buckyos.table-source",
         "parent_id": "data", "order_key": "v", "payload": { "data_mode": "url_query",
         "source_ref": { "kind": "url_query", "source_url": "fixture://events?rows=100000&snapshot=1", "query": {} },
         "fields": [{ "field_id": "event_id", "name": "事件", "type": "text" }] } }]))).await;
     assert_eq!(r["status"], "accepted", "{r}");
-    let page = s.rpc("tok-alice", "doc.query", json!({ "workspace_id": id, "source_id": "events", "limit": 5 })).await;
+    let page = s.rpc("tok-alice", "doc.source_query", json!({ "workspace_id": id, "source_id": "events", "limit": 5 })).await;
     assert_eq!((page["rows"].as_array().unwrap().len(), page["data_mode"].as_str()), (5, Some("url_query")));
     // export → download → upload into a second, empty deployment → same content root
     let exp = s.rpc("tok-alice", "doc.export", json!({ "workspace_id": id, "mode": "share", "self_contained": true })).await;
@@ -230,8 +234,8 @@ async fn v23_service_api_end_to_end() {
     assert_eq!(s2.rpc("tok-bob", "ws.list", json!({})).await["workspaces"].as_array().unwrap().len(), 1);
     assert_eq!(s2.rpc("tok-alice", "ws.list", json!({})).await["workspaces"].as_array().unwrap().len(), 1);
     drop(s2);
-    let forked = s.rpc("tok-alice", "ws.fork", w.clone()).await;
-    assert_eq!(forked["content_root"], s.rpc("tok-alice", "doc.checkpoint", w.clone()).await["content_root"]);
+    let cloned = s.rpc("tok-alice", "ws.clone", w.clone()).await;
+    assert_eq!(cloned["content_root"], s.rpc("tok-alice", "doc.checkpoint", w.clone()).await["content_root"]);
     // the replica database comes through a read token for its key
     let rep = s.rpc("tok-alice", "replica.bootstrap", w.clone()).await;
     assert!(rep.get("path").is_none());
@@ -270,7 +274,7 @@ async fn an_uploaded_asset_is_taken_over_by_the_workspace_owner() {
     let bobs = nfs.put("alice", "assets", "upload/b.txt", b"other".to_vec()).await;
     assert_eq!(srv.rpc("tok-bob", "asset.import_object", json!({"workspace_id": id, "bucket_id": bobs["bucket_id"], "key": bobs["key"]})).await["error"]["code"], "PERMISSION_DENIED");
     // a collaborator's upload lands in the owner's bucket
-    srv.rpc("tok-alice", "ws.grant", json!({"workspace_id": id, "subject": "bob", "capabilities": ["read", "update"]})).await;
+    srv.rpc("tok-alice", "acl.set", json!({"workspace_id": id, "changes": [{"subject": "bob", "allow": ["read", "update"]}]})).await;
     let from_bob = srv.upload_asset(&nfs, "tok-bob", "bob", &id, b"from bob".to_vec()).await;
     let bob_object = from_bob["object_id"].as_str().unwrap();
     assert_eq!(from_bob["bucket_id"], "user/aiworkspace/alice/assets", "{from_bob}");
@@ -295,7 +299,7 @@ async fn a_restore_journal_recovers_an_interrupted_replacement() {
     let srv = Server::start(dir.path(), &nfs, None).await;
     let workspace = srv.rpc("tok-alice", "ws.create", json!({"title": "restore"})).await;
     let id = workspace["workspace_id"].as_str().unwrap();
-    assert_eq!(srv.rpc("tok-alice", "ws.grant", json!({"workspace_id": id, "subject": "bob", "capabilities": ["read"]})).await["ok"], true);
+    assert_eq!(srv.rpc("tok-alice", "acl.set", json!({"workspace_id": id, "changes": [{"subject": "bob", "allow": ["read"]}]})).await["ok"], true);
     let first_package = srv.export_package(&nfs, "tok-alice", id).await;
     let (accepted, _) = srv.import(&nfs, "tok-alice", "alice", first_package, json!({"semantics": "restore", "replace": true})).await;
     assert_eq!(accepted["ok"], true, "{accepted}");

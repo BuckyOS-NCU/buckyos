@@ -27,11 +27,11 @@ async function save(dir: string, name: string, text: string) {
 
 test('a control from home: build, an instance with a binding, rebuild, a refused build, export and the library', async ({ page, api }) => {
   const ws = await api.sample(ALICE, '控件开发 E2E')
-  const rows = (await api.rpc(ALICE, 'doc.query', { workspace_id: ws.workspace_id, source_id: 'tasks', limit: 500 })).rows.length
+  const rows = (await api.table(ALICE, ws.workspace_id, { source_id: 'tasks', limit: 500 })).rows.length
   await openCanvas(page, ALICE, ws.workspace_id)
 
   // new control: a folder in alice's home with a working sample, built at once
-  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-insert-group-extension', 'aiws-menu-extensions')
+  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-extensions')
   const dialog = page.getByTestId('aiws-ext-dialog')
   await expect(dialog).toBeVisible()
   await dialog.getByTestId('aiws-ext-new').click()
@@ -56,6 +56,8 @@ test('a control from home: build, an instance with a binding, rebuild, a refused
   await catalog.getByTestId('aiws-instance-config-label').fill('数量')
   await catalog.getByTestId('aiws-catalog-insert').click()
   await expect(catalog).toBeHidden()
+  // placed once its bindings are settled (on_bind)
+  await expect.poll(async () => (await api.outline(ALICE, ws.workspace_id)).some((e: { type_id: string; def_id?: string }) => e.type_id === 'buckyos.cell' && e.def_id === defId)).toBe(true)
   const cell = (await api.outline(ALICE, ws.workspace_id)).find((e: { type_id: string; def_id?: string }) => e.type_id === 'buckyos.cell' && e.def_id === defId)
   expect(cell).toBeTruthy()
   const cellRead = await api.read(ALICE, ws.workspace_id, cell.entity_id)
@@ -66,7 +68,7 @@ test('a control from home: build, an instance with a binding, rebuild, a refused
 
   // a saved change builds into the instance
   await save(dir, 'declarative.json', JSON.stringify({ layout: 'stack', items: [{ kind: 'metric', label: '全部任务', bind: 'data.count', format: 'number' }] }))
-  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-insert-group-extension', 'aiws-menu-extensions')
+  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-extensions')
   await dialog.getByTestId(`aiws-ext-row-${defId}`).click()
   await dialog.getByTestId('aiws-ext-build').click()
   await expect(dialog.getByTestId('aiws-ext-build-ok')).toBeVisible({ timeout: 30_000 })
@@ -100,11 +102,10 @@ test('a control from home: build, an instance with a binding, rebuild, a refused
 
   // a second workspace adds it from the library
   const ws2 = await api.sample(ALICE, '控件使用 E2E')
-  await page.getByTestId('aiws-main-menu').click()
-  await page.getByTestId('aiws-back').click()
+  await mainMenu(page, 'aiws-menu-workspace', 'aiws-back')
   await page.locator(`[data-testid="aiws-workspace-card"][data-workspace-id="${ws2.workspace_id}"]`).getByTestId('aiws-open').click()
   await expect(page.getByTestId('aiws-workspace')).toHaveAttribute('data-workspace-id', ws2.workspace_id)
-  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-insert-group-extension', 'aiws-menu-extensions')
+  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-extensions')
   await dialog.getByTestId('aiws-ext-library').click()
   await dialog.getByTestId(`aiws-ext-library-pick-${NAME}`).check()
   await dialog.getByTestId('aiws-ext-library-add').click()
@@ -161,7 +162,7 @@ test('composite controls: inserted from the catalogue, laid out from the composi
   const { ws, card, board, boardId } = await compositeWorkspace(api, `composite-e2e ${Date.now()}`)
   await openCanvas(page, ALICE, ws.workspace_id)
   // an instance: the container from the extension catalogue, no data asked for
-  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-insert-group-extension', 'aiws-menu-extensions')
+  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-extensions')
   const dialog = page.getByTestId('aiws-ext-dialog')
   await dialog.getByTestId(`aiws-ext-row-${boardId}`).click()
   await expect(dialog.getByTestId('aiws-ext-deps')).toHaveText('did:bns:alice#card-e2e')
@@ -171,6 +172,8 @@ test('composite controls: inserted from the catalogue, laid out from the composi
   await catalog.getByTestId('aiws-instance-config-title').fill('Sprint')
   await catalog.getByTestId('aiws-catalog-insert').click()
   await expect(catalog).toBeHidden()
+  // placed once its bindings are settled (on_bind)
+  await expect.poll(async () => (await api.outline(ALICE, ws.workspace_id)).some((e: J) => e.kind === 'composite')).toBe(true)
   const instance = (await api.outline(ALICE, ws.workspace_id)).find((e: J) => e.kind === 'composite') as J
   expect(instance.def_id).toBe(boardId)
   const id = String(instance.entity_id)
@@ -222,7 +225,7 @@ test('composite controls: inserted from the catalogue, laid out from the composi
   expect(all.filter((e: J) => e.parent_id === copy.entity_id).map((e: J) => e.slot)).toEqual(['cards', 'cards'])
 
   // a .pikg made by the service, then put into the library
-  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-insert-group-extension', 'aiws-menu-extensions')
+  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-extensions')
   await dialog.getByTestId(`aiws-ext-check-${boardId}`).check()
   await dialog.getByTestId('aiws-ext-export').click()
   await dialog.getByTestId('aiws-ext-export-name').fill('boards-e2e')
@@ -274,7 +277,7 @@ test('Q24: on a workspace\'s own host the home folder is reached too: a new cont
   ]) as J
   expect(surface.status, JSON.stringify(surface)).toBe('accepted')
   await openWorkspacePage(page, ALICE, ws.workspace_id, 'free')
-  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-insert-group-extension', 'aiws-menu-extensions')
+  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-extensions')
   const dialog = page.getByTestId('aiws-ext-dialog')
   await dialog.getByTestId('aiws-ext-new').click()
   await dialog.getByTestId('aiws-ext-new-name').fill('own-host-kpi')
@@ -389,8 +392,8 @@ test('P2 design mode: a click on a declarative button selects the Block and note
   expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head)
   expect(await status(api, ws.workspace_id)).toBe('open')
   // the events page of the instance shows what it binds
+  // the properties panel's "interaction" section (UI 框架 PRD §10.2)
   await openSide(page, 'inspector')
-  await page.getByTestId('aiws-instance-page-events').click()
   await expect(page.getByTestId('aiws-events-kind-completed-0')).toHaveValue('write')
   await expect(page.getByTestId('aiws-events-target-completed-0')).toHaveValue('task')
   await runMode(page, true)
@@ -404,7 +407,7 @@ test('P2 view mode runs: a collaborator with update writes through a button, a r
   const built = await api.build(ALICE, ws.workspace_id, BUTTON_FILES)
   expect((await api.commit(ALICE, ws, [TASK(), { op: 'entity.create', entity_id: 'btn', type_id: 'buckyos.cell', parent_id: 'free', order_key: 'a', placement: { x: 40, y: 40, w: 240, h: 140 },
     payload: { view: { type: 'declarative' }, def_ref: { entity_id: built.def_entity_id }, bindings: { task: { entity_id: 'task' } }, on: WRITE_STATUS } }])).status).toBe('accepted')
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', capabilities: ['read'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', allow: ['read'] }] })
   await api.rpc(BOB, 'ws.set_user_state', { workspace_id: ws.workspace_id, entries: { 'canvas:mode': 'view' } })
   const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } })
   const page = await context.newPage()
@@ -415,11 +418,45 @@ test('P2 view mode runs: a collaborator with update writes through a button, a r
   await page.getByTestId('aiws-decl-button-completed').click()
   await expect(page.getByTestId('aiws-notice').filter({ hasText: '不能修改数据 task' }).last()).toBeVisible()
   expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head)
-  await api.rpc(ALICE, 'ws.grant', { workspace_id: ws.workspace_id, subject: 'bob', capabilities: ['read', 'update'] })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: 'bob', allow: ['read', 'update'] }] })
   await openCanvas(page, BOB, ws.workspace_id)
   await page.getByTestId('aiws-decl-button-completed').click()
   await expect.poll(() => status(api, ws.workspace_id)).toBe('done')
   expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head + 1)
+  await context.close()
+})
+
+test('P2 a guest of a public link views and its HTML control runs by itself: a click on the canvas does not stop it; its write is refused (owner 11-12)', async ({ browser, api }) => {
+  const ws = await api.freeCanvas(ALICE, `guest-run-e2e ${Date.now()}`)
+  const built = await api.build(ALICE, ws.workspace_id, DONE_FILES('done'))
+  expect((await api.commit(ALICE, ws, [TASK(), { op: 'entity.create', entity_id: 'card', type_id: 'buckyos.cell', parent_id: 'free', order_key: 'a', placement: { x: 40, y: 40, w: 260, h: 200 },
+    payload: { view: { type: 'html' }, def_ref: { entity_id: built.def_entity_id }, bindings: { task: { entity_id: 'task' } }, on: WRITE_STATUS } }])).status).toBe('accepted')
+  // a public link: anonymous access on, `@guest` reads (权限需求 §4.2)
+  await api.rpc(ALICE, 'acl.set_anonymous', { workspace_id: ws.workspace_id, enabled: true })
+  await api.rpc(ALICE, 'acl.set', { workspace_id: ws.workspace_id, changes: [{ subject: '@guest', allow: ['read'] }] })
+  const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } })
+  const page = await context.newPage()
+  await openWorkspacePage(page, { guest: true }, ws.workspace_id)
+  await expect(page.getByTestId('aiws-principal')).toHaveAttribute('data-guest', 'true')
+  if (await page.getByTestId('aiws-top-canvas').isVisible().catch(() => false)) await page.getByTestId('aiws-top-canvas').click()
+  // nothing chosen: a guest views, and view mode runs
+  await expect(page.getByTestId('aiws-canvas')).toHaveAttribute('data-mode', 'view', { timeout: 30_000 })
+  await expect(page.getByTestId('aiws-run-toggle')).toHaveAttribute('data-interactive', 'true')
+  await expect(page.getByTestId('aiws-html-active-card')).toBeVisible()
+  const frame = page.frameLocator('.aiws-html-frame')
+  await expect(frame.locator('#done')).toBeVisible()
+  await frame.locator('#out').evaluate((el) => { el.setAttribute('data-mark', 'same-runtime') })
+  // clicks on the empty canvas and on another place: the same runtime keeps running
+  await page.mouse.click(1200, 700)
+  await page.mouse.click(900, 500)
+  await page.waitForTimeout(500)
+  await expect(page.getByTestId('aiws-html-active-card')).toBeVisible()
+  await expect(frame.locator('#out')).toHaveAttribute('data-mark', 'same-runtime')
+  // it runs for the guest, but what it writes needs update
+  const head = await api.headSeq(ALICE, ws.workspace_id)
+  await frame.locator('#done').click()
+  await expect(page.getByTestId('aiws-notice').filter({ hasText: '不能修改数据 task' }).last()).toBeVisible()
+  expect(await api.headSeq(ALICE, ws.workspace_id)).toBe(head)
   await context.close()
 })
 
@@ -496,7 +533,7 @@ test('P2 upgrade: a control imported at 0.1.0 is upgraded to 0.2.0 from the libr
   const before = await api.read(ALICE, ws.workspace_id, 'inst') as J & { content: { payload: J } }
   await openCanvas(page, ALICE, ws.workspace_id)
   await expect(page.getByTestId('aiws-decl-inst')).toContainText('version one')
-  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-insert-group-extension', 'aiws-menu-extensions')
+  await mainMenu(page, 'aiws-menu-insert', 'aiws-menu-extensions')
   const dialog = page.getByTestId('aiws-ext-dialog')
   await dialog.getByTestId(`aiws-ext-row-${defId}`).click()
   await expect(dialog.getByTestId('aiws-ext-new-version')).toHaveAttribute('data-version', '0.2.0')
@@ -531,7 +568,7 @@ test('P3 templates: canvases saved as a template into the library, a new workspa
       payload: { view: { type: 'declarative' }, def_ref: { entity_id: kpi.def_entity_id }, bindings: { data: { entity_id: 'tasks' } }, title: '{{params.team_name}} KPI' } },
   ])).status).toBe('accepted')
   await openCanvas(page, ALICE, ws.workspace_id)
-  await mainMenu(page, 'aiws-menu-export-menu', 'aiws-menu-save-template')
+  await mainMenu(page, 'aiws-menu-surface', 'aiws-menu-save-template')
   const save = page.getByTestId('aiws-save-template')
   await expect(save.getByTestId('aiws-template-surface-free')).toBeChecked()
   await save.getByTestId('aiws-template-title').fill('Team E2E')
@@ -547,7 +584,7 @@ test('P3 templates: canvases saved as a template into the library, a new workspa
   await save.getByTestId('aiws-save-template-close').click()
   // installing created no workspace; the New dialog lists the template beside the built-in ones
   const listed = (await api.rpc(ALICE, 'ws.list', {})).workspaces.length
-  await mainMenu(page, 'aiws-menu-new')
+  await mainMenu(page, 'aiws-menu-workspace', 'aiws-menu-new')
   await page.getByTestId('aiws-new-tab-template').click()
   await page.getByTestId(`aiws-template-lib-${pkg}-team-e2e`).click()
   await page.getByTestId('aiws-template-param-team_name').fill('Alpha')
@@ -562,9 +599,9 @@ test('P3 templates: canvases saved as a template into the library, a new workspa
   const read = await api.read(ALICE, made!, String(cell.entity_id)) as J & { content: { payload: J } }
   const table = ((read.content.payload.bindings as J).data as J).entity_id as string
   expect(outline.find((e: J) => e.entity_id === table)?.type_id).toBe('buckyos.table-source')
-  expect((await api.rpc(ALICE, 'doc.query', { workspace_id: made, source_id: table, limit: 10 })).rows).toHaveLength(0)
+  expect((await api.table(ALICE, made!, { source_id: table, limit: 10 })).rows).toHaveLength(0)
   // the source workspace still has its rows
-  expect((await api.rpc(ALICE, 'doc.query', { workspace_id: ws.workspace_id, source_id: 'tasks', limit: 10 })).rows).toHaveLength(2)
+  expect((await api.table(ALICE, ws.workspace_id, { source_id: 'tasks', limit: 10 })).rows).toHaveLength(2)
 })
 
 test('Q33 a host older than the definition: a layout it does not ship is a marked group, an HTML API above it shows the snapshot fallback', async ({ page, api }) => {
@@ -573,7 +610,7 @@ test('Q33 a host older than the definition: a layout it does not ship is a marke
     { op: 'entity.create', entity_id: 'd-radial', type_id: 'buckyos.block-def', parent_id: 'data', order_key: 'd1',
       payload: { def_id: 'radial-e2e', kind: 'composite', title: 'Radial', composition: { layout: { algorithm: 'radial' }, slots: { items: {} } } } },
     { op: 'entity.create', entity_id: 'd-future', type_id: 'buckyos.block-def', parent_id: 'data', order_key: 'd2',
-      payload: { def_id: 'future-e2e', kind: 'html', title: 'Future', allow_no_source: true, html: { html: '<div/>', js: 'aiws.ready()', api_version: 4 } } },
+      payload: { def_id: 'future-e2e', kind: 'html', title: 'Future', allow_no_source: true, html: { html: '<div/>', js: 'aiws.ready()', api_version: 7 } } },
     { op: 'entity.create', entity_id: 'ring', type_id: 'buckyos.container', parent_id: 'free', order_key: 'a', placement: { x: 40, y: 40, w: 'auto', h: 'auto' }, payload: { kind: 'composite', def_ref: { entity_id: 'd-radial' } } },
     { op: 'entity.create', entity_id: 'r1', type_id: 'buckyos.cell', parent_id: 'ring', order_key: 'a', placement: { x: 20, y: 30, w: 160, h: 80 }, payload: { view: { type: 'shape' }, slot: 'items', title: 'one', config: { shape: 'rect' } } },
     { op: 'entity.create', entity_id: 'future', type_id: 'buckyos.cell', parent_id: 'free', order_key: 'b', placement: { x: 500, y: 40, w: 240, h: 140 }, payload: { view: { type: 'html' }, def_ref: { entity_id: 'd-future' } } },
@@ -583,7 +620,7 @@ test('Q33 a host older than the definition: a layout it does not ship is a marke
   await expect(page.getByTestId('aiws-composite-unknown-ring')).toContainText('radial')
   await expect(page.getByTestId('aiws-canvas-block-r1')).toBeVisible()
   await expect(page.getByTestId('aiws-block-fallback-future')).toHaveAttribute('data-reason', 'unsupported_api')
-  await expect(page.getByTestId('aiws-block-fallback-future')).toContainText('需要宿主 API 4')
+  await expect(page.getByTestId('aiws-block-fallback-future')).toContainText('需要宿主 API 7')
   await runMode(page, true)
   await expect(page.locator('.aiws-html-frame')).toHaveCount(0)
 })

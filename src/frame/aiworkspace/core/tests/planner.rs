@@ -71,7 +71,10 @@ fn tree_rules_and_auto_merge() {
     let order: Vec<String> = ws.store.children("surface-main").unwrap().into_iter().map(|e| e.child_id).collect();
     assert_eq!(order, vec!["g-b", "g-c", "g-d"]);
     // names are unique among siblings, also when moving in
-    ws.ok(json!([{ "op": "entity.rename", "entity_id": "g-c", "name": "同名", "expect": { "rev": 2 } }]));
+    // a following name moved aside when the node moved in (two `group-1`s under one parent are not allowed)
+    assert_eq!(ws.store.entities["g-c"].name.as_deref(), Some("group-3"));
+    let rev = ws.store.entities["g-c"].meta_rev;
+    ws.ok(json!([{ "op": "entity.rename", "entity_id": "g-c", "name": "同名", "expect": { "rev": rev } }]));
     ws.ok(json!([grp("g-e", "g-b", "b")]));
     let rev = ws.store.entities["g-e"].meta_rev;
     ws.ok(json!([{ "op": "entity.rename", "entity_id": "g-e", "name": "同名", "expect": { "rev": rev } }]));
@@ -338,7 +341,7 @@ fn keyed_documents_and_views() {
 fn permissions_append_only_and_personal_scope() {
     let mut ws = MemWorkspace::new();
     tasks(&mut ws);
-    let bob = Access { principal: "bob".into(), ws_caps: CapSet(Cap::Append as u16), scoped: Default::default() };
+    let bob = Access::granted("bob", CapSet(Cap::Append as u16), []);
     let env = ws.env("bob", "human", None, false);
     // append-only: may insert, may not update or delete
     let req = MemWorkspace::request(json!([{ "op": "table.insert_records", "source_id": "tasks",
@@ -349,7 +352,7 @@ fn permissions_append_only_and_personal_scope() {
         "values": [{ "record_id": "task-b1", "field_id": "title", "value": "x", "expect": { "rev": 3 } }] }]));
     assert_eq!(code(&ws.commit_with(&bob, &env, &req).err().unwrap().to_json()), "PERMISSION_DENIED");
     // read-only principal with comment: can annotate a cell, cannot touch data
-    let carol = Access { principal: "carol".into(), ws_caps: CapSet(Cap::Read as u16 | Cap::Comment as u16), scoped: Default::default() };
+    let carol = Access::granted("carol", CapSet(Cap::Read as u16 | Cap::Comment as u16), []);
     let env = ws.env("carol", "human", None, false);
     let req = MemWorkspace::request(json!([{ "op": "entity.create", "entity_id": "note-budget", "type_id": TYPE_ANNOTATION,
         "parent_id": "data", "order_key": "z", "scope": "personal",

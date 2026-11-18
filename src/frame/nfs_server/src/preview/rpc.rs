@@ -8,8 +8,10 @@
 //! explicit Retry. Planning failures answer `state: "unsupported"` with a
 //! `reason` (`no-pipeline` | `no-renderer` | `not-content`) and a `detail`;
 //! execution failures are `state: "failed"` with an `error`. A document's
-//! result is a PDF (`result_type: "document"`), accepted by a Runtime that
-//! accepts `pdf`.
+//! result is a PDF (`result_type: "document"`, accepted by a Runtime that
+//! accepts `pdf`), a legacy spreadsheet's an xlsx (`sheet`), markup's one
+//! self-contained HTML file (`html`). A thumbnail the content cannot give
+//! (no embedded picture, an encrypted PDF) is `unsupported`, too.
 //!
 //! `get_repr`: `args.work_key` of a work this principal ensured (within an
 //! hour); it never creates an attempt.
@@ -118,11 +120,20 @@ fn bucket_nfs_error(e: BucketError) -> NfsError {
 }
 
 /// `(input, input ObjId)` of the named source, after the caller's read check.
-async fn resolve_source(state: &SharedState, actor: &Actor, env: &Envelope, args: &ReprArgs, headers: &HeaderMap) -> NfsResult<Result<(Input, String), Value>> {
+async fn resolve_source(state: &SharedState, actor: &Actor, env: &Envelope, args: &ReprArgs, headers: &HeaderMap) -> NfsResult<Result<(Input, String, Option<String>), Value>> {
     let ndm = || async { state.share.store(&state.config).await.map(|s| s.clone()) };
     if let Some(at) = &env.at {
         let node = state.resolve_for(actor, at, Level::Read, "read")?;
+        if let Node::Archive(a) = &node {
+            if a.is_dir() {
+                return Ok(Err(unsupported("not-content", "folders and containers have no preview")));
+            }
+            let path = crate::archive::materialize(state, actor, a).await?;
+            let id = super::native_obj_id(&state.db, &format!("archive:{}", path.display()), &path).await?;
+            return Ok(Ok((Input::Path(path), id, Some(a.name()))));
+        }
         return Ok(match &node {
+            Node::Native { meta, .. } if meta.special => Err(unsupported("not-content", "device files, FIFOs and sockets have no preview")),
             Node::Native { root, rel, meta, .. } if meta.kind == "file" || meta.kind == "symlink" => {
                 let cfg = state.config.root(root).ok_or_else(|| stale("root gone"))?;
                 let full = join_root(&cfg.path, rel);
@@ -130,13 +141,13 @@ async fn resolve_source(state: &SharedState, actor: &Actor, env: &Envelope, args
                     state.require_symlink_target(actor, &full)?;
                 }
                 let id = super::native_obj_id(&state.db, &format!("{root}/{rel}"), &full).await?;
-                Ok((Input::Path(full), id))
+                Ok((Input::Path(full), id, None))
             }
             Node::Projection(p) => match &p.at {
                 crate::bucket::projection::ProjAt::File { binding, .. } => {
                     let id = ObjId::new(binding.obj_id.as_deref().unwrap_or_default()).map_err(|e| invalid(e.to_string()))?;
                     let content = super::content_of(&ndm().await?, &id).await.map_err(|e| not_found(e.message))?;
-                    Ok((Input::Object(id), content.to_string()))
+                    Ok((Input::Object(id), content.to_string(), None))
                 }
                 _ => Err(unsupported("not-content", "folders and containers have no preview")),
             },
@@ -170,34 +181,33 @@ async fn resolve_source(state: &SharedState, actor: &Actor, env: &Envelope, args
         return Ok(Err(unsupported("not-content", "the object holds no file content")));
     }
     let content = super::content_of(&ndm().await?, &id).await.map_err(|e| not_found(e.message))?;
-    Ok(Ok((Input::Object(id), content.to_string())))
+    Ok(Ok((Input::Object(id), content.to_string(), None)))
 }
 
-fn profile_for(kind: Kind, purpose: &str) -> Option<Profile> {
+fn profile_for(kind: Kind, purpose: &str) -> Result<Profile, Value> {
     match (purpose, kind) {
-        ("thumbnail", Kind::Audio | Kind::Document(_)) => None,
-        ("thumbnail", _) => Some(Profile::Thumbnail),
-        (_, Kind::Heif | Kind::Image) => Some(Profile::PreviewImage),
-        (_, Kind::Video) => Some(Profile::PreviewVideo),
-        (_, Kind::Audio) => Some(Profile::PreviewAudio),
-        (_, Kind::Document(_)) => Some(Profile::PreviewDocument),
-    }
-}
-
-fn result_type_of(profile: Profile) -> &'static str {
-    match profile {
-        Profile::PreviewImage | Profile::Thumbnail => "image",
-        Profile::PreviewVideo => "video",
-        Profile::PreviewAudio => "audio",
-        Profile::PreviewDocument => "document",
+        ("thumbnail", Kind::Audio) => Err(unsupported("no-renderer", "audio has no thumbnail")),
+        ("thumbnail", Kind::Markup(reader)) if reader != "epub" => Err(unsupported("no-renderer", "markup has no thumbnail")),
+        ("thumbnail", _) => Ok(Profile::Thumbnail),
+        (_, Kind::Pdf) => Err(unsupported("no-pipeline", "a PDF is shown as it is")),
+        (_, Kind::Heif | Kind::Image | Kind::Raster(_)) => Ok(Profile::PreviewImage),
+        (_, Kind::Video) => Ok(Profile::PreviewVideo),
+        (_, Kind::Audio) => Ok(Profile::PreviewAudio),
+        (_, Kind::Document(ext)) if super::media::is_sheet(ext) => Ok(Profile::PreviewSheet),
+        (_, Kind::Document(_)) => Ok(Profile::PreviewDocument),
+        (_, Kind::Markup(_)) => Ok(Profile::PreviewHtml),
     }
 }
 
 /// The Runtime renderer (`runtime.accept`) a result needs.
 fn renderer_of(profile: Profile) -> &'static str {
     match profile {
+        Profile::PreviewImage | Profile::Thumbnail => "image",
+        Profile::PreviewVideo => "video",
+        Profile::PreviewAudio => "audio",
         Profile::PreviewDocument => "pdf",
-        other => result_type_of(other),
+        Profile::PreviewSheet => "sheet",
+        Profile::PreviewHtml => "html",
     }
 }
 
@@ -229,6 +239,9 @@ pub async fn wire(state: &SharedState, rec: &Record) -> NfsResult<Value> {
                 "plan": r["plan"],
             });
         }
+        _ if rec.error.as_ref().is_some_and(|e| e["code"] == super::convert::NO_THUMBNAIL) => {
+            return Ok(unsupported("no-renderer", rec.error.as_ref().and_then(|e| e["message"].as_str()).unwrap_or_default()));
+        }
         _ => out["error"] = rec.error.clone().unwrap_or_else(|| json!({"code": "PIPELINE_FAILED", "message": "the conversion failed", "retryable": true})),
     }
     Ok(out)
@@ -247,24 +260,39 @@ pub async fn op_repr(state: &SharedState, actor: &Actor, env: &Envelope, headers
     if !probe.available() {
         return Ok(unsupported("no-pipeline", probe.missing_detail().unwrap_or_default()));
     }
-    let (input, input_obj_id) = match resolve_source(state, actor, env, &args, headers).await? {
+    let (input, input_obj_id, name_hint) = match resolve_source(state, actor, env, &args, headers).await? {
         Ok(found) => found,
         Err(planned) => return Ok(planned),
     };
-    let head = super::read_head(state, &input).await.map_err(|e| not_found(e.message))?;
-    let kind = match super::media::sniff(&head, None) {
-        Some(kind) => Some(kind),
-        None => super::media::sniff(&head, super::name_of(state, &input).await.as_deref()),
+    let head = super::sniff_bytes(state, &input).await.map_err(|e| not_found(e.message))?;
+    let name = match name_hint {
+        Some(name) => Some(name),
+        None => super::name_of(state, &input).await,
     };
-    let Some(kind) = kind else {
+    let Some(kind) = super::media::sniff(&head, name.as_deref()) else {
         return Ok(unsupported("no-pipeline", "no converter for this content type"));
     };
-    let Some(profile) = profile_for(kind, purpose) else {
-        let what = if kind == Kind::Audio { "audio has no thumbnail" } else { "documents have no thumbnail yet" };
-        return Ok(unsupported("no-renderer", what));
+    let profile = match profile_for(kind, purpose) {
+        Ok(profile) => profile,
+        Err(planned) => return Ok(planned),
     };
-    let Some(converter) = probe.converter(profile) else {
-        return Ok(unsupported("no-pipeline", probe.detail_for(profile)));
+    let mut preview_pdf = None;
+    if let (Profile::Thumbnail, Kind::Document(ext), Some(pdf)) = (profile, kind, &probe.pdf) {
+        if let Some(soffice) = probe.soffice_for_document(ext) {
+            preview_pdf = super::cached_preview_pdf(state, soffice, &input_obj_id).await.map(|id| (id, tools::Converter::Pdftoppm(pdf.clone())));
+        }
+    }
+    let (preview_pdf, converter) = match preview_pdf {
+        Some((id, converter)) => (Some(id), converter),
+        None => match probe.converter(profile, kind) {
+            Ok(converter) => (None, converter),
+            Err(detail) => {
+                if let Kind::Document(_) = kind {
+                    log::warn!("preview: no converter for {kind:?} ({}): {detail}; LibreOffice installs: {}", profile.as_str(), serde_json::json!(probe.office));
+                }
+                return Ok(unsupported("no-pipeline", detail));
+            }
+        },
     };
     if let (Kind::Heif, tools::Converter::Ffmpeg(t)) = (kind, &converter) {
         if !t.heif {
@@ -276,7 +304,7 @@ pub async fn op_repr(state: &SharedState, actor: &Actor, env: &Envelope, headers
             return Ok(unsupported("no-renderer", format!("the Runtime does not accept {} results", renderer_of(profile))));
         }
     }
-    let plan = Plan { input, input_obj_id, kind, profile, hevc_playable: args.runtime.video_codecs.hevc };
+    let plan = Plan { input, input_obj_id, kind, profile, hevc_playable: args.runtime.video_codecs.hevc, name, preview_pdf };
     let rec = super::ensure(state, &converter, plan, args.retry, args.expected_attempt_id.as_deref()).await?;
     state.preview.authorize(&actor_key(actor), &rec.work_key);
     wire(state, &rec).await

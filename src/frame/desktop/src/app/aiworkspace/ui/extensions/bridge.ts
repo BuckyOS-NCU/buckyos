@@ -12,6 +12,7 @@ import { randomId } from '../../api/ids'
 import type {
   CellPayload, EntityEnvelope, FieldDef, Json, KeyedContent, Operation, QueryPage, QueryParams, QueryRow, RecordContent, RichTextContent, Selector, StoredPlacement, TableSourceContent,
 } from '../../api/types'
+import { pathOf, resolvePath } from '../../api/paths'
 import { aiwsT, aiwsText } from '../../i18n'
 import type { WorkspaceStore } from '../../state/store'
 import { modePolicy, type CanvasMode } from '../blocks/registry'
@@ -47,7 +48,9 @@ export function bindingsOf(payload: { source_ref?: { entity_id: string }; bindin
  * (Q27: view's `writes: false` no longer refuses every write). */
 export function writeAllowed(store: WorkspaceStore, mode: CanvasMode, interactive: boolean, entityId: string): boolean {
   if (modePolicy(mode).writes) return true
-  return mode === 'view' && interactive && (store.outline.get(entityId)?.capabilities.includes('update') ?? false)
+  // `append` alone: the records a person submits (控件机制 TODO G20); the service decides which those are
+  const caps = store.outline.get(entityId)?.capabilities ?? []
+  return mode === 'view' && interactive && (caps.includes('update') || caps.includes('append'))
 }
 
 function plain(field: FieldDef, v: Json | undefined): Json | undefined {
@@ -84,6 +87,16 @@ function stored(field: FieldDef, v: Json | undefined): Json | undefined {
     case 'text': return typeof v === 'string' ? v : JSON.stringify(v)
     default: return v
   }
+}
+
+/** An option id for a name: its letters and digits, lower case, and a short hash of the whole name (stable, unique). */
+export function optionIdOf(name: string, taken: Set<string> = new Set()): string {
+  let h = 0x811c9dc5
+  for (const c of name) h = Math.imul(h ^ c.codePointAt(0)!, 0x01000193) >>> 0
+  const slug = name.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'o'
+  let id = `${/^[a-z0-9]/.test(slug) ? slug : `o${slug}`}-${h.toString(36)}`.slice(0, 64)
+  for (let i = 2; taken.has(id); i++) id = `${id.slice(0, 60)}-${i}`
+  return id
 }
 
 /** The typed writes of host API 2 as operations (`upsert`, `setColumn`, `recordSet`, `setMarkdown`, `createBlock`) over
@@ -187,6 +200,51 @@ export function typedWriter(store: WorkspaceStore, anchor: EntityEnvelope, bindi
         const ops: Operation[] = []
         if (inserts.length) ops.push({ op: 'table.insert_records', source_id: b.entity_id, records: inserts })
         if (sets.length) ops.push({ op: 'table.set_values', source_id: b.entity_id, values: sets })
+        return { ops }
+      }
+      case 'toggle': {
+        // one value in a list field of the caller's own record (控件机制 TODO G20: a table whose `submitter` field the
+        // service fills; each person writes only theirs): added when absent, removed when present; the record is created
+        // on the first choice; `max` (and the field's `max_items`, which the core enforces) caps the list
+        const { b, meta } = await tableOf(name)
+        const f = meta.fields.find((x) => x.name === a.field || x.field_id === a.field)
+        if (!f) throw new Error(aiwsT('aiworkspace.extension.noTableField', { field: String(a.field) }))
+        const submitter = meta.fields.find((x) => x.submitter)
+        const principal = store.session.info().principal
+        if (!submitter || !principal) throw new Error(aiwsT('aiworkspace.extension.toggleNeedsSubmitter', { name }))
+        const raw = typeof a.value === 'string' ? a.value : String(a.value ?? '')
+        // a select's option, named by its id or its label (a projected photo is keyed by its name)
+        const option = f.options ? f.options.find((o) => o.option_id === raw) ?? f.options.find((o) => o.label === raw) : undefined
+        if (f.options && !option) throw new Error(aiwsT('aiworkspace.extension.toggleUnknown', { value: raw, field: f.name }))
+        const value = option ? option.option_id : raw
+        const own = (await allRows({ entity_id: b.entity_id })).find((r) => r.values[submitter.field_id] === principal)
+        const before = own ? (Array.isArray(own.values[f.field_id]) ? (own.values[f.field_id] as Json[]).map(String) : []) : []
+        const next = before.includes(value) ? before.filter((x) => x !== value) : [...before, value]
+        const max = typeof a.max === 'number' ? a.max : f.max_items
+        if (max !== undefined && next.length > max) throw new Error(aiwsT('aiworkspace.extension.toggleMax', { max }))
+        if (!own) return { ops: [{ op: 'table.insert_records', source_id: b.entity_id, records: [{ record_id: `r${randomId().slice(0, 16)}`, values: { [f.field_id]: next } }] }] }
+        return { ops: [next.length
+          ? { op: 'table.set_values', source_id: b.entity_id, values: [{ record_id: own.record_id, field_id: f.field_id, value: next, expect: { rev: own.revs[f.field_id] ?? 0 } }] }
+          : { op: 'table.unset_values', source_id: b.entity_id, values: [{ record_id: own.record_id, field_id: f.field_id, expect: { rev: own.revs[f.field_id] ?? 0 } }] }] }
+      }
+      case 'addOptions': {
+        // the options of a select field from the files of a bound directory (`from`; `accept`: image / audio / video):
+        // one per file not yet an option, its label the file's name (a photo vote's ballot, 控件机制 TODO §0.4)
+        const { b, meta } = await tableOf(name)
+        const f = meta.fields.find((x) => x.name === a.field || x.field_id === a.field)
+        if (!f?.options) throw new Error(aiwsT('aiworkspace.extension.noTableField', { field: String(a.field) }))
+        const dir = await store.session.read<{ payload: { members?: Record<string, { kind: string; media_type?: string }> } }>(binding(String(a.from ?? '')).entity_id)
+        const accept = typeof a.accept === 'string' ? a.accept : 'any'
+        const labels = new Set(f.options.map((o) => o.label))
+        const ids = new Set(f.options.map((o) => o.option_id))
+        const ops: Operation[] = []
+        for (const [member, m] of Object.entries(dir.content.payload?.members ?? {}).sort((x, y) => x[0].localeCompare(y[0]))) {
+          if (m.kind !== 'file' || labels.has(member) || (accept !== 'any' && !(m.media_type ?? '').startsWith(`${accept}/`))) continue
+          const id = optionIdOf(member, ids)
+          ids.add(id)
+          // several in one Commit: each `expect` is the field's revision before it (the service accepts its own bump)
+          ops.push({ op: 'table.add_option', source_id: b.entity_id, field_id: f.field_id, option: { option_id: id, label: member.slice(0, 256) }, expect: { rev: f.def_rev } })
+        }
         return { ops }
       }
       case 'setColumn': {
@@ -299,7 +357,11 @@ export function makeBridge(store: WorkspaceStore, target: BridgeTarget, onSnapsh
       const result = await store.session.read<Json>(entityId, (selector ?? undefined) as Selector | undefined)
       return result as unknown as Json
     },
-    query: async (params) => (await store.session.query(params as unknown as QueryParams)) as unknown as Json,
+    query: async (params) => {
+      const p = (params ?? {}) as { sql?: unknown; params?: Json[] | null }
+      if (typeof p.sql !== 'string') throw new Error('aiws.query(sql, params?) takes one SQL SELECT (host API 6)')
+      return (await store.session.sql({ sql: p.sql, ...(p.params ? { params: p.params } : {}) })) as unknown as Json
+    },
     submit: (operations, label) => submit(operations, label),
     upload: async (bytes, fileName, mediaType) => {
       const blob = new Blob([bytes as BlobPart], mediaType ? { type: mediaType } : undefined)
@@ -397,19 +459,20 @@ export function makeBridge(store: WorkspaceStore, target: BridgeTarget, onSnapsh
         default: throw new Error(aiwsT('aiworkspace.extension.unknownRead', { what }))
       }
     },
+    // the one path syntax and the name / title matching of `doc.find` (核心 API 调整 R5): what a path printed anywhere names
     outline: async (what, args) => {
       const a = (args ?? {}) as { target?: string | null; depth?: number; text?: string }
-      const brief = (e: EntityEnvelope) => ({ entity_id: e.entity_id, type_id: e.type_id, title: e.title ?? e.name ?? null, parent_id: e.parent_id ?? null })
-      const all = store.outline.all().filter((e) => !e.deleted)
+      const brief = (e: EntityEnvelope) => ({ entity_id: e.entity_id, type_id: e.type_id, name: e.name, title: e.title ?? null, path: pathOf(store.outline, e.entity_id), parent_id: e.parent_id ?? null })
       if (what === 'find') {
         const t = String(a.text ?? '').toLowerCase()
-        return all.filter((e) => String(e.title ?? e.name ?? '').toLowerCase().includes(t)).slice(0, 50).map(brief) as unknown as Json
+        const all = store.outline.all().filter((e) => !e.deleted && e.entity_id !== 'root')
+        return all.filter((e) => [e.name, e.title].some((x) => typeof x === 'string' && x.toLowerCase().includes(t))).slice(0, 50).map(brief) as unknown as Json
       }
       if (what === 'resolve') {
-        const t = String(a.target ?? '')
-        return all.filter((e) => e.entity_id === t || e.title === t || e.name === t).map(brief) as unknown as Json
+        const e = resolvePath(store.outline, String(a.target ?? ''))
+        return (e ? [brief(e)] : []) as unknown as Json
       }
-      const root = a.target ?? 'data'
+      const root = a.target ? (resolvePath(store.outline, a.target)?.entity_id ?? a.target) : 'data'
       const out: ReturnType<typeof brief>[] = []
       const walk = (id: string, depth: number) => {
         for (const c of store.outline.childrenOf(id)) {
@@ -445,6 +508,23 @@ export function makeBridge(store: WorkspaceStore, target: BridgeTarget, onSnapsh
       if (!b) throw new Error(aiwsT('aiworkspace.extension.noBatch'))
       if (action === 'abort' || b.operations.length === 0) return { status: action === 'abort' ? 'aborted' : 'unchanged' }
       return submit(b.operations, b.label)
+    },
+    // ---- v4 (控件机制 TODO H4, H6)
+    userState: async (action, key, value) => {
+      if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) throw new Error(aiwsT('aiworkspace.extension.userStateKey'))
+      const full = `block:${target.cell.entity_id}/${key}`
+      if (action === 'get') return (store.userState.get<Json>(full) ?? null) as Json
+      store.userState.set(full, value)
+      return null
+    },
+    mediaUrl: async (name, member) => {
+      const b = binding(name)
+      const read = await store.session.read<{ payload: { object_id?: string; members?: Record<string, { object_id?: string }> } }>(b.entity_id)
+      const payload = read.content.payload
+      const objectId = member !== null ? payload.members?.[member]?.object_id : payload.object_id
+      if (!objectId) throw new Error(aiwsT('aiworkspace.extension.noMedia', { name: member ?? name }))
+      const url = await store.session.assetStreamUrl(objectId)
+      return url ?? URL.createObjectURL(await store.session.fetchAsset(objectId))
     },
     watch: (name, notify) => {
       const b = bindings[name]

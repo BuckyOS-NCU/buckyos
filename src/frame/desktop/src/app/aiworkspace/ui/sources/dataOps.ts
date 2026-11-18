@@ -5,20 +5,20 @@ import { SYSTEM_IDS, type EntityEnvelope, type Json, type Operation } from '../.
 import { aiwsT, localizedLabels } from '../../i18n'
 import type { WorkspaceStore } from '../../state/store'
 import type { ImportedAsset } from '../../api/session'
-import { MOCK_WISH_DEF_ID, mockWishDefOp } from '../wish/mockWishDef'
 
 export const TYPE_LABEL: Readonly<Record<string, string>> = localizedLabels({
   'buckyos.container': 'aiworkspace.data.type.container', 'buckyos.record': 'aiworkspace.data.type.record', 'buckyos.richtext': 'aiworkspace.data.type.richtext',
   'buckyos.table-source': 'aiworkspace.data.type.tableSource', 'buckyos.cell': 'aiworkspace.data.type.cell', 'buckyos.asset-ref': 'aiworkspace.data.type.assetRef',
   'buckyos.annotation': 'aiworkspace.data.type.annotation', 'buckyos.wish': 'aiworkspace.data.type.wish', 'buckyos.block-def': 'aiworkspace.data.type.blockDef',
   'buckyos.viewport': 'aiworkspace.data.type.viewport', 'buckyos.show-path': 'aiworkspace.data.type.showPath',
+  'buckyos.dir': 'aiworkspace.data.type.dir',
 })
 
 export function entityLabel(entity: EntityEnvelope): string {
   return entity.title ?? entity.name ?? entity.entity_id
 }
 
-export type NewDataKind = 'folder' | 'table' | 'richtext' | 'record' | 'wish' | 'note' | 'link'
+export type NewDataKind = 'folder' | 'dir' | 'table' | 'richtext' | 'record' | 'wish' | 'note' | 'link'
 
 export function importedAssetOps(store: WorkspaceStore, parentId: string, items: ImportedAsset[], canvas?: { parentId: string; free: boolean; x: number; y: number }): Operation[] {
   const operations: Operation[] = []
@@ -52,6 +52,7 @@ export function newDataOps(store: WorkspaceStore, parentId: string, kind: NewDat
   const name = title.trim() || undefined
   const create = (id: string, typeId: string, payload: Record<string, Json>): Operation => ({ op: 'entity.create', entity_id: id, type_id: typeId, parent_id: parentId, order_key: key, ...(name ? { name } : {}), payload })
   switch (kind) {
+    case 'dir': return [create(randomId('dir'), 'buckyos.dir', { members: {} })]
     case 'folder': return [create(randomId('f'), 'buckyos.container', { kind: 'folder', title: title || aiwsT('aiworkspace.data.default.folder') })]
     case 'table': return [create(randomId('s'), 'buckyos.table-source', { title_field_id: 'title', fields: [{ field_id: 'title', name: aiwsT('aiworkspace.data.default.title'), type: 'text', required: true }, { field_id: 'done', name: aiwsT('aiworkspace.data.default.done'), type: 'boolean' }] })]
     case 'richtext': return [create(randomId('t'), 'buckyos.richtext', { content: { type: 'doc', content: [{ type: 'paragraph', attrs: { block_id: randomId('b') }, content: title ? [{ type: 'text', text: title }] : [] }] } })]
@@ -62,11 +63,8 @@ export function newDataOps(store: WorkspaceStore, parentId: string, kind: NewDat
     case 'note': return [create(randomId('n'), 'buckyos.annotation', { kind: 'note', body: title || aiwsT('aiworkspace.data.stickyNote'), style: { color: '#fff2cc' } })]
     case 'link': return [] // inserted through insertLinkedSource (sourceLinks.ts): the link decides the type
     case 'wish': {
-      const ops: Operation[] = []
-      if (!store.outline.get(MOCK_WISH_DEF_ID)) ops.push(mockWishDefOp(store.core.order_key_between(store.outline.childrenOf('data').filter((e) => !SYSTEM_IDS.has(e.entity_id)).at(-1)?.order_key ?? undefined, undefined)) as Operation)
       const wishTitle = title || aiwsT('aiworkspace.data.default.wish')
-      ops.push(create(randomId('w'), 'buckyos.wish', { title: wishTitle, prompt: title, executor: 'mock', output_mode: 'overwrite', output: { container_id: parentId, name: aiwsT('aiworkspace.data.default.wishResult', { name: wishTitle }) } }))
-      return ops
+      return [create(randomId('w'), 'buckyos.wish', { title: wishTitle, prompt: title, executor: 'xllm', output_mode: 'overwrite', output: { container_id: parentId, name: aiwsT('aiworkspace.data.default.wishResult', { name: wishTitle }) } })]
     }
   }
 }

@@ -43,6 +43,10 @@ export class Replica {
      * The next queued request ready to send, or `null`.
      */
     next_to_send(): string;
+    /**
+     * An asset the service staged after the replica was made (an upload from this window): local plans know it.
+     */
+    note_asset(object_id: string, media_type: string, size: number): void;
     outline(): string;
     pending(): string;
     /**
@@ -150,13 +154,26 @@ export function richtext_to_markdown(ast_json: string): string;
 export function verify_object(id: string, canonical_text: string): void;
 
 /**
+ * A table view compiled to SQL over the logical table named `table` (a path or an alias, quoted here) — core
+ * `sqlview::compile_view`, the one compiler the service uses too (核心 API 调整 §3.5). For sessions without a replica,
+ * which read a view with `doc.query { sql }`. `fields_json`: the table's live fields as `doc.read` gives them;
+ * `view_json`: `{ filter?, sorts?, fields?, group?, manual_order? }`; `projection`: `records` (`_record`, the native
+ * rows) or `display` (`_id` and the display columns). → `{ sql, count_sql, group_sql?, diagnostics }`.
+ */
+export function view_sql(table: string, fields_json: string, view_json: string, projection: string): string;
+
+/**
  * Configuration digest of a wish payload (results record it; §4.3).
  */
 export function wish_config_digest(payload_json: string): string;
 
 /**
  * Whether a wish payload must be analysed before it can execute (§4.1).
+ * The main state and next action of a wish (PRD §5.8, 许愿格交互升级 §2.6): `freshness_json` is its freshness, `runs_json`
+ * what the page knows of its runs (`{ active?: { stage, state }, last_failed?: { stage, error } }`).
  */
+export function wish_main_status(freshness_json: string, runs_json: string): string;
+
 export function wish_needs_analysis(payload_json: string): boolean;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -185,6 +202,7 @@ export interface InitOutput {
     readonly replica_mark: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly replica_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
     readonly replica_next_to_send: (a: number, b: number) => void;
+    readonly replica_note_asset: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly replica_outline: (a: number, b: number) => void;
     readonly replica_pending: (a: number, b: number) => void;
     readonly replica_pending_richtext_updates: (a: number, b: number, c: number, d: number) => void;
@@ -202,7 +220,9 @@ export interface InitOutput {
     readonly richtext_schema: (a: number) => void;
     readonly richtext_to_markdown: (a: number, b: number, c: number) => void;
     readonly verify_object: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly view_sql: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
     readonly wish_config_digest: (a: number, b: number, c: number) => void;
+    readonly wish_main_status: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly wish_needs_analysis: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number) => void;
     readonly __wbindgen_export2: () => number;

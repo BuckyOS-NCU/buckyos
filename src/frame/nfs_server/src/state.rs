@@ -32,6 +32,7 @@ pub struct AppState {
     pub ndm: crate::ndm::NdmMgr,
     pub buckets: crate::bucket::BucketHost,
     pub preview: crate::preview::PreviewMgr,
+    pub archive: crate::archive::cache::ArchiveMgr,
     pub ndn_egress: Arc<crate::ndn::EgressLimit>,
     pub ambient: crate::ndn::ambient::AmbientFetches,
 }
@@ -53,16 +54,23 @@ impl AppState {
                 )));
             }
         }
+        if let Some(host) = &config.host {
+            if !host.export.path.as_os_str().is_empty() && !host.export.path.is_dir() {
+                return Err(crate::error::invalid(format!("host root {} is not a directory", host.export.path.display())));
+            }
+        }
         let db = FileDb::open(&config.db_path())?;
         let handle_key = db.handle_key()?;
         let uploads = UploadMgr::new(config.staging_dir())?;
         let copies = crate::copy::CopyJournal::open(&config.data_dir)?;
         let acls = AclTable::load(&db)?;
+        crate::recent::ensure_builtin_views(&db)?;
         let share = crate::share::ShareMgr::new(&db)?;
         let ndm = crate::ndm::NdmMgr::new(config.ndm_staging_dir())?;
         if matches!(config.auth, crate::config::AuthMode::Runtime) {
             seed_default_acls(&config, &db, &acls)?;
         }
+        let archive = crate::archive::cache::ArchiveMgr::new(&config.data_dir, config.archive.clone())?;
         let preview = config.preview_tool_dirs.clone().map(crate::preview::PreviewMgr::with_dirs).unwrap_or_default();
         if crate::share::ShareMgr::store_configured(&config) {
             preview.refresh();
@@ -83,6 +91,7 @@ impl AppState {
             ndm,
             buckets: Default::default(),
             preview,
+            archive,
             ndn_egress: crate::ndn::EgressLimit::new(config.ndn_anonymous_bytes_per_sec),
             ambient: Default::default(),
             db,

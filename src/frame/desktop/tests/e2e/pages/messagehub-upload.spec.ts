@@ -1,4 +1,6 @@
 import { crc32, deflateSync } from 'node:zlib'
+import { createNamedSession } from '../fixtures/messagehub'
+import { closeSelect, selectDialog, selectGoto } from '../fixtures/selectDialog'
 import { expect, test, type Page } from '@playwright/test'
 
 declare global {
@@ -32,12 +34,7 @@ function png(width: number, height: number, rgb: [number, number, number]): Buff
 async function openSession(page: Page, title: string) {
   await page.goto(`/messagehub?entityId=${encodeURIComponent(CODER)}`)
   await expect(page.getByRole('button', { name: 'Sessions', exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'New Session', exact: true }).last().click()
-  const dialog = page.getByRole('dialog')
-  await dialog.getByLabel('Title (optional)', { exact: true }).fill(title)
-  await dialog.getByRole('combobox', { name: 'Connection', exact: true }).selectOption('native')
-  await dialog.getByRole('button', { name: 'Create', exact: true }).click()
-  await expect(dialog).toHaveCount(0)
+  await createNamedSession(page, title)
   await expect(page.getByTestId('conversation-history')).toHaveAttribute('data-raw-count', '0')
   return page.evaluate(({ context, entity }) => window.__messageHubMock.sessions(context, entity)[0].id, { context: OWN, entity: CODER })
 }
@@ -111,7 +108,7 @@ test('a failed upload takes its bubble back and returns the draft to the compose
   await expect(page.getByTitle('beach.png', { exact: true })).toBeVisible()
 })
 
-test('an iPhone HEIC photo the browser can decode goes out as a JPEG; one it cannot decode goes out unchanged', async ({ page }) => {
+test('an iPhone HEIC photo goes out as the original file, whether or not the browser can decode it', async ({ page }) => {
   const id = await openSession(page, 'HEIC photos')
   const input = page.locator('input[type="file"]').first()
   await input.setInputFiles({ name: 'IMG_0001.HEIC', mimeType: 'image/heic', buffer: png(64, 48, [250, 200, 20]) })
@@ -120,15 +117,14 @@ test('an iPhone HEIC photo the browser can decode goes out as a JPEG; one it can
   await expect.poll(() => page.evaluate(async ({ context, id }) => (await window.__messageHubMock.reader(context, id).readRange(0, 1)).map(message => message.ui_local_id ?? 'stored'), { context: OWN, id }), { timeout: 10_000 }).toEqual(['stored'])
   const sent = await page.evaluate(async ({ context, id }) => {
     const [message] = await window.__messageHubMock.reader(context, id).readRange(0, 1)
-    const modulePath = '/src/app/messagehub/conversation/history/objectAccess.ts'
+    const modulePath = '/src/components/conversation/history/objectAccess.ts'
     const { getObjectAccess } = await import(modulePath)
     return Promise.all((message.content.refs ?? []).map(async ref => {
       const info = await getObjectAccess()!.describe(ref.target.type === 'data_obj' ? ref.target.obj_id : '')
       return { label: ref.label, mimeType: info.mimeType }
     }))
   }, { context: OWN, id })
-  expect(sent).toEqual([{ label: 'IMG_0001.jpg', mimeType: 'image/jpeg' }, { label: 'IMG_0002.HEIC', mimeType: 'image/heic' }])
-  await expect(page.getByTestId('conversation-history').getByRole('img', { name: 'IMG_0001.jpg', exact: true })).toBeVisible()
+  expect(sent).toEqual([{ label: 'IMG_0001.HEIC', mimeType: 'image/heic' }, { label: 'IMG_0002.HEIC', mimeType: 'image/heic' }])
 })
 
 test('photos with the same file name are all kept in the draft', async ({ page }) => {
@@ -175,7 +171,7 @@ test('an attachment is saved to the viewer\'s collection through its message', a
 test('directory enumeration retains empty nodes and reports file or reader failures', async ({ page }) => {
   await page.goto('/messagehub')
   const result = await page.evaluate(async () => {
-    const modulePath = '/src/app/messagehub/conversation/input/attachmentDraft.ts'
+    const modulePath = '/src/components/conversation/input/attachmentDraft.ts'
     const { extractTransferFiles } = await import(modulePath)
     const transfer = (entry: object) => ({ items: [{ kind: 'file', webkitGetAsEntry: () => entry }], files: [] })
     const directory = (path: string, entries: object[]) => ({ isDirectory: true, isFile: false, fullPath: path, createReader() { let sent = false; return { readEntries(done: (items: object[]) => void) { done(sent ? [] : entries); sent = true } } } })
@@ -205,7 +201,7 @@ test('a directory is one attachment with empty children and original file bytes 
     const [message] = await window.__messageHubMock.reader(context, sessionId).readRange(0, 1)
     const target = message.content.refs?.[0].target
     if (target?.type !== 'data_obj') throw Error('missing directory reference')
-    const modulePath = '/src/app/messagehub/conversation/history/objectAccess.ts'
+    const modulePath = '/src/components/conversation/history/objectAccess.ts'
     const { getObjectAccess } = await import(modulePath)
     return { count: message.content.refs?.length, id: target.obj_id, content: await (await fetch(await getObjectAccess()!.contentUrl(target.obj_id, undefined, 'photo.heic'))).text() }
   }, { context: OWN, sessionId })
@@ -214,7 +210,76 @@ test('a directory is one attachment with empty children and original file bytes 
   const folder = page.getByTestId('conversation-history').getByTestId('attachment-directory').first()
   await folder.getByRole('button', { name: '旅行', exact: true }).click()
   await expect(folder.getByRole('button', { name: '空目录', exact: true })).toBeVisible()
-  await expect(folder.getByRole('button', { name: 'photo.heic', exact: true })).toBeVisible()
+  await expect(folder.getByTestId('attachment-directory-file').filter({ hasText: 'photo.heic' })).toBeVisible()
+})
+
+/** What the mock Zone holds at `path`, as text; null when nothing is there. */
+const zoneText = (page: Page, path: string) => page.evaluate(async path => {
+  const data = '/src/app/filebrowser/mock/data.ts'
+  const content = '/src/app/filebrowser/mock/content.ts'
+  const entry = (await import(data)).mockEntryByPath(path)
+  return entry ? (await (await import(content)).mockReadContent(entry)).text() as string : null
+}, path)
+
+test('a received file is saved into my files at a place I pick in the Zone', async ({ page }) => {
+  await page.route('https://upload.wikimedia.org/**', route => route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600"/>' }))
+  await page.goto(`/messagehub?entityId=${encodeURIComponent(ALICE)}`)
+  const card = page.getByTestId('conversation-history').getByTestId('attachment-file').filter({ hasText: 'design-brief.pdf' })
+  await expect(card).toBeVisible({ timeout: 15_000 })
+  const save = card.getByRole('button', { name: 'Save design-brief.pdf to my files', exact: true })
+  await save.click()
+  const dialog = selectDialog(page)
+  await expect(dialog).toHaveAttribute('data-mode', 'save')
+  await expect(dialog.getByTestId('select-name')).toHaveValue('design-brief.pdf')
+  await selectGoto(dialog, '/home/Downloads')
+  await dialog.getByTestId('select-confirm').click()
+  await expect(card.getByTestId('attachment-save')).toHaveAttribute('data-state', 'saved')
+  await expect(card.getByTestId('attachment-save')).toHaveAccessibleName('Saved to /home/Downloads/design-brief.pdf')
+  expect(await zoneText(page, '/home/Downloads/design-brief.pdf')).toMatch(/^%PDF/)
+
+  // Cancelling the picker saves nothing.
+  await card.getByTestId('attachment-save').click()
+  await closeSelect(page)
+  await expect(card.getByTestId('attachment-save')).toHaveAttribute('data-state', 'idle')
+})
+
+test('a received folder, or a file in it, is saved into my files', async ({ page }) => {
+  const sessionId = await openSession(page, 'Save folder')
+  await page.evaluate(async ({ context, sessionId }) => {
+    const directory = { kind: 'dir' as const, name: '旅行', children: [
+      { kind: 'dir' as const, name: 'day1', children: [{ kind: 'file' as const, file: new File(['day one'], 'notes.txt', { type: 'text/plain' }) }] },
+      { kind: 'file' as const, file: new File(['photo bytes'], 'photo.heic', { type: 'image/heic' }) },
+    ] }
+    await window.__messageHubMock.send(context, sessionId, { content: 'folder', attachments: [{ file: new File([], directory.name), directory }] }, undefined)
+  }, { context: OWN, sessionId })
+  const folder = page.getByTestId('conversation-history').getByTestId('attachment-directory').first()
+  await expect(folder).toBeVisible()
+  await folder.getByRole('button', { name: 'Save 旅行 to my files', exact: true }).click()
+  let dialog = selectDialog(page)
+  await expect(dialog.getByTestId('select-name')).toHaveValue('旅行')
+  await selectGoto(dialog, '/home/Documents')
+  await dialog.getByTestId('select-confirm').click()
+  await expect(folder.getByRole('button', { name: 'Saved to /home/Documents/旅行', exact: true })).toBeVisible()
+  expect(await zoneText(page, '/home/Documents/旅行/photo.heic')).toBe('photo bytes')
+  expect(await zoneText(page, '/home/Documents/旅行/day1/notes.txt')).toBe('day one')
+
+  // Saving it there again: the picker refuses the taken name and keeps asking.
+  await folder.getByRole('button', { name: 'Saved to /home/Documents/旅行', exact: true }).click()
+  dialog = selectDialog(page)
+  await selectGoto(dialog, '/home/Documents')
+  await dialog.getByTestId('select-confirm').click()
+  await expect(dialog.getByTestId('select-notice')).toBeVisible()
+  await closeSelect(page)
+
+  // One file inside it.
+  await folder.getByRole('button', { name: '旅行', exact: true }).click()
+  const inner = folder.getByTestId('attachment-directory-file').filter({ hasText: 'photo.heic' })
+  await inner.getByRole('button', { name: 'Save photo.heic to my files', exact: true }).click()
+  dialog = selectDialog(page)
+  await selectGoto(dialog, '/home/Downloads')
+  await dialog.getByTestId('select-confirm').click()
+  await expect(inner.getByTestId('attachment-save')).toHaveAttribute('data-state', 'saved')
+  expect(await zoneText(page, '/home/Downloads/photo.heic')).toBe('photo bytes')
 })
 
 test('a directory read failure names the failed path in the composer', async ({ page }) => {

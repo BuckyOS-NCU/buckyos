@@ -52,13 +52,17 @@ fn check_new_refs(p: &Planner, old: &Validated, new: &Validated) -> WsResult<()>
 /// carries the CRDT snapshot so replicas obtain the very same lineage.
 pub fn create(p: &mut Planner, row: &mut EntityRow, payload: JsonMap) -> WsResult<Value> {
     for k in payload.keys() {
-        if !matches!(k.as_str(), "content" | "lineage_id" | "snapshot" | "source") {
+        if !matches!(k.as_str(), "content" | "lineage_id" | "snapshot" | "source" | "data_version") {
             return Err(WsError::invalid_schema(format!("richtext: unknown key {k}")));
         }
     }
     if let Some(s) = payload.get("source") {
         crate::types::check_source(s)?;
         row.payload.insert("source".into(), s.clone());
+    }
+    if let Some(v) = payload.get("data_version") {
+        row.payload.insert("data_version".into(), v.clone());
+        crate::types::check_data_version(p, row, None)?;
     }
     let id = row.entity_id.clone();
     let (doc, lineage_id) = match (payload.get("content"), payload.get("snapshot")) {
@@ -197,6 +201,10 @@ fn check_block(
         p.conflict(Code::TargetDeleted, item, entity_id, sel(block_sel(block_id)), expect.cloned().unwrap_or(Value::Null), Value::Null, None);
         return Ok(false);
     };
+    // an internal Commit (a rollback replaying the inverse of a run) writes whatever the block holds now
+    if expect == Some(&json!("any")) {
+        return if p.env.internal { Ok(true) } else { Err(WsError::invalid_op("expect: \"any\" is not available to this caller").at("/expect")) };
+    }
     let expect = expect.and_then(Value::as_object).ok_or_else(|| WsError::invalid_op("expect required").at("/expect"))?;
     let mut ok = true;
     if need_hash {

@@ -21,36 +21,36 @@
         "workspace_id": "string"
       },
       "result": {
+        "acl_rev": "number",
+        "anonymous": "boolean",
         "base_seq": "number",
         "capabilities": [
           "string"
         ],
+        "cloned_from": null,
         "epoch": "string",
-        "forked_from": null,
         "format_version": "string",
         "head_commit_id": "string",
         "head_seq": "number",
-        "hosted_exec": {
-          "digest": "string",
-          "enabled": "boolean"
-        },
+        "judged_as": "string",
         "ok": "boolean",
+        "owner": "boolean",
         "planner_version": "number",
         "principal": "string",
         "protocol_version": "string",
         "public_base": null,
         "purpose": null,
         "richtext_schema": "string",
+        "settings": {},
+        "settings_rev": "number",
         "show_lock": null,
         "title": "string",
         "traffic": "number",
         "usage": {
           "total": "number"
         },
-        "wish_aicc_mode": "string",
         "wish_execution": {
-          "default": "string",
-          "service": "boolean"
+          "default": "string"
         },
         "workspace_id": "string"
       }
@@ -62,12 +62,20 @@
         "ok": "boolean",
         "workspaces": [
           {
+            "anonymous": "boolean",
             "capabilities": [
               "string"
             ],
+            "cover": null,
             "epoch": "string",
             "head_seq": "number",
+            "live_sessions": "number",
+            "opened_at": null,
+            "owner_principal": "string",
+            "public": "boolean",
+            "published": "boolean",
             "title": "string",
+            "updated_at": "string",
             "workspace_id": "string"
           }
         ]
@@ -184,6 +192,83 @@
       }
     },
     {
+      "method": "doc.stage",
+      "params": {
+        "epoch": "string",
+        "idempotency_key": "string",
+        "operations": [
+          {
+            "op": "string",
+            "records": [
+              {
+                "record_id": "string",
+                "values": {
+                  "n": "number",
+                  "title": "string"
+                }
+              }
+            ],
+            "source_id": "string"
+          }
+        ],
+        "part": "number",
+        "workspace_id": "string"
+      },
+      "result": {
+        "digest": "string",
+        "expires_at": "string",
+        "ok": "boolean",
+        "operations": "number",
+        "part": "number"
+      }
+    },
+    {
+      "method": "doc.commit",
+      "params": {
+        "epoch": "string",
+        "idempotency_key": "string",
+        "operations": [
+          {
+            "op": "string",
+            "records": [
+              {
+                "record_id": "string",
+                "values": {
+                  "n": "number",
+                  "title": "string"
+                }
+              }
+            ],
+            "source_id": "string"
+          }
+        ],
+        "protocol_version": "string",
+        "session_id": "string",
+        "staged": [
+          "string"
+        ],
+        "workspace_id": "string"
+      },
+      "result": {
+        "commit_id": "string",
+        "replayed": "boolean",
+        "seq": "number",
+        "server_ops": [],
+        "status": "string",
+        "touched": [
+          {
+            "change": "string",
+            "entity_id": "string",
+            "rev": "number",
+            "selector": {
+              "kind": "string",
+              "record_id": "string"
+            }
+          }
+        ]
+      }
+    },
+    {
       "method": "doc.read",
       "params": {
         "entity_id": "string",
@@ -211,6 +296,7 @@
           "record_count": "number"
         },
         "content_rev": "number",
+        "created_by": "string",
         "deleted": "boolean",
         "entity_id": "string",
         "head_seq": "number",
@@ -225,6 +311,92 @@
         "struct_rev": "number",
         "type_id": "string",
         "write_policy": "string"
+      }
+    },
+    {
+      "method": "doc.read",
+      "params": {
+        "as": "string",
+        "path": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "body": {
+          "bytes": null,
+          "etag": "string",
+          "format": "string",
+          "format_version": "number",
+          "records": null,
+          "state": "string"
+        },
+        "capabilities": [
+          "string"
+        ],
+        "children": "number",
+        "data": {
+          "mode": "string",
+          "write": "string"
+        },
+        "entity_id": "string",
+        "head_seq": "number",
+        "kind": null,
+        "name": "string",
+        "name_follows": "boolean",
+        "ok": "boolean",
+        "ops": [
+          "string"
+        ],
+        "parent": {
+          "entity_id": "string",
+          "path": "string"
+        },
+        "path": "string",
+        "ref": {
+          "entity_id": "string",
+          "mode": "string",
+          "workspace_id": "string"
+        },
+        "schema_id": null,
+        "schema_version": "number",
+        "scope": "string",
+        "title": null,
+        "type": "string",
+        "type_id": "string",
+        "version": {
+          "content_rev": "number",
+          "epoch": "string",
+          "head_seq": "number",
+          "life_rev": "number",
+          "meta_rev": "number",
+          "struct_rev": "number"
+        }
+      }
+    },
+    {
+      "method": "doc.read",
+      "params": {
+        "as": "string",
+        "entity_id": "string",
+        "parts": "boolean",
+        "workspace_id": "string"
+      },
+      "result": {
+        "complete": "boolean",
+        "entity_id": "string",
+        "etag": "string",
+        "format": "string",
+        "format_version": "number",
+        "head_seq": "number",
+        "ok": "boolean",
+        "parts": [
+          {
+            "end": "number",
+            "start": "number"
+          }
+        ],
+        "path": "string",
+        "state": "string",
+        "text": "string"
       }
     },
     {
@@ -246,7 +418,9 @@
           "string"
         ],
         "content_rev": "number",
+        "name": "string",
         "ok": "boolean",
+        "path": "string",
         "reference": {
           "entity_id": "string",
           "version": {
@@ -258,32 +432,155 @@
       }
     },
     {
-      "method": "doc.query",
+      "method": "doc.resolve",
       "params": {
-        "limit": "number",
-        "source_id": "string",
+        "path": "string",
         "workspace_id": "string"
       },
       "result": {
-        "consistency": "string",
+        "canonical": {
+          "entity_id": "string",
+          "mode": "string",
+          "workspace_id": "string"
+        },
+        "capabilities": [
+          "string"
+        ],
         "content_rev": "number",
+        "name": "string",
         "ok": "boolean",
-        "rows": [
+        "path": "string",
+        "reference": {
+          "entity_id": "string",
+          "version": {
+            "mode": "string"
+          },
+          "workspace_id": "string"
+        },
+        "type_id": "string"
+      }
+    },
+    {
+      "method": "doc.list",
+      "params": {
+        "at": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "at": {
+          "entity_id": "string",
+          "path": "string"
+        },
+        "head_seq": "number",
+        "items": [
           {
-            "record_id": "string",
-            "rev": "number",
-            "revs": {
-              "n": "number",
-              "title": "number"
+            "body": {
+              "format": "string",
+              "state": "string"
             },
-            "values": {
-              "n": "number",
-              "title": "string"
-            }
+            "children": "number",
+            "content_rev": "number",
+            "entity_id": "string",
+            "name": "string",
+            "path": "string",
+            "title": null,
+            "type": "string",
+            "type_id": "string"
           }
         ],
-        "source_id": "string",
-        "total": "number"
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "doc.find",
+      "params": {
+        "name": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "at": {
+          "entity_id": "string",
+          "path": "string"
+        },
+        "complete": "boolean",
+        "head_seq": "number",
+        "items": [
+          {
+            "body": {
+              "format": "string",
+              "state": "string"
+            },
+            "children": "number",
+            "content_rev": "number",
+            "entity_id": "string",
+            "match": "string",
+            "name": "string",
+            "path": "string",
+            "title": null,
+            "type": "string",
+            "type_id": "string"
+          }
+        ],
+        "ok": "boolean",
+        "visited": "number"
+      }
+    },
+    {
+      "method": "doc.query",
+      "params": {
+        "text": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "at": {
+          "entity_id": "string",
+          "path": "string"
+        },
+        "coverage": {
+          "bytes": "number",
+          "complete": "boolean",
+          "scanned": "number",
+          "skipped": []
+        },
+        "head_seq": "number",
+        "hits": [
+          {
+            "entity_id": "string",
+            "on": "string",
+            "path": "string",
+            "snippet": "string",
+            "type": "string"
+          }
+        ],
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "doc.query",
+      "params": {
+        "sql": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "columns": [
+          "string"
+        ],
+        "head_seq": "number",
+        "ok": "boolean",
+        "read": [
+          {
+            "content_rev": "number",
+            "entity_id": "string",
+            "path": "string",
+            "table": "string"
+          }
+        ],
+        "rows": [
+          [
+            "string"
+          ]
+        ],
+        "truncated": "boolean"
       }
     },
     {
@@ -326,6 +623,7 @@
               "entities": [
                 {
                   "content_rev": "number",
+                  "created_by": "string",
                   "created_seq": "number",
                   "deleted_seq": null,
                   "derived_json": null,
@@ -409,46 +707,316 @@
         "workspace_id": "string"
       },
       "result": {
+        "acl_rev": "number",
         "epoch": "string",
         "head_seq": "number",
         "ok": "boolean",
+        "server_ms": "number",
         "show_lock": null,
         "timed_out": "boolean"
       }
     },
     {
-      "method": "ws.grant",
+      "method": "acl.set",
       "params": {
-        "capabilities": [
-          "string"
+        "changes": [
+          {
+            "allow": [
+              "string"
+            ],
+            "deny": [
+              "string"
+            ],
+            "resource": "string",
+            "subject": "string"
+          }
         ],
-        "subject": "string",
         "workspace_id": "string"
       },
       "result": {
+        "acl_rev": "number",
+        "changes": [
+          {
+            "allow": [
+              "string"
+            ],
+            "deny": [
+              "string"
+            ],
+            "resource": {
+              "entity_id": "string",
+              "path": "string"
+            },
+            "subject": "string"
+          }
+        ],
         "ok": "boolean"
       }
     },
     {
-      "method": "ws.list_grants",
+      "method": "acl.set_group",
+      "params": {
+        "group_id": "string",
+        "title": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "acl_rev": "number",
+        "created": "boolean",
+        "group": {
+          "description": "string",
+          "group_id": "string",
+          "title": "string"
+        },
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "acl.members",
+      "params": {
+        "add": [
+          "string"
+        ],
+        "group_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "acl_rev": "number",
+        "added": "number",
+        "group_id": "string",
+        "ok": "boolean",
+        "removed": "number"
+      }
+    },
+    {
+      "method": "acl.set",
+      "params": {
+        "changes": [
+          {
+            "allow": [
+              "string"
+            ],
+            "resource": "string",
+            "subject": "string"
+          }
+        ],
+        "workspace_id": "string"
+      },
+      "result": {
+        "acl_rev": "number",
+        "changes": [
+          {
+            "allow": [
+              "string"
+            ],
+            "deny": [],
+            "resource": {
+              "entity_id": null,
+              "path": "string"
+            },
+            "subject": "string"
+          }
+        ],
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "acl.groups",
       "params": {
         "workspace_id": "string"
       },
       "result": {
+        "anonymous": "boolean",
         "complete": "boolean",
-        "grants": [
+        "groups": [
           {
-            "capabilities": [
+            "created_at": "string",
+            "created_by": "string",
+            "description": "string",
+            "group_id": "string",
+            "member": "boolean",
+            "members": [
+              {
+                "added_at": "string",
+                "added_by": "string",
+                "member": "string",
+                "via_entry": null
+              }
+            ],
+            "subject": "string",
+            "title": "string"
+          }
+        ],
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "acl.query",
+      "params": {
+        "by": "string",
+        "expand": "boolean",
+        "resource": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "anonymous": "boolean",
+        "by": "string",
+        "macros": [],
+        "ok": "boolean",
+        "resource": {
+          "entity_id": "string",
+          "path": "string"
+        },
+        "subjects": [
+          {
+            "effective": [
               "string"
             ],
-            "scope_entity_id": null,
-            "subject": "string",
+            "entries": [],
+            "kind": "string",
+            "principal": "string",
+            "subject": "string"
+          }
+        ]
+      }
+    },
+    {
+      "method": "acl.query",
+      "params": {
+        "by": "string",
+        "subject": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "by": "string",
+        "entries": [
+          {
+            "allow": [
+              "string"
+            ],
+            "deny": [],
+            "resource": {
+              "entity_id": null,
+              "path": "string"
+            },
+            "updated_at": "string",
+            "updated_by": "string"
+          }
+        ],
+        "group": {
+          "description": "string",
+          "group_id": "string",
+          "title": "string"
+        },
+        "kind": "string",
+        "members": [
+          {
+            "member": "string",
             "via_entry": null
+          }
+        ],
+        "ok": "boolean",
+        "subject": "string"
+      }
+    },
+    {
+      "method": "acl.query",
+      "params": {
+        "by": "string",
+        "principal": "string",
+        "resource": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "by": "string",
+        "capabilities": [
+          {
+            "allowed": "boolean",
+            "capability": "string",
+            "decided_by": {
+              "kind": "string",
+              "resource": {
+                "entity_id": "string",
+                "path": "string"
+              },
+              "subject": "string",
+              "tier": "string"
+            },
+            "owner": "boolean"
+          }
+        ],
+        "effective": [
+          "string"
+        ],
+        "judgment": {
+          "agent_as_owner": "boolean",
+          "direct": "boolean",
+          "groups": [
+            {
+              "group_id": "string",
+              "title": "string",
+              "via": [
+                {
+                  "member": "string",
+                  "via_entry": null
+                }
+              ]
+            }
+          ],
+          "guest": "boolean",
+          "judged_as": "string",
+          "member": "boolean",
+          "owner": "boolean"
+        },
+        "ok": "boolean",
+        "principal": "string",
+        "resource": {
+          "entity_id": "string",
+          "path": "string"
+        }
+      }
+    },
+    {
+      "method": "acl.query",
+      "params": {
+        "by": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "anonymous": "boolean",
+        "by": "string",
+        "complete": "boolean",
+        "entries": [
+          {
+            "allow": [
+              "string"
+            ],
+            "deny": [],
+            "kind": "string",
+            "resource": {
+              "entity_id": null,
+              "path": "string"
+            },
+            "subject": "string",
+            "updated_at": "string",
+            "updated_by": "string"
           }
         ],
         "ok": "boolean",
         "owner": "string",
         "principal": "string"
+      }
+    },
+    {
+      "method": "acl.set_anonymous",
+      "params": {
+        "enabled": "boolean",
+        "workspace_id": "string"
+      },
+      "result": {
+        "acl_rev": "number",
+        "anonymous": "boolean",
+        "ok": "boolean"
       }
     },
     {
@@ -465,14 +1033,30 @@
       }
     },
     {
-      "method": "ws.revoke",
+      "method": "acl.set",
       "params": {
-        "subject": "string",
+        "changes": [
+          {
+            "resource": "string",
+            "subject": "string"
+          }
+        ],
         "workspace_id": "string"
       },
       "result": {
-        "ok": "boolean",
-        "removed": "number"
+        "acl_rev": "number",
+        "changes": [
+          {
+            "allow": [],
+            "deny": [],
+            "resource": {
+              "entity_id": "string",
+              "path": "string"
+            },
+            "subject": "string"
+          }
+        ],
+        "ok": "boolean"
       }
     },
     {
@@ -514,22 +1098,58 @@
       }
     },
     {
-      "method": "ws.set_wish_aicc",
+      "method": "acl.set_group",
       "params": {
-        "mode": "string",
+        "group_id": "string",
         "workspace_id": "string"
       },
       "result": {
-        "ok": "boolean",
-        "wish_aicc_mode": "string"
+        "acl_rev": "number",
+        "created": "boolean",
+        "group": {
+          "description": "string",
+          "group_id": "string",
+          "title": "string"
+        },
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "acl.set",
+      "params": {
+        "changes": [
+          {
+            "allow": [
+              "string"
+            ],
+            "subject": "string"
+          }
+        ],
+        "workspace_id": "string"
+      },
+      "result": {
+        "acl_rev": "number",
+        "changes": [
+          {
+            "allow": [
+              "string"
+            ],
+            "deny": [],
+            "resource": {
+              "entity_id": null,
+              "path": "string"
+            },
+            "subject": "string"
+          }
+        ],
+        "ok": "boolean"
       }
     },
     {
       "method": "ws.create_entry",
       "params": {
-        "capabilities": [
-          "string"
-        ],
+        "group_id": "string",
+        "max_joins": "number",
         "methods": {
           "guest": "boolean"
         },
@@ -537,20 +1157,18 @@
       },
       "result": {
         "entry": {
-          "capabilities": [
-            "string"
-          ],
           "created_at": "number",
           "created_by": "string",
           "entry_id": "string",
           "expires_at": null,
+          "group_id": "string",
+          "max_joins": "number",
           "methods": {
             "did_login": "boolean",
             "guest": "boolean",
             "password": "boolean",
             "self_register": "boolean"
           },
-          "scope_entity_id": null,
           "state": "string",
           "workspace_id": "string"
         },
@@ -587,20 +1205,19 @@
       "result": {
         "entries": [
           {
-            "capabilities": [
-              "string"
-            ],
             "created_at": "number",
             "created_by": "string",
             "entry_id": "string",
             "expires_at": null,
+            "group_id": "string",
+            "joined": "number",
+            "max_joins": "number",
             "methods": {
               "did_login": "boolean",
               "guest": "boolean",
               "password": "boolean",
               "self_register": "boolean"
             },
-            "scope_entity_id": null,
             "state": "string",
             "workspace_id": "string"
           }
@@ -614,42 +1231,50 @@
         "entry_id": "string"
       },
       "result": {
-        "capabilities": [
-          "string"
-        ],
         "entry_id": "string",
-        "granted": "boolean",
+        "group_id": "string",
         "joined": "boolean",
         "ok": "boolean",
         "path": "string",
-        "scope_entity_id": null,
         "workspace_id": "string"
       }
     },
     {
       "method": "ws.close_entry",
       "params": {
-        "entry_id": "string"
+        "entry_id": "string",
+        "remove_members": "boolean"
       },
       "result": {
         "entry": {
-          "capabilities": [
-            "string"
-          ],
           "created_at": "number",
           "created_by": "string",
           "entry_id": "string",
           "expires_at": null,
+          "group_id": "string",
+          "max_joins": "number",
           "methods": {
             "did_login": "boolean",
             "guest": "boolean",
             "password": "boolean",
             "self_register": "boolean"
           },
-          "scope_entity_id": null,
           "state": "string",
           "workspace_id": "string"
         },
+        "ok": "boolean",
+        "removed_members": "number"
+      }
+    },
+    {
+      "method": "acl.delete_group",
+      "params": {
+        "group_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "acl_rev": "number",
+        "group_id": "string",
         "ok": "boolean"
       }
     },
@@ -757,6 +1382,20 @@
       }
     },
     {
+      "method": "asset.stream_url",
+      "params": {
+        "object_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "expires_at": "string",
+        "media_type": "string",
+        "ok": "boolean",
+        "size": "number",
+        "url": "string"
+      }
+    },
+    {
       "method": "ws.import",
       "params": {
         "bucket_id": "string",
@@ -770,6 +1409,12 @@
         "head_seq": "number",
         "missing": [],
         "ok": "boolean",
+        "permission_design": {
+          "entries": "number",
+          "groups": "number",
+          "macros": "number",
+          "skipped": []
+        },
         "replaced": "boolean",
         "semantics": "string",
         "workspace_id": "string"
@@ -798,6 +1443,34 @@
               "kind": "string",
               "record_id": "string"
             }
+          }
+        ]
+      }
+    },
+    {
+      "method": "doc.list_versions",
+      "params": {
+        "entity_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "content_rev": "number",
+        "entity_id": "string",
+        "head_seq": "number",
+        "ok": "boolean",
+        "versions": [
+          {
+            "accepted_at": "string",
+            "author": "string",
+            "commit_id": "string",
+            "content_rev": "number",
+            "created_at": "string",
+            "derived": null,
+            "kind": "string",
+            "message": null,
+            "object_id": "string",
+            "origin": "string",
+            "run_id": null
           }
         ]
       }
@@ -846,25 +1519,1131 @@
       },
       "result": {
         "bytes": "number",
+        "commit_part_bytes": "number",
+        "commit_parts": "number",
         "ok": "boolean",
         "removed": "number"
       }
     },
     {
-      "method": "ws.fork",
+      "method": "ws.get_info",
       "params": {
         "workspace_id": "string"
       },
       "result": {
-        "content_root": "string",
+        "acl_rev": "number",
+        "anonymous": "boolean",
+        "base_seq": "number",
+        "capabilities": [
+          "string"
+        ],
+        "cloned_from": null,
         "epoch": "string",
-        "excluded_entities": "number",
-        "forked_from": {
+        "format_version": "string",
+        "head_commit_id": "string",
+        "head_seq": "number",
+        "judged_as": "string",
+        "ok": "boolean",
+        "owner": "boolean",
+        "planner_version": "number",
+        "principal": "string",
+        "protocol_version": "string",
+        "public_base": null,
+        "purpose": null,
+        "richtext_schema": "string",
+        "settings": {},
+        "settings_rev": "number",
+        "show_lock": null,
+        "title": "string",
+        "traffic": "number",
+        "usage": {
+          "content": "number",
+          "staged": "number",
+          "total": "number"
+        },
+        "wish_execution": {
+          "default": "string"
+        },
+        "workspace_id": "string"
+      }
+    },
+    {
+      "method": "doc.commit",
+      "params": {
+        "epoch": "string",
+        "idempotency_key": "string",
+        "operations": [
+          {
+            "entity_id": "string",
+            "op": "string",
+            "order_key": "string",
+            "parent_id": "string",
+            "payload": {
+              "executor": "string",
+              "output_mode": "string",
+              "prompt": "string"
+            },
+            "type_id": "string"
+          }
+        ],
+        "protocol_version": "string",
+        "session_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "commit_id": "string",
+        "replayed": "boolean",
+        "seq": "number",
+        "server_ops": [],
+        "status": "string",
+        "touched": [
+          {
+            "change": "string",
+            "entity_id": "string",
+            "rev": "number"
+          }
+        ]
+      }
+    },
+    {
+      "method": "acl.bind_macro",
+      "params": {
+        "group_id": "string",
+        "mode": "string",
+        "wish": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "acl_rev": "number",
+        "binding": {
+          "group_id": "string",
+          "mode": "string"
+        },
+        "ok": "boolean",
+        "warning": "string",
+        "wish_id": "string"
+      }
+    },
+    {
+      "method": "acl.bind_macro",
+      "params": {
+        "group_id": null,
+        "wish": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "acl_rev": "number",
+        "binding": null,
+        "ok": "boolean",
+        "warning": "string",
+        "wish_id": "string"
+      }
+    },
+    {
+      "method": "acl.audit",
+      "params": {
+        "limit": "number",
+        "workspace_id": "string"
+      },
+      "result": {
+        "items": [
+          {
+            "action": "string",
+            "actor": "string",
+            "after": [
+              {
+                "allow": [
+                  "string"
+                ],
+                "deny": [
+                  "string"
+                ],
+                "resource": {
+                  "entity_id": "string",
+                  "path": "string"
+                },
+                "subject": "string"
+              }
+            ],
+            "at": "string",
+            "before": [
+              null
+            ],
+            "judged_as": null,
+            "seq": "number",
+            "target": [
+              {
+                "resource": {
+                  "entity_id": "string",
+                  "path": "string"
+                },
+                "subject": "string"
+              }
+            ]
+          }
+        ],
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "proc.start",
+      "params": {
+        "idempotency_key": "string",
+        "params": {
+          "execution": {
+            "mode": "string"
+          },
+          "stage": "string",
+          "wish_id": "string"
+        },
+        "program": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "aicc": {
+          "mode": "string",
+          "operator_id": "string",
+          "user_id": "string"
+        },
+        "brief": {
+          "analysis": null,
+          "inputs": null,
+          "knowledge": null,
+          "output": null,
+          "prompt": "string",
+          "refinements": null,
+          "request": null,
+          "stage": "string"
+        },
+        "claim_token": "string",
+        "context": {
+          "ai": {
+            "mode": "string",
+            "operator_id": "string",
+            "user_id": "string"
+          },
+          "compute": {
+            "kind": "string",
+            "principal": "string"
+          },
+          "executor": {
+            "kind": "string",
+            "principal": "string"
+          },
+          "expires_at": "string",
+          "location": "string",
+          "outputs": {
+            "container_id": null,
+            "name": null,
+            "results": [],
+            "surface_id": null
+          },
+          "task": {
+            "digest": "string",
+            "wish_id": "string"
+          },
+          "trigger": "string",
+          "trigger_identity": {
+            "class": "string",
+            "did": null,
+            "kind": null,
+            "owner": null,
+            "principal": "string",
+            "restricted": "boolean"
+          }
+        },
+        "created_at": "string",
+        "dispatch": null,
+        "error": null,
+        "evidence": {
+          "appended_inputs": null,
+          "inputs": null,
+          "read_set": null
+        },
+        "execution": {
+          "attempt": "number",
+          "executor": null,
+          "lease_until": null,
+          "mode": "string"
+        },
+        "feedback": null,
+        "ok": "boolean",
+        "params": {
+          "execution": {
+            "mode": "string"
+          },
+          "stage": "string",
+          "wish_id": "string"
+        },
+        "parent_run_id": null,
+        "program": "string",
+        "program_log": null,
+        "progress": {
+          "phase": "string"
+        },
+        "record": null,
+        "run_id": "string",
+        "stage": "string",
+        "state": "string",
+        "updated_at": "string",
+        "usage": null,
+        "warnings": [],
+        "wish_id": "string"
+      }
+    },
+    {
+      "method": "proc.list",
+      "params": {
+        "wish_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "ok": "boolean",
+        "runs": [
+          {
+            "aicc": {
+              "mode": "string",
+              "operator_id": "string",
+              "user_id": "string"
+            },
+            "brief": {
+              "analysis": null,
+              "inputs": null,
+              "knowledge": null,
+              "output": null,
+              "prompt": "string",
+              "refinements": null,
+              "request": null,
+              "stage": "string"
+            },
+            "context": {
+              "ai": {
+                "mode": "string",
+                "operator_id": "string",
+                "user_id": "string"
+              },
+              "compute": {
+                "kind": "string",
+                "principal": "string"
+              },
+              "executor": {
+                "kind": "string",
+                "principal": "string"
+              },
+              "expires_at": "string",
+              "location": "string",
+              "outputs": {
+                "container_id": null,
+                "name": null,
+                "results": [],
+                "surface_id": null
+              },
+              "task": {
+                "digest": "string",
+                "wish_id": "string"
+              },
+              "trigger": "string",
+              "trigger_identity": {
+                "class": "string",
+                "did": null,
+                "kind": null,
+                "owner": null,
+                "principal": "string",
+                "restricted": "boolean"
+              }
+            },
+            "created_at": "string",
+            "dispatch": null,
+            "error": null,
+            "execution": {
+              "attempt": "number",
+              "executor": null,
+              "lease_until": null,
+              "mode": "string"
+            },
+            "feedback": null,
+            "ok": "boolean",
+            "params": {
+              "execution": {
+                "mode": "string"
+              },
+              "stage": "string",
+              "wish_id": "string"
+            },
+            "parent_run_id": null,
+            "program": "string",
+            "progress": {
+              "phase": "string"
+            },
+            "record": null,
+            "run_id": "string",
+            "stage": "string",
+            "state": "string",
+            "updated_at": "string",
+            "usage": null,
+            "warnings": [],
+            "wish_id": "string"
+          }
+        ]
+      }
+    },
+    {
+      "method": "proc.claim",
+      "params": {
+        "claim_token": "string",
+        "run_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "attempt": "number",
+        "lease_ms": "number",
+        "lease_until": "string",
+        "ok": "boolean",
+        "run_id": "string",
+        "run_token": "string",
+        "stage": {
+          "budget": {
+            "ai_max_calls": "number",
+            "ai_max_tokens": "number",
+            "complete_model": "string",
+            "image_max_calls": "number",
+            "image_model": "string",
+            "iterations": "number",
+            "llm_map_max_items": "number",
+            "map_model": "string",
+            "max_output_tokens": "number",
+            "media_timeout_secs": "number",
+            "program_timeout_secs": "number",
+            "sql_max_calls": "number",
+            "video_max_calls": "number",
+            "video_model": "string"
+          },
+          "iterations": "number",
+          "kind": "string",
+          "model": "string",
+          "stage": "string",
+          "system": "string",
+          "tools": [
+            {
+              "description": "string",
+              "name": "string",
+              "parameters": {
+                "properties": {
+                  "depth": {
+                    "maximum": "number",
+                    "minimum": "number",
+                    "type": "string"
+                  },
+                  "target": {
+                    "description": "string",
+                    "type": "string"
+                  }
+                },
+                "type": "string"
+              }
+            }
+          ],
+          "user": "string"
+        }
+      }
+    },
+    {
+      "method": "proc.heartbeat",
+      "params": {
+        "attempt": "number",
+        "progress": {
+          "phase": "string"
+        },
+        "run_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "lease_ms": "number",
+        "lease_until": "string",
+        "ok": "boolean"
+      }
+    },
+    {
+      "method": "proc.files",
+      "params": {
+        "attempt": "number",
+        "run_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "files": {
+          "WORKSPACE.md": {
+            "text": "string"
+          },
+          "catalog/controls.json": {
+            "text": "string"
+          },
+          "catalog/renderers.json": {
+            "text": "string"
+          },
+          "context/entities/canvas-content/meta.json": {
+            "text": "string"
+          },
+          "context/entities/canvas-content/profile.json": {
+            "text": "string"
+          },
+          "context/inputs.json": {
+            "text": "string"
+          },
+          "context/manifest.json": {
+            "text": "string"
+          },
+          "lib/aiws.js": {
+            "text": "string"
+          },
+          "lib/host.js": {
+            "text": "string"
+          },
+          "lib/run.js": {
+            "text": "string"
+          },
+          "request.json": {
+            "text": "string"
+          }
+        },
+        "ok": "boolean",
+        "stage": {
+          "budget": {
+            "ai_max_calls": "number",
+            "ai_max_tokens": "number",
+            "complete_model": "string",
+            "image_max_calls": "number",
+            "image_model": "string",
+            "iterations": "number",
+            "llm_map_max_items": "number",
+            "map_model": "string",
+            "max_output_tokens": "number",
+            "media_timeout_secs": "number",
+            "program_timeout_secs": "number",
+            "sql_max_calls": "number",
+            "video_max_calls": "number",
+            "video_model": "string"
+          },
+          "manifest": null
+        }
+      }
+    },
+    {
+      "method": "proc.tool",
+      "params": {
+        "args": {
+          "text": "string"
+        },
+        "attempt": "number",
+        "name": "string",
+        "run_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "ok": "boolean",
+        "status": "string",
+        "text": "string"
+      }
+    },
+    {
+      "method": "proc.program",
+      "params": {
+        "attempt": "number",
+        "files": {},
+        "log": "string",
+        "results": null,
+        "run_id": "string",
+        "source": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "ok": "boolean",
+        "status": "string",
+        "text": "string"
+      }
+    },
+    {
+      "method": "proc.tool",
+      "params": {
+        "args": {
+          "analysis": {
+            "blockers": [],
+            "checks": [],
+            "context_prompt": "string",
+            "inputs": [],
+            "output_contract": {
+              "results": [
+                {
+                  "name": "string",
+                  "title": "string",
+                  "type": "string"
+                }
+              ]
+            },
+            "schema_version": "string",
+            "status": "string",
+            "warnings": []
+          }
+        },
+        "attempt": "number",
+        "name": "string",
+        "run_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "ok": "boolean",
+        "status": "string",
+        "text": "string"
+      }
+    },
+    {
+      "method": "proc.report",
+      "params": {
+        "attempt": "number",
+        "finished": "boolean",
+        "run_id": "string",
+        "usage": {
+          "calls": "number",
+          "input_tokens": "number",
+          "model": "string",
+          "output_tokens": "number"
+        },
+        "workspace_id": "string"
+      },
+      "result": {
+        "aicc": {
+          "mode": "string",
+          "operator_id": "string",
+          "user_id": "string"
+        },
+        "brief": {
+          "analysis": null,
+          "inputs": null,
+          "knowledge": null,
+          "output": null,
+          "prompt": "string",
+          "refinements": null,
+          "request": null,
+          "stage": "string"
+        },
+        "context": {
+          "ai": {
+            "mode": "string",
+            "operator_id": "string",
+            "user_id": "string"
+          },
+          "compute": {
+            "kind": "string",
+            "principal": "string"
+          },
+          "executor": {
+            "kind": "string",
+            "principal": "string"
+          },
+          "expires_at": "string",
+          "location": "string",
+          "outputs": {
+            "container_id": null,
+            "name": null,
+            "results": [],
+            "surface_id": null
+          },
+          "task": {
+            "digest": "string",
+            "wish_id": "string"
+          },
+          "trigger": "string",
+          "trigger_identity": {
+            "class": "string",
+            "did": null,
+            "kind": null,
+            "owner": null,
+            "principal": "string",
+            "restricted": "boolean"
+          }
+        },
+        "created_at": "string",
+        "dispatch": null,
+        "error": null,
+        "execution": {
+          "attempt": "number",
+          "executor": {
+            "detail": null,
+            "kind": "string",
+            "principal": "string"
+          },
+          "lease_until": "string",
+          "mode": "string"
+        },
+        "feedback": null,
+        "ok": "boolean",
+        "params": {
+          "execution": {
+            "mode": "string"
+          },
+          "stage": "string",
+          "wish_id": "string"
+        },
+        "parent_run_id": null,
+        "program": "string",
+        "progress": {
+          "activity": "string",
+          "last_tool": "string",
+          "model": "string",
+          "phase": "string",
+          "tool_calls": "number"
+        },
+        "record": null,
+        "run_id": "string",
+        "stage": "string",
+        "state": "string",
+        "updated_at": "string",
+        "usage": {
+          "calls": "number",
+          "input_tokens": "number",
+          "model": "string",
+          "output_tokens": "number"
+        },
+        "warnings": [],
+        "wish_id": "string"
+      }
+    },
+    {
+      "method": "proc.get",
+      "params": {
+        "run_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "aicc": {
+          "mode": "string",
+          "operator_id": "string",
+          "user_id": "string"
+        },
+        "applied": {
+          "attribution": {
+            "executed_by": "string",
+            "judged_as": "string",
+            "macro": null,
+            "triggered_by": "string"
+          },
+          "commit": {
+            "commit_id": "string",
+            "replayed": "boolean",
+            "seq": "number",
+            "server_ops": [],
+            "status": "string",
+            "touched": [
+              {
+                "change": "string",
+                "entity_id": "string",
+                "rev": "number",
+                "selector": {
+                  "key": "string",
+                  "kind": "string"
+                }
+              }
+            ]
+          },
+          "status": "string"
+        },
+        "brief": {
+          "analysis": null,
+          "inputs": null,
+          "knowledge": null,
+          "output": null,
+          "prompt": "string",
+          "refinements": null,
+          "request": null,
+          "stage": "string"
+        },
+        "context": {
+          "ai": {
+            "mode": "string",
+            "operator_id": "string",
+            "user_id": "string"
+          },
+          "compute": {
+            "kind": "string",
+            "principal": "string"
+          },
+          "executor": {
+            "kind": "string",
+            "principal": "string"
+          },
+          "expires_at": "string",
+          "location": "string",
+          "outputs": {
+            "container_id": null,
+            "name": null,
+            "results": [],
+            "surface_id": null
+          },
+          "task": {
+            "digest": "string",
+            "wish_id": "string"
+          },
+          "trigger": "string",
+          "trigger_identity": {
+            "class": "string",
+            "did": null,
+            "kind": null,
+            "owner": null,
+            "principal": "string",
+            "restricted": "boolean"
+          }
+        },
+        "created_at": "string",
+        "dispatch": null,
+        "error": null,
+        "evidence": {
+          "appended_inputs": [],
+          "inputs": [],
+          "read_set": []
+        },
+        "execution": {
+          "attempt": "number",
+          "executor": {
+            "detail": null,
+            "kind": "string",
+            "principal": "string"
+          },
+          "lease_until": "string",
+          "mode": "string"
+        },
+        "feedback": null,
+        "ok": "boolean",
+        "params": {
+          "execution": {
+            "mode": "string"
+          },
+          "stage": "string",
+          "wish_id": "string"
+        },
+        "parent_run_id": null,
+        "program": "string",
+        "program_log": null,
+        "progress": {
+          "activity": "string",
+          "last_tool": "string",
+          "model": "string",
+          "phase": "string",
+          "tool_calls": "number"
+        },
+        "record": {
+          "action": "string",
+          "aicc": {
+            "mode": "string",
+            "user_id": "string"
+          },
+          "at": "string",
+          "basis": {},
+          "by": "string",
+          "commit_id": "string",
+          "duration_ms": "number",
+          "ended_at": "string",
+          "id": "string",
+          "inputs": [],
+          "objects": {
+            "analysis": "string",
+            "prompt": "string"
+          },
+          "ok": "boolean",
+          "outputs": {
+            "analysis": {
+              "checks": "number",
+              "results": "number"
+            }
+          },
+          "stage": "string",
+          "summary": {
+            "checks": "number",
+            "results": "number"
+          },
+          "usage": {
+            "calls": "number",
+            "input_tokens": "number",
+            "model": "string",
+            "output_tokens": "number"
+          },
+          "warnings": []
+        },
+        "result": {
+          "commit_id": "string",
+          "replayed": "boolean",
+          "seq": "number",
+          "server_ops": [],
+          "status": "string",
+          "touched": [
+            {
+              "change": "string",
+              "entity_id": "string",
+              "rev": "number",
+              "selector": {
+                "key": "string",
+                "kind": "string"
+              }
+            }
+          ]
+        },
+        "run_id": "string",
+        "stage": "string",
+        "state": "string",
+        "updated_at": "string",
+        "usage": {
+          "calls": "number",
+          "input_tokens": "number",
+          "model": "string",
+          "output_tokens": "number"
+        },
+        "warnings": [],
+        "wish_id": "string"
+      }
+    },
+    {
+      "method": "proc.rollback",
+      "params": {
+        "run_id": "string",
+        "session_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "commit": {
+          "commit_id": "string",
+          "replayed": "boolean",
+          "seq": "number",
+          "server_ops": [],
+          "status": "string",
+          "touched": [
+            {
+              "change": "string",
+              "entity_id": "string",
+              "rev": "number",
+              "selector": {
+                "key": "string",
+                "kind": "string"
+              }
+            }
+          ]
+        },
+        "ok": "boolean",
+        "record": {
+          "action": "string",
+          "at": "string",
+          "basis": {},
+          "by": "string",
+          "commit_id": "string",
+          "duration_ms": "number",
+          "ended_at": "string",
+          "id": "string",
+          "inputs": [],
+          "objects": {},
+          "ok": "boolean",
+          "outputs": {},
+          "rollback_of": "string",
+          "stage": "string",
+          "summary": {
+            "of": "string"
+          },
+          "warnings": []
+        },
+        "status": "string"
+      }
+    },
+    {
+      "method": "proc.start",
+      "params": {
+        "idempotency_key": "string",
+        "params": {
+          "execution": {
+            "mode": "string"
+          },
+          "stage": "string",
+          "wish_id": "string"
+        },
+        "program": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "aicc": {
+          "mode": "string",
+          "operator_id": "string",
+          "user_id": "string"
+        },
+        "brief": {
+          "analysis": null,
+          "inputs": [],
+          "knowledge": null,
+          "output": null,
+          "prompt": "string",
+          "refinements": null,
+          "request": null,
+          "stage": "string"
+        },
+        "claim_token": "string",
+        "context": {
+          "ai": {
+            "mode": "string",
+            "operator_id": "string",
+            "user_id": "string"
+          },
+          "compute": {
+            "kind": "string",
+            "principal": "string"
+          },
+          "executor": {
+            "kind": "string",
+            "principal": "string"
+          },
+          "expires_at": "string",
+          "location": "string",
+          "outputs": {
+            "container_id": null,
+            "name": null,
+            "results": [],
+            "surface_id": null
+          },
+          "task": {
+            "digest": "string",
+            "wish_id": "string"
+          },
+          "trigger": "string",
+          "trigger_identity": {
+            "class": "string",
+            "did": null,
+            "kind": null,
+            "owner": null,
+            "principal": "string",
+            "restricted": "boolean"
+          }
+        },
+        "created_at": "string",
+        "dispatch": null,
+        "error": null,
+        "evidence": {
+          "appended_inputs": null,
+          "inputs": null,
+          "read_set": null
+        },
+        "execution": {
+          "attempt": "number",
+          "executor": null,
+          "lease_until": null,
+          "mode": "string"
+        },
+        "feedback": null,
+        "ok": "boolean",
+        "params": {
+          "execution": {
+            "mode": "string"
+          },
+          "stage": "string",
+          "wish_id": "string"
+        },
+        "parent_run_id": null,
+        "program": "string",
+        "program_log": null,
+        "progress": {
+          "phase": "string"
+        },
+        "record": null,
+        "run_id": "string",
+        "stage": "string",
+        "state": "string",
+        "updated_at": "string",
+        "usage": null,
+        "warnings": [],
+        "wish_id": "string"
+      }
+    },
+    {
+      "method": "proc.cancel",
+      "params": {
+        "run_id": "string",
+        "workspace_id": "string"
+      },
+      "result": {
+        "already_applied": "boolean",
+        "ok": "boolean",
+        "state": "string"
+      }
+    },
+    {
+      "method": "ws.ensure",
+      "params": {
+        "name": "string",
+        "title": "string"
+      },
+      "result": {
+        "created": "boolean",
+        "epoch": "string",
+        "head_seq": "number",
+        "name": "string",
+        "ok": "boolean",
+        "title": "string",
+        "workspace_id": "string"
+      }
+    },
+    {
+      "method": "ws.ensure",
+      "params": {
+        "name": "string"
+      },
+      "result": {
+        "created": "boolean",
+        "epoch": "string",
+        "head_seq": "number",
+        "name": "string",
+        "ok": "boolean",
+        "title": "string",
+        "workspace_id": "string"
+      }
+    },
+    {
+      "method": "ws.create",
+      "params": {
+        "name": "string",
+        "title": "string"
+      },
+      "result": {
+        "epoch": "string",
+        "head_seq": "number",
+        "name": "string",
+        "ok": "boolean",
+        "title": "string",
+        "workspace_id": "string"
+      }
+    },
+    {
+      "method": "ws.time",
+      "params": {},
+      "result": {
+        "ok": "boolean",
+        "server_ms": "number"
+      }
+    },
+    {
+      "method": "ws.clone",
+      "params": {
+        "workspace_id": "string"
+      },
+      "result": {
+        "cloned_from": {
           "snapshot": "string",
           "workspace_id": "string"
         },
+        "content_root": "string",
+        "epoch": "string",
+        "excluded_entities": "number",
         "head_seq": "number",
         "ok": "boolean",
+        "permission_design": {
+          "dropped": [],
+          "entries": "number",
+          "groups": "number",
+          "macros": "number",
+          "skipped": []
+        },
         "workspace_id": "string"
       }
     },

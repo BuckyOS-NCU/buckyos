@@ -159,6 +159,7 @@ pub(crate) enum CloudUpdateError {
 pub(crate) enum NativeTaskResumeError {
     CredentialUnavailable,
     Protocol(crate::protocol::ProtocolError),
+    ResultMaterialization(crate::protocol::ProtocolError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -468,6 +469,19 @@ pub(crate) enum StorageError {
 
 pub(crate) type StorageResult<T> = Result<T, StorageError>;
 
+impl StorageError {
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Database(sqlx::Error::PoolTimedOut) => true,
+            Self::Database(sqlx::Error::Database(error)) => error
+                .code()
+                .and_then(|code| code.parse::<u32>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6)),
+            _ => false,
+        }
+    }
+}
+
 impl NativeTaskResumeError {
     pub(crate) fn into_aicc_error(self) -> AiccError {
         match self {
@@ -478,7 +492,7 @@ impl NativeTaskResumeError {
                 retriable: false,
                 details: None,
             },
-            Self::Protocol(error) => error.into(),
+            Self::Protocol(error) | Self::ResultMaterialization(error) => error.into(),
         }
     }
 }

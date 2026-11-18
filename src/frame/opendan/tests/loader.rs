@@ -33,6 +33,9 @@ use opendan::tasks::{NewTask, TaskService, TaskView};
 use opendan::ui::MailService;
 use serde_json::{json, Value};
 
+#[cfg(unix)]
+mod fake_browser;
+
 const AGENT: &str = "did:bns:jarvis.alice";
 const WHO: &str = "app:jarvis@alice";
 const BOB: &str = "did:bns:bob";
@@ -425,6 +428,10 @@ sid_strategy = "per_group"
 
 [session.group]
 base = "ui"
+
+# The fake browser (tests/fake_browser) is a headless one: it has no display.
+[loader.browser]
+display = "headless"
 "#;
 
 impl World {
@@ -577,9 +584,16 @@ fn finished(sd: &SessionDir) -> bool {
     sd.state().map(|s| s.is_finished()).unwrap_or(false)
 }
 
+/// The registry's copy of a session's status: what the service decides on,
+/// published after the session's own state.
+fn registered_status(agent: &dyn AgentStateClient, sid: &str) -> Option<SessionStatus> {
+    futures_block(agent.sessions().lookup(sid)).ok().flatten().map(|e| e.status)
+}
+
 /// M1: sessions registered for this driver are hosted without anything
 /// touching them — those left over from before the start and those created
-/// while the Loader runs.
+/// while the Loader runs. A work left unfinished by an earlier process is
+/// not continued by itself: it is interrupted until its owner resumes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn registered_sessions_are_hosted_and_recovered() {
     let w = World::new();
@@ -588,7 +602,20 @@ async fn registered_sessions_are_hosted_and_recovered() {
     assert_eq!(before.state().unwrap().run_state, RunState::Created);
 
     // A work session ends with its explicit final report.
-    let loader = w.start(Llm::new(|_, _| r#"CALL:report {"report": "done", "is_end": true}"#.into())).await;
+    let llm = Llm::new(|_, _| r#"CALL:report {"report": "done", "is_end": true}"#.into());
+    let loader = w.start(llm.clone()).await;
+    until("the work left unfinished is interrupted", || {
+        before.state().is_ok_and(|s| s.paused.as_ref().is_some_and(|p| p.source == PauseSource::Interrupted))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 0, "nothing is inferred before the resume");
+    loader
+        .agent
+        .sessions()
+        .post_input(before.sid(), &PostedInput::control(WHO, "resume-1", ControlCommand::Resume { reason: None }))
+        .await
+        .unwrap();
     until("recovered session finishes", || finished(&before)).await;
     let later = new_work(loader.agent.as_ref(), &w, "created while hosting").await;
     until("new session finishes", || finished(&later)).await;
@@ -626,6 +653,219 @@ async fn rpc(port: u16, method: &str, params: Value) -> libopendan::Result<Value
     KrpcTransport::new(&format!("http://127.0.0.1:{port}{SERVICE_PATH}"), None)
         .call(method, params)
         .await
+}
+
+/// The runtimes an agent was assigned, as its owner switches them on the
+/// agent's side (runtime lifecycle TODO R7, R8, RT1): switching the default
+/// off keeps it configured; the private runtime stays; removing one keeps its
+/// record as history; work in progress on a runtime that goes away is shown
+/// first, marked and told to the owner once.
+struct NoNode;
+
+#[async_trait]
+impl agent_tool::runtime::node::NodeExecutorConnector for NoNode {
+    async fn connect(&self, _node: &str) -> std::io::Result<Box<dyn agent_tool::runtime::node::NodeIo>> {
+        Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no node in this test"))
+    }
+
+    async fn session_token(&self) -> std::result::Result<String, String> {
+        Ok("test-session".into())
+    }
+}
+
+struct LabNode;
+
+#[async_trait]
+impl agent_tool::runtime::node::NodeExecutorConnector for LabNode {
+    async fn connect(&self, _node: &str) -> std::io::Result<Box<dyn agent_tool::runtime::node::NodeIo>> {
+        use tokio::io::AsyncWriteExt;
+        let (client, mut server) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let mut profile = serde_json::Value::Null;
+            while let Ok(Some(buckyos_api::ExecutorFrame::Control(bytes))) = buckyos_api::read_executor_frame(&mut server).await {
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let id = &request["request_id"];
+                let response = match request["type"].as_str().unwrap() {
+                    "login" => {
+                        profile = request["profile"].clone();
+                        json!({"type":"login_ok", "request_id":id, "posture":"normal", "principal":AGENT, "app_instance_id":"jarvis@alice",
+                            "caps":["open_stream","describe","exec","read","write","mkdir","stat","query","cancel"],
+                            "limits":buckyos_api::ExecutorLimits::default(), "revision":"one", "generation":1,
+                            "auth_valid_until_ms":u64::MAX, "token_expires_at_ms":u64::MAX, "store_id":"lab-ledger", "server_epoch":"one"})
+                    }
+                    "describe" => json!({"type":"describe_ok", "request_id":id,
+                        "target":{"node_did":"did:web:lab.test.buckyos.io", "profile_id":profile, "uid":1000, "gid":1000,
+                            "workdir":request["workdir"], "workdir_roots":["/lab"], "store_id":"lab-ledger", "protocol_version":1},
+                        "info":{"os":"linux", "arch":"x86_64", "hostname":"lab", "shell":"bash", "time_ms":1, "home":"/lab/home", "identity_mode":"current_user"}}),
+                    other => json!({"type":"error", "request_id":id, "error":{"code":"capability", "message":format!("lab node: no {other}")}}),
+                };
+                server.write_all(&buckyos_api::encode_executor_control(&response).unwrap()).await.unwrap();
+            }
+        });
+        Ok(Box::new(client))
+    }
+
+    async fn session_token(&self) -> std::result::Result<String, String> {
+        Ok("test-session".into())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owner_switches_assigned_runtimes_and_work_in_progress_is_told() {
+    use buckyos_api::{AgentRuntimeSettings, AgentRuntimeTarget};
+    libopendan::runtime::set_node_connector(Arc::new(LabNode));
+    let mut w = World::new();
+    w.settings.runtimes.insert(
+        "node-lab".into(),
+        AgentRuntimeSettings {
+            enabled: true,
+            target: AgentRuntimeTarget::Node { node_id: "lab".into(), node_did: "did:web:lab.test.buckyos.io".into() },
+        },
+    );
+    w.settings.default_runtime_id = Some("node-lab".into());
+    let notify = Arc::new(libopendan::notify::LocalNotify::enable(&w.root, AGENT).unwrap());
+    w.notify = Some(notify.clone());
+    let port = free_port();
+    let llm = Llm::new(|req, _| format!("echo: {}", last_user(req).len()));
+    let loader = Loader::start(w.env(llm, port).await).await.unwrap();
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+
+    let settings = rpc(port, "runtimes.settings", json!({})).await.unwrap();
+    assert_eq!((settings["default_runtime_id"].as_str(), settings["configured_default_runtime_id"].as_str()), (Some("node-lab"), Some("node-lab")));
+    assert_eq!(settings["runtimes"]["node-lab"], json!({"enabled": true, "target": {"kind": "node", "node_id": "lab", "node_did": "did:web:lab.test.buckyos.io"}}));
+
+    // A work that is not finished, frozen to the lab runtime.
+    let done = new_work(loader.agent.as_ref(), &w, "a finished one").await;
+    until("work session finishes", || finished(&done)).await;
+    let mut entry = loader.agent.sessions().lookup(done.sid()).await.unwrap().unwrap();
+    assert_eq!(entry.runtime_id.as_deref(), Some("private"));
+    entry.session_id = "work-20260101-900".into();
+    entry.idempotency_key = Some("on-the-lab".into());
+    entry.driver.principal = "app:elsewhere@alice".into();
+    entry.runtime_id = Some("node-lab".into());
+    entry.title = Some("render on the lab".into());
+    entry.status = SessionStatus::created(libopendan::now_ms());
+    let mut idle = entry.clone();
+    idle.session_id = "work-20260101-899".into();
+    idle.idempotency_key = Some("idle-on-the-lab".into());
+    loader.agent.sessions().register(idle, WHO).await.unwrap();
+
+    // Created but never started: switching the runtime off cuts nothing off.
+    let impact = rpc(port, "runtimes.impact", json!({"runtime_id": "node-lab"})).await.unwrap();
+    assert_eq!((impact["blocking"].as_bool(), impact["active_sessions"].as_array().map(Vec::len)), (Some(false), Some(1)));
+    entry.status.run_state = RunState::Running;
+    loader.agent.sessions().register(entry, WHO).await.unwrap();
+
+    let impact = rpc(port, "runtimes.impact", json!({"runtime_id": "node-lab"})).await.unwrap();
+    assert_eq!((impact["blocking"].as_bool(), impact["owner_default"].as_bool()), (Some(true), Some(true)));
+    assert_eq!(impact["running_sessions"], json!(["work-20260101-900"]));
+    assert_eq!(impact["active_sessions"].as_array().map(Vec::len), Some(2));
+    assert_eq!(rpc(port, "runtimes.impact", json!({"runtime_id": "private"})).await.unwrap()["active_sessions"], json!([]));
+
+    // A runtime is not taken away from sessions in progress on it.
+    for (method, params) in [
+        ("runtimes.settings_set", json!({"runtime_id": "node-lab", "enabled": false})),
+        ("runtimes.settings_set", json!({"runtime_id": "node-lab", "enabled": false, "confirm": true})),
+        ("runtimes.remove", json!({"runtime_id": "node-lab"})),
+    ] {
+        let refused = rpc(port, method, params).await.unwrap_err().to_string();
+        assert!(refused.contains("sessions_in_progress") && refused.contains("work-20260101-900"), "{refused}");
+    }
+    assert_eq!(rpc(port, "runtimes.settings", json!({})).await.unwrap()["runtimes"]["node-lab"]["enabled"], true);
+
+    // Switched off past the agent (the control panel's `agent.update`): a
+    // default that is off keeps its place.
+    let mut changed = records::settings(w.records.as_ref()).await.unwrap();
+    changed.runtimes.get_mut("node-lab").unwrap().enabled = false;
+    records::set_settings(w.records.as_ref(), &changed).await.unwrap();
+    opendan::loader::project_runtimes(loader.agent.as_ref(), loader.agent.agent_root().unwrap(), &changed, WHO).await;
+    let off = rpc(port, "runtimes.settings", json!({})).await.unwrap();
+    assert_eq!((off["default_runtime_id"].as_str(), off["configured_default_runtime_id"].as_str()), (Some("private"), Some("node-lab")));
+    let record = loader.agent.runtimes().lookup("node-lab").await.unwrap().unwrap();
+    assert!(!record.usable() && record.lifecycle == RuntimeLifecycle::Active);
+
+    // The session stays where it was frozen: marked, and the owner is told once.
+    opendan::loader::mark_runtime_sessions(loader.agent.as_ref(), Some(notify.as_ref())).await;
+    opendan::loader::mark_runtime_sessions(loader.agent.as_ref(), Some(notify.as_ref())).await;
+    let marked = loader.agent.sessions().lookup("work-20260101-900").await.unwrap().unwrap();
+    assert!(marked.runtime_unavailable.as_deref().unwrap().contains("switched off"), "{:?}", marked.runtime_unavailable);
+    assert_eq!(marked.runtime_id.as_deref(), Some("node-lab"), "never moved");
+    use libopendan::notify::NotifyHost;
+    let told = notify.list(Default::default()).await.unwrap();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].prompt.message.as_deref().unwrap().contains("work-20260101-900"), "{:?}", told[0].prompt);
+
+    // Back on: the default counts again and the mark goes.
+    let on = rpc(port, "runtimes.settings_set", json!({"runtime_id": "node-lab", "enabled": true})).await.unwrap();
+    assert_eq!(on["default_runtime_id"], "node-lab");
+    opendan::loader::mark_runtime_sessions(loader.agent.as_ref(), Some(notify.as_ref())).await;
+    assert!(loader.agent.sessions().lookup("work-20260101-900").await.unwrap().unwrap().runtime_unavailable.is_none());
+
+    // The private runtime is always on and cannot be removed, under any of its names.
+    for id in ["private", "container"] {
+        assert!(rpc(port, "runtimes.settings_set", json!({"runtime_id": id, "enabled": false})).await.unwrap_err().to_string().contains("always on"));
+        assert!(rpc(port, "runtimes.remove", json!({"runtime_id": id})).await.unwrap_err().to_string().contains("cannot be removed"));
+    }
+    assert!(rpc(port, "runtimes.settings_set", json!({"runtime_id": "node-other", "enabled": true})).await.unwrap_err().to_string().contains("not assigned"));
+
+    // Removed past the agent: gone from its settings with the default, kept as history.
+    let mut changed = records::settings(w.records.as_ref()).await.unwrap();
+    changed.runtimes.remove("node-lab");
+    changed.default_runtime_id = None;
+    records::set_settings(w.records.as_ref(), &changed).await.unwrap();
+    opendan::loader::project_runtimes(loader.agent.as_ref(), loader.agent.agent_root().unwrap(), &changed, WHO).await;
+    let removed = rpc(port, "runtimes.settings", json!({})).await.unwrap();
+    assert_eq!(removed["runtimes"], json!({}));
+    assert_eq!((removed["default_runtime_id"].as_str(), removed["configured_default_runtime_id"].as_str()), (Some("private"), None));
+    let retired = loader.agent.runtimes().lookup("node-lab").await.unwrap().unwrap();
+    assert_eq!(retired.lifecycle, RuntimeLifecycle::Retired);
+    opendan::loader::mark_runtime_sessions(loader.agent.as_ref(), Some(notify.as_ref())).await;
+    let marked = loader.agent.sessions().lookup("work-20260101-900").await.unwrap().unwrap();
+    assert!(marked.runtime_unavailable.as_deref().unwrap().contains("removed from this agent"));
+    let mut spec = work_spec("on the lab again", "go");
+    spec.runtime.requirement.runtime_id = Some("node-lab".into());
+    let refused = create_session(&w.root.join("sessions"), spec, loader.agent.as_ref(), WHO, w.channels().as_ref()).await.unwrap_err();
+    assert!(refused.to_string().contains("retired"), "{refused}");
+    loader.shutdown().await;
+}
+
+/// The owner pauses, resumes and stops a plain work session: its queue
+/// takes these controls (and no message); the stop interrupts the command
+/// in flight and the work ends as stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owner_controls_a_work_session_that_takes_no_message() {
+    let w = World::new();
+    let asked = Arc::new(AtomicBool::new(false));
+    let seen = asked.clone();
+    let llm = Llm::new(move |_, _| {
+        seen.store(true, Ordering::SeqCst);
+        "TOOL:sleep 20".to_string()
+    });
+    let port = free_port();
+    let loader = Loader::start(w.env(llm, port).await).await.unwrap();
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+    let work = new_work(loader.agent.as_ref(), &w, "a long job").await;
+    assert!(loader.agent.sessions().lookup(work.sid()).await.unwrap().unwrap().input_queue.is_some());
+    until("the work runs its command", || asked.load(Ordering::SeqCst)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let refused = rpc(port, "session.post", json!({ "sid": work.sid(), "text": "do it differently" })).await.unwrap_err();
+    assert!(refused.to_string().contains("takes no messages"), "{refused}");
+    let paused = rpc(port, "session.pause", json!({ "sid": work.sid(), "reason": "hold on" })).await.unwrap();
+    assert!(paused["index"].as_u64().is_some(), "{paused}");
+    let resumed = rpc(port, "session.resume", json!({ "sid": work.sid() })).await.unwrap();
+    assert!(resumed["index"].as_u64().is_some(), "{resumed}");
+    let started = Instant::now();
+    let stopped = rpc(port, "session.stop", json!({ "sid": work.sid(), "reason": "enough" })).await.unwrap();
+    assert!(stopped["index"].as_u64().is_some(), "{stopped}");
+    until("stopped", || {
+        finished(&work) && registered_status(loader.agent.as_ref(), work.sid()).is_some_and(|s| s.run_state == RunState::Finished)
+    })
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(15), "the command was interrupted, not waited for");
+    assert_eq!(work.state().unwrap().outcome, Some(Outcome::Stopped));
+    let again = rpc(port, "session.stop", json!({ "sid": work.sid() })).await.unwrap_err();
+    assert!(again.to_string().contains("finished"), "{again}");
+    loader.shutdown().await;
 }
 
 /// `session.work_cards` over kRPC (TODO messagehub-worksession-ui §3.5):
@@ -796,10 +1036,11 @@ async fn agent_state_over_krpc_matches_the_files() {
     let local = fs_agent(&w);
     assert!(remote.agent_root().is_none());
     assert_eq!(remote.agent_id(), local.agent_id());
-    assert_eq!(
-        remote.sessions().lookup(done.sid()).await.unwrap(),
-        local.sessions().lookup(done.sid()).await.unwrap()
-    );
+    // A finished session's record is written once more as its runner lets it go.
+    until("the record over kRPC is the file's", || {
+        futures_block(remote.sessions().lookup(done.sid())).unwrap() == futures_block(local.sessions().lookup(done.sid())).unwrap()
+    })
+    .await;
     assert_eq!(remote.sessions().lookup("no-such").await.unwrap(), None);
     let q = RegistryQuery {
         driver: Some(WHO.into()),
@@ -917,7 +1158,7 @@ async fn agent_state_over_krpc_matches_the_files() {
         .collect();
     assert_eq!(modules["ui"], true);
     assert_eq!(modules["agent_state_service"], true);
-    assert_eq!(modules["self_check"], false);
+    assert!(!modules.contains_key("self_check"), "self_check is retired");
     assert!(status["hosted"].as_array().unwrap().iter().any(|h| h["session_id"] == ui.sid()));
 
     // The home page: profile card, usage by model, conversations. Without
@@ -955,6 +1196,7 @@ async fn agent_state_over_krpc_matches_the_files() {
         "operation_id": "homepage-workspace", "name": "Shared project", "description": "A long-term project",
         "location": { "runtime_id": "local", "directory": directory }, "usage": "collaborative"
     }})).await.unwrap();
+    let canonical = std::fs::canonicalize(&directory).unwrap();
     let workspace_id = registered["workspace_id"].as_str().unwrap();
     let annotated = rpc(port, "workspaces.update", json!({
         "workspace_id": workspace_id, "request": { "expected_revision": registered["revision"], "private_notes": "private cognition" }
@@ -969,7 +1211,7 @@ async fn agent_state_over_krpc_matches_the_files() {
     let known = rpc(port, "home.workspaces", json!({})).await.unwrap();
     assert_eq!(known.as_array().unwrap().len(), 1);
     assert_eq!(known[0]["workspace_id"], workspace_id);
-    assert_eq!(known[0]["location"]["directory"], json!(directory));
+    assert_eq!(known[0]["location"]["directory"], json!(canonical));
     assert_eq!(known[0]["lifecycle"], "archived");
     assert_eq!(known[0]["availability"], "missing");
     assert!(known[0]["last_error"].is_string());
@@ -979,8 +1221,20 @@ async fn agent_state_over_krpc_matches_the_files() {
     // The three operations are records on the session's bus.
     let posted = rpc(port, "session.post", json!({ "sid": ui.sid(), "text": "second" })).await.unwrap();
     assert!(posted["key"].as_str().unwrap().starts_with("cymsg:"));
-    until("second turn", || ui.state().map(|s| s.turns_completed == 2).unwrap_or(false)).await;
-    rpc(port, "session.stop", json!({ "sid": ui.sid(), "reason": "enough" })).await.unwrap();
+    until("second turn", || {
+        ui.state().map(|s| s.turns_completed == 2).unwrap_or(false)
+            && registered_status(loader.agent.as_ref(), ui.sid()).is_some_and(|s| !s.turn_open)
+    })
+    .await;
+    // A conversation is not stopped: a stop is for the message in
+    // progress, and its context is dropped by archiving it.
+    let refused = rpc(port, "session.stop", json!({ "sid": ui.sid(), "reason": "enough" })).await.unwrap_err();
+    assert!(refused.to_string().contains("ui.rotate"), "{refused}");
+    let idle = rpc(port, "session.stop", json!({ "sid": ui.sid(), "scope": "turn" })).await.unwrap_err();
+    assert!(idle.to_string().contains("no Turn in progress"), "{idle}");
+    assert!(!ui.state().unwrap().is_finished());
+    let archived = rpc(port, "ui.rotate", json!({ "sid": ui.sid() })).await.unwrap();
+    assert_eq!(archived, json!({ "archived": ui.sid(), "finished": true }));
     until("stopped", || {
         ui.state().map(|s| s.outcome == Some(Outcome::Stopped)).unwrap_or(false)
     })
@@ -1001,6 +1255,10 @@ fn ui_entry(agent: &dyn AgentStateClient, route: &str) -> Option<RegistryEntry> 
     entries.into_iter().find(|e| e.route_key.as_deref() == Some(route))
 }
 
+fn read_worklog_len(sd: &SessionDir) -> usize {
+    sd.worklog().read_all_for_audit().map(|w| w.len()).unwrap_or(0)
+}
+
 fn futures_block<T>(f: impl std::future::Future<Output = T>) -> T {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
@@ -1011,7 +1269,8 @@ fn futures_block<T>(f: impl std::future::Future<Output = T>) -> T {
 async fn inbox_messages_are_answered_along_the_same_conversation() {
     let w = World::new();
     let llm = Llm::new(|req, n| format!("answer {n} to: {}", last_user(req).contains("hello")));
-    let loader = w.start(llm.clone()).await;
+    let port = free_port();
+    let loader = Loader::start(w.env(llm.clone(), port).await).await.unwrap();
     let session = format!("dm:{BOB}");
     let first = chat(BOB, "hello jarvis");
     let first_id = msg_key(&first);
@@ -1085,12 +1344,39 @@ async fn inbox_messages_are_answered_along_the_same_conversation() {
         .to_string();
     assert!(ui_entry(loader.agent.as_ref(), &sroute).is_none());
 
-    // `/stop` from the owner ends the session; the next message of that
-    // inbox opens the next generation.
+    // `/stop` (and `/cancel`) is for the message in progress: with nothing
+    // in progress the owner is told so and the conversation stays.
     w.mail.deliver(&session, chat(BOB, "/stop"));
-    until("stopped", || sd.state().map(|s| s.is_finished()).unwrap_or(false)).await;
+    until("told there is nothing to stop", || w.mail.sent().len() == 3).await;
+    assert_eq!(w.mail.sent()[2].1.content.content, "Nothing is in progress.");
+    assert!(!sd.state().unwrap().is_finished());
+    // `/clean` (and `/new`) saves the conversation and starts a new one
+    // with the next message; the old session stays readable.
+    w.mail.deliver(&session, chat(BOB, "/clean"));
+    until("archived", || sd.state().map(|s| s.is_finished()).unwrap_or(false)).await;
+    assert_eq!(sd.state().unwrap().outcome, Some(Outcome::Stopped));
+    until("told about the new conversation", || w.mail.sent().len() == 4).await;
+    assert!(w.mail.sent()[3].1.content.content.starts_with("Started a new conversation"));
+    w.mail.deliver(&session, chat(BOB, "/new"));
+    until("already new", || w.mail.sent().len() == 5).await;
+    assert_eq!(w.mail.sent()[4].1.content.content, "This is already a new conversation.");
     w.mail.deliver(&session, chat(BOB, "hello once more"));
-    until("reply of the next generation", || w.mail.sent().len() == 3).await;
+    until("reply of the next generation", || w.mail.sent().len() == 6).await;
+    assert!(read_worklog_len(&sd) > 0, "the archived conversation is kept");
+    // What the side panel reads: the conversation's session now and the
+    // generations before it.
+    let view = rpc(port, "ui.conversation", json!({ "peer_did": BOB, "session_id": session })).await.unwrap();
+    let generations = view["generations"].as_array().unwrap();
+    assert_eq!(generations.len(), 2, "{view}");
+    assert_eq!(generations[0]["session_id"], entry.session_id.as_str());
+    assert_eq!(generations[0]["outcome"], "stopped");
+    assert_eq!(view["current"]["session_id"], generations[1]["session_id"]);
+    assert_ne!(view["current"]["session_id"], entry.session_id.as_str());
+    assert_eq!(view["current"]["paused"], Value::Null);
+    assert_eq!(view["current"]["unfinished_works"], 0);
+    assert_eq!(view["current"]["prompt"]["current"], true, "{view}");
+    let tree = rpc(port, "session.work_tree", json!({ "sid": view["current"]["session_id"], "unfinished_only": true })).await.unwrap();
+    assert_eq!((tree["complete"].as_bool(), tree["sessions"].as_array().map(Vec::len)), (Some(true), Some(0)), "{tree}");
     let all: Vec<RegistryEntry> = loader
         .agent
         .sessions()
@@ -1101,6 +1387,63 @@ async fn inbox_messages_are_answered_along_the_same_conversation() {
         .filter(|e| e.route_key.as_deref() == Some(route.as_str()))
         .collect();
     assert_eq!(all.len(), 2);
+    loader.shutdown().await;
+}
+
+/// SC11 over the tunnel: the host restarts while a message is worked on —
+/// the conversation is interrupted, not continued; a message sent meanwhile
+/// waits and the owner is told once how to go on; `/resume` continues the
+/// interrupted Turn, then the waiting message is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_interrupts_the_message_in_progress_until_resume() {
+    let w = World::new();
+    let llm = Llm::new(move |req, n| {
+        if last_user(req).contains("the next thing") {
+            return "answer to the next thing".to_string();
+        }
+        // The host goes away while this command runs.
+        if n == 0 {
+            return "TOOL:sleep 4".to_string();
+        }
+        "answer to the long job".to_string()
+    });
+    let loader = w.start(llm.clone()).await;
+    let session = format!("dm:{BOB}");
+    w.mail.deliver(&session, chat(BOB, "a long job"));
+    let route = MailboxAddress::new(parse_did(AGENT).unwrap(), Some(session.clone()))
+        .unwrap()
+        .to_string();
+    until("the command is running", || llm.calls.load(Ordering::SeqCst) == 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let entry = ui_entry(loader.agent.as_ref(), &route).unwrap();
+    let sd = SessionDir::open(&entry.location).unwrap();
+    loader.shutdown().await;
+    assert!(sd.state().unwrap().open_turn.is_some());
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+
+    let loader = w.start(llm.clone()).await;
+    until("interrupted", || {
+        sd.state().is_ok_and(|s| s.paused.as_ref().is_some_and(|p| p.source == PauseSource::Interrupted))
+    })
+    .await;
+    let calls = llm.calls.load(Ordering::SeqCst);
+    let sent = w.mail.sent().len();
+    w.mail.deliver(&session, chat(BOB, "the next thing"));
+    until("told about the interruption", || w.mail.sent().len() == sent + 1).await;
+    assert!(w.mail.sent()[sent].1.content.content.contains("/resume"), "{:?}", w.mail.sent()[sent].1.content.content);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(llm.calls.load(Ordering::SeqCst), calls, "nothing is inferred while interrupted");
+    assert_eq!(w.mail.sent().len(), sent + 1, "told once");
+
+    w.mail.deliver(&session, chat(BOB, "/resume"));
+    until("both answered", || {
+        let texts: Vec<String> = w.mail.sent().into_iter().map(|(_, m)| m.content.content).collect();
+        texts.iter().any(|t| t.contains("answer to the long job")) && texts.iter().any(|t| t.contains("answer to the next thing"))
+    })
+    .await;
+    assert!(w.mail.sent().iter().any(|(_, m)| m.content.content == "Resumed 1 interrupted session(s)."));
+    let st = sd.state().unwrap();
+    assert!(st.paused.is_none() && st.open_turn.is_none() && !st.is_finished(), "{st:?}");
     loader.shutdown().await;
 }
 
@@ -1397,7 +1740,8 @@ async fn the_jarvis_package_loads_and_answers() {
         // The UI reply is structured (`[reply]` of chat_route).
         serde_json::json!({ "reply": "你好", "topic": null, "artifacts": [] }).to_string()
     });
-    let mut env = w.env(llm, free_port()).await;
+    let port = free_port();
+    let mut env = w.env(llm, port).await;
     env.package_root = Some(package);
     let loader = Loader::start(env).await.unwrap();
     assert_eq!(loader.config.language, "zh");
@@ -1430,16 +1774,11 @@ async fn the_jarvis_package_loads_and_answers() {
     );
     let simple = loader.agent.behaviors().get("work_simple").await.unwrap().unwrap();
     assert_eq!(simple.capabilities.tool_whitelist.as_deref(), Some(&["group:bash".to_string(), "report".to_string()][..]));
-    // The built-in runtimes are registered before anything runs.
+    // The private runtime is registered before anything runs; nothing else
+    // is assigned to this agent.
     let runtimes = loader.agent.runtimes().list().await.unwrap();
     let ids: Vec<_> = runtimes.iter().map(|r| (r.runtime_id.as_str(), r.availability)).collect();
-    assert_eq!(
-        ids,
-        [
-            ("private", libopendan::protocol::RuntimeAvailability::Available),
-            ("host", libopendan::protocol::RuntimeAvailability::RuntimeUnavailable)
-        ]
-    );
+    assert_eq!(ids, [("private", libopendan::protocol::RuntimeAvailability::Available)]);
     // Both conversations reply under a contract; the analysis returns its
     // result under its own, listing the questions it asked.
     for name in ["chat_route", "groupchat_route"] {
@@ -1477,7 +1816,13 @@ async fn the_jarvis_package_loads_and_answers() {
     assert!(!system.contains("<<"), "{system}");
     let mut tools = tools.lock().unwrap().clone();
     tools.sort();
-    assert_eq!(tools, ["edit_file", "read", "shell", "try_analyze_user_intent", "write_file"]);
+    // Without the task bridge (a Unix socket) a session follows its commands with `cancel_task`.
+    let expected: &[&str] = if cfg!(unix) {
+        &["edit_file", "read", "shell", "try_analyze_user_intent", "write_file"]
+    } else {
+        &["cancel_task", "edit_file", "read", "shell", "try_analyze_user_intent", "write_file"]
+    };
+    assert_eq!(tools, expected);
     assert_eq!(cfg_max_tokens(&loader.config.llm_context), Some(8192));
     let route = MailboxAddress::new(parse_did(AGENT).unwrap(), Some(session))
         .unwrap()
@@ -1494,6 +1839,71 @@ async fn the_jarvis_package_loads_and_answers() {
     // A work session of the package is a plan session by default.
     let template = SessionTemplate::load("work", loader.agent.agent_root()).unwrap();
     assert_eq!(template.default_behavior.as_deref(), Some("plan_simple"));
+    // Skills of the package (skills system TODO): three kinds in the directory layout, a plan that only chooses
+    // manuals, the owner's methods over the service, and an import that starts a draft-writing work and installs nothing.
+    let plan = loader.agent.behaviors().get("plan_simple").await.unwrap().unwrap();
+    assert_eq!(plan.capabilities.cmd_skills, CmdSkillsUse::Candidates);
+    for name in ["skill_import", "skill_crystallize"] {
+        assert!(loader.agent.behaviors().get(name).await.unwrap().is_some(), "{name}");
+    }
+    assert!(!libopendan::goal::defaults(loader.agent.agent_root(), libopendan::goal::GOAL_CLASS).crystallize.enabled, "crystallization is the owner's to switch on");
+    let listed = rpc(port, "skills.list", json!({ "kind": "plan" })).await.unwrap();
+    let mut plans: Vec<&str> = listed.as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    plans.sort();
+    assert_eq!(plans, ["plan_content_production", "plan_research", "plan_software_change"]);
+    let ui_set = rpc(port, "skills.ui_get", json!({})).await.unwrap();
+    assert_eq!((ui_set["names"].clone(), ui_set["source"].clone()), (json!(["ui_core"]), json!("template")));
+    assert!(ui_set["available"].as_array().unwrap().contains(&json!("share")), "{ui_set}");
+    let status = rpc(port, "skills.status", json!({})).await.unwrap();
+    let status_of = |name: &str| status["skills"].as_array().unwrap().iter().find(|s| s["name"] == name).cloned().unwrap_or_else(|| panic!("{name} in {status}"));
+    assert_eq!(status_of("share")["commands"]["state"], "ready", "a manual without `commands` is listed too");
+    assert!(status_of("aigc_video")["commands"]["commands"].get("ffmpeg").is_some());
+
+    // Install the repository's sample package as the owner: plan first, then what the plan said.
+    use base64::Engine;
+    let sample = libopendan::skills::read_pikg(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../test/skills_pikg_sample/dapp_dist/hello-skills-0.1.0.pikg")).unwrap();
+    let planned = rpc(port, "skills.install_plan", json!({ "package": sample })).await.unwrap();
+    assert_eq!((planned["risk"]["level"].clone(), planned["checked_runtime_id"].clone()), (json!("low"), json!("private")), "{planned}");
+    assert!(planned.get("runtime_id").is_none() && planned.get("targets").is_none(), "a skill installs nothing on a runtime: {planned}");
+    let refused = rpc(port, "skills.install", json!({ "package": sample, "plan_digest": "sha256:other" })).await.unwrap_err();
+    assert!(refused.to_string().contains("not the plan of this package"), "{refused}");
+    let installed = rpc(port, "skills.install", json!({ "package": sample, "plan_digest": planned["plan_digest"] })).await.unwrap();
+    assert_eq!(installed["skills"].as_array().unwrap().len(), 2, "{installed}");
+    assert!(w.root.join("cmd_skills/hello/SKILL.md").is_file() && w.root.join("plan_skills/hello_plan/SKILL.md").is_file());
+    let off = rpc(port, "skills.set_enabled", json!({ "name": "hello", "enabled": false, "reason": "trying" })).await.unwrap();
+    assert_eq!(off["enabled"], false);
+    let added = rpc(port, "skills.ui_set", json!({ "names": ["ui_core", "share"] })).await.unwrap();
+    assert_eq!(added["source"], "state");
+    assert_eq!(SessionTemplate::load("ui", loader.agent.agent_root()).unwrap().default_cmd_skills, ["ui_core", "share"]);
+    rpc(port, "skills.remove", json!({ "kind": "work", "name": "hello" })).await.unwrap();
+    assert!(!w.root.join("cmd_skills/hello").exists() && !w.root.join("tools/hello").exists());
+    assert!(rpc(port, "skills.remove", json!({ "kind": "work", "name": "ui_core" })).await.is_err(), "a package's manual is disabled, not removed");
+
+    // A draft on the AgentRoot is installed by its slug and is gone afterwards.
+    let draft = w.root.join("skills_drafts/howto");
+    std::fs::create_dir_all(draft.join("cmd_skills/howto")).unwrap();
+    std::fs::write(draft.join("cmd_skills/howto/SKILL.md"), "---\nname: howto\ndescription: how to do it\n---\nSteps.").unwrap();
+    std::fs::write(draft.join("draft.json"), json!({ "imported_from": { "digest": "sha256:1", "runtime_id": "private", "platform": "linux" }, "risk": "Reads files only." }).to_string()).unwrap();
+    let drafts = rpc(port, "skills.drafts", json!({})).await.unwrap();
+    assert_eq!(drafts[0]["slug"], "howto");
+    let planned = rpc(port, "skills.install_plan", json!({ "draft": "howto" })).await.unwrap();
+    let codes: Vec<&str> = planned["risk"]["findings"].as_array().unwrap().iter().map(|f| f["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"imported_text") && codes.contains(&"author_note"), "{codes:?}");
+    let installed = rpc(port, "skills.install", json!({ "draft": "howto", "plan_digest": planned["plan_digest"] })).await.unwrap();
+    assert_eq!(installed["skills"][0]["origin"], "imported");
+    assert!(!draft.exists());
+
+    let import = rpc(port, "skills.import", json!({ "text": "# How to tidy notes\n1. list them\n2. merge duplicates\n", "name": "tidy_notes", "source": "notes.md" })).await.unwrap();
+    let inbox = import["inbox"].as_str().unwrap();
+    assert!(std::fs::read_to_string(w.root.join(inbox)).unwrap().contains("merge duplicates"));
+    let entry = loader.agent.sessions().lookup(import["session_id"].as_str().unwrap()).await.unwrap().unwrap();
+    let cfg = SessionDir::open(&entry.location).unwrap().config().unwrap();
+    assert_eq!(cfg.prompt.behavior.as_deref(), Some("skill_import"));
+    assert_eq!(cfg.prompt.frozen.as_ref().unwrap().cmd_skills.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["skill_authoring"]);
+    let first = serde_json::to_string(&cfg.prompt.initial_inputs).unwrap();
+    assert!(first.contains(inbox) && first.contains("tidy_notes"), "{first}");
+    assert!(!w.root.join("cmd_skills/tidy_notes").exists(), "an import installs nothing");
+    let _ = base64::engine::general_purpose::STANDARD.encode("");
     loader.shutdown().await;
 }
 
@@ -1576,7 +1986,13 @@ async fn jarvis_prompt_review() -> Result<(), Box<dyn std::error::Error>> {
     assert!(first.force_json && first.json_schema.is_some());
     let mut tools: Vec<&str> = first.tool_specs.iter().map(|t| t.name.as_str()).collect();
     tools.sort();
-    assert_eq!(tools, ["edit_file", "read", "shell", "try_analyze_user_intent", "write_file"]);
+    // Without the task bridge (a Unix socket) a session follows its commands with `cancel_task`.
+    let expected: &[&str] = if cfg!(unix) {
+        &["edit_file", "read", "shell", "try_analyze_user_intent", "write_file"]
+    } else {
+        &["cancel_task", "edit_file", "read", "shell", "try_analyze_user_intent", "write_file"]
+    };
+    assert_eq!(tools, expected);
     let input = last_user(first);
     assert!(input.starts_with("<<background_context>>\n- current_time "), "{input}");
     assert!(input.ends_with("<</background_context>>\n你好 Jarvis"), "{input}");
@@ -1809,9 +2225,9 @@ async fn loaded_info(w: &World) -> buckyos_api::AgentRuntimeInfo {
 async fn a_pinned_template_keeps_the_agentroot() {
     let mut w = World::new();
     let package = w._tmp.path().join("package");
-    std::fs::create_dir_all(package.join("cmd_skills")).unwrap();
+    std::fs::create_dir_all(package.join("cmd_skills/tip")).unwrap();
     std::fs::write(package.join("role.md"), "role v1").unwrap();
-    std::fs::write(package.join("cmd_skills/tip.md"), "tip v1").unwrap();
+    std::fs::write(package.join("cmd_skills/tip/SKILL.md"), "tip v1").unwrap();
     // Pinned from the start: the first load still installs the template.
     w.settings.template_auto_update = false;
     async fn start(w: &World, package: &std::path::Path, version: &str) -> Loader {
@@ -1830,7 +2246,7 @@ async fn a_pinned_template_keeps_the_agentroot() {
 
     // A new package version does not reach a pinned agent.
     std::fs::write(package.join("role.md"), "role v2").unwrap();
-    std::fs::write(package.join("cmd_skills/tip.md"), "tip v2").unwrap();
+    std::fs::write(package.join("cmd_skills/tip/SKILL.md"), "tip v2").unwrap();
     let mut stale = info.clone();
     stale.loaded_at = 0;
     w.records
@@ -1839,7 +2255,7 @@ async fn a_pinned_template_keeps_the_agentroot() {
         .unwrap();
     let loader = start(&w, &package, "2.0.0").await;
     assert_eq!(std::fs::read_to_string(w.root.join("role.md")).unwrap(), "role v1");
-    assert_eq!(std::fs::read_to_string(w.root.join("cmd_skills/tip.md")).unwrap(), "tip v1");
+    assert_eq!(std::fs::read_to_string(w.root.join("cmd_skills/tip/SKILL.md")).unwrap(), "tip v1");
     let started = Instant::now();
     let reloaded = loop {
         let now = records::info(w.records.as_ref()).await.unwrap().unwrap();
@@ -2068,7 +2484,7 @@ async fn sub_sessions_are_child_tasks_of_the_turn_that_created_them() {
 /// A cancel requested in TaskMgr stops the session through its own control
 /// protocol; the task ends as canceled and the placeholder is closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_canceled_task_stops_its_session() {
+async fn a_canceled_task_stops_its_message_and_keeps_the_conversation() {
     let w = World::with_tasks();
     let tasks = w.tasks.clone().unwrap();
     let release = Arc::new(AtomicBool::new(false));
@@ -2100,13 +2516,15 @@ async fn a_canceled_task_stops_its_session() {
         .to_string();
     let entry = ui_entry(loader.agent.as_ref(), &route).unwrap();
     let sd = SessionDir::open(&entry.location).unwrap();
-    until("the session heard the stop", || {
-        sd.state().map(|s| s.stop_requested || s.is_finished()).unwrap_or(false)
+    release.store(true, Ordering::SeqCst);
+    until("the message is stopped", || {
+        sd.state().map(|s| s.open_turn.is_none() && s.turn_seq == 1).unwrap_or(false)
     })
     .await;
-    release.store(true, Ordering::SeqCst);
-    until("stopped", || finished(&sd)).await;
-    assert_eq!(sd.state().unwrap().outcome, Some(Outcome::Stopped));
+    // The task is the Turn of a conversation: canceling it stops that
+    // message, never the conversation.
+    let st = sd.state().unwrap();
+    assert!(!st.is_finished() && !st.stop_requested && !st.turn_stop_requested, "{st:?}");
     until("task canceled", || tasks.all().iter().any(|t| t.id == task_id && t.state == "canceled")).await;
     until("placeholder closed", || w.mail.sent().len() == 2).await;
     let (_, end) = w.mail.sent().remove(1);
@@ -2316,11 +2734,17 @@ async fn a_session_process_elsewhere_reaches_its_session_through_the_service() {
     let port = free_port();
     let bin = w.root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
+    let exe = |name: &str| bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     for name in ["xagent", "agent-session"] {
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_opendan"), bin.join(name)).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_opendan"), exe(name)).unwrap();
+        #[cfg(not(unix))]
+        std::fs::hard_link(env!("CARGO_BIN_EXE_opendan"), exe(name))
+            .or_else(|_| std::fs::copy(env!("CARGO_BIN_EXE_opendan"), exe(name)).map(|_| ()))
+            .unwrap();
     }
     let mut env = w.env(Llm::new(|_, _| "done".into()), port).await;
-    env.session_cli = Some(bin.join("xagent"));
+    env.session_cli = Some(exe("xagent"));
     let loader = Loader::start(env).await.unwrap();
     until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
     let mut spec = work_spec("work driven elsewhere", "go");
@@ -2353,12 +2777,16 @@ async fn a_session_process_elsewhere_reaches_its_session_through_the_service() {
     };
     let helper = |args: &[&str], stdin: Option<&str>| {
         use std::io::Write;
-        let mut cmd = std::process::Command::new(bin.join("agent-session"));
+        let mut cmd = std::process::Command::new(exe("agent-session"));
         cmd.args(args).current_dir(&deep).env_clear().env("PATH", "/usr/bin:/bin")
             .env(buckyos_api::ENV_EXECUTOR_CALL_ID, "call-7")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            cmd.env("SystemRoot", root);
+        }
         let mut child = cmd.spawn().unwrap();
         child.stdin.take().unwrap().write_all(stdin.unwrap_or_default().as_bytes()).unwrap();
         child.wait_with_output().unwrap()
@@ -2408,5 +2836,536 @@ async fn a_session_process_elsewhere_reaches_its_session_through_the_service() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("cannot call"), "{err}");
+    loader.shutdown().await;
+}
+
+/// A kRPC call as the wire shows it: the result, or the error's JSON
+/// (`kind`, `code`, `message`).
+#[cfg(unix)]
+async fn rpc_wire(port: u16, method: &str, params: Value) -> Result<Value, Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body = json!({ "method": method, "params": params, "sys": [1] }).to_string();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {SERVICE_PATH} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_string(&mut response)).await.unwrap().unwrap();
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    let answer: Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {response}"));
+    match answer["error"].as_str() {
+        Some(error) => Err(serde_json::from_str(&error[error.find('{').unwrap_or(0)..]).unwrap_or_else(|_| json!({ "message": error }))),
+        None => Ok(answer["result"].clone()),
+    }
+}
+
+/// The agent's browser is the fake one (`tests/fake_browser`), in the
+/// AgentRoot's cache directory as on a host without an instance volume.
+#[cfg(unix)]
+async fn fake_browser_of(w: &World) -> Arc<fake_browser::FakeBrowser> {
+    std::env::set_var("OPENDAN_CHROMIUM", fake_browser::chromium());
+    std::env::remove_var("OPENDAN_BROWSER_DIR");
+    fake_browser::FakeBrowser::start(&w.root.join(".cache").join("browser")).await
+}
+
+/// Browser TODO BR5 / BR6 / HO through the Loader: `browser.*` over real
+/// kRPC — the browser starts on demand, the agent's commands find the
+/// service in their environment, a lease makes the agent the operating
+/// party until the user takes over, errors carry their `code`, and the
+/// screen and upload entries are routed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agents_browser_is_served_over_krpc() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let w = World::new();
+    let fake = fake_browser_of(&w).await;
+    let port = free_port();
+    // A session's command says what it finds in its environment.
+    let found = Arc::new(Mutex::new(String::new()));
+    let told = found.clone();
+    let llm = Llm::new(move |req, n| match n {
+        0 => "TOOL:echo \"rpc=$OPENDAN_BROWSER_RPC session=$OPENDAN_SESSION_ID\"".to_string(),
+        _ => {
+            *told.lock().unwrap() = format!("{:?}", req.messages);
+            r#"CALL:report {"report": "done", "is_end": true}"#.to_string()
+        }
+    });
+    let loader = Loader::start(w.env(llm, port).await).await.unwrap();
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+    // Where a session's `agent-browser` finds the service: the Loader's environment, which a
+    // command of a session on the private runtime inherits.
+    let address = format!("http://127.0.0.1:{port}/kapi/{}", loader.agent.agent_id());
+    assert_eq!(std::env::var("OPENDAN_BROWSER_RPC").unwrap(), address);
+    let work = new_work(loader.agent.as_ref(), &w, "look something up in the browser").await;
+    until("the work ran its command", || finished(&work)).await;
+    let found = found.lock().unwrap().clone();
+    assert!(found.contains(&format!("rpc={address} session={}", work.sid())), "{found}");
+    let status = rpc(port, "loader.status", json!({})).await.unwrap();
+    let module = status["modules"].as_array().unwrap().iter().find(|m| m["name"] == "browser").unwrap().clone();
+    assert_eq!((module["enabled"].clone(), module["running"].clone()), (json!(true), json!(true)), "{module}");
+
+    let status = rpc(port, "browser.status", json!({})).await.unwrap();
+    assert_eq!((status["enabled"].clone(), status["available"].clone(), status["running"].clone()), (json!(true), json!(true), json!(false)));
+    assert_eq!(status["unavailable_code"], Value::Null, "an executable named by OPENDAN_CHROMIUM waits for no download");
+    assert_eq!(status["groups"][0]["group_id"], "default");
+    assert_eq!(status["default_session_id"], Value::Null);
+    assert!(fake.pid().is_none(), "nothing is started for a status");
+    let status = rpc(port, "browser.ensure", json!({})).await.unwrap();
+    assert_eq!(status["running"], true);
+    assert_eq!(status["version"]["browser"], "1.2.3.4");
+    assert!(fake.args().contains(&format!("--user-data-dir={}", w.root.join(".cache/browser/profile").display())));
+
+    // The agent's side: a lease, renewed, released with what it says about the thing.
+    let lease = rpc_wire(port, "browser.acquire", json!({ "session_id": "no-such-session" })).await.unwrap();
+    assert_eq!(lease["group_id"], "default");
+    // Through this service, where the lease's end closes the connection (Agent Browser Protocol §2.2).
+    let cdp_url = format!("http://127.0.0.1:{port}/kapi/jarvis.alice/browser/cdp/{}", lease["lease_id"].as_str().unwrap());
+    assert_eq!(lease["cdp_url"], cdp_url.as_str());
+    let version: Value = reqwest::get(format!("{cdp_url}/json/version/")).await.unwrap().json().await.unwrap();
+    assert_eq!(version["webSocketDebuggerUrl"], format!("{}/devtools/browser", cdp_url.replacen("http://", "ws://", 1)));
+    assert!(fake.port > 0);
+    assert_eq!((lease["ttl_ms"].clone(), lease["tabs"].clone(), lease["active_tab_id"].clone()), (json!(60_000), json!([]), Value::Null));
+    let group = rpc(port, "browser.status", json!({ "group_id": "default" })).await.unwrap()["groups"][0].clone();
+    assert_eq!((group["controller"].clone(), group["agent_state"].clone()), (json!("agent"), json!("working")));
+    assert_eq!(group["lease"]["session_id"], "no-such-session");
+    let renewed = rpc(port, "browser.renew", json!({ "lease_id": lease["lease_id"] })).await.unwrap();
+    assert!(renewed["expires_at_ms"].as_u64().unwrap() >= lease["expires_at_ms"].as_u64().unwrap());
+    assert_eq!(
+        rpc(port, "browser.release", json!({ "lease_id": lease["lease_id"], "state": "stuck", "note": "a captcha" })).await.unwrap(),
+        json!({})
+    );
+    let group = rpc(port, "browser.status", json!({ "group_id": "default" })).await.unwrap()["groups"][0].clone();
+    assert_eq!(
+        (group["controller"].clone(), group["agent_state"].clone(), group["note"].clone(), group["lease"].clone()),
+        (json!("user"), json!("stuck"), json!("a captcha"), Value::Null)
+    );
+    // A lease that ended has no way to the browser any more.
+    assert_eq!(reqwest::get(format!("{cdp_url}/json/version")).await.unwrap().status(), reqwest::StatusCode::GONE);
+
+    // The user's side: taken over, the agent gets no lease; handed back, it does.
+    let lease = rpc(port, "browser.acquire", json!({ "session_id": "s" })).await.unwrap();
+    let taken = rpc(port, "browser.take_over", json!({ "group_id": "default" })).await.unwrap();
+    assert_eq!((taken["user_hold"].clone(), taken["controller"].clone(), taken["lease"].clone()), (json!(true), json!("user"), Value::Null));
+    let refused = rpc_wire(port, "browser.acquire", json!({ "session_id": "s" })).await.unwrap_err();
+    assert_eq!((refused["code"].clone(), refused["kind"].clone()), (json!("user_in_control"), json!("other")), "{refused}");
+    let lost = rpc_wire(port, "browser.renew", json!({ "lease_id": lease["lease_id"] })).await.unwrap_err();
+    assert_eq!(lost["code"], "lease_lost");
+    let back = rpc(port, "browser.hand_back", json!({ "group_id": "default" })).await.unwrap();
+    assert_eq!(back["user_hold"], false);
+    rpc(port, "browser.acquire", json!({ "session_id": "s" })).await.unwrap();
+    // The agent asks for the user.
+    let asked = rpc(port, "browser.request_handover", json!({ "session_id": "s", "reason": "password", "note": "the login" })).await.unwrap();
+    assert_eq!(asked, json!({ "group_id": "default" }));
+    let group = rpc(port, "browser.status", json!({ "group_id": "default" })).await.unwrap()["groups"][0].clone();
+    assert_eq!((group["agent_state"].clone(), group["user_hold"].clone()), (json!("waiting_takeover"), json!(true)));
+    assert_eq!(group["handover"]["reason"], "password");
+    let to_agent = rpc(port, "browser.hand_to_agent", json!({ "group_id": "default" })).await.unwrap();
+    assert_eq!((to_agent["user_hold"].clone(), to_agent["handover"].clone()), (json!(false), Value::Null));
+
+    // Errors name what is wrong.
+    for (method, params, code) in [
+        ("browser.acquire", json!({}), "invalid_argument"),
+        ("browser.release", json!({ "lease_id": "l", "state": "happy" }), "invalid_argument"),
+        ("browser.request_handover", json!({ "session_id": "s", "reason": "bored" }), "invalid_argument"),
+        ("browser.take_over", json!({ "group_id": "_reflow" }), "no_such_group"),
+        ("browser.bind_default", json!({}), "invalid_argument"),
+        ("browser.bind_default", json!({ "session_id": "default" }), "invalid_argument"),
+        ("browser.renew", json!({ "lease_id": "lease-0" }), "lease_lost"),
+        ("browser.upload", json!({ "request_id": "r", "zone_path": "/x" }), "no_such_request"),
+        ("browser.upload", json!({ "zone_path": "/x" }), "invalid_argument"),
+        ("browser.download_export", json!({ "download_id": "d" }), "no_such_download"),
+        ("browser.reflow_state", json!({ "url": "about:blank" }), "invalid_argument"),
+        // The reflow library is a bucket of the owner's Zone: this Loader runs outside one.
+        ("browser.reflow_state", json!({ "url": "https://example.com" }), "other"),
+        ("browser.reflow_action", json!({ "url": "https://example.com" }), "invalid_argument"),
+        ("browser.nope", json!({}), "invalid_argument"),
+    ] {
+        let error = rpc_wire(port, method, params).await.unwrap_err();
+        assert_eq!(error["code"], code, "{method}: {error}");
+        assert!(!error["message"].as_str().unwrap().is_empty());
+    }
+
+    // The screen and the upload are entries of their own (`the_browsers_screen_and_uploads_are_served_over_http`).
+    for (request, status) in [("GET /kapi/opendan/browser/screen", 400), ("PUT /api/opendan/browser/upload/r1?name=a.txt", 404)] {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(format!("{request} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response)).await.unwrap().unwrap();
+        assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{request}: {response}");
+    }
+
+    // Clearing the logins stops the browser; the Loader's end stops it too.
+    rpc(port, "browser.clear_profile", json!({})).await.unwrap();
+    assert_eq!(rpc(port, "browser.status", json!({})).await.unwrap()["running"], false);
+    rpc(port, "browser.ensure", json!({})).await.unwrap();
+    let pid = fake.pid().unwrap();
+    loader.shutdown().await;
+    until("the browser ended with the Loader", || !std::path::Path::new(&format!("/proc/{pid}/cmdline")).exists()).await;
+}
+
+/// One HTTP request to the service: `(status, body)`.
+#[cfg(unix)]
+async fn http_request(port: u16, head: &str, body: &[u8]) -> (u16, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(format!("{head}\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut response)).await.unwrap().unwrap();
+    let status = response.split(' ').nth(1).and_then(|code| code.parse().ok()).unwrap_or_else(|| panic!("{response}"));
+    let body = response.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or_default();
+    (status, serde_json::from_str(body).unwrap_or(Value::Null))
+}
+
+#[cfg(unix)]
+type ScreenSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The next message of `kind` on a screen connection (frames are acknowledged), `None` once it is closed.
+#[cfg(unix)]
+async fn screen_message(ws: &mut ScreenSocket, kind: &str) -> Option<Value> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(20), ws.next()).await.unwrap_or_else(|_| panic!("no `{kind}` arrived"));
+        let Some(Ok(Message::Text(text))) = message else {
+            if matches!(message, Some(Ok(Message::Binary(_)))) {
+                continue;
+            }
+            return None;
+        };
+        let message: Value = serde_json::from_str(text.as_str()).unwrap();
+        if message["type"] == kind {
+            return Some(message);
+        }
+        if message["type"] == "frame_meta" {
+            ws.send(Message::text(json!({ "type": "ack", "seq": message["seq"] }).to_string())).await.unwrap();
+        }
+    }
+}
+
+/// Connect to the screen below `path` and say `hello`.
+#[cfg(unix)]
+async fn screen_hello(port: u16, path: &str, token: Option<&str>) -> ScreenSocket {
+    use futures::SinkExt;
+    let (mut ws, response) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}{path}/browser/screen")).await.unwrap();
+    assert_eq!(response.status(), 101);
+    let hello = json!({ "type": "hello", "token": token, "group_id": "default", "viewport": { "width": 412, "height": 915, "mobile": true } });
+    ws.send(tokio_tungstenite::tungstenite::Message::text(hello.to_string())).await.unwrap();
+    ws
+}
+
+/// Browser TODO SC1 / SC6 through the Loader: `GET …/browser/screen` below
+/// every mount becomes a WebSocket whose `hello` is admitted like a kRPC
+/// call of the owner's, and `PUT …/browser/upload/<request>` gives a file
+/// of the App's device to the page that asked for one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_browsers_screen_and_uploads_are_served_over_http() {
+    let w = World::new();
+    let fake = fake_browser_of(&w).await;
+    let port = free_port();
+    let loader = Loader::start(w.env(Llm::new(|_, _| "unused".into()), port).await).await.unwrap();
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+    let agent_path = format!("/kapi/{}", loader.agent.agent_id());
+
+    // Outside a Zone every caller is the owner: the hello is answered with the group's state.
+    for path in [WEB_API_PATH, SERVICE_PATH, agent_path.as_str()] {
+        let mut ws = screen_hello(port, path, None).await;
+        let ready = screen_message(&mut ws, "ready").await.unwrap();
+        assert_eq!(ready["state"]["group"]["group_id"], "default", "{path}");
+        // A phone's viewport: the browser is not made a phone.
+        assert_eq!((ready["state"]["running"].clone(), ready["state"]["viewport"]["mobile"].clone()), (json!(true), json!(false)));
+        assert_eq!(loader.browser.viewers(), 1);
+        drop(ws);
+        until("the viewer is gone", || loader.browser.viewers() == 0).await;
+    }
+    assert!(fake.pid().is_some(), "the browser was started for the screen");
+    // Not a WebSocket request: refused, nothing is upgraded.
+    let (status, error) = http_request(port, &format!("GET {SERVICE_PATH}/browser/screen HTTP/1.1"), b"").await;
+    assert_eq!((status, error["code"].as_str()), (400, Some("invalid_argument")));
+
+    // A page asks for a file: the screen is told, the App uploads it, the page's input gets it.
+    let tab = loader.browser.open_tab("default", Some("https://a.example/")).await.unwrap();
+    let (_, session) = loader.browser.tab_session(&tab.tab_id).await.unwrap();
+    let mut ws = screen_hello(port, SERVICE_PATH, None).await;
+    screen_message(&mut ws, "ready").await.unwrap();
+    fake.tell(&tab.tab_id, "Page.fileChooserOpened", json!({ "frameId": tab.tab_id, "mode": "selectMultiple", "backendNodeId": 9 }));
+    let request = screen_message(&mut ws, "request").await.unwrap();
+    assert_eq!((request["kind"].clone(), request["multiple"].clone(), request["accept"].clone()), (json!("file_chooser"), json!(true), json!([".png", "image/*"])));
+    let request_id = request["request_id"].as_str().unwrap();
+    let put = |query: &str, length: usize| format!("PUT {agent_path}/browser/upload/{request_id}?{query} HTTP/1.1\r\nContent-Length: {length}");
+    assert_eq!(http_request(port, &put("name=first%20file.txt", 5), b"first").await, (200, json!({})));
+    assert!(fake.received("DOM.setFileInputFiles").is_empty(), "the files are given together");
+    // What cannot be taken says why.
+    let (status, error) = http_request(port, &put("done=1", 1), b"x").await;
+    assert_eq!((status, error["code"].as_str()), (400, Some("invalid_argument")), "a file has a name");
+    let (status, error) = http_request(port, &put("name=huge.bin&done=1", 200 * 1024 * 1024), b"").await;
+    assert_eq!((status, error["code"].as_str()), (413, Some("upload_too_large")));
+    let (status, error) = http_request(port, &format!("PUT {SERVICE_PATH}/browser/upload/r-none?name=a.txt HTTP/1.1\r\nContent-Length: 1"), b"x").await;
+    assert_eq!((status, error["code"].as_str()), (404, Some("no_such_request")));
+    assert_eq!(http_request(port, &put("name=%E7%85%A7%E7%89%87.png&done=1", 6), b"second").await, (200, json!({})));
+    let set = fake.received("DOM.setFileInputFiles");
+    assert_eq!((set.len(), set[0].0.as_deref(), set[0].1["backendNodeId"].clone()), (1, Some(session.as_str()), json!(9)));
+    let files: Vec<PathBuf> = set[0].1["files"].as_array().unwrap().iter().map(|f| PathBuf::from(f.as_str().unwrap())).collect();
+    assert_eq!(files.iter().map(|f| f.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), vec!["first file.txt", "照片.png"]);
+    assert_eq!((std::fs::read(&files[0]).unwrap(), std::fs::read(&files[1]).unwrap()), (b"first".to_vec(), b"second".to_vec()));
+    assert!(files[0].starts_with(w.root.join(".cache/browser/uploads")));
+    assert_eq!(screen_message(&mut ws, "request_closed").await.unwrap()["request_id"], request_id);
+    // The request is over: nothing more is taken for it.
+    assert_eq!(http_request(port, &put("name=late.txt&done=1", 1), b"x").await.0, 404);
+    // Over the connection the user operates the page.
+    futures::SinkExt::send(&mut ws, tokio_tungstenite::tungstenite::Message::text(json!({ "type": "input", "kind": "text", "text": "typed" }).to_string())).await.unwrap();
+    until("the input reached the tab", || fake.received("Input.insertText").iter().any(|(s, p)| s.as_deref() == Some(session.as_str()) && p["text"] == "typed")).await;
+    drop(ws);
+    loader.shutdown().await;
+
+    // Inside a Zone the hello and the upload carry the owner's session token, checked like a kRPC call's.
+    let w = World::new();
+    let fake = fake_browser_of(&w).await;
+    let port = free_port();
+    let mut env = w.env(Llm::new(|_, _| "unused".into()), port).await;
+    env.access = Access::Zone { owner: "bob".into(), app_id: "jarvis.alice".into(), trust_loopback: false, zone_host: Some("test.buckyos.io".into()) };
+    let loader = Loader::start(env).await.unwrap();
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+    for token in [None, Some("not-a-session-token")] {
+        let mut ws = screen_hello(port, SERVICE_PATH, token).await;
+        let error = screen_message(&mut ws, "error").await.unwrap();
+        assert_eq!(error["code"], "unauthorized", "{token:?}: {error}");
+        assert!(!error["message"].as_str().unwrap().is_empty());
+        assert!(screen_message(&mut ws, "ready").await.is_none(), "the connection is closed");
+    }
+    let (status, error) = http_request(port, &format!("PUT {SERVICE_PATH}/browser/upload/r1?name=a.txt HTTP/1.1\r\nContent-Length: 1"), b"x").await;
+    assert_eq!((status, error["code"].as_str()), (401, Some("unauthorized")));
+    let (status, error) =
+        http_request(port, &format!("PUT {SERVICE_PATH}/browser/upload/r1?name=a.txt HTTP/1.1\r\nAuthorization: Bearer not-a-session-token\r\nContent-Length: 1"), b"x").await;
+    assert_eq!((status, error["code"].as_str()), (403, Some("unauthorized")));
+    assert!(fake.pid().is_none() && loader.browser.viewers() == 0, "nobody was admitted");
+    loader.shutdown().await;
+}
+
+/// An agent without a browser says why on every entry: `browser.status`,
+/// the error of a kRPC call, the screen's handshake and the upload carry
+/// `unavailable_code` beside `browser_unavailable`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_without_a_browser_says_why_on_every_entry() {
+    let w = World::new();
+    std::fs::write(w.root.join("agent.toml"), format!("{AGENT_TOML}enabled = false\n")).unwrap();
+    let fake = fake_browser_of(&w).await;
+    let port = free_port();
+    let loader = Loader::start(w.env(Llm::new(|_, _| "unused".into()), port).await).await.unwrap();
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+
+    let status = rpc(port, "browser.status", json!({})).await.unwrap();
+    assert_eq!((status["enabled"].clone(), status["available"].clone(), status["unavailable_code"].clone()), (json!(false), json!(true), json!("disabled")));
+    for (method, params) in [
+        ("browser.ensure", json!({})),
+        ("browser.acquire", json!({ "session_id": "s" })),
+        ("browser.take_over", json!({ "group_id": "default" })),
+        ("browser.reflow_refresh", json!({ "url": "https://example.com" })),
+    ] {
+        let error = rpc_wire(port, method, params).await.unwrap_err();
+        assert_eq!(
+            (error["kind"].as_str(), error["code"].as_str(), error["unavailable_code"].as_str()),
+            (Some("other"), Some("browser_unavailable"), Some("disabled")),
+            "{method}: {error}"
+        );
+        assert_eq!(error["message"], status["unavailable"], "{method}");
+    }
+    let mut ws = screen_hello(port, SERVICE_PATH, None).await;
+    let error = screen_message(&mut ws, "error").await.unwrap();
+    assert_eq!((error["code"].as_str(), error["unavailable_code"].as_str()), (Some("browser_unavailable"), Some("disabled")), "{error}");
+    assert!(screen_message(&mut ws, "ready").await.is_none(), "the connection is closed");
+    let (code, error) = http_request(port, &format!("PUT {SERVICE_PATH}/browser/upload/r1?name=a.txt HTTP/1.1\r\nContent-Length: 1"), b"x").await;
+    assert_eq!((code, error["code"].as_str(), error["unavailable_code"].as_str()), (503, Some("browser_unavailable"), Some("disabled")), "{error}");
+    assert!(fake.pid().is_none(), "nothing was started");
+    loader.shutdown().await;
+}
+
+/// Browser TODO BR7 / HO4, D35, D36: every session works in the agent's one
+/// group. The browser conversation is the one `browser.bind_default` names:
+/// what the user does to the browser is told to its UI session as a
+/// `_browser` observation — it says nothing by itself, only the latest one is
+/// kept, and the owner's next message sees it — and its questions are what
+/// the browser shows the agent waiting for. Its UI sessions have the
+/// browser's manual, no other conversation's has; a UI session it had before
+/// it was bound is archived, and its next message opens one with the manual.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn taking_the_browser_over_is_told_to_the_browser_conversation() {
+    use libopendan::notify::NotifyHost;
+    let mut w = World::new();
+    std::fs::create_dir_all(w.root.join("cmd_skills/browser")).unwrap();
+    std::fs::write(w.root.join("cmd_skills/browser/SKILL.md"), "---\ndescription: the browser\nscope: ui, work\n---\nThe browser manual.").unwrap();
+    let notify = Arc::new(libopendan::notify::LocalNotify::enable(&w.root, AGENT).unwrap());
+    w.notify = Some(notify.clone());
+    let fake = fake_browser_of(&w).await;
+    let port = free_port();
+    let llm = Llm::new(|req, n| {
+        let all: String = req.messages.iter().map(|m| m.text_content()).collect();
+        let manual = all.contains("The browser manual.");
+        match n {
+            0 | 1 => {
+                assert!(!manual, "no conversation has the browser's manual before it is the browser conversation");
+                "hello".to_string()
+            }
+            2 => {
+                assert!(manual, "the browser conversation's new session has the manual");
+                "ready".to_string()
+            }
+            3 => {
+                assert!(all.contains("[browser] The user handed the browser back."), "{all}");
+                assert!(all.contains("\"Title of https://shop.example/cart\" (https://shop.example/cart)"), "{all}");
+                assert!(!all.contains("The user took over the browser"), "only the latest record is kept: {all}");
+                "reading the page again".to_string()
+            }
+            4 => {
+                assert!(all.contains("[browser] The user asks you to go on from the current page"), "{all}");
+                "on it".to_string()
+            }
+            5 => {
+                assert!(manual, "{all}");
+                "here too".to_string()
+            }
+            _ => panic!("unexpected call {n}"),
+        }
+    });
+    let loader = Loader::start(w.env(llm.clone(), port).await).await.unwrap();
+    until("service answers", || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()).await;
+    let route = |session: &str| MailboxAddress::new(parse_did(AGENT).unwrap(), Some(session.to_string())).unwrap().to_string();
+    let open_ui = |session: &str| {
+        let entries = futures_block(loader.agent.sessions().query(&RegistryQuery { kind: Some(SessionKind::Ui), ..Default::default() })).unwrap();
+        entries.into_iter().find(|e| e.route_key.as_deref() == Some(route(session).as_str()) && e.status.run_state != RunState::Finished)
+    };
+    let manuals = |entry: &RegistryEntry| {
+        let cfg = SessionDir::open(&entry.location).unwrap().config().unwrap();
+        cfg.prompt.frozen.unwrap().cmd_skills.into_iter().map(|c| c.name).collect::<Vec<_>>()
+    };
+    let pending = |entry: &RegistryEntry| SessionDir::open(&entry.location).and_then(|sd| sd.state()).map(|st| st.pending_events).unwrap();
+    let say = |session: &str, text: &str| {
+        let mut msg = chat(BOB, text);
+        msg.to_session = Some(session.to_string());
+        w.mail.deliver(session, msg);
+    };
+
+    // Two conversations of the owner, neither of them the browser conversation yet.
+    let direct = format!("dm:{BOB}");
+    w.mail.deliver(&direct, chat(BOB, "hi"));
+    until("first reply", || w.mail.sent().len() == 1).await;
+    say("thing-1", "book the flight");
+    until("second reply", || w.mail.sent().len() == 2).await;
+    let ui_direct = open_ui(&direct).unwrap();
+    let before = open_ui("thing-1").unwrap();
+    assert!(manuals(&ui_direct).is_empty() && manuals(&before).is_empty());
+
+    // Every session works in the one group, also one the registry does not know.
+    for session in [ui_direct.session_id.as_str(), before.session_id.as_str(), "no-such-session"] {
+        let lease = rpc(port, "browser.acquire", json!({ "session_id": session })).await.unwrap();
+        assert_eq!(lease["group_id"], "default", "session {session}");
+        rpc(port, "browser.release", json!({ "lease_id": lease["lease_id"] })).await.unwrap();
+        let status = rpc(port, "browser.status", json!({ "session_id": session })).await.unwrap();
+        assert_eq!(status["groups"].as_array().unwrap().iter().map(|g| g["group_id"].clone()).collect::<Vec<_>>(), vec![json!("default")]);
+    }
+    for (method, params) in [("browser.status", json!({ "group_id": "thing-1" })), ("browser.take_over", json!({ "group_id": "thing-1" }))] {
+        assert_eq!(rpc_wire(port, method, params).await.unwrap_err()["code"], "no_such_group", "{method}");
+    }
+    // Without a browser conversation the browser changes hands without a record.
+    let silent = rpc(port, "browser.take_over", json!({ "group_id": "default" })).await.unwrap();
+    assert_eq!(silent["user_hold"], true);
+    rpc(port, "browser.hand_back", json!({ "group_id": "default" })).await.unwrap();
+    assert!(pending(&ui_direct).is_empty() && pending(&before).is_empty());
+
+    // The named conversation becomes the browser conversation: its session without the manual is archived.
+    assert_eq!(rpc(port, "browser.bind_default", json!({ "session_id": "thing-1" })).await.unwrap(), json!({ "default_session_id": "thing-1" }));
+    assert_eq!(rpc(port, "browser.status", json!({})).await.unwrap()["default_session_id"], "thing-1");
+    until("the session without the manual is archived", || open_ui("thing-1").is_none()).await;
+    say("thing-1", "the browser is yours");
+    until("third reply", || w.mail.sent().len() == 3).await;
+    let ui_browser = open_ui("thing-1").unwrap();
+    assert_ne!(ui_browser.session_id, before.session_id);
+    assert_eq!(manuals(&ui_browser), ["browser"]);
+    assert!(manuals(&open_ui(&direct).unwrap()).is_empty(), "another conversation has no browser manual");
+    // Bound again: nothing is archived.
+    rpc(port, "browser.bind_default", json!({ "session_id": "thing-1" })).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(open_ui("thing-1").unwrap().session_id, ui_browser.session_id);
+
+    // The user opens a page, takes over, hands back: the browser conversation is told, no other.
+    let tab = loader.browser.open_tab("default", Some("https://shop.example/")).await.unwrap();
+    loader.browser.tab_send(&tab.tab_id, "Page.navigate", json!({ "url": "https://shop.example/cart" })).await.unwrap();
+    until("the page's title arrives", || loader.browser.group("default").tabs[0].title.contains("cart")).await;
+    rpc(port, "browser.take_over", json!({ "group_id": "default" })).await.unwrap();
+    until("the take-over is observed", || pending(&ui_browser).len() == 1).await;
+    let seen = pending(&ui_browser);
+    assert_eq!(seen[0].subscription_id.as_deref(), Some("_browser"));
+    assert_eq!((seen[0].source.kind.as_str(), seen[0].source.id.as_str()), ("system", "browser:default"));
+    assert_eq!(seen[0].latest.as_ref().unwrap().event, "take_over");
+    rpc(port, "browser.hand_back", json!({ "group_id": "default" })).await.unwrap();
+    until("the hand-back replaces it", || pending(&ui_browser)[0].latest.as_ref().is_some_and(|l| l.event == "hand_back")).await;
+    assert_eq!(pending(&ui_browser).len(), 1);
+    assert!(pending(&ui_direct).is_empty(), "another conversation is not told");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 3, "an observation says nothing");
+    // The App wakes the agent with an ordinary message.
+    say("thing-1", "go on");
+    until("fourth reply", || w.mail.sent().len() == 4).await;
+    assert_eq!(w.mail.sent()[3].1.content.content, "reading the page again");
+
+    // A question the agent asked in the browser conversation (here: a Work of it) shows as its state; one asked elsewhere does not.
+    let agent_state = || async move { rpc(port, "browser.status", json!({})).await.unwrap()["groups"][0]["agent_state"].clone() };
+    let work_of = |parent: &RegistryEntry, objective: &str| {
+        let mut spec = work_spec(objective, "go");
+        spec.origin = Some(Origin { parent_session: Some(parent.session_id.clone()), ..Default::default() });
+        spec.driver = Some("app:other@alice".into());
+        spec
+    };
+    let elsewhere = create_session(&w.root.join("sessions"), work_of(&ui_direct, "a work of the direct conversation"), loader.agent.as_ref(), WHO, w.channels().as_ref()).await.unwrap();
+    let work = create_session(&w.root.join("sessions"), work_of(&ui_browser, "a work of the browser conversation"), loader.agent.as_ref(), WHO, w.channels().as_ref()).await.unwrap();
+    assert_eq!(agent_state().await, "idle", "a conversation waiting for its next message is not a question");
+    let ask = |session: &str, key: &str| {
+        let mut question = buckyos_api::NotifySendReq::input("", "Window or aisle?", "", Vec::new(), true, key);
+        question.source = Some(buckyos_api::NotifySource { session_id: Some(session.to_string()), ..Default::default() });
+        question
+    };
+    let other = notify.send(ask(elsewhere.sid(), "ask-elsewhere")).await.unwrap();
+    assert_eq!(agent_state().await, "idle", "asked in another conversation");
+    let question = notify.send(ask(work.sid(), "ask-seat")).await.unwrap();
+    assert_eq!(agent_state().await, "waiting_answer");
+    let lease = rpc(port, "browser.acquire", json!({ "session_id": work.sid() })).await.unwrap();
+    assert_eq!(agent_state().await, "working", "an agent at work is shown working");
+    rpc(port, "browser.release", json!({ "lease_id": lease["lease_id"], "state": "done" })).await.unwrap();
+    assert_eq!(agent_state().await, "waiting_answer", "the open question comes before how the last lease ended");
+    notify.cancel(&question.notify_id, "answered in the test").await.unwrap();
+    notify.cancel(&other.notify_id, "answered in the test").await.unwrap();
+    assert_eq!(agent_state().await, "done");
+
+    // Handed to the agent: the browser conversation is told, and the App's message wakes it.
+    let handed = rpc(port, "browser.hand_to_agent", json!({ "group_id": "default" })).await.unwrap();
+    assert_eq!(handed["group_id"], "default");
+    until("the hand-over is observed", || pending(&ui_browser).len() == 1).await;
+    say("thing-1", "from here");
+    until("fifth reply", || w.mail.sent().len() == 5).await;
+
+    // Another conversation becomes the browser conversation: its first session has the manual; the tabs stay.
+    rpc(port, "browser.bind_default", json!({ "session_id": "thing-3" })).await.unwrap();
+    say("thing-3", "hello browser");
+    until("sixth reply", || w.mail.sent().len() == 6).await;
+    assert_eq!(manuals(&open_ui("thing-3").unwrap()), ["browser"]);
+    assert_eq!(open_ui("thing-1").unwrap().session_id, ui_browser.session_id, "the conversation bound before keeps its session");
+    let status = rpc(port, "browser.status", json!({})).await.unwrap();
+    assert_eq!((status["default_session_id"].clone(), status["groups"][0]["tabs"].as_array().unwrap().len()), (json!("thing-3"), 1));
+    let file: Value = serde_json::from_slice(&std::fs::read(w.root.join("state/browser/groups.json")).unwrap()).unwrap();
+    assert_eq!(file["default_session_id"], "thing-3");
+    drop(fake);
     loader.shutdown().await;
 }

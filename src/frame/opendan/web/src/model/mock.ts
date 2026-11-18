@@ -8,12 +8,22 @@ import type {
   GoalSchedule,
   GoalState,
   HostedStatus,
+  InstallPlan,
   KnownRuntime,
   KnownWorkspace,
+  MemoryEntry,
+  RuntimeImpact,
   RuntimeSettings,
   RegistryEntry,
   SessionDetail,
   SessionState,
+  PlannedSkill,
+  SkillAudit,
+  SkillDraft,
+  SkillFinding,
+  SkillMeta,
+  SkillSource,
+  UiSkills,
   WorklogEntry,
 } from './types'
 
@@ -28,12 +38,24 @@ const UI = 'ui-7f3a2c91'
 const WORK_RUNNING = 'work-b41d09e2'
 const WORK_PENDING = 'work-5c8e17aa'
 const WORK_FAILED = 'work-e02b66f4'
-const CHECK = 'sc-daily'
+const CHECK = 'work-20261101-4'
 const GOAL_BUILTIN = 'goal-memory-maintenance'
 const GOAL_TIDY = 'goal-downloads-tidy'
 const GOAL_ARCHIVED = 'goal-photo-backlog'
 const SLOT_SECS = 1800
 const slotNow = Math.floor(now / 1000 / SLOT_SECS)
+// The goals' statistics period (fixed windows of a day, as the host counts them).
+const PERIOD_START = Math.floor(now / 86_400_000) * 86_400_000
+const MEMORY_CHECK = 'goal_checks/memory_maintenance.ts'
+const MEMORY_CHECK_V1 = `// Check of the built-in Memory maintenance goal (its initial version).
+export default async function check(ctx, state) {
+  const status = await ctx.host.call('memory.status', { full: true })
+  const pending = status.pending ?? {}
+  const run = (pending.new ?? 0) + (pending.due ?? 0) + (status.due_reviews ?? 0) > 0
+  return { run, reason: run ? 'memory holds material' : undefined, state }
+}
+`
+const MEMORY_CHECK_V2 = MEMORY_CHECK_V1.replace("{ full: true }", "{ full: !state?.digest }").replace('(its initial version)', '(rewritten by the goal: the full check only when the digest moved)')
 const iso = (seconds: number) => new Date(now + seconds * 1000).toISOString()
 
 const entry = (
@@ -143,6 +165,7 @@ const buildFixtures = () => {
     input_queue: `opendan/${WORK_RUNNING}/input`,
     artifact_id: 'art-weekly-report',
     workspace: { workspace_id: 'ws-downloads', access: 'read_write' },
+    runtime_id: 'host',
   })
   const pending = entry(WORK_PENDING, 'work', 'work.default', 'Rename photos by capture date', {
     rev: 48,
@@ -170,11 +193,11 @@ const buildFixtures = () => {
     origin: { parent_session: WORK_RUNNING },
     driver: { principal: 'app:xagent@devtest' },
   })
-  const check = entry(CHECK, 'self_check', 'self_check', 'Daily self check', {
+  const check = entry(CHECK, 'work', 'work.default', 'Summarize last week\'s notes', {
     rev: 6,
     run_state: 'finished',
     outcome: 'succeeded',
-    one_line_status: 'No issue found',
+    one_line_status: 'Summary written',
     updated_at_ms: ago(40000),
   })
   const entries = [ui, running, pending, failed, check]
@@ -315,7 +338,16 @@ interface GoalFixture {
   schedule: GoalSchedule
   activations: GoalActivation[]
   changes: GoalChange[]
+  /** Earlier revisions of the definition. */
+  revisions?: Record<number, GoalDefinition>
+  /** Check script source by version. */
+  scripts?: Record<number, string>
 }
+
+const noStats = (): GoalSchedule['stats'] => ({
+  period_start_ms: PERIOD_START, skipped_min_interval: 0, skipped_budget: 0, checks_true: 0, checks_false: 0, checks_error: 0, guarantees: 0, notified: 0,
+})
+const gateState = { check_errors: 0, guarantee_posted_for_ms: 0, switched_off: false }
 
 const goalDef = (goal_id: string, title: string, objective: string, extra: Partial<GoalDefinition>): GoalDefinition => ({
   schema: 'opendan.goal/1',
@@ -365,7 +397,10 @@ const buildGoalFixtures = (): GoalFixture[] => {
       constraints: ['Never record perceptions of its own', 'Small batches: about 20 materials, at most 3 per activation'],
       created_by: { principal: AGENT, via: 'opendan' },
       budget: { activation: { max_total_tokens: 32000, max_runs: 4 }, period: { window_secs: 86400, max_total_tokens: 200000, max_activations: 48 } },
-      schedule: { every_secs: SLOT_SECS },
+      schedule: {
+        every_secs: SLOT_SECS,
+        check: { version: 2, sha256: 'b7e1c0a4', source: `goal_session:${GOAL_BUILTIN}-e1`, package: MEMORY_CHECK, updated_at_ms: ago(86400) },
+      },
       behavior: 'memory_maintenance',
       status_by: AGENT,
       idempotency_key: 'builtin:memory_maintenance',
@@ -389,7 +424,9 @@ const buildGoalFixtures = (): GoalFixture[] => {
         text: 'You mentioned a weekly release report three times. Should I keep a schedule for it (Fridays 16:00)?',
         at_ms: ago(5400), epoch: 1, activation: 7, notify_id: 'ntf-7c2e', status: 'open', candidate_id: 'cand-weekly-report',
       }],
-      usage: { period_start_ms: ago(30000), tokens: 41200, activations: 5, works: 0, work_tokens: 0 },
+      usage: { period_start_ms: PERIOD_START, tokens: 41200, activations: 5, works: 0, work_tokens: 0 },
+      consecutive_no_action: 0,
+      holds: { period_start_ms: PERIOD_START, min_interval: 2, budget: 0 },
       maintenance: {
         receipts: [
           { operation_id: 'op-01HX1', epoch: 1, activation: 7, batch_id: 'batch-0a3f', graph_seq: 1180, refs: ['mat-1', 'mat-2'], batch: { materials: 8 }, stage: 'completed', operations: 9, dispositions: 8, cleanup_pending: false, created_at_ms: ago(5500), updated_at_ms: ago(5450) },
@@ -412,30 +449,21 @@ const buildGoalFixtures = (): GoalFixture[] => {
       schema: 'opendan.goal_schedule/1',
       goal_id: GOAL_BUILTIN,
       backend: 'local',
-      every_secs: SLOT_SECS,
+      timetable: `every:${SLOT_SECS}`,
       last_slot: slotNow,
       last_fire_at_ms: ago(5400),
       start_posted_epoch: 1,
       skipped: [
-        { slot: slotNow - 1, at_ms: ago(1800), reason: 'no_change' },
-        { slot: slotNow, at_ms: ago(60), reason: 'no_change' },
+        { slot: slotNow - 1, at_ms: ago(1800), reason: 'check_false' },
+        { slot: slotNow, at_ms: ago(60), reason: 'check_false' },
       ],
-      gate: {
-        status: 'no_change',
-        last_checked_slot: slotNow,
-        last_baseline_slot: slotNow - 3,
-        last_checked_at_ms: ago(60),
-        last_full_check_at_ms: ago(7200),
-        last_skip_reason: 'no_change',
-        last_inputs_digest: 'sha256:1f9c2b7e',
-        pending: { new: 0, due: 0, waiting: 3, retry_cleanup: 0, next_deadline: iso(4 * 3600), oldest_at_ms: ago(86400) },
-        due_reviews: 0,
-        next_review_at: iso(2 * 86400),
-        unfinished_receipts: 0,
-        last_run_at_ms: ago(5400),
-        last_run_slot: slotNow - 3,
-        backoff_level: 0,
-      },
+      last_check: { at_ms: ago(60), outcome: 'false', script_version: 2, elapsed_ms: 140, held: 'min_interval' },
+      check_errors: 0,
+      last_check_error: 'memory.status timed out after 10s',
+      check_state: { digest: 'sha256:1f9c2b7e', full_check_at: ago(7200), next_deadline: iso(4 * 3600) },
+      stats: { period_start_ms: PERIOD_START, skipped_min_interval: 1, skipped_budget: 0, checks_true: 3, checks_false: 14, checks_error: 1, guarantees: 0, notified: 0 },
+      guarantee_posted_for_ms: 0,
+      switched_off: false,
       updated_at_ms: ago(60),
     },
     activations: [5, 6, 7].map((seq) =>
@@ -444,6 +472,7 @@ const buildGoalFixtures = (): GoalFixture[] => {
         : { summary: 'Checked: nothing reached its processing condition.' }),
     ),
     changes: [change(1, ago(86400 * 3), 'created', AGENT, 'opendan', { revision: 1, epoch: 1, reason: 'seeded builtin:memory_maintenance' })],
+    scripts: { 1: MEMORY_CHECK_V1, 2: MEMORY_CHECK_V2 },
   }
 
   const tidy: GoalFixture = {
@@ -482,18 +511,23 @@ const buildGoalFixtures = (): GoalFixture[] => {
         at_ms: ago(43200), epoch: 2, activation: 1, notify_id: 'ntf-4a1b', status: 'open',
       }],
       recent_works: [{ sid: 'work-tidy-01', outcome: 'succeeded', one_line_status: 'Moved 12 archives into the workspace', absorbed_in: [1, 2] }],
-      usage: { period_start_ms: ago(50000), tokens: 12800, activations: 1, works: 0, work_tokens: 0 },
+      usage: { period_start_ms: PERIOD_START, tokens: 12800, activations: 1, works: 0, work_tokens: 0 },
+      consecutive_no_action: 0,
+      holding: { reason: 'min_interval', since_ms: ago(600), until_ms: now + 300_000, checked_at_ms: ago(600) },
+      holds: { period_start_ms: PERIOD_START, min_interval: 1, budget: 0 },
       updated_at_ms: ago(43200),
     },
     schedule: {
       schema: 'opendan.goal_schedule/1',
       goal_id: GOAL_TIDY,
       backend: 'local',
-      every_secs: 6 * 3600,
+      timetable: `every:${6 * 3600}`,
       last_slot: Math.floor(now / 1000 / (6 * 3600)),
       last_fire_at_ms: ago(43200),
       start_posted_epoch: 2,
       skipped: [{ slot: Math.floor(now / 1000 / (6 * 3600)), at_ms: ago(600), reason: 'min_interval' }],
+      ...gateState,
+      stats: { ...noStats(), skipped_min_interval: 1 },
       updated_at_ms: ago(600),
     },
     activations: [
@@ -540,10 +574,12 @@ const buildGoalFixtures = (): GoalFixture[] => {
       distance: { text: '212 photos renamed, 3 skipped.', observed_at_ms: ago(86400 * 2) },
       recent_works: [{ sid: WORK_PENDING, outcome: 'succeeded', one_line_status: 'Renamed 212 photos, 3 skipped', absorbed_in: [1, 1] }],
       usage: { period_start_ms: ago(86400 * 2), tokens: 2600, activations: 1, works: 1, work_tokens: 9800 },
+      consecutive_no_action: 0,
+      holds: { period_start_ms: ago(86400 * 2), min_interval: 0, budget: 0 },
       last_error: { kind: 'llm', message: 'provider returned 529 (overloaded) after 3 attempts', at_ms: ago(86400 * 4) },
       updated_at_ms: ago(86400 * 2),
     },
-    schedule: { schema: 'opendan.goal_schedule/1', goal_id: GOAL_ARCHIVED, backend: 'local', start_posted_epoch: 1, updated_at_ms: ago(86400 * 6) },
+    schedule: { schema: 'opendan.goal_schedule/1', goal_id: GOAL_ARCHIVED, backend: 'local', start_posted_epoch: 1, ...gateState, stats: noStats(), updated_at_ms: ago(86400 * 6) },
     activations: [
       activation(GOAL_ARCHIVED, 1, 1, ago(86400 * 6), { reasons: [{ kind: 'created', key: `create:${GOAL_ARCHIVED}` }], decision: 'created_work', summary: 'Started the rename Work.', works_created: [WORK_PENDING], cost: { runs: 1, total_tokens: 2600 } }),
     ],
@@ -558,9 +594,49 @@ const buildGoalFixtures = (): GoalFixture[] => {
 
 const delay = () => new Promise((resolve) => window.setTimeout(resolve, 60))
 
-export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => {
+/**
+ * `runtime=native`: Desktop Lite. `scene=restart`: sessions the host's restart interrupted. `memory=busy`: the
+ * consolidation holds Memory; `memory=empty`: nothing remembered, no consolidation goal. `goals=many`: more active
+ * goals than the list thinks wise; `goals=off`: the built-in goal is switched off in the agent's configuration.
+ */
+export const createMockDataModel = (params = new URLSearchParams()): OpenDanDataModel => {
+  const nativeRuntime = params.get('runtime') === 'native'
+  const memoryScene = params.get('memory')
   const fx = buildFixtures()
+  if (params.get('scene') === 'restart') {
+    const queue = (sid: string) => ({ input_queue: `opendan/${sid}/input` })
+    fx.entries[1].status.paused = 'interrupted'
+    fx.entries.push(
+      entry('work-plan-77', 'work', 'plan_simple', 'Plan the photo archive migration', { run_state: 'waiting', paused: 'interrupted', one_line_status: 'Waiting for 1 todo', updated_at_ms: ago(200) },
+        { origin: { parent_session: UI }, ...queue('work-plan-77') }),
+      entry('work-todo-a1', 'work', 'work.default', 'Copy the 2019 albums', { run_state: 'running', turn_open: true, paused: 'interrupted', updated_at_ms: ago(210) },
+        { origin: { parent_session: 'work-plan-77' }, ...queue('work-todo-a1') }),
+      entry('work-weekly', 'work', 'work.default', 'Write the weekly report', { run_state: 'running', turn_open: true, paused: 'interrupted', updated_at_ms: ago(220) }, queue('work-weekly')),
+      entry('work-user-paused', 'work', 'work.default', 'Index the music library', { run_state: 'waiting', paused: 'user', updated_at_ms: ago(230) },
+        { origin: { parent_session: UI }, ...queue('work-user-paused') }),
+      entry('work-goal-child', 'work', 'work.default', 'Tidy the downloads folder', { run_state: 'waiting', paused: 'goal', updated_at_ms: ago(240) },
+        { origin: { goal: { goal_id: GOAL_TIDY } }, ...queue('work-goal-child') }),
+      entry('ui-interrupted', 'ui', 'ui.direct', 'Talk with alice', { run_state: 'running', turn_open: true, paused: 'interrupted', updated_at_ms: ago(250) },
+        { route_key: `${AGENT}/dm:did:bns:alice.buckyos`, ...queue('ui-interrupted') }),
+    )
+  }
   const goals = buildGoalFixtures()
+  if (params.get('goals') === 'off') goals[0].schedule.switched_off = true
+  if (params.get('goals') === 'many') {
+    for (let i = 1; i <= 16; i += 1) {
+      const id = `goal-chore-${i}`
+      goals.push({
+        def: goalDef(id, `Chore ${i}`, `Keep chore ${i} done.`, { updated_at_ms: ago(86400 * 4 + i) }),
+        state: {
+          schema: 'opendan.goal_state/1', goal_id: id, rev: 1, epoch: 1,
+          usage: { period_start_ms: PERIOD_START }, consecutive_no_action: 0, holds: { period_start_ms: PERIOD_START, min_interval: 0, budget: 0 },
+        },
+        schedule: { schema: 'opendan.goal_schedule/1', goal_id: id, backend: 'local', start_posted_epoch: 1, ...gateState, stats: noStats() },
+        activations: [],
+        changes: [change(1, ago(86400 * 4), 'created', OWNER, 'owner', { revision: 1, epoch: 1 })],
+      })
+    }
+  }
   const goalEntries: RegistryEntry[] = goals.flatMap((g) =>
     (g.def.epochs ?? []).map((ep) =>
       entry(ep.sid, 'goal', 'goal', g.def.title, {
@@ -595,7 +671,6 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
     g.state.rev += 1
     g.state.updated_at_ms = Date.now()
     if (keep === 'facts') Object.assign(g.state, { distance: undefined, pending: undefined, questions: undefined, last_activation: undefined })
-    if (g.schedule.gate) g.schedule.gate.status = 'unknown'
     goalEntries.push(entry(sid, 'goal', 'goal', g.def.title, { run_state: 'waiting', one_line_status: `Epoch ${epoch}: waiting for the next activation` }, { input_queue: `opendan/${sid}/input` }))
     goalChange(g, start, { epoch, reason })
     return structuredClone(g.def)
@@ -633,36 +708,113 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
       revision: 2, location_revision: 1, updated_at_ms: ago(8000), checked_at_ms: ago(120),
       source_session: null, conflict: null, last_error: 'Directory does not exist; locate the moved workspace to restore access.',
     },
+    {
+      version: 1, runtime_host: 'mock-host',
+      workspace_id: 'ws-site', name: 'Family site', description: 'Static site of the family album.', url: 'https://github.com/example/family-site',
+      location: { runtime_id: 'host', directory: '/Users/devtest/Sites/family' },
+      usage: 'collaborative', lifecycle: 'active', availability: 'available',
+      revision: 1, location_revision: 1, updated_at_ms: ago(20000), checked_at_ms: ago(20000),
+      source_session: null, conflict: null, last_error: null,
+    },
+    {
+      version: 1, runtime_host: 'mock-host',
+      workspace_id: 'ws-scratch', name: 'Scratch', description: '', url: null,
+      location: { runtime_id: 'local', directory: `${ROOT}/workspace/scratch` },
+      usage: 'private', lifecycle: 'active', availability: 'available',
+      revision: 1, location_revision: 1, updated_at_ms: ago(90000), checked_at_ms: ago(90000),
+      source_session: null, conflict: null, last_error: null,
+    },
   ]
   const allOps = ['open_stream', 'describe', 'exec', 'read', 'write', 'edit', 'mkdir', 'stat', 'rename', 'remove', 'computer_inspect', 'computer_observe', 'computer_act', 'query', 'cancel']
   const runtimes: KnownRuntime[] = [
     {
-      version: 4, runtime_id: 'private', name: 'Private runtime',
+      version: 5, runtime_id: 'private', name: 'Private runtime',
       desc: "Your own environment: the agent's container. Commands run directly; paths here are not the owner's host paths.",
       runtime_host: 'mock-host', connector: { type: 'native' }, enabled: true,
       caps: { os: 'linux', arch: 'x86_64', shell: 'bash', desktop: false, baseline: 'extended', baseline_check: { checked_at_ms: ago(60), level: 'extended', missing: ['pandoc'], ok: false, ext: { status: 'partial', missing: ['pandoc'], system: ['ffmpeg', 'python3'] } } },
-      grant: { ops: allOps, roots: [], computer: 'none', install: 'system', workspace: true },
+      grant: { ops: allOps, roots: [], computer: 'none' },
       availability: 'available', builtin: true, default: false, lifecycle: 'active',
-      usage: { sessions_total: 12, last_used_at_ms: ago(300), last_session_id: UI, workspaces: 2, skill_commands: [] },
+      usage: { sessions_total: 12, last_used_at_ms: ago(300), last_session_id: UI, workspaces: 2 },
       revision: 1, registered_by: 'app:jarvis@devtest', registered_at_ms: ago(86400), updated_at_ms: ago(86400),
       checked_at_ms: ago(60), last_error: null,
     },
     {
-      version: 4, runtime_id: 'host', name: "Owner's desktop",
+      version: 5, runtime_id: 'host', name: "Owner's desktop",
       desc: "The owner's own machine (node `desktop`), shared with the owner: the owner's files and tools are here; commands and files go through its node executor.",
       runtime_host: 'mock-host', connector: { type: 'node_executor', node_did: 'did:dev:mock', profile_id: 'agent-0123456789ab' }, enabled: true,
       caps: { os: 'macos', arch: 'aarch64', shell: 'zsh', desktop: true, identity_mode: 'current_user', baseline: 'standard',
         baseline_check: { checked_at_ms: ago(60), level: 'standard', missing: ['aicc-tool', 'gen_image'], ok: false, ext: { status: 'partial', missing: ['pandoc', 'tesseract'], system: ['ffmpeg'] } } },
-      grant: { ops: allOps.filter((op) => op !== 'computer_act'), roots: ['/Users/devtest'], computer: 'observe', install: 'none', workspace: true },
+      grant: { ops: allOps.filter((op) => op !== 'computer_act'), roots: ['/Users/devtest'], computer: 'observe' },
       availability: 'available', builtin: true, default: true, lifecycle: 'active',
-      usage: { sessions_total: 1, last_used_at_ms: ago(370), last_session_id: WORK_RUNNING, workspaces: 1, skill_commands: [] },
+      usage: { sessions_total: 1, last_used_at_ms: ago(370), last_session_id: WORK_RUNNING, workspaces: 1 },
       revision: 3, registered_by: 'app:jarvis@devtest', registered_at_ms: ago(86400), updated_at_ms: ago(600),
       checked_at_ms: ago(60), last_error: null,
     },
+    {
+      version: 5, runtime_id: 'build-box', name: 'Build box',
+      desc: 'A Linux machine in the closet, assigned to this agent for long builds.',
+      runtime_host: 'build-host', connector: { type: 'node_executor', node_did: 'did:dev:build', executor_id: 'exec-build', profile_id: 'agent-0123456789ab' }, enabled: true,
+      caps: { os: 'linux', arch: 'x86_64', shell: 'bash', desktop: false, baseline: 'standard',
+        baseline_check: { checked_at_ms: ago(600), level: 'standard', missing: [], ok: true, ext: { status: 'ok', missing: [], system: [], waiting: ['chromium', 'page-render'] } } },
+      grant: { ops: allOps, roots: ['/srv/build'], computer: 'none' },
+      availability: 'available', builtin: false, default: false, lifecycle: 'active',
+      usage: { sessions_total: 4, last_used_at_ms: ago(86400), last_session_id: WORK_PENDING, workspaces: 0 },
+      revision: 2, registered_by: 'app:jarvis@devtest', registered_at_ms: ago(86400 * 5), updated_at_ms: ago(86400),
+      checked_at_ms: ago(600), last_error: null,
+    },
+    {
+      version: 5, runtime_id: 'old-laptop', name: 'Old laptop',
+      desc: 'Removed from this agent.',
+      runtime_host: 'laptop-host', connector: { type: 'node_executor', node_did: 'did:dev:laptop', profile_id: 'agent-0123456789ab' }, enabled: false,
+      caps: { os: 'windows', arch: 'x86_64', shell: 'powershell', desktop: true, baseline: 'standard' },
+      grant: { ops: allOps, roots: ['C:\\Users\\devtest'], computer: 'none' },
+      availability: 'runtime_unavailable', builtin: false, default: false, lifecycle: 'retired',
+      usage: { sessions_total: 7, last_used_at_ms: ago(86400 * 30), last_session_id: null, workspaces: 0 },
+      revision: 6, registered_by: 'app:jarvis@devtest', registered_at_ms: ago(86400 * 90), updated_at_ms: ago(86400 * 30),
+      checked_at_ms: ago(86400 * 30), last_error: 'the `old-laptop` runtime is no longer assigned to this agent',
+    },
   ]
   const runtimeSettings: RuntimeSettings = {
-    runtimes: { host: { enabled: true, computer: 'observe', target: { kind: 'node', node_id: 'desktop', node_did: 'did:dev:mock' } } },
+    runtimes: {
+      host: { enabled: true, target: { kind: 'node', node_id: 'desktop', node_did: 'did:dev:mock' } },
+      'build-box': { enabled: true, target: { kind: 'executor', executor_id: 'exec-build' } },
+    },
     default_runtime_id: 'host',
+    configured_default_runtime_id: 'host',
+  }
+  const findRuntime = (runtimeId: string) => {
+    const runtime = runtimes.find((r) => r.runtime_id === runtimeId || (r.connector.type === 'native' && r.connector.aliases?.includes(runtimeId)))
+    if (!runtime) throw new OpenDanError('not_found', `runtime ${runtimeId} is not registered`)
+    return runtime
+  }
+  const impactOf = (runtimeId: string): RuntimeImpact => {
+    const runtime = findRuntime(runtimeId)
+    const open = fx.entries.filter((e) => e.status.run_state !== 'finished' && e.runtime_id === runtime.runtime_id)
+    const todos = open.some((e) => e.session_id === WORK_RUNNING)
+      ? [{ session_id: WORK_RUNNING, todo_id: 'todo-2', title: 'Write the weekly report', status: 'pending' }]
+      : []
+    return {
+      runtime_id: runtime.runtime_id,
+      owner_default: runtime.default,
+      blocking: runtime.availability === 'available' && open.some((e) => e.status.run_state !== 'created'),
+      running_sessions: runtime.availability === 'available' ? open.filter((e) => e.status.run_state !== 'created').map((e) => e.session_id) : [],
+      active_sessions: open.map((e) => ({ session_id: e.session_id, kind: e.kind, class: e.class, title: e.objective, run_state: e.status.run_state })),
+      pending_todos: todos,
+      workspaces: workspaces.filter((w) => w.location.runtime_id === runtime.runtime_id)
+        .map((w) => ({ workspace_id: w.workspace_id, name: w.name, directory: w.location.directory, lifecycle: w.lifecycle })),
+      usage: structuredClone(runtime.usage),
+    }
+  }
+  const notInUse = (runtimeId: string, verb: string) => {
+    const impact = impactOf(runtimeId)
+    if (!impact.blocking) return
+    throw new OpenDanError('invalid_argument', `sessions_in_progress: runtime \`${impact.runtime_id}\` has ${impact.running_sessions.length} session(s) in progress (${impact.running_sessions.join(', ')}); stop them or let them finish, then ${verb}`)
+  }
+  const withRuntimeMark = (e: RegistryEntry): RegistryEntry => {
+    const runtime = e.status.run_state !== 'finished' && runtimes.find((r) => r.runtime_id === e.runtime_id)
+    return runtime && runtime.availability !== 'available'
+      ? { ...e, runtime_unavailable: runtime.last_error ?? `runtime \`${runtime.runtime_id}\` is not usable` }
+      : e
   }
   if (nativeRuntime) {
     const runtime = runtimes[0]
@@ -673,6 +825,21 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
     runtime.caps = { ...runtimes[1].caps, baseline_check: { checked_at_ms: ago(60), level: 'standard', missing: [], ok: true, ext: { status: 'ok', missing: [], system: [] } } }
     runtime.grant.computer = 'observe'
     runtimes.splice(1)
+    delete runtimeSettings.runtimes['build-box']
+  }
+  const projectRuntimes = () => {
+    const asSetting = (r: KnownRuntime) => (r.connector.type === 'native' ? (r.connector.aliases?.[0] ?? 'container') : r.runtime_id)
+    const configured = runtimeSettings.configured_default_runtime_id
+    runtimeSettings.default_runtime_id = configured && runtimeSettings.runtimes[configured]?.enabled ? configured : 'container'
+    for (const r of runtimes) {
+      const chosen = runtimeSettings.runtimes[asSetting(r)]
+      r.default = runtimeSettings.default_runtime_id === asSetting(r)
+      if (chosen) {
+        r.enabled = chosen.enabled
+        r.availability = chosen.enabled ? 'available' : 'runtime_unavailable'
+        r.last_error = chosen.enabled ? null : `the \`${r.runtime_id}\` runtime is not enabled for this agent`
+      }
+    }
   }
   const availableRuntimeIds = () => runtimes.filter((r) => r.availability === 'available').map((r) => r.runtime_id).concat('local', 'container')
   const findWorkspace = (workspaceId: string) => {
@@ -718,6 +885,157 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
     }
   }
 
+  const skill = (kind: SkillMeta['kind'], name: string, description: string, extra: Partial<SkillMeta> = {}): SkillMeta => ({
+    kind, name, description, origin: 'package', baseline: 'standard', size: 2400, enabled: true, ...extra,
+  })
+  const skills: SkillMeta[] = [
+    skill('work', 'ui_core', 'What a conversation can do: sessions, reports, notifications.', { scope: 'ui', size: 6700, usage: { frozen: 31, last_ms: ago(400), recent_sessions: [UI] } }),
+    skill('work', 'share', 'Publish a file or a folder and hand out the link.', { scope: 'ui,work', size: 1900, references: ['references/acl.md'], usage: { frozen: 3, last_ms: ago(86400 * 2) } }),
+    skill('work', 'aigc_audio', 'Speech and music: TTS, transcription, cutting and joining audio.', {
+      requires: 'an AICC provider with a speech model; ffmpeg only for cutting and joining', commands: ['ffmpeg', 'ffprobe'], size: 4100,
+      usage: { frozen: 2, last_ms: ago(86400), recent_sessions: [WORK_RUNNING] },
+    }),
+    skill('work', 'doc_convert', 'Convert documents between Markdown, DOCX and PDF; OCR for scans.', {
+      requires: 'the extended environment (pandoc, tesseract)', baseline: 'extended', commands: ['pandoc', 'tesseract'], size: 3300,
+    }),
+    skill('work', 'win_registry', 'Read and repair Windows registry settings.', { platforms: ['windows'], requires: 'a Windows runtime', size: 1500 }),
+    skill('work', 'browser', 'Use this Agent’s own browser: open and read pages, fill in forms, get things done on websites.', {
+      requires: 'the private runtime with the ext-core extension package (agent-browser, chromium)', baseline: 'extended', commands: ['agent-browser', 'chromium'], size: 5200,
+    }),
+    skill('work', 'yt_fetch', 'Download a video and its subtitles for offline summarising.', {
+      origin: 'installed', commands: ['yt-dlp'], size: 2100,
+      install: { package: 'media-skills', version: '0.2.0', digest: 'sha256:9a41c0de', installed_at_ms: ago(86400 * 3), installed_by: OWNER },
+      install_state: { risk: { level: 'medium', accepted_by: OWNER, accepted_at_ms: ago(86400 * 3), plan_digest: 'sha256:11aa' } },
+    }),
+    skill('work', 'old_invoice_flow', 'How invoices were filed before the accounting tool changed.', {
+      origin: 'imported', size: 900, enabled: false, disabled: { at_ms: ago(86400 * 9), by: OWNER, reason: 'the accounting tool changed' },
+      install: { package: 'imported-old-invoice-flow', version: '', digest: 'sha256:77b2', installed_at_ms: ago(86400 * 30), installed_by: OWNER, imported_from: { digest: 'sha256:5d10', runtime_id: 'private', platform: 'linux' } },
+    }),
+    skill('plan', 'research_report', 'How to split a research question into parallel work and one written report.', { size: 2800, usage: { frozen: 5, last_ms: ago(86400 * 4) } }),
+  ]
+  const skillAudit: SkillAudit[] = [
+    { at_ms: ago(86400 * 9), by: OWNER, action: 'disable', skill: 'work:old_invoice_flow', note: 'the accounting tool changed' },
+    { at_ms: ago(86400 * 3), by: OWNER, action: 'install', skill: 'work:yt_fetch', note: 'media-skills 0.2.0' },
+    { at_ms: ago(7200), by: 'goal:skill_crystallize', action: 'revise', skill: 'work:old_invoice_flow', note: 'body rewritten from 3 sessions; previous text in revisions/' },
+  ]
+  const audit = (action: string, skillKey?: string, note?: string) => {
+    skillAudit.push({ at_ms: Date.now(), by: OWNER, action, ...(skillKey ? { skill: skillKey } : {}), ...(note ? { note } : {}) })
+  }
+  const findSkill = (kind: string, name: string): SkillMeta => {
+    const found = skills.find((s) => s.kind === kind && s.name === name)
+    if (!found) throw new OpenDanError('not_found', `no ${kind} skill ${name}`)
+    return found
+  }
+  let uiNames: string[] | null = null
+  let crystallize: boolean | undefined
+  const uiCandidates = () => skills.filter((s) => s.kind === 'work' && s.enabled && s.scope?.split(',').includes('ui')).map((s) => s.name)
+  const uiSkills = (): UiSkills => {
+    const names = uiNames ?? ['ui_core']
+    return {
+      names: [...names],
+      source: uiNames ? 'state' : 'template',
+      total_bytes: names.reduce((sum, n) => sum + (skills.find((s) => s.kind === 'work' && s.name === n)?.size ?? 0), 0),
+      available: uiCandidates().filter((n) => !names.includes(n)),
+    }
+  }
+  const drafts: (Omit<SkillDraft, 'files'> & { texts: Record<string, string> })[] = [
+    {
+      slug: 'meeting-minutes',
+      draft: {
+        imported_from: { digest: 'sha256:c41f09', runtime_id: 'private', platform: 'linux' },
+        split: 'one work skill; the template section became references/template.md',
+        verified: [{ command: 'pandoc', present: false }, { command: 'ffmpeg', present: true }],
+        risk: 'The manual makes the agent transcribe recordings and mail the minutes to every attendee. Sending the mail cannot be undone.',
+      },
+      skills: [skill('work', 'meeting_minutes', 'Turn a meeting recording into minutes and send them round.', { origin: 'local', commands: ['ffmpeg', 'pandoc'], baseline: 'extended', platforms: ['linux'], size: 1800 })],
+      texts: {
+        'draft.json': '{\n  "imported_from": {"digest": "sha256:c41f09", "runtime_id": "private", "platform": "linux"}\n}',
+        'cmd_skills/meeting_minutes/SKILL.md': '---\nname: meeting_minutes\ndescription: Turn a meeting recording into minutes and send them round.\ncommands: ffmpeg, pandoc\n---\n\n1. Transcribe the recording.\n2. Write the minutes.\n3. Mail them to the attendees.\n',
+      },
+      updated_at_ms: ago(1800),
+    },
+    { slug: 'broken-notes', draft: null, skills: [], texts: { 'notes.txt': 'unfinished' }, updated_at_ms: ago(86400), error: 'draft.json is missing' },
+  ]
+  // What the real service works out from the files: one skill per manual.
+  const planOf = (source: SkillSource, runtimeId?: string): InstallPlan => {
+    const draft = 'draft' in source ? drafts.find((d) => d.slug === source.draft) : undefined
+    if ('draft' in source && !draft) throw new OpenDanError('not_found', `no draft ${source.draft}`)
+    const paths = draft ? Object.keys(draft.texts) : Object.keys('package' in source ? source.package.files : {})
+    const tool = paths.find((path) => path.split('/')[0] === 'tools')
+    if (tool) throw new OpenDanError('invalid_argument', `\`${tool}\`: a skill is text only and brings no command or install script; publish the commands as an extension package and name them in the manual's \`commands\``)
+    const packageName = draft ? `imported-${draft.slug}` : 'package' in source ? source.package.package : ''
+    const version = 'package' in source ? source.package.version : ''
+    const dirs: Record<string, SkillMeta['kind']> = { cmd_skills: 'work', plan_skills: 'plan', goal_skills: 'goal' }
+    const planned = paths.flatMap((path): PlannedSkill[] => {
+      const [dir, name, file, ...rest] = path.split('/')
+      if (!dirs[dir] || !name || rest.length || file !== 'SKILL.md') return []
+      const kind = dirs[dir]
+      const existing = skills.find((s) => s.kind === kind && s.name === name)
+      const known = draft?.skills.find((s) => s.kind === kind && s.name === name)
+      return [{
+        ...(known ?? skill(kind, name, `Skill ${name} of ${packageName}`, { size: 1200 })),
+        origin: draft ? 'imported' : 'installed',
+        ...(existing ? { replaces: existing.origin } : {}),
+      }]
+    })
+    if (!planned.length) throw new OpenDanError('invalid_argument', 'the package holds no skill')
+    const findings: SkillFinding[] = [
+      ...planned.filter((s) => s.replaces).map((s): SkillFinding => ({ code: 'replaces_skill', level: 'medium', where: `${s.kind}:${s.name}`, note: `takes the place of the ${s.replaces} skill of the same name` })),
+      ...planned.filter((s) => s.scope?.split(',').includes('ui')).map((s): SkillFinding => ({ code: 'ui_scope', level: 'medium', where: `${s.kind}:${s.name}`, note: 'its scope includes `ui`: once the owner adds it to the UI set it goes into the prompt of every conversation' })),
+      ...(draft ? [{ code: 'imported_text', level: 'medium', where: packageName, note: 'written by the agent from a text the owner gave it: nobody signed it' } satisfies SkillFinding] : []),
+    ]
+    const digest = `sha256:mock-${paths.length}-${paths.join('|').length}`
+    return {
+      package: packageName,
+      version,
+      digest,
+      plan_digest: `sha256:plan-${packageName}-${version}-${paths.length}`,
+      skills: planned,
+      risk: { level: findings.some((f) => f.level === 'high') ? 'high' : findings.some((f) => f.level === 'medium') ? 'medium' : 'low', findings },
+      command_status: planned.filter((s) => s.kind === 'work').map((s) => ({
+        name: s.name,
+        commands: s.commands ?? [],
+        status: {
+          state: s.commands?.includes('pandoc') ? 'partial' as const : 'ready' as const,
+          commands: Object.fromEntries((s.commands ?? []).map((c) => [c, { present: c !== 'pandoc' }])),
+          ...(s.commands?.includes('pandoc') ? { recommended_packages: [{ id: 'ext-docs', version: '0.3.1', provides: ['pandoc'] }] } : {}),
+        },
+      })),
+      checked_runtime_id: findRuntime(runtimeId ?? 'private').runtime_id,
+    }
+  }
+
+  const cognitions: (MemoryEntry & { revision: number })[] = memoryScene === 'empty' ? [] : Array.from({ length: 23 }, (_, i) => ({
+    layer: 'cognition' as const,
+    reference: `cog:${String(23 - i).padStart(3, '0')}`,
+    summary: i === 0 ? 'The owner prefers weekly reports as a single PDF, sent on Monday morning.'
+      : i === 1 ? 'Photos are archived by capture date, never by import date.'
+      : `Fact ${23 - i} the agent concluded about the owner's files and habits.`,
+    kind: i % 4 === 0 ? 'preference' : 'fact',
+    state: i === 2 ? 'disputed' : 'active',
+    at_ms: ago(600 * (i + 1)),
+    ...(i === 1 ? { revised_at_ms: ago(300) } : {}),
+    subjects: i % 3 === 0 ? [OWNER] : ['workspace:ws-photos'],
+    deletable: true,
+    revision: i === 1 ? 2 : 1,
+  }))
+  const perceptionStates = ['pending', 'pending', 'deferred', 'absorbed', 'absorbed', 'pending', 'absorbed', 'absorbed']
+  const perceptions: MemoryEntry[] = memoryScene === 'empty' ? [] : perceptionStates.map((state, i) => ({
+    layer: 'perception' as const,
+    reference: `per:${UI}:${40 - i}`,
+    summary: i === 0 ? 'The owner asked for the report before 9 am.' : `Observation ${40 - i} noted during a conversation.`,
+    kind: 'observation',
+    state,
+    at_ms: ago(120 * (i + 1)),
+    subjects: [OWNER],
+    session_id: UI,
+    deletable: state === 'pending' || state === 'deferred',
+    ...(state === 'absorbed' ? { absorbed_into: ['cog:023'] } : {}),
+  }))
+  const memoryEntry = (e: MemoryEntry): MemoryEntry => e
+  const descendants = (sid: string): RegistryEntry[] =>
+    fx.entries.filter((e) => e.origin?.parent_session === sid).flatMap((e) => [e, ...descendants(e.session_id)])
+
   return {
     source: 'mock',
     login: { lost: () => false, subscribe: () => () => {} },
@@ -736,8 +1054,7 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
           { name: 'agent_state_service', enabled: true, running: true, note: 'port 4060' },
           { name: 'webui', enabled: true, running: true },
           { name: 'ui', enabled: true, running: true, note: '1 inbox' },
-          { name: 'self_check', enabled: true, running: false, note: 'next run in 6h' },
-          { name: 'memory_maintenance', enabled: true, running: true, note: 'built-in goal seeded by the goals module; decision pre-check off' },
+          { name: 'memory_maintenance', enabled: true, running: true, note: 'built-in goal seeded by the goals module; its check script decides when it infers' },
         ],
         hosted: structuredClone(fx.hostedList),
         ui: {
@@ -801,6 +1118,7 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
     createWorkspace: async (request) => {
       await delay()
       if (!availableRuntimeIds().includes(request.location.runtime_id)) throw new OpenDanError('invalid_argument', 'Runtime is unavailable.')
+      if (!request.location.directory.startsWith('/')) throw new OpenDanError('invalid_argument', 'Workspace directory must be absolute.')
       if (!request.name.trim()) throw new OpenDanError('invalid_argument', 'A name is required.')
       const workspace: KnownWorkspace = {
         version: 2, runtime_host: 'mock-host', workspace_id: `ws-${crypto.randomUUID()}`,
@@ -816,6 +1134,7 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
     importWorkspace: async (request) => {
       await delay()
       if (!availableRuntimeIds().includes(request.location.runtime_id)) throw new OpenDanError('invalid_argument', 'Runtime is unavailable.')
+      if (!request.location.directory.startsWith('/')) throw new OpenDanError('invalid_argument', 'Workspace directory must be absolute.')
       const workspace: KnownWorkspace = {
         version: 2, runtime_host: 'mock-host', workspace_id: `ws-${crypto.randomUUID()}`,
         name: request.name || request.location.directory.split('/').filter(Boolean).pop() || 'workspace',
@@ -847,8 +1166,7 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
     }),
     checkRuntime: async (runtimeId) => {
       await delay()
-      const runtime = runtimes.find((r) => r.runtime_id === runtimeId)
-      if (!runtime) throw new OpenDanError('not_found', `runtime ${runtimeId} is not registered`)
+      const runtime = findRuntime(runtimeId)
       runtime.checked_at_ms = Date.now()
       if (runtime.runtime_id === 'private') {
         runtime.caps.baseline_check = { checked_at_ms: Date.now(), level: 'extended', missing: [], ok: true, ext: { status: 'system', missing: [], system: ['ffmpeg', 'python3'] } }
@@ -867,26 +1185,32 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
       const settingId = record?.connector.type === 'native' ? (record.connector.aliases?.[0] ?? 'container') : patch.runtime_id
       const entry = runtimeSettings.runtimes[settingId]
       if (settingId !== 'container' && !entry) throw new OpenDanError('invalid_argument', `runtime ${patch.runtime_id} is not one of this agent's runtimes`)
-      if (entry) {
-        if (patch.enabled !== undefined) entry.enabled = patch.enabled
-        if (patch.computer) entry.computer = patch.computer
-        if (patch.baseline !== undefined) entry.baseline = patch.baseline
+      if (entry && patch.enabled !== undefined) {
+        if (!patch.enabled && entry.enabled) notInUse(patch.runtime_id, 'switch it off')
+        entry.enabled = patch.enabled
       }
-      const asSetting = (id: string) => (id === 'private' ? (nativeRuntime ? 'host' : 'container') : id)
-      if (patch.default === true) runtimeSettings.default_runtime_id = asSetting(patch.runtime_id)
-      if (patch.default === false && runtimeSettings.default_runtime_id === asSetting(patch.runtime_id)) runtimeSettings.default_runtime_id = 'container'
-      if (runtimeSettings.default_runtime_id !== 'container' && !runtimeSettings.runtimes[runtimeSettings.default_runtime_id]?.enabled) runtimeSettings.default_runtime_id = 'container'
-      for (const r of runtimes) {
-        const chosen = runtimeSettings.runtimes[asSetting(r.runtime_id)]
-        r.default = runtimeSettings.default_runtime_id === asSetting(r.runtime_id)
-        if (chosen) {
-          r.grant.computer = chosen.computer
-          r.caps.baseline = chosen.baseline ?? 'standard'
-          r.enabled = chosen.enabled
-          r.availability = chosen.enabled ? 'available' : 'runtime_unavailable'
-          r.last_error = chosen.enabled ? null : 'the `host` runtime is not enabled for this agent'
-        }
-      }
+      if (patch.default === true) runtimeSettings.configured_default_runtime_id = settingId
+      if (patch.default === false && runtimeSettings.configured_default_runtime_id === settingId) runtimeSettings.configured_default_runtime_id = null
+      projectRuntimes()
+      return structuredClone(runtimeSettings)
+    },
+
+    runtimeImpact: async (runtimeId) => {
+      await delay()
+      return impactOf(runtimeId)
+    },
+
+    removeRuntime: async (runtimeId) => {
+      await delay()
+      const record = findRuntime(runtimeId)
+      if (record.connector.type === 'native') throw new OpenDanError('invalid_argument', 'the private runtime cannot be removed')
+      notInUse(runtimeId, 'remove it')
+      delete runtimeSettings.runtimes[record.runtime_id]
+      if (runtimeSettings.configured_default_runtime_id === record.runtime_id) runtimeSettings.configured_default_runtime_id = null
+      record.lifecycle = 'retired'
+      record.enabled = false
+      record.availability = 'runtime_unavailable'
+      projectRuntimes()
       return structuredClone(runtimeSettings)
     },
 
@@ -920,7 +1244,7 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
 
     sessions: async () => {
       await delay()
-      return structuredClone(fx.entries)
+      return structuredClone(fx.entries.map(withRuntimeMark))
     },
 
     activeSessions: async () => {
@@ -945,24 +1269,116 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
       const e = find(sid)
       return structuredClone({
         ...fx.details[sid],
-        entry: e,
+        entry: withRuntimeMark(e),
         worklog: (fx.worklogs[sid] ?? []).slice(-worklog),
         children: fx.entries.filter((c) => c.origin?.parent_session === sid).map((c) => c.session_id),
         hosted: fx.hostedList.find((h) => h.session_id === sid) ?? null,
       })
     },
 
-    stopSession: async (sid, reason) => {
+    stopSession: async (sid, scope, reason) => {
       await delay()
       const e = find(sid)
+      if (e.status.run_state === 'finished') throw new OpenDanError('session_finished', `session ${sid} is finished`)
+      if (scope === 'session' && e.kind === 'ui') {
+        throw new OpenDanError('invalid_argument', `session ${sid} is a UI session: it is not stopped; start a new conversation to clear its context`)
+      }
       inputIndex += 1
-      log(sid, { t: 'control_applied', input: { src: 'queue', index: inputIndex, kind: 'control' }, command: 'stop', detail: reason ? { reason } : undefined })
-      if (e.status.run_state !== 'finished') {
-        commit(e, { run_state: 'finished', outcome: 'stopped', needs_input: false, turn_open: false, one_line_status: reason ? `Stopped: ${reason}` : 'Stopped' })
-        const st = fx.details[sid]?.state
+      log(sid, { t: 'control_applied', input: { src: 'queue', index: inputIndex, kind: 'control' }, command: 'stop', detail: { scope, ...(reason ? { reason } : {}) } })
+      const st = fx.details[sid]?.state
+      if (scope === 'session' && e.kind === 'goal') {
+        const g = goals.find((x) => x.def.session.sid === sid)
+        if (g) Object.assign(g.def, { status: 'paused', status_changed_at_ms: Date.now(), status_reason: reason, status_by: OWNER })
+      } else if (scope === 'turn') {
+        // An interrupted Turn that is given up clears the interruption with it.
+        commit(e, { run_state: 'waiting', turn_open: false, needs_input: e.kind === 'ui', paused: e.status.paused === 'interrupted' ? undefined : e.status.paused, one_line_status: 'Stopped the current message' })
+        if (st) Object.assign(st, { open_turn: undefined })
+      } else {
+        for (const s of [e, ...descendants(sid).filter((c) => c.status.run_state !== 'finished')]) {
+          commit(s, { run_state: 'finished', outcome: 'stopped', needs_input: false, turn_open: false, paused: undefined, one_line_status: reason ? `Stopped: ${reason}` : 'Stopped' })
+        }
         if (st) Object.assign(st, { open_turn: undefined, wait_children: undefined, stop_requested: true })
       }
       return { index: inputIndex }
+    },
+
+    resumeSession: async (sid) => {
+      await delay()
+      const e = find(sid)
+      if (e.status.run_state === 'finished') throw new OpenDanError('session_finished', `session ${sid} is finished`)
+      inputIndex += 1
+      const source = e.status.paused
+      log(sid, { t: 'control_applied', input: { src: 'queue', index: inputIndex, kind: 'control' }, command: 'resume', applied: Boolean(source) })
+      if (source) {
+        // A resume cascades from a paused session only, to the sub sessions paused for the same reason.
+        const follows = source === 'user' ? 'parent' : source
+        commit(e, { paused: undefined })
+        for (const child of descendants(sid)) if (child.status.paused === follows) commit(child, { paused: undefined })
+      }
+      return { index: inputIndex }
+    },
+
+    deleteSession: async (sid) => {
+      await delay()
+      const e = find(sid)
+      if (e.kind !== 'work') throw new OpenDanError('invalid_argument', `session ${sid} is a ${e.kind} session: only work sessions are deleted`)
+      const all = [e, ...descendants(sid)]
+      const open = all.filter((x) => x.status.run_state !== 'finished')
+      if (open.length) throw new OpenDanError('invalid_argument', `session ${sid} has unfinished sessions (${open.map((x) => x.session_id).join(', ')})`)
+      const deleted = all.map((x) => x.session_id)
+      fx.entries.splice(0, fx.entries.length, ...fx.entries.filter((x) => !deleted.includes(x.session_id)))
+      return { deleted }
+    },
+
+    memoryOverview: async () => {
+      await delay()
+      const maintenance = memoryScene === 'empty' ? undefined : goals.find((g) => g.def.goal_id === GOAL_BUILTIN)
+      return structuredClone({
+        cognitions: { current: cognitions.length },
+        perceptions: { total: perceptions.length, pending: perceptions.filter((p) => p.state === 'pending' || p.state === 'deferred').length },
+        last_consolidation_at_ms: maintenance ? ago(5400) : null,
+        maintenance_goal_id: maintenance?.def.goal_id ?? null,
+        recent: { cognitions: cognitions.slice(0, 5).map(memoryEntry), perceptions: perceptions.slice(0, 3) },
+      })
+    },
+
+    memoryList: async (layer, limit, cursor) => {
+      await delay()
+      const all = layer === 'cognition' ? cognitions.map(memoryEntry) : perceptions
+      const start = cursor ? Math.max(0, all.findIndex((e) => e.reference === cursor) + 1) : 0
+      const entries = all.slice(start, start + limit)
+      return structuredClone({ entries, next_cursor: start + limit < all.length ? entries[entries.length - 1].reference : null })
+    },
+
+    memoryRead: async (reference) => {
+      await delay()
+      const cognition = cognitions.find((c) => c.reference === reference)
+      if (cognition) {
+        return structuredClone({
+          detail: { statement: cognition.summary, confidence: 0.8, sources: [{ perception: `per:${UI}:33`, session_id: UI }] },
+        })
+      }
+      const perception = perceptions.find((p) => p.reference === reference)
+      if (!perception) throw new OpenDanError('not_found', `memory ${reference} does not exist`)
+      return structuredClone({ detail: { seq: Number(reference.split(':').pop()), content: perception.summary, by: `session:${UI}` } })
+    },
+
+    memoryForget: async (reference, expectedRevision) => {
+      await delay()
+      if (memoryScene === 'busy') throw new OpenDanError('busy', 'memory consolidation is running; try again later')
+      const cognition = cognitions.findIndex((c) => c.reference === reference)
+      if (cognition >= 0) {
+        if (expectedRevision != null && expectedRevision !== cognitions[cognition].revision) throw new OpenDanError('conflict', `${reference} was revised; reload before retrying`)
+        cognitions.splice(cognition, 1)
+        return { reference, state: 'deleted' }
+      }
+      const perception = perceptions.findIndex((p) => p.reference === reference)
+      if (perception < 0) throw new OpenDanError('conflict', `${reference} is already deleted`)
+      if (!perceptions[perception].deletable) {
+        throw new OpenDanError('invalid_argument', `${reference} is already consolidated into ${perceptions[perception].absorbed_into}`)
+      }
+      perceptions.splice(perception, 1)
+      return { reference, state: 'discarded' }
     },
 
     decideSession: async (sid, decision, note) => {
@@ -1029,17 +1445,30 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
       return { role: 'Jarvis, the personal agent of devtest.', self: 'I am careful, concise and I report what I did.' }
     },
 
-    recallHints: async (tags, maxHints = 8) => {
+    queryMemory: async (_session, words) => {
       await delay()
       const all = [
-        { id: 'h-101', time: '2026-09-28', sentence: 'Photos live under /home/devtest/Pictures/camera.', kind: 'fact', tags: ['photos'] },
-        { id: 'h-102', time: '2026-09-30', sentence: 'The user prefers reports as markdown with a short summary first.', kind: 'preference', tags: ['report'] },
-        { id: 'h-103', time: '2026-10-01', sentence: 'Renaming photos requires an accept decision before files are moved.', kind: 'rule', tags: ['photos', 'rename'] },
+        { id: 'item_photos_dir', time: '2026-09-28T00:00:00Z', sentence: 'Photos live under /home/devtest/Pictures/camera.', kind: 'fact', tags: ['photos'] },
+        { id: 'item_report_style', time: '2026-09-30T00:00:00Z', sentence: 'The user prefers reports as markdown with a short summary first.', kind: 'preference', tags: ['report'] },
+        { id: 'item_rename_accept', time: '2026-10-01T00:00:00Z', sentence: 'Renaming photos requires an accept decision before files are moved.', kind: 'rule', tags: ['photos', 'rename'] },
       ]
-      return all
-        .filter((h) => tags.length === 0 || h.tags.some((t) => tags.includes(t)))
-        .slice(0, maxHints)
-        .map((h) => ({ id: h.id, time: h.time, sentence: h.sentence, kind: h.kind }))
+      const cognitions = all
+        .filter((h) => words.length > 0 && h.tags.some((t) => words.includes(t)))
+        .map((h) => ({
+          layer: 'cognition' as const,
+          reference: `${h.id}@1`,
+          id: h.id,
+          summary: h.sentence,
+          kind: h.kind,
+          state: 'active',
+          observed_at: h.time,
+        }))
+      return {
+        status: words.length ? ('recalled' as const) : ('not_triggered' as const),
+        cognitions,
+        recent_perceptions: [],
+        pending_in_scope: 0,
+      }
     },
 
     goals: async () => {
@@ -1057,7 +1486,8 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
       await delay()
       const g = goals.find((x) => x.def.goal_id === goalId)
       if (!g || revision > g.def.revision || revision < 1) return null
-      return structuredClone({ ...g.def, revision, constraints: revision === g.def.revision ? g.def.constraints : (g.def.constraints ?? []).slice(0, -1) })
+      if (revision === g.def.revision) return structuredClone(g.def)
+      return structuredClone(g.revisions?.[revision] ?? { ...g.def, revision, constraints: (g.def.constraints ?? []).slice(0, -1) })
     },
 
     goalChanges: async (goalId, limit = 0) => {
@@ -1102,7 +1532,6 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
       g.state.usage.activations = (g.state.usage.activations ?? 0) + 1
       g.state.rev += 1
       g.state.updated_at_ms = started
-      if (g.schedule.gate) Object.assign(g.schedule.gate, { last_run_at_ms: started, last_checked_at_ms: started })
       inputIndex += 1
       return { index: inputIndex, key: `goal:${goalId}:activate:${seq}` }
     },
@@ -1116,10 +1545,6 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
       g.def.status_changed_at_ms = Date.now()
       g.def.status_reason = reason
       g.def.status_by = OWNER
-      if (g.schedule.gate) {
-        g.schedule.gate.status = status === 'paused' ? 'paused' : status === 'active' ? 'no_change' : 'disabled'
-        if (status === 'paused') g.schedule.gate.last_skip_reason = 'paused'
-      }
       if (status === 'paused') (g.schedule.skipped ??= []).push({ slot: slotNow, at_ms: Date.now(), reason: 'paused' })
       if (status === 'archived') {
         const current = g.def.epochs?.find((ep) => ep.epoch === g.def.session.epoch)
@@ -1142,6 +1567,219 @@ export const createMockDataModel = (nativeRuntime = false): OpenDanDataModel => 
       const g = findGoal(goalId)
       if (!(g.def.status === 'active' || g.def.status === 'paused')) throw new OpenDanError('invalid_argument', `goal ${goalId} is ${g.def.status}: only a live goal restarts`)
       return openEpoch(g, 'restarted', reason, carryState ? 'all' : 'facts')
+    },
+
+    reviseGoal: async (goalId, request) => {
+      await delay()
+      const g = findGoal(goalId)
+      if (request.expected_revision !== g.def.revision) {
+        throw new OpenDanError('goal_conflict', `goal ${goalId} is at revision ${g.def.revision}, not ${request.expected_revision}`)
+      }
+      const next = structuredClone(g.def)
+      if (request.budget) next.budget = structuredClone(request.budget)
+      // The check script changes through set_check only.
+      if (request.schedule) next.schedule = { ...structuredClone(request.schedule), check: g.def.schedule?.check }
+      if (next.schedule?.every_secs != null && next.schedule.every_secs < 60) throw new OpenDanError('invalid_argument', 'schedule: every_secs is at least 60')
+      if (JSON.stringify(next) === JSON.stringify(g.def)) return structuredClone(g.def)
+      ;(g.revisions ??= {})[g.def.revision] = structuredClone(g.def)
+      next.revision += 1
+      g.def = next
+      goalChange(g, 'revised', { revision: next.revision, reason: request.reason })
+      return structuredClone(g.def)
+    },
+
+    setGoalCheck: async (goalId, request) => {
+      await delay()
+      const g = findGoal(goalId)
+      const schedule = (g.def.schedule ??= {})
+      if (request.every_secs != null && request.cron != null) throw new OpenDanError('invalid_argument', 'every_secs or cron, not both')
+      if (request.every_secs != null) {
+        if (request.every_secs < 60) throw new OpenDanError('invalid_argument', 'schedule: every_secs is at least 60')
+        schedule.every_secs = request.every_secs
+        delete schedule.cron
+      }
+      if (request.cron != null) {
+        if (request.cron.trim().split(/\s+/).length !== 5) throw new OpenDanError('invalid_argument', 'schedule: a cron expression has 5 fields')
+        schedule.cron = request.cron.trim()
+        delete schedule.every_secs
+      }
+      if (request.timezone != null) schedule.timezone = request.timezone.trim() || undefined
+      if (request.clear_script) delete schedule.check
+      if (request.restore_package) {
+        const pkg = schedule.check?.package
+        if (!pkg) throw new OpenDanError('invalid_argument', `goal ${goalId} has no package check script to restore`)
+        const version = Math.max(0, ...Object.keys(g.scripts ?? {}).map(Number)) + 1
+        ;(g.scripts ??= {})[version] = MEMORY_CHECK_V1
+        schedule.check = { version, sha256: 'a51f9d02', source: `package:${pkg}`, package: pkg, updated_at_ms: Date.now() }
+      }
+      g.schedule.timetable = schedule.cron ? `cron:${schedule.cron}@${schedule.timezone ?? 'UTC'}` : schedule.every_secs ? `every:${schedule.every_secs}` : schedule.check ? 'every:300' : undefined
+      goalChange(g, 'check', { reason: request.reason, epoch: g.def.session.epoch, detail: { every_secs: schedule.every_secs, cron: schedule.cron, timezone: schedule.timezone, script: schedule.check } })
+      return structuredClone(g.def)
+    },
+
+    goalCheckScript: async (goalId, version) => {
+      await delay()
+      const g = findGoal(goalId)
+      const v = version ?? g.def.schedule?.check?.version
+      return v != null ? g.scripts?.[v] ?? null : null
+    },
+
+    skills: async () => {
+      await delay()
+      return structuredClone(skills)
+    },
+
+    skillsState: async () => {
+      await delay()
+      return {
+        disabled: Object.fromEntries(skills.filter((s) => s.disabled).map((s) => [`${s.kind}:${s.name}`, s.disabled!])),
+        ...(uiNames ? { ui_cmd_skills: [...uiNames] } : {}),
+        usage: { ...Object.fromEntries(skills.filter((s) => s.usage).map((s) => [`${s.kind}:${s.name}`, s.usage!])), none: { frozen: 4, last_ms: ago(5400), recent_sessions: [WORK_FAILED] } },
+        audit: structuredClone(skillAudit),
+        ...(crystallize != null ? { crystallize } : {}),
+      }
+    },
+
+    uiSkills: async () => {
+      await delay()
+      return uiSkills()
+    },
+
+    skillsStatus: async (runtimeId = 'private') => {
+      await new Promise((resolve) => window.setTimeout(resolve, 400))
+      const runtime = findRuntime(runtimeId)
+      const onPrivate = runtime.connector.type === 'native'
+      return {
+        runtime_id: runtime.runtime_id,
+        skills: skills.filter((s) => s.kind === 'work').map((s) => {
+          const unmet = s.platforms?.length && !s.platforms.includes(runtime.caps.os)
+            ? `works on ${s.platforms.join(', ')} only (this runtime is ${runtime.caps.os})`
+            : s.baseline === 'extended' && runtime.caps.baseline !== 'extended' ? 'needs the extended environment, and this runtime declares standard' : undefined
+          // chromium: its launcher is there, the browser it runs is not downloaded to the node yet.
+          const commands = Object.fromEntries((s.commands ?? []).map((c) => [c, c === 'pandoc' || c === 'chromium' || (!onPrivate && c === 'tesseract')
+            ? { present: false }
+            : { present: true, provided_by: c === 'ffmpeg' ? 'system' : 'exttools' }]))
+          const missing = Object.entries(commands).filter(([, c]) => !c.present).map(([name]) => name)
+          return {
+            name: s.name,
+            ...(s.scope ? { scope: s.scope } : {}),
+            enabled: s.enabled,
+            off: !s.enabled,
+            ...(s.requires ? { requires: s.requires } : {}),
+            ...(unmet ? { unmet } : {}),
+            commands: {
+              state: missing.length ? 'partial' as const : Object.values(commands).some((c) => c.present && c.provided_by === 'system') ? 'ready_system' as const : 'ready' as const,
+              commands,
+              ...(missing.includes('pandoc') ? { recommended_packages: [{ id: 'ext-docs', version: '0.3.1', requires_chain: ['ext-core'], provides: ['pandoc'] }] } : {}),
+              ...(missing.includes('tesseract') ? { no_package: ['tesseract'] } : {}),
+              ...(missing.includes('chromium') ? { waiting_online: [{ package: 'ext-core', item: 'chromium', commands: ['chromium'] }] } : {}),
+            },
+          }
+        }),
+      }
+    },
+
+    skillInstallPlan: async (source, runtimeId) => {
+      await delay()
+      return planOf(source, runtimeId)
+    },
+
+    skillDrafts: async () => {
+      await delay()
+      return drafts.map(({ texts, ...draft }) => structuredClone({ ...draft, files: Object.keys(texts) }))
+    },
+
+    skillDraftFile: async (slug, file) => {
+      await delay()
+      const text = drafts.find((d) => d.slug === slug)?.texts[file]
+      if (text === undefined) throw new OpenDanError('not_found', `draft ${slug} has no file ${file}`)
+      return { text }
+    },
+
+    installSkills: async (source, planDigest, replace = false) => {
+      await delay()
+      const plan = planOf(source)
+      if (plan.plan_digest !== planDigest) throw new OpenDanError('invalid_argument', 'the package is not the one that was planned (plan_digest differs)')
+      if (plan.skills.some((s) => s.replaces) && !replace) throw new OpenDanError('invalid_argument', 'a skill of the same name is installed (replace)')
+      const origin = 'draft' in source ? 'imported' as const : 'installed' as const
+      for (const planned of plan.skills) {
+        const meta: SkillMeta & Partial<PlannedSkill> = { ...planned }
+        delete meta.replaces
+        const at = skills.findIndex((s) => s.kind === meta.kind && s.name === meta.name)
+        const installed: SkillMeta = {
+          ...meta,
+          origin,
+          install: { package: plan.package, version: plan.version, digest: plan.digest, installed_at_ms: Date.now(), installed_by: OWNER },
+          install_state: { risk: { level: plan.risk.level, accepted_by: OWNER, accepted_at_ms: Date.now(), plan_digest: plan.plan_digest } },
+        }
+        if (at >= 0) skills[at] = installed
+        else skills.push(installed)
+        audit('install', `${meta.kind}:${meta.name}`, `${plan.package} ${plan.version}`.trim())
+      }
+      if ('draft' in source) drafts.splice(drafts.findIndex((d) => d.slug === source.draft), 1)
+      return { package: plan.package, version: plan.version, digest: plan.digest, skills: plan.skills, plan }
+    },
+
+    removeSkill: async (kind, name) => {
+      await delay()
+      const skill = findSkill(kind, name)
+      if (skill.origin !== 'installed' && skill.origin !== 'imported') throw new OpenDanError('invalid_argument', `${name} is a ${skill.origin} skill: disable it instead`)
+      skills.splice(skills.indexOf(skill), 1)
+      if (uiNames) uiNames = uiNames.filter((n) => n !== name)
+      audit('remove', `${kind}:${name}`)
+      return structuredClone(skill)
+    },
+
+    setSkillEnabled: async (kind, name, enabled, reason) => {
+      await delay()
+      const skill = findSkill(kind, name)
+      skill.enabled = enabled
+      skill.disabled = enabled ? undefined : { at_ms: Date.now(), by: OWNER, ...(reason ? { reason } : {}) }
+      audit(enabled ? 'enable' : 'disable', `${kind}:${name}`, reason)
+      return structuredClone(skill)
+    },
+
+    setUiSkills: async (names) => {
+      await delay()
+      const candidates = uiCandidates()
+      const unknown = names?.find((n) => !candidates.includes(n))
+      if (unknown) throw new OpenDanError('invalid_argument', `\`${unknown}\` is not an enabled work skill whose scope includes ui`)
+      uiNames = names ? [...names] : null
+      audit('ui_set', undefined, names ? names.join(', ') : 'back to the template')
+      return uiSkills()
+    },
+
+    importSkill: async (request) => {
+      await delay()
+      if (!request.text.trim()) throw new OpenDanError('invalid_argument', 'no text to import')
+      const slug = request.name?.trim() || `import-${drafts.length + 1}`
+      const scope = request.scope && request.scope !== 'work' ? request.scope : undefined
+      const kind = scope === 'plan' ? 'plan' as const : 'work' as const
+      const dir = kind === 'plan' ? 'plan_skills' : 'cmd_skills'
+      drafts.push({
+        slug,
+        draft: { imported_from: { digest: 'sha256:mock', runtime_id: 'private', platform: 'linux' }, risk: 'Mock import: nothing was analysed.', verified: [] },
+        skills: [{ kind, name: slug, ...(scope && kind === 'work' ? { scope } : {}), description: request.text.trim().split('\n')[0].slice(0, 80), origin: 'local', size: request.text.length, enabled: true }],
+        texts: { 'draft.json': '{}', [`${dir}/${slug}/SKILL.md`]: request.text },
+        updated_at_ms: Date.now(),
+      })
+      return { session_id: WORK_RUNNING, inbox: { index: 1 } }
+    },
+
+    discardSkillDraft: async (slug) => {
+      await delay()
+      const at = drafts.findIndex((d) => d.slug === slug)
+      if (at < 0) throw new OpenDanError('not_found', `no draft ${slug}`)
+      drafts.splice(at, 1)
+      audit('draft_discard', undefined, slug)
+      return {}
+    },
+
+    setCrystallize: async (enabled) => {
+      await delay()
+      crystallize = enabled
+      audit(enabled ? 'crystallize_on' : 'crystallize_off')
+      return { crystallize }
     },
   }
 }

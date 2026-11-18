@@ -57,6 +57,8 @@ export const en: Record<string, string> = {
   'aiworkspace.presentation.frame.defaultTitle': 'Page {{n}}',
   'aiworkspace.presentation.frame.untitled': 'Frame',
   'aiworkspace.presentation.editor.title': 'Presentation paths',
+  'aiworkspace.presentation.editor.exit': 'Exit',
+  'aiworkspace.presentation.editor.exitTitle': 'Exit path editing and return to canvas',
   'aiworkspace.presentation.editor.choosePath': 'Choose path',
   'aiworkspace.presentation.editor.noPaths': '(No paths yet)',
   'aiworkspace.presentation.editor.guideOption': '{{name}} (guide)',
@@ -176,7 +178,6 @@ export const en: Record<string, string> = {
   'aiworkspace.presentation.show.linkHelp': 'Open it in any browser (phone, tablet, another computer) to get the presenter controls of this presentation. Whoever has the link can turn pages and see the notes; the link stops working as soon as the presentation ends.',
   'aiworkspace.presentation.show.copy': 'Copy',
   'aiworkspace.presentation.show.openInWindow': 'Open in new window',
-  'aiworkspace.presentation.show.wish': 'Wish block',
 
   // starting a show
   'aiworkspace.presentation.start.savingEdits': 'Saving uncommitted changes…',
@@ -282,6 +283,8 @@ export const zh: Record<string, string> = {
   'aiworkspace.presentation.frame.defaultTitle': '第 {{n}} 页',
   'aiworkspace.presentation.frame.untitled': '框',
   'aiworkspace.presentation.editor.title': '演讲路径',
+  'aiworkspace.presentation.editor.exit': '退出',
+  'aiworkspace.presentation.editor.exitTitle': '退出路径编辑，返回普通画布',
   'aiworkspace.presentation.editor.choosePath': '选择路径',
   'aiworkspace.presentation.editor.noPaths': '（还没有路径）',
   'aiworkspace.presentation.editor.guideOption': '{{name}}（使用引导）',
@@ -399,7 +402,6 @@ export const zh: Record<string, string> = {
   'aiworkspace.presentation.show.linkHelp': '在任何浏览器（手机、平板、另一台电脑）打开它，即进入本场的演讲者控制面板。持有链接的人可以翻页并看到备注；放映结束后链接立即失效。',
   'aiworkspace.presentation.show.copy': '复制',
   'aiworkspace.presentation.show.openInWindow': '在新窗口打开',
-  'aiworkspace.presentation.show.wish': '许愿格',
 
   'aiworkspace.presentation.start.savingEdits': '正在保存未提交的修改…',
   'aiworkspace.presentation.start.preparingClone': '正在准备临时副本…',

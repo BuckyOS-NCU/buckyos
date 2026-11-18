@@ -23,7 +23,6 @@ pub const SESSION_CONFIG_SCHEMA: &str = "opendan.session_config/7";
 pub enum SessionKind {
     Ui,
     Work,
-    SelfCheck,
     /// The context of a Goal (`state/goals/<goal_id>`): one per `(goal,
     /// epoch)`, created by the host, never a sub session.
     Goal,
@@ -34,7 +33,6 @@ impl SessionKind {
         match self {
             SessionKind::Ui => "ui",
             SessionKind::Work => "work",
-            SessionKind::SelfCheck => "self_check",
             SessionKind::Goal => "goal",
         }
     }
@@ -44,7 +42,6 @@ impl SessionKind {
         match self {
             SessionKind::Ui => "ui",
             SessionKind::Work => "work",
-            SessionKind::SelfCheck => "sc",
             SessionKind::Goal => "goal",
         }
     }
@@ -415,7 +412,7 @@ pub struct PromptSection {
     /// Behaviors and identity frozen from the agent's catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen: Option<super::behavior::FrozenPrompt>,
-    /// The cmd_skills of the session (`<agent_root>/cmd_skills/<name>.md`,
+    /// The cmd_skills of the session (`<agent_root>/cmd_skills/<name>/SKILL.md`,
     /// at most [`super::behavior::MAX_CMD_SKILLS`]): chosen when the session
     /// is created (`agent.toml [session.<class>] default_cmd_skills`,
     /// `create-worksession --cmd-skill`), frozen with the behaviors
@@ -458,6 +455,20 @@ pub struct PromptSection {
     /// runner default (0.30).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_target_ratio: Option<f32>,
+}
+
+impl PromptSection {
+    /// The entry behavior only chooses manuals for the work it plans: the ones named for it are candidates
+    /// (`frozen.skill_candidates`), not its own.
+    pub fn entry_takes_candidates(&self) -> bool {
+        match (&self.behavior, &self.frozen) {
+            (Some(entry), Some(frozen)) => frozen
+                .behaviors
+                .get(entry)
+                .is_some_and(|b| b.capabilities.cmd_skills == super::behavior::CmdSkillsUse::Candidates),
+            _ => false,
+        }
+    }
 }
 
 /// How a behavior is entered when a hand-over (`next_behavior`) or a
@@ -748,8 +759,6 @@ pub enum RuntimeSelection {
     Explicit,
     /// The parent session's frozen runtime.
     Inherited,
-    /// Where the commands of a named cmd_skill are installed.
-    Skill,
     /// The agent's private runtime: every chat, and any session nobody
     /// placed elsewhere.
     Private,
@@ -927,6 +936,12 @@ pub const USER_TIMEZONE_SOURCE_ID: &str = "user_timezone";
 /// `system:<id>` subscription also takes the sub ids `<id>:<sub>`).
 pub const NOTIFY_SUBSCRIPTION: &str = "_notify";
 
+/// Id of the implicit semi subscription every session has on what the user
+/// does to the agent's browser in its conversation
+/// (`source = system:browser:<group_id>`: taken over, handed back).
+pub const BROWSER_SUBSCRIPTION: &str = "_browser";
+pub const BROWSER_SOURCE_ID: &str = "browser";
+
 /// Id of a Work Session's implicit timer subscription: while the session
 /// waits for the work it started, the runner ticks it every
 /// `policy.tick_secs` and the tick opens a Turn.
@@ -1030,14 +1045,18 @@ impl SessionConfig {
 
     /// Subscriptions every session has without declaring them.
     pub fn implicit_subscriptions(&self) -> Vec<Subscription> {
-        vec![Subscription {
-            id: USER_TIMEZONE_SUBSCRIPTION.to_string(),
+        [
+            (USER_TIMEZONE_SUBSCRIPTION, USER_TIMEZONE_SOURCE_ID),
+            (BROWSER_SUBSCRIPTION, BROWSER_SOURCE_ID),
+        ]
+        .into_iter()
+        .map(|(id, source)| Subscription {
+            id: id.to_string(),
             mode: SubscriptionMode::Semi,
-            source: SubscriptionSource::System {
-                id: USER_TIMEZONE_SOURCE_ID.to_string(),
-            },
+            source: SubscriptionSource::System { id: source.to_string() },
             watch: Vec::new(),
-        }]
+        })
+        .collect()
     }
 
     /// The valid subscription an event belongs to: the one named by

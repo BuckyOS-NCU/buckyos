@@ -6,7 +6,11 @@
    "code": "INVALID_SCHEMA",
    "retryable": false,
    "status": "rejected",
-   "meaning": "Input does not match the type's schema."
+   "meaning": "Input does not match the type's schema.",
+   "sub_codes": [
+    "PRIMARY_KEY_REQUIRED",
+    "DUPLICATE_KEY"
+   ]
   },
   {
    "code": "INVALID_OPERATION",
@@ -22,17 +26,37 @@
     "VIEW_BROKEN",
     "TREE_CYCLE",
     "CHILD_NOT_ALLOWED",
+    "FOLDER_NOT_EMPTY",
     "SOURCE_READ_ONLY",
     "SLOT_CONFLICT",
     "EXT_IDENT_EXISTS",
-    "EXT_LOCAL_CHANGES"
+    "EXT_LOCAL_CHANGES",
+    "SQL_NOT_ALLOWED",
+    "SQL_ERROR",
+    "NOT_MATERIALIZED",
+    "DATA_PENDING",
+    "NEEDS_ANALYSIS",
+    "NEEDS_INPUT",
+    "NEEDS_EXTERNAL_DATA",
+    "NEEDS_CODING",
+    "PROGRAM_FAILED",
+    "MACRO_CODE_CHANGED",
+    "CHECKS_FAILED",
+    "PLAN_PROBLEMS",
+    "NOT_CURRENT_RECORD",
+    "PRINT_PATH_REQUIRED",
+    "PRINT_PATH_UNUSABLE",
+    "PRINT_FRAME_UNUSABLE"
    ]
   },
   {
    "code": "LIMIT_EXCEEDED",
    "retryable": false,
    "status": "rejected",
-   "meaning": "A size, count or depth limit was exceeded."
+   "meaning": "A size, count or depth limit was exceeded.",
+   "sub_codes": [
+    "SNAPSHOT_TOO_LARGE"
+   ]
   },
   {
    "code": "NOT_FOUND",
@@ -56,7 +80,10 @@
    "code": "PERMISSION_DENIED",
    "retryable": false,
    "status": "rejected",
-   "meaning": "The trusted principal lacks the capability."
+   "meaning": "The trusted principal lacks the capability.",
+   "sub_codes": [
+    "MACRO_CANNOT_WRITE"
+   ]
   },
   {
    "code": "REVISION_CONFLICT",
@@ -92,7 +119,17 @@
    "code": "DEPENDENCY_UNAVAILABLE",
    "retryable": false,
    "status": "rejected",
-   "meaning": "An asset, object or data source is not available."
+   "meaning": "An asset, object or data source is not available.",
+   "sub_codes": [
+    "AI_QUOTA_EXHAUSTED",
+    "AI_QUOTA_BUDGET_EXCEEDED",
+    "AI_RESOURCE_NOT_PERMITTED",
+    "AI_ATTRIBUTION_UNAVAILABLE",
+    "AI_UNAVAILABLE",
+    "CODING_UNFINISHED",
+    "SYNC_UNAVAILABLE",
+    "PRINT_RENDERER_MISSING"
+   ]
   },
   {
    "code": "STORAGE_FULL",
@@ -134,7 +171,10 @@
    "code": "SNAPSHOT_EXPIRED",
    "retryable": true,
    "status": "rejected",
-   "meaning": "The source changed during consistent paging."
+   "meaning": "What a cursor or a pinned read depended on changed: a page cursor (consistent paging, `doc.list` / `doc.find` / body cursors bound to the head or the body etag), or the head an SQL query expected (`HEAD_MISMATCH`). Read again from the start.",
+   "sub_codes": [
+    "HEAD_MISMATCH"
+   ]
   },
   {
    "code": "NOT_UNDOABLE",

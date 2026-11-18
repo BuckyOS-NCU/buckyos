@@ -53,6 +53,10 @@ pub fn envelope(ctx: &dyn ReadCtx, access: &Access, e: &EntityRow) -> WsResult<V
     if let Some(d) = &e.derived {
         m.insert("derived".into(), d.clone());
     }
+    // who created it (权限需求 R6): what `@creator` entries are judged against
+    if let Some(c) = &e.created_by {
+        m.insert("created_by".into(), json!(c));
+    }
     if let Some(edge) = ctx.edge(&e.entity_id)? {
         m.insert("parent_id".into(), json!(edge.parent_id));
         m.insert("order_key".into(), json!(edge.order_key));
@@ -196,16 +200,9 @@ fn entity_content(ctx: &dyn ReadCtx, e: &EntityRow) -> WsResult<Value> {
         }
         TYPE_CELL => json!({ "payload": e.payload, "key_revs": revs, "diagnostics": cell_diagnostics(ctx, e)? }),
         TYPE_ANNOTATION => json!({ "payload": e.payload, "key_revs": revs, "anchor": anchor::resolve(ctx, &e.payload)?.to_json() }),
-        TYPE_TABLE => {
-            let mut count = 0u64;
-            ctx.scan_records(&e.entity_id, &mut |r| {
-                count += r.alive() as u64;
-                Ok(true)
-            })?;
-            json!({ "payload": e.payload, "key_revs": revs,
-                    "fields": live_fields(ctx, &e.entity_id)?.iter().map(field_json).collect::<Vec<_>>(),
-                    "record_count": count, "members_rev": e.key_rev(MEMBERS_KEY) })
-        }
+        TYPE_TABLE => json!({ "payload": e.payload, "key_revs": revs,
+                              "fields": live_fields(ctx, &e.entity_id)?.iter().map(field_json).collect::<Vec<_>>(),
+                              "record_count": ctx.record_count(&e.entity_id)?, "members_rev": e.key_rev(MEMBERS_KEY) }),
         TYPE_RICHTEXT => {
             let rt = ctx.richtext(&e.entity_id)?.ok_or_else(|| WsError::io("rich text state missing"))?;
             let blocks: BTreeMap<&String, Value> =
@@ -282,6 +279,20 @@ pub fn outline_extras(env: &mut Value, e: &EntityRow) {
             }
             if let Some(d) = e.payload.get("def_ref").and_then(|r| r.get("entity_id")) {
                 env["def_id"] = d.clone();
+            }
+            // a data control projects the tables it binds, a composite its projections' data (控件机制 TODO G2, G13):
+            // their ids, by binding name (a list for a `many` binding)
+            if env["kind"].as_str().is_some_and(|k| types::is_data_control(k) || k == types::COMPOSITE) {
+                if let Some(b) = e.payload.get("bindings").and_then(Value::as_object) {
+                    let ids: Map<String, Value> = b
+                        .iter()
+                        .filter_map(|(k, v)| match v {
+                            Value::Array(list) => Some((k.clone(), Value::Array(list.iter().filter_map(|i| i.get("entity_id").cloned()).collect()))),
+                            _ => v.get("entity_id").map(|id| (k.clone(), id.clone())),
+                        })
+                        .collect();
+                    env["bindings"] = Value::Object(ids);
+                }
             }
             if let Some(v) = e.payload.get("slot") {
                 env["slot"] = v.clone();
@@ -365,6 +376,10 @@ pub fn outline_extras(env: &mut Value, e: &EntityRow) {
                 let defaults: Map<String, Value> = e.payload.get("config_schema").and_then(|s| s.get("properties")).and_then(Value::as_object).into_iter().flatten()
                     .filter_map(|(k, p)| p.get("default").map(|d| (k.clone(), d.clone()))).collect();
                 env["config_defaults"] = Value::Object(defaults);
+                // its declared actions (manifest 4, 控件机制 TODO H2): offered on the instance's toolbar
+                if let Some(a) = e.payload.get("actions").filter(|a| a.is_array()) {
+                    env["def_actions"] = a.clone();
+                }
             }
         }
         TYPE_ANNOTATION => {
@@ -393,20 +408,77 @@ pub fn outline_extras(env: &mut Value, e: &EntityRow) {
     }
 }
 
-/// All readable, alive entities in tree order (the "outline"), decorated with `outline_extras`.
+/// A path node of the outline: an entity the caller cannot read, listed because something below it is readable. It
+/// places that in the tree — id, type, a container's kind, parent and sibling order — and gives nothing else: no
+/// name or title (a printed path never names an unreadable ancestor either, `path::path_of`), no content, no
+/// capabilities.
+fn path_node(ctx: &dyn ReadCtx, e: &EntityRow) -> WsResult<Value> {
+    let mut v = json!({ "entity_id": e.entity_id, "type_id": e.type_id, "path_only": true });
+    if e.type_id == TYPE_CONTAINER {
+        v["kind"] = e.payload.get("kind").cloned().unwrap_or(Value::Null);
+    }
+    if let Some(edge) = ctx.edge(&e.entity_id)? {
+        v["parent_id"] = json!(edge.parent_id);
+        v["order_key"] = json!(edge.order_key);
+    }
+    Ok(v)
+}
+
+/// The "outline": every readable, alive entity in tree order, decorated with `outline_extras`, and — so that what the
+/// caller may read below an entity it may not (a grant on one canvas folder, one canvas, `/data/销售`) still hangs
+/// in the two trees — each unreadable ancestor of one as a [`path_node`]. An entity outside the caller's scope hides
+/// its subtree.
 pub fn outline(ctx: &dyn ReadCtx, access: &Access) -> WsResult<Vec<Value>> {
+    // where an unreadable entity may still hold something readable: above a layer that allows `read`
+    let reach: Option<BTreeSet<String>> = match access.read_layers() {
+        None => None,
+        Some(layers) => {
+            let mut up = BTreeSet::new();
+            for layer in layers {
+                let mut cur = layer;
+                for _ in 0..4096 {
+                    match ctx.edge(&cur)? {
+                        Some(edge) if up.insert(edge.parent_id.clone()) => cur = edge.parent_id,
+                        _ => break,
+                    }
+                }
+            }
+            Some(up)
+        }
+    };
+    enum Step {
+        Visit(String),
+        /// Leaving a path node pushed at this index: dropped again when nothing readable came after it.
+        Leave(usize),
+    }
     let mut out = Vec::new();
-    let mut stack = vec![ROOT_ID.to_string()];
-    while let Some(id) = stack.pop() {
+    let mut stack = vec![Step::Visit(ROOT_ID.to_string())];
+    while let Some(step) = stack.pop() {
+        let id = match step {
+            Step::Visit(id) => id,
+            Step::Leave(at) => {
+                if out.len() == at + 1 {
+                    out.pop();
+                }
+                continue;
+            }
+        };
         let Some(e) = ctx.entity(&id)? else { continue };
-        if !e.alive() || !access.can_read(ctx, &e)? {
+        if !e.alive() || !access.sees_scope(&e) {
             continue;
         }
-        let mut env = envelope(ctx, access, &e)?;
-        outline_extras(&mut env, &e);
-        out.push(env);
+        if access.can_read(ctx, &e)? {
+            let mut env = envelope(ctx, access, &e)?;
+            outline_extras(&mut env, &e);
+            out.push(env);
+        } else if reach.as_ref().is_none_or(|r| r.contains(&id)) {
+            stack.push(Step::Leave(out.len()));
+            out.push(path_node(ctx, &e)?);
+        } else {
+            continue;
+        }
         for edge in ctx.children(&id)?.into_iter().rev() {
-            stack.push(edge.child_id);
+            stack.push(Step::Visit(edge.child_id));
         }
     }
     Ok(out)
@@ -426,21 +498,9 @@ pub fn list_children(ctx: &dyn ReadCtx, access: &Access, parent_id: &str, includ
     Ok(out)
 }
 
-/// `/data/entity name` → entity id (the system nodes are named `data` / `surfaces`). Paths are for
-/// lookup only; anything persistent stores the id.
+/// A path (`/data/销售`, `~<id>/…`) → entity id: the one path implementation (`path::resolve`). Paths are for lookup
+/// only; anything persistent stores the id.
 pub fn resolve_path(ctx: &dyn ReadCtx, access: &Access, path: &str) -> WsResult<String> {
-    let mut cur = ROOT_ID.to_string();
-    for seg in path.split('/').filter(|s| !s.is_empty()) {
-        let mut next = None;
-        for edge in ctx.children(&cur)? {
-            if let Some(e) = ctx.entity(&edge.child_id)? {
-                if e.alive() && e.name.as_deref() == Some(seg) && access.can_read(ctx, &e)? {
-                    next = Some(e.entity_id);
-                    break;
-                }
-            }
-        }
-        cur = next.ok_or_else(|| WsError::not_found(format!("path segment {seg:?} not found")))?;
-    }
-    Ok(cur)
+    let p = if path.starts_with('/') || path.starts_with('~') { path.to_string() } else { format!("/{path}") };
+    crate::path::resolve(ctx, access, &p)
 }

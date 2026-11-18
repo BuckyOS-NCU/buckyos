@@ -9,16 +9,19 @@ import type { AccessDenial, AdjustLocation, DenyReason } from 'buckyos'
 import { ndm } from 'buckyos'
 import { AiwsClient, ServiceFailure, unwrap } from './client'
 import { randomId } from './ids'
+import { queryBySql, type TableQueryDeps } from './tableQuery'
+import { loadCore } from './wasm'
 import { TransportError } from './transport'
-import { aiwsT, localizedLabels } from '../i18n'
+import { aiwsT, aiwsText, localizedLabels } from '../i18n'
 import type { LocalExport, PendingMeta, PendingRow, PendingState, RichTextDraftRow } from '../offline/protocol'
 import {
   PROTOCOL_VERSION,
   type CollabState, type CommitEvent, type CommitOutcome, type CommitRequest, type CommitResult, type EntityEnvelope, type Json,
-  type LockInfo, type Operation, type PrepareResult, type QueryPage, type QueryParams, type RunView, type Selector, type WorkspaceInfo,
-  type AnnotationRead, type ListAnnotationsParams, type Capability, type DerivedRecord, type FreshnessInfo, type GrantList, type RelationsInfo,
-  type Subject, type VersionInfo, type WishChoices, type WishRunView, type ShowLockInfo, type ServiceError, type WishAiccMode, type WishClaim, type WishToolAnswer, type HostedExecConfig, type Publication, type Referrer,
+  type LockInfo, type Operation, type PrepareResult, type QueryPage, type QueryParams, type RunView, type Selector, type SqlParams, type SqlResult, type WorkspaceInfo,
+  type AnnotationRead, type ListAnnotationsParams, type DerivedRecord, type FreshnessInfo, type RelationsInfo,
+  type Subject, type VersionInfo, type NeedsCodingReason, type WishRollbackResult, type WishRunView, type ShowLockInfo, type ServiceError, type WishClaim, type WishToolAnswer, type WishStageFiles, type Publication, type Referrer,
   type BucketBinding, type StagedAsset, type ExtBuildResult, type ExtExportResult, type ExtMigration, type ExtPackResult, type LibraryPackage, type TemplateSpec,
+  type PresenceList, type WorkLogFilter, type WorkLogPage, type ExternalDataWanted,
 } from './types'
 
 export type SessionStatus =
@@ -44,24 +47,41 @@ export interface CommitOptions {
   idempotencyKey?: string
   /** Replica session: stored with the pending row so the edit can be shown again after a restart. */
   meta?: PendingMeta
+  /** A Commit sent in several requests: told before request `part` of `total` goes out (the last one writes). Not
+   * told by a replica session, which sends later. */
+  onPart?: (part: number, total: number) => void
 }
 
-export type ImportedAsset = { kind: 'file'; name: string; object_id: string; size: number } | { kind: 'dir'; name: string; children: ImportedAsset[] }
+export type ImportedAsset = { kind: 'file'; name: string; object_id: string; size: number; media_type: string } | { kind: 'dir'; name: string; children: ImportedAsset[] }
 
 /** One file into a Workspace (design §3.6, Durable Data Schema §3.3): uploaded through NDM and bound into the
  * caller's own `assets` bucket at finalize, then taken over by the service into the Workspace owner's bucket.
  * A caller without a bucket of its own (a guest) uploads unbound and the service binds what it may read. */
-export async function uploadWorkspaceAsset(client: AiwsClient, workspaceId: string, file: File): Promise<StagedAsset> {
+/** Workspace assets: 32 MiB each; audio and video up to 2 GiB (控件机制 TODO Q16; the service checks the sniffed type). */
+export const ASSET_LIMIT_BYTES = 32 * 1024 * 1024
+export const MEDIA_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+export const assetLimitOf = (file: Blob) => (/^(audio|video)\//.test(file.type) ? MEDIA_LIMIT_BYTES : ASSET_LIMIT_BYTES)
+const tooLarge = (file: Blob) => (assetLimitOf(file) === MEDIA_LIMIT_BYTES ? 'Audio and video are limited to 2 GiB per file.' : 'Workspace assets are limited to 32 MiB per file.')
+
+/** An upload that can be followed and stopped (a directory's per-file progress, 框架 PRD §7.4): `onProgress` gets the
+ * bytes sent of the bytes to send; aborting `signal` stops hashing or sending. */
+export interface UploadControl { signal?: AbortSignal; onProgress?: (sent: number, total: number) => void }
+
+export async function uploadWorkspaceAsset(client: AiwsClient, workspaceId: string, file: File, control: UploadControl = {}): Promise<StagedAsset> {
   const options = await client.transport.importOptions()
   const own = await client.transport.ownBucket('assets')
-  const snapshot = await ndm.importFiles([file], { ...options, mode: 'single_file', autoStartUpload: false })
+  const { signal, onProgress } = control
+  const snapshot = await ndm.importFiles([file], { ...options, mode: 'single_file', autoStartUpload: false, signal })
   const ws = { workspace_id: workspaceId }
+  const sending = { signal, onProgress: onProgress && ((p: ndm.UploadProgress) => onProgress(p.uploadedBytes, p.totalBytes)) }
   try {
     if (!own) {
-      await ndm.ensureUploaded(snapshot.sessionId, options)
+      await ndm.ensureUploaded(snapshot.sessionId, { ...options, ...sending })
+      signal?.throwIfAborted()
       return unwrap(await client.assetImportObject(ws, { obj_id: snapshot.selection.objectId }))
     }
-    const status = await ndm.ensureUploaded(snapshot.sessionId, { ...options, bind: { bucketId: own, key: `${workspaceId}/${snapshot.selection.objectId}` } })
+    const status = await ndm.ensureUploaded(snapshot.sessionId, { ...options, ...sending, bind: { bucketId: own, key: `${workspaceId}/${snapshot.selection.objectId}` } })
+    signal?.throwIfAborted()
     if (!status.binding) throw new Error('the upload was not bound')
     return unwrap(await client.assetImportObject(ws, { bucket_id: status.binding.bucket_id, key: status.binding.key }))
   } finally { ndm.releaseImportSession(snapshot.sessionId) }
@@ -143,13 +163,22 @@ export interface WorkspaceSession {
   subscribeChanges(listener: (event: CommitEvent) => void): () => void
   /** Resolves once the change stream has been applied up to `seq`. */
   whenApplied(seq: number): Promise<void>
+  /** The service's clock now (unix ms), as one round trip measures it (控件机制 TODO G16); null without the service. */
+  serverTime(): Promise<{ server_ms: number; rtt_ms: number } | null>
+  /** An address that plays an asset by Range (G17, H6); null where there is none (offline). */
+  assetStreamUrl(objectId: string): Promise<string | null>
 
   outline(): Promise<EntityEnvelope[]>
   read<C>(entityId: string, selector?: Selector): Promise<ReadOk<C>>
   readMany(targets: { entity_id: string; selector?: Selector }[]): Promise<(ReadOk<unknown> | { error: { code: string; detail?: string } })[]>
   /** Annotations anchored to `target_ids` and/or placed under `parent_id`, each with its anchor. */
   listAnnotations(params: ListAnnotationsParams): Promise<AnnotationRead[]>
+  /** A table view's rows (`view_id` and/or `source_id`, with filter, sorts, group): evaluated on the replica when this tab
+   * holds it, compiled to SQL and run by the service otherwise — the same rows either way. */
   query(params: QueryParams): Promise<QueryPage>
+  /** `doc.query { sql }` (核心 API 调整 §3.4): runs on the service only. A replica session asks with its confirmed head
+   * (`expect_head`) and refuses while it has local changes not yet confirmed, or offline. */
+  sql(params: SqlParams): Promise<SqlResult>
   getCollabState(entityId: string): Promise<CollabState>
   /** Dependency-based freshness of results and wishes (computed by the core, phase two §7.5). */
   freshness(entityIds: string[]): Promise<FreshnessInfo[]>
@@ -164,15 +193,11 @@ export interface WorkspaceSession {
   getUserState(): Promise<Record<string, Json>>
   setUserState(entries: Record<string, Json | null>): Promise<void>
 
-  /** Deployment management (online only; never queued, never undoable). */
-  listGrants(): Promise<GrantList>
-  grant(subject: string, capabilities: Capability[], scopeEntityId?: string): Promise<void>
-  revoke(subject: string, scopeEntityId?: string): Promise<void>
+  /** Deployment management (online only; never queued, never undoable). The permissions themselves (`acl.*`) are
+   * called through the client by ui/permissions; `subscribeAcl` tells when they moved (权限需求 R4): `info()` then
+   * carries the new `acl_rev` and the caller's Workspace capabilities (a replica window follows them too). */
+  subscribeAcl(listener: () => void): () => void
   listSubjects(): Promise<Subject[]>
-  /** Whose AICC the wish blocks use (AI Center Quota PRD §3.3); a manager's setting, online only. */
-  setWishAiccMode(mode: WishAiccMode): Promise<WishAiccMode>
-  /** The owner's hosted execution configuration (D22, T3-7); `manage`, online only. */
-  setHostedExec(config: HostedExecConfig): Promise<HostedExecConfig>
   /** Publication by path (D26): `manage`; the link is in `url` when the deployment has a host. */
   publish(entityId: string, name?: string): Promise<Publication>
   unpublish(entityId: string): Promise<void>
@@ -213,7 +238,7 @@ export interface WorkspaceSession {
 
   /** A service method this interface does not wrap (a session's `session.*`, 第四期规划): raw kRPC, needs the backend. */
   call<T>(method: string, params: Record<string, unknown>): Promise<T>
-  uploadAsset(file: Blob, fileName?: string): Promise<StagedAsset>
+  uploadAsset(file: Blob, fileName?: string, control?: UploadControl): Promise<StagedAsset>
   /** A file into the content store only (not a Workspace asset, no bucket binding): the uploader holds it for a day,
    * long enough for a conversion (`repr`) to read it by `object_id`; nothing references it afterwards (Office 导入 Q14). */
   uploadTransient(file: Blob, fileName: string): Promise<{ object_id: string }>
@@ -225,22 +250,32 @@ export interface WorkspaceSession {
 
   procStart(program: string, params: Record<string, Json>): Promise<RunView>
   procGet(runId: string): Promise<RunView>
-  procApply(runId: string): Promise<RunView>
   procCancel(runId: string): Promise<{ state: string; already_applied: boolean; commit_id?: string }>
 
-  /** Wish runs on the service (need the backend): start a stage, read it (with a preview for `choices`), apply a previewed plan, list. */
+  /** Wish runs on the service (need the backend): start a stage (it writes its product when it ends), read it, list. */
   /** `idempotencyKey`: an event's run (扩展控件 P2) is keyed like its writes, so a repeat starts nothing new. */
-  wishStart(program: 'wish.xllm@1' | 'wish.mock@1', params: Record<string, Json>, idempotencyKey?: string): Promise<WishRunView>
-  wishGet(runId: string, choices?: WishChoices): Promise<WishRunView>
-  wishApply(runId: string, planDigest: string): Promise<WishRunView>
+  wishStart(program: 'wish.xllm@1', params: Record<string, Json>, idempotencyKey?: string): Promise<WishRunView>
+  wishGet(runId: string): Promise<WishRunView>
   wishList(wishId: string, limit?: number): Promise<WishRunView[]>
+  /** Roll a stage's current record back (许愿格交互升级 §2.1, §2.3); `confirm` accepts losing the later changes it named. */
+  procRollback(runId: string, confirm?: boolean): Promise<WishRollbackResult>
   /** The executor protocol (内核架构改进 T3-4): this browser as the executor of a local run. */
   procClaim(runId: string, claimToken: string): Promise<WishClaim>
   procHeartbeat(runId: string, attempt: number, progress?: Json): Promise<void>
   procReport(runId: string, attempt: number, body: Record<string, Json>): Promise<WishRunView>
   procTool(runId: string, attempt: number, name: string, args: Json): Promise<WishToolAnswer>
   procProgram(runId: string, attempt: number, body: { source: string; results: Json | null; log: string; files: Json }): Promise<WishToolAnswer>
-  procFiles(runId: string, attempt: number): Promise<Record<string, { text?: string; base64?: string; skipped?: string }>>
+  procFiles(runId: string, attempt: number): Promise<WishStageFiles>
+  /** A file object already in the Zone (a picture a wish macro generated) becomes a staged asset of this Workspace. */
+  importObject(objId: string): Promise<StagedAsset>
+
+  /** Presence (UI 框架 PRD K2): this window (`sessionId` is its connection id) on `surfaceId`; a guest gives the name it
+   * chose. In memory on the service, never a Commit, never queued: needs the backend. */
+  presenceHeartbeat(surfaceId: string | null, name?: string): Promise<PresenceList>
+  presenceLeave(): Promise<void>
+  presenceList(): Promise<PresenceList>
+  /** The work log (K3): newest first, what this caller may read; `before` is the previous page's `next_before`. Needs the backend. */
+  workLog(params?: { before?: string | null; limit?: number; filter?: WorkLogFilter }): Promise<WorkLogPage>
 
   close(): void
   /** Resolves once a closed session released what it held exclusively (replica database, holder lock). */
@@ -300,6 +335,7 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
   private catchUpChain: Promise<void> = Promise.resolve()
   private readonly statusListeners = new Set<() => void>()
   private readonly changeListeners = new Set<(event: CommitEvent) => void>()
+  private readonly aclListeners = new Set<() => void>()
   private readonly seqWaiters: { seq: number; resolve: () => void }[] = []
   /** Requests whose result is unknown, kept verbatim for a same-key resend. */
   private readonly unknown = new Map<string, { kind: 'commit'; request: CommitRequest } | { kind: 'undo'; params: Parameters<AiwsClient['undo']>[1] }>()
@@ -315,7 +351,8 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
   }
 
   static async open(client: AiwsClient, workspaceId: string, mode: SessionMode = { kind: 'direct', reason: 'not_prepared', detail: aiwsT('aiworkspace.core.session.notPrepared') }): Promise<OnlineWorkspaceSession> {
-    const info = unwrap(await client.wsGetInfo({ workspace_id: workspaceId }))
+    // opening a Workspace session is what the home page's "recently opened" counts (UI 框架 PRD K6)
+    const info = unwrap(await client.wsGetInfo({ workspace_id: workspaceId }, { recordOpen: true }))
     if (info.principal) client.transport.learnPrincipal(info.principal)
     const session = new OnlineWorkspaceSession(client, info, mode, null)
     if (versionMismatch(info)) session.noteCode('VERSION_MISMATCH')
@@ -323,7 +360,7 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
     return session
   }
 
-  /** The direct-to-backend calls of a replica session (locks, uploads, Mock runs, commits of lock-protected
+  /** The direct-to-backend calls of a replica session (locks, uploads, runs, commits of lock-protected
    * objects, undo): no follower of its own, the host owns the change stream. */
   static hosted(client: AiwsClient, info: WorkspaceInfo, host: SessionHost): OnlineWorkspaceSession {
     return new OnlineWorkspaceSession(client, info, { kind: 'direct', reason: 'not_prepared', detail: '' }, host)
@@ -343,6 +380,21 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
   }
 
   info() { return this.wsInfo }
+
+  async assetStreamUrl(objectId: string) {
+    try { return unwrap(await this.client.assetStreamUrl(this.ws, objectId)).url } catch { return null }
+  }
+
+  async serverTime() {
+    const sent = performance.now()
+    try {
+      const r = unwrap(await this.client.wsTime())
+      const rtt = performance.now() - sent
+      return { server_ms: r.server_ms, rtt_ms: rtt }
+    } catch {
+      return null
+    }
+  }
   status() { return this.currentStatus }
   appliedSeq() { return this.applied }
   showLock() { return this.lock }
@@ -361,6 +413,22 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
   subscribeChanges(listener: (event: CommitEvent) => void) {
     this.changeListeners.add(listener)
     return () => { this.changeListeners.delete(listener) }
+  }
+
+  subscribeAcl(listener: () => void) {
+    this.aclListeners.add(listener)
+    return () => { this.aclListeners.delete(listener) }
+  }
+
+  /** The permissions moved past what this window knows (R4): read the caller's Workspace capabilities again. */
+  private async noteAclRev(rev: number | undefined) {
+    if (rev === undefined || rev <= (this.wsInfo.acl_rev ?? 0)) return
+    const info = await this.client.wsGetInfo(this.ws)
+    if (!info.ok) { this.handleStreamError(info.error.code, info.error.detail); return }
+    this.wsInfo = { ...this.wsInfo, capabilities: info.capabilities, acl_rev: info.acl_rev ?? rev, anonymous: info.anonymous, judged_as: info.judged_as, owner: info.owner }
+    for (const listener of [...this.aclListeners]) {
+      try { listener() } catch (error) { console.error('[aiworkspace] permission listener failed', error) }
+    }
   }
 
   whenApplied(seq: number): Promise<void> {
@@ -412,9 +480,12 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
         this.setStatus({ kind: 'live' })
         backoff = 500
         this.waitAbort = new AbortController()
-        const woke = await this.client.waitChanges(this.ws, this.epoch, this.applied, 25000, this.waitAbort.signal)
+        const woke = await this.client.waitChanges(this.ws, this.epoch, this.applied, 25000, this.waitAbort.signal, this.wsInfo.acl_rev)
         if (!woke.ok) this.handleStreamError(woke.error.code, woke.error.detail)
-        else this.noteShowLock(woke.show_lock ?? null)
+        else {
+          this.noteShowLock(woke.show_lock ?? null)
+          await this.noteAclRev(woke.acl_rev)
+        }
       } catch (error) {
         if (this.closed || this.isStopped()) break
         if (!(error instanceof TransportError)) throw error
@@ -490,8 +561,22 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
     try { return unwrap(await this.client.listAnnotations(this.ws, params)).annotations } catch (error) { return this.fail(error) }
   }
 
+  /** A table view's rows: compiled to SQL by the core and run by the service (核心 API 调整 §3.5). */
   async query(params: QueryParams) {
-    try { return unwrap(await this.client.query(this.ws, params)) } catch (error) { return this.fail(error) }
+    try {
+      const core = await loadCore()
+      return await queryBySql({
+        read: async (ids) => unwrap(await this.client.readMany(this.ws, ids.map((entity_id) => ({ entity_id })))).results as unknown as Awaited<ReturnType<TableQueryDeps['read']>>,
+        sql: async (p) => unwrap(await this.client.sql(this.ws, p)),
+        sourceQuery: async (p) => unwrap(await this.client.sourceQuery(this.ws, p)),
+        viewSql: (table, fields, view, projection) => core.view_sql(table, fields, view, projection),
+        fail: (e) => new ServiceFailure(e),
+      }, params)
+    } catch (error) { return this.fail(error) }
+  }
+
+  async sql(params: SqlParams) {
+    try { return unwrap(await this.client.sql(this.ws, params)) } catch (error) { return this.fail(error) }
   }
 
   async getCollabState(entityId: string) {
@@ -523,31 +608,8 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
     try { unwrap(await this.client.wsSetUserState(this.ws, entries)) } catch (error) { return this.fail(error) }
   }
 
-  async listGrants() {
-    try { const r = unwrap(await this.client.wsListGrants(this.ws)); return { grants: r.grants, complete: r.complete, owner: r.owner, principal: r.principal } } catch (error) { return this.fail(error) }
-  }
-  async grant(subject: string, capabilities: Capability[], scopeEntityId?: string) {
-    try { unwrap(await this.client.wsGrant(this.ws, subject, capabilities, scopeEntityId)) } catch (error) { return this.fail(error) }
-  }
-  async revoke(subject: string, scopeEntityId?: string) {
-    try { unwrap(await this.client.wsRevoke(this.ws, subject, scopeEntityId)) } catch (error) { return this.fail(error) }
-  }
   async listSubjects() {
     try { return unwrap(await this.client.wsListSubjects(this.ws)).subjects } catch (error) { return this.fail(error) }
-  }
-  async setWishAiccMode(mode: WishAiccMode) {
-    try {
-      const applied = unwrap(await this.client.wsSetWishAicc(this.ws, mode)).wish_aicc_mode
-      this.wsInfo = { ...this.wsInfo, wish_aicc_mode: applied }
-      return applied
-    } catch (error) { return this.fail(error) }
-  }
-  async setHostedExec(config: HostedExecConfig) {
-    try {
-      const applied = unwrap(await this.client.wsSetHostedExec(this.ws, config)).hosted_exec
-      this.wsInfo = { ...this.wsInfo, hosted_exec: applied }
-      return applied
-    } catch (error) { return this.fail(error) }
   }
   async publish(entityId: string, name?: string) { try { return unwrap(await this.client.wsPublish(this.ws, entityId, name)) } catch (error) { return this.fail(error) } }
   async unpublish(entityId: string) { try { unwrap(await this.client.wsUnpublish(this.ws, entityId)) } catch (error) { return this.fail(error) } }
@@ -607,7 +669,7 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
       return Promise.resolve({ status: 'rejected', code: 'BACKEND_UNREACHABLE', retryable: true, detail, errors: [{ code: 'BACKEND_UNREACHABLE', detail }], idempotency_key: key })
     }
     const request = this.request(operations, key, options)
-    return this.deliver(key, () => this.client.commit(request), { kind: 'commit', request })
+    return this.deliver(key, () => this.client.commit(request, options?.onPart), { kind: 'commit', request })
   }
 
   undoCommit(commitId: string, options?: { mode?: 'all_or_nothing' | 'partial'; planDigest?: string }): Promise<CommitOutcome> {
@@ -691,10 +753,10 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
 
   // ---- assets (design §3.6): verified bytes first, then the reference is committed by the caller
 
-  async uploadAsset(file: Blob, fileName?: string) {
-    if (file.size > 32 * 1024 * 1024) throw new Error('Workspace assets are limited to 32 MiB.')
+  async uploadAsset(file: Blob, fileName?: string, control?: UploadControl) {
+    if (file.size > assetLimitOf(file)) throw new Error(tooLarge(file))
     const source = file instanceof File ? file : new File([file], fileName ?? 'asset', { type: file.type })
-    return uploadWorkspaceAsset(this.client, this.workspaceId, source)
+    return uploadWorkspaceAsset(this.client, this.workspaceId, source, control)
   }
 
   contentServer() { return this.client.transport.importOptions() }
@@ -709,7 +771,8 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
   }
 
   async importAssets(files: File[], folder: boolean, signal?: AbortSignal): Promise<ImportedAsset[]> {
-    if (files.some(file => file.size > 32 * 1024 * 1024)) throw new Error('Workspace assets are limited to 32 MiB per file.')
+    const big = files.find((file) => file.size > assetLimitOf(file))
+    if (big) throw new Error(tooLarge(big))
     const options = await this.client.transport.importOptions()
     const snapshot = await ndm.importFiles(files, { ...options, mode: folder ? 'single_dir' : 'multi_file', autoStartUpload: false, signal })
     try {
@@ -722,7 +785,7 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
           return { kind: 'dir', name: item.name, children }
         }
         const asset = unwrap(await this.client.assetImportObject(this.ws, { obj_id: item.objectId }))
-        return { kind: 'file', name: item.name, object_id: asset.object_id, size: asset.size }
+        return { kind: 'file', name: item.name, object_id: asset.object_id, size: asset.size, media_type: asset.media_type }
       }
       const items: ImportedAsset[] = []
       for (const item of snapshot.items) items.push(await stage(item))
@@ -738,36 +801,41 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
     return this.client.transport.call<T>(method, params)
   }
 
-  // ---- controlled processing (design §7)
+  // ---- processing runs (design §7)
 
   async procStart(program: string, params: Record<string, Json>) {
     return unwrap(await this.client.procStart(this.ws, program, params, `${this.sessionId}/run/${randomId()}`))
   }
   async procGet(runId: string) { return unwrap(await this.client.procGet(this.ws, runId)) }
-  async procApply(runId: string) {
-    const run = unwrap(await this.client.procApply(this.ws, runId, this.sessionId))
-    if (run.result && run.result.status === 'accepted') this.poke()
-    return run
-  }
   async procCancel(runId: string) { return unwrap(await this.client.procCancel(this.ws, runId)) }
 
-  async wishStart(program: 'wish.xllm@1' | 'wish.mock@1', params: Record<string, Json>, idempotencyKey?: string) {
+  async wishStart(program: 'wish.xllm@1', params: Record<string, Json>, idempotencyKey?: string) {
     return unwrap(await this.client.wishStart(this.ws, program, params, idempotencyKey ?? `${this.sessionId}/wish/${randomId()}`))
   }
-  async wishGet(runId: string, choices?: WishChoices) { return unwrap(await this.client.wishGet(this.ws, runId, choices)) }
-  async wishApply(runId: string, planDigest: string) {
-    const run = unwrap(await this.client.wishApply(this.ws, runId, planDigest, this.sessionId))
+  async wishGet(runId: string) {
+    const run = unwrap(await this.client.wishGet(this.ws, runId))
+    // the stage committed on the service: follow it at once
     if (run.applied?.status === 'accepted') this.poke()
     return run
   }
   async wishList(wishId: string, limit = 10) { return unwrap(await this.client.wishList(this.ws, wishId, limit)).runs }
+  async procRollback(runId: string, confirm = false) {
+    const result = unwrap(await this.client.procRollback(this.ws, runId, confirm, this.sessionId))
+    if (result.status === 'accepted') this.poke()
+    return result
+  }
   async submissionStatus(epoch: string, idempotencyKey: string) { try { return unwrap(await this.client.getSubmission(this.ws, epoch, idempotencyKey)) } catch (error) { return this.fail(error) } }
   async procClaim(runId: string, claimToken: string) { return unwrap(await this.client.procClaim(this.ws, runId, claimToken, { kind: 'browser', session_id: this.sessionId })) }
   async procHeartbeat(runId: string, attempt: number, progress?: Json) { unwrap(await this.client.procHeartbeat(this.ws, runId, attempt, progress)) }
   async procReport(runId: string, attempt: number, body: Record<string, Json>) { return unwrap(await this.client.procReport(this.ws, runId, attempt, body)) }
   async procTool(runId: string, attempt: number, name: string, args: Json) { return unwrap(await this.client.procTool(this.ws, runId, attempt, name, args)) }
   async procProgram(runId: string, attempt: number, body: { source: string; results: Json | null; log: string; files: Json }) { return unwrap(await this.client.procProgram(this.ws, runId, attempt, body)) }
-  async procFiles(runId: string, attempt: number) { return unwrap(await this.client.procFiles(this.ws, runId, attempt)).files }
+  async procFiles(runId: string, attempt: number) { return unwrap(await this.client.procFiles(this.ws, runId, attempt)) }
+  async importObject(objId: string) { return unwrap(await this.client.assetImportObject(this.ws, { obj_id: objId })) }
+  async presenceHeartbeat(surfaceId: string | null, name?: string) { return unwrap(await this.client.presenceHeartbeat(this.ws, this.sessionId, surfaceId, name)) }
+  async presenceLeave() { unwrap(await this.client.presenceLeave(this.ws, this.sessionId)) }
+  async presenceList() { return unwrap(await this.client.presenceList(this.ws)) }
+  async workLog(params: { before?: string | null; limit?: number; filter?: WorkLogFilter } = {}) { return unwrap(await this.client.workLog(this.ws, params)) }
 
   close() {
     this.closed = true
@@ -828,6 +896,65 @@ export function aiRefusalText(subCode: string | undefined, data: Record<string, 
     case 'AI_QUOTA_BUDGET_EXCEEDED': return aiwsT(own ? 'aiworkspace.wish.aicc.budgetOwn' : 'aiworkspace.wish.aicc.quotaOther')
     case 'AI_RESOURCE_NOT_PERMITTED': return aiwsT(own ? 'aiworkspace.wish.aicc.notPermittedOwn' : 'aiworkspace.wish.aicc.notPermittedOther')
     case 'AI_ATTRIBUTION_UNAVAILABLE': return aiwsT(aicc.mode === 'current_user' ? 'aiworkspace.wish.aicc.noOwnResources' : 'aiworkspace.wish.aicc.noAttribution')
+    case 'AI_UNAVAILABLE': return aiwsT('aiworkspace.wish.error.aiUnavailable')
+    default: return undefined
+  }
+}
+
+/** Why a wish's macro does not fit its inputs (AI Native 第一期 §2.7), one reason as a short line. */
+export function needsCodingReasonText(reason: NeedsCodingReason): string {
+  const vars = { input: reason.input ?? '', field: reason.name ?? reason.field_id ?? '', from: reason.from ?? '', to: reason.to ?? '', code: reason.run_code ?? '' }
+  switch (reason.code) {
+    case 'no_macro': return aiwsT('aiworkspace.wish.reason.noMacro')
+    case 'api_version': return aiwsT('aiworkspace.wish.reason.apiVersion')
+    case 'input_unbound': return aiwsT('aiworkspace.wish.reason.inputUnbound', vars)
+    case 'input_changed': return aiwsT('aiworkspace.wish.reason.inputChanged', vars)
+    case 'input_missing': return aiwsT('aiworkspace.wish.reason.inputMissing', vars)
+    case 'field_deleted': return aiwsT('aiworkspace.wish.reason.fieldDeleted', vars)
+    case 'field_type_changed': return aiwsT('aiworkspace.wish.reason.fieldTypeChanged', vars)
+    case 'program_failed': return aiwsT('aiworkspace.wish.reason.programFailed', vars)
+    default: return String(reason.code)
+  }
+}
+
+/** Wish runs refused or failed because of the macro or the place it runs (第一期 §2.1, §2.5; 浏览器优先 Q6), or because
+ * of what a stage found (许愿格交互升级 §2.4–§2.5: inputs it could not find, error-level checks that failed), and a rollback
+ * of a record that is no longer the current one — by sub-code, or by code where the code is the reason. */
+/** The data a `NEEDS_EXTERNAL_DATA` failure names: the run's blockers (`data.blockers`, `code: external_data`) or its
+ * record's `missing_inputs`. */
+export function externalDataWanted(data: Record<string, unknown> | undefined): { message?: string; wanted?: ExternalDataWanted }[] {
+  const blockers = Array.isArray(data?.blockers) ? (data.blockers as { code?: string; message?: string; wanted?: ExternalDataWanted }[]).filter((b) => b.code === 'external_data') : []
+  const missing = Array.isArray(data?.missing_inputs) ? (data.missing_inputs as { message?: string; wanted?: ExternalDataWanted }[]) : []
+  return blockers.length ? blockers : missing
+}
+
+export function wishRunCodeText(subCode: string | undefined, data: Record<string, unknown> | undefined): string | undefined {
+  switch (subCode) {
+    case 'NEEDS_INPUT': {
+      const missing = Array.isArray(data?.missing_inputs) ? (data.missing_inputs as { label?: string; message?: string }[]) : []
+      const names = missing.map((m) => m.label || m.message || '').filter(Boolean)
+      return names.length ? aiwsT('aiworkspace.wishcard.error.needsInputNamed', { inputs: aiwsText().list(names) }) : aiwsT('aiworkspace.wishcard.error.needsInput')
+    }
+    case 'NEEDS_EXTERNAL_DATA': {
+      // 余下任务 B2-1: this browser cannot create a data source; an Agent executor can, or the owner prepares it
+      const what = externalDataWanted(data).map((b) => b.wanted?.meaning || b.message || '').filter(Boolean)
+      return aiwsT(what.length ? 'aiworkspace.wishcard.error.needsExternalDataNamed' : 'aiworkspace.wishcard.error.needsExternalData', { data: aiwsText().list(what) })
+    }
+    case 'CHECKS_FAILED': return aiwsT('aiworkspace.wishcard.error.checksFailed')
+    case 'CODING_UNFINISHED': {
+      const parts = [aiwsT('aiworkspace.wishcard.error.codingUnfinished')]
+      if (typeof data?.last_trial_error === 'string' && data.last_trial_error) parts.push(aiwsT('aiworkspace.wishcard.error.lastTrial', { error: data.last_trial_error }))
+      if (typeof data?.said === 'string' && data.said) parts.push(aiwsT('aiworkspace.wishcard.error.modelSaid', { text: data.said }))
+      return parts.join(' ')
+    }
+    case 'NOT_CURRENT_RECORD': return aiwsT('aiworkspace.wishcard.error.notCurrentRecord')
+    case 'NEEDS_CODING': {
+      const reasons = Array.isArray(data?.reasons) ? (data.reasons as NeedsCodingReason[]) : []
+      return reasons.length ? aiwsT('aiworkspace.wish.error.needsCoding', { reasons: aiwsText().clauses(reasons.map(needsCodingReasonText)) }) : aiwsT('aiworkspace.wish.error.needsCodingNoMacro')
+    }
+    case 'MACRO_CODE_CHANGED': return aiwsT('aiworkspace.wish.error.macroCodeChanged')
+    case 'MACRO_CANNOT_WRITE': return aiwsT(data?.group_id ? 'aiworkspace.wish.error.macroCannotWriteGroup' : 'aiworkspace.wish.error.macroCannotWrite', { group: String(data?.group_id ?? '') })
+    case 'SNAPSHOT_TOO_LARGE': return aiwsT('aiworkspace.wish.error.snapshotTooLarge', { size: formatBytes(Number(data?.bytes ?? 0)), limit: formatBytes(Number(data?.limit ?? 0)) })
     default: return undefined
   }
 }
@@ -857,14 +984,15 @@ function formatBytes(n: number): string {
 }
 
 /** The failure of a run as shown to its viewer. */
-export function runErrorText(error: (ServiceError & { data?: unknown }) | null | undefined): string | undefined {
+export function runErrorText(error: (ServiceError & { data?: unknown; missing_inputs?: unknown; last_trial_error?: unknown; said?: unknown }) | null | undefined): string | undefined {
   if (!error) return undefined
-  const data = error.data as Record<string, unknown> | undefined
-  return aiRefusalText(error.sub_code, data) ?? errorCodeText(error.code, data) ?? error.detail
+  const data = { ...(error.missing_inputs ? { missing_inputs: error.missing_inputs } : {}), ...(error.last_trial_error ? { last_trial_error: error.last_trial_error } : {}),
+    ...(error.said ? { said: error.said } : {}), ...(error.data as Record<string, unknown> | undefined) }
+  return aiRefusalText(error.sub_code, data) ?? wishRunCodeText(error.sub_code, data) ?? wishRunCodeText(error.code, data) ?? errorCodeText(error.code, data) ?? error.detail
 }
 
 export function describeError(error: unknown): string {
-  if (error instanceof ServiceFailure) return aiRefusalText(error.subCode, error.data) ?? errorCodeText(error.code, error.data) ?? error.message
+  if (error instanceof ServiceFailure) return aiRefusalText(error.subCode, error.data) ?? wishRunCodeText(error.subCode, error.data) ?? wishRunCodeText(error.code, error.data) ?? errorCodeText(error.code, error.data) ?? error.message
   if (error instanceof TransportError) return aiwsT(browserOffline() ? 'aiworkspace.core.session.cannotConnectOffline' : 'aiworkspace.core.session.cannotConnect', { error: error.message })
   return error instanceof Error ? error.message : String(error)
 }

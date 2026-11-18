@@ -1,5 +1,5 @@
 import { useMessageHubClock } from './store'
-import { relativeActivity } from './sessionModel'
+import { relativeActivity } from '../../components/conversation/model/activity'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowLeft,
@@ -19,7 +19,7 @@ import type {
 } from './types'
 import { HubAvatar } from './HubAvatar'
 import { EntityListHeader, type HeaderMenuItem, type HubIdentity } from './EntityListHeader'
-import { hubButtonClass } from './SessionDialogs'
+import { hubButtonClass } from '../../components/conversation/DialogFocus'
 
 /** Pin and mute apply to every session of the chosen entities. */
 export type EntityPreferencePatch = { pinned: boolean } | { muted: boolean }

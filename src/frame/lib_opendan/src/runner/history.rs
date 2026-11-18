@@ -459,6 +459,14 @@ impl<'a> Render<'a> {
             WorklogBody::EventDropped { input, reason } => {
                 self.note(pos, format!("[event dropped {}] {reason}", input.id()))
             }
+            WorklogBody::ControlApplied { command, detail, .. } if command == "retract" => {
+                if detail["outcome"] == "stopped" {
+                    self.note(
+                        pos,
+                        "[control] the user retracted the input of this turn: do not act on it. What the turn already did is not undone.".to_string(),
+                    )
+                }
+            }
             WorklogBody::ControlApplied { command, .. } => {
                 self.note(pos, format!("[control] {command}"))
             }
@@ -743,6 +751,11 @@ async fn compact(
         made_by: made_by.to_string(),
         updated_at_ms: crate::now_ms(),
     };
+    // The clues shown before are no longer in the history (only in its
+    // summary): the session's observation may show them again.
+    if let Some(m) = session.state.memory.as_mut() {
+        m.bump_context_generation();
+    }
     let persisted: Result<()> = (|| {
         session.write_summary(lease, &new)?;
         session.append_worklog(

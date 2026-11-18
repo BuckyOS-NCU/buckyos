@@ -58,8 +58,10 @@ pub const POLICY_LOCK: &str = "lock_required";
 pub const MEMBERS_KEY: &str = "#members";
 pub const FORMAT_VERSION: &str = "1.0";
 /// 1.1: Block-controls (`mindmap` containers, `"auto"` placement components, Blocks under Blocks inside a control,
-/// `slot`; 脑图方案 R12). A minor version only adds: requests of an older minor are still accepted.
-pub const PROTOCOL_VERSION: &str = "1.1";
+/// `slot`; 脑图方案 R12). 1.2: finding, reading and querying (核心 API 调整): `doc.list`, `doc.find`, `doc.read { as,
+/// path }`, `doc.query` takes `text` or `sql` only (the table query moved to SQL, URL tables to `doc.source_query`),
+/// every entity has a name. Commit requests of an older minor are still accepted.
+pub const PROTOCOL_VERSION: &str = "1.2";
 
 /// Requests speaking `version` are understood: the same major version, a minor not newer than ours.
 pub fn supports_protocol(version: &str) -> bool {
@@ -120,6 +122,10 @@ pub struct EntityRow {
     /// which input versions it read. Entity-level metadata, not part of the type's payload.
     #[serde(default)]
     pub derived: Option<Value>,
+    /// Who created it (权限需求 R6): the principal the creating Commit was judged as; `@creator` entries apply to them.
+    /// Kept by this deployment only (never part of the content); `None` for the system nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
     pub created_seq: u64,
     pub meta_rev: u64,
     pub content_rev: u64,
@@ -260,6 +266,7 @@ pub const REF_KINDS: &[(&str, &str, &str, &str)] = &[
     ("body", "live", "strong", "a table record's body rich text"),
     ("def", "live", "strong", "a Block uses this Block definition"),
     ("asset", "fixed", "strong", "an AssetRef or a directory member names this content object"),
+    ("log", "fixed", "strong", "a wish's run record keeps this macro output log (read with update on the wish)"),
     ("member", "live", "strong", "a resource directory holds this child directory"),
     ("def_source", "live", "strong", "a Block definition's build source snapshot (a resource directory; extension controls P0)"),
     ("def_dep", "live", "strong", "a control definition builds on this definition (deps; extension controls P1)"),
@@ -324,6 +331,19 @@ pub trait ReadCtx {
     fn record(&self, source: &str, record: &str) -> WsResult<Option<RecordRow>>;
     /// Visit every record row (including tombstones) in `record_id` order; return `false` to stop.
     fn scan_records(&self, source: &str, visit: &mut dyn FnMut(&RecordRow) -> WsResult<bool>) -> WsResult<()>;
+    /// Like `scan_records`, from the first record whose id is `>= from` (`""`: all of them).
+    fn scan_records_from(&self, source: &str, from: &str, visit: &mut dyn FnMut(&RecordRow) -> WsResult<bool>) -> WsResult<()> {
+        self.scan_records(source, &mut |r| if r.record_id.as_str() < from { Ok(true) } else { visit(r) })
+    }
+    /// The live records of a table (a store counts them without decoding each: `doc.read` of a 100 000-record table).
+    fn record_count(&self, source: &str) -> WsResult<u64> {
+        let mut n = 0u64;
+        self.scan_records(source, &mut |r| {
+            n += r.alive() as u64;
+            Ok(true)
+        })?;
+        Ok(n)
+    }
     fn richtext(&self, id: &str) -> WsResult<Option<RichTextState>>;
     fn refs_to(&self, dst_entity: &str) -> WsResult<Vec<RefEdge>>;
     fn refs_from(&self, src_entity: &str) -> WsResult<Vec<RefEdge>>;
@@ -605,6 +625,7 @@ pub fn system_container(id: &str, kind: &str, name: Option<&str>, title: Option<
         payload,
         key_revs,
         derived: None,
+        created_by: None,
         created_seq: 0,
         meta_rev: 0,
         content_rev: 0,
@@ -663,7 +684,10 @@ impl ReadCtx for MemStore {
         Ok(self.records.get(&(source.to_string(), record.to_string())).cloned())
     }
     fn scan_records(&self, source: &str, visit: &mut dyn FnMut(&RecordRow) -> WsResult<bool>) -> WsResult<()> {
-        let lo = (source.to_string(), String::new());
+        self.scan_records_from(source, "", visit)
+    }
+    fn scan_records_from(&self, source: &str, from: &str, visit: &mut dyn FnMut(&RecordRow) -> WsResult<bool>) -> WsResult<()> {
+        let lo = (source.to_string(), from.to_string());
         for (_, r) in self.records.range(lo..).take_while(|((s, _), _)| s == source) {
             if !visit(r)? {
                 break;
