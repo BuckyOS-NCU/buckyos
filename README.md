@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README_zhCN.md)
 
+For this NCU fork, see the Chinese guides for [native campus deployment and offline activation](doc/host-native-deployment.md), [database backup and migration](doc/local-database-migration.md), and [fork changes and verification](doc/local-deployment-changes.md). Core identity services run locally without official hosted services.
+
 BuckyOS is an open-source personal AI operating system. It brings your devices, applications, data, and AI agents together in a **Zone**: a personal cloud under your control.
 
 The current source tree targets **Beta2.2 / 0.7.0**, with the official launch planned for **October 15, 2026**. This is a breaking-change release: system configuration, identity, application packaging, and agent configuration have changed. Backward compatibility with earlier betas is not guaranteed.

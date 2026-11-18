@@ -2,6 +2,8 @@
 
 [English](README.md) | **简体中文**
 
+本 NCU fork 的校内部署使用官方宿主机流程，核心身份不依赖官方运营服务：[部署与离线激活](doc/host-native-deployment.md)、[数据库备份与迁移](doc/local-database-migration.md)、[fork 改动和验证记录](doc/local-deployment-changes.md)。
+
 BuckyOS 是一个开源的个人 AI 操作系统，将你的设备、应用、数据和 AI Agent 整合到一个 **Zone** 中，构成由你掌控的个人云。
 
 当前源码面向 **Beta2.2 / 0.7.0**，计划于 **2026 年 10 月 15 日**正式上线。这是一次包含不兼容变更的版本更新：系统配置、身份、应用打包和 Agent 配置均有调整，不保证与早期 Beta 版本向后兼容。
