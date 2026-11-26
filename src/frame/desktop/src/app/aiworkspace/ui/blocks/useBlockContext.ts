@@ -5,6 +5,7 @@ import { aiwsT } from '../../i18n'
 import { useEntity, useLoad, useReadOnlyReason, useStore, useVersion, useWorkspaceUi } from '../../state/hooks'
 import { useAiwsText } from '../../useAiwsText'
 import { RunModeContext } from '../../state/runMode'
+import { ApprovalReadOnlyContext } from '../../approval/readOnly'
 import { useFilePicker } from '../shell/filePicker'
 import { EditorToolbarContext } from './editorToolbar'
 import { blockRegistry, modePolicy, type BlockDefinition, type CanvasMode, type DataState, type RenderContext, type Resolution, type ToolbarItem } from './registry'
@@ -27,6 +28,7 @@ export interface BlockContextOptions {
   selected?: boolean
   hovered?: boolean
   editorActive?: boolean
+  onSelect?: (id: string) => void
   onActivate?: () => void
   onDeactivate?: () => void
   size?: { w: number; h: number }
@@ -49,6 +51,7 @@ function dataStateOf(payload: CellPayload, source: EntityEnvelope | undefined): 
 
 export function useBlockContext(options: BlockContextOptions) {
   const { cellId, mode, view, depth = 0 } = options
+  const approvalReadOnly = useContext(ApprovalReadOnlyContext)
   const { t } = useAiwsText()
   const store = useStore()
   const ui = useWorkspaceUi()
@@ -61,7 +64,7 @@ export function useBlockContext(options: BlockContextOptions) {
   const payload = current?.content.payload
   const source = useEntity(payload?.source_ref?.entity_id ?? '')
   const registryVersion = useSyncExternalStore(blockRegistry.subscribe, blockRegistry.snapshot)
-  const defId = payload?.def_ref?.entity_id
+  const defId = approvalReadOnly ? undefined : payload?.def_ref?.entity_id
   const defVersion = useVersion(`e:${defId ?? ''}`)
   const loadDefinition = useCallback(() => defId ? store.readBatched<BlockDefRead>(defId) : Promise.resolve(null), [store, defId])
   const definitionRead = useLoad(loadDefinition, `${defId ?? ''}:${defVersion}`)
@@ -69,11 +72,14 @@ export function useBlockContext(options: BlockContextOptions) {
   const resolution = useMemo<Resolution | null>(() => {
     if (!payload?.view) return null
     const registered = blockRegistry.get(payload.view.type, payload.view.version ?? 1)
+    if (approvalReadOnly && (!registered || payload.def_ref || registered.definitionKind || registered.cost.html)) {
+      return { ok: false, reason: 'invalid_definition', detail: t('aiworkspace.printrender.readOnly') }
+    }
     if (registered?.definitionKind && defId && !documentDefinition && !definitionRead.error) return null
     if (registered?.definitionKind && definitionRead.data?.degraded) return { ok: false, reason: 'invalid_definition', detail: t('aiworkspace.blocks.resolve.defDataVersion') }
     return blockRegistry.resolve(payload, source?.type_id, documentDefinition)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [payload, source?.type_id, documentDefinition, definitionRead.error, definitionRead.data?.degraded, defId, registryVersion, t])
+  }, [payload, source?.type_id, documentDefinition, definitionRead.error, definitionRead.data?.degraded, defId, registryVersion, t, approvalReadOnly])
   const readOnlyNow = useReadOnlyReason()
   const toolbarSink = useContext(EditorToolbarContext)
   const runMode = useContext(RunModeContext)
@@ -83,26 +89,26 @@ export function useBlockContext(options: BlockContextOptions) {
   const dataState = dataStateOf(payload, source)
   const policy = modePolicy(mode)
   // on stage only the Blocks marked "operable on stage" take input (第三期规划 §10.2)
-  const editable = policy.editContent && (mode !== 'show' || payload.presentation?.live === true)
+  const editable = !approvalReadOnly && policy.editContent && (mode !== 'show' || payload.presentation?.live === true)
   // run mode (Q27): the canvas runs its Blocks (on stage only the operable ones). An HTML Block runs code: it mounts in
   // run mode (view mode included, within the `html` budget) or by "Run once" while editing — never on a stage that does
   // not run (a public session, a replay: its snapshot only)
-  const interactive = runMode.interactive && depth === 0 && mode !== 'print' && (mode !== 'show' || payload.presentation?.live === true)
+  const interactive = !approvalReadOnly && runMode.interactive && depth === 0 && mode !== 'print' && (mode !== 'show' || payload.presentation?.live === true)
   const html = Boolean(resolution?.ok && resolution.definition.cost.html)
   const activatable = depth === 0 && (html ? interactive || (editable && mode !== 'show') : editable)
   const readOnlyReason = readOnlyNow ? readOnlyNow
     : depth > 0 ? t('aiworkspace.blocks.readOnly.embedded')
       : !policy.writes ? mode === 'view' ? t('aiworkspace.blocks.readOnly.viewMode') : mode === 'print' ? t('aiworkspace.printrender.readOnly') : t('aiworkspace.blocks.readOnly.pathEdit')
         : !editable ? t('aiworkspace.blocks.readOnly.show')
-        : !cell.capabilities.includes('update') ? t('aiworkspace.blocks.noPermission')
+        : !cell.capabilities.includes('update') && payload.view.type !== 'table' ? t('aiworkspace.blocks.noPermission')
           : dataState === 'missing' || dataState === 'unreadable' || dataState === 'degraded' ? t('aiworkspace.blocks.readOnly.dataUnavailable')
-            : source && !source.capabilities.some((c) => c === 'update' || c === 'append') ? t('aiworkspace.blocks.readOnly.noDataPermission') : null
+            : source && !source.capabilities.some((c) => c === 'update' || c === 'append' || (payload.view.type === 'table' && c === 'structure')) ? t('aiworkspace.blocks.readOnly.noDataPermission') : null
   const context: RenderContext = {
     cell, payload, keyRevs: current.content.key_revs, source, definition: resolution?.ok ? resolution.definition : MISSING_DEF, documentDefinition, depth,
     mode, view, selected: Boolean(options.selected), hovered: Boolean(options.hovered), editorActive: Boolean(options.editorActive) && activatable, interactive,
     capabilities: cell.capabilities, readOnlyReason, dataState, size: options.size ?? { w: num(cell.placement?.w) ?? 320, h: num(cell.placement?.h) ?? 200 }, zoom: options.zoom ?? 1,
     activateEditor: () => { if (activatable && resolution?.ok) options.onActivate?.() },
-    deactivateEditor: () => options.onDeactivate?.(), openEntity: ui.openEntity,
+    selectBlock: options.onSelect ? () => options.onSelect?.(cell.entity_id) : undefined, deactivateEditor: () => options.onDeactivate?.(), openEntity: ui.openEntity,
     setEditorToolbar: (items: ToolbarItem[] | null) => toolbarSink?.set(`block:${cellId}`, items), pointerType,
     annotate: ui.annotate, showAnnotations: ui.showAnnotations, pickFile: picker.file,
   }

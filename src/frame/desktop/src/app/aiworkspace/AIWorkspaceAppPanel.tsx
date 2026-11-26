@@ -9,14 +9,16 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import './aiworkspace.css'
 import { desktopUIStore } from '../../models/DesktopUIDataModel'
+import { useI18n } from '../../i18n/provider'
 import type { AppContentLoaderProps } from '../types'
-import { AiwsClient, ServiceFailure } from './api/client'
+import { AiwsClient, ServiceFailure, unwrap } from './api/client'
 import { denialOf, describeDenial, describeError, OnlineWorkspaceSession, type WorkspaceSession } from './api/session'
 import { isGuestPrincipal, resolveTransport, TransportError } from './api/transport'
 import { loadCore } from './api/wasm'
-import { loginUrl } from './links'
+import { entryUrl, loginUrl } from './links'
 import { OfflineUnavailable, openPreparedReplica, prepareOffline, type PrepareReport } from './offline/holder'
 import { ReplicaWorkspaceSession } from './offline/replicaSession'
+import { projectCanvasChoice, returnProjectCanvasChoice } from './projectCanvasChoice'
 import { forgetRecent, readRecent, rememberRecent } from './state/recent'
 import { WorkspaceStore } from './state/store'
 import { externalImports } from './ui/import/externalImport'
@@ -47,12 +49,15 @@ function isGone(failure: unknown): boolean {
 export function AIWorkspaceAppPanel(props: Partial<AppContentLoaderProps> & { tab?: TabHost } = {}) {
   const { t, tNode, clauses } = useAiwsText()
   const tab = props.tab ?? null
+  const choice = tab ? projectCanvasChoice() : null
   const [availability] = useState(resolveTransport)
   const [client] = useState(() => (availability.ok ? new AiwsClient(availability.transport) : null))
   const [store, setStore] = useState<WorkspaceStore | null>(null)
   const [target, setTarget] = useState<LaunchTarget | null>(null)
   const [opening, setOpening] = useState<string | null>(() => tab?.workspaceId ?? null)
   const [error, setError] = useState<string | null>(null)
+  const [requestTarget, setRequestTarget] = useState<{ workspaceId: string; surfaceId: string } | null>(null)
+  const { t: translate } = useI18n()
   const [report, setReport] = useState<PrepareReport | null>(null)
   const [leave, setLeave] = useState<{ summary: LeaveSummary; reason: string; resolve: (go: boolean) => void } | null>(null)
   /** A restricted session (Limited account, External DID): it owns nothing (hybrid SSO, from the current identity). */
@@ -85,6 +90,7 @@ export function AIWorkspaceAppPanel(props: Partial<AppContentLoaderProps> & { ta
     const seq = ++openSeq.current
     setOpening(workspaceId)
     setError(null)
+    setRequestTarget(null)
     try {
       // this window's previous session must have released the replica before the same workspace is opened again
       await closing.current
@@ -108,6 +114,19 @@ export function AIWorkspaceAppPanel(props: Partial<AppContentLoaderProps> & { ta
       setTarget(how.target ?? null)
       storeRef.current = next
       setStore(next)
+      const surfaceId = how.target?.surfaceId
+      if (how.link && surfaceId) {
+        // A person may already see another Surface in this Workspace. Check the
+        // exact linked Surface without substituting one they can already read.
+        void (async () => {
+          if (await client.transport.isGuest()) return
+          const [linked] = await session.readMany([{ entity_id: surfaceId }])
+          if (seq === openSeq.current && storeRef.current === next && linked && 'error' in linked
+              && ['NOT_FOUND', 'PERMISSION_DENIED'].includes(linked.error.code)) {
+            setRequestTarget({ workspaceId, surfaceId })
+          }
+        })().catch(() => undefined)
+      }
       void rememberRecent(client.transport, workspaceId)
       if (how.target) tabRef.current?.consumeTarget()
     } catch (failure) {
@@ -115,6 +134,9 @@ export function AIWorkspaceAppPanel(props: Partial<AppContentLoaderProps> & { ta
       const guest = await client.transport.isGuest()
       // a guest's link is not public: signing in is the only way on (a signed-in visitor sees the error below)
       if (how.link && isGone(failure) && guest) { window.location.replace(loginUrl()); return }
+      if (how.link && isGone(failure) && how.target?.surfaceId && !guest) {
+        setRequestTarget({ workspaceId, surfaceId: how.target.surfaceId })
+      }
       if (how.auto && isGone(failure)) void forgetRecent(client.transport, workspaceId)
       // a signed-in caller is told the category of a refusal (D-4) instead of being sent to sign in again
       const denial = denialOf(failure)
@@ -255,10 +277,29 @@ export function AIWorkspaceAppPanel(props: Partial<AppContentLoaderProps> & { ta
     : () => window.dispatchEvent(new CustomEvent(LOGOUT_REQUEST_EVENT))
   const goHome = tab ? () => leaveThen(t('aiworkspace.core.app.leave.home'), () => { dispose(); tab.home() }) : null
   const login = () => leaveThen(t('aiworkspace.core.app.leave.login'), () => { window.location.assign(loginUrl()) })
+  const returnChoice = (canvasUrl?: string) => {
+    if (choice) leaveThen(t('aiworkspace.core.app.leave.close'), () => returnProjectCanvasChoice(choice, canvasUrl))
+  }
 
   return (
     <div className="aiws-root" data-testid="aiws-root">
+      {choice && <div className="aiws-warning aiws-root-error flex flex-wrap items-center justify-between gap-2">
+        <span>{translate('school.projectCanvas.instructions', 'Open or create a canvas to link to your project.')}</span>
+        <button type="button" data-testid="aiws-cancel-project-canvas" onClick={() => returnChoice()}>{translate('school.projectCanvas.cancel', 'Cancel selection')}</button>
+      </div>}
       {error && <div className="aiws-error aiws-root-error" role="alert" data-testid="aiws-open-error">{error} <button type="button" className="aiws-link" onClick={() => setError(null)}>{t('aiworkspace.core.app.dismiss')}</button></div>}
+      {client && requestTarget && (
+        <RequestClassroomAccess
+          key={requestTarget.workspaceId + '/' + requestTarget.surfaceId}
+          client={client}
+          workspaceId={requestTarget.workspaceId}
+          surfaceId={requestTarget.surfaceId}
+          label={translate('school.classroom.request', 'Request or check read-only access')}
+          redeem={translate('school.classroom.redeem', 'Accept read-only invitation')}
+          sent={translate('school.classroom.requestSent', 'Request sent to the teacher. Open this link again after approval.')}
+          failed={translate('school.classroom.unavailable', 'Classroom access is unavailable.')}
+        />
+      )}
       {handedOver && (
         <div className="aiws-warning aiws-root-error" role="status" data-testid="aiws-external-import">
           {!store ? t('aiworkspace.core.app.import.openWorkspace', { name: handedOver.file.name })
@@ -285,6 +326,7 @@ export function AIWorkspaceAppPanel(props: Partial<AppContentLoaderProps> & { ta
       {store
         ? <WorkspaceView key={store.session.workspaceId + store.session.sessionId} store={store} client={client} offline={actions} target={target}
             onClose={closeWorkspace} onOpenWorkspace={switchTo} onLogout={logout} onLogin={login} onHome={goHome}
+            onChooseProjectCanvas={choice ? returnChoice : null}
             identity={{ principal: store.session.principal, dev: client.transport.mode === 'dev-override', guest: isGuestPrincipal(store.session.principal), restricted }}
             devTools={import.meta.env.DEV || client.transport.mode === 'dev-override'} />
         : (opening || checkingRecent) && !error
@@ -295,6 +337,41 @@ export function AIWorkspaceAppPanel(props: Partial<AppContentLoaderProps> & { ta
           onStay={() => { leave.resolve(false); setLeave(null) }}
           onExportAndLeave={() => { void store?.exportLocal().finally(() => { leave.resolve(true); setLeave(null) }) }}
           onLeave={() => { leave.resolve(true); setLeave(null) }} />
+      )}
+    </div>
+  )
+}
+
+
+function RequestClassroomAccess({ client, workspaceId, surfaceId, label, redeem, sent, failed }: {
+  client: AiwsClient
+  workspaceId: string
+  surfaceId: string
+  label: string
+  redeem: string
+  sent: string
+  failed: string
+}) {
+  const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'failed'>('idle')
+  const [readyEntry, setReadyEntry] = useState<string | null>(null)
+  const request = async () => {
+    setStatus('sending')
+    try {
+      const result = unwrap(await client.classroomRequest({ workspace_id: workspaceId }, surfaceId))
+      if (result.state === 'ready') setReadyEntry(result.entry_id)
+      setStatus('sent')
+    } catch {
+      setStatus('failed')
+    }
+  }
+  return (
+    <div className="aiws-warning aiws-root-error">
+      {readyEntry ? <a className="aiws-link" href={entryUrl(readyEntry)}>{redeem}</a> : (
+        <>
+          <button type="button" className="aiws-link" disabled={status === 'sending'} onClick={() => void request()}>{label}</button>
+          {status === 'sent' && <span role="status"> {sent}</span>}
+          {status === 'failed' && <span role="status"> {failed}</span>}
+        </>
       )}
     </div>
   )

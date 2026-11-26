@@ -1,13 +1,28 @@
 /* A table Block made from the catalog's standard-table variants (`config.standard`): which standard table it stands for,
  * and a free name for a new one in the canvas's content folder. A control's data is settled by its on_bind (binding.ts). */
 
-import { CALENDAR_SCHEMA_ID, TODO_SCHEMA_ID } from 'buckyos'
+import { CALENDAR_SCHEMA_ID, TODO_SCHEMA_ID, standardTableOp as sdkStandardTableOp } from 'buckyos'
 import { uniqueName } from '@table/operations'
 import type { Json } from '../../../api/types'
 import type { WorkspaceStore } from '../../../state/store'
 
 /** A standard table: its schema, and which of websdk `standardTableOp`'s tables it is. */
 export interface StandardTable { schemaId: string; table: 'todo' | 'calendar' }
+
+/** Complete the To-do schema while the shared SDK still omits its initial status. */
+export function standardTableOp(table: StandardTable['table'], options: Parameters<typeof sdkStandardTableOp>[1]) {
+  const operation = sdkStandardTableOp(table, options)
+  const payload = operation.payload
+  if (table === 'todo' && payload && typeof payload === 'object' && !Array.isArray(payload) && Array.isArray(payload.fields)) {
+    for (const field of payload.fields) {
+      if (field && typeof field === 'object' && !Array.isArray(field) && field.field_id === 'status' && field.default === undefined) {
+        field.default = 'todo'
+        break
+      }
+    }
+  }
+  return operation
+}
 
 /** A table name free in `folderId` (names are unique among siblings): `base`, else `base (2)` … */
 export function freeTableName(store: WorkspaceStore, folderId: string, base: string): string {

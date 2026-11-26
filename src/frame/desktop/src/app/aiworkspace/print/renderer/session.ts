@@ -11,6 +11,7 @@ import { aiwsT } from '../../i18n'
 import { printAssetUrl } from './assets'
 
 type Replica = InstanceType<AiwsCore['Replica']>
+type SnapshotData = Pick<PrintPackage, 'workspace_id' | 'title' | 'epoch' | 'head_seq' | 'principal' | 'rows'>
 
 // one object each: React reads them as external store snapshots
 const LIVE: SessionStatus = { kind: 'live' }
@@ -34,17 +35,24 @@ function base64(bytes: Uint8Array): string {
   return btoa(text)
 }
 
+export interface SnapshotAssets {
+  url(objectId: string): string | null
+  fetch?(objectId: string): Promise<Blob>
+}
+
 export class PrintSession implements WorkspaceSession {
   readonly workspaceId: string
   readonly sessionId = 'print'
   readonly principal: string
   readonly offline = null
   private readonly replica: Replica
-  private readonly pkg: PrintPackage
+  private readonly pkg: SnapshotData
   private readonly wsInfo: WorkspaceInfo
+  private readonly assets: SnapshotAssets
 
-  constructor(core: AiwsCore, pkg: PrintPackage) {
+  constructor(core: AiwsCore, pkg: SnapshotData, assets: SnapshotAssets = { url: printAssetUrl }) {
     this.pkg = pkg
+    this.assets = assets
     this.workspaceId = pkg.workspace_id
     this.principal = pkg.principal
     this.replica = engine(() => new core.Replica(pkg.principal, pkg.workspace_id, pkg.epoch, JSON.stringify(pkg.rows), pkg.head_seq, 1))
@@ -71,7 +79,7 @@ export class PrintSession implements WorkspaceSession {
   subscribeChanges() { return () => undefined }
   async whenApplied() { /* the head is fixed */ }
   async serverTime() { return null }
-  async assetStreamUrl(objectId: string) { return printAssetUrl(objectId) }
+  async assetStreamUrl(objectId: string) { return this.assets.url(objectId) }
 
   async outline(): Promise<EntityEnvelope[]> {
     return (JSON.parse(engine(() => this.replica.outline())) as { entities: EntityEnvelope[] }).entities
@@ -83,7 +91,8 @@ export class PrintSession implements WorkspaceSession {
     if (r.type_id === 'buckyos.asset-ref' && r.content && typeof r.content === 'object') {
       // the bytes a page shows are in the package (a video or a sound: its poster only)
       const payload = (r.content as { payload?: { object_id?: string; poster?: string } }).payload
-      const packaged = Boolean(printAssetUrl(payload?.object_id) ?? printAssetUrl(payload?.poster))
+      const packaged = Boolean((payload?.object_id && this.assets.url(payload.object_id)) ||
+        (payload?.poster && this.assets.url(payload.poster)))
       r.content = { ...(r.content as Record<string, unknown>), availability: packaged ? 'available' : 'missing' } as C
     }
     return r
@@ -154,7 +163,8 @@ export class PrintSession implements WorkspaceSession {
   contentServer() { return this.refuse() }
   importAssets() { return this.refuse() }
   /** The bytes of an asset are not readable here (file:// fetches nothing): pages show assets by their address. */
-  fetchAsset(): Promise<never> {
+  fetchAsset(objectId: string): Promise<Blob> {
+    if (this.assets.fetch) return this.assets.fetch(objectId)
     return Promise.reject(new ServiceFailure({ code: 'NOT_FOUND', detail: aiwsT('aiworkspace.printrender.assetBytes') }))
   }
 

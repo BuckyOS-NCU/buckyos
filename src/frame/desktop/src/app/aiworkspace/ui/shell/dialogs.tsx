@@ -3,6 +3,7 @@
  * dialog also serves the workspace list, where only the workspace and template tabs exist. */
 
 import { useEffect, useState, type ReactNode } from 'react'
+import { X } from 'lucide-react'
 import { unwrap, type AiwsClient } from '../../api/client'
 import { createDemoWorkspace, TemplateFailure } from '../../api/demos'
 import { createSampleWorkspace } from '../../api/sample'
@@ -44,11 +45,12 @@ const TEMPLATES = [
   { id: 'film' as const, title: 'aiworkspace.shell.template.film.title', description: 'aiworkspace.shell.template.film.description', preview: 'aiworkspace.shell.template.film.preview' },
 ]
 
-export function NewDialog({ client, store, initialTab, folderId, onClose, onCreatedSurface, onOpenWorkspace }: {
+export function NewDialog({ client, store, initialTab, allowTemplate = true, folderId, onClose, onCreatedSurface, onOpenWorkspace }: {
   client: AiwsClient
   /** The open workspace (the canvas tab needs it); null in the workspace list. */
   store: WorkspaceStore | null
   initialTab: NewTab
+  allowTemplate?: boolean
   /** The canvas folder a new canvas goes into (“在此新建画布”, PRD §4.1.1); otherwise the current canvas's folder. */
   folderId?: string
   onClose: () => void
@@ -58,17 +60,19 @@ export function NewDialog({ client, store, initialTab, folderId, onClose, onCrea
   const { t } = useAiwsText()
   const canCanvas = Boolean(store?.session.info().capabilities.includes('structure') || (store && folderId && store.outline.get(folderId)?.capabilities.includes('structure')))
   const [tab, setTab] = useState<NewTab>(initialTab === 'canvas' && !canCanvas ? 'workspace' : initialTab)
-  const tabs: NewTab[] = store ? ['canvas', 'workspace', 'template'] : ['workspace', 'template']
+  const activeTab = tab === 'template' && !allowTemplate ? 'workspace' : tab
+  const tabs: NewTab[] = store ? ['canvas', 'workspace'] : ['workspace']
+  if (allowTemplate) tabs.push('template')
   const label: Record<NewTab, string> = { canvas: t('aiworkspace.shell.new.tab.canvas'), workspace: t('aiworkspace.shell.new.tab.workspace'), template: t('aiworkspace.shell.new.tab.template') }
   return (
     <Modal label={t('aiworkspace.shell.new.title')} testId="aiws-new-dialog" onClose={onClose} className="aiws-new-dialog">
-      <div className="aiws-dialog-head"><b>{t('aiworkspace.shell.new.title')}</b><span className="aiws-grow" /><button type="button" className="aiws-link" onClick={onClose}>{t('aiworkspace.common.close')}</button></div>
+      <div className="aiws-dialog-head"><b>{t('aiworkspace.shell.new.title')}</b><span className="aiws-grow" /><button type="button" className="aiws-tool aiws-tool-small aiws-dialog-close" aria-label={t('aiworkspace.common.close')} title={t('aiworkspace.common.close')} onClick={onClose}><X size={16} aria-hidden="true" /></button></div>
       <div className="aiws-tabs" role="tablist" aria-label={t('aiworkspace.shell.new.tabs')}>
-        {tabs.map((item) => <button key={item} type="button" role="tab" aria-selected={tab === item} data-testid={`aiws-new-tab-${item}`} disabled={item === 'canvas' && !canCanvas} title={item === 'canvas' && !canCanvas ? t('aiworkspace.shell.noStructurePermission') : undefined} onClick={() => setTab(item)}>{label[item]}</button>)}
+        {tabs.map((item) => <button key={item} type="button" role="tab" aria-selected={activeTab === item} data-testid={`aiws-new-tab-${item}`} disabled={item === 'canvas' && !canCanvas} title={item === 'canvas' && !canCanvas ? t('aiworkspace.shell.noStructurePermission') : undefined} onClick={() => setTab(item)}>{label[item]}</button>)}
       </div>
-      {tab === 'canvas' && store && <NewCanvas store={store} folderId={folderId} onDone={(id) => { onClose(); onCreatedSurface?.(id) }} />}
-      {tab === 'workspace' && <NewWorkspace client={client} onOpen={(id) => { onClose(); onOpenWorkspace(id) }} />}
-      {tab === 'template' && <NewFromTemplate client={client} onOpen={(id) => { onClose(); onOpenWorkspace(id) }} />}
+      {activeTab === 'canvas' && store && <NewCanvas store={store} folderId={folderId} onDone={(id) => { onClose(); onCreatedSurface?.(id) }} />}
+      {activeTab === 'workspace' && <NewWorkspace client={client} onOpen={(id) => { onClose(); onOpenWorkspace(id) }} />}
+      {activeTab === 'template' && <NewFromTemplate client={client} onOpen={(id) => { onClose(); onOpenWorkspace(id) }} />}
     </Modal>
   )
 }
@@ -371,7 +375,7 @@ export function ExportDialog({ client, workspace, onClose }: { client: AiwsClien
   const { t } = useAiwsText()
   return (
     <Modal label={t('aiworkspace.shell.export.dialog')} testId="aiws-export-dialog" onClose={onClose}>
-      <div className="aiws-dialog-head"><b>{t('aiworkspace.shell.export.dialogTitle', { name: workspace.title })}</b><span className="aiws-grow" /><button type="button" className="aiws-link" onClick={onClose}>{t('aiworkspace.common.close')}</button></div>
+      <div className="aiws-dialog-head"><b>{t('aiworkspace.shell.export.dialogTitle', { name: workspace.title })}</b><span className="aiws-grow" /><button type="button" className="aiws-tool aiws-tool-small aiws-dialog-close" aria-label={t('aiworkspace.common.close')} title={t('aiworkspace.common.close')} onClick={onClose}><X size={16} aria-hidden="true" /></button></div>
       <div className="aiws-muted">{t('aiworkspace.shell.export.explain')}</div>
       <ExportForm client={client} workspace={workspace} />
     </Modal>
@@ -392,7 +396,7 @@ export function ImportDialog({ client, onClose, onOpenWorkspace, file = null, on
   const [done, setDone] = useState<{ text: string; workspaceId: string } | null>(null)
   return (
     <Modal label={t('aiworkspace.shell.import.title')} testId="aiws-import-dialog" onClose={onClose}>
-      <div className="aiws-dialog-head"><b>{t('aiworkspace.shell.import.title')}</b><span className="aiws-grow" /><button type="button" className="aiws-link" onClick={onClose}>{t('aiworkspace.common.close')}</button></div>
+      <div className="aiws-dialog-head"><b>{t('aiworkspace.shell.import.title')}</b><span className="aiws-grow" /><button type="button" className="aiws-tool aiws-tool-small aiws-dialog-close" aria-label={t('aiworkspace.common.close')} title={t('aiworkspace.common.close')} onClick={onClose}><X size={16} aria-hidden="true" /></button></div>
       {done ? (
         <>
           <div role="status" data-testid="aiws-import-done">{done.text}</div>
@@ -424,7 +428,7 @@ export function HelpDialog({ onClose }: { onClose: () => void }) {
   const { t } = useAiwsText()
   return (
     <Modal label={t('aiworkspace.shell.help.title')} testId="aiws-help-dialog" onClose={onClose}>
-      <div className="aiws-dialog-head"><b>{t('aiworkspace.shell.help.title')}</b><span className="aiws-grow" /><button type="button" className="aiws-link" autoFocus onClick={onClose}>{t('aiworkspace.common.close')}</button></div>
+      <div className="aiws-dialog-head"><b>{t('aiworkspace.shell.help.title')}</b><span className="aiws-grow" /><button type="button" className="aiws-tool aiws-tool-small aiws-dialog-close" aria-label={t('aiworkspace.common.close')} title={t('aiworkspace.common.close')} autoFocus onClick={onClose}><X size={16} aria-hidden="true" /></button></div>
       <table className="aiws-shortcuts"><tbody>{shortcuts(t).map(([keys, text]) => <tr key={keys}><th scope="row"><kbd>{keys}</kbd></th><td>{text}</td></tr>)}</tbody></table>
       <div className="aiws-muted">{t('aiworkspace.shell.help.note')}</div>
     </Modal>

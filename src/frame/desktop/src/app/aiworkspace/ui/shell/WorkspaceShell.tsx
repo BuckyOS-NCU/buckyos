@@ -8,6 +8,8 @@ import { ExtensionsDialog } from '../extensions/ExtensionsDialog'
 import { SaveTemplateDialog } from '../extensions/SaveTemplateDialog'
 import { isCanvasContainer } from '../controls/registry'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowUpRight } from 'lucide-react'
+import { useI18n } from '../../../../i18n/provider'
 import type { CapturedAnchor } from '../../anchors/registry'
 import type { AiwsClient } from '../../api/client'
 import type { EntityEnvelope } from '../../api/types'
@@ -38,7 +40,7 @@ import { useUserPrefs } from '../../state/prefs'
 import { isDataControl } from '@controls/contract'
 import { ControlPage } from '../controls/data/ControlPage'
 import { onControlPage, requestRecordFocus } from '../controls/data/focus'
-import type { RecordTarget } from '../../links'
+import { workspacePageUrl, type RecordTarget } from '../../links'
 
 export type { TopMode } from './shellContext'
 
@@ -79,13 +81,15 @@ export interface ShellProps {
   onLogout: () => void
   onLogin: () => void
   onHome: (() => void) | null
+  onChooseProjectCanvas?: ((canvasUrl: string) => void) | null
   devTools: boolean
   target?: LaunchTarget | null
 }
 
-export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, identity, onLogout, onLogin, onHome, devTools, target }: ShellProps) {
+export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, identity, onLogout, onLogin, onHome, onChooseProjectCanvas, devTools, target }: ShellProps) {
   const store = useStore()
   const { t } = useAiwsText()
+  const { t: translate } = useI18n()
   const outlineVersion = useOutlineVersion()
   const [loadError, setLoadError] = useState<string | null>(null)
   useEffect(() => {
@@ -261,7 +265,7 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
     if (embedded.type_id !== 'buckyos.cell') return <div className="aiws-warning">{t('aiworkspace.shell.workspace.embedNotBlock', { id: cellId })}</div>
     return (
       <div className="aiws-embedded" data-testid={`aiws-embed-${cellId}`}>
-        <div className="aiws-embedded-title" title={t('aiworkspace.shell.workspace.embedTitle')}>↗ {embedded.title ?? embedded.name ?? cellId}</div>
+        <div className="aiws-embedded-title" title={t('aiworkspace.shell.workspace.embedTitle')}><ArrowUpRight size={12} aria-hidden="true" />{embedded.title ?? embedded.name ?? cellId}</div>
         <BlockHost cellId={cellId} mode="view" view="source" depth={depth} />
       </div>
     )
@@ -313,9 +317,15 @@ export function WorkspaceShell({ client, onClose, onOpenWorkspace, offline, iden
   }, [store])
 
   const workspaceInfo = store.session.info()
+  const chooseUrl = onChooseProjectCanvas && workspaceInfo.owner && !workspaceInfo.purpose
+    && activeSurface && mode === 'canvas' && !showSession && !pageControl
+    ? workspacePageUrl(workspaceInfo.public_base, workspaceInfo.title, { id: activeSurface.entity_id, title: activeSurface.title ?? activeSurface.name ?? '' }) : null
   return (
     <div ref={rootRef} className="aiws-workspace" data-testid="aiws-workspace" data-workspace-id={store.session.workspaceId} data-session-id={store.session.sessionId} data-top-mode={mode} data-size={size} data-phone={phone ? 'true' : undefined}>
       <ShellContext.Provider value={shell}>
+        {loaded && onChooseProjectCanvas && chooseUrl && <div className="flex justify-end px-2 py-1">
+          <button type="button" className="is-primary" data-testid="aiws-use-project-canvas" onClick={() => onChooseProjectCanvas(chooseUrl)}>{translate('school.projectCanvas.use', 'Use this canvas')}</button>
+        </div>}
         {loadError && !loaded && <div className="aiws-error" role="alert">{t('aiworkspace.shell.workspace.loadError', { error: loadError })}</div>}
         {loaded && (
           <WorkspaceUiContext.Provider value={ui}>

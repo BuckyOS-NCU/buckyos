@@ -58,7 +58,7 @@ export function WorkspaceCard({ workspace, transport, me, openedAt, prepared, op
   const menu = (): MenuItem[] => [
     { id: 'open-tab', label: t('aiworkspace.home.menu.openTab'), run: actions.openTab, testId: 'aiws-home-open-tab' },
     ...(can('manage') && !restricted ? [{ id: 'clone', label: t('aiworkspace.core.list.clone'), disabled: busy, run: actions.clone, testId: 'aiws-clone' }] : []),
-    ...(can('export') ? [{ id: 'export', label: t('aiworkspace.home.menu.export'), run: actions.exportPackage, testId: 'aiws-home-export' }] : []),
+    ...(workspace.owner ? [{ id: 'export', label: t('aiworkspace.home.menu.export'), run: actions.exportPackage, testId: 'aiws-home-export' }] : []),
     { id: 'prepare', label: t('aiworkspace.shell.prepareOffline'), disabled: busy || offlineReason !== null, reason: offlineReason, explain: true, run: actions.prepare, testId: 'aiws-home-prepare' },
     { id: 'details', label: t('aiworkspace.home.menu.details'), run: actions.details, testId: 'aiws-home-details' },
     ...(can('manage') ? [{ id: 'cover', label: t('aiworkspace.cover.menu'), disabled: busy, run: actions.cover, testId: 'aiws-home-cover-set' }] : []),
@@ -96,7 +96,7 @@ export function WorkspaceCard({ workspace, transport, me, openedAt, prepared, op
 }
 
 /** The first card of "All workspaces": the New dialog, on its blank or its template tab. */
-export function NewWorkspaceCard({ onNew, onTemplate }: { onNew: () => void; onTemplate: () => void }) {
+export function NewWorkspaceCard({ onNew, onTemplate }: { onNew: () => void; onTemplate?: () => void }) {
   const { t } = useAiwsText()
   return (
     <div className="aiws-home-card is-new" data-testid="aiws-home-new-card">
@@ -107,7 +107,7 @@ export function NewWorkspaceCard({ onNew, onTemplate }: { onNew: () => void; onT
           <span className="aiws-home-card-info">{t('aiworkspace.home.newCardHint')}</span>
         </span>
       </button>
-      <button type="button" className="aiws-link aiws-home-new-template" data-testid="aiws-new-template" onClick={onTemplate}>{t('aiworkspace.core.list.newFromTemplate')}</button>
+      {onTemplate && <button type="button" className="aiws-link aiws-home-new-template" data-testid="aiws-new-template" onClick={onTemplate}>{t('aiworkspace.core.list.newFromTemplate')}</button>}
     </div>
   )
 }

@@ -14,6 +14,7 @@ pub enum Check {
     Session,
     /// Unrestricted accounts and services: those that may own Workspaces (PRE-03).
     MayOwn,
+    CreateWorkspace,
     /// The Workspace's owner (R17).
     Owner,
     /// May enter the Workspace (any member of it; otherwise it does not exist for the caller).
@@ -34,6 +35,7 @@ impl Check {
             Check::Public => "none (no session)".into(),
             Check::Session => "a session".into(),
             Check::MayOwn => "may own (unrestricted account or service)".into(),
+            Check::CreateWorkspace => "may own, or has a live NCU PBL workspace creation grant".into(),
             Check::Owner => "the owner".into(),
             Check::Member => "may enter".into(),
             Check::Ws(c) => format!("`{}` on `/`", cap_name(*c)),
@@ -64,7 +66,7 @@ const SESSION_ROLE: Check = Handler("the session's roles and links");
 const SHOW_ROLE: Check = Handler("the presenter's read; a prompter token");
 
 pub const METHODS: &[MethodSpec] = &[
-    m("ws.create", "stable", &[MayOwn]),
+    m("ws.create", "stable", &[CreateWorkspace]),
     m("ws.ensure", "stable", &[MayOwn]),
     m("ws.time", "stable", &[Session]),
     m("ws.list", "stable", &[Session]),
@@ -85,6 +87,11 @@ pub const METHODS: &[MethodSpec] = &[
     m("ws.list_entries", "stable", &[Ws(Cap::Manage)]),
     m("ws.close_entry", "stable", &[Ws(Cap::Manage)]),
     m("ws.join_entry", "stable", &[Handler("a person presenting an active entry the Zone switches admit")]),
+    m("ws.classroom_request", "experimental", &[Handler("an existing local account requesting a specific classroom surface")]),
+    m("ws.classroom_requests", "experimental", &[Handler("the verified live classroom owner")]),
+    m("ws.classroom_issue", "experimental", &[Handler("the verified live classroom owner")]),
+    m("ws.classroom_approve", "experimental", &[Handler("the verified live classroom owner")]),
+    m("ws.classroom_revoke", "experimental", &[Handler("the verified live classroom owner")]),
     m("entry.describe", "stable", &[Public]),
     m("ws.get_user_state", "stable", &[Member]),
     m("ws.set_user_state", "stable", &[Member]),

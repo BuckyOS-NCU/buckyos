@@ -11,6 +11,7 @@ mod group_hook;
 mod homestation_client;
 pub mod bucket_client;
 mod hybrid_sso;
+mod ncu_identity;
 mod msg_center_client;
 mod msg_contact;
 mod msg_notify;
@@ -110,6 +111,7 @@ pub use bucket_client::{
     BUCKET_EVENT_PREFIX, BUCKET_INDEX_RDB_INSTANCE_ID,
 };
 pub use hybrid_sso::*;
+pub use ncu_identity::*;
 pub use msg_center_client::*;
 pub use msg_contact::*;
 pub use msg_notify::*;

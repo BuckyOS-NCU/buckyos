@@ -575,7 +575,7 @@ impl Service {
             local
                 .execute_batch(
                     "DELETE FROM acl_entries; DELETE FROM acl_groups; DELETE FROM acl_members; DELETE FROM acl_macro_bindings; DELETE FROM acl_audit; \
-                     DELETE FROM share_entries; DELETE FROM publications; DELETE FROM publication_versions; DELETE FROM referrers; DELETE FROM locks; \
+                     DELETE FROM share_entries; DELETE FROM classroom_entries; DELETE FROM classroom_access_requests; DELETE FROM publications; DELETE FROM publication_versions; DELETE FROM referrers; DELETE FROM locks; \
                      DELETE FROM lock_events; DELETE FROM staged_assets; DELETE FROM staged_commits; DELETE FROM user_state; DELETE FROM runs; DELETE FROM local_meta;",
                 )
                 .map_err(db_err)?;
@@ -2283,7 +2283,9 @@ impl Workspace {
             readable.insert(id.to_string(), ok);
             Ok(ok)
         };
-        crate::workspace::filter_rows(&mut rows, &mut can_read)?;
+        crate::workspace::filter_rows(&mut rows, &mut can_read, &|target| {
+            aiworkspace_core::anchor::target_visible(&ctx, target, &|e| access.can_read(&ctx, e))
+        })?;
         Ok(rows)
     }
 }

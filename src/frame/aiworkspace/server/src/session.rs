@@ -619,6 +619,11 @@ async fn connection(state: Arc<AppState>, socket: WebSocket) -> Result<(), Strin
             return Err(e);
         }
     };
+    if caller.has_live_ncu_pbl_teacher() {
+        let detail = "the PBL teacher session is limited to workspace content".to_string();
+        let _ = send(&mut sink, fail("PERMISSION_DENIED", detail.clone())).await;
+        return Err(detail);
+    }
     let link = link.or_else(|| token.as_deref().and_then(|t| link_caller(&state, t)).map(|(_, i)| i));
     let sid = hello["session_id"].as_str().unwrap_or("").to_string();
     let terminal = hello["terminal_id"].as_str().filter(|t| !t.is_empty() && t.len() <= 64).unwrap_or("").to_string();

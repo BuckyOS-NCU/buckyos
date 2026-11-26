@@ -33,6 +33,13 @@ pub trait ZoneDirectory: Send + Sync {
     async fn user_settings(&self, user_id: &str) -> Result<Option<UserSettings>>;
     /// `None` when the account has no usable OwnerDocument.
     async fn user_doc(&self, user_id: &str) -> Result<Option<UserDoc>>;
+    async fn ncu_cas_account_key(
+        &self,
+        _request: &buckyos_api::NcuCasLoginRequest,
+        _user_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
     async fn list_users(&self) -> Result<Vec<String>>;
     async fn exclusive_invite(&self, invite_id: &str) -> Result<Option<ExclusiveInvite>>;
     async fn sso_settings(&self) -> Result<SsoSettings>;
@@ -115,6 +122,23 @@ impl ZoneDirectory for SystemConfigDirectory {
             .ok()
             .map(|doc| owner_canonical_zone(&doc));
         Ok(Some(UserDoc { did, default_zone }))
+    }
+
+    async fn ncu_cas_account_key(
+        &self,
+        request: &buckyos_api::NcuCasLoginRequest,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        let key = format!("users/{user_id}/doc");
+        Ok(read_json::<OwnerDocument>(&key)
+            .await?
+            .filter(|doc| {
+                doc.extra_info
+                    .get(buckyos_api::NCU_CAS_READY_MARKER)
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            })
+            .and_then(|doc| request.account_key(&doc)))
     }
 
     async fn list_users(&self) -> Result<Vec<String>> {

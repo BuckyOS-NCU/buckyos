@@ -20,7 +20,7 @@ import { currentZoneHost } from '../presentation/zone'
 import { isMockRuntime } from '../runtime'
 import { FirstPasswordPrompt } from './FirstPasswordPrompt'
 import { IdentityCard } from './IdentityCard'
-import { getBootIdentity } from './identity'
+import { getBootIdentity, isSchoolAccount } from './identity'
 
 /** Web Apps the account may open: what `apps.list` returns for it, without Desktop built-ins and Agent Apps. */
 function openableApps(apps: AppSummary[]): AppSummary[] {
@@ -121,6 +121,11 @@ export function RestrictedHome({ identity = getBootIdentity() }: { identity?: Cu
             : t('sso.restricted.hintLimited', 'This account can use what was shared with it. Open the links you were sent to reach your conversations and documents.')}
         </p>
         {identity.kind === 'account' ? <RestrictedApps /> : null}
+        {isSchoolAccount(identity) ? (
+          <Button href="/personal-info" fullWidth variant="outlined" data-testid="restricted-home-personal-info">
+            {t('school.profile.title', 'Personal information')}
+          </Button>
+        ) : null}
         {signOutFailed ? <Alert severity="error">{t('shell.logoutFailed', 'Log out failed. Please try again.')}</Alert> : null}
         <Button fullWidth variant="outlined" startIcon={<LogOut size={16} />} disabled={signingOut} onClick={() => void signOut()} data-testid="restricted-home-sign-out">
           {signingOut ? t('shell.loggingOut', 'Logging out...') : t('shell.logout', 'Log out')}

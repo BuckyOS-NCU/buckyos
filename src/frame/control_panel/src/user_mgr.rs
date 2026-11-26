@@ -1017,6 +1017,9 @@ impl ControlPanelServer {
             }
         }
 
+        if let Some(academic) = crate::ncu_school::own_projection(principal, &target).await {
+            result["school_profile"] = academic;
+        }
         Ok(RPCResponse::new(RPCResult::Success(result), req.seq))
     }
 

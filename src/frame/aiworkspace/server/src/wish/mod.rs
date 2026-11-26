@@ -369,7 +369,11 @@ pub async fn delegated(state: &Arc<AppState>, ws_id: &str, run: &Value) -> Calle
 /// the Workspace configured nothing for that Agent (R16).
 fn acting_as(trigger: Caller, agent: Option<&str>) -> Caller {
     match agent {
-        Some(did) => Caller { acting_for: Some(Box::new(trigger)), ..Caller::agent(did) },
+        Some(did) => {
+            let mut agent = Caller::agent(did);
+            agent.acting_for = Some(Box::new(trigger));
+            agent
+        }
         None => trigger,
     }
 }

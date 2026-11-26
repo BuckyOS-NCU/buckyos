@@ -34,8 +34,7 @@ import { useFilePicker } from './shell/filePicker'
 import { usePhone } from './shell/shellContext'
 import './home/home.css'
 
-/** `restricted`: a Limited account or an External DID — it lists what was shared with it and creates, imports or
- * clones nothing (the service refuses those; hybrid SSO PRE-03). */
+/** A restricted session keeps its import, clone and template restrictions. The service reports blank creation separately. */
 interface Props { client: AiwsClient; onOpen: (workspaceId: string) => void; opening: string | null; restricted?: boolean }
 
 type CardAction = 'clone' | 'delete' | 'prepare'
@@ -51,8 +50,8 @@ export function WorkspaceList({ client, onOpen, opening, restricted = false }: P
   const transport = client.transport
   /** Bumped by the refresh button: everything reloads. */
   const [version, setVersion] = useState(0)
-  const load = useCallback(async () => unwrap(await client.wsList()).workspaces, [client])
-  const list = useLoad<WorkspaceListItem[]>(load, version)
+  const load = useCallback(async () => unwrap(await client.wsList()), [client])
+  const list = useLoad(load, version)
   const loadSessions = useCallback(() => loadHomeSessions(transport), [transport])
   const sessions = useLoad<OpenSession[]>(loadSessions, version)
   const loadRecent = useCallback(() => readRecentList(transport), [transport])
@@ -80,10 +79,12 @@ export function WorkspaceList({ client, onOpen, opening, restricted = false }: P
   const pickFile = useFilePicker((text) => setMessage({ kind: 'error', text }))
 
   const offline = list.error !== null && !list.data
+  const workspaces = list.data?.workspaces
+  const canCreate = !offline && (list.data?.can_create_workspace ?? !restricted)
   const listState = list.loading ? 'loading' : offline ? 'offline' : 'ready'
   const prepared = useMemo(() => { void preparedTick; return preparedIndex() }, [preparedTick])
   const facts = useMemo<WorkspaceFacts>(() => ({ me: me.data ?? null, prepared: new Set(Object.keys(prepared)) }), [me.data, prepared])
-  const recentList = useMemo(() => recentItems(list.data, sessions.data, recent.data ?? []), [recent.data, list.data, sessions.data])
+  const recentList = useMemo(() => recentItems(workspaces, sessions.data, recent.data ?? []), [recent.data, workspaces, sessions.data])
   // the category kept last; without one, Recent when there is any, else All workspaces (§9.1), once that is known
   const settled = !list.loading && !recent.loading && !sessions.loading && !me.loading && home.ready
   const category: HomeCategory | null = settled ? prefs.category ?? (recentList.length > 0 ? 'recent' : 'all') : null
@@ -155,13 +156,13 @@ export function WorkspaceList({ client, onOpen, opening, restricted = false }: P
 
   // what the category shows, filtered by the search and the settings
   const filtered = !category ? [] : category === 'all'
-    ? sortWorkspaces(filterWorkspaces(list.data ?? [], prefs, query, facts), prefs, compare).map((ws) => workspaceCard(ws))
+    ? sortWorkspaces(filterWorkspaces(workspaces ?? [], prefs, query, facts), prefs, compare).map((ws) => workspaceCard(ws))
     : category === 'sessions'
       ? filterSessions(sortSessions(sessions.data ?? []), prefs, query).map(sessionCard)
       : recentList.flatMap((item) => item.kind === 'workspace'
         ? filterWorkspaces([item.workspace], prefs, query, facts).map((ws) => workspaceCard(ws, item.at))
         : filterSessions([item.session], prefs, query).map(sessionCard))
-  const unfiltered = !category ? 0 : category === 'all' ? (list.data?.length ?? 0) : category === 'sessions' ? (sessions.data?.length ?? 0) : recentList.length
+  const unfiltered = !category ? 0 : category === 'all' ? (workspaces?.length ?? 0) : category === 'sessions' ? (sessions.data?.length ?? 0) : recentList.length
   const narrowed = query.trim() !== '' || (category !== null && filtersActive(category, prefs))
 
   const tabs = (
@@ -203,7 +204,7 @@ export function WorkspaceList({ client, onOpen, opening, restricted = false }: P
           {category && <FilterButton category={category} prefs={prefs} onChange={setPrefs} />}
           {refreshButton}
           {!restricted && <button type="button" data-testid="aiws-home-import" onClick={startImport}><Upload size={16} /> {t('aiworkspace.home.import')}</button>}
-          {!restricted && <button type="button" className="is-primary" data-testid="aiws-new" onClick={() => setCreating('workspace')}><Plus size={16} /> {t('aiworkspace.core.list.new')}</button>}
+          {canCreate && <button type="button" className="is-primary" data-testid="aiws-new" onClick={() => setCreating('workspace')}><Plus size={16} /> {t('aiworkspace.core.list.new')}</button>}
         </header>
       )}
       {!offline && tabs}
@@ -217,7 +218,7 @@ export function WorkspaceList({ client, onOpen, opening, restricted = false }: P
               <>
                 {category === 'sessions' && sessions.error && <div className="aiws-error" role="alert" data-testid="aiws-home-sessions-error">{t('aiworkspace.session.mine.loadFailed', { error: sessions.error })}</div>}
                 <div className="aiws-home-grid" data-testid={`aiws-home-grid-${category}`}>
-                  {category === 'all' && !restricted && !narrowed && <NewWorkspaceCard onNew={() => setCreating('workspace')} onTemplate={() => setCreating('template')} />}
+                  {category === 'all' && canCreate && !narrowed && <NewWorkspaceCard onNew={() => setCreating('workspace')} onTemplate={restricted ? undefined : () => setCreating('template')} />}
                   {filtered}
                 </div>
                 {filtered.length === 0 && !(category === 'sessions' && sessions.error) && (narrowed && unfiltered > 0
@@ -226,14 +227,14 @@ export function WorkspaceList({ client, onOpen, opening, restricted = false }: P
               </>
             )}
       </div>
-      {phone && !restricted && (
+      {phone && (!restricted || canCreate) && (
         <div className="aiws-home-fabs">
-          <button type="button" className="aiws-home-fab" data-testid="aiws-home-import" aria-label={t('aiworkspace.home.import')} title={t('aiworkspace.home.import')} onClick={startImport}><Upload size={20} /></button>
-          <button type="button" className="aiws-home-fab is-primary" data-testid="aiws-new" aria-label={t('aiworkspace.core.list.new')} title={t('aiworkspace.core.list.new')} onClick={() => setCreating('workspace')}><Plus size={24} /></button>
+          {!restricted && <button type="button" className="aiws-home-fab" data-testid="aiws-home-import" aria-label={t('aiworkspace.home.import')} title={t('aiworkspace.home.import')} onClick={startImport}><Upload size={20} /></button>}
+          {canCreate && <button type="button" className="aiws-home-fab is-primary" data-testid="aiws-new" aria-label={t('aiworkspace.core.list.new')} title={t('aiworkspace.core.list.new')} onClick={() => setCreating('workspace')}><Plus size={24} /></button>}
         </div>
       )}
       {sheet && category && <FilterSheet category={category} prefs={prefs} onChange={setPrefs} onClose={() => setSheet(false)} />}
-      {creating && <NewDialog client={client} store={null} initialTab={creating} onClose={() => setCreating(null)} onOpenWorkspace={openWorkspace} />}
+      {creating && <NewDialog client={client} store={null} initialTab={creating} allowTemplate={!restricted} onClose={() => setCreating(null)} onOpenWorkspace={openWorkspace} />}
       {importing && <ImportDialog client={client} file={importing} stayLabel={t('aiworkspace.common.close')} onClose={() => setImporting(null)} onOpenWorkspace={openWorkspace}
         onDone={(text) => { setMessage({ kind: 'info', text }); list.reload() }} />}
       {exporting && <ExportDialog client={client} workspace={exporting} onClose={() => setExporting(null)} />}

@@ -347,6 +347,24 @@ impl AgentNameIndex {
         })
     }
 
+    /// Campus enrollment may preserve residual Desktop state for its already verified principal.
+    /// Any other records under this name still reserve the user namespace.
+    pub(crate) async fn allow_campus_desktop_namespace(
+        &mut self,
+        kv: &dyn AgentKv,
+        name: &str,
+    ) -> Result<(), RPCErrors> {
+        if self.users.contains(name) {
+            let namespace = format!("users/{name}");
+            if kv.list(&namespace).await?.as_slice() == ["desktop"]
+                && kv.get(&namespace).await?.is_none()
+            {
+                self.users.remove(name);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn check(&self, name: &str) -> Result<AgentId, NameConflict> {
         if !is_dns_label(name) {
             return Err(NameConflict::new(

@@ -280,7 +280,7 @@ impl Service {
     /// `ws.create { name? }`: a name already used by one of the caller's Workspaces is `NAME_CONFLICT`.
     pub fn create_workspace_with(&self, caller: &Caller, title: &str, workspace_id: Option<&str>, name: Option<&str>) -> WsResult<Value> {
         let Some(name) = name else { return self.create_folder(caller, title, workspace_id, None) };
-        require_may_own(caller)?;
+        require_may_create_workspace(caller)?;
         check_workspace_name(name)?;
         let mut names = self.names.lock().unwrap();
         let index = self.name_index(&mut names)?;
@@ -305,6 +305,9 @@ impl Service {
             if self.ws_dir(&id).exists() {
                 let handle = self.workspace(&id)?;
                 let ws = handle.lock().unwrap();
+                if ws.acl_data()?.ncu_pbl_teacher_owned {
+                    ws.require_owner(caller)?;
+                }
                 return Ok(json!({ "ok": true, "workspace_id": id, "name": name, "title": ws.title(), "epoch": ws.epoch, "head_seq": ws.head_seq, "created": false }));
             }
             index.remove(&key);
@@ -338,7 +341,7 @@ impl Service {
     }
 
     fn create_folder(&self, caller: &Caller, title: &str, workspace_id: Option<&str>, name: Option<&str>) -> WsResult<Value> {
-        require_may_own(caller)?;
+        require_may_create_workspace(caller)?;
         let lease = match workspace_id {
             Some(id) if is_workspace_id(id) => None,
             Some(_) => return Err(WsError::invalid_op("workspace_id must be ws_ + YYMM + 4 base36 chars")),
@@ -354,6 +357,12 @@ impl Service {
         let tmp = self.tmp_dir();
         // an Agent's Workspace belongs to its owner (权限需求 R16)
         let ws = Workspace::create(&tmp, &id, title, caller.owner_principal(), self.objects.clone(), self.clock.clone())?;
+        if caller.has_live_ncu_pbl_teacher() {
+            ws.local.execute(
+                "INSERT INTO local_meta (key, value) VALUES (?1, '1')",
+                [crate::acl::NCU_PBL_TEACHER_OWNER_KEY],
+            ).map_err(db_err)?;
+        }
         let mut info = json!({ "ok": true, "workspace_id": id, "epoch": ws.epoch, "head_seq": 0, "title": title });
         if let Some(name) = name {
             ws.local.execute("INSERT INTO local_meta (key, value) VALUES ('name', ?1)", [name]).map_err(db_err)?;
@@ -395,7 +404,7 @@ impl Service {
     pub fn list_workspaces(&self, caller: &Caller) -> WsResult<Value> {
         let mut out = Vec::new();
         if caller.is_guest() {
-            return Ok(json!({ "ok": true, "workspaces": out }));
+            return Ok(json!({ "ok": true, "workspaces": out, "can_create_workspace": false }));
         }
         // the home page's card (UI 框架 PRD §9.2, K6): when the caller last opened each, the live sessions of each
         let opened = self.users.opened(&caller.principal)?;
@@ -415,6 +424,9 @@ impl Service {
             {
                 let mut item = json!({ "workspace_id": name, "title": ws.title(), "head_seq": ws.head_seq, "epoch": ws.epoch,
                                        "capabilities": access.ws_caps.names() });
+                if access.is_owner() {
+                    item["owner"] = json!(true);
+                }
                 if let Ok(Some(n)) = ws.name() {
                     item["name"] = json!(n);
                 }
@@ -433,7 +445,7 @@ impl Service {
             }
         }
         out.sort_by(|a, b| a["workspace_id"].as_str().cmp(&b["workspace_id"].as_str()));
-        Ok(json!({ "ok": true, "workspaces": out }))
+        Ok(json!({ "ok": true, "workspaces": out, "can_create_workspace": caller.may_create_workspace() }))
     }
 
     fn trash(&self, id: &str) -> WsResult<()> {
@@ -562,6 +574,8 @@ impl Service {
                                 DELETE FROM acl_macro_bindings; INSERT INTO acl_macro_bindings SELECT * FROM old.acl_macro_bindings; \
                                 DELETE FROM acl_audit; INSERT INTO acl_audit SELECT * FROM old.acl_audit; \
                                 INSERT INTO share_entries SELECT * FROM old.share_entries; \
+                                INSERT INTO classroom_entries SELECT * FROM old.classroom_entries; \
+                                INSERT INTO classroom_access_requests SELECT * FROM old.classroom_access_requests; \
                                 INSERT OR REPLACE INTO local_meta SELECT * FROM old.local_meta; DETACH DATABASE old;")
                 .map_err(crate::docdb::db_err)?;
             drop(conn);
@@ -725,6 +739,13 @@ fn check_workspace_name(name: &str) -> WsResult<()> {
         return Err(WsError::invalid_op("name must match ^[a-z0-9][a-z0-9._-]{0,63}$"));
     }
     Ok(())
+}
+
+pub fn require_may_create_workspace(caller: &Caller) -> WsResult<()> {
+    if caller.may_create_workspace() {
+        return Ok(());
+    }
+    require_may_own(caller)
 }
 
 pub fn require_may_own(caller: &Caller) -> WsResult<()> {

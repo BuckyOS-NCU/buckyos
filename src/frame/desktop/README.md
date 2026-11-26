@@ -17,6 +17,8 @@ pnpm run build
 
 真实 Zone 开发代理由 [vite.config.ts](vite.config.ts) 的 `VITE_ZONE_PROXY`、`VITE_ZONE_HOST` 和 `VITE_ZONE_PROXY_IP` 控制，需关闭 Mock runtime。AI Workspace 的独立后台使用自己的 `AIWS_BACKEND` 与显式 dev override，详见 [AI Workspace README](src/app/aiworkspace/README.md)。HomeStation 的独立后台使用 `HS_BACKEND`。
 
+生产构建从 [`.env.production`](.env.production) 读取南昌大学联调站的 `VITE_NCU_CAS_ORIGIN`。如需为另一已启用 CAS 的站点构建，可覆盖该变量。值应为控制面板 CAS 回调地址的 HTTPS origin，不含路径或末尾斜杠。登录入口仅在该 origin 的顶层窗口显示。学校认证由控制面板的 `/sso/cas/start` 发起。可传入 `redirect_url` 返回本站页面或当前 Zone 的工作区专属 HTTPS 地址。服务端在发起认证时校验并绑定目标，未提供目标时返回 Desktop 首页。
+
 ## 开源软件清单
 
 设置 → 通用 → 开源软件展示人工维护清单中的依赖版本、许可证标识、项目来源及随包提供的许可原文。清单位于 `public/open-source/`，按需使用 [`src/tools/generate_open_source.py`](../../tools/generate_open_source.py) 辅助生成，再由维护者核对、修订并提交。列表先合并同一仓库的组件及同名软件的多个版本，再按名称前缀、npm 命名空间及明确的软件系列归组，例如 `serde`、`react`、`tokio`、`proc-macro`。跨项目归组显示“系列”标记，每个项目只归入一个系列，避免桥接包把多个系列串成一个大组。点击分组后可搜索组件、逐项查看确切版本、来源及许可原文；主列表搜索组件名也能找到所属分组。名称归组不代表来自同一上游项目或使用同一许可证，不删减清单的原始软件包记录。

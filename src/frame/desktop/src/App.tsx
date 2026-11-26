@@ -48,6 +48,7 @@ const TaskCenterRoute = lazy(() =>
 const UserProfileRoute = lazy(() =>
   import('./userprofile').then((m) => ({ default: m.UserProfileRoute })),
 )
+const PersonalInformationRoute = lazy(() => import('./sso/PersonalInformationRoute'))
 const AppInstallerRoute = lazy(() =>
   import('./sysdlg').then((m) => ({ default: m.AppInstallerRoute })),
 )
@@ -153,6 +154,14 @@ const router = createBrowserRouter([
     element: (
       <Suspense fallback={null}>
         <TaskCenterRoute />
+      </Suspense>
+    ),
+  },
+  {
+    path: '/personal-info',
+    element: (
+      <Suspense fallback={null}>
+        <PersonalInformationRoute />
       </Suspense>
     ),
   },

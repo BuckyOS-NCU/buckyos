@@ -352,6 +352,16 @@ impl SystemConfigBuilder {
             service_doc,
         )
         .await?;
+        config.spec_config.rdb_instances.insert(
+            "ncu-school".to_string(),
+            buckyos_api::RdbInstanceConfig {
+                backend: buckyos_api::RdbBackend::Sqlite,
+                version: 1,
+                connection: "sqlite:$partdata/ncu-school/school.sqlite".to_string(),
+                schema: HashMap::new(),
+                partitions: vec![buckyos_api::RdbPartition::UserData],
+            },
+        );
         config.spec_config.buckets = buckyos_api::control_panel_bucket_decls();
         config.spec_config.storage_quota_mib = Some(buckyos_api::CONTROL_PANEL_STORAGE_QUOTA_MIB);
 

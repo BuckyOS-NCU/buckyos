@@ -152,6 +152,8 @@ export interface ContentPreviewProps {
   allowFullscreen?: boolean
   /** Host policy: copy / download of the current content (§10.7). */
   allowExport?: boolean
+  /** Sandboxed hosts use this to keep PDF rendering on their own page. */
+  forcePdfJs?: boolean
   /** Prefetch ±1 neighbours once the current item is ready (§11.7). */
   prefetchAdjacent?: boolean
   autoFocus?: boolean
@@ -497,6 +499,7 @@ function ContentViewer(props: ContentPreviewProps) {
     titleInHost = false,
     allowFullscreen = true,
     allowExport = true,
+    forcePdfJs = false,
     prefetchAdjacent = true,
     autoFocus = false,
     variant = 'default',
@@ -1033,11 +1036,20 @@ function ContentViewer(props: ContentPreviewProps) {
       anchor.click()
       return
     }
-    const url = URL.createObjectURL(readRef.blob)
-    anchor.href = url
-    anchor.click()
-    window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
-  }, [capabilities.export, current?.resolved?.readRef, current?.result?.readRef, displayName, invokeAction])
+    const save = (blob: Blob) => {
+      const url = URL.createObjectURL(blob)
+      anchor.href = url
+      anchor.click()
+      window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    }
+    if (readRef.downloadBlob) {
+      void readRef.downloadBlob().then(save, (error: unknown) => {
+        latest.current.onError?.(errorStateFrom(error, displayName), itemInfo)
+      })
+    } else {
+      save(readRef.blob)
+    }
+  }, [capabilities.export, current?.resolved?.readRef, current?.result?.readRef, displayName, invokeAction, itemInfo, latest])
 
   const copySource = useCallback(() => {
     if (!itemInfo) return
@@ -1252,6 +1264,7 @@ function ContentViewer(props: ContentPreviewProps) {
               fitMode={fitMode}
               uiMode={effectiveUiMode}
               compact={inline}
+              forcePdfJs={forcePdfJs}
               autoPlay={autoPlay}
               reducedMotion={reducedMotion}
               fontScale={fontScale}
@@ -1920,6 +1933,7 @@ function RendererSwitch({
   fitMode,
   uiMode,
   compact,
+  forcePdfJs,
   autoPlay,
   reducedMotion,
   fontScale,
@@ -1940,6 +1954,7 @@ function RendererSwitch({
   fitMode: PreviewFitMode
   uiMode: PreviewUIMode
   compact: boolean
+  forcePdfJs: boolean
   autoPlay: boolean
   reducedMotion: boolean
   fontScale: number
@@ -1992,7 +2007,7 @@ function RendererSwitch({
         />
       )
     case 'pdf':
-      return <PdfRenderer ref={zoomRef} readRef={result.readRef} title={displayName} topInset={uiMode !== 'silent' && !compact ? TOOLBAR_BAND_PX : 0} onViewChange={onViewChange} onRendered={onRendered} onFailure={onFailure} onDownload={onDownload} onOpenWith={onOpenWith} t={t} />
+      return <PdfRenderer forcePdfJs={forcePdfJs} ref={zoomRef} readRef={result.readRef} title={displayName} topInset={uiMode !== 'silent' && !compact ? TOOLBAR_BAND_PX : 0} onViewChange={onViewChange} onRendered={onRendered} onFailure={onFailure} onDownload={onDownload} onOpenWith={onOpenWith} t={t} />
     case 'diagram':
       return (
         <DiagramRenderer
@@ -2604,6 +2619,7 @@ function MediaRenderer({
 
 function PdfRenderer({
   ref,
+  forcePdfJs,
   readRef,
   title,
   topInset,
@@ -2615,6 +2631,7 @@ function PdfRenderer({
   t,
 }: {
   ref: Ref<ZoomHandle>
+  forcePdfJs: boolean
   readRef: PreviewReadRef
   title: string
   /** The browser's viewer draws its own toolbar at the top: it starts below the component's (a fixed band, so the
@@ -2629,7 +2646,7 @@ function PdfRenderer({
 }) {
   const [pdfjs, setPdfjs] = useState(() => pdfUsesPdfjs())
   const fallBack = useCallback(() => setPdfjs(true), [])
-  if (pdfjs) {
+  if (forcePdfJs || pdfjs) {
     return <PdfJsRenderer ref={ref} readRef={readRef} title={title} onViewChange={onViewChange} onRendered={onRendered} onFailure={onFailure} onDownload={onDownload} onOpenWith={onOpenWith} t={t} />
   }
   return <PDFIframeRenderer ref={ref} readRef={readRef} title={title} topInset={topInset} onRendered={onRendered} onUnavailable={fallBack} />

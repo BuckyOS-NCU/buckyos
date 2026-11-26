@@ -75,6 +75,8 @@ pub struct Caller {
     /// is the macro identity — its own permissions bounded by the wish's group when bound with `intersection`
     /// (权限需求 §4.5 “读取也按宏身份”).
     pub macro_of: Option<String>,
+    verified_workspace_account: bool,
+    live_ncu_pbl_teacher: bool,
 }
 
 /// Member spec: every unrestricted account of the Zone.
@@ -98,7 +100,7 @@ pub enum MemberMatch {
 impl Caller {
     fn with_class(principal: &str, class: CallerClass) -> Caller {
         Caller { principal: principal.to_string(), app_id: None, class, kind: None, run_scope: None, auth_method: None, contacts: BTreeSet::new(), unconfirmed: BTreeSet::new(),
-                 acting_for: None, publication: None, macro_of: None }
+                 acting_for: None, publication: None, macro_of: None, verified_workspace_account: false, live_ncu_pbl_teacher: false }
     }
     /// The holder of a run token (M3): acts as the run's principal, for that run only.
     pub fn run_token(principal: &str, run_id: &str) -> Caller {
@@ -121,6 +123,44 @@ impl Caller {
     pub fn account(principal: &str, restricted: bool) -> Caller {
         Self::with_class(principal, CallerClass::Account { restricted, did: None, groups: Vec::new() })
     }
+    pub fn verified_account(principal: &str, restricted: bool, live_ncu_pbl_teacher: bool) -> Caller {
+        Caller {
+            verified_workspace_account: true,
+            live_ncu_pbl_teacher: restricted && live_ncu_pbl_teacher,
+            ..Self::account(principal, restricted)
+        }
+    }
+
+    /// Only the verified interactive account may consume classroom grants.
+    pub fn is_direct_workspace_account(&self) -> bool {
+        self.verified_workspace_account
+            && matches!(self.class, CallerClass::Account { .. })
+            && self.acting_for.is_none()
+            && self.run_scope.is_none()
+            && self.macro_of.is_none()
+    }
+
+    pub fn has_live_ncu_pbl_teacher(&self) -> bool {
+        self.live_ncu_pbl_teacher
+            && matches!(self.class, CallerClass::Account { restricted: true, .. })
+            && self.acting_for.is_none()
+            && self.run_scope.is_none()
+            && self.macro_of.is_none()
+    }
+
+    pub fn is_verified_workspace_owner_session(&self) -> bool {
+        self.has_live_ncu_pbl_teacher()
+            || (self.verified_workspace_account
+                && matches!(self.class, CallerClass::Account { restricted: false, .. })
+                && self.acting_for.is_none()
+                && self.run_scope.is_none()
+                && self.macro_of.is_none())
+    }
+
+    pub fn may_create_workspace(&self) -> bool {
+        self.may_own() || self.has_live_ncu_pbl_teacher()
+    }
+
     pub fn external(did: &str) -> Caller {
         Self::with_class(did, CallerClass::External { did: did.to_string() })
     }
@@ -209,6 +249,8 @@ impl Caller {
     /// The same caller before the service settled its group and contact memberships (they are settled again).
     pub fn without_memberships(&self) -> Caller {
         let mut c = self.clone();
+        c.verified_workspace_account = false;
+        c.live_ncu_pbl_teacher = false;
         c.contacts.clear();
         c.unconfirmed.clear();
         if let CallerClass::Account { groups, .. } = &mut c.class {
@@ -423,8 +465,12 @@ pub fn derive_origin(caller: &Caller, opts: &CommitOpts, has_run: bool) -> &'sta
     }
 }
 
-/// Keep only the rows of entities `can_read` admits (the replica bootstrap applies the same rule).
-pub(crate) fn filter_rows(rows: &mut Value, can_read: &mut dyn FnMut(&str) -> WsResult<bool>) -> WsResult<()> {
+/// Filter replica rows and record target visibility for the annotations at this point in history.
+pub(crate) fn filter_rows(
+    rows: &mut Value,
+    can_read: &mut dyn FnMut(&str) -> WsResult<bool>,
+    target_visible: &dyn Fn(Option<&Value>) -> WsResult<bool>,
+) -> WsResult<BTreeMap<String, bool>> {
     let keep = |table: &str, key: &str, rows: &mut Value, can_read: &mut dyn FnMut(&str) -> WsResult<bool>| -> WsResult<()> {
         if let Some(a) = rows.get_mut(table).and_then(Value::as_array_mut) {
             let mut out = Vec::with_capacity(a.len());
@@ -445,7 +491,21 @@ pub(crate) fn filter_rows(rows: &mut Value, can_read: &mut dyn FnMut(&str) -> Ws
     keep("richtext_updates", "entity_id", rows, can_read)?;
     keep("refs", "src_entity_id", rows, can_read)?;
     keep("refs_deleted", "src_entity_id", rows, can_read)?;
-    Ok(())
+    let mut targets = BTreeMap::new();
+    for row in rows.get_mut("entities").and_then(Value::as_array_mut).into_iter().flatten().filter(|r| r["type_id"] == TYPE_ANNOTATION) {
+        let raw = &row["payload_json"];
+        let mut payload: JsonMap = match raw.as_str() {
+            Some(text) => serde_json::from_str(text),
+            None => serde_json::from_value(raw.clone()),
+        }.map_err(|e| WsError::invalid_schema(format!("annotation payload_json: {e}")))?;
+        let visible = target_visible(payload.get("target"))?;
+        if !visible && payload.remove("context").is_some() {
+            let projected = Value::Object(payload);
+            row["payload_json"] = if raw.is_string() { Value::String(projected.to_string()) } else { projected };
+        }
+        targets.insert(row["entity_id"].as_str().unwrap_or("").to_string(), visible);
+    }
+    Ok(targets)
 }
 
 fn add_usage(conn: &Connection, category: &str, bytes: i64) -> WsResult<()> {
@@ -600,6 +660,8 @@ impl Workspace {
         if get("format_version")? != FORMAT_VERSION {
             return Err(WsError::new(Code::UnsupportedVersion, "format_version is not supported"));
         }
+        doc.execute_batch(crate::schema::RECORD_ORDER_INDEX).map_err(db_err)?;
+        doc.execute_batch(crate::approval_worklog::DDL).map_err(db_err)?;
         let session_events: bool = doc
             .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_events'", [], |_| Ok(true))
             .optional()
@@ -1122,6 +1184,9 @@ impl Workspace {
                    "cloned_from": meta_get(&self.doc, "cloned_from")?.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
                    "show_lock": self.show_lock().map(|l| l.to_json()), "purpose": self.purpose(),
                    "acl_rev": self.acl_rev(), "anonymous": self.anonymous()?, "judged_as": access.principal });
+        if self.has_recorded_student_seat(caller)? {
+            info["classroom_audited_download"] = json!(true);
+        }
         if access.is_owner() {
             info["owner"] = json!(true);
         }
@@ -1156,14 +1221,13 @@ impl Workspace {
 
     /// `doc.commit`: always answers with the three-state result.
     pub fn commit(&mut self, req: &Value, caller: &Caller, opts: &CommitOpts) -> Value {
-        let out = match self.commit_inner(req, caller, opts, false) {
-            Ok(v) => v,
-            Err(f) => f.to_json(),
-        };
+        let result = self.commit_inner(req, caller, opts, false);
         if let Some(key) = req.get("idempotency_key").and_then(Value::as_str) {
-            self.consume_staged(&caller.principal, key);
+            if result.is_ok() || self.require_ws_any(caller).is_ok() {
+                self.consume_staged(&caller.principal, key);
+            }
         }
-        out
+        result.unwrap_or_else(|failure| failure.to_json())
     }
 
     /// `doc.prepare`: steps 1–3 and the read-only part of step 4. Nothing is stored.
@@ -1523,6 +1587,7 @@ impl Workspace {
                     .map_err(db_err)?;
             }
         }
+        self.record_approval_commit(&tx, caller, opts, seq, now, ops)?;
         meta_set(&tx, "head_seq", &seq.to_string())?;
         meta_set(&tx, "head_commit_id", commit_id)?;
         if fail_in_txn {
@@ -1717,6 +1782,61 @@ impl Workspace {
 
     // ---- change stream ----
 
+    /// The row delta gives the final target. Walk back through re-anchors in this commit so a
+    /// context-only edit is checked against the target it had when the edit was made.
+    fn filter_annotation_ops(
+        &self, ctx: &dyn ReadCtx, seq: u64, ops: &mut [(usize, Value)], mut targets: BTreeMap<String, bool>,
+        target_visible: &dyn Fn(Option<&Value>) -> WsResult<bool>,
+    ) -> WsResult<()> {
+        for (index, op) in ops.iter_mut().rev() {
+            if op["op"] == "entity.create" && op["type_id"] == TYPE_ANNOTATION {
+                if let Some(payload) = op["payload"].as_object_mut() {
+                    if !target_visible(payload.get("target"))? {
+                        payload.remove("context");
+                    }
+                }
+                continue;
+            }
+            if !matches!(op["op"].as_str(), Some("entity.set_keys" | "entity.unset_keys")) {
+                continue;
+            }
+            let id = op["entity_id"].as_str().unwrap_or("").to_string();
+            let Some(keys) = op["keys"].as_array_mut() else { continue };
+            if !keys.iter().any(|k| matches!(k["key"].as_str(), Some("context" | "target"))) {
+                continue;
+            }
+            // Older commits may have only operations. The entity type is immutable, but the head's
+            // target says nothing about that earlier context.
+            if !targets.contains_key(&id) && !ctx.entity(&id)?.is_some_and(|e| e.type_id == TYPE_ANNOTATION) {
+                continue;
+            }
+            let target_edits = keys.iter().filter(|k| k["key"] == "target").count();
+            let visible = match keys.iter().rev().find(|k| k["key"] == "target") {
+                Some(k) => target_visible(k.get("value"))?,
+                None => targets.get(&id).copied().unwrap_or(false),
+            };
+            if !visible {
+                for k in keys.iter_mut().filter(|k| k["key"] == "context" && k.get("value").is_some()) {
+                    k["value"] = Value::Null;
+                }
+            }
+            if target_edits > 0 && *index > 0 {
+                // The inverse written alongside this exact operation records its previous target.
+                let inverse: Option<String> = self.doc.query_row(
+                    "SELECT inverse_json FROM commit_ops WHERE seq = ?1 AND op_index = ?2", params![seq, *index], |r| r.get(0)
+                ).map_err(db_err)?;
+                let inverse: Vec<Value> = serde_json::from_str(inverse.as_deref().unwrap_or("[]")).map_err(|e| WsError::io(e.to_string()))?;
+                let before = inverse.iter().flat_map(|o| o["keys"].as_array().into_iter().flatten()).find(|k| k["key"] == "target");
+                let before_visible = match before {
+                    Some(k) if target_edits == 1 => target_visible(k.get("value"))?,
+                    _ => false,
+                };
+                targets.insert(id, before_visible);
+            }
+        }
+        Ok(())
+    }
+
     /// `doc.get_changes`: the only authoritative propagation mechanism. Entries
     /// are filtered by the caller's *current* read permission; a fully filtered
     /// commit still yields an empty event so `seq` stays contiguous.
@@ -1755,13 +1875,13 @@ impl Workspace {
             readable.insert(id.to_string(), ok);
             Ok(ok)
         };
-        let mut ops_st = self.doc.prepare_cached("SELECT op_json, touched_json FROM commit_ops WHERE seq = ?1 ORDER BY op_index").map_err(db_err)?;
+        let mut ops_st = self.doc.prepare_cached("SELECT op_index, op_json, touched_json FROM commit_ops WHERE seq = ?1 ORDER BY op_index").map_err(db_err)?;
         let (mut events, mut bytes) = (Vec::new(), 0usize);
         for (seq, commit_id, principal, origin, run_id, undoes, idem_key, accepted_at, undo_group) in commits.into_iter().take(limit) {
-            let rows: Vec<(String, String)> =
-                ops_st.query_map([seq], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db_err)?.collect::<rusqlite::Result<_>>().map_err(db_err)?;
+            let rows: Vec<(usize, String, String)> =
+                ops_st.query_map([seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db_err)?.collect::<rusqlite::Result<_>>().map_err(db_err)?;
             let (mut touched_out, mut ops_out) = (Vec::new(), Vec::new());
-            for (op_json, touched_json) in rows {
+            for (op_index, op_json, touched_json) in rows {
                 let touched: Vec<Value> = serde_json::from_str(&touched_json).map_err(|e| WsError::io(e.to_string()))?;
                 let op: Value = serde_json::from_str(&op_json).map_err(|e| WsError::io(e.to_string()))?;
                 let primary = op.get("entity_id").or_else(|| op.get("source_id")).and_then(Value::as_str).unwrap_or("").to_string();
@@ -1774,7 +1894,7 @@ impl Workspace {
                 }
                 if with_ops && any && can_read(&primary)? {
                     bytes += op_json.len();
-                    ops_out.push(op);
+                    ops_out.push((op_index, op));
                 }
             }
             let mut ev = json!({ "seq": seq });
@@ -1782,15 +1902,18 @@ impl Workspace {
                 ev = json!({ "seq": seq, "commit_id": commit_id, "origin": origin, "run_id": run_id, "undoes": undoes,
                              "undo_group": undo_group, "author": principal, "accepted_at": accepted_at, "touched": touched_out });
                 if with_ops {
-                    ev["ops"] = json!(ops_out);
+                    let target_visible = |target: Option<&Value>| aiworkspace_core::anchor::target_visible(&ctx, target, &|e| access.can_read(&ctx, e));
+                    let mut targets = BTreeMap::new();
                     // the row delta, restricted to what the caller may read (D20)
                     let delta: Option<String> = self.doc.query_row("SELECT rows_json FROM commit_deltas WHERE seq = ?1", [seq], |r| r.get(0)).optional().map_err(db_err)?;
                     if let Some(d) = delta {
                         let mut rows: Value = serde_json::from_str(&d).map_err(|e| WsError::io(e.to_string()))?;
                         bytes += d.len();
-                        filter_rows(&mut rows, &mut can_read)?;
+                        targets = filter_rows(&mut rows, &mut can_read, &target_visible)?;
                         ev["rows"] = rows;
                     }
+                    self.filter_annotation_ops(&ctx, seq, &mut ops_out, targets, &target_visible)?;
+                    ev["ops"] = Value::Array(ops_out.into_iter().map(|(_, op)| op).collect());
                 }
             }
             if principal == caller.principal {

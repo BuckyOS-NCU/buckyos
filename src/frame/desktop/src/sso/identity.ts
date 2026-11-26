@@ -29,6 +29,13 @@ export function isRestrictedIdentity(identity: CurrentIdentity | null | undefine
   return !!identity && identity.kind !== 'anonymous' && identity.restricted
 }
 
+/** Campus auth methods originate in the NCU fork and are preserved by the SDK at runtime. */
+export function isSchoolAccount(identity: CurrentIdentity): identity is Extract<CurrentIdentity, { kind: 'account' }> {
+  if (identity.kind !== 'account') return false
+  const method = String(identity.auth_method)
+  return method === 'ncu_cas' || method === 'ncu_pbl_teacher'
+}
+
 export function identityDisplayName(identity: CurrentIdentity): string {
   switch (identity.kind) {
     case 'account':

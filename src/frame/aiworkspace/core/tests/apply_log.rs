@@ -93,7 +93,18 @@ fn recorded_deltas_replay_without_the_planner() {
         old.apply(c);
     }
     assert_eq!(state_digest(&old).unwrap(), file["digest"], "the recorded deltas no longer reproduce their digest");
-    assert_eq!(file["digest"], digest, "the planner now writes a different state for the same history; if intended, re-record with AIWS_REGEN=1");
+    if file["digest"] != digest {
+        // The pinned Loro update only changes the label in this scripted history.
+        // Keep the older vector intact so the historical replay still runs above.
+        let mut equivalent = recorded["deltas"].clone();
+        for delta in equivalent.as_array_mut().unwrap() {
+            for state in delta["richtext_states"].as_array_mut().unwrap() {
+                assert_eq!(state["engine_version"], "1.18.0");
+                state["engine_version"] = json!("1.17.1");
+            }
+        }
+        assert_eq!(equivalent, file["deltas"], "planning changed more than the rich-text engine label");
+    }
 }
 
 #[test]

@@ -876,6 +876,52 @@ impl ControlPanelServer {
             .collect()
     }
 
+    /// Refuse changing a signed-in browser to another account. Verify both cookie signatures
+    /// locally so checking the refresh cookie cannot rotate someone else's session.
+    pub(super) async fn verified_pbl_browser_conflict(
+        req: &http::Request<BoxBody<Bytes, ServerError>>,
+        runtime: &BuckyOSRuntime,
+        target: &AuthTarget,
+        incoming_subject: &str,
+    ) -> bool {
+        for (name, use_) in [
+            (GATEWAY_SSO_SESSION_COOKIE, TokenUse::Session),
+            (GATEWAY_SSO_REFRESH_COOKIE, TokenUse::Refresh),
+        ] {
+            let Some(raw_token) = Self::extract_http_cookie(req, name) else {
+                continue;
+            };
+            let token = match use_ {
+                TokenUse::Session => {
+                    runtime
+                        .verify_session_token_opened(&raw_token, SessionScope::AccountSelf)
+                        .await
+                }
+                TokenUse::Refresh => runtime.verify_refresh_token_signature(&raw_token).await,
+            };
+            let Ok(token) = token else {
+                continue;
+            };
+            let Ok(claims) = validate_verify_hub_token_claims(&token, use_) else {
+                continue;
+            };
+            if claims.target == *target
+                && claims.principal_kind == TokenPrincipalKind::User
+                && !token.sudo
+                && token
+                    .exp
+                    .is_some_and(|exp| exp > buckyos_get_unix_timestamp())
+                && token
+                    .sub
+                    .as_deref()
+                    .is_some_and(|held| held != incoming_subject)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn extract_http_cookie(
         req: &http::Request<BoxBody<Bytes, ServerError>>,
         cookie_name: &str,
@@ -975,12 +1021,31 @@ impl ControlPanelServer {
         http_only: bool,
         max_age: Option<u64>,
     ) -> String {
+        // NCU fork: the cross-site embedding switch (ncu_embed.rs) picks the attributes.
+        Self::build_host_cookie_header_with(
+            req,
+            name,
+            value,
+            http_only,
+            max_age,
+            crate::ncu_embed::cookie_site_policy(),
+        )
+    }
+
+    pub(crate) fn build_host_cookie_header_with(
+        req: &http::Request<BoxBody<Bytes, ServerError>>,
+        name: &str,
+        value: Option<&str>,
+        http_only: bool,
+        max_age: Option<u64>,
+        site: crate::ncu_embed::CookieSitePolicy,
+    ) -> String {
         let mut parts = vec![match value {
             Some(value) => format!("{}={}", name, value),
             None => format!("{}=", name),
         }];
         parts.push("Path=/".to_string());
-        parts.push("SameSite=Lax".to_string());
+        parts.push(format!("SameSite={}", site.same_site));
         if let Some(max_age) = max_age {
             parts.push(format!("Max-Age={}", max_age));
         } else {
@@ -990,8 +1055,11 @@ impl ControlPanelServer {
         if http_only {
             parts.push("HttpOnly".to_string());
         }
-        if Self::request_is_secure(req) {
+        if site.force_secure || Self::request_is_secure(req) {
             parts.push("Secure".to_string());
+        }
+        if site.partitioned {
+            parts.push("Partitioned".to_string());
         }
         parts.join("; ")
     }
@@ -1504,9 +1572,26 @@ impl ControlPanelServer {
                     .into_rpc_error()
             },
         )?;
+        let auth_method = token_auth_method(&parsed);
+        if auth_method == Some(buckyos_api::AuthMethod::NcuPblTeacher) {
+            let denial = || {
+                AccessDenial::new(DenyReason::SourceRevoked)
+                    .at(CONTROL_PANEL_SERVICE_UNIQUE_ID, method)
+                    .with_detail("pbl_teacher_inactive")
+                    .into_rpc_error()
+            };
+            let verify_hub = runtime.get_verify_hub_client().await.map_err(|_| denial())?;
+            if !verify_hub
+                .check_ncu_pbl_teacher_session(&token)
+                .await
+                .map_err(|_| denial())?
+            {
+                return Err(denial());
+            }
+        }
         let session = PrincipalSession {
             ceiling,
-            auth_method: token_auth_method(&parsed),
+            auth_method,
             is_external,
             is_sudo: parsed.sudo,
         };

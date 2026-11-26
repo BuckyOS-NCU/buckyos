@@ -148,6 +148,18 @@ pub struct SqlCtx<'a> {
 }
 
 impl SqlCtx<'_> {
+    pub(crate) fn children_limited(&self, parent: &str, limit: i64) -> WsResult<Vec<TreeEdge>> {
+        let mut st = self
+            .conn
+            .prepare_cached(
+                "SELECT child_id, parent_id, order_key, placement_json, struct_rev FROM tree_edges \
+                 WHERE parent_id = ?1 ORDER BY order_key, child_id LIMIT ?2",
+            )
+            .map_err(db_err)?;
+        let rows = st.query_map(params![parent, limit], edge_row).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+        rows.into_iter().map(finish_edge).collect()
+    }
+
     pub fn all_entity_ids(&self) -> WsResult<Vec<String>> {
         let mut st = self.conn.prepare_cached("SELECT entity_id FROM entities ORDER BY entity_id").map_err(db_err)?;
         let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(db_err)?;
@@ -220,15 +232,7 @@ impl ReadCtx for SqlCtx<'_> {
         st.query_row([child], edge_row).optional().map_err(db_err)?.map(finish_edge).transpose()
     }
     fn children(&self, parent: &str) -> WsResult<Vec<TreeEdge>> {
-        let mut st = self
-            .conn
-            .prepare_cached(
-                "SELECT child_id, parent_id, order_key, placement_json, struct_rev FROM tree_edges \
-                 WHERE parent_id = ?1 ORDER BY order_key, child_id",
-            )
-            .map_err(db_err)?;
-        let rows = st.query_map([parent], edge_row).map_err(db_err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-        rows.into_iter().map(finish_edge).collect()
+        self.children_limited(parent, -1)
     }
     fn field(&self, source: &str, field: &str) -> WsResult<Option<FieldRow>> {
         let mut st = self

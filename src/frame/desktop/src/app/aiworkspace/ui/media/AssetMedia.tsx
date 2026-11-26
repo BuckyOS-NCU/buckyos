@@ -2,7 +2,7 @@
  * PDF's first page, an album cover) or, without one, its icon card. A video or sound this browser plays is played in
  * place by the system Preview component; everything else opens the preview on top of the workspace. */
 
-import { useEffect, useState, type ReactNode } from 'react'
+import { useContext, useEffect, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { File as FileIcon, FileText, Film, Music, Play, X } from 'lucide-react'
 import { ContentPreview } from '../../../../components/ContentPreview'
@@ -19,6 +19,7 @@ import { useSession } from '../../session/context'
 import { SessionMediaPlayer } from '../../session/media'
 import { BroadcastMedia, broadcastOf } from './BroadcastMedia'
 import { printAssetUrl } from '../../print/renderer/assets'
+import { ApprovalReadOnlyContext } from '../../approval/readOnly'
 
 /** A stored picture (the asset itself or its poster) as a blob URL: the asset route needs the session token. */
 function usePictureUrl(store: WorkspaceStore, objectId: string | undefined, mediaType: string) {
@@ -107,7 +108,7 @@ function PlainAssetMedia({ asset, cellId, fit, activated = false, onActivate, on
   }
   useEffect(() => { if (wanted && cellId) consumeIntent(cellId, wanted) }, [wanted, cellId])
   const picture = usePictureUrl(store, kind === 'image' ? payload.object_id : payload.poster, kind === 'image' ? mediaType : '')
-  const current = assetSource(store, payload, name)
+  const current = assetSource(store, payload, name, asset.entity_id)
   const play = () => { if (onActivate) onActivate(); else setPlaying(true) }
   const stop = () => { setPlaying(false); onDone?.() }
   const closePreview = () => { setPreviewing(false); onDone?.() }
@@ -160,6 +161,7 @@ function PlainAssetMedia({ asset, cellId, fit, activated = false, onActivate, on
  * of the same Surface. */
 function MediaPreviewDialog({ store, cellId, source, name, onClose }: { store: WorkspaceStore; cellId: string | null; source: ContentRef; name: string; onClose: () => void }) {
   const { t } = useAiwsText()
+  const approvalReadOnly = useContext(ApprovalReadOnlyContext)
   const [host, setHost] = useState<HTMLElement | null>(null)
   const [session] = useState(() => (cellId ? surfaceMediaSession(store, cellId, source) : undefined))
   const bindAnchor = (element: HTMLSpanElement | null) => { if (element) setHost(element.closest<HTMLElement>('.aiws-root') ?? document.body) }
@@ -172,7 +174,7 @@ function MediaPreviewDialog({ store, cellId, source, name, onClose }: { store: W
           data-role="editor" data-testid="aiws-media-preview"
           onPointerDown={stop} onDoubleClick={stop} onContextMenu={stop} onWheel={stop}
           onClick={(event) => { if (event.target === event.currentTarget) onClose() }}>
-          <ContentPreview source={source} session={session} uiMode="visible" autoFocus prefetchAdjacent={false} onRequestExit={onClose} className="aiws-media-dialog-body" />
+          <ContentPreview source={source} session={session} uiMode="visible" autoFocus prefetchAdjacent={false} allowExport={!approvalReadOnly} forcePdfJs={approvalReadOnly} onRequestExit={onClose} className="aiws-media-dialog-body" />
         </div>,
         host,
       )}

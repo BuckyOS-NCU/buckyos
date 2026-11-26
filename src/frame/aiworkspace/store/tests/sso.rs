@@ -366,3 +366,83 @@ fn restore_keeps_permissions_and_entries() {
     assert_eq!(caps(&ws, &guest), json!(["read"]));
     assert!(ws.acl_audit(&alice(), 0, 100).unwrap()["items"].as_array().unwrap().iter().any(|i| i["action"] == "entry.join"), "the record moves over too");
 }
+
+
+#[test]
+fn pbl_workspace_creation_does_not_grant_stale_or_delegated_ownership() {
+    let env = env();
+    let account = "ncuteacher";
+    let ordinary_cas = Caller::verified_account(account, true, false);
+    let live = Caller::verified_account(account, true, true);
+    let standalone_owner = Caller::verified_account(account, false, false);
+    let other_teacher = Caller::verified_account("another-teacher", true, true);
+
+    assert!(!live.may_own());
+    assert!(live.may_create_workspace());
+    assert!(!ordinary_cas.may_create_workspace());
+    assert_eq!(env.svc.create_workspace(&ordinary_cas, "Denied", None).unwrap_err().code, Code::PermissionDenied);
+    assert_eq!(env.svc.ensure_workspace(&live, "ensure", None).unwrap_err().code, Code::PermissionDenied);
+
+    let created = env.svc.create_workspace(&live, "Classroom", None).unwrap();
+    let id = created["workspace_id"].as_str().unwrap();
+    let listed = env.svc.list_workspaces(&live).unwrap();
+    assert_eq!(listed["can_create_workspace"], true);
+    assert_eq!(listed["workspaces"][0]["workspace_id"], id);
+    assert_eq!(env.svc.list_workspaces(&ordinary_cas).unwrap()["workspaces"], json!([]));
+    assert_eq!(env.svc.list_workspaces(&ordinary_cas).unwrap()["can_create_workspace"], false);
+    assert_eq!(env.svc.list_workspaces(&other_teacher).unwrap()["workspaces"], json!([]));
+    assert_eq!(env.svc.clone_workspace(&live, id).unwrap_err().code, Code::PermissionDenied);
+
+    env.svc.close(id);
+    let handle = env.svc.workspace(id).unwrap();
+    let mut ws = handle.lock().unwrap();
+    assert!(ws.require_owner(&live).is_ok());
+    assert!(ws.require_owner(&standalone_owner).is_ok());
+    let write = json!({
+        "protocol_version": aiworkspace_core::model::PROTOCOL_VERSION,
+        "workspace_id": id, "epoch": created["epoch"], "idempotency_key": "pbl-write",
+        "operations": [{
+            "op": "entity.create", "entity_id": "notes", "type_id": "buckyos.richtext",
+            "parent_id": "data", "order_key": "1", "payload": {}
+        }]
+    });
+    let saved = ws.commit(&write, &live, &Default::default());
+    assert_eq!(saved["status"], "accepted", "{saved}");
+    let staged = ws.stage_asset(&live, b"attachment").unwrap();
+    let object = staged["object_id"].as_str().unwrap();
+    assert!(ws.can_read_asset(&live, object).unwrap());
+
+    let delegated = Caller::delegated(&live.identity_json(), account);
+    let agent = Caller::agent_of("did:bns:classroom-agent", account);
+    let owner_service = Caller::internal(account);
+    for refused in [&ordinary_cas, &other_teacher, &delegated, &agent, &owner_service] {
+        not_found(&ws, refused);
+        assert!(ws.require_owner(refused).is_err());
+        assert!(ws.can_read_asset(refused, object).is_err());
+        let refused_write = ws.commit(&write, refused, &Default::default());
+        assert_eq!(refused_write["status"], "rejected", "{refused_write}");
+    }
+    let mut staged_write = write.clone();
+    staged_write["idempotency_key"] = json!("pbl-staged-write");
+    staged_write["operations"][0]["entity_id"] = json!("staged-notes");
+    let part = ws.stage_commit(&live, &json!({
+        "workspace_id": id,
+        "epoch": created["epoch"],
+        "idempotency_key": staged_write["idempotency_key"],
+        "part": 0,
+        "operations": staged_write["operations"]
+    })).unwrap();
+    staged_write["staged"] = json!([part["digest"]]);
+    staged_write["operations"] = json!([]);
+    let refused = ws.commit(&staged_write, &ordinary_cas, &Default::default());
+    assert_eq!(refused["status"], "rejected", "{refused}");
+    let accepted = ws.commit(&staged_write, &live, &Default::default());
+    assert_eq!(accepted["status"], "accepted", "the refused session consumed the live session's staged part: {accepted}");
+    drop(ws);
+
+    let existing = env.svc.create_workspace(&standalone_owner, "Ordinary", None).unwrap();
+    let other_handle = env.svc.workspace(existing["workspace_id"].as_str().unwrap()).unwrap();
+    let ordinary = other_handle.lock().unwrap();
+    assert!(ordinary.require_owner(&standalone_owner).is_ok());
+    assert!(ordinary.require_owner(&live).is_ok());
+}

@@ -12,6 +12,7 @@ import { AiwsClient } from '../api/client'
 import { resolveTransport } from '../api/transport'
 import { openWorkspaceById } from '../launch'
 import { loginUrl, targetOf, workspaceIdOfHost, WORKSPACE_ROUTE, zoneOrigin } from '../links'
+import { projectCanvasChoice } from '../projectCanvasChoice'
 import { SessionPage } from '../session/SessionPage'
 
 /** This origin's session is ended here (`/sso_logout` of this host), then the Zone host asks to sign in again. */
@@ -25,8 +26,13 @@ async function signOut() {
 }
 
 /** Another workspace (a clone, a New dialog's pick): its own origin; the list when the service names no page. */
+function workspaceListUrl() {
+  const state = projectCanvasChoice()
+  return `${zoneOrigin()}${WORKSPACE_ROUTE}${state ? `#pbl_canvas=${state}` : ''}`
+}
+
 async function goToWorkspace(workspaceId: string) {
-  if (!(await openWorkspaceById(workspaceId))) window.location.assign(`${zoneOrigin()}${WORKSPACE_ROUTE}`)
+  if (!(await openWorkspaceById(workspaceId))) window.location.assign(workspaceListUrl())
 }
 
 /** Arriving from an entry link (`?entry=<entry id>`): the visitor joins the entry's group before the workspace opens
@@ -72,7 +78,7 @@ export function StandalonePage() {
     workspaceId,
     target,
     navigate: (id) => {
-      if (id === null) window.location.assign(`${zoneOrigin()}${WORKSPACE_ROUTE}`)
+      if (id === null) window.location.assign(workspaceListUrl())
       else if (id !== workspaceId) void goToWorkspace(id)
     },
     // the address keeps naming the workspace; what was asked for has been opened
@@ -83,7 +89,7 @@ export function StandalonePage() {
       window.history.replaceState(window.history.state, '', url)
     },
     onShown: (shown) => setShownTitle(shown?.title ?? null),
-    home: () => window.location.assign(`${zoneOrigin()}/`),
+    home: () => window.location.assign(projectCanvasChoice() ? workspaceListUrl() : `${zoneOrigin()}/`),
     signOut,
   }
 

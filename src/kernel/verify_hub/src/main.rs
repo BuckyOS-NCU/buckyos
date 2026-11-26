@@ -21,6 +21,7 @@ use name_lib::*;
 mod directory;
 mod family_store;
 mod federation;
+mod ncu_pbl;
 
 use directory::{SystemConfigDirectory, ZoneDirectory};
 use family_store::{
@@ -36,6 +37,7 @@ use federation::{
 // Session token: short-lived, used for API requests
 const SESSION_TOKEN_EXPIRE_SECONDS: u64 = 15 * 60; // 15 minutes
 const SUDO_SESSION_TOKEN_EXPIRE_SECONDS: u64 = 3 * 60;
+const NCU_CAS_SESSION_MAX_SECONDS: u64 = 8 * 60 * 60;
 const SUDO_SESSION_TOKEN_MAX_EXPIRE_SECONDS: u64 = 30 * 60;
 // Refresh token: long-lived, used to obtain new token pairs
 const REFRESH_TOKEN_EXPIRE_SECONDS: u64 = 7 * 24 * 3600; // 7 days
@@ -366,14 +368,19 @@ fn require_control_panel_target(target: &AuthTarget, method: &str) -> Result<Aut
 /// Only the Control Panel service may call `method`: /kapi/verify-hub is reachable from
 /// browsers, and these methods return token pairs or revoke sessions on CP's decision.
 async fn authorize_control_panel_caller(caller_token: Option<&str>, method: &str) -> Result<()> {
-    let denied = || RPCErrors::NoPermission(format!("only control-panel may call {method}"));
+    authorize_target_service(caller_token, &[control_panel_target()?], method).await
+}
+
+async fn authorize_target_service(
+    caller_token: Option<&str>,
+    allowed_targets: &[AuthTarget],
+    method: &str,
+) -> Result<()> {
+    let denied = || RPCErrors::NoPermission(format!("service is not authorized for {method}"));
     let caller_token = caller_token.ok_or_else(denied)?;
     let payload = verify_verify_hub_jwt(caller_token, None)
         .await
-        .map_err(|error| {
-            warn!("{} caller token rejected: {}", method, error);
-            denied()
-        })?;
+        .map_err(|_| denied())?;
     let caller: RPCSessionToken = serde_json::from_value(payload).map_err(|_| denied())?;
     let claims =
         validate_verify_hub_token_claims(&caller, TokenUse::Session).map_err(|_| denied())?;
@@ -382,11 +389,31 @@ async fn authorize_control_panel_caller(caller_token: Option<&str>, method: &str
             claims.principal_kind,
             SessionPrincipalKind::System | SessionPrincipalKind::Device
         )
-        || claims.target != control_panel_target()?
+        || !allowed_targets.contains(&claims.target)
     {
         return Err(denied());
     }
     Ok(())
+}
+
+fn aiworkspace_target() -> Result<AuthTarget> {
+    let service_id = AIWORKSPACE_UNIQUE_ID
+        .parse()
+        .map_err(RPCErrors::ParseRequestError)?;
+    Ok(AuthTarget::system(service_id))
+}
+
+fn pbl_teacher_claims() -> FamilyClaims {
+    FamilyClaims::restricted(
+        AuthMethod::NcuPblTeacher,
+        [SessionScope::AccountSelf, SessionScope::AiWorkspace],
+    )
+}
+
+fn pbl_role_denied() -> RPCErrors {
+    AccessDenial::new(DenyReason::SourceRevoked)
+        .with_detail("pbl_teacher_inactive")
+        .into_rpc_error()
 }
 
 /// `None` when the source cannot prove a session (bad signature, expired, malformed):
@@ -895,6 +922,8 @@ struct HubState {
     federation_codes: FederationCodes,
     app_login_codes: AppLoginCodes,
     last_family_gc: AtomicU64,
+    ncu_pbl: Arc<dyn ncu_pbl::GrantStatusChecker>,
+    ncu_pbl_enrollments: ncu_pbl::PendingEnrollments,
 }
 
 /// App login codes already exchanged (EXT-09): one exchange per code; a retry with the
@@ -976,6 +1005,8 @@ impl VerifyHubServer {
                 custody,
                 federation_codes: FederationCodes::default(),
                 app_login_codes: AppLoginCodes::default(),
+                ncu_pbl: Arc::new(ncu_pbl::Backchannel),
+                ncu_pbl_enrollments: ncu_pbl::PendingEnrollments::default(),
                 last_family_gc: AtomicU64::new(0),
             }),
         }
@@ -1041,6 +1072,22 @@ impl VerifyHubServer {
         reject_root_user_settings(&user_settings)?;
         require_active_user_settings(&user_settings)?;
         Ok(user_settings)
+    }
+
+    async fn ncu_cas_account_key(
+        &self,
+        request: &NcuCasLoginRequest,
+        user_id: &str,
+    ) -> Result<String> {
+        let account = self.active_account(user_id).await?;
+        if !request.matches_account(&account) {
+            return Err(account_state_denied());
+        }
+        self.state
+            .zone
+            .ncu_cas_account_key(request, user_id)
+            .await?
+            .ok_or_else(account_state_denied)
     }
 
     async fn resolve_user_auth_target(
@@ -1163,6 +1210,132 @@ impl VerifyHubServer {
         Ok((user_settings, session_key))
     }
 
+    async fn issue_pbl_teacher(
+        &self,
+        identity_digest: String,
+        grant: String,
+        expires_at: u64,
+        school_id: Option<&str>,
+    ) -> Result<TokenPair> {
+        let now = buckyos_get_unix_timestamp();
+        if expires_at <= now || !is_ncu_handoff_token(&grant) {
+            return Err(pbl_role_denied());
+        }
+        let mut binding = NcuCasLoginRequest {
+            identity_digest,
+            user_type: UserType::Limited,
+        };
+        let user_id = binding.user_id().ok_or_else(account_state_denied)?;
+        binding.user_type = self.active_account(&user_id).await?.user_type;
+        let account_key = self.ncu_cas_account_key(&binding, &user_id).await?;
+        let active = match school_id {
+            Some(id) => self.state.ncu_pbl.enrollment_grant_active(&grant, id).await,
+            None => self.state.ncu_pbl.grant_active(&grant).await,
+        };
+        if !active {
+            return Err(pbl_role_denied());
+        }
+        let absolute_exp = expires_at.min(now + NCU_CAS_SESSION_MAX_SECONDS);
+        if absolute_exp <= buckyos_get_unix_timestamp() {
+            return Err(pbl_role_denied());
+        }
+        self.issue_family(
+            SessionSubject {
+                subject: user_id,
+                principal_kind: SessionPrincipalKind::User,
+                target: control_panel_target()?,
+                session_id: rand::random(),
+                claims: pbl_teacher_claims(),
+            },
+            Some(SessionSource::NcuPblTeacher {
+                identity_digest: binding.identity_digest,
+                user_type: binding.user_type,
+                account_key,
+                grant,
+            }),
+            Some(absolute_exp),
+        )
+        .await
+    }
+
+    fn valid_pbl_teacher_lineage(&self, family: &FamilyRecord, now: u64) -> Result<bool> {
+        if !family.is_live(now)
+            || family.absolute_exp.is_none()
+            || family.session.claims != pbl_teacher_claims()
+            || family.session.principal_kind != SessionPrincipalKind::User
+            || !matches!(family.source, Some(SessionSource::NcuPblTeacher { .. }))
+        {
+            return Ok(false);
+        }
+        let control_panel = control_panel_target()?;
+        if family.session.target == control_panel {
+            return Ok(family.parent_key.is_none());
+        }
+        if family.session.target != aiworkspace_target()? {
+            return Ok(false);
+        }
+        let Some(parent_key) = family.parent_key.as_deref() else {
+            return Ok(false);
+        };
+        let parent = self.families().get(parent_key)?;
+        Ok(parent.is_some_and(|parent| {
+            parent.session.target == control_panel
+                && parent.session.principal_kind == SessionPrincipalKind::User
+                && parent.session.subject == family.session.subject
+                && parent.session.claims == family.session.claims
+                && parent.source == family.source
+                && parent.absolute_exp == family.absolute_exp
+                && parent.parent_key.is_none()
+                && parent.is_live(now)
+        }))
+    }
+
+    async fn checked_pbl_teacher_session(&self, session_token: &str) -> Result<bool> {
+        let payload = verify_verify_hub_jwt(session_token, None).await?;
+        let token: RPCSessionToken =
+            serde_json::from_value(payload).map_err(|_| pbl_role_denied())?;
+        let claims = validate_verify_hub_token_claims(&token, TokenUse::Session)?;
+        let now = buckyos_get_unix_timestamp();
+        if token.sudo
+            || token_auth_method(&token) != Some(AuthMethod::NcuPblTeacher)
+            || claims.principal_kind != SessionPrincipalKind::User
+            || token_is_external(&token)
+            || token_session_ceiling(&token)? != pbl_teacher_claims().ceiling()
+            || token.exp.is_none_or(|expiry| expiry <= now)
+            || (claims.target != control_panel_target()? && claims.target != aiworkspace_target()?)
+        {
+            return Ok(false);
+        }
+        if let Some(zone) = issuer_zone().await {
+            if token_zone(&token) != Some(zone.as_str()) {
+                return Ok(false);
+            }
+        }
+        let subject = token.sub.as_deref().ok_or_else(pbl_role_denied)?;
+        let session_id = get_token_session_id(&token).map_err(|_| pbl_role_denied())?;
+        let key = family_key(subject, &claims.target, session_id);
+        let Some(family) = self.families().get(&key)? else {
+            return Ok(false);
+        };
+        if family.session.subject != subject
+            || family.session.target != claims.target
+            || family.session.session_id != session_id
+            || !self.valid_pbl_teacher_lineage(&family, now)?
+            || !matches!(
+                self.recheck_family(&family).await?,
+                FamilyRecheck::Allowed(_)
+            )
+        {
+            return Ok(false);
+        }
+        // Logout can race the backchannel check; check the parent and record again.
+        let Some(current) = self.families().get(&key)? else {
+            return Ok(false);
+        };
+        Ok(current.source == family.source
+            && self.valid_pbl_teacher_lineage(&current, buckyos_get_unix_timestamp())?)
+    }
+
     /// D-5: before a family answers again (refresh, grace, delegation) its principal, ceiling,
     /// source and parent are checked anew. A denial or an ended parent removes the family.
     async fn recheck_family(&self, family: &FamilyRecord) -> Result<FamilyRecheck> {
@@ -1218,6 +1391,36 @@ impl VerifyHubServer {
             }
         }
         match &family.source {
+            Some(SessionSource::NcuCas {
+                identity_digest,
+                user_type,
+                account_key,
+            }) => {
+                let request = NcuCasLoginRequest {
+                    identity_digest: identity_digest.clone(),
+                    user_type: *user_type,
+                };
+                if &self.ncu_cas_account_key(&request, &session.subject).await? != account_key {
+                    return Err(account_state_denied());
+                }
+            }
+            Some(SessionSource::NcuPblTeacher {
+                identity_digest,
+                user_type,
+                account_key,
+                grant,
+            }) => {
+                let request = NcuCasLoginRequest {
+                    identity_digest: identity_digest.clone(),
+                    user_type: *user_type,
+                };
+                if !self.valid_pbl_teacher_lineage(family, buckyos_get_unix_timestamp())?
+                    || &self.ncu_cas_account_key(&request, &session.subject).await? != account_key
+                    || !self.state.ncu_pbl.grant_active(grant).await
+                {
+                    return Err(pbl_role_denied());
+                }
+            }
             Some(SessionSource::ExclusiveInvite { invite_id, .. }) => {
                 self.require_active_invite(invite_id).await?;
             }
@@ -1780,7 +1983,10 @@ impl VerifyHubApiHandler for VerifyHubServer {
             FamilyRecheck::Allowed(claims) => claims,
             FamilyRecheck::Ended(_) => return Ok(DelegateUserSessionResult::SourceInactive),
         };
-        if claims.external {
+        if claims.external
+            || (claims.auth_method == Some(AuthMethod::NcuPblTeacher)
+                && target != &aiworkspace_target()?)
+        {
             return Ok(DelegateUserSessionResult::AccessDenied);
         }
         let target = match self
@@ -2323,6 +2529,100 @@ impl VerifyHubApiHandler for VerifyHubServer {
     /// A device of another Zone vouches for its user or Agent (跨Zone登录断言契约 §4): the
     /// assertion and its custody verify, the RTCP peer (if any) is of the same Zone, and the
     /// result is an External family for the asserted target and scopes.
+    async fn handle_login_by_ncu_cas(
+        &self,
+        caller_token: Option<&str>,
+        request: NcuCasLoginRequest,
+    ) -> Result<TokenPair> {
+        authorize_control_panel_caller(caller_token, "login_by_ncu_cas").await?;
+        let user_id = request.user_id().ok_or_else(account_state_denied)?;
+        let account_key = self.ncu_cas_account_key(&request, &user_id).await?;
+        let session = SessionSubject {
+            subject: user_id,
+            principal_kind: SessionPrincipalKind::User,
+            target: control_panel_target()?,
+            session_id: rand::thread_rng().gen(),
+            claims: FamilyClaims::account(AuthMethod::NcuCas, request.user_type),
+        };
+        self.issue_family(
+            session,
+            Some(SessionSource::NcuCas {
+                identity_digest: request.identity_digest,
+                user_type: request.user_type,
+                account_key,
+            }),
+            Some(buckyos_get_unix_timestamp() + NCU_CAS_SESSION_MAX_SECONDS),
+        )
+        .await
+    }
+
+    async fn handle_login_by_ncu_pbl_teacher(
+        &self,
+        caller_token: Option<&str>,
+        request: NcuPblTeacherLoginRequest,
+    ) -> Result<TokenPair> {
+        authorize_control_panel_caller(caller_token, "login_by_ncu_pbl_teacher").await?;
+        let config = ncu_pbl::load_cas_config().ok_or_else(pbl_role_denied)?;
+        let receipt = ncu_pbl::redeem(request).await?;
+        let identity_digest =
+            ncu_cas_identity_digest(&config.app_key, &config.identity_key, &receipt.school_id)
+                .ok_or_else(account_state_denied)?;
+        self.issue_pbl_teacher(identity_digest, receipt.grant, receipt.expires_at, None)
+            .await
+    }
+
+    async fn handle_prepare_ncu_pbl_teacher_enrollment(
+        &self,
+        caller_token: Option<&str>,
+        request: NcuPblTeacherLoginRequest,
+    ) -> Result<NcuPblTeacherEnrollment> {
+        authorize_control_panel_caller(caller_token, "prepare_ncu_pbl_teacher_enrollment").await?;
+        let config = ncu_pbl::load_cas_config().ok_or_else(pbl_role_denied)?;
+        let receipt = ncu_pbl::redeem_enrollment(request).await?;
+        let identity_digest = ncu_cas_identity_digest(&config.app_key, &config.identity_key, &receipt.school_id)
+            .ok_or_else(account_state_denied)?;
+        if receipt.expires_at <= buckyos_get_unix_timestamp()
+            || !self.state.ncu_pbl.enrollment_grant_active(&receipt.grant, &receipt.school_id).await
+        {
+            return Err(pbl_role_denied());
+        }
+        self.state.ncu_pbl_enrollments
+            .prepare(identity_digest, receipt, buckyos_get_unix_timestamp())
+            .ok_or_else(pbl_role_denied)
+    }
+
+    async fn handle_finish_ncu_pbl_teacher_enrollment(
+        &self,
+        caller_token: Option<&str>,
+        enrollment_id: String,
+    ) -> Result<TokenPair> {
+        authorize_control_panel_caller(caller_token, "finish_ncu_pbl_teacher_enrollment").await?;
+        let prepared = self.state.ncu_pbl_enrollments
+            .take(&enrollment_id, buckyos_get_unix_timestamp())
+            .ok_or_else(pbl_role_denied)?;
+        let receipt = prepared.receipt;
+        self.issue_pbl_teacher(
+            prepared.identity_digest, receipt.grant, receipt.expires_at, Some(&receipt.school_id)
+        ).await
+    }
+
+    async fn handle_check_ncu_pbl_teacher_session(
+        &self,
+        caller_token: Option<&str>,
+        session_token: &str,
+    ) -> Result<bool> {
+        authorize_target_service(
+            caller_token,
+            &[control_panel_target()?, aiworkspace_target()?],
+            "check_ncu_pbl_teacher_session",
+        )
+        .await?;
+        Ok(self
+            .checked_pbl_teacher_session(session_token)
+            .await
+            .unwrap_or(false))
+    }
+
     async fn handle_login_by_cross_zone_assertion(
         &self,
         request: CrossZoneLoginRequest,
@@ -2634,6 +2934,7 @@ mod test {
     struct DirectoryData {
         zone_did: Option<DID>,
         users: HashMap<String, UserSettings>,
+        cas_keys: HashMap<String, (String, String)>,
         docs: HashMap<String, UserDoc>,
         invites: HashMap<String, ExclusiveInvite>,
         sso: SsoSettings,
@@ -2727,6 +3028,16 @@ mod test {
 
         async fn user_doc(&self, user_id: &str) -> Result<Option<UserDoc>> {
             Ok(self.data().docs.get(user_id).cloned())
+        }
+
+        async fn ncu_cas_account_key(
+            &self,
+            request: &NcuCasLoginRequest,
+            user_id: &str,
+        ) -> Result<Option<String>> {
+            Ok(self.data().cas_keys.get(user_id).and_then(|(identity, key)| {
+                (identity == &request.identity_digest).then(|| key.clone())
+            }))
         }
 
         async fn list_users(&self) -> Result<Vec<String>> {
@@ -2918,6 +3229,251 @@ MC4CAQAwBQYDK2VwBCIEIMDp9endjUnT2o4ImedpgvhVFyZEunZqG+ca0mka8oRp
 
     async fn cp_caller() -> String {
         service_session("control-panel", SessionPrincipalKind::System).await
+    }
+
+    #[tokio::test]
+    async fn ncu_cas_issues_only_for_control_panel_and_its_bound_account() {
+        setup_test_environment().await;
+        let (hub, zone) = test_hub();
+        let request = NcuCasLoginRequest {
+            identity_digest: "a6".repeat(32),
+            user_type: UserType::Limited,
+        };
+        let user_id = request.user_id().unwrap();
+        zone.add_user(&user_id, UserType::Limited, None);
+        zone.update_user(&user_id, |account| account.allow_password_change = Some(false));
+        let control_panel = cp_caller().await;
+        assert!(hub
+            .handle_login_by_ncu_cas(Some(&control_panel), request.clone())
+            .await
+            .is_err());
+        zone.data().cas_keys.insert(
+            user_id.clone(),
+            (request.identity_digest.clone(), "initial-key".to_string()),
+        );
+        let user_cookie = signed_session(&user_id, SessionPrincipalKind::User, control_panel_target().unwrap())
+            .await
+            .to_string();
+        assert!(hub
+            .handle_login_by_ncu_cas(Some(&user_cookie), request.clone())
+            .await
+            .is_err());
+        assert!(hub.handle_login_by_ncu_cas(None, request.clone()).await.is_err());
+        let admin_request = NcuCasLoginRequest { user_type: UserType::Admin, ..request.clone() };
+        assert!(hub
+            .handle_login_by_ncu_cas(Some(&control_panel), admin_request)
+            .await
+            .is_err());
+        let other_service = service_session("scheduler", SessionPrincipalKind::System).await;
+        assert!(hub
+            .handle_login_by_ncu_cas(Some(&other_service), request.clone())
+            .await
+            .is_err());
+
+        let pair = hub
+            .handle_login_by_ncu_cas(Some(&control_panel), request)
+            .await
+            .unwrap();
+        let session = decoded(&pair.session_token);
+        assert_eq!(session.sub.as_deref(), Some(user_id.as_str()));
+        assert_eq!(token_auth_method(&session), Some(AuthMethod::NcuCas));
+        assert_eq!(
+            validate_verify_hub_token_claims(&session, TokenUse::Session).unwrap().target,
+            control_panel_target().unwrap(),
+        );
+        assert_eq!(
+            ceiling_of(&pair.session_token),
+            SessionCeiling::for_user_type(UserType::Limited)
+        );
+        zone.data().cas_keys.get_mut(&user_id).unwrap().1 = "replacement-key".to_string();
+        assert!(hub.handle_refresh_token(&pair.refresh_token).await.is_err());
+    }
+
+    struct PblTestGrant(std::sync::atomic::AtomicBool);
+
+    #[async_trait]
+    impl ncu_pbl::GrantStatusChecker for PblTestGrant {
+        async fn grant_active(&self, grant: &str) -> bool {
+            grant == "g".repeat(43) && self.0.load(Ordering::SeqCst)
+        }
+
+        async fn enrollment_grant_active(&self, grant: &str, school_id: &str) -> bool {
+            school_id == "0000042" && self.grant_active(grant).await
+        }
+    }
+
+    #[tokio::test]
+    async fn pbl_enrollment_finish_is_one_use_and_checks_exact_school_and_active_grant() {
+        setup_test_environment().await;
+        let (mut hub, zone) = test_hub();
+        let grant = Arc::new(PblTestGrant(std::sync::atomic::AtomicBool::new(true)));
+        Arc::get_mut(&mut hub.state).unwrap().ncu_pbl = grant.clone();
+        let binding = NcuCasLoginRequest { identity_digest: "57".repeat(32), user_type: UserType::Limited };
+        let user_id = binding.user_id().unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let receipt = |school_id: &str| serde_json::from_value(json!({
+            "school_id":school_id,"grant":"g".repeat(43),"expires_at":now+600,"school_user_type":"UNDERGRADUATE"
+        })).unwrap();
+        let prepare = |school_id| hub.state.ncu_pbl_enrollments.prepare(
+            binding.identity_digest.clone(), receipt(school_id), now
+        ).unwrap();
+        let cp = cp_caller().await;
+        let missing = prepare("0000042");
+        assert_eq!(missing.new_account_type, Some(UserType::Limited));
+        assert!(hub.handle_finish_ncu_pbl_teacher_enrollment(Some(&cp), missing.enrollment_id).await.is_err());
+
+        zone.add_user(&user_id, UserType::Limited, None);
+        zone.update_user(&user_id, |account| account.allow_password_change = Some(false));
+        zone.data().cas_keys.insert(user_id.clone(), (binding.identity_digest.clone(), "validated-key".to_string()));
+        let mismatched = prepare("0000043");
+        assert!(hub.handle_finish_ncu_pbl_teacher_enrollment(Some(&cp), mismatched.enrollment_id).await.is_err());
+        let pending = prepare("0000042");
+        assert!(hub.handle_finish_ncu_pbl_teacher_enrollment(None, pending.enrollment_id.clone()).await.is_err());
+        let pair = hub.handle_finish_ncu_pbl_teacher_enrollment(Some(&cp), pending.enrollment_id.clone()).await.unwrap();
+        assert!(hub.handle_finish_ncu_pbl_teacher_enrollment(Some(&cp), pending.enrollment_id).await.is_err());
+        let claims = RPCSessionToken::from_string(&pair.session_token).unwrap();
+        assert_eq!(claims.sub.as_deref(), Some(user_id.as_str()));
+        assert_eq!(token_auth_method(&claims), Some(AuthMethod::NcuPblTeacher));
+        assert_eq!(token_session_ceiling(&claims).unwrap(), pbl_teacher_claims().ceiling());
+
+        let revoked = prepare("0000042");
+        grant.0.store(false, Ordering::SeqCst);
+        assert!(hub.handle_finish_ncu_pbl_teacher_enrollment(Some(&cp), revoked.enrollment_id).await.is_err());
+        assert!(!hub.handle_check_ncu_pbl_teacher_session(Some(&cp), &pair.session_token).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pbl_teacher_has_narrow_scope_and_revokes_linked_sessions() {
+        setup_test_environment().await;
+        let (mut hub, zone) = test_hub();
+        let grant = Arc::new(PblTestGrant(std::sync::atomic::AtomicBool::new(true)));
+        Arc::get_mut(&mut hub.state).unwrap().ncu_pbl = grant.clone();
+        let binding = NcuCasLoginRequest {
+            identity_digest: "b6".repeat(32),
+            user_type: UserType::Limited,
+        };
+        let user_id = binding.user_id().unwrap();
+        let expires = buckyos_get_unix_timestamp() + 600;
+        assert!(hub
+            .issue_pbl_teacher(binding.identity_digest.clone(), "g".repeat(43), expires, None)
+            .await
+            .is_err());
+        zone.add_user(&user_id, UserType::Limited, None);
+        zone.update_user(&user_id, |account| {
+            account.allow_password_change = Some(false)
+        });
+        zone.data().cas_keys.insert(
+            user_id.clone(),
+            (binding.identity_digest.clone(), "first-key".to_string()),
+        );
+        let parent = hub
+            .issue_pbl_teacher(binding.identity_digest, "g".repeat(43), expires, None)
+            .await
+            .unwrap();
+        let token = decoded(&parent.session_token);
+        assert_eq!(token.sub.as_deref(), Some(user_id.as_str()));
+        assert_eq!(token_auth_method(&token), Some(AuthMethod::NcuPblTeacher));
+        assert_eq!(
+            ceiling_of(&parent.session_token),
+            pbl_teacher_claims().ceiling()
+        );
+        assert!(!token.sudo);
+        assert!(!serde_json::to_string(&token)
+            .unwrap()
+            .contains(&"g".repeat(43)));
+
+        let aiworkspace =
+            service_session(AIWORKSPACE_UNIQUE_ID, SessionPrincipalKind::System).await;
+        let cp = cp_caller().await;
+        assert!(hub
+            .handle_check_ncu_pbl_teacher_session(Some(&cp), &parent.session_token)
+            .await
+            .unwrap());
+        let other_system = service_session("nfs-server", SessionPrincipalKind::System).await;
+        let app_caller = service_session(AIWORKSPACE_UNIQUE_ID, SessionPrincipalKind::App).await;
+        for caller in [&parent.session_token, &other_system, &app_caller] {
+            assert!(hub
+                .handle_check_ncu_pbl_teacher_session(Some(caller), &parent.session_token)
+                .await
+                .is_err());
+        }
+        assert!(hub
+            .handle_check_ncu_pbl_teacher_session(Some(&aiworkspace), &parent.session_token)
+            .await
+            .unwrap());
+        assert!(!hub
+            .handle_check_ncu_pbl_teacher_session(Some(&aiworkspace), &parent.refresh_token)
+            .await
+            .unwrap());
+        let mut different = token;
+        different.sub = Some("different-user".into());
+        let different = signed_verify_hub_token(different).await;
+        assert!(!hub
+            .handle_check_ncu_pbl_teacher_session(Some(&aiworkspace), &different)
+            .await
+            .unwrap());
+
+        assert!(matches!(
+            hub.handle_delegate_user_session(
+                Some(&cp),
+                &parent.session_token,
+                &system_target("nfs-server")
+            )
+            .await
+            .unwrap(),
+            DelegateUserSessionResult::AccessDenied
+        ));
+        let child = match hub
+            .handle_delegate_user_session(
+                Some(&cp),
+                &parent.session_token,
+                &aiworkspace_target().unwrap(),
+            )
+            .await
+            .unwrap()
+        {
+            DelegateUserSessionResult::Issued(child) => child,
+            _ => panic!("workspace delegation refused"),
+        };
+        assert!(hub
+            .handle_check_ncu_pbl_teacher_session(Some(&aiworkspace), &child.session_token)
+            .await
+            .unwrap());
+        grant.0.store(false, Ordering::SeqCst);
+        assert!(!hub
+            .handle_check_ncu_pbl_teacher_session(Some(&cp), &parent.session_token)
+            .await
+            .unwrap());
+        assert!(!hub
+            .handle_check_ncu_pbl_teacher_session(Some(&aiworkspace), &child.session_token)
+            .await
+            .unwrap());
+        assert!(hub
+            .handle_refresh_token(&parent.refresh_token)
+            .await
+            .is_err());
+        grant.0.store(true, Ordering::SeqCst);
+        assert!(!hub
+            .handle_check_ncu_pbl_teacher_session(Some(&aiworkspace), &child.session_token)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn pbl_redeem_requires_control_panel_service() {
+        setup_test_environment().await;
+        let hub = test_server();
+        let other = service_session(AIWORKSPACE_UNIQUE_ID, SessionPrincipalKind::System).await;
+        let request = || NcuPblTeacherLoginRequest {
+            state: "s".repeat(43),
+            code: "c".repeat(43),
+        };
+        for caller in [None, Some(other.as_str())] {
+            assert!(matches!(
+                hub.handle_login_by_ncu_pbl_teacher(caller, request()).await,
+                Err(RPCErrors::NoPermission(_)),
+            ));
+        }
     }
 
     async fn signed_verify_hub_token(mut token: RPCSessionToken) -> String {

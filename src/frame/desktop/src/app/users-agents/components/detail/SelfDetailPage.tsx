@@ -6,6 +6,7 @@ import { useSelf, useUsersAgentsStore } from '../../hooks/use-users-agents-store
 import { HeaderSection } from '../sections/HeaderSection'
 import { SocialAccountsSection } from '../sections/SocialAccountsSection'
 import { InfoFieldsSection } from '../sections/InfoFieldsSection'
+import { SchoolProfileSection } from '../sections/SchoolProfileSection'
 import { DIDDocumentSection } from '../sections/DIDDocumentSection'
 import { SecuritySection } from '../sections/SecuritySection'
 import { SELF_EDITABLE_INFO_KEYS } from '../../datamodel/transforms'
@@ -161,6 +162,8 @@ export function SelfDetailPage() {
         editableKeys={SELF_EDITABLE_INFO_KEYS}
         onFieldChange={(key, value) => void runSave(() => store.updateSelfInfo(key, value))}
       />
+
+      <SchoolProfileSection />
 
       <SocialAccountsSection entityId={self.id} accounts={self.socialAccounts} ownProfile />
 

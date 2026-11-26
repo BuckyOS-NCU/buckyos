@@ -18,6 +18,24 @@ import type { Transport } from './transport'
 
 type Ws = { workspace_id: string }
 
+export type ClassroomAccessKind = 'guest' | 'student'
+
+export interface ClassroomAccessRequest {
+  request_id: string
+  scope_id: string
+  applicant: string
+  state: 'pending' | 'ready' | 'approved' | 'revoked'
+  entry_id: string | null
+}
+
+export interface ClassroomInvitation {
+  entry_id: string
+  scope_id: string
+  recipient: string
+  kind: ClassroomAccessKind
+  state: 'active' | 'redeemed' | 'closed'
+}
+
 export class AiwsClient {
   readonly transport: Transport
   constructor(transport: Transport) {
@@ -31,7 +49,7 @@ export class AiwsClient {
   // ---- workspaces
   wsCreate(title: string) { return this.call<Result<WorkspaceSummary>>('ws.create', { title }) }
   /** The caller's Workspaces with what the home page's cards show (UI 框架 PRD §9.2, K6). */
-  wsList() { return this.call<Result<{ workspaces: WorkspaceListItem[] }>>('ws.list', {}) }
+  wsList() { return this.call<Result<{ workspaces: WorkspaceListItem[]; can_create_workspace?: boolean }>>('ws.list', {}) }
   /** `recordOpen`: a Workspace session opening — the service records when the caller opened it (`opened_at`, K6). */
   wsGetInfo(ws: Ws, opts?: { recordOpen?: boolean }) { return this.call<Result<WorkspaceInfo>>('ws.get_info', { ...ws, ...(opts?.recordOpen ? { record_open: true } : {}) }) }
   // ---- the caller's own preferences across Workspaces (UI 框架 PRD §4.6, K4): never part of a Workspace
@@ -42,6 +60,21 @@ export class AiwsClient {
   }
   wsDelete(ws: Ws) { return this.call<Result<object>>('ws.delete', ws) }
   wsClone(ws: Ws) { return this.call<Result<{ workspace_id: string; epoch: string; content_root: string; cloned_from: ClonedFrom; excluded_entities: number }>>('ws.clone', ws) }
+  classroomRequest(ws: Ws, surface_id: string) {
+    return this.call<Result<{ state: 'pending' | 'joined' } | { state: 'ready'; entry_id: string }>>('ws.classroom_request', { ...ws, surface_id })
+  }
+  classroomRequests(ws: Ws) {
+    return this.call<Result<{ requests: ClassroomAccessRequest[]; invitations: ClassroomInvitation[] }>>('ws.classroom_requests', ws)
+  }
+  classroomIssue(ws: Ws, recipient: string, scope_id: string, kind: ClassroomAccessKind) {
+    return this.call<Result<{ entry_id: string }>>('ws.classroom_issue', { ...ws, recipient, scope_id, kind })
+  }
+  classroomApprove(ws: Ws, request_id: string) {
+    return this.call<Result<{ entry_id: string }>>('ws.classroom_approve', { ...ws, request_id })
+  }
+  classroomRevoke(ws: Ws, entry_id: string) {
+    return this.call<Result<object>>('ws.classroom_revoke', { ...ws, entry_id })
+  }
   // permissions (README “Permissions”, 权限需求 §4): entries by path, logical groups, anonymous access
   aclSet(ws: Ws, changes: AclChange[]) { return this.call<Result<{ acl_rev: number }>>('acl.set', { ...ws, changes }) }
   aclQueryAll(ws: Ws) { return this.call<Result<AclEntryList>>('acl.query', { ...ws, by: 'all' }) }

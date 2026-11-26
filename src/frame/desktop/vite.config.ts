@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import https from 'node:https'
 import { join, relative, resolve, sep } from 'node:path'
-import { build, defineConfig, searchForWorkspaceRoot, type Plugin, type Rolldown } from 'vite'
+import { build, defineConfig, searchForWorkspaceRoot, type Plugin, type UserConfig, type Rolldown } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // Desktop service worker (application resources for a cold start without the network): after the
@@ -232,7 +232,26 @@ const ALIASES = [
 // HomeStation dev proxy: HS_BACKEND (e.g. http://127.0.0.1:4131, the `devnet` example's `me`
 // node) forwards /kapi/homestation and the zone-level protocol paths /home/* to it. See
 // src/app/homestation/UI_DATAMODEL.md §11.
-export default defineConfig(() => {
+export default defineConfig(({ mode }): UserConfig => {
+  if (mode === 'approval-viewer') {
+    return {
+      base: '/xmz/approval-canvas/',
+      publicDir: false,
+      plugins: [react(), pdfjsAssets(), aiwsProgramRunner()],
+      resolve: { alias: ALIASES },
+      worker: { format: 'es' as const },
+      build: {
+        rollupOptions: {
+          input: {
+            entry: resolve(import.meta.dirname, 'src/app/aiworkspace/approval/mount.ts'),
+            viewer: resolve(import.meta.dirname, 'approval-canvas-viewer.html'),
+          },
+          preserveEntrySignatures: 'strict',
+          output: { entryFileNames: (chunk) => chunk.name === 'entry' ? 'entry.js' : 'assets/[name]-[hash].js' },
+        },
+      },
+    }
+  }
   const nfsTarget = process.env.VITE_NFS_PROXY
   const zoneTarget = process.env.VITE_ZONE_PROXY
   const zoneIp = process.env.VITE_ZONE_PROXY_IP

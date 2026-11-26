@@ -247,6 +247,7 @@ export interface WorkspaceSession {
   contentServer(): Promise<{ endpoint: string; sessionToken: string | null }>
   importAssets(files: File[], folder: boolean, signal?: AbortSignal): Promise<ImportedAsset[]>
   fetchAsset(objectId: string): Promise<Blob>
+  downloadAttachment?(assetEntityId: string): Promise<Blob>
 
   procStart(program: string, params: Record<string, Json>): Promise<RunView>
   procGet(runId: string): Promise<RunView>
@@ -795,6 +796,10 @@ export class OnlineWorkspaceSession implements WorkspaceSession {
 
   fetchAsset(objectId: string) {
     return this.client.transport.download(`asset/${this.workspaceId}/${objectId}`)
+  }
+
+  downloadAttachment(assetEntityId: string) {
+    return this.client.transport.download(`classroom/download/${this.workspaceId}/${encodeURIComponent(assetEntityId)}`)
   }
 
   call<T>(method: string, params: Record<string, unknown>): Promise<T> {

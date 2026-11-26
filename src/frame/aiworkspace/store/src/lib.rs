@@ -1,6 +1,10 @@
 //! aiworkspace-store: SQLite persistence, NamedObject/asset storage, packages.
 
 pub mod acl;
+pub mod approval_capture;
+pub mod approval_viewer;
+pub mod approval_worklog;
+pub mod classroom;
 pub mod docdb;
 pub mod entries;
 pub mod export;

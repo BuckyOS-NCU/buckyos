@@ -21,6 +21,38 @@ pub fn check_order_key(k: &str) -> WsResult<()> {
     }
 }
 
+pub fn base_row_key(seq: u64, id: &str) -> String {
+    format!("{seq:016x}!{id}!h")
+}
+
+/// Interpret a stored row rank against the anchor's current creation sequence.
+/// An absent anchor keeps the saved rank, as does the fixed zero sequence.
+pub fn resolve_row_key(
+    rank: &str,
+    anchor_sequence: impl FnOnce(&str) -> WsResult<Option<u64>>,
+) -> WsResult<Option<String>> {
+    let mut parts = rank.split('!');
+    let (Some(seq), Some(anchor), Some(fraction)) = (parts.next(), parts.next(), parts.next()) else {
+        return Ok(None);
+    };
+    let sequence = if seq == "0000000000000000" { None } else { anchor_sequence(anchor)? };
+    Ok(Some(match sequence {
+        Some(sequence) => format!("{sequence:016x}!{anchor}!{fraction}"),
+        None => rank.to_owned(),
+    }))
+}
+
+pub fn check_row_key(k: &str) -> WsResult<()> {
+    let mut parts = k.split('!');
+    let (Some(seq), Some(id), Some(fraction), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return Err(WsError::invalid_op("expected a row key with creation sequence, record id and fraction"));
+    };
+    if seq.len() != 16 || !seq.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) || !crate::id::is_valid_id(id) || fraction == "h" {
+        return Err(WsError::invalid_op("invalid row order key"));
+    }
+    check_order_key(fraction)
+}
+
 fn idx(c: u8) -> usize {
     DIGITS.iter().position(|d| *d == c).unwrap_or(0)
 }

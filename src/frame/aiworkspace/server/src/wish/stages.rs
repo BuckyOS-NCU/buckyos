@@ -164,7 +164,8 @@ pub fn open_stage(state: &Arc<AppState>, caller: &Caller, ws_id: &str, run_id: &
     };
     // coding and running read as the macro identity (§4.5): bounded by the wish's group when it is bound with
     // `intersection`, so a macro never reads what it could not write about
-    let as_macro = Caller { macro_of: super::macro_scope(&run), ..caller.clone() };
+    let mut as_macro = caller.clone();
+    as_macro.macro_of = super::macro_scope(&run);
     let snap = state.with_ws(ws_id, |ws| ws.wish_snapshot(&as_macro))?;
     // running the stored macro: only what its manifest declares is materialized
     let manifest = if kind == StageKind::Run {

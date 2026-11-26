@@ -1835,7 +1835,22 @@ impl BuckyOSRuntime {
         })
     }
 
+    /// Authenticate a refresh cookie's identity without rotating or returning a session.
+    pub async fn verify_refresh_token_signature(&self, token_str: &str) -> Result<RPCSessionToken> {
+        self.verify_token_signature_for_use(token_str, TokenUse::Refresh)
+            .await
+    }
+
     async fn verify_session_signature(&self, token_str: &str) -> Result<RPCSessionToken> {
+        self.verify_token_signature_for_use(token_str, TokenUse::Session)
+            .await
+    }
+
+    async fn verify_token_signature_for_use(
+        &self,
+        token_str: &str,
+        token_use: TokenUse,
+    ) -> Result<RPCSessionToken> {
         let mut rpc_token = RPCSessionToken::from_string(token_str).map_err(|error| {
             RPCErrors::InvalidToken(format!("Invalid session token: {}", error))
         })?;
@@ -1885,7 +1900,7 @@ impl BuckyOSRuntime {
         rpc_token
             .verify_by_key(&decoding_key)
             .map_err(|error| RPCErrors::InvalidToken(format!("JWT decode error: {}", error)))?;
-        validate_verify_hub_token_claims(&rpc_token, TokenUse::Session)?;
+        validate_verify_hub_token_claims(&rpc_token, token_use)?;
         // A token signed for another Zone never passes here, whatever key it verifies with.
         if let Some(zone) = crate::token_zone(&rpc_token) {
             let issued_here = DID::from_str(zone)

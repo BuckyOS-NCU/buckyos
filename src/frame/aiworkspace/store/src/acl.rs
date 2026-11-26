@@ -58,11 +58,15 @@ pub struct MemberRow {
 #[derive(Debug, Clone, Default)]
 pub struct AclData {
     pub owner: Option<String>,
+    pub ncu_pbl_teacher_owned: bool,
     pub anonymous: bool,
     pub entries: Vec<EntryRow>,
     pub groups: BTreeMap<String, GroupRow>,
     pub members: Vec<MemberRow>,
+    pub classroom_groups: BTreeSet<String>,
 }
+
+pub(crate) const NCU_PBL_TEACHER_OWNER_KEY: &str = "ncu_pbl_teacher_owned";
 
 fn rows<T>(conn: &Connection, sql: &str, f: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>) -> WsResult<Vec<T>> {
     let mut st = conn.prepare_cached(sql).map_err(db_err)?;
@@ -85,7 +89,15 @@ impl AclData {
         let members = rows(conn, "SELECT group_id, member, via_entry, added_by, added_at FROM acl_members ORDER BY group_id, member", |r| {
             Ok(MemberRow { group_id: r.get(0)?, member: r.get(1)?, via_entry: r.get(2)?, added_by: r.get(3)?, added_at: r.get(4)? })
         })?;
-        Ok(AclData { owner: meta("owner")?, anonymous: meta("anonymous")?.as_deref() == Some("1"), entries, groups, members })
+        // A read-only show-source connection can open an old local database.
+        let classroom_groups = if conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='classroom_entries'", [], |_| Ok(()),
+        ).optional().map_err(db_err)?.is_some() {
+            rows(conn, "SELECT s.group_id FROM share_entries s JOIN classroom_entries c ON c.entry_id=s.entry_id",
+                 |row| row.get(0))?.into_iter().collect()
+        } else { BTreeSet::new() };
+        Ok(AclData { owner: meta("owner")?, ncu_pbl_teacher_owned: meta(NCU_PBL_TEACHER_OWNER_KEY)?.is_some(),
+                     anonymous: meta("anonymous")?.as_deref() == Some("1"), entries, groups, members, classroom_groups })
     }
 
     pub fn has_entries(&self, subject: &str) -> bool {
@@ -198,6 +210,14 @@ impl Judgment {
 /// Judge `caller` against `data`: an Agent nobody configured here is judged as its owner (R16, Q29) — also as the run
 /// token of a run that acts as the Agent.
 pub fn judge(data: &AclData, caller: &Caller) -> WsResult<Judgment> {
+    if data.ncu_pbl_teacher_owned {
+        let owner = data.owner.as_deref();
+        let is_owner = owner == Some(caller.principal.as_str());
+        let acts_for_owner = caller.acting_for.as_ref().is_some_and(|account| owner == Some(account.principal.as_str()));
+        if acts_for_owner || (is_owner && !caller.is_verified_workspace_owner_session()) {
+            return Err(WsError::not_found("workspace not found"));
+        }
+    }
     if caller.acting_for.is_some() && caller.publication.is_none() && !data.configures(&caller.principal) {
         if let Some(owner) = &caller.acting_for {
             let mut j = judge_one(data, owner)?;
@@ -217,6 +237,9 @@ fn judge_one(data: &AclData, caller: &Caller) -> WsResult<Judgment> {
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut undecided: BTreeSet<String> = BTreeSet::new();
     for m in &data.members {
+        if data.classroom_groups.contains(&m.group_id) && !caller.is_direct_workspace_account() {
+            continue;
+        }
         match caller.matches_member(&m.member) {
             MemberMatch::Yes => groups.entry(m.group_id.clone()).or_default().push(m.member.clone()),
             MemberMatch::Unknown => {
@@ -424,6 +447,23 @@ impl Workspace {
         };
         if !caps.may_run() {
             return Err(WsError::denied("run capability required"));
+        }
+        if !access.is_owner() && !caps.has(Cap::Run) && caller.is_direct_workspace_account() {
+            let mut without_classroom = self.acl_data()?;
+            let before = without_classroom.members.len();
+            without_classroom.members.retain(|member| {
+                member.member != caller.principal || !without_classroom.classroom_groups.contains(&member.group_id)
+            });
+            if without_classroom.members.len() != before {
+                let baseline = access_of(&without_classroom, &judge(&without_classroom, caller)?);
+                let before_caps = match wish_id {
+                    Some(id) => baseline.caps(&self.ctx(&self.now()), id)?,
+                    None => baseline.ws_caps,
+                };
+                if !before_caps.may_run() {
+                    return Err(WsError::denied("classroom structure permission does not start runs"));
+                }
+            }
         }
         Ok(access)
     }

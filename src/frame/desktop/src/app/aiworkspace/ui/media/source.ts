@@ -21,9 +21,10 @@ export interface AssetSourceValue {
   reference: string
   /** Not part of the source's identity (functions do not serialize). */
   read: () => Promise<Blob>
+  downloadBlob?: () => Promise<Blob>
 }
 
-export function assetSource(store: WorkspaceStore, payload: AssetContent['payload'], name: string): ContentRef {
+export function assetSource(store: WorkspaceStore, payload: AssetContent['payload'], name: string, assetEntityId?: string): ContentRef {
   if (!installed) {
     installed = true
     registerPreviewSourceResolver(AIWORKSPACE_ASSET_SOURCE, { resolvePreviewSource: resolveAsset })
@@ -31,6 +32,9 @@ export function assetSource(store: WorkspaceStore, payload: AssetContent['payloa
   const value: AssetSourceValue = {
     workspace_id: store.session.workspaceId, object_id: payload.object_id, media_type: assetMediaType(payload.media_type, payload.file_name),
     name, reference: payload.object_id, read: () => store.session.fetchAsset(payload.object_id),
+  }
+  if (assetEntityId && store.session.info().classroom_audited_download && store.session.downloadAttachment) {
+    value.downloadBlob = () => store.session.downloadAttachment!(assetEntityId)
   }
   return { kind: AIWORKSPACE_ASSET_SOURCE, value }
 }
@@ -55,7 +59,9 @@ async function resolveAsset(source: ContentRef): Promise<ResolvedPreviewSource> 
   const typed = blob.type === value.media_type ? blob : new Blob([blob], { type: value.media_type })
   return {
     originalSource: source, sourceObjectId: value.object_id, displayName: value.name, size: typed.size, objectType: 'file',
-    mediaTypeHints: [value.media_type], readRef: { kind: 'blob', blob: typed },
+    mediaTypeHints: [value.media_type], readRef: { kind: 'blob', blob: typed, downloadBlob: value.downloadBlob && (async () => {
+      try { return await value.downloadBlob!() } catch (error) { throw failure(error) }
+    }) },
   }
 }
 
@@ -75,7 +81,7 @@ export function surfaceMediaSession(store: WorkspaceStore, cellId: string, curre
             const read: ReadOk<AssetContent> = await store.readBatched<AssetContent>(cell.source_id as string)
             if (read.content.availability !== 'available') return null
             const name = read.content.payload.file_name ?? read.name ?? cell.source_id as string
-            return { id: cell.entity_id, source: assetSource(store, read.content.payload, name), title: name }
+            return { id: cell.entity_id, source: assetSource(store, read.content.payload, name, read.entity_id), title: name }
           } catch { return null }
         }))
         const listed = items.filter((item): item is PreviewSessionItemInput => item !== null)

@@ -9,6 +9,8 @@ import { Modal } from './dialogs'
 import { useAcl, useAclRead } from '../permissions/aclData'
 import { PUBLIC_LINK_CAPABILITIES, shareLink, useShell } from './shellContext'
 import { ShareEntries } from './ShareEntries'
+import { ClassroomShare } from './ClassroomShare'
+import { useI18n } from '../../../../i18n/provider'
 
 export function ShareDialog({ onClose }: { onClose: () => void }) {
   const store = useStore()
@@ -32,6 +34,8 @@ export function ShareDialog({ onClose }: { onClose: () => void }) {
   const link = shareLink(store.session.info(), shell.topMode === 'canvas' ? shell.activeSurface : null)
   const where = shell.topMode === 'canvas' && shell.activeSurface ? t('aiworkspace.shell.share.whereCanvas', { name: shell.activeSurface.title ?? shell.activeSurface.name ?? '' }) : t('aiworkspace.shell.share.whereWorkspace')
   const canManage = store.session.info().capabilities.includes('manage')
+  const classroom = store.session.info().can_manage_classroom === true
+  const { t: translate } = useI18n()
   // the one-click public link (§8.3, 权限需求 §4.2): anonymous access on and `@guest` allowed to read and comment on `/`
   const { api } = useAcl()
   const grants = useAclRead('all', api.all)
@@ -57,7 +61,7 @@ export function ShareDialog({ onClose }: { onClose: () => void }) {
   }
   const tabs = [
     { key: 'link', label: t('aiworkspace.shell.share.link'), icon: Link2 },
-    { key: 'entries', label: t('aiworkspace.shell.share.entries'), icon: Users },
+    { key: 'entries', label: classroom ? translate('school.classroom.title', 'Classroom access') : t('aiworkspace.shell.share.entries'), icon: Users },
   ]
   const switchTab = (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
     const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : event.key === 'ArrowRight' ? (index + 1) % tabs.length : event.key === 'ArrowLeft' ? (index + tabs.length - 1) % tabs.length : null
@@ -106,7 +110,7 @@ export function ShareDialog({ onClose }: { onClose: () => void }) {
                       <h3>{t(isPublic ? 'aiworkspace.shell.share.publicTitle' : 'aiworkspace.shell.share.privateTitle')}</h3>
                     </div>
                     <p className="aiws-muted">{t(isPublic ? 'aiworkspace.shell.share.publicOn' : 'aiworkspace.shell.share.privateNote', { where })}</p>
-                    {canManage && (isPublic
+                    {canManage && !classroom && (isPublic
                       ? <button type="button" data-testid="aiws-share-unpublish" disabled={busy || grants.loading} onClick={() => change('aiworkspace.shell.share.unpublishFailed', unpublish)}>{t('aiworkspace.shell.share.unpublish')}</button>
                       : <button type="button" data-testid="aiws-share-publish" disabled={busy || grants.loading} title={t('aiworkspace.shell.share.publishHint')} onClick={() => change('aiworkspace.shell.share.publishFailed', publish)}><Globe size={16} aria-hidden="true" />{t('aiworkspace.shell.share.publish')}</button>)}
                   </section>
@@ -114,10 +118,14 @@ export function ShareDialog({ onClose }: { onClose: () => void }) {
                 {grants.loading && !grants.data && <div className="aiws-muted" role="status">{t('aiworkspace.shell.share.loading')}</div>}
                 {grants.error && <div className="aiws-error" role="alert">{grants.error}</div>}
                 {failure && <div className="aiws-error" role="alert" data-testid="aiws-share-error">{failure}</div>}
-                {canManage && <button type="button" className="aiws-share-collab" data-testid="aiws-share-collab" onClick={() => { onClose(); shell.openPermissions() }}><Users size={16} aria-hidden="true" />{t('aiworkspace.shell.share.grantInCollab')}</button>}
+                {canManage && !classroom && <button type="button" className="aiws-share-collab" data-testid="aiws-share-collab" onClick={() => { onClose(); shell.openPermissions() }}><Users size={16} aria-hidden="true" />{t('aiworkspace.shell.share.grantInCollab')}</button>}
               </div>
             </div>
-            {canManage && <div id={`${id}-entries-panel`} role="tabpanel" aria-labelledby={`${id}-entries-tab`} hidden={tab !== 'entries'}><ShareEntries client={shell.client} workspaceId={store.session.workspaceId} /></div>}
+            {canManage && <div id={`${id}-entries-panel`} role="tabpanel" aria-labelledby={`${id}-entries-tab`} hidden={tab !== 'entries'}>
+              {classroom
+                ? tab === 'entries' && <ClassroomShare client={shell.client} workspaceId={store.session.workspaceId} surfaceId={shell.activeSurface?.entity_id ?? null} />
+                : <ShareEntries client={shell.client} workspaceId={store.session.workspaceId} />}
+            </div>}
           </div>
           {!shell.identity.guest && <div className="aiws-share-dialog-foot aiws-muted">{t('aiworkspace.shell.share.exportHint')}</div>}
         </div>

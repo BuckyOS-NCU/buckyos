@@ -10,7 +10,7 @@ use aiworkspace_core::canonical::{self, named_object, obj_id_from_filename, obj_
 use aiworkspace_core::materialize::{self, load_ops, materialize_with, snapshot_root, ObjectSink, ObjectSource};
 use aiworkspace_core::model::*;
 use aiworkspace_core::value::format_utc_ms;
-use aiworkspace_core::{richtext, Code, WsError, WsResult};
+use aiworkspace_core::{read, richtext, Code, WsError, WsResult};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -248,7 +248,13 @@ impl Workspace {
             let ids: Vec<String> = st.query_map([&scope], |r| r.get(0)).map_err(db_err)?.collect::<rusqlite::Result<_>>().map_err(db_err)?;
             for id in ids {
                 if let (Some(e), Some(edge)) = (ctx.entity(&id)?, ctx.edge(&id)?) {
-                    let mut payload = e.payload.clone();
+                    if !access.can_read(&ctx, &e)? {
+                        continue;
+                    }
+                    let mut payload = e.payload;
+                    if e.type_id == TYPE_ANNOTATION && !read::annotation_target_readable(&ctx, &access, &payload)? {
+                        payload.remove("context");
+                    }
                     payload.remove("author");
                     lines.push_str(&canonical::canonical_json(&json!({ "entity_id": id, "type_id": e.type_id, "parent_id": edge.parent_id,
                         "order_key": edge.order_key, "payload": payload }))?);
@@ -438,28 +444,31 @@ impl Workspace {
             let fresh = Connection::open(&path).map_err(db_err)?;
             fresh.execute_batch(DOC_DDL).map_err(db_err)?;
         }
-        // rich text: fold pending updates into the snapshot so the replica needs no update rows
-        let rich_ids: Vec<String> = {
-            let mut st = self.doc.prepare("SELECT entity_id FROM richtext_states").map_err(db_err)?;
-            let v: Vec<String> = st.query_map([], |r| r.get(0)).map_err(db_err)?.collect::<rusqlite::Result<_>>().map_err(db_err)?;
-            v
-        };
-        let mut merged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        {
-            let ctx = self.ctx(&now);
-            for id in &rich_ids {
-                if let Some(rt) = ctx.richtext(id)? {
-                    merged.insert(id.clone(), richtext::export_snapshot(&rt.doc)?);
-                }
-            }
-        }
         let scope = format!("user:{}", caller.principal);
         self.doc.execute("ATTACH DATABASE ?1 AS replica", [path.to_string_lossy().as_ref()]).map_err(db_err)?;
         let result = (|| -> WsResult<()> {
             let tx = self.doc.unchecked_transaction().map_err(db_err)?;
+            let ctx = self.ctx(&now);
             debug_assert!(REPLICA_TABLES.contains(&"entities"));
             tx.execute("INSERT INTO replica.workspace_meta SELECT key, value FROM main.workspace_meta WHERE key <> 'peer_id'", []).map_err(db_err)?;
-            tx.execute("INSERT INTO replica.entities SELECT * FROM main.entities WHERE scope = 'shared' OR scope = ?1", [&scope]).map_err(db_err)?;
+            {
+                let mut ids = tx.prepare("SELECT entity_id FROM main.entities WHERE scope = 'shared' OR scope = ?1").map_err(db_err)?;
+                let mut insert = tx.prepare(
+                    "INSERT INTO replica.entities SELECT entity_id, type_id, schema_version, schema_id, scope, name, write_policy,
+                        CASE WHEN ?2 THEN json_remove(payload_json, '$.context') ELSE payload_json END,
+                        key_revs_json, derived_json, created_seq, meta_rev, content_rev, life_rev, deleted_seq, created_by
+                     FROM main.entities WHERE entity_id = ?1",
+                ).map_err(db_err)?;
+                for id in ids.query_map([scope], |row| row.get::<_, String>(0)).map_err(db_err)? {
+                    let id = id.map_err(db_err)?;
+                    let Some(entity) = ctx.entity(&id)? else { continue };
+                    if access.can_read(&ctx, &entity)? {
+                        let redact = entity.type_id == TYPE_ANNOTATION && entity.payload.contains_key("context")
+                            && !read::annotation_target_readable(&ctx, &access, &entity.payload)?;
+                        insert.execute(params![id, redact]).map_err(db_err)?;
+                    }
+                }
+            }
             tx.execute(
                 "INSERT INTO replica.tree_edges SELECT * FROM main.tree_edges WHERE child_id IN (SELECT entity_id FROM replica.entities) \
                  AND parent_id IN (SELECT entity_id FROM replica.entities)",
@@ -472,12 +481,13 @@ impl Workspace {
                 [],
             )
             .map_err(db_err)?;
-            tx.execute("INSERT INTO replica.table_fields SELECT * FROM main.table_fields", []).map_err(db_err)?;
+            tx.execute("INSERT INTO replica.table_fields SELECT * FROM main.table_fields WHERE source_id IN (SELECT entity_id FROM replica.entities)", [])
+                .map_err(db_err)?;
             // Residual values of deleted fields stay behind. They are filtered while
             // copying: an UPDATE afterwards would leave the old row bytes in free space.
             let mut dead: BTreeMap<String, Vec<String>> = BTreeMap::new();
             {
-                let mut st = tx.prepare("SELECT source_id, field_id FROM main.table_fields WHERE deleted_seq IS NOT NULL").map_err(db_err)?;
+                let mut st = tx.prepare("SELECT source_id, field_id FROM replica.table_fields WHERE deleted_seq IS NOT NULL").map_err(db_err)?;
                 let rows: Vec<(String, String)> =
                     st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db_err)?.collect::<rusqlite::Result<_>>().map_err(db_err)?;
                 for (source, field) in rows {
@@ -485,8 +495,10 @@ impl Workspace {
                 }
             }
             tx.execute(
-                "INSERT INTO replica.table_records SELECT * FROM main.table_records \
-                 WHERE source_id NOT IN (SELECT source_id FROM main.table_fields WHERE deleted_seq IS NOT NULL)",
+                "INSERT INTO replica.table_records SELECT source_id, record_id, values_json, revs_json, meta_json,
+                    (SELECT entity_id FROM replica.entities WHERE entity_id = body_entity_id), created_seq, rev, deleted_seq
+                 FROM main.table_records WHERE source_id IN (SELECT entity_id FROM replica.entities)
+                   AND source_id NOT IN (SELECT source_id FROM replica.table_fields WHERE deleted_seq IS NOT NULL)",
                 [],
             )
             .map_err(db_err)?;
@@ -496,7 +508,8 @@ impl Workspace {
                 let strip = |col: &str| format!("json_remove({col}, {})", paths.join(", "));
                 tx.execute(
                     &format!(
-                        "INSERT INTO replica.table_records SELECT source_id, record_id, {}, {}, {}, body_entity_id, created_seq, rev, deleted_seq \
+                        "INSERT INTO replica.table_records SELECT source_id, record_id, {}, {}, {},
+                            (SELECT entity_id FROM replica.entities WHERE entity_id = body_entity_id), created_seq, rev, deleted_seq \
                          FROM main.table_records WHERE source_id = ?1",
                         strip("values_json"),
                         strip("revs_json"),
@@ -506,16 +519,20 @@ impl Workspace {
                 )
                 .map_err(db_err)?;
             }
-            tx.execute(
-                "INSERT INTO replica.richtext_states SELECT * FROM main.richtext_states WHERE entity_id IN (SELECT entity_id FROM replica.entities)",
-                [],
-            )
-            .map_err(db_err)?;
-            for (id, snapshot) in &merged {
-                tx.execute("UPDATE replica.richtext_states SET snapshot = ?2, snapshot_seq = ?3 WHERE entity_id = ?1", params![id, snapshot, self.head_seq])
-                    .map_err(db_err)?;
+            {
+                let mut ids = tx.prepare("SELECT entity_id FROM main.richtext_states WHERE entity_id IN (SELECT entity_id FROM replica.entities)").map_err(db_err)?;
+                let mut insert = tx.prepare(
+                    "INSERT INTO replica.richtext_states SELECT entity_id, lineage_id, engine, engine_version, encoding, ?2, ?3, ast_json, block_index_json
+                     FROM main.richtext_states WHERE entity_id = ?1",
+                ).map_err(db_err)?;
+                for id in ids.query_map([], |row| row.get::<_, String>(0)).map_err(db_err)? {
+                    let id = id.map_err(db_err)?;
+                    if let Some(rt) = ctx.richtext(&id)? {
+                        insert.execute(params![id, richtext::export_snapshot(&rt.doc)?, self.head_seq]).map_err(db_err)?;
+                    }
+                }
             }
-            tx.execute("INSERT INTO replica.assets SELECT * FROM main.assets", []).map_err(db_err)?;
+            copy_replica_assets(&tx, &ctx, &access)?;
             tx.commit().map_err(db_err)
         })();
         self.doc.execute("DETACH DATABASE replica", []).map_err(db_err)?;
@@ -657,7 +674,11 @@ pub fn load_workspace(
     // a mismatch here is an implementation defect; the package must not become visible
     let check = ws.materialize_for(&Access::full(&caller.principal), "import", &caller.principal)?;
     if check.content_root != spec.content_root {
-        return Err(WsError::io(format!("import verification failed: content root {} != {}", check.content_root, spec.content_root)));
+        let now = ws.now();
+        let original = materialize::imported_content_root(&ws.ctx(&now), &mut StoreSink::new(&objects))?;
+        if original != spec.content_root {
+            return Err(WsError::io(format!("import verification failed: content root {original} != {}", spec.content_root)));
+        }
     }
     let personal: Vec<Value> = spec
         .personal
@@ -680,5 +701,24 @@ fn require_update(access: &Access) -> WsResult<()> {
     if !access.anywhere(Cap::Update) && !access.anywhere(Cap::Structure) && !access.anywhere(Cap::Append) {
         return Err(WsError::denied("update or structure capability required"));
     }
+    Ok(())
+}
+
+fn copy_replica_assets(tx: &rusqlite::Transaction<'_>, ctx: &dyn ReadCtx, access: &Access) -> WsResult<()> {
+    let mut log_sources = Vec::new();
+    let mut st = tx.prepare("SELECT DISTINCT src_entity_id FROM replica.refs WHERE kind = 'log'").map_err(db_err)?;
+    for row in st.query_map([], |r| r.get::<_, String>(0)).map_err(db_err)? {
+        let source = row.map_err(db_err)?;
+        if access.can(ctx, &source, Cap::Update)? {
+            log_sources.push(source);
+        }
+    }
+    tx.execute(
+        "INSERT INTO replica.assets SELECT * FROM main.assets WHERE object_id IN (\
+         SELECT r.dst_object_id FROM replica.refs r JOIN replica.entities e ON e.entity_id = r.src_entity_id \
+         WHERE e.deleted_seq IS NULL AND (r.kind = 'asset' OR (r.kind = 'log' AND r.src_entity_id IN (SELECT value FROM json_each(?1)))))",
+        [json!(log_sources).to_string()],
+    )
+    .map_err(db_err)?;
     Ok(())
 }

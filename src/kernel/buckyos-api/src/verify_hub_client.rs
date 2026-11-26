@@ -9,12 +9,87 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{AccessDenial, AppDoc, AppType, AuthMethod, AuthTarget, SelectorType, UserInfo};
+use crate::{
+    AccessDenial, AppDoc, AppType, AuthMethod, AuthTarget, PasswordState, SelectorType, UserInfo,
+    UserSettings, UserType,
+};
 
 pub const VERIFY_HUB_UNIQUE_ID: &str = "verify-hub";
 pub const VERIFY_HUB_SERVICE_NAME: &str = "verify-hub";
 pub const VERIFY_HUB_TOKEN_EXPIRE_TIME: u64 = 60 * 10; //10 minutes
 pub const VERIFY_HUB_SERVICE_PORT: u16 = 3210;
+pub const NCU_CAS_IDENTITY_MARKER: &str = "buckyos:ncuCasIdentityDigest";
+pub const NCU_CAS_READY_MARKER: &str = "buckyos:ncuCasRbacReady";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NcuCasLoginRequest {
+    pub identity_digest: String,
+    pub user_type: UserType,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NcuPblTeacherLoginRequest {
+    pub state: String,
+    pub code: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NcuPblTeacherEnrollment {
+    pub enrollment_id: String,
+    pub identity_digest: String,
+    pub new_account_type: Option<UserType>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NcuPblTeacherEnrollmentFinish {
+    enrollment_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NcuPblTeacherSessionCheck {
+    session_token: String,
+}
+
+impl NcuCasLoginRequest {
+    pub fn user_id(&self) -> Option<String> {
+        let digest = &self.identity_digest;
+        if digest.len() != 64
+            || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !matches!(self.user_type, UserType::User | UserType::Limited)
+        {
+            return None;
+        }
+        Some(format!("ncu-{}", &digest[..56]))
+    }
+
+    pub fn matches_account(&self, settings: &UserSettings) -> bool {
+        self.user_id().as_deref() == Some(settings.user_id.as_str())
+            && settings.user_type == self.user_type
+            && settings.is_active()
+            && settings.is_local
+            && settings.groups.is_empty()
+            && settings.password_state == PasswordState::Unset
+            && settings.password.is_empty()
+            && settings.allow_password_change == Some(false)
+    }
+
+    pub fn account_key(&self, doc: &name_lib::OwnerDocument) -> Option<String> {
+        use sha2::{Digest, Sha256};
+
+        if self.user_id().as_deref() != Some(doc.name.as_str())
+            || doc.extra_info.get(NCU_CAS_IDENTITY_MARKER)?.as_str()? != self.identity_digest
+        {
+            return None;
+        }
+        let key_json = serde_json::to_vec(&doc.get_default_key()?).ok()?;
+        Some(hex::encode(Sha256::digest(key_json)))
+    }
+}
 
 pub fn generate_service_login_assertion(
     subject_id: &str,
@@ -749,6 +824,68 @@ impl VerifyHubClient {
         }
     }
 
+    pub async fn login_by_ncu_cas(&self, request: NcuCasLoginRequest) -> Result<TokenPair> {
+        match self {
+            Self::InProcess(handler) => handler.handle_login_by_ncu_cas(None, request).await,
+            Self::KRPC(client) => Self::call_typed(client, "login_by_ncu_cas", request).await,
+        }
+    }
+
+    pub async fn login_by_ncu_pbl_teacher(
+        &self,
+        request: NcuPblTeacherLoginRequest,
+    ) -> Result<TokenPair> {
+        match self {
+            Self::InProcess(handler) => {
+                handler.handle_login_by_ncu_pbl_teacher(None, request).await
+            }
+            Self::KRPC(client) => {
+                Self::call_typed(client, "login_by_ncu_pbl_teacher", request).await
+            }
+        }
+    }
+
+    pub async fn prepare_ncu_pbl_teacher_enrollment(
+        &self,
+        request: NcuPblTeacherLoginRequest,
+    ) -> Result<NcuPblTeacherEnrollment> {
+        match self {
+            Self::InProcess(handler) => handler.handle_prepare_ncu_pbl_teacher_enrollment(None, request).await,
+            Self::KRPC(client) => Self::call_typed(client, "prepare_ncu_pbl_teacher_enrollment", request).await,
+        }
+    }
+
+    pub async fn finish_ncu_pbl_teacher_enrollment(&self, enrollment_id: String) -> Result<TokenPair> {
+        match self {
+            Self::InProcess(handler) => handler.handle_finish_ncu_pbl_teacher_enrollment(None, enrollment_id).await,
+            Self::KRPC(client) => Self::call_typed(
+                client,
+                "finish_ncu_pbl_teacher_enrollment",
+                NcuPblTeacherEnrollmentFinish { enrollment_id },
+            ).await,
+        }
+    }
+
+    pub async fn check_ncu_pbl_teacher_session(&self, session_token: &str) -> Result<bool> {
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_check_ncu_pbl_teacher_session(None, session_token)
+                    .await
+            }
+            Self::KRPC(client) => {
+                Self::call_typed(
+                    client,
+                    "check_ncu_pbl_teacher_session",
+                    NcuPblTeacherSessionCheck {
+                        session_token: session_token.to_owned(),
+                    },
+                )
+                .await
+            }
+        }
+    }
+
     pub async fn login_by_cross_zone_assertion(
         &self,
         request: CrossZoneLoginRequest,
@@ -879,6 +1016,48 @@ pub trait VerifyHubApiHandler: Send + Sync {
         Err(RPCErrors::UnknownMethod(
             "login_by_remote_verify_hub".to_string(),
         ))
+    }
+
+    async fn handle_login_by_ncu_cas(
+        &self,
+        _caller_token: Option<&str>,
+        _request: NcuCasLoginRequest,
+    ) -> Result<TokenPair> {
+        Err(RPCErrors::UnknownMethod("login_by_ncu_cas".to_string()))
+    }
+
+    async fn handle_login_by_ncu_pbl_teacher(
+        &self,
+        _caller_token: Option<&str>,
+        _request: NcuPblTeacherLoginRequest,
+    ) -> Result<TokenPair> {
+        Err(RPCErrors::UnknownMethod(
+            "login_by_ncu_pbl_teacher".to_string(),
+        ))
+    }
+
+    async fn handle_prepare_ncu_pbl_teacher_enrollment(
+        &self,
+        _caller_token: Option<&str>,
+        _request: NcuPblTeacherLoginRequest,
+    ) -> Result<NcuPblTeacherEnrollment> {
+        Err(RPCErrors::UnknownMethod("prepare_ncu_pbl_teacher_enrollment".into()))
+    }
+
+    async fn handle_finish_ncu_pbl_teacher_enrollment(
+        &self,
+        _caller_token: Option<&str>,
+        _enrollment_id: String,
+    ) -> Result<TokenPair> {
+        Err(RPCErrors::UnknownMethod("finish_ncu_pbl_teacher_enrollment".into()))
+    }
+
+    async fn handle_check_ncu_pbl_teacher_session(
+        &self,
+        _caller_token: Option<&str>,
+        _session_token: &str,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     async fn handle_login_by_cross_zone_assertion(
@@ -1057,6 +1236,57 @@ impl<T: VerifyHubApiHandler> RPCHandler for VerifyHubRpcHandler<T> {
                     )
                     .await?,
             )?,
+            "login_by_ncu_cas" => success_value(
+                self.0
+                    .handle_login_by_ncu_cas(
+                        req.token.as_deref(),
+                        parse_request("login_by_ncu_cas", req.params)?,
+                    )
+                    .await?,
+            )?,
+            "login_by_ncu_pbl_teacher" => {
+                let request = serde_json::from_value(req.params).map_err(|_| {
+                    RPCErrors::ParseRequestError("invalid PBL handoff request".into())
+                })?;
+                success_value(
+                    self.0
+                        .handle_login_by_ncu_pbl_teacher(req.token.as_deref(), request)
+                        .await?,
+                )?
+            }
+            "prepare_ncu_pbl_teacher_enrollment" => {
+                let request = serde_json::from_value(req.params).map_err(|_| {
+                    RPCErrors::ParseRequestError("invalid PBL enrollment request".into())
+                })?;
+                success_value(
+                    self.0
+                        .handle_prepare_ncu_pbl_teacher_enrollment(req.token.as_deref(), request)
+                        .await?,
+                )?
+            }
+            "finish_ncu_pbl_teacher_enrollment" => {
+                let request: NcuPblTeacherEnrollmentFinish = serde_json::from_value(req.params)
+                    .map_err(|_| RPCErrors::ParseRequestError("invalid PBL enrollment finish".into()))?;
+                success_value(
+                    self.0
+                        .handle_finish_ncu_pbl_teacher_enrollment(req.token.as_deref(), request.enrollment_id)
+                        .await?,
+                )?
+            }
+            "check_ncu_pbl_teacher_session" => {
+                let request: NcuPblTeacherSessionCheck = serde_json::from_value(req.params)
+                    .map_err(|_| {
+                        RPCErrors::ParseRequestError("invalid PBL session check".into())
+                    })?;
+                success_value(
+                    self.0
+                        .handle_check_ncu_pbl_teacher_session(
+                            req.token.as_deref(),
+                            &request.session_token,
+                        )
+                        .await?,
+                )?
+            }
             crate::CROSS_ZONE_LOGIN_METHOD => success_value(
                 self.0
                     .handle_login_by_cross_zone_assertion(parse_request(

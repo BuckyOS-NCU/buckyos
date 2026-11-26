@@ -136,6 +136,8 @@ fn compiled_views_match_the_evaluator() {
         json!({ "group": "ok" }),
         json!({ "group": "month" }),
         json!({ "manual_order": { "o05": "a", "o03": "b", "o30": "c" } }),
+        json!({ "manual_order": { "o05": "a" }, "row_order": {} }),
+        json!({ "row_order": { "o05": "0000000000000000!wish!a", "o03": "0000000000000000!wish!b", "o30": "0000000000000000!wish!c" } }),
     ];
     let ctx_ids = |ws: &aiworkspace_store::Workspace, v: &Value| -> (Vec<String>, Option<Value>) {
         let mut spec = QuerySpec { limit: 1000, best_effort: true, ..Default::default() };
@@ -143,6 +145,7 @@ fn compiled_views_match_the_evaluator() {
         spec.filter = def.filter.clone();
         spec.sorts = def.sorts.clone();
         spec.group = def.group.clone();
+        spec.row_order = def.row_order.clone();
         spec.manual_order = def.manual_order.clone();
         let rows = ws.read_ctx(|ctx| run_query(ctx, &ctx.entity("orders")?.unwrap(), &spec)).unwrap();
         (rows["rows"].as_array().unwrap().iter().map(|r| r["record_id"].as_str().unwrap().to_string()).collect(), rows.get("groups").cloned())
@@ -151,7 +154,7 @@ fn compiled_views_match_the_evaluator() {
         let (want, groups) = ctx_ids(&ws, &v);
         let fields = ws.read_ctx(|ctx| aiworkspace_core::filter::live_fields(ctx, "orders")).unwrap();
         let c = aiworkspace_core::sqlview::compile_view("\"/data/销售/订单\"", &fields, &ViewDef::of_params(&v), aiworkspace_core::sqlview::Projection::Display).unwrap();
-        let got = ids_of(&sql(&ws, &alice(), &c.sql).unwrap());
+        let got = ids_of(&ws.query(&alice(), &json!({ "sql": c.sql, "params": c.params })).unwrap());
         assert_eq!(got, want, "{v}\n{}", c.sql);
         let n = sql(&ws, &alice(), &c.count_sql).unwrap()["rows"][0][0].as_u64().unwrap();
         assert_eq!(n as usize, want.len(), "{v}");

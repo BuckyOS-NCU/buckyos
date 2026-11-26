@@ -8,6 +8,8 @@
 
 pub const STORAGE_SCHEMA_VERSION: u32 = 7;
 
+pub const RECORD_ORDER_INDEX: &str = "CREATE INDEX IF NOT EXISTS table_records_created ON table_records(source_id, created_seq, record_id) WHERE deleted_seq IS NULL";
+
 /// The document database: the working form of one portable Workspace.
 pub const DOC_DDL: &str = r#"
 CREATE TABLE workspace_meta (
@@ -335,6 +337,27 @@ CREATE TABLE IF NOT EXISTS share_entries (
   created_by TEXT NOT NULL,
   created_at INTEGER NOT NULL
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS classroom_entries (
+  entry_id       TEXT PRIMARY KEY,
+  recipient      TEXT NOT NULL,
+  kind           TEXT NOT NULL CHECK (kind IN ('guest','student')),
+  scope_id       TEXT NOT NULL,
+  backing_folder TEXT,
+  consumed_at    INTEGER
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS classroom_access_requests (
+  request_id TEXT PRIMARY KEY,
+  scope_id   TEXT NOT NULL,
+  applicant  TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  entry_id   TEXT
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS classroom_access_pending ON classroom_access_requests
+  (scope_id, applicant) WHERE entry_id IS NULL;
+CREATE INDEX IF NOT EXISTS classroom_access_recipient ON classroom_access_requests (scope_id, applicant);
 
 CREATE TABLE IF NOT EXISTS staged_commits (
   principal  TEXT NOT NULL,

@@ -146,7 +146,7 @@ export type PreviewReadRef =
       /** URL variant that forces a download (`Content-Disposition: attachment`). */
       downloadUrl?: string
     }
-  | { kind: 'blob'; blob: Blob }
+  | { kind: 'blob'; blob: Blob; downloadBlob?: () => Promise<Blob> }
 
 export interface ResolvedPreviewSource {
   originalSource: ContentRef

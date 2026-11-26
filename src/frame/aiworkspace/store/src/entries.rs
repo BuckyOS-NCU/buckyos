@@ -219,6 +219,9 @@ impl Workspace {
     /// when the entry is open to guests (anyone may come in anonymously anyway); a guest (its browser's token) joins
     /// an entry open to guests. Joining again changes nothing; nobody becomes the owner by joining.
     pub fn join_entry(&mut self, caller: &Caller, local: &str, allowed: impl FnOnce(u8) -> WsResult<()>) -> WsResult<Value> {
+        if self.is_classroom_entry(local)? {
+            return Err(unavailable());
+        }
         let entry = self.entry(local)?.filter(|e| e.state == EntryState::Active).ok_or_else(unavailable)?;
         match caller.class {
             CallerClass::Account { .. } | CallerClass::External { .. } => {

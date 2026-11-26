@@ -3,7 +3,9 @@
 //! each Workspace has exactly one writer behind its mutex. Uploads and downloads go
 //! through the zone's NDM and application object buckets (Durable Data Schema §3).
 
+mod approval_capture;
 pub mod auth;
+mod classroom;
 pub mod buckets;
 pub mod control;
 pub mod ext;
@@ -23,7 +25,7 @@ pub mod worklog;
 
 use aiworkspace_core::{Code, Deny, WsError, WsResult};
 use aiworkspace_store::entries::{parse_entry_methods, split_entry_id, EntryState, ENTRY_DID_LOGIN, ENTRY_GUEST, ENTRY_PASSWORD, ENTRY_SELF_REGISTER};
-use aiworkspace_store::service::require_may_own;
+use aiworkspace_store::service::{require_may_create_workspace, require_may_own};
 use aiworkspace_store::workspace::{CommitOpts, Workspace, CONTACT_PREFIX};
 use aiworkspace_store::{Caller, CallerClass, Service};
 use auth::{AuthError, Authenticator};
@@ -125,13 +127,13 @@ impl AppState {
                 .lock()
                 .unwrap()
                 .entry(ws.workspace_id.clone())
-                .or_insert_with(|| watch::channel(ws.head_seq).0)
+                .or_insert_with(|| watch::Sender::new(ws.head_seq))
                 .clone();
-            let _ = tx.send(ws.head_seq);
+            tx.send_replace(ws.head_seq);
             let (id, epoch, wake_head) = (ws.workspace_id.clone(), ws.epoch.clone(), wake.clone());
             // called only after the commit is durable and published in memory
             ws.on_commit = Some(Box::new(move |seq| {
-                let _ = tx.send(seq);
+                tx.send_replace(seq);
                 if let Some(w) = &wake_head {
                     let _ = w.send(Wake::Head { workspace_id: id.clone(), epoch: epoch.clone(), head_seq: seq });
                 }
@@ -144,11 +146,11 @@ impl AppState {
                     let _ = w.send(Wake::Locks { workspace_id: id.clone(), counter: n });
                 }
             }));
-            let acl_tx = hook_acls.lock().unwrap().entry(ws.workspace_id.clone()).or_insert_with(|| watch::channel(ws.acl_rev()).0).clone();
-            let _ = acl_tx.send(ws.acl_rev());
+            let acl_tx = hook_acls.lock().unwrap().entry(ws.workspace_id.clone()).or_insert_with(|| watch::Sender::new(ws.acl_rev())).clone();
+            acl_tx.send_replace(ws.acl_rev());
             let (id, wake_acl) = (ws.workspace_id.clone(), wake.clone());
             ws.on_acl_change = Some(Box::new(move |rev| {
-                let _ = acl_tx.send(rev);
+                acl_tx.send_replace(rev);
                 if let Some(w) = &wake_acl {
                     let _ = w.send(Wake::Acl { workspace_id: id.clone(), acl_rev: rev });
                 }
@@ -217,7 +219,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(HTTP_PATH, post(krpc))
         .route(&format!("{HTTP_PATH}/"), post(krpc))
         .layer(DefaultBodyLimit::max(krpc_limit))
+        .route(
+            "/kapi/aiworkspace/pbl/approval-capture",
+            post(approval_capture::capture).layer(DefaultBodyLimit::max(approval_capture::MAX_REQUEST_BYTES)),
+        )
+        .route(
+            "/kapi/aiworkspace/pbl/approval-viewer",
+            post(approval_capture::viewer).layer(DefaultBodyLimit::max(approval_capture::MAX_REQUEST_BYTES)),
+        )
+        .route(
+            "/kapi/aiworkspace/pbl/approval-viewer/asset",
+            post(approval_capture::viewer_asset).layer(DefaultBodyLimit::max(approval_capture::MAX_REQUEST_BYTES)),
+        )
+        .route(
+            "/kapi/aiworkspace/pbl/approval-work-log",
+            post(approval_capture::work_log).layer(DefaultBodyLimit::max(approval_capture::MAX_WORK_LOG_REQUEST_BYTES)),
+        )
         .route(&format!("{HTTP_PATH}/asset/{{workspace_id}}/{{object_id}}"), get(asset))
+        .route(
+            &format!("{HTTP_PATH}/classroom/download/{{workspace_id}}/{{asset_entity_id}}"),
+            get(classroom::download),
+        )
         // presentation sessions (第四期规划): the channel and media by Range
         .route(&format!("{HTTP_PATH}/session/ws"), get(session::ws_route))
         .route(&format!("{HTTP_PATH}/stream/{{token}}"), get(stream::serve))
@@ -470,6 +492,8 @@ pub(crate) async fn krpc(State(state): State<Arc<AppState>>, body: bytes::Bytes)
         }
     } else if method == "doc.wait_changes" {
         wait_changes(&state, &params, caller.as_ref().expect("authenticated above")).await
+    } else if method.starts_with("ws.classroom_") {
+        classroom::handle(&state, &method, &params, caller.as_ref().expect("authenticated above")).await
     } else if method == "ws.join_entry" {
         join_entry(&state, &params, caller.as_ref().expect("authenticated above")).await
     } else if method == "asset.import_object" {
@@ -542,10 +566,14 @@ fn workspace_of(p: &Value) -> Option<String> {
 fn precheck(state: &Arc<AppState>, method: &str, p: &Value, caller: &Caller) -> WsResult<()> {
     use aiworkspace_core::access::Cap;
     use methods::Check;
+    if caller.has_live_ncu_pbl_teacher() && method != "ws.join_entry" {
+        require_pbl_teacher_workspace_method(method)?;
+    }
     let Some(spec) = methods::spec(method) else { return Ok(()) };
     for check in spec.checks {
         match check {
             Check::MayOwn => require_may_own(caller)?,
+            Check::CreateWorkspace => require_may_create_workspace(caller)?,
             Check::Owner | Check::Member | Check::Ws(_) | Check::Entity(..) => {
                 let Some(ws_id) = workspace_of(p) else { continue };
                 if matches!(check, Check::Entity(Cap::Read, _)) {
@@ -570,6 +598,28 @@ fn precheck(state: &Arc<AppState>, method: &str, p: &Value, caller: &Caller) -> 
     Ok(())
 }
 
+fn require_pbl_teacher_workspace_method(method: &str) -> WsResult<()> {
+    if matches!(method,
+        "ws.create" | "ws.time" | "ws.list" | "ws.get_info" | "ws.delete" | "ws.get_user_state"
+        | "ws.set_user_state" | "ws.work_log" | "ws.list_publications" | "ws.list_referrers"
+        | "acl.query" | "acl.groups" | "acl.audit" | "ws.list_entries"
+        | "ws.classroom_request" | "ws.classroom_issue" | "ws.classroom_requests" | "ws.classroom_approve" | "ws.classroom_revoke"
+        | "doc.resolve" | "doc.read" | "doc.list" | "doc.find" | "doc.query" | "doc.prepare"
+        | "doc.commit" | "doc.stage" | "doc.get_submission" | "doc.undo" | "doc.get_changes"
+        | "doc.wait_changes" | "doc.outline" | "doc.source_capabilities" | "doc.source_query"
+        | "doc.index" | "doc.get_collab_state" | "doc.list_annotations" | "doc.freshness"
+        | "doc.relations" | "doc.list_versions" | "doc.restore_version" | "asset.import_object"
+        | "lock.acquire" | "lock.renew" | "lock.release" | "lock.break" | "lock.list"
+        | "presence.heartbeat" | "presence.leave" | "presence.list"
+        | "user.get_prefs" | "user.set_prefs" | "control.list" | "control.describe"
+        | "session.list" | "session.list_mine" | "session.list_open"
+    ) {
+        Ok(())
+    } else {
+        Err(WsError::refused(Code::PermissionDenied, Deny::SessionKindNotAllowed, "the PBL teacher session is limited to workspace content"))
+    }
+}
+
 /// Synchronous method dispatch. Every method authorizes against the grants of
 /// the trusted `caller`.
 /// `session`: the caller's own token, for a call the service makes on the caller's behalf (a hosted run's dispatch).
@@ -583,7 +633,13 @@ fn dispatch(state: &Arc<AppState>, method: &str, p: &Value, caller: &Caller, ses
         "ws.time" => json!({ "ok": true, "server_ms": (svc.clock)() }),
         "ws.list" => svc.list_workspaces(caller)?,
         "ws.get_info" => {
-            let mut v = state.with_ws(ws_id()?, |ws| ws.info(caller))?;
+            let mut v = state.with_ws(ws_id()?, |ws| {
+                let mut info = ws.info(caller)?;
+                if caller.has_live_ncu_pbl_teacher() && ws.require_classroom_owner(caller).is_ok() {
+                    info["can_manage_classroom"] = json!(true);
+                }
+                Ok(info)
+            })?;
             v["wish_execution"] = json!({ "default": state.wish.config.default_execution });
             v["public_base"] = json!(source::public_base(state, ws_id()?));
             v["traffic"] = json!(state.with_ws(ws_id()?, |ws| ws.traffic())?);
@@ -847,14 +903,17 @@ async fn describe_entry(state: &Arc<AppState>, p: &Value) -> WsResult<Value> {
             if ws.purpose().is_some() {
                 return Ok(None);
             }
-            Ok(ws.entry(local)?.filter(|e| e.state == EntryState::Active).map(|e| (e, ws.title(), ws.owner().ok().flatten(), ws.workspace_slug())))
+            let entry = ws.entry(local)?.filter(|e| e.state == EntryState::Active);
+            let classroom = ws.is_classroom_entry(local)?;
+            Ok(entry.map(|e| (e, classroom.then(|| "Classroom invitation".to_string()).unwrap_or_else(|| ws.title()),
+                if classroom { None } else { ws.owner().ok().flatten() }, if classroom { None } else { Some(ws.workspace_slug()) })))
         });
         Ok(match found {
             Ok(Some((entry, title, owner, slug))) => EntryDescription {
                 state: buckyos_api::EntryState::Active,
                 // the Workspace's page on its own origin (T4-8); only a deployment without a host has no page to name
-                resource: Some(EntryResource { kind: "workspace".into(), title, owner_name: owner, path: pages::page_url(&st, ws_id, &slug, None).unwrap_or_else(|| "/".into()) }),
-                methods: entry_methods(entry.methods),
+                resource: Some(EntryResource { kind: "workspace".into(), title, owner_name: owner, path: slug.as_deref().and_then(|slug| pages::page_url(&st, ws_id, slug, None)).unwrap_or_else(|| "/".into()) }),
+                methods: entry_methods(if slug.is_none() { ENTRY_PASSWORD } else { entry.methods }),
                 expires_at: entry.expires_at.map(|e| e.max(0) as u64),
             },
             _ => EntryDescription::unavailable(),
@@ -885,6 +944,15 @@ async fn join_entry(state: &Arc<AppState>, p: &Value, caller: &Caller) -> WsResu
     let unavailable = || WsError::refused(Code::NotFound, Deny::EntryUnavailable, "the entry is closed, expired or does not exist");
     let entry_id = s(p, "entry_id")?.to_string();
     let (ws_id, local) = split_entry_id(&entry_id).map(|(w, l)| (w.to_string(), l.to_string())).ok_or_else(unavailable)?;
+    let (st, w, l) = (state.clone(), ws_id.clone(), local.clone());
+    let targeted = blocking(move || st.with_ws(&w, |ws| ws.is_classroom_entry(&l)))
+        .await.map_err(|e| if e.code == Code::NotFound { unavailable() } else { e })?;
+    if targeted {
+        return classroom::redeem(state, &ws_id, &local, caller).await;
+    }
+    if caller.has_live_ncu_pbl_teacher() {
+        require_pbl_teacher_workspace_method("ws.join_entry")?;
+    }
     let settings = state.auth.sso_settings().await.map_err(|_| {
         WsError::refused(Code::PermissionDenied, Deny::AuthorizationUnavailable, "the Zone's sign-in settings could not be read; retry later")
     })?;
@@ -1104,19 +1172,24 @@ async fn asset(State(state): State<Arc<AppState>>, Path((workspace_id, object_id
             }
             let media = ws.asset_info(&object_id)?.map(|a| a.media_type).unwrap_or_else(|| "application/octet-stream".into());
             use aiworkspace_core::materialize::ObjectSource;
-            Ok((media, ws.objects.get_file(&object_id)?))
+            Ok((media, ws.objects.get_file(&object_id)?, ws.acl_data()?.ncu_pbl_teacher_owned))
         })
     })
     .await;
     match result {
-        Ok((media, data)) => {
+        Ok((media, data, protected)) => {
             // user content is never served as active content from the service origin: pictures, sound and video are
             // passive, SVG and HTML are not
             let safe = matches!(media.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "image/bmp" | "application/pdf" | "text/plain")
                 || (media.starts_with("audio/") || media.starts_with("video/")) && !media.contains(['+', ';']);
             let ctype = if safe { media } else { "application/octet-stream".to_string() };
+            let cache = if protected || caller.has_live_ncu_pbl_teacher() {
+                "private, no-store"
+            } else {
+                "private, max-age=31536000, immutable"
+            };
             ([(header::CONTENT_TYPE, ctype), (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-              (header::CACHE_CONTROL, "private, max-age=31536000, immutable".to_string())], data).into_response()
+              (header::CACHE_CONTROL, cache.to_string())], data).into_response()
         }
         Err(e) => http_error(e, Some(&caller), "asset"),
     }
@@ -1130,4 +1203,24 @@ pub async fn serve(state: Arc<AppState>, listen: &str) -> std::io::Result<()> {
     session::spawn_timers(state.clone());
     media::start(&state);
     axum::serve(listener, build_router(state)).await
+}
+
+
+#[cfg(test)]
+mod pbl_teacher_workspace_tests {
+    use super::require_pbl_teacher_workspace_method;
+
+    #[test]
+    fn teacher_slice_does_not_open_delegation_or_general_ownership() {
+        for method in ["ws.create", "ws.list", "doc.commit", "doc.undo", "asset.import_object", "lock.break"] {
+            assert!(require_pbl_teacher_workspace_method(method).is_ok(), "{method}");
+        }
+        for method in [
+            "ws.ensure", "ws.list_subjects", "ws.clone", "ws.import", "acl.set",
+            "ws.create_entry", "ws.publish", "replica.bootstrap", "doc.export", "proc.start",
+            "proc.report", "show.start", "session.create", "ext.create_from_template", "unknown",
+        ] {
+            assert!(require_pbl_teacher_workspace_method(method).is_err(), "{method}");
+        }
+    }
 }

@@ -10,6 +10,7 @@ import { requestServiceLaunch } from '../../api/app_launch'
 import { AiwsClient } from './api/client'
 import { DEV_OVERRIDE_KEY, resolveTransport } from './api/transport'
 import { onWorkspaceHost, workspacePageUrl } from './links'
+import { carryProjectCanvasChoice } from './projectCanvasChoice'
 
 function devOverride(): boolean {
   try { return window.localStorage.getItem(DEV_OVERRIDE_KEY) !== null } catch { return false }
@@ -30,7 +31,7 @@ export async function openWorkspaceById(workspaceId: string): Promise<boolean> {
   const info = await new AiwsClient(availability.transport).wsGetInfo({ workspace_id: workspaceId })
   const url = info.ok ? workspacePageUrl(info.public_base, info.title) : null
   if (!url) return false
-  await openWorkspacePage(url)
+  await openWorkspacePage(carryProjectCanvasChoice(url))
   return true
 }
 

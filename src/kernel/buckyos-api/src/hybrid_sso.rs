@@ -26,6 +26,8 @@ pub enum AuthMethod {
     /// A device of another Zone vouched for its user or Agent with a signed assertion
     /// (doc/arch/verify-hub/跨Zone登录断言契约.md).
     CrossZoneAssertion,
+    NcuCas,
+    NcuPblTeacher,
 }
 
 impl AuthMethod {
@@ -37,6 +39,8 @@ impl AuthMethod {
             Self::Assertion => "assertion",
             Self::AppAccessToken => "app_access_token",
             Self::CrossZoneAssertion => "cross_zone_assertion",
+            Self::NcuCas => "ncu_cas",
+            Self::NcuPblTeacher => "ncu_pbl_teacher",
         }
     }
 
@@ -48,6 +52,8 @@ impl AuthMethod {
             "assertion" => Some(Self::Assertion),
             "app_access_token" => Some(Self::AppAccessToken),
             "cross_zone_assertion" => Some(Self::CrossZoneAssertion),
+            "ncu_cas" => Some(Self::NcuCas),
+            "ncu_pbl_teacher" => Some(Self::NcuPblTeacher),
             _ => None,
         }
     }
@@ -810,6 +816,17 @@ impl ExclusiveInvite {
 pub enum SessionSource {
     ExclusiveInvite { invite_id: String, version: u32 },
     DidFederation { canonical_host: String },
+    NcuCas {
+        identity_digest: String,
+        user_type: UserType,
+        account_key: String,
+    },
+    NcuPblTeacher {
+        identity_digest: String,
+        user_type: UserType,
+        account_key: String,
+        grant: String,
+    },
     /// Signed in through a credential an App issued (`user.app_login.issue`): a one-time
     /// code exchanged into a session targeting that App instance, or a 48-hour customer
     /// link opened on the Zone root (EXT-11). Either way the App's `app_login` switch and

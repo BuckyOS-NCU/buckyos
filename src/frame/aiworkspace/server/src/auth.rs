@@ -37,6 +37,11 @@ pub trait Authenticator: Send + Sync {
     }
     /// The Zone's sign-in switches (`system/sso/settings`, defaults when absent).
     async fn sso_settings(&self) -> Result<SsoSettings, AccessDenial>;
+    /// Does the exact recipient currently stand as an active local BuckyOS account?
+    async fn classroom_account_active(&self, _principal: &str) -> Result<bool, AccessDenial> {
+        Ok(false)
+    }
+
     /// A principal someone asks about (`acl.query`), as a caller of the kind it is: an Agent with its owner, an
     /// External DID, a guest or link, an account. Memberships are settled separately.
     async fn caller_for(&self, principal: &str) -> Caller {
@@ -213,7 +218,8 @@ impl Authenticator for RuntimeAuth {
     async fn authenticate(&self, token: &str) -> Result<Caller, AuthError> {
         use buckyos_api::{
             get_buckyos_api_runtime, token_auth_method, token_is_external, token_session_ceiling, validate_verify_hub_token_claims,
-            SessionScope, TokenPrincipalKind, TokenUse,
+            AuthMethod, AuthTarget, DenyReason, SessionScope, TokenPrincipalKind, TokenUse,
+            AIWORKSPACE_UNIQUE_ID, CONTROL_PANEL_SERVICE_UNIQUE_ID,
         };
         let runtime = get_buckyos_api_runtime().map_err(|e| AuthError::Invalid(format!("runtime unavailable: {e}")))?;
         let verified = runtime.verify_session_token_opened(token, SessionScope::AiWorkspace).await.map_err(|e| match AccessDenial::from_rpc_error(&e) {
@@ -223,8 +229,33 @@ impl Authenticator for RuntimeAuth {
         let claims = validate_verify_hub_token_claims(&verified, TokenUse::Session).map_err(|e| AuthError::Invalid(format!("invalid session token: {e}")))?;
         let ceiling = token_session_ceiling(&verified).map_err(|e| AuthError::Invalid(format!("invalid session token: {e}")))?;
         let principal = verified.sub.clone().filter(|s| !s.trim().is_empty()).ok_or_else(|| AuthError::Invalid("session token has no subject".to_string()))?;
+        let auth_method = token_auth_method(&verified);
+        let target_ok = matches!(&claims.target, AuthTarget::System { service_id }
+            if matches!(service_id.as_str(), CONTROL_PANEL_SERVICE_UNIQUE_ID | AIWORKSPACE_UNIQUE_ID));
+        let live_pbl_teacher = if auth_method == Some(AuthMethod::NcuPblTeacher) {
+            if !target_ok || claims.principal_kind != TokenPrincipalKind::User
+                || !ceiling.restricted || token_is_external(&verified) || verified.sudo
+            {
+                return Err(AuthError::Denied(AccessDenial::new(DenyReason::SessionKindNotAllowed)));
+            }
+            let unavailable = || AuthError::Denied(AccessDenial::new(DenyReason::AuthorizationUnavailable));
+            let hub = runtime.get_verify_hub_client().await.map_err(|_| unavailable())?;
+            if !hub.check_ncu_pbl_teacher_session(token).await.map_err(|_| unavailable())? {
+                return Err(AuthError::Denied(AccessDenial::new(DenyReason::SourceRevoked)));
+            }
+            true
+        } else {
+            false
+        };
         let mut caller = match claims.principal_kind {
             TokenPrincipalKind::User if token_is_external(&verified) => Caller::external(&principal),
+            TokenPrincipalKind::User if live_pbl_teacher => Caller::verified_account(&principal, true, true),
+            TokenPrincipalKind::User
+                if target_ok && !verified.sudo && matches!(auth_method,
+                    Some(AuthMethod::NcuCas | AuthMethod::Password | AuthMethod::DidFederation | AuthMethod::ExclusiveInvite)) =>
+            {
+                Caller::verified_account(&principal, ceiling.restricted, false)
+            }
             TokenPrincipalKind::User => Caller::account(&principal, ceiling.restricted),
             // an Agent acts as itself; a Workspace that configured nothing for it judges it as its owner (权限需求 R16)
             TokenPrincipalKind::Agent => match agent_owner(&principal).await {
@@ -244,9 +275,26 @@ impl Authenticator for RuntimeAuth {
             (aiworkspace_store::CallerClass::Service, Some(app)) => Some(app.to_string()),
             _ => Some(claims.target.canonical_key()),
         };
-        caller.auth_method = token_auth_method(&verified).map(|m| m.as_str().to_string());
+        caller.auth_method = auth_method.map(|m| m.as_str().to_string());
         Ok(caller)
     }
+    async fn classroom_account_active(&self, principal: &str) -> Result<bool, AccessDenial> {
+        use buckyos_api::{get_buckyos_api_runtime, SystemConfigError, UserSettings};
+        if !aiworkspace_store::classroom::valid_recipient(principal) {
+            return Ok(false);
+        }
+        let runtime = get_buckyos_api_runtime().map_err(|_| unavailable())?;
+        let client = runtime.get_system_config_client().await.map_err(|_| unavailable())?;
+        let key = format!("users/{principal}/settings");
+        client.invalidate_cache(&key).await;
+        let settings = match client.get(&key).await {
+            Ok(value) => serde_json::from_str::<UserSettings>(&value.value).map_err(|_| unavailable())?,
+            Err(SystemConfigError::KeyNotFound(_)) => return Ok(false),
+            Err(_) => return Err(unavailable()),
+        };
+        Ok(settings.user_id == principal && settings.is_local && settings.is_active())
+    }
+
     /// Zone users from system-config `users/` and the system user groups (whether a non-owner may read those lists
     /// is decided by system-config; a refusal just leaves them out).
     async fn subjects(&self) -> Vec<serde_json::Value> {

@@ -24,6 +24,10 @@ mod download_mgr;
 mod exclusive_invite;
 mod federation;
 mod image_data_url;
+mod ncu_cas;
+mod ncu_embed;
+mod ncu_pbl;
+mod ncu_school;
 mod ndn_download;
 use buckyos_api::pikg;
 mod pre_install_reconciler;
@@ -1152,7 +1156,7 @@ impl ControlPanelServer {
 
         let req_seq = rpc_request.seq;
         let req_trace_id = rpc_request.trace_id.clone();
-        let carries_credentials = rpc_request.method.starts_with("auth.");
+        let private_response = rpc_request.method.starts_with("auth.") || rpc_request.method == "user.get";
         let (response, detail) = match self.handle_rpc_call(rpc_request, client_ip).await {
             Ok(response) => (response, None),
             Err(error) => Self::failed_rpc_response(error, req_seq, req_trace_id),
@@ -1174,7 +1178,7 @@ impl ControlPanelServer {
         })?;
 
         let mut response = http::Response::builder().header(CONTENT_TYPE, "application/json");
-        if carries_credentials {
+        if private_response {
             response = response.header(CACHE_CONTROL, "no-store");
         }
         Ok(response
@@ -1456,6 +1460,18 @@ impl HttpServer for ControlPanelServer {
         if method == Method::GET && path == federation::DID_CALLBACK_PATH {
             return self.serve_did_callback(req).await;
         }
+        if method == Method::GET && path == ncu_cas::START_PATH {
+            return self.serve_ncu_cas_start(req).await;
+        }
+        if method == Method::GET && path == ncu_cas::CALLBACK_PATH {
+            return self.serve_ncu_cas_callback(req).await;
+        }
+        if method == Method::GET && path == ncu_pbl::START_PATH {
+            return self.serve_ncu_pbl_start(req).await;
+        }
+        if method == Method::GET && path == ncu_pbl::CALLBACK_PATH {
+            return self.serve_ncu_pbl_callback(req).await;
+        }
         if method == Method::POST && path == "/sso_refresh" {
             return self.serve_sso_refresh(req, info).await;
         }
@@ -1567,6 +1583,10 @@ pub async fn start_control_panel_service() -> anyhow::Result<()> {
         federation::DID_CALLBACK_PATH.to_string(),
         control_panel_server.clone(),
     );
+    let _ = runner.add_http_server(ncu_cas::START_PATH.to_string(), control_panel_server.clone());
+    let _ = runner.add_http_server(ncu_cas::CALLBACK_PATH.to_string(), control_panel_server.clone());
+    let _ = runner.add_http_server(ncu_pbl::START_PATH.to_string(), control_panel_server.clone());
+    let _ = runner.add_http_server(ncu_pbl::CALLBACK_PATH.to_string(), control_panel_server.clone());
     // Control-panel desktop API endpoints.
     let _ = runner.add_http_server("/api".to_string(), control_panel_server.clone());
 

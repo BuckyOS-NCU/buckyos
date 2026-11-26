@@ -752,6 +752,10 @@ export class ReplicaWorkspaceSession implements WorkspaceSession {
     return this.direct.call<T>(method, params)
   }
 
+  downloadAttachment(assetEntityId: string): Promise<Blob> {
+    return this.direct.downloadAttachment(assetEntityId)
+  }
+
   async fetchAsset(objectId: string): Promise<Blob> {
     const cached = this.replica.dead === null ? await this.replica.call('getAsset', objectId).catch(() => null) : null
     if (cached) return new Blob([cached])

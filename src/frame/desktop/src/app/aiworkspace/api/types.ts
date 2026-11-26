@@ -30,6 +30,8 @@ export interface WorkspaceSummary {
   epoch: string
   head_seq: number
   capabilities: Capability[]
+  /** The caller has the Workspace owner's effective access. */
+  owner?: boolean
 }
 
 export interface ClonedFrom {
@@ -75,6 +77,7 @@ export interface WorkspaceSettings { toolbar?: Json; cover?: WorkspaceCover; fon
 export interface UserPrefsRead { prefs: Record<string, Json>; revision: number; updated_at: string | null }
 
 export interface WorkspaceInfo extends WorkspaceSummary {
+  classroom_audited_download?: boolean
   format_version: string
   protocol_version: string
   head_commit_id: string | null
@@ -99,6 +102,7 @@ export interface WorkspaceInfo extends WorkspaceSummary {
   judged_as?: string
   /** The caller is the Workspace's owner. */
   owner?: boolean
+  can_manage_classroom?: boolean
   /** The Workspace's shared settings (the root's `config`, K4) and the version a conditional write expects. */
   settings?: WorkspaceSettings
   settings_rev?: number
@@ -332,7 +336,11 @@ export type FieldType = 'text' | 'number' | 'decimal' | 'date' | 'datetime' | 'b
 
 export interface OptionDef { option_id: string; label: string }
 
+export type ReferencePurpose = 'image' | 'canvas'
+
 export interface FieldDef {
+  ref_purpose?: ReferencePurpose
+  target_types?: string[]
   field_id: string
   name: string
   type: FieldType
@@ -387,11 +395,16 @@ export interface ConnectorProjection {
 }
 export interface ConnectorEnd { entity_id: string; anchor: { kind: 'named'; id: string } }
 
+export type RowOrder = Record<string, string>
+
 export interface CellPayload {
   /** Absent on a pure UI Block (frame, shape…). */
   source_ref?: Reference
   /** Renderer id and version (D6: the backend checks the format only; the registry decides support). */
   view: { type: string; version?: number }
+  /** Legacy keyed-first order for cells saved before per-view row ranks. */
+  manual_order?: RowOrder
+  row_order?: RowOrder
   title?: string
   fields?: { field_id: string; width?: number }[]
   filter?: FilterNode | null
@@ -878,7 +891,7 @@ export interface AnchorInfo {
   range_status?: 'exact' | 'relocated' | 'lost' | 'unchecked'
   position?: { block_id?: string; end_block_id?: string; text?: string }
 }
-export interface AnnotationContent extends KeyedContent<AnnotationPayload> { anchor: AnchorInfo }
+export interface AnnotationContent extends KeyedContent<AnnotationPayload> { anchor?: AnchorInfo }
 export type AnnotationRead = EntityEnvelope & { content: AnnotationContent }
 export interface ListAnnotationsParams { target_ids?: string[]; parent_id?: string }
 
@@ -891,6 +904,7 @@ export interface CellMeta { derived?: { run_id?: string; program?: string; input
 
 export interface QueryRow {
   record_id: string
+  created_seq?: number
   rev: number
   revs: Record<string, number>
   values: Record<string, Json>
@@ -899,6 +913,7 @@ export interface QueryRow {
 }
 
 export interface QueryParams {
+  row_order?: RowOrder
   view_id?: string
   source_id?: string
   filter?: FilterNode | null

@@ -156,7 +156,7 @@ pub fn record_nested(payload: &JsonMap) -> Value {
 // ---- Cell / TableView ----
 
 const CELL_KEYS: &[&str] = &[
-    "source_ref", "view", "title", "fields", "filter", "sorts", "group", "manual_order", "options", "config", "def_ref", "bindings", "locked",
+    "source_ref", "view", "title", "fields", "filter", "sorts", "group", "row_order", "manual_order", "options", "config", "def_ref", "bindings", "locked",
     "flip", "start", "end", "route", "controls", "label", "presentation",
     "data_ownership", "slot", "on", "row_limit",
 ];
@@ -388,7 +388,7 @@ fn validate_cell(p: &mut Planner, e: &mut EntityRow, changed: Option<&[String]>)
         }
     }
     if view_type != "table" {
-        for k in ["filter", "sorts", "group", "manual_order"] {
+        for k in ["filter", "sorts", "group", "row_order", "manual_order"] {
             if e.payload.get(k).is_some_and(|v| !v.is_null()) {
                 return Err(bad(format!("{k} is only valid on table views")));
             }
@@ -453,13 +453,18 @@ fn validate_cell(p: &mut Planner, e: &mut EntityRow, changed: Option<&[String]>)
             }
         }
     }
-    if let Some(m) = e.payload.get("manual_order").filter(|v| !v.is_null()) {
-        let o = m.as_object().ok_or_else(|| bad("manual_order must be an object"))?;
-        for (rid, key) in o {
-            if !is_valid_id(rid) {
-                return Err(bad("manual_order: invalid record_id"));
+    for (field, check) in [
+        ("row_order", crate::order_key::check_row_key as fn(&str) -> WsResult<()>),
+        ("manual_order", check_order_key),
+    ] {
+        if let Some(m) = e.payload.get(field).filter(|v| !v.is_null()) {
+            let o = m.as_object().ok_or_else(|| bad(format!("{field} must be an object")))?;
+            for (rid, key) in o {
+                if !is_valid_id(rid) {
+                    return Err(bad(format!("{field}: invalid record_id")));
+                }
+                check(key.as_str().unwrap_or(""))?;
             }
-            check_order_key(key.as_str().unwrap_or(""))?;
         }
     }
     // how many rows the table view shows (B7-3, §6 Q9): a display limit, the data keeps every row
@@ -3222,9 +3227,9 @@ pub fn asset_object_ids<'a>(type_id: &str, payload: &'a JsonMap) -> Vec<&'a str>
     }
 }
 
-pub fn value_ref_edge(source_id: &str, record_id: &str, field_id: &str, reference: &Value) -> RefEdge {
-    let s = selector_string(&json!({ "kind": "table_cell", "record_id": record_id, "field_id": field_id }));
-    ref_edge(source_id, &s, "value", reference)
+pub fn value_ref_edge(source_id: &str, record_id: &str, field: &FieldDef, reference: &Value) -> RefEdge {
+    let s = selector_string(&json!({ "kind": "table_cell", "record_id": record_id, "field_id": field.field_id }));
+    ref_edge(source_id, &s, if field.ref_purpose.is_some() { "value_link" } else { "value" }, reference)
 }
 
 pub fn body_ref_edge(source_id: &str, record_id: &str, body_entity_id: &str) -> RefEdge {

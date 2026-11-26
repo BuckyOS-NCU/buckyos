@@ -20,6 +20,7 @@ import { initialOf } from '../presentation/model'
 import { useDesktopUIStore } from '../models/DesktopUIDataModel'
 import { ObjectImage } from '../presentation/ObjectIcon'
 import type { TaskbarAppItem } from '../models/ui'
+import { getBootIdentity, isSchoolAccount } from '../sso/identity'
 import { connectionLabel, connectionTone, type ConnectionState } from './shell'
 import type { CurrentUser, SystemStatusState, useHoverCard } from './taskbarHooks'
 
@@ -309,6 +310,18 @@ export function ProfileCard({
           </span>
         </div>
       </div>
+      {isSchoolAccount(getBootIdentity()) ? (
+        <div className="border-t border-[color:var(--cp-border)] px-3 py-2">
+          <a
+            href="/personal-info"
+            className="flex h-9 items-center gap-2 rounded-[8px] px-3 text-[13px] font-medium text-[color:var(--cp-text)] hover:bg-[color:color-mix(in_srgb,var(--cp-text)_6%,transparent)]"
+            data-testid="taskbar-personal-info"
+          >
+            <UserRound className="size-4 shrink-0 text-[color:var(--cp-muted)]" />
+            {t('school.profile.title', 'Personal information')}
+          </a>
+        </div>
+      ) : null}
       <div className="flex items-center gap-2 border-t border-[color:var(--cp-border)] px-3 py-3">
         {onOpenAccount ? (
           <button

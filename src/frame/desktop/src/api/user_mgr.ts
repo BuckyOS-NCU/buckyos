@@ -114,6 +114,22 @@ export interface UsersListResponse {
   users: UserInfo[]
 }
 
+/** Display projection of the verified campus dossier, returned to that account only. */
+export interface SchoolProfile {
+  role: 'teacher' | 'student'
+  school_number: string
+  school_number_type: 'staff' | 'student'
+  real_name?: string
+  user_type_label?: string
+  college_name?: string
+  major_name?: string
+  class_name?: string
+  grade?: string
+  degree_level?: string
+  current_status?: string
+  title?: string
+}
+
 /** Full user detail as returned by `user.get`. */
 export interface UserDetail {
   user_id: string
@@ -124,6 +140,7 @@ export interface UserDetail {
   is_local?: boolean
   profile?: UserProfile | Record<string, unknown> | null
   local_profile?: UserPrivateProfile | null
+  school_profile?: SchoolProfile
   /** Effective: the account may change its own password. */
   allow_password_change?: boolean
   /** Effective: the account may edit its own address book. */

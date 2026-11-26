@@ -258,7 +258,11 @@ pub fn materialize_with(
     cached: &mut dyn FnMut(&EntityRow, Option<&ObjId>) -> Option<ObjId>,
     strip_notes: bool,
 ) -> WsResult<Materialized> {
-    materialize_stripped(ctx, sink, visible, cached, &|e| strip_notes.then(|| without_notes(e)).flatten())
+    materialize_stripped(ctx, sink, visible, cached, &|e| strip_notes.then(|| without_notes(e)).flatten(), true)
+}
+
+pub fn imported_content_root(ctx: &dyn ReadCtx, sink: &mut dyn ObjectSink) -> WsResult<ObjId> {
+    Ok(materialize_stripped(ctx, sink, &|_| Ok(true), &mut |_, _| None, &|_| None, false)?.content_root)
 }
 
 /// A template's content (README "Workspace templates"): without speaker notes, and without the run records of its
@@ -270,7 +274,7 @@ pub fn materialize_template(ctx: &dyn ReadCtx, sink: &mut dyn ObjectSink, visibl
             out.get_or_insert_with(|| e.clone()).payload.remove("history");
         }
         out
-    })
+    }, true)
 }
 
 /// `strip` gives the entity as it is materialized when that differs from what it is (never through `cached`).
@@ -280,6 +284,7 @@ fn materialize_stripped(
     visible: &dyn Fn(&EntityRow) -> WsResult<bool>,
     cached: &mut dyn FnMut(&EntityRow, Option<&ObjId>) -> Option<ObjId>,
     strip: &dyn Fn(&EntityRow) -> Option<EntityRow>,
+    redact_context: bool,
 ) -> WsResult<Materialized> {
     let mut included: BTreeSet<String> = BTreeSet::new();
     let (mut lines, mut objects, mut unresolved, mut excluded) = (Vec::new(), BTreeMap::new(), Vec::new(), 0);
@@ -290,14 +295,19 @@ fn materialize_stripped(
             continue;
         }
         included.insert(e.entity_id.clone());
-        let object_id = match (strip(&e), cached(&e, None)) {
-            (Some(stripped), _) => content_object(ctx, &stripped, sink)?,
-            (None, Some(id)) => id,
-            (None, None) => {
-                let id = content_object(ctx, &e, sink)?;
-                cached(&e, Some(&id));
-                id
-            }
+        let mut stripped = strip(&e);
+        if redact_context && e.type_id == TYPE_ANNOTATION && e.payload.contains_key("context")
+            && !crate::anchor::target_visible(ctx, e.payload.get("target"), visible)? {
+            stripped.get_or_insert_with(|| e.clone()).payload.remove("context");
+        }
+        let object_id = if let Some(stripped) = stripped {
+            content_object(ctx, &stripped, sink)?
+        } else if let Some(id) = cached(&e, None) {
+            id
+        } else {
+            let id = content_object(ctx, &e, sink)?;
+            cached(&e, Some(&id));
+            id
         };
         let mut line = Map::new();
         line.insert("entity_id".into(), json!(e.entity_id));
@@ -443,6 +453,10 @@ pub fn load_ops(src: &dyn ObjectSource, content_root: &str, collab: &dyn Fn(&str
     let mut order: Vec<&String> = by_id.keys().filter(|id| !is_system_id(id)).collect();
     order.sort_by_key(|id| (rank(by_id[*id]["type_id"].as_str().unwrap_or("")), depth[*id], (*id).clone()));
     let (mut ops, mut inserts, mut later, mut types, mut assets) = (Vec::new(), Vec::new(), Vec::new(), BTreeMap::new(), Vec::new());
+    // all but one: the session folder is made the first time a session needs it, so a new Workspace has none yet
+    if by_id.contains_key(SESSION_ID) {
+        ops.push(json!({ "op": "system.ensure", "id": SESSION_ID }));
+    }
     for id in order {
         let entry = &by_id[id];
         let type_id = entry["type_id"].as_str().unwrap_or("");
@@ -551,7 +565,7 @@ pub fn rebuild_refs(ctx: &dyn ReadCtx, entity_ids: &[String]) -> WsResult<BTreeS
                     if r.alive() {
                         for d in &refs {
                             if let Some(v) = r.values.get(&d.field_id).filter(|v| v.is_object()) {
-                                out.insert(types::value_ref_edge(id, &r.record_id, &d.field_id, v));
+                                out.insert(types::value_ref_edge(id, &r.record_id, d, v));
                             }
                         }
                         if let Some(b) = &r.body_entity_id {

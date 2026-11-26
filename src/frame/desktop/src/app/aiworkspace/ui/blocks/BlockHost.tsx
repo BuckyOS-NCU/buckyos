@@ -10,6 +10,7 @@ import { describeError } from '../../api/session'
 import type { CellPayload, EntityEnvelope } from '../../api/types'
 import { INK_VIEW } from '../../ink/model'
 import { useStore } from '../../state/hooks'
+import { ApprovalReadOnlyContext } from '../../approval/readOnly'
 import { useAiwsText } from '../../useAiwsText'
 import { AssetBlobImage } from '../extensions/AssetBlobImage'
 import { linkAffordance, shapeOf, sourceLabel } from './affordances'
@@ -28,6 +29,7 @@ export interface BlockHostProps {
   hovered?: boolean
   /** The host that owns selection decides activation (double-click / "edit content"); the source view activates at once. */
   editorActive?: boolean
+  onSelect?: (id: string) => void
   onActivate?: () => void
   onDeactivate?: () => void
   size?: { w: number; h: number }
@@ -88,7 +90,9 @@ function PrintBlank({ cellId, reason, payload }: { cellId: string; reason: strin
 /** Memoised: pans and overlay updates re-render the frame list only; a Block re-renders when its own props change. */
 export const BlockHost = memo(function BlockHost(props: BlockHostProps) {
   const { t } = useAiwsText()
+  const approvalReadOnly = useContext(ApprovalReadOnlyContext)
   const { cell, context, resolution, error, registryVersion } = useBlockContext(props)
+  if (approvalReadOnly && resolution?.ok === false) return <div className="aiws-block-fallback" />
   // a printed page names nothing it cannot show (打印 TODO §3.4): what cannot be read stays empty
   if (props.mode === 'print' && ((!context && error) || resolution?.ok === false)) return <PrintBlank cellId={props.cellId} reason={resolution?.ok === false ? resolution.reason : 'read_failed'} payload={context?.payload ?? null} />
   if (!context && error) return <div className="aiws-block-fallback" data-testid={`aiws-block-fallback-${props.cellId}`} data-reason="read_failed"><div className="aiws-error" role="alert">{t('aiworkspace.blocks.readFailed', { error })}</div></div>

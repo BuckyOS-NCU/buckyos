@@ -12,7 +12,7 @@ import {
   TextField,
   Typography,
 } from '@mui/material'
-import { Eye, EyeOff, ExternalLink, Fingerprint } from 'lucide-react'
+import { Eye, EyeOff, ExternalLink, Fingerprint, GraduationCap } from 'lucide-react'
 import { requestServiceLaunch } from '../api/app_launch'
 import { describeLoginTarget, fetchSsoConfig } from '../api/sso'
 import { onWorkspaceHost } from '../app/aiworkspace/links'
@@ -136,6 +136,28 @@ function useDidErrorText(code: string): string | null {
   return t('sso.login.didError.failed', 'DID sign-in did not complete. Try again.')
 }
 
+function campusLoginError(code: string | null): string | null {
+  switch (code) {
+    case null:
+      return null
+    case 'invalid_callback':
+      return '登录请求已过期或无法确认，请从这里重新发起登录。'
+    case 'provider_denied':
+      return '学校统一认证未完成，请重新登录。'
+    case 'provider_unavailable':
+    case 'unavailable':
+      return '统一认证暂时不可用，请稍后重试。'
+    case 'ineligible':
+      return '此校园账号暂无法使用 BuckyOS，请联系管理员。'
+    case 'identity_conflict':
+      return '此浏览器已登录其他账号，请先退出，再使用学校统一认证。'
+    case 'account_unavailable':
+      return '暂时无法登录 BuckyOS，请稍后重试或联系管理员。'
+    default:
+      return '学校统一认证登录失败，请重试。'
+  }
+}
+
 const LoginPage = () => {
   const { t } = useI18n()
   const [searchParams] = useSearchParams()
@@ -144,6 +166,12 @@ const LoginPage = () => {
     [searchParams],
   )
   const didErrorText = useDidErrorText(searchParams.get('did_error') ?? '')
+  const campusLoginEnabled = window.location.origin === import.meta.env.VITE_NCU_CAS_ORIGIN
+    && window.self === window.top
+  const campusErrorText = campusLoginEnabled ? campusLoginError(searchParams.get('cas_error')) : null
+  const campusStartUrl = redirectUrl
+    ? `/sso/cas/start?${new URLSearchParams({ redirect_url: redirectUrl })}`
+    : '/sso/cas/start'
   const zone = useZonePresentation()
 
   const [requester, setRequester] = useState<{ url: string; name: string } | null>(null)
@@ -181,6 +209,7 @@ const LoginPage = () => {
   // already signed in on this host is handed over through the Control Panel's launch — the one-time callback on
   // that origin signs them in there — without seeing the form. Anyone else signs in as usual.
   const [handoff, setHandoff] = useState(() => {
+    if (campusErrorText) return false
     try { return !!redirectUrl && onWorkspaceHost(new URL(redirectUrl).host) } catch { return false }
   })
   useEffect(() => {
@@ -264,7 +293,7 @@ const LoginPage = () => {
             color="text.secondary"
             sx={{ mt: 0.5 }}
           >
-            Enter your credentials to continue
+            {campusLoginEnabled ? '请选择登录方式' : 'Enter your credentials to continue'}
           </Typography>
           {requesterName && (
             <Box
@@ -289,6 +318,12 @@ const LoginPage = () => {
         </>
       }
     >
+      {campusErrorText && (
+        <Alert severity="error" sx={{ mb: 2.5 }}>
+          {campusErrorText}
+        </Alert>
+      )}
+
       {didErrorText && didErrorOpen && (
         <Alert severity="error" sx={{ mb: 2.5 }} onClose={() => setDidErrorOpen(false)} data-testid="login-did-error">
           {didErrorText}
@@ -314,6 +349,20 @@ const LoginPage = () => {
         <DidLoginForm redirectUrl={didRedirectUrl} onCancel={() => setShowDidLogin(false)} />
       ) : (
         <Box component="form" onSubmit={handleSubmit} noValidate>
+          {campusLoginEnabled && (
+            <Button
+              href={campusStartUrl}
+              fullWidth
+              size="large"
+              variant="outlined"
+              startIcon={<GraduationCap size={18} />}
+              disabled={disabled}
+              sx={{ mb: 2.5 }}
+            >
+              南昌大学统一认证登录
+            </Button>
+          )}
+
           <TextField
             label="Username"
             autoComplete="username"
